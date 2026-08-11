@@ -76,7 +76,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 | `--mcp-no-streaming` | off | Disable the MCP **Streamable HTTP** transport (ADR-1005 Decision 15): no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` return `405`, and only plain JSON-RPC POST is served. The spec-required `202` status on notification POSTs still applies. Use where a buffering reverse proxy interferes with streaming. Env: `YUZU_MCP_NO_STREAMING`. |
-| `--mcp-enable-streamed-post` | off | Enable **SSE-on-POST** (streamed POST) for `execute_instruction` callers that supply a `progressToken`. **Ships OFF** — turning it on by default is a separate rung. The transport machinery is complete and reviewed, and the four defects that gated that flip are fixed: #2739 (the 120 s response cap is now enforced on a busy execution — after it expires the bridge delivers one final drain of already-latched progress and then settles, bounding the response at the cap plus at most two ~3 s pump ticks plus one mailbox drain), #2740 (a committed-but-undelivered final no longer locks a session out of streaming — admission reclaims the slot and audits it), #2785 (streamed-POST frames now carry the replay-ring event id, so a POST-only client can build a `Last-Event-ID` resume cursor) and #2789 (end-to-end coverage of the per-principal admission reject). Distinct from `--mcp-no-streaming`, which disables the whole transport including the session lifecycle and GET channel. |
+| `--mcp-enable-streamed-post` / `--no-mcp-streamed-post` | on | Enable **SSE-on-POST** (streamed POST) for `execute_instruction` callers that supply a `progressToken`. **Ships ON** — the transport machinery is complete and reviewed, and the four defects that previously gated the on-by-default flip are fixed: #2739 (the 120 s response cap is now enforced on a busy execution — after it expires the bridge delivers one final drain of already-latched progress and then settles, bounding the response at the cap plus at most two ~3 s pump ticks plus one mailbox drain), #2740 (a committed-but-undelivered final no longer locks a session out of streaming — admission reclaims the slot and audits it), #2785 (streamed-POST frames now carry the replay-ring event id, so a POST-only client can build a `Last-Event-ID` resume cursor) and #2789 (end-to-end coverage of the per-principal admission reject). Pass `--no-mcp-streamed-post` to opt out. Distinct from `--mcp-no-streaming`, which disables the whole transport including the session lifecycle and GET channel. |
 | `--mcp-allowed-origin` | *(none)* | **Repeatable.** An allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/` DNS-rebinding defence. An **absent** `Origin` is always allowed (the endpoint requires a credential); an **empty allowlist rejects any *present* Origin** (secure default) — browser-based MCP clients must be listed explicitly, non-browser clients need no configuration. Env: `YUZU_MCP_ALLOWED_ORIGINS`. |
 | `--max-sse-streams` | `128` | **Concurrent held-open SSE responses this server is sized for, across EVERY streaming surface** — `GET /mcp/v1/`, MCP streamed POST, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. The HTTP worker pool is derived *from* this number: cpp-httplib is thread-per-connection, so each held-open response pins one worker for its whole life. That thread burns no CPU, and its resident cost is a fraction of a stack reservation that is virtual and platform-dependent (8 MB on Linux/glibc, 1 MB on Windows, 512 KB for macOS secondary threads). The resident fraction itself is **not yet measured** on our platforms (ADR-0034), so treat the default as a starting point rather than a sizing guarantee until a per-platform baseline exists. Utilisation is `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`. The ceiling is thread-count; see ADR-0034. Env: `YUZU_MAX_SSE_STREAMS`. |
 | `--mcp-max-streams-per-principal` | `4` | Max concurrent MCP SSE streams for one principal. An **anti-monopoly policy, not a capacity limit** — capacity is `--max-sse-streams`. Stops a single agentic token taking the channel; does not ration the fleet. Env: `YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL`. |
@@ -645,23 +645,70 @@ Three operator-visible consequences:
   (120 s), enforced on a busy execution too (#2739): after the cap expires the
   bridge delivers one final drain of already-latched progress and then settles,
   so the bound is the cap plus at most two ~3 s pump ticks plus one bounded
-  mailbox drain and its socket-write time — not the execution's duration. It
-  leases from the same held-open budget as the GET channel, so total
-  concurrency is unchanged — but `TimeoutStopSec` and any container termination
-  grace period should be sized above **120 s** with that margin in mind; 30 s —
-  which suited GET alone — is the figure to move away from. Under-sizing
+  mailbox drain and its socket-write time (the server's 30 s write timeout,
+  `set_write_timeout` in `server.cpp`) — worst case ~156 s, not the execution's
+  duration. It leases from the same held-open budget as the GET channel, so
+  total concurrency is unchanged — but `TimeoutStopSec` and any container
+  termination grace period should be sized comfortably above that ~156 s bound
+  (the shipped systemd unit and every shipped compose file use **210 s**); 30 s
+  — which suited GET alone — is the figure to move away from. Under-sizing
   SIGKILLs mid-drain and silently drops in-flight streams on deploy.
 - **Per-principal ceiling.** `--mcp-max-streams-per-principal` governs the GET
-  channel. The streamed-POST allowance is a separate, fixed 4 per session (twinned
-  to the replay ring's pin slots), so the real per-principal held-open ceiling is
-  `--mcp-max-streams-per-principal + 4`. Lowering the flag to contain a noisy
-  principal does not reduce its streamed-POST concurrency.
+  channel. The streamed-POST allowance is a fixed 4 concurrent calls per
+  principal — numerically the same as, but counted and enforced separately
+  from, any single session's own replay-ring pin-slot count — so the
+  steady-state per-principal held-open sum across both channels is
+  `--mcp-max-streams-per-principal + 4`. That sum is not a hard ceiling: a
+  GET-channel reconnect keeps the superseded connection's count until it
+  finishes draining, and `McpStreamState` bounds this to one pending handover
+  per *session*, not per principal — a principal with every one of its GET
+  sessions mid-handover at once can transiently double the GET component.
+  Lowering the flag to contain a noisy principal does not reduce its
+  streamed-POST concurrency.
 - **Reverse proxies.** The response sets `X-Accel-Buffering: no`, which only nginx
   honours. Envoy, HAProxy, ALB and Cloudflare need their own no-buffering opt-out,
   or the stream is buffered and dead clients are not detected.
 
 `--mcp-no-streaming` remains the kill switch and now also degrades the streamed
 POST arm back to plain JSON, not just GET/DELETE.
+
+### vNEXT — streamed POST (`--mcp-enable-streamed-post`) now ships ON by default (breaking)
+
+The feature described in the vNEXT entry above already existed; this entry is
+about its **default** changing. Every prerequisite that gated the on-by-default flip
+(#2739, #2740, #2785, #2789) is fixed, so a server started with no MCP flags now
+serves streamed POST for any `execute_instruction` call that sends
+`_meta.progressToken` with an SSE-capable `Accept` — no configuration required.
+
+**What this means for an upgrading operator**, restated from the Sizing and
+per-principal bullets above because they are no longer conditional on opting in
+— they now apply to every deployment by default:
+
+- **`TimeoutStopSec` (or your container runtime's equivalent termination grace)
+  must be sized comfortably above the ~156 s worst-case bound derived in the
+  Sizing bullet above** (120 s cap + pump ticks + the 30 s write timeout), not
+  the ~30 s that sufficed for the GET channel alone. The shipped systemd unit
+  and every shipped compose file that runs `yuzu-server` use **210 s** — use
+  that as your own starting point if you're not deploying from one of those. This
+  was previously only a concern for operators who had explicitly enabled the
+  flag; it is now the default posture for every deployment that takes no
+  action.
+- **A principal's steady-state held-open sum is `--mcp-max-streams-per-principal
+  + 4`** — the streamed-POST allowance is no longer contingent on opting in, it
+  applies to every deployment by default. That sum is not a hard ceiling (see
+  the Per-principal ceiling bullet above for the GET-reconnect transient).
+- **If you're behind a non-nginx reverse proxy (Envoy, HAProxy, ALB,
+  Cloudflare) or running an MCP client whose HTTP transport can't consume a
+  streamed response body**, verify SSE-on-POST actually reaches your client
+  before upgrading (see the Reverse proxies bullet above) — otherwise a call
+  that previously answered promptly can appear to hang for up to the ~156 s
+  worst-case bound (see the Sizing bullet above), not just the 120 s cap.
+  Pass `--no-mcp-streamed-post` if you'd rather verify after upgrading.
+
+**To opt out**, pass `--no-mcp-streamed-post` (or set
+`YUZU_MCP_ENABLE_STREAMED_POST=false`) to keep the pre-flip plain-POST-only
+behavior. `--mcp-no-streaming` remains the broader kill switch and disables
+streamed POST along with the rest of the Streamable HTTP transport.
 
 ### vNEXT — MCP stream revalidation rides the tick, and the pin-drift alert moves to a new counter
 
@@ -817,6 +864,31 @@ credential) call `rotate`, not replay `confirm`. Agentic MCP clients honouring
 `idempotentHint:true` get the correct terminal answer automatically. Full
 detail: `docs/user-manual/rest-api.md` (confirm error table) and
 `docs/user-manual/engine-principals.md`.
+
+### vNEXT — API-token rotation confirm-identity binding now survives a restart; first schema change to `api_tokens` (#2961)
+
+Migration v3 adds `api_tokens.rotation_initiator` (durable twin of the
+confirm-identity binding described in `docs/auth-architecture.md`
+"Confirm-identity binding survives a server restart"). This is the FIRST
+schema change ever applied to `api_tokens` since it shipped — every
+authenticated request validates a Bearer token against this table, so it is
+one of the hottest tables on the server.
+
+**Not breaking, but worth knowing before a rolling upgrade.** `ALTER TABLE
+... ADD COLUMN ... DEFAULT ''` takes Postgres's briefest possible form (a
+metadata-only "fast default" on PG 11+, not a table rewrite) but is still an
+`ACCESS EXCLUSIVE` DDL statement: it must wait for every transaction
+currently touching `api_tokens` to finish before it can run, and every new
+transaction on the table queues behind it in turn while it waits. During a
+rolling upgrade, an outgoing replica's still-open request handling can hold
+such a transaction open. This is bounded and loud, not silent: the pool's
+`lock_timeout` (10s, `pg_pool.hpp`) cancels the migration's `ALTER` if it
+queues that long, and `ApiTokenStore` construction fails closed exactly as
+it does for any other migration failure — the new binary refuses to start
+with a clear log line rather than serving degraded or hanging the table. If
+you see this on a rolling upgrade, retry once traffic quiesces (a load
+balancer draining the outgoing replica is usually enough); it is not a data
+integrity concern either way.
 
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 

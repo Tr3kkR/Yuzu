@@ -987,9 +987,20 @@ void RbacStore::seed_defaults() {
          "the /inventory software catalog remains under Inventory:Read' "
          "WHERE name = 'SoftwareLicensing' AND description = ''");
 
-    // Operations.
-    const std::array<std::string_view, 7> ops = {"Read",    "Write", "Execute", "Delete",
-                                                 "Approve", "Push",  "Attest"};
+    // Operations. "Rotate" (dev P2 #11, SOC 2 CC6.3, merged from origin/dev):
+    // ApiToken-specific self-service rotation
+    // (ApiTokenStore::rotate_token/confirm_token_rotation). Same treatment as
+    // Push/Attest below — a first-class operation, deliberately EXCLUDED from
+    // crud_ops so no cross-type loop ever widens it onto an unrelated
+    // securable, and deliberately distinct from ApiToken's own "Write": a
+    // security-critical round on dev found that reusing Write to admit the
+    // MCP rotation tools at the operator tier silently widened every OTHER
+    // ApiToken:Write route/tool too (mcp_policy.hpp's tier_allows()
+    // operator-tier comment is the narrative home for that finding). Granted
+    // below to Administrator and ApiTokenManager only — the SAME population
+    // that already holds ApiToken:Write.
+    const std::array<std::string_view, 8> ops = {"Read",  "Write", "Execute", "Delete",
+                                                 "Approve", "Push", "Attest",  "Rotate"};
     for (auto o : ops)
         exec("INSERT INTO rbac_store.operations (id, is_system) VALUES ($1, TRUE) "
              "ON CONFLICT (id) DO NOTHING",
@@ -1054,12 +1065,15 @@ void RbacStore::seed_defaults() {
         txn.commit();
     };
 
-    // Administrator: CRUD on everything + targeted Push + Attest.
+    // Administrator: CRUD on everything + targeted Push + Attest + Rotate
+    // (Rotate merged from origin/dev, P2 #11 — same targeted-grant treatment
+    // as Push/Attest, see the "Rotate" catalogue comment above).
     for (auto t : types)
         for (auto o : crud_ops)
             grant("Administrator", t, o);
     grant("Administrator", "GuaranteedState", "Push");
     grant("Administrator", "AccessReview", "Attest");
+    grant("Administrator", "ApiToken", "Rotate");
 
     // PlatformEngineer.
     for (std::string_view t : {"InstructionDefinition", "InstructionSet"})
@@ -1097,8 +1111,10 @@ void RbacStore::seed_defaults() {
     grant("Operator", "GuaranteedState", "Read");
     grant("Operator", "GuaranteedState", "Push");
 
-    // ApiTokenManager.
-    for (std::string_view o : {"Read", "Write", "Delete"})
+    // ApiTokenManager. "Rotate" merged from origin/dev (P2 #11, SOC 2 CC6.3
+    // — self-service human token rotation; same population that already
+    // holds Write).
+    for (std::string_view o : {"Read", "Write", "Delete", "Rotate"})
         grant("ApiTokenManager", "ApiToken", o);
 
     // ITServiceOwner.

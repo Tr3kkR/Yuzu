@@ -419,6 +419,26 @@ groups:
             it. A sustained rate points at a releaser or connection-teardown bug;
             the records are parked rather than reaped, so nothing is lost, but the
             path should not be exercised in a healthy server.
+      - alert: YuzuMcpStreamedPostDispatchThrewMidStream
+        expr: |
+          rate(yuzu_mcp_bridge_degrade_total{reason="post_dispatch_threw"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "MCP streamed POST dispatched a command but could not stream its response"
+          description: >-
+            yuzu_mcp_bridge_degrade_total{reason="post_dispatch_threw"} is moving -
+            the command WAS dispatched to the fleet and is still running, but the
+            streamed-POST response that was meant to carry its progress/result could
+            not be completed, so the caller got an error for work that is genuinely
+            still in flight. Not data loss: the client's own tool description tells
+            it to recover via query_responses/get_execution_status by execution_id,
+            and streamed POST ships ON by default (docs/user-manual/mcp.md), so this
+            family is now populated by every deployment unless an operator has
+            opted out with --no-mcp-streamed-post. A sustained rate points at
+            allocation pressure or a stream-teardown bug on the POST path
+            specifically, distinct from the pre-existing GET-only degrade reasons
+            in the same metric family.
       - alert: YuzuMcpBridgeProjectionDegraded
         expr: |
           yuzu_mcp_bridge_projection_degraded_total > 0
@@ -1215,103 +1235,193 @@ groups:
             needs an engineering escalation rather than a config change.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#capacity"
 
-      # THE ABSENCE ALERT. Every other COUNTER-driven rule in this group fires on
-      # a counter RISING, so none of those fires when the cleanup thread never
-      # runs. No rule detects a reaper that never ran
-      # (never started because the store was closed at boot, died, or was
-      # stopped and not restarted). In that state all six other series sit flat
-      # at 0 -- indistinguishable from a quiet, healthy store -- while audit_store
-      # grows without bound and rows are retained past the stated window. This
-      # is the only rule that catches it.
+      # YuzuServerRestartLoop -- the crash-loop signal in its own right. Previously this
+      # lived ONLY as the `resets(...) <= 1` grace-exclusion inside
+      # YuzuAuditRetentionNotRunning below (#2854 hole 3: "no restart-frequency signal
+      # exists in its own right, so the retention rule is carrying a job that is not
+      # its own"). Standalone here is what let that rule's grace collapse to "has a
+      # pass ever stamped this database" (#2854 rung D) without losing crash-loop
+      # detection outright.
+      #
+      # THRESHOLD, a judgment call, stated: at a 30-minute restart cadence (the
+      # family's flagship failure -- also YuzuAuditRetentionNotRunning's own motivating
+      # case) a 3h window holds 6 resets, well past `> 3`, and FIRES. An install
+      # followed by two config-fix restarts holds 2 resets and stays quiet. An hourly
+      # restart cadence holds exactly 3 resets and ALSO stays quiet -- the boundary is
+      # deliberately placed there, not at `>= 3`; both halves pinned in the test file.
+      #
+      # WHY `[3h] > 3`, NOT THE ISSUE TEXT'S `[1h] > N`. A 30-minute cadence produces
+      # exactly 2 resets per hour, indistinguishable from an ordinary install-plus-fix
+      # pair measured on an hourly window. Any threshold on `[1h]` that catches the
+      # flagship cadence also pages the benign one; widening to a 3h window is what
+      # separates them.
+      #
+      # SAMPLING BOUND, and it is not merely a delay. `yuzu_server_uptime_seconds` is
+      # written once per periodic metrics-sweep tick (server.cpp), not on every
+      # scrape, so `resets()` can undercount restarts faster than that tick interval.
+      # `> 3` in a 3h window (one reset per 45 minutes) sits comfortably above an
+      # ordinary crash loop's cadence; do not lower the threshold without
+      # re-checking the sweep interval. But a loop faster than the tick itself --
+      # `Restart=always` with no `RestartSec` crashing before the first tick fires,
+      # every time -- writes the gauge AT MOST once per boot no matter how long the
+      # loop runs, so `resets()` can never observe more than a handful of
+      # transitions and this rule stays PERMANENTLY silent, not just delayed. No
+      # rule in this file is a dead-man's-switch for the server process itself (an
+      # `up == 0` / `absent_over_time()` companion would be); tracked as #2956, not
+      # closed here.
+      #
+      # `resets()` FALSE-NEGATIVES ON A PARTIAL RANGE, the mirror of
+      # YuzuAuditRetentionNotRunning's documented `increase()` false-POSITIVE below.
+      # The same four causes -- a Prometheus restart, a fresh TSDB, a new HA
+      # replica, or applying this file for the first time -- clip the trailing [3h]
+      # window from the LEFT, so an actively ongoing crash loop that started before
+      # the clip can show fewer than 4 resets in-window and stay quiet for up to
+      # roughly `4 x cadence + 15m` after the clip (~2h15m at the flagship 30-minute
+      # cadence) before enough fresh resets accumulate to fire. Where the sibling
+      # rule's clipped `increase()` reads as "broken" when it is not, this rule's
+      # clipped `resets()` reads as "healthy" when it may not be -- do not trust a
+      # quiet YuzuServerRestartLoop in the ~3h after any of those four events.
+      #
+      # KNOWN LIMIT, and it bites hardest where crash loops live. `resets()` needs
+      # ONE CONTINUOUS SERIES per server. If a restart changes the `instance`
+      # label -- dynamic-port or IP-based service discovery, a rescheduled pod --
+      # each restart starts a FRESH series with `resets == 0`, so this rule goes
+      # silent exactly where a crash loop is most likely. (The retention rules
+      # below no longer share this limit: their stamp-based grace reads a value,
+      # not a series history, so an identity-changing restart does not silence
+      # them.) Nothing in PromQL can recover from that; the fix is scrape config,
+      # not this rule (target a stable identity). It is called out in the runbook.
+      - alert: YuzuServerRestartLoop
+        expr: |
+          resets(yuzu_server_uptime_seconds[3h]) > 3
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Server is restarting in a loop"
+          description: >-
+            yuzu_server_uptime_seconds has reset more than 3 times in the last 3 hours --
+            more often than an hourly restart cadence, which is not itself a fault. Check
+            the server's process log / systemd journal / container restart history for a
+            crash signature (unhandled exception, OOM-kill, failed boot precondition)
+            around each reset. This is a process-health signal, not evidence of a specific
+            subsystem fault -- YuzuAuditRetentionNotRunning and the rest of the yuzu-audit
+            group cover what a dead reaper causes DURING a loop like this one. Note:
+            those rules key on the audit database's own state, not on restart counts, so
+            at 2 or 3 resets in the window this alert stays quiet while a stalled reaper
+            still fires YuzuAuditRetentionNotRunning -- seeing that alert alone is not
+            evidence this one should also be firing.
+            Runbook: docs/ops-runbooks/audit-store-clock-guard.md.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/audit-store-clock-guard.md"
+
+      # THE ABSENCE ALERTS. Every COUNTER-driven rule in this group fires on a
+      # counter RISING, so none of those fires when the cleanup thread never
+      # runs (never started because the store was closed at boot, died, or was
+      # stopped and not restarted). In that state every counter sits flat at 0
+      # while audit_store grows without bound and rows are retained past the
+      # stated window. What makes the state DETECTABLE is the seventh series:
+      # yuzu_server_audit_retention_last_pass_unixtime is seeded from the durable
+      # audit_retention_meta anchor at startup (#2854), so it is NOT flat -- it
+      # reads the last pass's stamp on a database that has ever had one, and
+      # exactly 0 only on a database that never has. This rule catches the dead
+      # reaper on an anchored database; YuzuAuditRetentionNeverRan below catches
+      # the database no pass ever ran against.
       #
       # Threshold is tied to the 60-minute cleanup interval: no pass in 3h is
       # unambiguously broken. That interval is NOT operator-configurable today --
       # `server.cpp` constructs `AuditStore` with only `audit_retention_days`, so
       # the `cleanup_interval_min` ctor parameter declared in `audit_store.hpp`
-      # keeps its 60-minute default. If it is ever exposed, this window and the
-      # `resets` bound below must both be revisited; PromQL cannot read the
-      # server's own interval.
+      # keeps its 60-minute default. If it is ever exposed, this window -- and
+      # YuzuAuditRetentionNeverRan's window and `for:` below -- must be
+      # revisited; PromQL cannot read the server's own interval.
       #
-      # THE YOUNG-SERVER GRACE MUST NOT EXCLUDE A CRASH LOOP. run_cleanup sleeps
-      # a full interval BEFORE its first pass, so a server that has genuinely
-      # just started has no pass yet and is not broken. But a server restarting
-      # more often than this window NEVER accumulates uptime past the grace, so a
-      # bare `uptime > 10800` (equivalently `unless uptime < 10800`) excluded the
-      # rule's own motivating case on every evaluation: a reaper that completes
-      # zero passes because the process keeps dying. `resets()` separates the
-      # two, and `unless` rather than `and` so a missing uptime series cannot
-      # silence the rule either.
+      # THE SEED IS WHAT CLOSED THE BAND (#2854). This rule's grace used to be a
+      # young-server test on yuzu_server_uptime_seconds (`unless (uptime < 10800
+      # and resets(uptime[3h]) <= 1)`), and the family's measured holes all
+      # lived in it: blind for a genuinely dead reaper at restart cadences the
+      # sweep measured (164-195 minutes in the final revision), able to resolve
+      # mid-fault from ~90-minute cadences up, and silent about restart
+      # frequency as a signal in its own right (#2854's three holes;
+      # YuzuServerRestartLoop above took the third). The grace is now a single
+      # fact about the DATABASE: the stamp gauge is seeded from the durable
+      # audit_retention_meta anchor at startup, so `stamp == 0` means "no
+      # retention pass has EVER run against this database" -- the only state in
+      # which zero passes is legitimate (run_cleanup sleeps a full interval
+      # before its first pass; YuzuAuditRetentionNeverRan below owns that
+      # state). A crash-looping process on an anchored database keeps a NON-ZERO
+      # stamp across every restart, so no restart cadence re-enters the grace:
+      # increase() over the passes counter stays 0 continuously and the unless
+      # operand stays false continuously -- no blind band, and no oscillation
+      # for Alertmanager to read as RESOLVED mid-fault. Deliberately NO
+      # keep_firing_for on this rule or the next: with the grace restart-proof
+      # there is no single-evaluation flake to paper over, and it would extend
+      # the documented Prometheus-restart false page below and delay every
+      # genuine RESOLVED.
       #
-      # WHY `<= 1` AND NOT `== 0`. A young server that restarts ONCE in the
-      # window -- install, then a config fix -- is healthy and must not page, but
-      # it has a reset. Excusing one is a deliberate trade, and it is NOT free.
-      # Both halves are pinned in the test file: the single-restart case must
-      # stay quiet, the 30-minute crash loop must still fire.
+      # THE GRACE IS A RANGE, NOT AN INSTANT SAMPLE, and that is load-bearing
+      # twice over (governance sec-F1/UP-1, both measured against the instant
+      # form this replaced). An instant `stamp == 0` operand re-excuses the
+      # rule at EVERY 0-valued sample, so any series that mixes 0 with
+      # something else faster than `for: 15m` -- a per-boot alternation between
+      # a 0 seed and the INT64_MIN unreadable-anchor sentinel, or an
+      # anchor-loss flap mixing 0 with a real stamp -- reset the `for:` clock
+      # forever and NEITHER liveness rule fired on a genuinely dead reaper.
+      # THE GRACE IS EXACTLY THE NEXT RULE'S FIRING CONDITION -- the same
+      # max/min expression, verbatim -- so the pair partitions the dead-reaper
+      # states STRUCTURALLY: at every instant, every window shape is either
+      # excused here and owned below, or unexcused here and paged here.
+      # Instantaneous ownership is not TEMPORAL coverage: a regime that
+      # phase-locks OSCILLATION between the two owners faster than either
+      # rule's `for:` can accumulate still starves both (measured: sentinel
+      # filler with single-scrape 0 excursions at a 180-195m period; requires
+      # a never-anchored database, a dead reaper, and a scrape phase-locked
+      # to the short boot). Closing that is a `for:`/window retune tracked as
+      # #2997 -- do not narrow either `for:` here without re-timing
+      # every case in the test file and re-running the sweep. Excused means "the
+      # window carries no evidence a pass ever happened": every sample is 0
+      # or the unreadable-anchor sentinel, with at least one 0. ANY evidence
+      # of a pass -- a genuine positive stamp, or a dead-CMOS NEGATIVE stamp
+      # (a pass is a pass, whatever the clock said; governance CA-G8-1
+      # measured a 0/negative anchor-flap silencing the max-only form of this
+      # grace) -- lifts it for a full window and fires HERE, as does a window
+      # of only sentinels (nothing rules a dead reaper out). A negative dead-CMOS stamp keeps max_over_time negative,
+      # never 0, so it does not earn the grace either -- a pass happened, and a
+      # subsequently dead reaper still pages here. Pinned in the test file.
+      # `unless` rather than `and` so an absent stamp series cannot silence the
+      # rule either -- also pinned.
       #
-      # WHAT THE TRADE COSTS, MEASURED (#2553, governance pass 13). An earlier
-      # revision of this comment argued it cost NO coverage -- "to complete zero
-      # passes a process must restart more often than hourly, which is at least
-      # three resets across 3h; any cadence slow enough to leave only one reset
-      # also leaves a segment long enough for a pass to complete". That argument
-      # presupposes a WORKING reaper. Where none runs at all -- a failed migration
-      # closes the store and `start_cleanup()` early-returns, or a pass threw --
-      # no segment is long enough for anything, so `increase(...) == 0` never
-      # engages as the backstop. The states this rule's own description names are
-      # the states that argument assumed away.
-      #
-      # SO IT IS STILL BLIND for a genuinely dead reaper at restart cadences of
-      # 164-195 MINUTES: uptime never reaches 10800, and the window holds two
-      # resets for only `10800 - cadence` seconds, which is under `for: 15m` once
-      # the cadence passes 9900s. Measured 164-195 at 30s and 60s evaluation
-      # intervals, 163-196 at 300s. Do NOT validate a change against these
-      # bounds -- they are a RESULT, and three earlier reviews each reported a
-      # different band from sparse sampling. Re-run
-      # `tests/prometheus/blind_band_sweep.py`; method, resolution and the three
-      # ways this measurement goes wrong are in
+      # THE MANIFEST IS THE GATE, NOT THIS COMMENT. Do not validate a change to
+      # this expression (or the next rule's) against any band or bound quoted
+      # in prose -- bands are RESULTS, and three earlier reviews each reported a
+      # different one from sparse sampling. Re-run
+      # `tests/prometheus/blind_band_sweep.py --emit` and compare against the
+      # committed `tests/prometheus/blind_band_manifest.json` (empty uncovered
+      # sets, enforced by `--check` on every PR); method, resolution and the
+      # ways the measurement goes wrong are in
       # docs/prometheus/blind-band-measurement.md.
       #
-      # NARROWED, NOT CLOSED. What this replaced required `uptime > 10800`
-      # outright and was silent at EVERY cadence SAMPLED against it -- 30 to 190
-      # at 10-minute resolution, and to 200 at a 5-minute evaluation interval.
-      # That is reported as a FLOOR, not as bounds: the sweep did not look for an
-      # upper edge, and the old rule was blind above 195 too. This is strictly
-      # and substantially better, and still has a hole.
-      #
-      # Closing it needs a SERVER change, not a PromQL one. The natural signal,
-      # `..._retention_last_pass_unixtime`, is seeded 0 and never reloaded from
-      # the persisted `audit_retention_meta` anchor, so it zeroes on every restart
-      # and a freshness rule built on it REGRESSES the 30-minute crash loop this
-      # rule already catches. Tracked separately; do not rewrite this expression
-      # in place without a cadence x evaluation-interval sweep.
-      #
-      # KNOWN LIMIT, and it bites hardest where crash loops live. `resets()` needs
-      # ONE CONTINUOUS SERIES per server. If a restart changes the `instance`
-      # label -- dynamic-port or IP-based service discovery, a rescheduled pod --
-      # each restart starts a FRESH series with `resets == 0` and uptime under the
-      # grace, so the grace applies forever and this rule is silent again. Nothing
-      # in PromQL can recover from that; the fix is scrape config, not this rule
-      # (target a stable identity). It is called out in the runbook.
-      #
-      # MATCHING IS DELIBERATELY BARE, and that is load-bearing. Both operands are
-      # scraped from the SAME server target, so their label sets are already
-      # identical and an explicit `on(...)` can only narrow them. An earlier
-      # revision used `on(instance)`, which let a young reset-free neighbour that
-      # merely SHARED an `instance` value -- a canary, an HA pair, a federated
-      # series -- suppress the alert for a genuinely broken server. `on(instance,
-      # job)` is not the fix: it moves the same hole to the next distinguishing
-      # label (`namespace`, `pod`, `cluster`). Default matching is what every other
-      # cross-metric rule in this file uses; a rule that opts out of it needs a
-      # stated reason, and this one has none. Pinned by the two-target case in
-      # `tests/prometheus/yuzu-alerts.test.yml`.
+      # MATCHING IS DELIBERATELY BARE, and that is load-bearing. Both operands
+      # -- the passes counter and the stamp gauge -- are scraped from the SAME
+      # server target, so their label sets are already identical and an explicit
+      # `on(...)` can only narrow them. An earlier revision of this rule used
+      # `on(instance)` on its then-uptime operands, which let any other series
+      # that merely SHARED an `instance` value -- a canary, an HA pair, a
+      # federated series -- stand in for a broken server's and suppress its
+      # alert. `on(instance, job)` is not the fix: it moves the same hole to the
+      # next distinguishing label (`namespace`, `pod`, `cluster`). Default
+      # matching is what every other cross-metric rule in this file uses; a rule
+      # that opts out of it needs a stated reason, and this one has none. Pinned
+      # by the two-target case in `tests/prometheus/yuzu-alerts.test.yml`.
       #
       # WHAT WOULD BREAK THE ASSUMPTION, since it is an operator-side change this
-      # file cannot guard: both metrics ship UNLABELLED (`server.cpp` emits them
-      # through the no-label `gauge(name)` overload), so their label sets are
-      # whatever the scrape adds -- identically, because it is one target. A
-      # `metric_relabel_configs` that adds or drops a label on ONE of the two makes
-      # the sets differ, the join then matches nothing, the grace silently stops
-      # applying, and every fresh boot pages. That is the inverse of the
-      # `on(instance)` bug above.
+      # file cannot guard: both metrics ship UNLABELLED -- `server.cpp` emits
+      # them in the SAME `if (audit_store_)` block through the same no-label
+      # `gauge(name)` overload, so they are co-present or co-absent with
+      # identical label sets, which is what makes the bare `unless` join sound.
+      # A `metric_relabel_configs` that adds or drops a label on ONE of the two
+      # makes the sets differ, the join then matches nothing, the never-ran
+      # grace silently stops applying, and every fresh database pages after 15
+      # minutes. That is the inverse of the `on(instance)` bug above.
       #
       # KNOWN LIMIT: THIS FALSE-PAGES AFTER A PROMETHEUS RESTART. MEASURED under
       # promtool with the next pass landing at the 60-minute cadence: it fires
@@ -1319,22 +1429,35 @@ groups:
       # MINUTES of firing - bounded by the cleanup interval, not by anything this
       # rule controls. (An earlier revision said ~75 minutes, adding `for:` to the
       # interval. `for:` delays the START; it does not extend the end.)
-      # It predates this rule's current form - MEASURED identically against the
-      # previous expression (#2553, Gate 5 chaos analysis). `increase()` over a
-      # PARTIAL range returns 0, and the young-server grace watches the SERVER's
-      # uptime, not Prometheus's, so it does not apply: a healthy long-lived
-      # server whose last hourly pass predates the first scrape is
-      # indistinguishable from a dead reaper until a pass lands inside the new
-      # window. A fresh TSDB, a new HA replica, or applying this file for the
-      # first time all produce it. Documented rather than fixed here because the
-      # fix is a behaviour change (a `count_over_time(...) >= n` conjunct) that
-      # wants deciding on its own evidence rather than folding into this branch.
+      # It predates this rule's current form - MEASURED identically against both
+      # previous expressions (#2553, Gate 5 chaos analysis). `increase()` over a
+      # PARTIAL range returns 0, and the grace watches the DATABASE's history,
+      # not Prometheus's, so it does not apply: a healthy long-lived server
+      # whose last hourly pass predates the first scrape is indistinguishable
+      # from a dead reaper until a pass lands inside the new window. A fresh
+      # TSDB, a new HA replica, or applying this file for the first time all
+      # produce it. Documented rather than fixed here because the fix is a
+      # behaviour change (a `count_over_time(...) >= n` conjunct) that wants
+      # deciding on its own evidence rather than folding into this branch.
+      # YuzuAuditRetentionNeverRan below is IMMUNE: its operands are the stamp
+      # itself, non-zero from the first scraped sample on any anchored database,
+      # and its 3-hour `for:` outlasts this false page's whole lifetime anyway.
+      #
+      # CANARY ANCHOR (tests/prometheus/run_promtool_tests.py, CANARY_FROM): the
+      # indented `unless (` line in the expr below is the suite's mutation
+      # target -- the canary build flips it to `and (`, which inverts the grace
+      # so the rule can fire ONLY on a never-anchored database, and the suite
+      # must redden. Rewriting this expr means updating CANARY_FROM in the same
+      # change, or the canary hard-fails the suite.
       - alert: YuzuAuditRetentionNotRunning
         expr: |
           increase(yuzu_server_audit_retention_passes_total[3h]) == 0
           unless (
-            yuzu_server_uptime_seconds < 10800
-            and resets(yuzu_server_uptime_seconds[3h]) <= 1
+            max_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == 0
+            and (
+              min_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == 0
+              or min_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == -9223372036854775808
+            )
           )
         for: 15m
         labels:
@@ -1344,18 +1467,102 @@ groups:
           description: >-
             No audit retention pass has been attempted in 3 hours, so audit_store is not
             being drained and rows are being retained past the configured window. Note the
-            other five retention COUNTERS cannot move in this state - they all key on a
-            counter rising, and nothing is running to raise one. The
-            uptime guard on this rule exists because run_cleanup sleeps BEFORE its first
-            pass, so a freshly started server legitimately has no pass for one interval;
-            it excuses a young server only while its uptime has AT MOST ONE RESET in the
-            window, so a crash-looping process - which never accumulates uptime past the
-            grace, and is a leading cause of zero completed passes - still fires.
-            Check the server log for
-            "AuditStore: retention pass threw", confirm the store opened at boot
-            (a failed migration closes it and start_cleanup() then early-returns), and
-            check yuzu_server_audit_retention_last_pass_unixtime for when it last ran.
+            other retention COUNTERS cannot move in this state - they all key on a
+            counter rising, and nothing is running to raise one. The only excused state
+            is a 3-hour window carrying no evidence of any pass - every stamp sample 0
+            or the INT64_MIN unreadable-anchor sentinel, with at least one 0 - which is
+            exactly the state YuzuAuditRetentionNeverRan fires on. Any evidence of a
+            pass - a genuine stamp, or a dead-CMOS negative one - or a window of only
+            sentinels does not excuse, so a
+            crash-looping server on an anchored database fires here at every restart
+            cadence, and this rule STAYS firing while the reaper stays dead: treat
+            RESOLVED as recovery only alongside yuzu_server_audit_retention_passes_total
+            rising. Check the server log for "AuditStore: retention pass threw", confirm
+            the store opened at boot (a failed migration closes it and start_cleanup()
+            then early-returns), and check
+            yuzu_server_audit_retention_last_pass_unixtime for when it last ran.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
+
+      # YuzuAuditRetentionNeverRan -- the collapsed grace, standalone. The rule
+      # above excuses exactly one state (no genuine stamp in the window: a
+      # database no retention pass has ever run against, seen through reads
+      # that may intermittently fail to the sentinel); this rule OWNS that
+      # state, because "the
+      # first pass never landed" is as broken as a reaper that died -- a failed
+      # migration closing the store at boot produces exactly this -- it just
+      # deserves a first-pass grace (run_cleanup sleeps one full interval, 60
+      # minutes today, before its first pass) rather than 15 minutes.
+      #
+      # WHY THE GRACE IS NOT `for:` ON AN INSTANT VECTOR. The naive form --
+      # `stamp == 0` with a long `for:` -- never latches on the fresh-install
+      # crash loop this rule exists for: a crash-looper whose downtime exceeds
+      # Prometheus's 5-minute staleness horizon EMPTIES an instant selector
+      # during each gap, and `for:` restarts from zero every time the vector
+      # goes empty. min_over_time/max_over_time hold the samples that DID land
+      # across those gaps, so the range form latches on exactly the series an
+      # instant vector keeps dropping. (The same argument, plus the mixed-seed
+      # regimes, is why the rule ABOVE reads its grace through max_over_time
+      # rather than an instant sample -- see THE GRACE IS A RANGE up there.)
+      #
+      # BOTH ARMS ARE LOAD-BEARING, and they clear DIFFERENT states -- an
+      # earlier revision credited the min arm with clearing everything, which
+      # was false (governance CA-F2) and is exactly the mis-read this
+      # paragraph exists to prevent. The MAX arm is what clears on a genuine
+      # pass: a positive stamp anywhere in the window makes max non-zero
+      # (min may still read 0 from older samples). The MIN arm distinguishes
+      # what a window WITHOUT a genuine stamp means: a negative dead-CMOS
+      # stamp (min < 0, matching neither branch) is a PASS -- the rule clears,
+      # because "never ran" is disproven even though the clock was garbage --
+      # while exactly-0 and the INT64_MIN unreadable-anchor sentinel both keep
+      # the never-ran hypothesis alive. THE SENTINEL BRANCH IS DELIBERATE
+      # (governance sec-F1, measured): a failed anchor READ on a fresh
+      # database is not evidence a pass happened, and without it a crash loop
+      # alternating 0 seeds with sentinel seeds satisfied neither this rule
+      # (min read the sentinel, not 0) nor the one above (each 0 sample
+      # re-excused it) -- a dead reaper paged NOTHING. Pinned in the test
+      # file: the negative-stamp case reddens if the min arm is dropped, and
+      # the mixed 0/sentinel case reddens if the sentinel branch is dropped.
+      #
+      # SEPARATE RULE, NOT `or`-JOINED INTO THE ONE ABOVE. Different graces (15m
+      # vs 3h), different remediations (dead reaper vs store-never-opened /
+      # first-boot failure), and burying a second condition inside one
+      # expression is the exact mistake this redesign fixed. Mutual exclusivity
+      # is STRUCTURAL while the target is scraped (the grace above IS this
+      # rule's condition) and pinned in the test file; after total scrape
+      # loss, see the case-13/case-42 double-page notes there.
+      - alert: YuzuAuditRetentionNeverRan
+        expr: |
+          max_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == 0
+          and (
+            min_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == 0
+            or min_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == -9223372036854775808
+          )
+        for: 3h
+        labels:
+          severity: warning
+        annotations:
+          summary: "No audit retention pass has ever run against this database"
+          description: >-
+            yuzu_server_audit_retention_last_pass_unixtime has recorded no genuine
+            pass for at least the 3 hours of `for:` - every sample read 0 (never ran)
+            or the INT64_MIN unreadable-anchor sentinel, with at least one 0 (a
+            dead-CMOS negative hiding BESIDE both of those still lands here - an
+            unreadable anchor keeps never-ran unprovable - so expect an imprecise
+            story in that corruption-grade triple mix) - this
+            database has never had a retention pass land. Not "not recently": NEVER -
+            the gauge is seeded from the durable audit_retention_meta anchor at
+            startup (#2854), so 0 is a fact about the DATABASE, not about a young
+            process, and a fresh install's one legitimate cleanup interval of silence
+            is over long before this fires. Restarts do not reset the clock: the [3h]
+            window holds the samples across crash-loop gaps - including a boot whose
+            anchor read failed and seeded the sentinel - so a fresh install stuck in
+            a boot loop still pages (one measured, filed exception: a mixed-seed
+            oscillation phase-locked at a 180-195 minute period can starve both
+            rules' for: clocks - #2997).
+            Check that the store opened at boot (a failed migration closes it and
+            start_cleanup() then early-returns) and the server log for
+            "AuditStore: retention pass threw".
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionneverran"
 
       # THE RULE ABOVE CANNOT DETECT ITS OWN INPUT GOING MISSING, which is why
       # this exists. `increase()` over a metric with NO series returns an empty
@@ -1368,10 +1575,10 @@ groups:
       # of the servers it points at.
       #
       # `absent()` is deliberately a SEPARATE rule rather than an `or` folded
-      # into the one above: the young-server grace must not apply to it (a
-      # missing metric is not excused by a recent boot), and the two states want
-      # different remediation -- one is "the reaper stopped", this one is "you
-      # are not watching the reaper at all".
+      # into the liveness pair above: no grace may apply to it (a missing
+      # metric is not excused by anything), and the states want different
+      # remediation -- theirs are "the reaper stopped" / "it never started",
+      # this one is "you are not watching the reaper at all".
       #
       # NOTE it is fleet-wide, not per-server: `absent()` fires only when NO
       # series exists anywhere in this Prometheus. A single server that stops
@@ -2090,7 +2297,8 @@ groups:
   #
   # REASON 2 - NO CHURN-ROBUST NEW-INCREMENT ALERT EXISTS OVER THIS SHAPE. This one does
   # not clear at the cutover. It clears only when a per-agent axis exists for the
-  # JOURNAL: #2083 is spark-scoped, and the journal equivalent is not filed (see below).
+  # JOURNAL: #2083 is spark-scoped, and the journal equivalent is tracked at #2336
+  # (filed 2026-07-21; see below).
   # These are UNLABELLED fleet SUMS of per-agent CUMULATIVE counters over a CHURNING
   # population, and all three candidate forms fail (governance Gate-4 unhappy-path +
   # Gate-6 sre):
@@ -2134,7 +2342,7 @@ groups:
   # rules stay disabled even once the cutover clears REASON 1, and it is separate again
   # from prerequisites (a)-(d) below. Closing it needs the per-agent delta plus a
   # server-owned monotonic counter - #2083 is the spark-scoped tracker, and the journal
-  # side belongs on #2298's cutover-gate list and is not yet filed there.
+  # side is tracked at #2336 (filed 2026-07-21; referenced from #2298's gate list).
   #
   # UNTIL BOTH REASONS CLEAR THESE ARE MONITOR-ONLY: graph them, review them in
   # post-incident analysis, do not page on them.

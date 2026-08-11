@@ -534,6 +534,8 @@ if build_server
       'unit/server/test_route_sink_harness.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
+      'unit/server/test_rotation_sweep_naming.cpp', # P2 #11: sweep-driver metric/audit family discrimination by principal_kind
+      'unit/server/test_rotation_warn_dedup.cpp', # P2 #11: successor-unused log/count/audit cadence (audit is once per state, never per tick)
       'unit/server/test_engine_principal_store.cpp',
       'unit/server/test_engine_principal_integration.cpp',
       # #2367: test-only definition of EngineLivenessTestAccess::revalidate,
@@ -627,6 +629,8 @@ if build_server
       'unit/server/test_license_store.cpp',
       'unit/server/test_rest_api_t2.cpp',
       'unit/server/test_rest_api_tokens.cpp',
+      'unit/server/test_rest_api_tokens_rotation.cpp',   # P2 #11: human token-keyed rotate/confirm REST surface
+      'unit/server/test_token_rotation_lookup.cpp',   # P2 #11: derive_rotation_successor, DB-free unit coverage
       'unit/server/test_rest_tag_routes.cpp',   # K-05: REST tag-route authz wiring (CDX-03/CDX-R4-02/B4)
       'unit/server/test_rest_quarantine_routes.cpp',   # CDX-P1-02: REST quarantine-route authz wiring
       'unit/server/test_rest_api_events.cpp',
@@ -903,6 +907,33 @@ test('prometheus alert rules',
 test('prometheus harness selftest',
   _python3_test,
   args: [files('prometheus/run_promtool_tests.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Audit-retention alert coverage manifest gate (#2854 rung B). Same
+# SKIP-vs-FAIL contract as the entry above -- no CI leg here sets
+# YUZU_TEST_ENABLE_PROMTOOL_DOCKER and none carries a 3.x native promtool, so
+# the realistic local/CI-matrix outcome is SKIP (77); the authoritative run is
+# the docs-lint.yml `prometheus-rules` job, which does set the opt-in.
+# Timeout sized to the sweep's own worst-case ceiling, not typical runtime:
+# with both scenarios' alerts shipped (#2854 rung D) all 6 (scenario,
+# interval) measure() calls run for real -- pull ladder ~195s plus 6 x
+# (30s check + 90s test) = ~915s -- so 1200 keeps a real margin over that.
+# A third sweep scenario adds another ~360s: re-derive, don't inherit.
+test('audit retention alert coverage manifest',
+  _python3_test,
+  args: [files('prometheus/blind_band_sweep.py'), '--check'],
+  suite: 'docs',
+  timeout: 1200,
+)
+
+# Pure-logic selftest for the sweep (cycles_for, the seconds-resolution grid,
+# extract()'s present/absent handling, the manifest compare()). No promtool,
+# no docker, no network.
+test('audit retention coverage sweep selftest',
+  _python3_test,
+  args: [files('prometheus/blind_band_sweep.py'), '--selftest'],
   suite: 'docs',
   timeout: 30,
 )

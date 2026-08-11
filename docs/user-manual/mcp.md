@@ -130,6 +130,7 @@ results.
 | `--mcp-disable` | `YUZU_MCP_DISABLE` | `false` | Disable the MCP endpoint entirely. All requests to `/mcp/v1/` (POST/GET/DELETE) return an error. |
 | `--mcp-read-only` | `YUZU_MCP_READ_ONLY` | `false` | Restrict MCP to read-only tools only. Write and execute operations are rejected regardless of the token's tier. |
 | `--mcp-no-streaming` | `YUZU_MCP_NO_STREAMING` | `false` | Disable the Streamable HTTP transport: no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` → `405`, plain JSON-RPC POST only. The `202`-on-notification status still applies. |
+| `--mcp-enable-streamed-post` / `--no-mcp-streamed-post` | `YUZU_MCP_ENABLE_STREAMED_POST` | `true` | Enable SSE-on-POST (streamed POST) for `execute_instruction` callers that send `_meta.progressToken` with an SSE-capable `Accept`. Pass `--no-mcp-streamed-post` to opt out and fall back to the pre-flip plain-POST-only behavior. |
 | `--mcp-allowed-origin` | `YUZU_MCP_ALLOWED_ORIGINS` | *(none)* | **Repeatable.** Allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/`. An absent `Origin` is always allowed (the endpoint requires a credential); an empty allowlist rejects any *present* `Origin` — browser-based MCP clients must be listed explicitly. |
 
 ### Examples
@@ -230,7 +231,7 @@ change: a notification POST now answers `202` instead of `204`).
   frames is indistinguishable from "nothing has happened yet". `execute_bundle` does
   **not** emit progress (poll `get_bundle_result`). Progress can be delivered two
   ways, and the client chooses per request **on a server that has enabled streamed
-  POST** (`--mcp-enable-streamed-post`, off by default): send an SSE-capable `Accept` alongside
+  POST** (`--mcp-enable-streamed-post`, on by default): send an SSE-capable `Accept` alongside
   the `progressToken` and the POST response itself streams the progress frames and
   then the result; send the token without an SSE `Accept` and the frames go to the
   session's `GET` stream after the POST has already answered. See
@@ -423,9 +424,9 @@ for the tool to execute.
 | 20 | `validate_scope` | Validate a scope expression without executing it. | (none -- always allowed) |
 | 21 | `preview_scope_targets` | Show which agents match a scope expression. | `Infrastructure:Read` |
 | 22 | `list_pending_approvals` | List pending approval requests (filterable by status, submitter). | `Approval:Read` |
-| 23 | `execute_instruction` | Execute a plugin action on agents. Returns `{command_id, execution_id, agents_reached, plugin, action}`; poll results with `query_responses` or subscribe to live events via REST `GET /api/v1/events?execution_id=<id>`. | `Execution:Execute` |
+| 23 | `execute_instruction` | Execute a plugin action on agents. Returns `{command_id, execution_id, agents_reached, plugin, action}` (`agents_reached` >= 1); poll results with `query_responses` or subscribe to live events via REST `GET /api/v1/events?execution_id=<id>`. If no agent was reachable, returns the OTHER outcome instead: `{status:"no_agents_reached", command_id, execution_id, agents_reached:0, plugin, action, message}` — the two shapes are mutually exclusive (`outputSchema`'s `oneOf`), never mixed. | `Execution:Execute` |
 | 24 | `list_issued_certs` | List certificates issued by the internal CA (serial, subject, purpose, status, expiry, revocation). MCP mirror of `GET /api/v1/ca/issued`. `limit`/`offset` args. | `Security:Read` |
-| 25 | `revoke_certificate` | Revoke an issued certificate by `serial_hex` and republish the CRL. MCP mirror of `POST /api/v1/ca/revoke`. Destructive. | `Security:Delete` |
+| 25 | `revoke_certificate` | Revoke an issued certificate by `serial_hex` and republish the CRL. MCP mirror of `POST /api/v1/ca/revoke`. Destructive. Returns `{revoked, serial_hex, crl_republished}` (plus `audit_persisted:false` on a dropped audit row). | `Security:Delete` |
 | 26 | `list_dex_signals` | DEX catalogue rollup: every observation type in the window with count, blast radius, last seen. Optional `os` (`all`/`windows`/`linux`/`macos`) narrows to one OS's signals. Mirrors `GET /api/v1/dex/signals`. | `GuaranteedState:Read` |
 | 27 | `get_dex_signal_scope` | DEX per-OS signal coverage (distinct types + total events per platform). Mirrors `GET /api/v1/dex/scope`. | `GuaranteedState:Read` |
 | 28 | `get_dex_signal_detail` | One DEX signal's drill-down (subjects, OS split, most-affected devices, trend). Optional `os` scopes subjects/devices/by_day (echoed in the result; OS split stays cross-OS). Behavioral — every call emits `dex.signal.view`. Mirrors `GET /api/v1/dex/signals/{obs_type}`. | `GuaranteedState:Read` |
@@ -437,31 +438,31 @@ for the tool to execute.
 | 34 | `list_network_devices` | The device list behind every network-quality drill (worst-by-metric / not-reporting / co-occurrence band / cohort members), with the co-occurring facts inline. Device link-health telemetry, never a verdict. Mirrors `GET /api/v1/network/devices`. | `GuaranteedState:Read` |
 | 35 | `execute_bundle` | Fan one instruction out into 1–32 plugin actions on **one** device, async (server-side fan-out, ADR-0011). Returns `{bundle_id, agent_id, expected}` immediately; poll `get_bundle_result` with the `bundle_id`. Use instead of N `execute_instruction` calls when refreshing a single device. Mirrors `POST /api/v1/bundles`. | `Execution:Execute` |
 | 36 | `get_bundle_result` | Collate a bundle dispatched by `execute_bundle` (arg `bundle_id`): `{complete, received, succeeded, expected, steps[]}` in request order, each step carrying its state (`pending`/`responded`/`dispatch_failed`), status, and output (invalid-UTF-8 bytes replaced with U+FFFD). `complete` is terminal **not** success — check `succeeded == expected`. Ownership-guarded. Mirrors `GET /api/v1/bundles/{id}`. | `Response:Read` |
-| 37 | `query_installed_software` | Query the typed installed-software inventory from the agent daily-sync framework (ADR-0016): machine-wide packages (name, version, publisher, install_date) per device, fleet-wide. Filter by `name` and/or `agent_id`; returns up to `limit` rows (max 1000). **Carries a per-agent management-group drop filter** (out-of-scope devices omitted, omission audited `result=denied`) — **not yet verified effective under the global gate (ADR-0017 / #1716):** both this tool and `GET /api/v1/inventory/software` gate on the *global* `Inventory:Read` permission, under which the drop filter does not narrow results (a confined operator is denied at the gate; a global operator sees all) until the admit-then-filter gate lands (#1713/#1676 UAT). The result object may carry `audit_persisted:false` (the access-audit row could not be written — SOC 2 evidence gap, investigate) and `result_truncated_by_cap:true` (the raw query hit the 1000-row cap — the page is incomplete; keyset follow-up). It always carries `devices_omitted` (integer, absent when zero): the count of devices excluded by management-group scoping — a positive value means matching software records exist **outside your groups**, so an empty or short result does **not** mean the software is absent fleet-wide. **Authoritative reads (ADR-0016 §7):** when the Postgres store is degraded (pool-acquire timeout or query failure) the tool returns a JSON-RPC `kInternalError` (`-32603`, `"Software inventory store degraded — query failed"`) with no `result` field — **never** a silent success with empty rows. A genuine empty result means no matches; an **error** means the store could not be read and the answer is unknown — a caller using this for CVE triage MUST treat the error distinctly from "not installed". **Distinct from `query_inventory`/`get_agent_inventory`** (generic blob store, `Infrastructure:Read`). | `Inventory:Read` |
+| 37 | `query_installed_software` | Query the typed installed-software inventory from the agent daily-sync framework (ADR-0016): machine-wide packages (name, version, publisher, install_date) per device, fleet-wide. Filter by `name` and/or `agent_id`; returns up to `limit` rows (max 1000). **Carries a per-agent management-group drop filter** (out-of-scope devices omitted, omission audited `result=denied`) — **not yet verified effective under the global gate (ADR-0017 / #1716):** both this tool and `GET /api/v1/inventory/software` gate on the *global* `Inventory:Read` permission, under which the drop filter does not narrow results (a confined operator is denied at the gate; a global operator sees all) until the admit-then-filter gate lands (#1713/#1676 UAT). The result object may carry `audit_persisted:false` (the access-audit row could not be written — SOC 2 evidence gap, investigate) and `result_truncated_by_cap:true` (the raw query hit the 1000-row cap — the page is incomplete; keyset follow-up). It always carries `devices_omitted` (integer, unconditionally present — 0 when no devices were excluded, not omitted): the count of devices excluded by management-group scoping — a positive value means matching software records exist **outside your groups**, so an empty or short result does **not** mean the software is absent fleet-wide. **Authoritative reads (ADR-0016 §7):** when the Postgres store is degraded (pool-acquire timeout or query failure) the tool returns a JSON-RPC `kInternalError` (`-32603`, `"Software inventory store degraded — query failed"`) with no `result` field — **never** a silent success with empty rows. A genuine empty result means no matches; an **error** means the store could not be read and the answer is unknown — a caller using this for CVE triage MUST treat the error distinctly from "not installed". **Distinct from `query_inventory`/`get_agent_inventory`** (generic blob store, `Infrastructure:Read`). | `Inventory:Read` |
 | 38 | `list_dex_perf_apps` | Applications with retained fleet app-performance-over-time data (the picker) — so you discover which `app=` values `get_dex_app_perf` can answer. Mirrors `GET /api/v1/dex/perf/apps`. | `GuaranteedState:Read` |
 | 39 | `get_dex_app_perf` | Fleet CPU/working-set trend for one application, by version, over the retained window. Mirrors `GET /api/v1/dex/perf/app`. | `GuaranteedState:Read` |
 | 40 | `get_dex_group_app_perf` | One management group's app-performance trend (sub-floor-suppressed below 10 devices). Mirrors `GET /api/v1/dex/perf/group`. | `GuaranteedState:Read` |
 | 41 | `compare_app_perf_versions` | Cohort-paired **before/after** comparison (the `/auto` VERIFY stage): did upgrading `app` from `baseline` to `candidate` change how the same machines in `group` perform? Per-machine paired delta, aggregated; EVIDENTIAL (no verdict). Identity-free aggregate; carries `truncated`/`small_cohort`/`insufficient` honesty flags. Recorded under the generic `mcp.compare_app_perf_versions` tool-call audit (subject in detail); `audit_persisted:false` in the body on a dropped row. Mirrors `GET /api/v1/dex/perf/compare`. | `GuaranteedState:Read` |
-| 42 | `set_tag` | Set a device tag (structured category or free-form) on `agent_id`. Structured-category keys (`role`/`environment`/`location`/`service`) are case-normalised and validated against their allowed set; a category change fires the agent tag-push. Returns `{set, agent_id, key}` (plus `audit_persisted:false` on a dropped audit row). Mirrors `PUT /api/v1/tags` — **one divergence:** setting a `service` tag via MCP does **not** auto-materialise the `Service: <value>` management group the REST/dashboard path creates (a tracked follow-up); the tag itself is written identically. Requires the **operator** or **supervised** tier. | `Tag:Write` |
-| 43 | `delete_tag` | Delete a device tag by `agent_id` + `key`. Destructive — **approval-gated** on the operator AND supervised tiers: the first call returns `kApprovalRequired` (-32006) with `approval_id` + `status_url`; after an admin approves, re-call with the `approval_id` argument to execute (one-time; replay rejected). Returns `{deleted, agent_id, key}`; a missing tag is a 404-equivalent (`kInvalidParams`, "tag not found"). Mirrors `DELETE /api/v1/tags/{agent_id}/{key}`. | `Tag:Delete` |
-| 44 | `approve_request` | Approve a pending approval request by `approval_id` (optional `comment`, audited). The reviewer is the MCP principal and **cannot be the submitter** (store-enforced), and only a **pending** request can be reviewed — a retry on an already-approved/rejected id returns `kInvalidParams` ("approval already reviewed"), **not** a success (approve is a one-shot state transition, not an idempotent write; treat a retry-after-timeout accordingly). Returns `{approved, approval_id}`. Mirrors `POST /api/approvals/{id}/approve`. Requires the **supervised** tier. | `Approval:Approve` |
-| 45 | `reject_request` | Reject a pending approval request by `approval_id` (optional `comment`). Same reviewer≠submitter + pending-only rules as `approve_request`. Returns `{rejected, approval_id}`. Mirrors `POST /api/approvals/{id}/reject`. Requires the **supervised** tier. | `Approval:Approve` |
-| 46 | `quarantine_device` | Isolate a device from the network. **Records** the quarantine (`POST /api/v1/quarantine` parity) **and dispatches** the live quarantine-plugin isolation (`plugin=quarantine`, `action=quarantine`), whitelisting the management server plus any extra IPs in the `whitelist` arg (comma-separated). Destructive — **approval-gated** on the supervised tier (ticket-then-recall). Returns `{command_id, agents_reached, quarantine_record}` (`agents_reached=0` if the agent was offline for the isolation dispatch — the record still persists). Not an executions-drawer producer. **No MCP release counterpart yet** — to lift a quarantine, use REST `DELETE /api/v1/quarantine/{agent_id}` or the dashboard (a `release_quarantine` MCP tool is a tracked follow-up). The live isolation keeps the agent's existing management connection alive (`ESTABLISHED,RELATED`); a device that fully drops and reconnects while quarantined may need out-of-band release. | `Security:Execute` |
+| 42 | `set_tag` | Set a device tag (structured category or free-form) on `agent_id`. Structured-category keys (`role`/`environment`/`location`/`service`) are case-normalised and validated against their allowed set; a category change fires the agent tag-push. Returns `{set, agent_id, key}` (plus `audit_persisted:false` on a dropped audit row) — a **superset** of REST `PUT /api/v1/tags`'s bare `{set:true}`. **One divergence beyond the response shape:** setting a `service` tag via MCP does **not** auto-materialise the `Service: <value>` management group the REST/dashboard path creates (a tracked follow-up); the tag itself is written identically. Requires the **operator** or **supervised** tier. | `Tag:Write` |
+| 43 | `delete_tag` | Delete a device tag by `agent_id` + `key`. Destructive — **approval-gated** on the operator AND supervised tiers: the first call returns `kApprovalRequired` (-32006) with `approval_id` + `status_url`; after an admin approves, re-call with the `approval_id` argument to execute (one-time; replay rejected). Returns `{deleted, agent_id, key}` (plus `audit_persisted:false` on a dropped audit row) — a **superset** of REST `DELETE /api/v1/tags/{agent_id}/{key}`'s bare `{deleted:true}`; a missing tag is a 404-equivalent (`kInvalidParams`, "tag not found"). | `Tag:Delete` |
+| 44 | `approve_request` | Approve a pending approval request by `approval_id` (optional `comment`, audited). The reviewer is the MCP principal and **cannot be the submitter** (store-enforced), and only a **pending** request can be reviewed — a retry on an already-approved/rejected id returns `kInvalidParams` ("approval already reviewed"), **not** a success (approve is a one-shot state transition, not an idempotent write; treat a retry-after-timeout accordingly). Returns `{approved, approval_id}` (plus `audit_persisted:false` on a dropped audit row). Writes through the same `ApprovalManager::approve()` as the legacy dashboard route `POST /api/approvals/{id}/approve`, but that route's response is `{"status":"approved"}` (an HTMX toast payload) — **NOT** the same wire shape; do not treat the two as interchangeable. Requires the **supervised** tier. | `Approval:Approve` |
+| 45 | `reject_request` | Reject a pending approval request by `approval_id` (optional `comment`). Same reviewer≠submitter + pending-only rules as `approve_request`. Returns `{rejected, approval_id}` (plus `audit_persisted:false` on a dropped audit row). Writes through the same `ApprovalManager::reject()` as the legacy dashboard route `POST /api/approvals/{id}/reject`, but that route returns `{"status":"rejected"}` (an HTMX toast payload) — **NOT** the same wire shape. Requires the **supervised** tier. | `Approval:Approve` |
+| 46 | `quarantine_device` | Isolate a device from the network. **Records** the quarantine (`POST /api/v1/quarantine` parity) **and dispatches** the live quarantine-plugin isolation (`plugin=quarantine`, `action=quarantine`), whitelisting the management server plus any extra IPs in the `whitelist` arg (comma-separated). Destructive — **approval-gated** on the supervised tier (ticket-then-recall). Returns `{command_id, agents_reached, quarantine_record}` (`agents_reached=0` if the agent was offline for the isolation dispatch — the record still persists) (plus `audit_persisted:false` on a dropped audit row). Not an executions-drawer producer. **No MCP release counterpart yet** — to lift a quarantine, use REST `DELETE /api/v1/quarantine/{agent_id}` or the dashboard (a `release_quarantine` MCP tool is a tracked follow-up). The live isolation keeps the agent's existing management connection alive (`ESTABLISHED,RELATED`); a device that fully drops and reconnects while quarantined may need out-of-band release. | `Security:Execute` |
 | 47 | `discover_permissions` | A2 discovery (roadmap Issue 17.1): RBAC permission catalog — every `securable_type` × `operation` pair, plus the full role → allowed-operations grid **for callers holding `UserManagement:Read`**; without it the tool still succeeds and returns the taxonomy with `roles_omitted: true` and a reason (declared, never silent). Mirrors `GET /api/v1/discover/permissions`, same builder function (no drift). | `Infrastructure:Read` (taxonomy); the `roles[]` grid additionally needs `UserManagement:Read` (#2376) |
 | 48 | `discover_instructions` | A2 discovery: published (`enabled_only=true`) `InstructionDefinition` catalog with `parameter_schema` as a nested JSON Schema object. Mirrors `GET /api/v1/discover/instructions`. | `InstructionDefinition:Read` |
 | 49 | `discover_routes` | A2 discovery: REST route catalog, a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves. Carries `source:"openapi"` and a caveat that it is hand-maintained, not generated from the live route table. Mirrors `GET /api/v1/discover/routes`. | `Infrastructure:Read` |
 | 50 | `discover_scope_kinds` | A2 discovery: Scope DSL kinds (`__all__`, `group:<name>`, `from_result_set:<id>`, `ostype`, `hostname`, `arch`, `agent_version`, `tag:<key>`, `props.<key>`), comparison operators, and syntax/examples for building a `scope` expression. Fully static — answers even when every store is down. Mirrors `GET /api/v1/discover/scope-kinds`. | `Infrastructure:Read` |
 | 51 | `discover_plugins` | A2 discovery: plugin/action catalog observed across currently-connected agents. NOT a build-time manifest. Catalog `version: 2`: each action carries an inline `parameter_schema` when it has a published `InstructionDefinition` (matched on plugin+action) **and** the caller holds `InstructionDefinition:Read`; otherwise name+description only (an `Infrastructure:Read`-only caller gets no schemas). A top-level `actions_enriched_with_schema` counts the enriched actions. Mirrors `GET /api/v1/discover/plugins`. | `Infrastructure:Read` |
-| 52 | `assign_engine_role` (PR 4.2) | Grant a fleet-wide RBAC role to an engine principal (arg `principal_id` — the bare slug, WITHOUT the `engine:` prefix — and `role`). Engine principals can never hold `admin`/any built-in system role; such a request is rejected, never silently narrowed. Mirrors `POST /api/v1/engine-principals/{id}/roles`. Not read-only, not destructive (a grant expands, never removes, access). | `Security:Write` |
-| 53 | `unassign_engine_role` (PR 4.2) | Revoke a fleet-wide RBAC role from an engine principal (args `principal_id`, `role`). Destructive — removes standing authority a module may be relying on right now. Mirrors `DELETE /api/v1/engine-principals/{id}/roles/{role}`. | `Security:Write` |
-| 54 | `list_engine_roles` (PR 4.2) | List the fleet-wide roles currently assigned to one engine principal (arg `principal_id`) — the read-only discovery step before assign/unassign, and how to audit what an autonomous module can actually do right now. Mirrors `GET /api/v1/engine-principals/{id}/roles`. | `EnginePrincipal:Read` |
+| 52 | `assign_engine_role` (PR 4.2) | Grant a fleet-wide RBAC role to an engine principal (arg `principal_id` — the bare slug, WITHOUT the `engine:` prefix — and `role`). Engine principals can never hold `admin`/any built-in system role; such a request is rejected, never silently narrowed. Mirrors `POST /api/v1/engine-principals/{id}/roles`. Not read-only, not destructive (a grant expands, never removes, access). Returns `{assigned, principal_id, role}` — `principal_id` in the response carries the `engine:` prefix (unlike the bare-slug input argument); `audit_persisted: false` is present only if the audit write itself failed. | `Security:Write` |
+| 53 | `unassign_engine_role` (PR 4.2) | Revoke a fleet-wide RBAC role from an engine principal (args `principal_id`, `role`). Destructive — removes standing authority a module may be relying on right now. Mirrors `DELETE /api/v1/engine-principals/{id}/roles/{role}`. Returns `{unassigned, principal_id, role}` (same `engine:`-prefix and `audit_persisted` notes as `assign_engine_role`). | `Security:Write` |
+| 54 | `list_engine_roles` (PR 4.2) | List the fleet-wide roles currently assigned to one engine principal (arg `principal_id`) — the read-only discovery step before assign/unassign, and how to audit what an autonomous module can actually do right now. Mirrors `GET /api/v1/engine-principals/{id}/roles`. Returns `{principal_id, count, roles: [{principal_id, role}, ...]}`. | `EnginePrincipal:Read` |
 | 55 | `create_engine_principal` | Create a new engine principal — the durable identity behind an autonomous use-case-engine module (ADR-1005 item 2b). Required args: `principal_id` (**note — unlike REST's `slug` field, this must already be the full `engine:<slug>` id**; the tool does not derive the `engine:` prefix for you, and the store rejects a `principal_id` outside that namespace), `display_name`, `owner_username`, `justification`, and `classification` — all five are checked non-empty at the tool layer (`kInvalidParams` if any is missing/empty), which is **stricter than the REST route**: `POST /api/v1/engine-principals` does not itself require `display_name` non-empty (it accepts and stores an empty one). `owner_username` is FK-validated against the user store; `classification` (`internal`/`external`) is required, no default. Mirrors `POST /api/v1/engine-principals`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 56 | `list_engine_principals` | List engine principals with each principal's active-credential **count** (`active_credentials`, an integer — note the field is named `active_credential_count` on the REST twin). Mirrors `GET /api/v1/engine-principals`. | `EnginePrincipal:Read` |
 | 57 | `get_engine_principal` | Get one engine principal's identity row plus its active-credential **count** (`active_credentials`, an integer). **Transport divergence:** the REST twin `GET /api/v1/engine-principals/{id}` returns a field with the *same name*, `active_credentials`, but as an **array** of full credential objects (token id, name, timestamps, rotation group, overlap-expiry) — a caller switching between the REST and MCP surfaces must not assume the shape carries over; check the type, not just the field name. Mirrors `GET /api/v1/engine-principals/{id}`. | `EnginePrincipal:Read` |
 | 58 | `revoke_engine_principal` | Terminally revoke an engine principal: revokes every active credential first, then flips `lifecycle_state` to revoked. TERMINAL and irreversible — a false-positive response mints a successor principal instead. Mirrors `DELETE /api/v1/engine-principals/{id}`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 59 | `mint_engine_credential` | Mint the FIRST credential for an engine principal (minted credential is hard-locked to MCP tier `readonly`, 90-day ceiling — design doc §7/§8). Returns the raw credential value exactly once; use `rotate_engine_credential` once a credential already exists (a second mint call errors). Mirrors `POST /api/v1/engine-principals/{id}/credentials`. Destructive — live credential issuance; requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 60 | `rotate_engine_credential` | Rotate an engine principal's credential via the overlap-pair workflow (design doc §7): mints a successor (both credentials valid during a default/minimum 7-day overlap, 24h floor — rejected outright, never truncated, below it), auto-revokes the predecessor at window end. BOUNDED-IDEMPOTENT: a re-call within a short grace window after the original mint re-serves the SAME successor secret (each reveal, original or replay, is independently audited as `engine_principal.credential.reveal`); once the grace window lapses a re-call errors. Mirrors `POST /api/v1/engine-principals/{id}/credentials/rotate`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
-| 61 | `confirm_engine_rotation` | Explicit maker-checker confirmation that a rotation's successor secret has been received/installed by its consumer. Distinct from `rotate_engine_credential` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. **Requires the successor `token_id` the rotate call returned** — the confirm is pinned to that exact rotation, and a stale or mismatched id is rejected with no state change (#2384), so a blind retry can never confirm a later rotation. A confirm replayed **after its own rotation resolved** returns a *terminal* already-confirmed/already-resolved conflict (`kInvalidParams`), never a retryable error, so a client honouring `idempotentHint` stops instead of looping (#2404); an exact supervised replay carrying the same consumed `approval_id` is denied even earlier at the approval gate. Mirrors `POST /api/v1/engine-principals/{id}/credentials/confirm`. Requires the `supervised` tier (approval-gated). | `Security:Write` |
+| 61 | `confirm_engine_rotation` | Explicit maker-checker confirmation that a rotation's successor secret has been received/installed by its consumer. Distinct from `rotate_engine_credential` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. **Requires the successor `token_id` the rotate call returned** — the confirm is pinned to that exact rotation, and a stale or mismatched id is rejected with no state change (#2384), so a blind retry can never confirm a later rotation. A confirm replayed **after its own rotation resolved** returns a *terminal* already-confirmed/already-resolved conflict (`kInvalidParams`), never a retryable error, so a client honouring `idempotentHint` stops instead of looping (#2404). The approval gate applies two independent checks before this logic runs (#2443): an exact replay of an already-consumed `approval_id` is denied ("approval already used"); and separately, a never-consumed, still-valid `approval_id` can also be denied if the rotation's state moved on since the ticket was minted — that denial leaves the ticket **unconsumed and recallable**, with a distinct message pointing the caller at `get_engine_principal` for the rotation's current state. Mirrors `POST /api/v1/engine-principals/{id}/credentials/confirm`. Requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 62 | `transfer_engine_principal_owner` | Reassign an engine principal's named responsible owner. Admin-forced — independent of the outgoing owner's cooperation. `new_owner` is FK-validated against the user store. Mirrors `POST /api/v1/engine-principals/{id}/transfer-owner`. Destructive — requires the `supervised` tier (approval-gated). | `Security:Write` |
 | 63 | `audit_engine_no_admin` | Auditor-runnable proof that "no admin, ever" and "no all-permissions toggle" hold for every engine principal — joins `principal_type=engine` against each principal's resolved role assignments AND effective permissions, and reports any violating row (literal admin/system role, or a full securable × operation wildcard grant). A `503`/internal-error result means the RBAC reference data needed to compute the wildcard bound could not be resolved — treat as "unable to verify," never as "clean." Mirrors `GET /api/v1/engine-principals/audit/no-admin` exactly (same checks — the two auditors must never diverge). | `AuditLog:Read` |
 | 64 | `export_access_review` (SOC 2 CC6.2) | Stateless cross-principal grant export — every user/group/engine-principal's **direct** role grants right now, with `effective_permission_count`, last activity, `classification`, `lifecycle_state`, and `source` (provenance). Mirrors `GET /api/v1/access-reviews/export` exactly, JSON only (the REST twin's `?format=csv` has no MCP equivalent — use the REST endpoint directly for a CSV download). Deliberately gated on a **global** `AccessReview:Read`, not a management-group-confined read — a scoped slice would be useless as fleet-wide CC6.2 evidence (#2225). Self-audited as `access_review.exported`. | `AccessReview:Read` |
@@ -470,6 +471,55 @@ for the tool to execute.
 | 67 | `get_access_review` (SOC 2 CC6.2) | Full evidentiary state of one review campaign: metadata plus every frozen attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`. Mirrors `GET /api/v1/access-reviews/{id}`. Self-audited as `access_review.get`. | `AccessReview:Read` |
 | 68 | `list_access_reviews` (SOC 2 CC6.2) | List every review campaign's metadata (**not** its attestations — use `get_access_review` for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence without already knowing a `campaign_id` out-of-band. Mirrors `GET /api/v1/access-reviews`. Self-audited as `access_review.list`. | `AccessReview:Read` |
 | 69 | `close_access_review` (SOC 2 CC6.2) | Close an open review campaign. Does **not** require every attestation to be decided first — a campaign closed with `pending` rows still outstanding is itself evidence (an incomplete review), not something this tool silently forces to completion. Closing is a **one-way lifecycle transition** (there is no reopen path) that permanently freezes every still-`pending` attestation — `destructiveHint:true`. It deletes no evidence (attestation rows are untouched), but the campaign's own `open`→`closed` state is irreversibly transitioned, which is what the hint reflects (corrected from a shipped `destructiveHint:false` — 2g PR 2). Mirrors `POST /api/v1/access-reviews/{id}/close`. Self-audited as `access_review.closed`. | `AccessReview:Attest` |
+| 70 | `rotate_api_token` (P2 #11, SOC 2 CC6.3) | Self-service overlap-pair rotation of a **human-owned** API token: mints a successor token alongside the still-valid predecessor for the overlap window (default 7 days, accepted range 1–3650, floor 24h — arg `overlap_days`, rejected outright — never truncated — below the floor). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call within a short grace window after the original mint re-serves the SAME successor secret (each reveal — original or replay — is independently audited as `api_token.reveal`); past the grace window a re-call errors and the caller falls back to an explicit new token. Self-service ONLY: the caller must own the `token_id` being rotated — no admin override; an unknown `token_id` and a not-owned one are indistinguishable (`kInvalidParams`, "token not found" — not an enumeration oracle). The successor **always** inherits the predecessor's `expires_at` verbatim — not a caller argument. **Wire-shape divergence from the REST twin (deliberate):** REST takes `overlap_secs`, this tool takes `overlap_days` (matching `rotate_engine_credential`'s MCP shape) — bounds are checked BEFORE the `*86400` multiply as an overflow guard. The returned `token_id` is the successor's, resolved via the shared `derive_rotation_successor` helper (`token_rotation_lookup.hpp`) scoped exactly to the predecessor rotated — never "any linked row of this principal", which is unsound once a principal has more than one rotation in flight (this human arm's ceiling is ≤2 active **per rotation group**, unlike the engine arm's ≤2-active-**per-principal**); a lookup miss right after a successful rotate fails CLOSED (retryable error, never a success with an empty `token_id`) rather than risk pairing the real secret with the wrong id. `overlap_expires_at` is the **predecessor's** own stamp (the successor row never carries one). Mirrors `POST /api/v1/tokens/{id}/rotate`. Destructive — requires the `operator` tier (self-service, no approval gate — see the tier note below). | `ApiToken:Rotate` |
+| 71 | `confirm_api_token_rotation` (P2 #11, SOC 2 CC6.3) | Explicit maker-checker confirmation that a rotated API token's successor secret has been received/installed. Distinct from `rotate_api_token` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. `token_id` is the **successor** `token_id` the rotate call returned — the confirm is pinned to that exact rotation, and a stale or mismatched id is rejected with no state change, so a blind retry can never confirm a later rotation. A confirm replayed **after its own rotation resolved** returns a *terminal* already-confirmed/already-resolved conflict (`kInvalidParams`), never a retryable error. Self-service ONLY, same owner-vs-nonexistent posture as `rotate_api_token`. Mirrors `POST /api/v1/tokens/{id}/confirm`. Destructive — requires the `operator` tier. | `ApiToken:Rotate` |
+
+> **`rotate_api_token`/`confirm_api_token_rotation` tier behavior (P2 #11, SOC 2
+> CC6.3) — deliberately NOT the engine-credential arm's answer, and NOT plain
+> `ApiToken:Write` either (round-4 security finding):** both tools map to
+> **`ApiToken:Rotate`**, a DISTINCT RBAC operation from the ordinary
+> `ApiToken:Write` that gates `POST /api/v1/tokens` (create) and its settings
+> twin. `mcp_policy.hpp`'s `tier_allows` carries an explicit `ApiToken:Rotate`
+> allowance for the **`operator`** tier, alongside the existing Tag
+> Write/Delete and Execution/Execute cases — **not** `supervised`-only like
+> the engine credential arm's `Security:Write`. This is a deliberate tier
+> choice, not an oversight: rotation here is self-service —
+> `ApiTokenStore::rotate_token`/`confirm_token_rotation` reject at the STORE
+> layer unless `requesting_user` equals the resolved token row's own
+> `principal_id`, so the caller can only ever touch their own credential, the
+> same "can only touch your own resource" shape as the `operator` tier's
+> existing Tag allowance.
+>
+> **Why a distinct operation, not a securable-wide `ApiToken:Write` allowance
+> (the shape a first fix attempt shipped and a security review caught):**
+> mcp_server.cpp's tools/call dispatch runs a GENERIC tier+approval gate for
+> every tool, keyed on the tool's registered `(securable_type, operation)`
+> pair — it is NOT possible to admit "only these two tools" at the operator
+> tier by widening `ApiToken:Write` itself, because `AuthRoutes::
+> require_permission`/`require_scoped_permission` (`auth_routes.cpp`) consult
+> the SAME `tier_allows()` for every REST route authenticated with an
+> MCP-tiered token. A securable-wide `ApiToken:Write` allowance for
+> `operator` would (and, for one round, did) also admit an operator-tier
+> token to REST `POST /api/v1/tokens` — which lets the caller choose the new
+> token's own `mcp_tier` (including omitting it, minting an untiered,
+> perpetual token) — a privilege escalation, not the self-service allowance
+> intended. `ApiToken:Rotate` is a NEW, separate operation seeded ONLY to
+> `Administrator` and `ApiTokenManager` (same population that already holds
+> `ApiToken:Write` — this taxonomy addition changes no role's RBAC-on access)
+> and mapped ONLY by these two tools' `kToolSecurityRows` entries and the
+> REST rotate/confirm routes' `perm_fn` calls — `ApiToken:Write` itself is
+> completely untouched, so `POST /api/v1/tokens` and its settings twin stay
+> supervised-tier-only. This also gives TRUE REST/MCP parity: an
+> operator-tier token can now reach REST
+> `POST /api/v1/tokens/{id}/rotate`/`/confirm` too.
+>
+> Neither tool is **approval-gated**: `requires_approval()` has no `ApiToken`
+> rule at all (for either operation), so no `kApprovalRequired` ticket-then-
+> recall step applies at any tier — matching the REST twin, which needs no
+> admin approval either (only step-up MFA, enforced on REST alone; the MCP
+> surface has no step-up concept). `requesting_user` is **always**
+> `session->username`, the authenticated MCP principal — never a tool
+> argument.
 
 > **Engine-principal tools — tier behavior (ADR-1005 item 2b, plan PR 4.3):**
 > the six **mutating** tools (`create_engine_principal`, `revoke_engine_principal`,
@@ -962,6 +1012,24 @@ oracle). Sessions are in-memory, so a **server restart** also drops them.
 **Fix**: Re-run `initialize` to mint a fresh `Mcp-Session-Id` and retry. Sessions
 are never required — a client may also simply omit the header and use plain POST.
 
+> **A live session can also end up here — not only via streamed POST.** A
+> `GET` resume presenting `Last-Event-ID` for a frame no longer in the replay
+> ring terminates the session server-side rather than answering with a gap:
+> `-32007` / HTTP 404, `error.message` "Replay window exceeded", audited as
+> `mcp.session.close` with `reason=replay_window_exceeded`. This is ordinary
+> ring eviction, reachable by any GET-channel client that falls behind the
+> ring's own capacity, independent of the streamed-POST flag.
+> `--mcp-enable-streamed-post` (on by default) adds a second, faster way to
+> reach the same state: a session whose client disconnects and retries repeatedly can hit a
+> further streamed call's admission reclaim (see "A pin released to admit a
+> new call" in `docs/mcp-server.md`) — each reclaim releases one undelivered
+> final's eviction exemption, after which ordinary ring eviction can reach it
+> like any other unpinned frame. Either way, the session is gone once this
+> fires, same as the causes above —
+> re-initialize. Nothing about the underlying result is lost: it stays fetchable
+> by `execution_id` (`get_execution_status` / `query_responses`), which is what
+> this error's own remediation already points at.
+
 ### -32008: Origin not allowed (HTTP 403)
 
 **Symptom**: A request carrying an `Origin` header returns `-32008` / HTTP `403`.
@@ -1047,6 +1115,72 @@ second).
 connection, or `DELETE /mcp/v1/` the session), or raise the cap. Do **not** blind-retry
 in a tight loop — the cap is protecting the worker pool that also serves your POSTs.
 
+> **Same code, four more causes (streamed POST, `--mcp-enable-streamed-post`).**
+> A `POST` to `/mcp/v1/` requesting an SSE-capable stream (`_meta.progressToken`
+> plus an SSE-capable `Accept`) can also return `-32012` / HTTP `429`, with
+> `retry_after_ms` fixed at 30s — longer than the GET-channel figure above,
+> since none of these causes is likely to clear within a second or two.
+> `error.data` carries no machine-readable cause label, only `remediation`
+> text — read it in full, since more than one cause can share the same
+> `error.message`. Two checkpoints, in order:
+>
+> **Checked before the call is even accepted** (`error.message`: "Concurrent
+> stream cap reached"; no record is created, so nothing to clean up):
+>
+> - the shared `--max-sse-streams` budget — every streaming surface on this
+>   server draws from one pool (MCP GET, MCP streamed POST, `/api/v1/events`,
+>   dashboard, legacy `/events`) — is exhausted. Remediation: retry shortly, or
+>   resend the same request without an SSE-capable `Accept` for a plain
+>   (non-streamed) response.
+> - this principal's own streamed-POST allowance, summed across every session
+>   that principal holds open, is exhausted. This is a **fixed 4 concurrent
+>   calls per principal** — numerically the same as, but counted and enforced
+>   separately from, any single session's own replay-ring pin-slot count (the
+>   next checkpoint below) — and it is **not** governed by
+>   `--mcp-max-streams-per-principal`. That flag affects only the GET channel;
+>   the two are separate steady-state allowances that happen to sum to
+>   `--mcp-max-streams-per-principal + 4` — not one combined pool of that
+>   size. During a GET-channel reconnect (a new GET superseding an old one
+>   on the same session), that sum can be transiently exceeded: a stream
+>   mid-handover counts twice against the GET-channel allowance — the
+>   superseded connection until it finishes draining, and the replacement
+>   once admitted. `McpStreamState` bounds this to at most one pending
+>   handover **per session**, not per principal — a principal holding its
+>   full `--mcp-max-streams-per-principal` GET sessions could in the worst
+>   case have every one of them mid-handover at once, so the GET-channel
+>   component of the aggregate can transiently reach twice
+>   `--mcp-max-streams-per-principal`, not just one extra. Remediation: wait for one of your streamed calls to finish, or resend
+>   the same request without an SSE-capable `Accept` for a plain
+>   (non-streamed) response.
+>
+> **Checked during admission itself, after that budget was already available**
+> (`error.message`: "Streamed request capacity reached"):
+>
+> - a server-wide ceiling on the total count of progress-tracked calls the
+>   server is still holding open (executing, or finished with results not
+>   yet delivered; streamed or not, across every session and principal) is
+>   full. This is an internal capacity limit, not adjustable by any flag.
+>   Remediation: retry shortly, or resend without an SSE-capable `Accept`.
+> - this session's own streamed-call slots are full — some held by results
+>   that have not reached a client yet, some by calls still executing with
+>   no result yet at all, or both. Admission first tries to reclaim a slot
+>   from an undelivered final before refusing — see "A pin released to
+>   admit a new call" in `docs/mcp-server.md` — so reaching this refusal
+>   means either no undelivered final existed to reclaim, or one did and
+>   couldn't be taken. The `remediation` text distinguishes two states:
+>   - if slots are held by results still being written, retry — a result
+>     still being written frees its slot as it lands. If this persists across
+>     several retries, resume the `GET` channel with `Last-Event-ID` set to
+>     one below the lowest id you still need — replay starts strictly above
+>     the cursor, and the cursor releases every pinned final at or below it on
+>     this session. A gap on that resume, or having no cursor to send, means
+>     re-initializing for a fresh session and fetching results by
+>     `execution_id` (see `-32007` above for what a gap on this session's own
+>     reclaimed results looks like);
+>   - if slots are held by calls genuinely still in flight (not a stuck slot,
+>     just the concurrency limit), the remediation is simply to wait for one
+>     to finish.
+
 ### -32014: Streamed result no longer buffered
 
 **Symptom**: On a `GET`-stream resume you receive a JSON-RPC error frame with code
@@ -1058,11 +1192,11 @@ before it could be delivered on the stream (the buffered-result population hit i
 The real result was never lost - only its *streamed* copy was dropped.
 
 **Fix**: Fetch the result durably with the `execution_id` this very frame carries (`get_execution_status` / `query_responses`). Do NOT re-resume the GET channel: this error IS the answer to a resume, and per the Cause above only the *streamed* copy was dropped - re-attaching cannot conjure a final the server already force-expired. (GET + `Last-Event-ID` resume is the right first move for a *different* case — a stream that died before any frame reached you, so you never learned an `execution_id` at all.)
-The parked-result path this arises from is reachable only under
-`--mcp-enable-streamed-post`, which ships off; with it on, it activates whenever a
+The parked-result path this arises from is reachable whenever
+`--mcp-enable-streamed-post` is on, which is the default: it activates whenever a
 streamed POST is parked without having delivered its final (the client
 disconnected, the response cap elapsed, or the server could not complete the
-stream).
+stream). Pass `--no-mcp-streamed-post` to rule this path out entirely.
 
 ### A streamed final can be dropped entirely
 
@@ -1082,7 +1216,7 @@ supported recovery path for every streamed-result failure mode on this surface, 
 this one.
 
 Like the `-32014` case above, this arises from the parked-result path, which is
-reachable only under `--mcp-enable-streamed-post`: a streamed POST parked before
+reachable whenever `--mcp-enable-streamed-post` is on (the default): a streamed POST parked before
 delivering its final leaves the terminal to be collected by a `GET` resume or
 fetched durably by `execution_id`.
 
@@ -1159,6 +1293,15 @@ replay — which is exactly what this response refuses to make, and `/metrics`
 is not a stronger reader than the caller — so alert on the refusal rate and
 read the audit trail for the kind.
 
+If a store fault happens to coincide with this exact check — the recall's
+lookup step, or the consume step's own cross-surface origin comparison — a
+foreign-origin ticket cannot be told apart from an innocent one for the
+duration of the fault, and the refusal comes back as `-32603` (below), not
+this `-32003`. `yuzu_mcp_approval_masked_denials_total` counts those refusals
+specifically, and the audit row carries a `(lookup)` or `(origin unverified)`
+suffix, so the event is not silently indistinguishable from ordinary store
+contention.
+
 **Fix**: For an RBAC denial — grant the permission to the token creator's
 principal, or use an account with the required permissions. For a ticket recall —
 submit the call **without** `approval_id` to obtain a fresh approval ticket, then
@@ -1184,16 +1327,16 @@ ticket's remaining window ends with it expired like any other.
 **Fix**: Check `retry_after_ms` in the response body — two distinct bodies
 share this code:
 
-- **`retry_after_ms` is a number (currently 5000)**: the store is open but the
-  read or write failed, most likely transiently. Retry after the hint.
-  Retrying indefinitely is not safe, and this body alone cannot tell you when
-  to stop: a store that is open but failing permanently (corruption,
-  read-only, disk full) still takes this arm and will honour a client that
-  retries forever. Bound your own retries — a handful of attempts, then
-  escalate to an operator. Distinguishing that case from a genuinely
-  transient one is a follow-up change.
-- **`retry_after_ms` is `null`**: the store never opened. This will not clear
-  on retry; escalate to an operator immediately.
+- **`retry_after_ms` is a number (currently 5000)**: the store is open and the
+  read or write failure is classified transient — retry after the hint.
+  Retrying indefinitely is still not unconditionally safe (an operator-side
+  escalation is always a reasonable backstop), but this body no longer
+  conflates "failing right now" with "failing permanently": a store that is
+  open but failing in a way an unchanged retry cannot clear (corruption,
+  not-a-database, read-only, disk full) takes the other arm below instead.
+- **`retry_after_ms` is `null`**: either the store never opened, or it is open
+  but failing permanently (corruption, not-a-database, read-only, disk full).
+  Neither will clear on retry; escalate to an operator immediately.
 
 Do **not** re-submit without `approval_id` while the approval
 window is still open: the ticket was not consumed, and minting a fresh one asks

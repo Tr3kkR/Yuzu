@@ -103,10 +103,24 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   `engine_principal.credential.reveal`.
 - If the consuming module updates the secret and you never call `confirm`
   (next step), a **60-second background sweep** auto-revokes the predecessor
-  once the overlap window elapses on its own, and separately warns
-  (an operational signal, not a security alert) if the *successor* looks
-  unused as its own window nears expiry — a sign the new secret was never
-  actually picked up.
+  once the overlap window elapses on its own — **unless the successor was
+  never presented at all**, in which case the sweep deliberately leaves BOTH
+  credentials active rather than revoke your only working credential out
+  from under you (a dropped rotate response, or simply never picking up the
+  new secret, must not end in zero usable credentials). The sweep separately
+  warns (an operational signal, not a security alert) whenever the
+  *successor* looks unused — once as its own window nears expiry, and once
+  more on crossing into the elapsed state if it is still unused (that row
+  and its metric fire once per pair per state, process-local — a restart
+  re-emits once; the underlying log line, by contrast, repeats every tick
+  once elapsed) — a sign the new secret was never actually picked up; once
+  that warning has fired for the elapsed state, do not assume the sweep will
+  eventually clean it up (it will not — see the "never presented" case
+  above) — either confirm once the successor genuinely is in use, or revoke
+  the *specific* credential you no longer trust via
+  `DELETE /api/v1/tokens/{token_id}` (never
+  `DELETE /api/v1/engine-principals/{id}` — see step 4's callout below for
+  why).
 
 ### 4. Confirm the rotation (optional but recommended)
 
@@ -127,6 +141,35 @@ rotate call returned 200." The required `token_id` is the successor id the
 rotate response returned: it pins the confirm to that exact rotation, so a
 blind retry of an old confirm can never resolve a **later** rotation early
 (a stale or mismatched id gets a `409` and changes nothing).
+
+`confirm`'s check that you're the same operator who called `rotate` is
+stored durably, not just in memory, so a server restart no longer blocks
+confirming an in-flight rotation. The one exception: a rotation already in
+flight *before* this durability guarantee was deployed has no durable
+record of who initiated it, and a restart still leaves it permanently
+unconfirmable (fails closed rather than accepting just anyone) — confirm
+before restarting during an upgrade if you can.
+
+**If you can't, do nothing — the 60-second background sweep (step 3) still
+resolves the pair on its own, `confirm` or no `confirm`.** Once the
+successor has been presented, the sweep auto-revokes the predecessor at the
+overlap window's end exactly as if you had confirmed; if the successor was
+never presented, the sweep deliberately leaves **both** credentials active
+rather than revoke your only working one. Neither outcome ends at zero
+usable credentials — what's lost by skipping `confirm` here is the
+attestation record, not access.
+
+**Do not run `DELETE /api/v1/engine-principals/{id}`** ("Revoke (terminal)",
+step 6 below) to resolve an unconfirmable pair — that revokes *both* active
+credentials and permanently flips the principal itself to `revoked`,
+destroying the working credential along with the one you meant to discard.
+There is no per-credential revoke among the engine-principal routes above.
+If you must resolve the pair by hand rather than wait for the sweep, revoke
+the *specific* credential you no longer trust instead: an engine credential
+is an ordinary API token row, so `DELETE /api/v1/tokens/{token_id}` (an
+admin caller may revoke any token, not just one they created — see
+`docs/user-manual/rest-api.md` "`DELETE /api/v1/tokens/{token_id}`") works
+on it, then rotate again once you're down to one active credential.
 
 If you replay a `confirm` **after it already succeeded** — a dropped `200`, a
 double-submit, or a client racing the auto-revoke sweep — you get a *terminal*

@@ -423,8 +423,12 @@ TEST_CASE("bridge parked terminal - one pinned final, result_base merged, final 
           "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
+    // #2712: base now carries structuredContent too (as real execute_instruction
+    // responses do since batch 3) - the merge below must preserve it untouched
+    // alongside the top-level additions, not just the legacy content array.
     const std::string base =
-        R"({"content":[{"type":"text","text":"{\"execution_id\":\"exec-p\"}"}]})";
+        R"({"content":[{"type":"text","text":"{\"execution_id\":\"exec-p\"}"}],)"
+        R"("structuredContent":{"execution_id":"exec-p"}})";
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(9), json("tok"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(9), "exec-p"));
     REQUIRE(fx.bridge->arm(s.id, json(9), Bridge::ArmMode::kStreaming, base) ==
@@ -447,6 +451,13 @@ TEST_CASE("bridge parked terminal - one pinned final, result_base merged, final 
     CHECK(fin["result"]["agents_success"] == 3);
     CHECK(fin["result"]["agents_failure"] == 0);
     CHECK_FALSE(fin["result"]["content"][0].contains("status"));
+    // #2712: structuredContent is a THIRD top-level result sibling (alongside
+    // content and the status/agents_* additions) that must survive the merge
+    // completely unchanged - a deliberate, pinned decision (mcp_server.cpp's
+    // execute_instruction handler comment), not an accident of construction
+    // order.
+    REQUIRE(fin["result"].contains("structuredContent"));
+    CHECK(fin["result"]["structuredContent"] == json{{"execution_id", "exec-p"}});
 
     // A7: post-terminal progress (a real publisher sequence) is dropped.
     const auto frames_before = frames.size();
@@ -4333,6 +4344,7 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
             double raced{};
             double failed{};
             double displaced{};
+            double ring_displaced{};
             std::size_t audits{};
             std::size_t still_pinned{};
         };
@@ -4365,6 +4377,22 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         out.failed = fx.reg.counter("yuzu_mcp_bridge_pin_release_failed_total").value();
         out.displaced =
             fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+        // The pin-slot array's own LRU-displacement counter (mcp_stream.cpp,
+        // kMetricPinDisplaced) - a distinct metric from the bridge-level
+        // admission-reclaim one above, and NOT the replay ring's own frame-
+        // eviction counter (kMetricRingEvictions /
+        // yuzu_mcp_stream_replay_ring_evictions_total) despite the "ring"-
+        // adjacent name: this one only strips a pinned terminal's eviction
+        // EXEMPTION, it never evicts a frame from the ring itself. This
+        // residual's admission-time reclaim never touches it: selecting and
+        // releasing a pin for the ADMISSION side is a separate code path from
+        // publish()'s pin-slot-full LRU branch, which is what actually
+        // increments this counter (#2795's acceptance criteria named this
+        // assertion explicitly). Not a claim that this branch can never fire
+        // from a LATER event on this same session (docs/mcp-server.md's
+        // "Terminal durability" prose says it can) - only that THIS reclaim,
+        // here, does not reach it.
+        out.ring_displaced = fx.reg.counter("yuzu_mcp_stream_pin_displaced_total").value();
         out.audits = fx.audit_count("mcp.bridge.pin_displaced_for_admission");
         // POSITIVELY confirm the over-admission rather than inferring it from the absence
         // of the displaced counter: the pin the reclaim selected is still HELD, so the
@@ -4383,6 +4411,7 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         // Not credited as a displacement, and not audited: no exemption was released by
         // us, so attributing that loss to the admitting principal would be a false record.
         CHECK(out.displaced == 0.0);
+        CHECK(out.ring_displaced == 0.0);  // the pin-slot LRU displacement never fires either
         CHECK(out.audits == 0);
         CHECK(out.still_pinned == 4);  // the pin was NOT released - the session is over cap
     }
@@ -4393,6 +4422,7 @@ TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts s
         CHECK(out.failed == 1.0);
         CHECK(out.raced == 0.0);  // the two arms are distinct, not aliases
         CHECK(out.displaced == 0.0);
+        CHECK(out.ring_displaced == 0.0);
         CHECK(out.audits == 0);
         CHECK(out.still_pinned == 4);  // the pin was NOT released - the session is over cap
     }

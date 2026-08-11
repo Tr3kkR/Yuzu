@@ -21,12 +21,35 @@ namespace yuzu::agent {
 /// rollup reader MUST key on this exact string.
 inline constexpr char kGuardianUnhealthySuppressedTag[] = "yuzu.guardian_unhealthy_suppressed";
 
+/// M1 item (a): guard.unhealthy re-emissions for a rule still stuck Unknown, sent at
+/// errored_refresh_ms cadence so a lost/coalesced edge cannot leave the server's errored
+/// view stale forever. Sibling to kGuardianUnhealthySuppressedTag above - together they
+/// partition every committed repeat-Unknown into "put on the wire" vs "not this tick".
+inline constexpr char kGuardianUnhealthyRefreshedTag[] = "yuzu.guardian_unhealthy_refreshed";
+
+/// M1 item (b): rule_ids demoted off the 5s convergence priority lane to their normal
+/// type-lane cadence (pending_demote_sweeps / pending_demote_ms) - the read-flood guard.
+inline constexpr char kGuardianPriorityDemotedTag[] = "yuzu.guardian_priority_demoted";
+
+/// M1 health-stream telemetry (F5: widened from a single scalar to a stats struct, mirroring
+/// GuardianJournalStats in guardian_journal_heartbeat.hpp, now that there are three sibling
+/// counters instead of one).
+struct GuardianHealthStats {
+    std::uint64_t unhealthy_suppressed{0};
+    std::uint64_t unhealthy_refreshed{0};
+    std::uint64_t priority_demoted{0};
+};
+
 /// Populate `tags` with the (sparse) Guardian health telemetry. `TagMap` is any map with a
 /// string `operator[]` - the protobuf status_tags map in production, std::map in tests.
 template <typename TagMap>
-void emit_guardian_health_heartbeat_tags(TagMap& tags, std::uint64_t unhealthy_suppressed) {
-    if (unhealthy_suppressed != 0)
-        tags[kGuardianUnhealthySuppressedTag] = std::to_string(unhealthy_suppressed);
+void emit_guardian_health_heartbeat_tags(TagMap& tags, const GuardianHealthStats& s) {
+    if (s.unhealthy_suppressed != 0)
+        tags[kGuardianUnhealthySuppressedTag] = std::to_string(s.unhealthy_suppressed);
+    if (s.unhealthy_refreshed != 0)
+        tags[kGuardianUnhealthyRefreshedTag] = std::to_string(s.unhealthy_refreshed);
+    if (s.priority_demoted != 0)
+        tags[kGuardianPriorityDemotedTag] = std::to_string(s.priority_demoted);
 }
 
 } // namespace yuzu::agent

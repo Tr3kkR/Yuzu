@@ -88,6 +88,12 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## Behaviour change: MCP approval-store permanent failures now say don't retry (#2786)
+
+An MCP approval-ticket recall that hits a store fault has always returned `-32603` with a `retry_after_ms` hint. Previously that hint was `5000` (retry after 5 seconds) for every store fault except a never-opened store, including one that was open but failing in a way no amount of retrying clears — SQLite corruption, not-a-database, a read-only filesystem, or a full disk. Those four cases now correctly get `retry_after_ms: null` (the same "escalate to an operator" response a never-opened store gets) instead of the transient retry hint.
+
+**What to do:** if you have automation that blindly retries on `-32603` without checking `retry_after_ms`, it now stops retrying sooner in this specific case — which is the correct behavior (the old retries were futile). If your automation already honors `retry_after_ms` per [invariant A5](../agentic-first-principle.md), no change is needed. See [`mcp.md`](mcp.md) "`-32603`: Approval store unavailable" for the full response-body reference.
+
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 
 Audit rows for the MCP progress bridge (`mcp.bridge.done_reap`, `session_dead`, `arming_reaped`, `pin_acked`, `forced_expire`) were previously stamped `result=success` unconditionally, regardless of what actually happened. They now report the real outcome: `result=failure` when a background teardown could not release one of the resources it owns, or when the terminal-frame publish ladder poisoned the session, threw, or was never reached. The `detail` field names which, and no longer asserts a delivery or a poisoning that did not occur.
@@ -1412,23 +1418,33 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
-- **`YuzuAuditRetentionNotRunning` now fires for a crash-looping server (#2553).**
-  Its young-server grace previously keyed on uptime alone, so a process restarting
-  more often than the 3-hour alert window never accumulated enough uptime to leave
-  the grace and was excused on every evaluation - silently, and for one of the
-  leading causes of the exact condition the rule detects. The grace now also
-  requires the uptime series to have at most one reset across the window. **If you
-  deployed this rule and have a crash-looping server, expect a new-to-you firing**
-  that reflects a pre-existing condition rather than a new fault. The rules file is
-  a copy you apply yourself; the server does not upgrade it for you. One limit is
-  worth knowing before you rely on the fix: `resets()` needs a continuous series per
-  server, so if a restart changes the `instance` label (dynamic-port or IP-based
-  service discovery, a rescheduled pod) the grace still applies forever and the rule
-  stays silent - target a stable identity in scrape config. The same re-apply also
-  removes an `on(instance)` join from that rule, so a server that was being
-  silenced by an unrelated young series sharing its `instance` value (a canary, an
-  HA pair, a federated series) can now correctly fire too - the same
-  new-to-you-firing shape as the crash-loop fix, for the same reason.
+- **`YuzuAuditRetentionNotRunning` now fires for a crash-looping server
+  (#2553, redesigned by #2854 rung D), and there is a new
+  `YuzuAuditRetentionNeverRan` alert to route.** The old rule's young-server
+  grace keyed on uptime, so a process restarting more often than the 3-hour
+  alert window never accumulated enough uptime to leave the grace and was
+  excused on every evaluation - silently, and for one of the leading causes of
+  the exact condition the rule detects. The grace is now the restart-surviving
+  last-pass stamp (`yuzu_server_audit_retention_last_pass_unixtime`, seeded
+  from the durable anchor at startup): the rule excuses only a database no
+  retention pass has EVER run against, fires at every restart cadence on an
+  anchored one, and stays firing while the reaper stays dead. The excused
+  never-ran state gets its own alert, `YuzuAuditRetentionNeverRan` (stamp
+  still `0` after 3 hours) - **a new alertname: give it an Alertmanager route**.
+  **If you re-apply this rules file and have a crash-looping server, expect a
+  new-to-you firing** that reflects a pre-existing condition rather than a new
+  fault - including on crash loops faster than the 60-minute first-pass sleep,
+  a true positive the old grace hid. The rules file is a copy you apply
+  yourself; the server does not upgrade it for you, and a stack that does not
+  re-apply it keeps the old blind rule and never gains the new alert. In a
+  staged rollout apply SERVERS first, rules second: an old, not-yet-upgraded
+  server restarting under the new rules reads a `0` stamp even on an anchored
+  database and pages `YuzuAuditRetentionNeverRan` with a fresh-install story
+  that is false for it (see the runbook's rollout note). The same
+  re-apply also removes an `on(instance)` join from the liveness rule, so a
+  server that was being silenced by an unrelated series sharing its `instance`
+  value (a canary, an HA pair, a federated series) can now correctly fire too -
+  the same new-to-you-firing shape as the crash-loop fix, for the same reason.
 - **You must ADD a new rule by hand: `YuzuAuditRetentionMetricMissing` (#2553).**
   `YuzuAuditRetentionNotRunning` cannot detect its own input going missing -
   `increase()` over a metric with no series is an empty vector, so the rule selects

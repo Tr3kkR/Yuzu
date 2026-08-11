@@ -73,13 +73,26 @@
 /// THIS change, not a claim those routes are safe unmeasured forever.
 ///
 /// KNOWN LIMITATION, recorded deliberately, not implied away: because of the
-/// default above, a chunked or Content-Length-less body is NOT refused on
-/// any class but `/mcp/` — it falls through this entire gate uncapped to
-/// httplib's own 100 MiB backstop. A comment or doc that says chunked bodies
-/// are "refused" without naming `/mcp/` as the sole exception is wrong. This
-/// is a recorded adjudication, not an oversight — see the paragraph above
-/// for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
+/// default above, a chunked or Content-Length-less body is NOT refused BEFORE
+/// BEING READ on any class but `/mcp/` — this table's pre-routing chokepoint
+/// admits it, up to httplib's own 100 MiB backstop, without checking this
+/// table's cap at all. A comment or doc that says chunked bodies are
+/// "refused" without naming `/mcp/` as the sole PRE-READ exception is wrong.
+/// This is a recorded adjudication, not an oversight — see the paragraph
+/// above for why — kept in sync with `docs/user-manual/rest-api.md` "Pre-Auth
 /// Request Body Caps".
+///
+/// That gap is narrower than it once was: `server.cpp`'s `set_pre_request_
+/// handler` (body-cap-post-read-stage) is a SECOND chokepoint, driven by the
+/// SAME `resolve_body_cap` table, that runs after httplib has read the body
+/// into `req.body` but before the route handler runs — so a chunked body
+/// that turns out to be over this table's cap is still refused, just after
+/// being buffered rather than before. It closes "reaches a handler
+/// uncapped", not "gets buffered uncapped" — see that handler's own doc
+/// comment for what it does and does not cover (notably: it cannot see a
+/// multipart request's body at all, since httplib never copies multipart
+/// content into `req.body`).
+///
 ///
 /// ROUTED-CONCERN ROW: `.claude/routed-concerns-access-control.md`, which
 /// routes any change to this table or to `server.cpp`'s pre-routing cap

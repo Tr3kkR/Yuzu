@@ -234,6 +234,21 @@ Every request is checked against a per-route body-size cap **before authenticati
 
 All three responses use the standard [A4 error envelope](#json-envelope) with a `remediation` hint (no `permission` field — the request is rejected before any principal is resolved) — **except the `scim` class**, which publishes SCIM's own RFC 7644 §3.12 error shape (`schemas`/`status`/`detail`) on `application/scim+json` instead of the generic envelope (`scim::error()`, `scim_json.hpp:192`; wired into all three status codes above in `server.cpp`'s pre-routing handler). This gate is separate from, and runs *before*, any route-local body check a handler may also carry (e.g. the SCIM/response-template 64 KiB checks below) — those still exist for defense-in-depth if a future edit widens this table's entry, but on the current table this pre-routing gate rejects first. **This is not purely a timing change for every affected class.** For most (response templates, CA import), an earlier rejection at the same byte count is the entire effect. SCIM is **no longer** an exception to that either (fixed as part of this change, D7): the pre-routing rejection's SCIM shape matches the wording of the handler's own (now-superseded, and unreachable — the pre-routing cap and the handler check the identical 64 KiB threshold, so the pre-routing gate always wins first) `413` check exactly, and extends the same shape to the `411`/`415` cases the handler-level check never covered.
 
+### Post-Read Backstop (#2407)
+
+The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 24 of 25 classes below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
+
+A second stage, wired at httplib's `Server::set_pre_request_handler` in `server.cpp`, closes that gap from the other side. It runs inside httplib's `dispatch_request` — **after** `read_content` has consumed the body off the socket into `req.body`, and after the route has matched, but **before the route's own handler runs**. At that point the body's actual size is known, so this stage resolves the SAME `kBodyCapTable`/`resolve_body_cap` the pre-routing gate uses (no forked table) and, if the now-fully-read body is over the class's cap, refuses with the same `413` A4/SCIM envelope shape and the same 1-in-100 per-reason log throttle as the pre-routing gate (tagged `[#2407 post-read]` in the journal rather than `[#2407]`). The rejection reason is a new value, `over_cap_post_read`, on `yuzu_body_cap_rejected_total{path_class,reason}` — pre-seeded at 0 for every class, unconditionally, unlike `unmeasurable`; see `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for the full description.
+
+**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 24-of-25-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
+
+**The two stages are mutually exclusive per request, not stacked.** httplib's `routing()` returns as soon as the pre-routing handler answers Handled, so it never calls `dispatch_request` for a request that gate already refused — a **measurable** over-cap body (a declared `Content-Length` above the cap) is still rejected by the pre-routing gate, before anything is buffered, exactly as before this stage existed. Do not describe this as "the cap now runs twice" — in practice `over_cap_post_read` fires almost exclusively for the chunked/unmeasurable case the pre-routing gate deliberately admits.
+
+**Limitations — read before relying on this as complete coverage:**
+
+- **Multipart is not covered.** httplib only appends to `req.body` on the non-multipart branch of `read_content` (`httplib.h:11002` swaps the receiver for the multipart parser once it detects a multipart body) — so `req.body.size()` reads 0 for ANY multipart request, regardless of the real bytes read off the wire. **No multipart class is covered** — stated as a rule rather than a list, because an earlier draft of this text enumerated a single class and was wrong: `/api/settings/updates/upload` (`ota_upload`) and `/api/settings/cert-upload` (no table entry, so the 4 MiB default) are multipart too. Their chunked-body gap is **not** closed by this stage. This is not a regression introduced here — it is exactly as exposed as it was before this stage existed — but do not read the post-read stage as having closed coverage for every class.
+- **The stage only runs when a route matched.** `set_pre_request_handler` is invoked from httplib's `dispatch_request`, which only runs once routing has matched a route — a request to a path that 404s never reaches this handler at all. It is a backstop behind the pre-routing gate for matched routes, not a second universal pre-auth gate.
+
 **Why not one global cap?** httplib's own `Server::set_payload_max_length` is a single server-wide knob shared by every route on the same listener, including the ~70 MiB live-query bundle route and the OTA agent-binary upload — a single small value would break those outright, and a single large value (httplib's 100 MiB default) leaves every small JSON/form route able to buffer up to 100 MiB from an unauthenticated caller. The table below exists so each route class gets a cap sized to what it actually needs.
 
 ### Per-class caps
@@ -726,6 +741,8 @@ List the current user's API tokens. Raw token values are never returned.
 }
 ```
 
+**Rotation fields (P2 #11):** `rotation_group`, `supersedes_token_id`, `overlap_expires_at`, and `confirmed_at` appear on an item **only** while a rotation is (or was) in flight for that token — a token that has never been rotated omits all four. `rotation_group` is present on **both** the predecessor and the successor row of an in-flight pair (it links them); `supersedes_token_id` is present only on the successor and equals the predecessor's `token_id`; `overlap_expires_at` is present on the predecessor while the overlap window is open (the epoch it is auto-revoked); `confirmed_at` is present once an explicit `credentials/confirm`-style confirmation (below) has closed the rotation. A caller that only checks for the absence of these fields on a fresh token needs no code change — they were not serialized before P2 #11 either.
+
 ---
 
 #### `POST /api/v1/tokens`
@@ -806,6 +823,88 @@ The same ownership constraint applies to the HTMX dashboard path `DELETE /api/se
   "meta": { "api_version": "v1" }
 }
 ```
+
+---
+
+#### `POST /api/v1/tokens/{token_id}/rotate`
+
+Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3): mints a successor token while the existing (predecessor) token stays valid for an overlap window — at most **two** active tokens in the rotation group during the overlap. `{token_id}` in the path is the **predecessor's** id. The raw successor secret is returned exactly once per reveal (see the grace-window re-serve note below), the same discipline the engine-principal `credentials/rotate` route above uses. MFA step-up runs on **every** call to this route, including an idempotent re-serve.
+
+**Permission:** `ApiToken:Rotate` — a DISTINCT operation from `ApiToken:Write` (round-4 security finding): `ApiToken:Write` also gates `POST /api/v1/tokens` (mint) and its settings twin, so a shared op would let an operator-tier MCP token mint a brand-new, caller-chosen-tier token — a privilege escalation, not a parity fix. See `mcp_policy.hpp`'s `tier_allows()` operator-tier comment for the full analysis.
+
+**Ownership constraint — self-service only, no admin bypass:** unlike `DELETE /api/v1/tokens/{token_id}` above, there is **no** admin override here. A human token's raw successor secret authenticates *as that user*, so an admin rotating or confirming someone else's token would hand out (or complete the cutover of) a credential that impersonates them — identity takeover, not a permission gap an admin role could legitimately cross. An admin who needs to act on another user's token still has `DELETE` (revoke). Attempting to rotate a token you do not own returns `404 token not found` — identical to the response for a token that does not exist, closing the same enumeration-oracle gap the DELETE route closes. Denied attempts are recorded in the audit log with `action=api_token.rotate`, `result=denied`, and `detail=owner=<real owner>`.
+
+**Request body (optional):**
+
+```json
+{ "overlap_secs": 604800 }
+```
+
+`overlap_secs` defaults to 7 days (`604800`), with the same 24-hour floor / 10-year ceiling as the engine-principal rotate route — a value outside that range is rejected (`400`), never silently clamped.
+
+**Lifetime-neutral by design (SOC 2 CC6.3):** the successor token **always inherits the predecessor's `expires_at` verbatim** — a perpetual (never-expiring) token stays perpetual, a 30-day token stays a 30-day token measured from its *own* original grant, never recomputed as "90 days from now". There is **no request field** to override this; the store-level `successor_expires_at` override that exists internally for the engine-principal arm is deliberately not exposed on this route. Rotating a credential must never silently extend its authorization lifetime — an auditor reviewing rotation evidence for CC6.3 must be able to trust that rotation and grant renewal are two separate, independently-audited actions, never one fused into the other. A caller that genuinely needs a longer-lived replacement token should mint a fresh one via `POST /api/v1/tokens` instead.
+
+**Response:** same `Cache-Control: no-store, no-cache, must-revalidate` + `Pragma: no-cache` headers as `POST /api/v1/tokens`, since the body carries a raw one-time secret.
+
+```json
+{
+  "data": {
+    "token": "yzt_...",
+    "token_id": "...",
+    "expires_at": 1742385600,
+    "overlap_expires_at": 1710936000
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`token_id` and `expires_at` describe the **successor**, found structurally — the active row whose `supersedes_token_id` equals `{token_id}` (the predecessor being rotated), never merely "any linked row of this principal's active set" and never by "most recently created" (which is second-resolution and can tie). A human principal routinely holds several unrelated tokens with independent in-flight rotations, so the match must be scoped to the exact predecessor in the path — a broader match can return a *different* rotation's successor.
+
+`overlap_expires_at`, by contrast, describes the **predecessor** — consistent with the `GET /api/v1/tokens` field of the same name above (§"Rotation fields"): it is stamped on the predecessor row, not the successor, and is echoed here purely for the caller's convenience (the epoch at which the predecessor this call just rotated is auto-revoked). There is no separate `overlap_expires_at` on the successor row itself; do not expect one from `GET /api/v1/tokens` until the successor is itself rotated in turn.
+
+**Success audit:** `action=api_token.reveal` — the reveal itself is the success event, mirroring the engine-principal route's `engine_principal.credential.reveal`; a grace-window re-serve gets its own row too, since every time the raw secret leaves the server is independently on the audit chain.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| No such token, or the token exists but is not owned by the caller | `404` — `token not found` (identical body; not an enumeration oracle) |
+| The token exists and IS owned by the caller, but the caller's OWN current `mcp_tier`/`scope_service` (from their authenticated session) does not equal the token's own (the authority-inheritance guard) — includes an untiered dashboard/cookie session attempting to rotate its owner's MCP-tiered or service-scoped token | `400` — `no such token to rotate` (store-level; distinct from the route's own `404` pre-check above, and worded identically to the absent/not-owned case on purpose, so this is not an authority-probing oracle either — see [Rotating a Token](authentication.md#rotating-a-token) for the operator-facing explanation) |
+| `overlap_secs` present in the body but not an integer (e.g. a string) | `400` — `overlap_secs must be an integer (seconds)` |
+| Overlap window below the 24h floor, or above the 10-year ceiling | `400` |
+| Overlap window would outlive the predecessor's or the successor's own expiry | `400` |
+| The token is not a human-owned credential (an engine-principal credential somehow reached this route) | `400` — `token is not a human-owned credential` |
+| The token is revoked or already expired | `400` — `credential is not currently active — nothing to rotate` |
+| Two active tokens in the rotation group exist but are not a recognized predecessor/successor pair | `400` — resolve via revoke, not rotate |
+| More than two active tokens in the rotation group | `400` — resolve manually before rotating |
+| A rotation already in flight, initiated by a **different** operator | `409` |
+| Grace window elapsed with no confirm | `409` — `grace window elapsed; confirm or revoke` |
+| No active credential found to rotate | `503` — deliberately conflated with a transient read failure, same rationale as the engine-principal rotate route above |
+| The rotation itself succeeded (a successor token now exists) but the follow-up read that locates it for the response came back empty | `503` — fails CLOSED rather than return a raw one-time secret with no `token_id` to ever confirm it against; retry, or check `GET /api/v1/tokens` |
+| Advisory-lock acquire failure, CSPRNG failure, or a mint/stamp write that did not persist | `503` — retryable store failure |
+| MFA step-up not satisfied | `401` |
+| Missing `ApiToken:Rotate`, or the caller's own session is engine-classed (structural deny belt) | `403` |
+
+---
+
+#### `POST /api/v1/tokens/{token_id}/confirm`
+
+Explicit maker-checker confirmation that a rotation's successor secret has been received and installed. `{token_id}` in the path is the **successor's** id — the value the `rotate` response above returned — so, unlike the engine-principal confirm route, **no request body is needed at all**: the id in the URL pins the exact rotation being confirmed. On success, the predecessor token is revoked and the successor becomes the sole active token in the rotation group.
+
+**Permission:** `ApiToken:Rotate` (same distinct-operation rationale as `rotate` above)
+
+**Ownership constraint:** the same self-service-only posture as `rotate` above — no admin bypass, `404 token not found` for both a nonexistent successor id and one owned by someone else, and the same `action=api_token.confirm`/`result=denied`/`detail=owner=<real owner>` audit row on a denied attempt.
+
+**Response:**
+
+```json
+{
+  "data": { "confirmed": true },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** the same state matrix as the engine-principal `credentials/confirm` route above (replay-after-success is a terminal `409`, an ambiguous empty/malformed-pair read is a retryable `503`, unresolved rotation metadata on the sole survivor is a terminal `409`), substituting `token is not a human-owned credential` / `principal has a non-human active credential` for the engine-kind equivalents. `401`/`403` follow the same step-up and permission rules as `rotate`. The same authority-inheritance `400` — `no such token to confirm` also applies here, as defence-in-depth only (see the `rotate` error matrix row above; the successor's tier/scope are fixed at mint time and cannot legitimately diverge from what the caller who initiated the rotation already held, so this path is not reachable today outside a future bypass of `rotate`'s own guard).
 
 ---
 
@@ -1038,7 +1137,7 @@ Like `credentials/rotate` above, this route never looks up `{id}` via a `get()` 
 | `token_id` missing from the body, empty, not a string, or the body is malformed/non-object JSON | `400` — `token_id required` |
 | The supplied `token_id` is not the pending rotation's successor (stale id from an earlier rotation, or the predecessor's id passed by mistake) | `409` — `token_id does not match the pending rotation successor; pass the token_id returned by rotate`. No state change. |
 | Confirm attempted by a **different** operator than the one who initiated the rotation | `409` — `rotation in progress by a different operator` |
-| The in-memory grace-cache entry needed to resolve the initiating operator is gone while the pair is still present (process restart mid-overlap) | `409` — `rotation confirmation unavailable — retry via rotate or fall back to revoke` |
+| The initiating operator cannot be resolved from either source — the in-memory grace-cache entry is gone (different replica, or this replica restarted) **and** the durable `rotation_initiator` column on the successor row is empty (the pair started rotating before the durable-binding migration shipped) — or the two sources are both present but disagree | `409` — `rotation confirmation unavailable — fall back to revoke`. A plain same-replica restart mid-overlap no longer triggers this: the successor row's own `rotation_initiator`, stamped durably at mint time, resolves the identity check when the in-memory grace cache is gone. |
 | **Replay after the rotation already resolved** — the successor is now the principal's sole active credential and the supplied `token_id` matches it | `409`, terminal, **do not retry**: `rotation already confirmed - the supplied token_id is the sole active credential; nothing to confirm` (an explicit confirm resolved it) or `no rotation in flight - the supplied token_id is already the sole active credential; nothing to confirm` (never rotated, or resolved by the auto-revoke sweep or a manual revoke) |
 | One credential is active with its rotation state clear, but the supplied `token_id` is a **different** id (the pinned rotation has moved on) | `409`, terminal — `no rotation in flight for the supplied token_id - the rotation was resolved (confirmed, revoked, or cut over); rotate again if a new rotation is needed` |
 | One credential is active but still carries **unresolved rotation metadata** (a best-effort pair-resolve failed, or its partner expired before cleanup while the sweep was down) | `409` — `one active credential with unresolved rotation metadata - inspect the credential state and do not rotate; revoke only if it is confirmed stale`. Rotating from here would strand a malformed pair; **inspect before revoking** — in the sweep-outage case this sole credential is the good survivor. |
@@ -3782,7 +3881,7 @@ API-token caller's representation to another.
   "version": 1,
   "description": "RBAC permission catalog: ...",
   "securable_types": ["Infrastructure", "InstructionDefinition", "Execution", "..."],
-  "operations": ["Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest"],
+  "operations": ["Read", "Write", "Execute", "Delete", "Approve", "Push", "Attest", "Rotate"],
   "roles": [
     {
       "name": "Administrator",
@@ -6851,8 +6950,10 @@ The MCP endpoint enables AI models and automation tools to interact with Yuzu vi
 #### `GET /mcp/v1/`
 
 The MCP Streamable HTTP **SSE channel** — the server→client half of a session minted by
-`initialize`. Carries heartbeats and, on reconnect, replayed frames; producers
-(`notifications/progress`) arrive with the next 2f rung.
+`initialize`. Carries heartbeats, replayed frames on reconnect, and
+`notifications/progress` frames for any `POST /mcp/v1/` call on this session that
+requested progress tracking and isn't being delivered as a streamed POST instead (see
+below).
 
 **Permission:** the same credential as `POST /mcp/v1/`, plus the session's
 `Mcp-Session-Id` header. The credential is re-checked once per tick (~3 s), whether or
@@ -7016,6 +7117,54 @@ The first three gate `GuaranteedState:Read` and are not audited (cohort posture)
 |---|---|
 | `--mcp-disable` | Reject all `/mcp/v1/` requests |
 | `--mcp-read-only` | Allow only read-only tools regardless of token tier |
+
+**Streamed responses (progress tracking).** A `tools/call` for `execute_instruction`
+carrying `_meta.progressToken` (see `docs/user-manual/mcp.md`'s `progressToken`
+definition for the type/length contract; an out-of-spec value is silently treated as
+absent — no error, no progress) opts into progress tracking — **this requires an
+active session**: a non-empty `Mcp-Session-Id` header from a prior `initialize`. A
+`Mcp-Session-Id` that is present but invalid (unknown, expired, or another
+principal's) fails the **entire call** with `404`/`-32007` before progress tracking is
+even considered — that is a property of every non-`initialize` method on this
+endpoint, not specific to progress tracking, and is covered above under `GET /mcp/v1/`.
+The table below assumes a valid session or none at all; where progress *is* tracked,
+delivery depends on the request's `Accept` header and whether the server has
+`--mcp-enable-streamed-post` enabled (on by default; opt out with `--no-mcp-streamed-post`):
+
+| `_meta.progressToken` | `Mcp-Session-Id` | `Accept: text/event-stream` | Server answers |
+|---|---|---|---|
+| present | sent, valid | present, streamed POST enabled | this POST response held open as an SSE stream — `notifications/progress` frames, then the JSON-RPC result last, then EOF |
+| present | sent, valid | absent, or streamed POST disabled | plain JSON now; progress frames go to the session's `GET /mcp/v1/` stream instead |
+| present | not sent | any | plain JSON, byte-identical to a call with no progress tracking |
+| absent | any | any | plain JSON, byte-identical to a call with no progress tracking |
+
+A streamed POST's response headers are `Content-Type: text/event-stream`,
+`Cache-Control: no-cache`, `X-Accel-Buffering: no` (nginx only — Envoy/HAProxy/ALB/
+Cloudflare need their own response-buffering opt-out, or the proxy will buffer the
+whole stream and the server cannot detect that the client has gone), `X-Correlation-Id`,
+and `X-Content-Type-Options: nosniff`. **Capacity** denials reuse `-32012` / HTTP `429`
+— the same code and `retry_after_ms`/`Retry-After` A4 shape as the `GET` channel above,
+but a longer fixed value (30s vs. the `GET` channel's 5s: none of these causes is
+likely to clear within a second or two) and a distinct set of causes (a shared
+cross-surface budget, this principal's own streamed-call allowance, a server-wide
+capacity ceiling, or this session's own slots). A duplicate request id or an unknown
+session get their own codes (`409`/`-32600`, `404`/`-32007`) instead — see
+`docs/user-manual/mcp.md` "`-32012`: Stream limit reached" for the full cause-by-cause
+remediation, and `docs/mcp-server.md` "Streamed POST — SSE on the response" for the
+admission/refusal table, close reasons, and resume/recovery rules. A denial
+caused by the server disabling/shutting down streaming, or an allocation failure,
+degrades silently to the plain (non-streamed) response instead of erroring — see the
+same admission table for which causes degrade vs. answer. Every session open, close,
+and denial is recorded in the audit log under `mcp.session.open` / `mcp.session.close`
+/ `mcp.session.reject` (`target_type = McpSession`) — see `docs/user-manual/mcp.md`
+"Audit". Progress is best-effort regardless of delivery mode: admission (the same
+`reserve()` call this table describes) runs whether or not the request is a streamed
+POST, but only the streamed-POST arm answers a capacity rejection with an explicit
+`429` — the identical causes silently degrade to a plain response, with no progress
+delivered anywhere and no error surfaced, when progress is being delivered on the
+`GET` channel instead (streamed POST not requested, or not enabled). A caller must
+therefore still be prepared to poll (`query_responses` / `get_execution_status`)
+regardless of which delivery mode it used.
 
 ---
 

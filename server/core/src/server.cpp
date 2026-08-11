@@ -21,6 +21,8 @@
 #include "store_errors.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "rotation_sweep_naming.hpp"
+#include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
@@ -561,10 +563,11 @@ public:
                           "gauge");
         metrics_.describe("yuzu_mcp_streamed_post_enabled",
                           "1 if SSE-on-POST is enabled (--mcp-enable-streamed-post), else 0. "
-                          "Ships 0; the four defects that gated the on-by-default flip "
-                          "(#2739, #2740, #2785, #2789) are fixed, but the flip itself is a "
-                          "separate rung. If this reads 1, size shutdown grace per the Sizing "
-                          "bullet in docs/user-manual/server-admin.md",
+                          "Ships 1: the four defects that gated the on-by-default flip "
+                          "(#2739, #2740, #2785, #2789) are fixed. Size shutdown grace per the "
+                          "Sizing bullet in docs/user-manual/server-admin.md — that guidance is "
+                          "now the default posture. If this reads 0, the operator opted out "
+                          "with --no-mcp-streamed-post.",
                           "gauge");
         metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
@@ -630,6 +633,28 @@ public:
                           "exactly like an ordinary replay, so this counter deliberately "
                           "carries NO reason label, and /metrics is not a stronger reader "
                           "than the caller. Read the audit trail for the kind",
+                          "counter");
+        metrics_.describe("yuzu_mcp_approval_masked_denials_total",
+                          "MCP approval-ticket recalls refused by a store fault at a point "
+                          "where the #2442 cross-surface origin check could not run — the "
+                          "lookup step, or the consume step's own origin-check read (#2786 "
+                          "arm 1). A foreign-origin ticket is exactly as likely to be behind "
+                          "one of these refusals as an innocent one while the fault holds, so "
+                          "this is the signal that the forgery-detection event is not simply "
+                          "absent. No reason label, same anti-oracle posture as "
+                          "yuzu_mcp_approval_refused_total: what this counter withholds is "
+                          "already withheld there",
+                          "counter");
+        metrics_.describe("yuzu_mcp_approval_precondition_denied_total",
+                          "MCP approval-ticket recalls refused by a pre-consume precondition "
+                          "(#2443) — the ticket matched and was approved, but the underlying "
+                          "operation's live state had already moved on since mint. A subset "
+                          "of yuzu_mcp_approval_refused_total, broken out separately: unlike "
+                          "the masked-denial split above, a precondition denial is already "
+                          "distinguishable to the caller from the response body, so this "
+                          "carries no anti-oracle restriction — it is not a `reason` label on "
+                          "the shared counter because the shared counter's other kinds "
+                          "(foreign-origin vs ordinary replay) still must not be",
                           "counter");
         // Progress bridge core (2f PR 3a). Same closed-set posture: every reject/
         // degrade reason is a static literal inside the bridge, never derived
@@ -905,7 +930,18 @@ public:
             // place — so pre-seed it here too, or an absent() alert on a fleet
             // that has never had a refusal cannot fire.
             metrics_.counter("yuzu_mcp_approval_refused_total", {{"tool", tool}});
+            // Same closed set again for the #2786 masked-denial counter.
+            metrics_.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", tool}});
         }
+        // yuzu_mcp_approval_precondition_denied_total's reachable label set is
+        // NARROWER than the two above: kPrecondition can only fire for a tool
+        // that actually has a ConsumePrecondition wired, which today is just
+        // confirm_engine_rotation (#2443) — pre-seeding the full
+        // approval-gated set here would claim reachability for tools whose
+        // precondition is always `{}`. Extend this list alongside #2939's
+        // sweep as each tool gets its own precondition wired.
+        metrics_.counter("yuzu_mcp_approval_precondition_denied_total",
+                         {{"tool", "confirm_engine_rotation"}});
         // #2437 handler-side bound denials. The label set is closed on BOTH
         // axes: `tool` is execute_instruction alone (the only tool that EMITS
         // this counter today; the two kAgenticParamMaxLen read tools bound in
@@ -1011,14 +1047,23 @@ public:
         // currently. `reason=unsupported_encoding` (D4 hardening) is seeded
         // for EVERY class, unconditionally: a non-identity Content-Encoding
         // is refused regardless of `requires_measurable`, so every class can
-        // reach it.
+        // reach it. `reason=over_cap_post_read` (body-cap-post-read-stage) is ALSO
+        // seeded for EVERY class, unconditionally — unlike `unmeasurable`,
+        // this is not gated on `requires_measurable`: the post-read stage
+        // (this file's `set_pre_request_handler`) is the backstop for every
+        // class that admits an unmeasurable body up to httplib's own 100 MiB
+        // backstop, which today is every class but /mcp/, and in principle
+        // any class could reach it if a future table edit ever widened a
+        // measured cap past what a handler can actually process.
         metrics_.describe(
             "yuzu_body_cap_rejected_total",
             "Pre-auth request-body cap rejections by route class and reason "
-            "(over_cap: measured and over the class's cap; unmeasurable: a "
-            "chunked/undeclared body refused outright for a class that "
-            "requires one it can size; unsupported_encoding: a non-identity "
-            "Content-Encoding, refused on every class)",
+            "(over_cap: measured and over the class's cap, pre-read; "
+            "unmeasurable: a chunked/undeclared body refused outright for a "
+            "class that requires one it can size; unsupported_encoding: a "
+            "non-identity Content-Encoding, refused on every class; "
+            "over_cap_post_read: the body was read in full — because it could not be "
+            "sized in advance — and turned out to be over the class's cap)",
             "counter");
         for (const auto& entry : yuzu::server::kBodyCapTable) {
             metrics_.counter("yuzu_body_cap_rejected_total",
@@ -1027,6 +1072,9 @@ public:
             metrics_.counter("yuzu_body_cap_rejected_total",
                              {{"path_class", std::string(entry.path_class)},
                               {"reason", "unsupported_encoding"}});
+            metrics_.counter("yuzu_body_cap_rejected_total",
+                             {{"path_class", std::string(entry.path_class)},
+                              {"reason", "over_cap_post_read"}});
             if (entry.requires_measurable) {
                 metrics_.counter("yuzu_body_cap_rejected_total",
                                  {{"path_class", std::string(entry.path_class)},
@@ -1639,6 +1687,29 @@ public:
                           "API token validate_token calls served from in-memory cache", "counter");
         metrics_.describe("yuzu_server_token_cache_misses_total",
                           "API token validate_token calls that fell through to SQLite", "counter");
+        // #2974 review (K7). Gauge-published from a store accessor like its
+        // token-cache siblings above, so it needs no counter() pre-seed to be
+        // present at 0 — the scrape callback sets it every time. (Contrast the
+        // rotation-sweep counters, which DO need an explicit pre-seed: see the
+        // note there.)
+        metrics_.describe("yuzu_server_rotation_pair_resolve_failures_total",
+                          "resolve_rotation_pair_after_revoke partner-clear failures that were "
+                          "swallowed - the revoke they follow has already committed, so they "
+                          "cannot fail the caller. Leaves stale rotation metadata on the "
+                          "surviving partner; NOT a lockout risk (the sweep cannot auto-revoke "
+                          "a stranded partner). Non-zero means inspect manually.",
+                          "counter");
+        // #2961 fix-round finding 4: not reachable through any live code
+        // path (both the RAM and durable initiator are written from the
+        // same requesting_user in the same mint call) - non-zero is a
+        // tamper/corruption signal on api_tokens.rotation_initiator, not an
+        // operational condition. Inspect the row's history manually.
+        metrics_.describe("yuzu_server_rotation_initiator_disagreements_total",
+                          "resolve_rotation_initiator RAM-vs-durable disagreements - not "
+                          "reachable in normal operation; non-zero means inspect "
+                          "api_tokens.rotation_initiator for out-of-band tampering or "
+                          "corruption.",
+                          "counter");
         metrics_.describe("yuzu_server_token_cache_size",
                           "Distinct API tokens currently held in the validate_token cache",
                           "gauge");
@@ -1742,7 +1813,15 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_audit_retention_last_pass_unixtime",
                           "Wall-clock reading of the most recent audit retention pass WHOSE CLOCK "
-                          "WAS USABLE; 0 if none has run in this process. Read WITH "
+                          "WAS USABLE; 0 if no pass has ever run on this DATABASE (seeded from "
+                          "the durable retention-meta anchor at startup, #2854 — survives a "
+                          "restart, including the first Postgres boot). A value of "
+                          "-9223372036854775808 (INT64_MIN) is a distinct anomaly sentinel — the "
+                          "durable anchor could not be read or trusted as a plausible integer — "
+                          "not a genuine timestamp; self-corrects at the next pass whose own clock "
+                          "reading is plausible — even if that pass then declines or fails for an "
+                          "unrelated reason — but NOT at a pass refusing on its own implausible clock, "
+                          "which skips the stamp entirely (see below). Read WITH "
                           "retention_passes_total: stale here while that RISES means the reaper "
                           "is alive but refusing an implausible clock, which is a different fault "
                           "from stopped",
@@ -2068,10 +2147,53 @@ public:
         // never close (two live credentials persist). The per-tick try/catch
         // keeps the thread alive; this counter makes that degradation
         // alertable instead of log-only (Gate 8 UP8-6).
+        // P2 #11: this is the SHARED per-tick health counter for the ONE
+        // sweep loop below, which serves BOTH engine-credential AND
+        // human API-token rotation pairs — unlike the auto-revoked/events
+        // counters above (and their yuzu_api_token_rotation_* twins below),
+        // it stays a single un-split series: a failed tick is a tick-level
+        // fault (pool contention / query error), not attributable to one
+        // kind's rows. Name/label/semantics unchanged; only this describe
+        // text was amended so it no longer implies engine-only scope.
         metrics_.describe("yuzu_engine_principal_rotation_sweep_failures_total",
-                          "Cumulative engine-credential rotation-sweep ticks that failed with an "
-                          "exception (predecessor auto-revocation skipped for that tick)",
+                          "Cumulative rotation-sweep ticks that failed with an exception "
+                          "(predecessor auto-revocation skipped for that tick) - the sweep is "
+                          "shared across BOTH engine-credential and human API-token rotation "
+                          "pairs; this counter is not split by principal_kind",
                           "counter");
+        // describe() alone does not publish the family — serialize() emits
+        // nothing until counter() has been called at least once, so without
+        // this the series is ABSENT from /metrics (not present-at-zero)
+        // until the first failed tick, and an increase()>0 alert can miss
+        // the first (possibly only) failure.
+        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total");
+        // UP-6 (clock-guarded-retention routed concern, part 5): the sweep's
+        // per-tick auto-revoke cap (kMaxAutoRevokesPerTick,
+        // api_token_store.cpp) was hit — more eligible predecessors existed
+        // than this tick processed. Same shared, un-split-by-principal_kind
+        // scope as sweep_failures_total above (the cap is a tick-level
+        // property, not attributable to one kind's rows) — makes an
+        // in-progress multi-tick drain (deliberate degradation, e.g. after a
+        // clock jump) visible/alertable rather than log-only.
+        //
+        // Deliberately kind-neutral NAME (`yuzu_rotation_sweep_capped_total`,
+        // not `yuzu_engine_principal_rotation_sweep_capped_total`): a capped
+        // tick is a tick-level property, not attributable to one kind's
+        // rows, so an `engine_principal`-scoped name would be dishonest
+        // naming under this file's own rule (see the "Deliberately a
+        // SEPARATE, parallel family" note in rotation_sweep_naming.hpp) even
+        // though the counter carries no per-kind label. Its sibling
+        // `..._sweep_failures_total` above keeps the engine-scoped name it
+        // shipped under — renaming an already-shipped series would break
+        // existing alerts, so only THIS series (new in this branch, never
+        // shipped) gets the honest name.
+        metrics_.describe("yuzu_rotation_sweep_capped_total",
+                          "Cumulative rotation-sweep ticks that hit the per-tick auto-revoke cap "
+                          "and deferred the remainder to later ticks - shared across BOTH "
+                          "engine-credential and human API-token rotation pairs, not split by "
+                          "principal_kind",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_capped_total");
         // #2404: confirm-rotation endpoint outcomes, so a 409-conflict or
         // 503-transient retry storm on confirm is alertable instead of
         // invisible (yuzu_http_requests_total has no per-route label). SCOPE
@@ -2093,6 +2215,56 @@ public:
         for (auto surface : {"rest", "mcp"}) {
             for (auto result : {"success", "conflict", "client_error", "transient"}) {
                 metrics_.counter("yuzu_engine_principal_confirm_total",
+                                 {{"surface", surface}, {"result", result}});
+            }
+        }
+        // P2 #11 (SOC 2 CC6.3): human-owned twin of the three engine-credential
+        // rotation families above. The T12 sweep (`sweep_expired_rotations`/
+        // `list_rotations_nearing_expiry_unused`) scans both `principal_kind`s
+        // with no filter — the driver below picks the family via
+        // `rotation_sweep_names_for_kind` (rotation_sweep_naming.hpp), the ONE
+        // chokepoint for this decision. Deliberately a SEPARATE family, never a
+        // `kind` label on the engine names above (dishonest naming under an
+        // `engine_principal`-named series, and it would silently widen that
+        // series' pre-seeded bounded cross-product) — see the header for the
+        // full rationale. Every name/label pulled from
+        // `kHumanRotationSweepNames` so the describe/pre-seed sites here can
+        // never drift from what the driver actually increments.
+        metrics_.describe(kHumanRotationSweepNames.metric_events,
+                          "Cumulative human API-token rotation sweep events, by reason (bounded "
+                          "label set) - the human-owned twin of "
+                          "yuzu_engine_principal_rotation_events_total",
+                          "counter");
+        metrics_.describe(kHumanRotationSweepNames.metric_auto_revoked,
+                          "Cumulative human API-token predecessors auto-revoked at overlap "
+                          "window end - the human-owned twin of "
+                          "yuzu_engine_principal_rotation_auto_revoked_total",
+                          "counter");
+        metrics_.counter(kHumanRotationSweepNames.metric_auto_revoked);
+        for (auto reason : {"successor_unused"}) {
+            metrics_.counter(kHumanRotationSweepNames.metric_events, {{"reason", reason}});
+        }
+        // Human-owned twin of yuzu_engine_principal_confirm_total (#2404):
+        // same scope contract — counts only calls that reached the credential
+        // store or found it unavailable at the store-open guard, `result`
+        // mirrors the same taxonomy plus success, no principal_id label
+        // (bounded cardinality only). Both transports increment this family —
+        // rest_api_v1.cpp's POST /api/v1/tokens/{id}/confirm handler and
+        // mcp_server.cpp's confirm_api_token_rotation tool — this registers +
+        // pre-seeds it so absent() alerts stay meaningful before the first
+        // real confirm. The name is the `kApiTokenConfirmTotalMetric` symbol
+        // (rotation_sweep_naming.hpp), not a repeated string literal, so the
+        // two increment call sites and this registration can never silently
+        // diverge into a shadow series.
+        metrics_.describe(kApiTokenConfirmTotalMetric,
+                          "Human API-token rotation confirm outcomes by surface (rest|mcp) and "
+                          "result (success|conflict|client_error|transient); store-reaching calls "
+                          "only, pre-store denials excluded - the human-owned twin of "
+                          "yuzu_engine_principal_confirm_total",
+                          "counter");
+        for (auto surface : {"rest", "mcp"}) {
+            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+                metrics_.counter(kApiTokenConfirmTotalMetric,
                                  {{"surface", surface}, {"result", result}});
             }
         }
@@ -5081,6 +5253,18 @@ public:
                         .set(static_cast<double>(api_token_store_->cache_misses()));
                     metrics_.gauge("yuzu_server_token_cache_size")
                         .set(static_cast<double>(api_token_store_->cache_size()));
+                    // #2974 review (K7): swallowed partner-clear failures in
+                    // resolve_rotation_pair_after_revoke. Published here rather
+                    // than incremented at the call site because the store holds
+                    // no MetricsRegistry — same accessor pattern as the token
+                    // cache counters above.
+                    metrics_.gauge("yuzu_server_rotation_pair_resolve_failures_total")
+                        .set(static_cast<double>(
+                            api_token_store_->rotation_pair_resolve_failures()));
+                    // #2961 fix-round finding 4 — same accessor pattern.
+                    metrics_.gauge("yuzu_server_rotation_initiator_disagreements_total")
+                        .set(static_cast<double>(
+                            api_token_store_->rotation_initiator_disagreements()));
                 }
                 // #2367: the same observability for the engine-principal
                 // revalidation cache. Without these the cache is invisible —
@@ -5383,28 +5567,47 @@ public:
                 });
         }
 
-        // T12 (design doc §7): engine-credential overlap-pair rotation
-        // sweep — auto-revoke + successor-unused warning. Only started when
-        // api_token_store_ is actually open (nothing to sweep otherwise).
-        // 60s cadence: overlap windows floor at 24h (kOverlapFloorSecs in
-        // api_token_store.cpp), so a minute of sweep latency is immaterial
-        // to either half's correctness — the sweep is idempotent and a
-        // missed tick simply defers to the next one (see
-        // sweep_expired_rotations's doc comment).
+        // T12 (design doc §7): overlap-pair rotation sweep — auto-revoke +
+        // successor-unused warning, covering BOTH engine-credential and
+        // (P2 #11) human API-token rotation pairs; the scan itself has no
+        // principal_kind filter. Only started when api_token_store_ is
+        // actually open (nothing to sweep otherwise). 60s cadence: overlap
+        // windows floor at 24h (kOverlapFloorSecs in api_token_store.cpp),
+        // so a minute of sweep latency is immaterial to either half's
+        // correctness — the sweep is idempotent and a missed tick simply
+        // defers to the next one (see sweep_expired_rotations's doc
+        // comment). Each swept row/pair is routed to the engine or human
+        // metric family + audit action by `rotation_sweep_names_for_kind`
+        // (rotation_sweep_naming.hpp) — the ONE chokepoint for that
+        // decision, keyed on the predecessor's `principal_kind`.
         if (api_token_store_ && api_token_store_->is_open()) {
             engine_rotation_sweep_thread_ = std::thread([this]() {
-                spdlog::info("Engine-credential rotation sweep thread started (interval=60s)");
+                spdlog::info("Rotation sweep thread started (engine-credential + human "
+                             "API-token, interval=60s)");
                 // Successor-unused warnings are process-local, best-effort
                 // de-duplication (mirrors ApiTokenStore's own rotation-grace
                 // cache precedent) — keyed on rotation_group, so the SAME
-                // pair isn't re-audited/re-counted every tick while its
-                // window is still open. Pruned each tick to whatever
+                // pair isn't re-audited/re-counted every tick during its
+                // PRE-elapse lead-time window (a heads-up ahead of the
+                // scheduled auto-revoke). Crossing INTO the elapsed state
+                // (UP-5: a never-used successor's predecessor is no longer
+                // auto-revoked, so the pair can sit stuck-open indefinitely)
+                // is a distinct fact and gets its own warning, tracked in a
+                // second set — but the three signals do NOT share a cadence,
+                // and `rotation_warn_dedup.hpp` is the ONLY authority on
+                // which fires when. In short: the LOG LINE repeats every
+                // tick while the pair stays stuck; the AUDIT ROW and the
+                // METRIC fire once per pair per state. Do not restore
+                // per-tick emission of the row from this comment — an
+                // un-throttled row is ~1440/day per stuck pair into the SOC 2
+                // audit store, which is what it did once already.
+                // Pruned each tick to whatever
                 // list_rotations_nearing_expiry_unused still returns, so a
                 // resolved pair (revoked, confirmed, or finally used) frees
                 // its slot for a future rotation on the same principal. A
-                // process restart forfeits the de-dup state and re-warns
-                // once — acceptable for an operational signal.
-                std::unordered_set<std::string> warned_rotation_groups;
+                // process restart forfeits the pre-elapse de-dup state and
+                // re-warns once more — acceptable for an operational signal.
+                RotationWarnDedup warn_dedup;
                 // Warn once the predecessor's overlap window has this much
                 // time left — matches the 24h overlap floor: the operator
                 // gets a full floor-window's notice before auto-revoke, the
@@ -5441,23 +5644,35 @@ public:
                     // so without this the sweep-failures alert would stay at zero
                     // while rotated-out credentials silently outlive their window.
                     bool sweep_tick_failed = false;
-                    auto revoked = api_token_store_->sweep_expired_rotations(now, &sweep_tick_failed);
+                    bool sweep_tick_capped = false;
+                    auto revoked = api_token_store_->sweep_expired_rotations(
+                        now, &sweep_tick_failed, &sweep_tick_capped);
                     if (sweep_tick_failed) {
-                        spdlog::warn("Engine-credential rotation sweep tick could not run (pool "
+                        spdlog::warn("Rotation sweep tick could not run (pool "
                                      "contention / query failure) — predecessor auto-revoke deferred "
                                      "to the next tick");
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
                             .increment();
                     }
+                    // UP-6: the per-tick cap already logged the eligible/
+                    // processed counts inside the store — the counter here is
+                    // the alertable signal that a drain is in progress.
+                    if (sweep_tick_capped) {
+                        metrics_.counter("yuzu_rotation_sweep_capped_total").increment();
+                    }
                     for (const auto& predecessor : revoked) {
-                        metrics_.counter("yuzu_engine_principal_rotation_auto_revoked_total")
-                            .increment();
+                        // P2 #11: route to the engine or human family/audit
+                        // action by THIS row's own principal_kind — never
+                        // assume every swept row is engine-owned.
+                        const auto& names =
+                            rotation_sweep_names_for_kind(predecessor.principal_kind);
+                        metrics_.counter(names.metric_auto_revoked).increment();
                         if (audit_store_ && audit_store_->is_open()) {
                             (void)audit_store_->log(
                                 {.timestamp = now,
                                  .principal = "system",
                                  .principal_role = "system",
-                                 .action = "engine_principal.rotation.auto_revoke",
+                                 .action = names.audit_auto_revoke,
                                  .target_type = "ApiToken",
                                  .target_id = predecessor.token_id,
                                  .detail = "principal_id=" + predecessor.principal_id +
@@ -5469,7 +5684,7 @@ public:
                         // under (rotation_group == successor's token_id,
                         // never the predecessor's) is pruned below anyway,
                         // but drop it here too for clarity/promptness.
-                        warned_rotation_groups.erase(predecessor.rotation_group);
+                        warn_dedup.resolve(predecessor.rotation_group);
                     }
 
                     // Half 2: successor-unused warning — an OPERATIONAL
@@ -5482,26 +5697,54 @@ public:
                     std::unordered_set<std::string> still_nearing;
                     for (const auto& pair : nearing) {
                         still_nearing.insert(pair.successor.rotation_group);
-                        if (warned_rotation_groups.contains(pair.successor.rotation_group))
-                            continue; // already warned this rotation attempt — don't re-spam
-                        warned_rotation_groups.insert(pair.successor.rotation_group);
+                        // UP-5: `list_rotations_nearing_expiry_unused` now
+                        // also returns a pair whose predecessor window has
+                        // ALREADY elapsed — sweep_expired_rotations
+                        // deliberately declines to auto-revoke it while the
+                        // successor stays unused, so this is the only
+                        // remaining signal for it. The signals do NOT share a
+                        // cadence — `RotationWarnDedup` owns which fire on this
+                        // tick, and its header states why (an un-throttled
+                        // audit row on an indefinitely-stuck pair is ~1440/day
+                        // into the SOC 2 evidence store).
+                        const bool elapsed = pair.predecessor.overlap_expires_at <= now;
+                        const auto signals =
+                            warn_dedup.observe(pair.successor.rotation_group, elapsed);
 
+                        if (signals.log) {
+                            spdlog::warn(
+                                "Rotation predecessor {} (principal {}) is past its overlap "
+                                "window but the successor has never been used — auto-revoke "
+                                "was declined to avoid leaving zero usable credentials; both "
+                                "stay active until an operator confirms or revokes explicitly",
+                                pair.predecessor.token_id, pair.predecessor.principal_id);
+                        }
+                        if (!signals.record_event)
+                            continue; // already counted and audited for this state
+
+                        // P2 #11: same per-row discrimination as Half 1,
+                        // keyed on the predecessor (the pair shares one
+                        // principal_id, so predecessor/successor always
+                        // agree on principal_kind).
+                        const auto& names =
+                            rotation_sweep_names_for_kind(pair.predecessor.principal_kind);
                         metrics_
-                            .counter("yuzu_engine_principal_rotation_events_total",
-                                     {{"reason", "successor_unused"}})
+                            .counter(names.metric_events, {{"reason", "successor_unused"}})
                             .increment();
                         if (audit_store_ && audit_store_->is_open()) {
                             (void)audit_store_->log(
                                 {.timestamp = now,
                                  .principal = "system",
                                  .principal_role = "system",
-                                 .action = "engine_principal.rotation.successor_unused",
+                                 .action = names.audit_successor_unused,
                                  .target_type = "ApiToken",
                                  .target_id = pair.successor.token_id,
                                  .detail = "principal_id=" + pair.predecessor.principal_id +
                                            " predecessor_token_id=" + pair.predecessor.token_id +
                                            " overlap_expires_at=" +
-                                           std::to_string(pair.predecessor.overlap_expires_at),
+                                           std::to_string(pair.predecessor.overlap_expires_at) +
+                                           (elapsed ? " status=elapsed_unrevoked_successor_unused"
+                                                    : ""),
                                  .result = "warning"});
                         }
                     }
@@ -5509,22 +5752,20 @@ public:
                     // (resolved via revoke, confirm, or the successor
                     // finally being used) so a later rotation on the same
                     // principal can warn again.
-                    std::erase_if(warned_rotation_groups, [&](const std::string& group) {
-                        return !still_nearing.contains(group);
-                    });
+                    warn_dedup.prune(still_nearing);
                     } catch (const std::exception& e) {
-                        spdlog::error("Engine-credential rotation sweep tick failed: {}",
+                        spdlog::error("Rotation sweep tick failed: {}",
                                      e.what());
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
                             .increment();
                     } catch (...) {
-                        spdlog::error("Engine-credential rotation sweep tick failed: unknown "
+                        spdlog::error("Rotation sweep tick failed: unknown "
                                       "exception");
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
                             .increment();
                     }
                 }
-                spdlog::info("Engine-credential rotation sweep thread stopped");
+                spdlog::info("Rotation sweep thread stopped");
             });
         }
 
@@ -7708,19 +7949,19 @@ private:
         // its sibling above, from the same post-clamp number.
         metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
-        // A dormant, security-relevant toggle nobody can confirm is dormant is an
-        // operability gap. --max-sse-streams already surfaces its resolved value as a
-        // gauge; this does the same, so an operator can answer "is streamed POST live
-        // on this box" from /metrics rather than from ps.
+        // A security-relevant toggle nobody can confirm the state of is an operability
+        // gap. --max-sse-streams already surfaces its resolved value as a gauge; this
+        // does the same, so an operator can answer "is streamed POST live on this box"
+        // from /metrics rather than from ps.
         metrics_.gauge("yuzu_mcp_streamed_post_enabled")
             .set(cfg_.mcp_streamed_post_enable ? 1.0 : 0.0);
         spdlog::info("MCP streamed POST (SSE-on-POST): {}{}",
-                     cfg_.mcp_streamed_post_enable ? "ENABLED" : "disabled (default)",
+                     cfg_.mcp_streamed_post_enable ? "ENABLED" : "disabled",
                      cfg_.mcp_streamed_post_enable
                          ? " - size shutdown grace above the 120s response cap plus a "
                            "drain margin (see the Sizing bullet in "
                            "docs/user-manual/server-admin.md)"
-                         : " - enable with --mcp-enable-streamed-post");
+                         : " - re-enable with --mcp-enable-streamed-post");
         spdlog::info("HTTP worker pool: {} threads, sized for {} concurrent held-open responses "
                      "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
                      "GET /mcp/v1/, MCP streamed POST, GET /api/v1/events, the dashboard "
@@ -8382,6 +8623,172 @@ private:
             }
 
             return httplib::Server::HandlerResponse::Unhandled;
+        });
+
+        // -- Post-read pre-auth body cap, second stage (body-cap-post-read) -----
+        // The pre-routing gate above bounds the DECLARED size of a request
+        // whose framing lets it be measured in advance (a Content-Length the
+        // class's cap can be checked against before anything is read off the
+        // socket). It has a structural limit, recorded in body_cap_policy.hpp's
+        // KNOWN LIMITATION paragraph: on any class with `requires_measurable ==
+        // false` (24 of 25 rows) a genuine chunked — or otherwise unmeasurable
+        // — body is NOT size-checked there at all; it falls through to
+        // httplib's own 100 MiB backstop (`CPPHTTPLIB_PAYLOAD_MAX_LENGTH`) and
+        // is handed to the route handler uncapped by this table. This second
+        // stage closes that hole from the other side: httplib's
+        // `pre_request_handler_` (httplib.h `Server::dispatch_request`, called
+        // from `routing()` only once the pre-routing handler above has
+        // returned Unhandled) runs AFTER `read_content` has consumed the body
+        // off the socket into `req.body` and AFTER the route MATCHED
+        // (`req.matched_route` is set), but BEFORE the route's own handler
+        // runs. That ordering means this stage can compare the body's ACTUAL,
+        // now-known size against the same `resolve_body_cap` table the
+        // pre-routing gate uses — the one table, never forked — and refuse a
+        // request the earlier stage could not size before admitting it.
+        //
+        // The two stages are complementary, not redundant: pre-routing bounds
+        // what the server will ever BUFFER (a rejection there costs a header
+        // parse, never the body itself); this stage bounds what reaches a
+        // route HANDLER, and — because the body is already fully read off the
+        // socket by the time this runs — a rejection here leaves the
+        // connection in a clean state, unlike a pre-routing rejection, which
+        // necessarily leaves an unread body still queued on the wire (see the
+        // pre-routing handler's own D5 comment above). For a MEASURABLE
+        // over-cap body the pre-routing gate has already refused the request
+        // before dispatch_request is ever reached, so in practice this stage
+        // fires almost exclusively for the chunked/unmeasurable case the
+        // earlier gate deliberately admits.
+        //
+        // ROUTE-MATCH GATED, NOT UNIVERSAL: httplib's `dispatch_request` only
+        // invokes `pre_request_handler_` once a route has MATCHED (see the
+        // vendored httplib.h) — an unmatched path (a 404) never reaches this
+        // handler at all. Do not read this as a second universal pre-auth
+        // gate; the pre-routing handler above is that gate, and this is a
+        // narrower backstop that runs strictly behind it.
+        //
+        // MULTIPART LIMITATION, recorded rather than implied away: httplib's
+        // `read_content` only appends bytes to `req.body` on the
+        // NON-multipart branch; a `multipart/form-data` request's content
+        // lands in `req.form.files`/`req.form.fields` instead, so
+        // `req.body.size()` reads 0 for ANY multipart request regardless of
+        // the real bytes read off the wire. **NO multipart class is covered
+        // by this stage** — stated as a RULE, not a list. An earlier draft
+        // named a single class and was wrong: `/api/settings/updates/upload`
+        // (`ota_upload`) and `/api/settings/cert-upload` (no table entry, so
+        // the catch-all default) are multipart too. Enumerating instances is
+        // how that error was made; the rule is what holds.
+        //
+        // SECOND CALL SITE: httplib also reaches this handler from
+        // `dispatch_request_for_content_reader`, where the body was streamed
+        // through a `ContentReader` and `req.body` is likewise EMPTY — so a
+        // route registered that way is not covered either. Dormant today
+        // (this codebase registers no `ContentReader` route), but it is the
+        // same blind spot as multipart and will not announce itself.
+        //
+        // Same table, same `path_class` label (never the attacker-controlled
+        // `req.path`), same 413 A4/SCIM envelope shapes, and the same
+        // per-reason log throttle as the pre-routing gate. `reason=over_cap_post_read`
+        // is its own value on `yuzu_body_cap_rejected_total` — pre-seeded for
+        // EVERY class in the boot-time seeding loop above — so an `absent()`
+        // alert can tell "this stage never fired" from "this stage isn't
+        // deployed".
+        //
+        // DOES NOT DOUBLE-COUNT: httplib's routing() returns immediately once
+        // the pre-routing handler above answers Handled, without ever calling
+        // dispatch_request — so a request the pre-routing gate already
+        // refused can never also reach this handler for the same request.
+        //
+        // CONTAIN THE WHOLE BLOCK (governance Gate 8, security + cpp-safety).
+        //
+        // NOT for the reason the pre-routing handler is contained, and the
+        // difference matters because the wrong reason is the one a future
+        // maintainer would trust. `enforce_pre_auth_body_cap` is contained
+        // because httplib calls `pre_routing_handler_` from the UNGUARDED
+        // WebSocket-upgrade path. This handler is NOT reachable from there —
+        // that path calls only `pre_routing_handler_` and the upgrade
+        // entry's own handler, never `pre_request_handler_`. Both real call
+        // sites sit inside `routing()`, which httplib does wrap in try/catch.
+        //
+        // It is contained anyway, deliberately: relying on a caller's
+        // try/catch means this block's safety depends on vendored code we do
+        // not control and would silently lose on a version bump. Containing
+        // it locally costs nothing and fails CLOSED (413) rather than
+        // deferring to httplib's generic 500.
+        //
+        // `[this]` ONLY. The httplib member function that invokes this
+        // handler (`Server::dispatch_request`) is `const`, but that constness
+        // is on httplib::Server's own members — it says nothing about what
+        // this lambda captures. `this` is the ServerImpl pointer, copied by
+        // value; calling `metrics_`/logging through it is unaffected. There
+        // are no pre-routing-handler locals in scope to capture by reference
+        // here, and none should be added — httplib can invoke
+        // `pre_request_handler_` from two distinct call sites
+        // (`dispatch_request` and `dispatch_request_for_content_reader`), so a
+        // captured reference to something scoped to one request's stack frame
+        // would be a dangling-reference hazard on the other.
+        web_server_->set_pre_request_handler([this](const httplib::Request& req,
+                                                     httplib::Response& res)
+                                                  -> httplib::Server::HandlerResponse {
+            try {
+                const auto cap_match = resolve_body_cap(req.method, req.path);
+                if (req.body.size() <= cap_match.max_body_bytes) {
+                    return httplib::Server::HandlerResponse::Unhandled;
+                }
+
+                static std::atomic<std::uint64_t> post_read_hits{0};
+                constexpr std::uint64_t kBodyLogEvery = 100;
+                if (post_read_hits.fetch_add(1, std::memory_order_relaxed) %
+                        kBodyLogEvery ==
+                    0) {
+                    spdlog::warn(
+                        "[#2407 post-read] rejected {} {} from {}: body {} bytes read, "
+                        "over the {}-byte cap (class={}, 1 log per {} rejections; the "
+                        "counter records all)",
+                        onbehalf::sanitize_for_log(req.method, 16),
+                        onbehalf::sanitize_for_log(req.path),
+                        onbehalf::sanitize_for_log(req.remote_addr, 64), req.body.size(),
+                        cap_match.max_body_bytes, cap_match.path_class, kBodyLogEvery);
+                }
+                try {
+                    metrics_
+                        .counter("yuzu_body_cap_rejected_total",
+                                 {{"path_class", std::string(cap_match.path_class)},
+                                  {"reason", "over_cap_post_read"}})
+                        .increment();
+                } catch (...) { // NOLINT(bugprone-empty-catch)
+                    // Observability must never kill the process from this
+                    // handler either — same reasoning as the pre-routing
+                    // gate's own metric try/catch above.
+                }
+
+                res.status = 413;
+                if (cap_match.path_class == "scim") {
+                    // D7 parity: same RFC 7644 §3.12 envelope the pre-routing
+                    // gate's SCIM branch uses.
+                    res.set_content(
+                        scim::error(413, "request body too large").dump(),
+                        "application/scim+json");
+                } else {
+                    res.set_content(
+                        detail::a4_denial(
+                            res, 413, "request body exceeds this route's size cap",
+                            detail::A4ErrorOpts{
+                                .remediation =
+                                    "reduce the request body size; see "
+                                    "docs/user-manual/rest-api.md for the per-route "
+                                    "limit"}),
+                        "application/json");
+                }
+                return httplib::Server::HandlerResponse::Handled;
+            } catch (...) { // NOLINT(bugprone-empty-catch)
+                // Last-resort containment for the whole block — see
+                // `enforce_pre_auth_body_cap`'s identical catch above. No
+                // envelope can be built once we are here, but the request
+                // must still be refused rather than let the throw reach an
+                // unguarded httplib call site.
+                res.status = 413;
+                return httplib::Server::HandlerResponse::Handled;
+            }
         });
 
         // -- Auth routes (login, logout, OIDC) — delegated to AuthRoutes --------

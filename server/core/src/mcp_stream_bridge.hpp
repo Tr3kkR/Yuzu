@@ -322,9 +322,9 @@ public:
     /// emits them, for the third time this pattern has been needed: a hand-written
     /// copy in the startup seed drifts the moment a reason is added, which is what
     /// let `detached` and six degrade reasons ship emitted-but-unseeded.
-    static constexpr std::array kPostRejectReasons{"post_per_principal_cap", "post_global_cap",
-                                                   "post_pin_slots", "post_duplicate_request_id",
-                                                   "post_unknown_session"};
+    static constexpr std::array kPostRejectReasons{
+        "post_per_principal_cap", "post_global_cap",          "post_record_cap",
+        "post_pin_slots",         "post_duplicate_request_id", "post_unknown_session"};
 
     enum class CancelOutcome {
         kAcceptedPending,  ///< pre-arm: recorded; arm()/abandon() arbitrate (C1 - no audit yet)

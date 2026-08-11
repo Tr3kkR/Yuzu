@@ -112,7 +112,25 @@ jobs:
   prometheus-rules:
     name: Prometheus alert rules
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # 20 -> 30 for #2854 rung D: `YuzuAuditRetentionNeverRan` now exists, so
+    # step 2's `fresh` scenario measures for real and its 3 (scenario,
+    # interval) `measure()` calls double to 6. The budget fits the WORST-CASE
+    # SUM of both steps' own documented ceilings, not their typical runtime -
+    # the same methodology run_promtool_tests.py's pull_with_retry() uses for
+    # its own ladder ("THE LADDER MUST FIT INSIDE THE TIMEOUTS THAT ENCLOSE
+    # IT"). Step 1's own comment states ~465-495s worst case (pull ladder +
+    # two 120s promtool calls). Step 2: its own pull_with_retry ladder (~195s,
+    # same shared function) plus 6 sequential measure() calls at 30s+90s each
+    # = ~720s, totalling ~915s. Sum: ~1410s (23.5 min). 25 minutes would leave
+    # only ~90s over that sum - thinner than the ~150s margin the rung B
+    # 10->20 derivation deliberately kept - so 30 minutes (1800s). Sizing to
+    # the ~1-minute TYPICAL combined runtime measured locally is what the
+    # original 10->15 bump did, and is exactly the gap that let step 2 ship
+    # with a per-call ceiling the job budget could not actually survive. A
+    # THIRD sweep scenario grows step 2 by another ~360s: re-derive this
+    # number in that PR, don't inherit it (see the warning next to
+    # `SCENARIO_ALERTS` in `blind_band_sweep.py`).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -142,3 +160,17 @@ jobs:
           # takes precedence over any promtool that happens to be on PATH.
           YUZU_TEST_ENABLE_PROMTOOL_DOCKER: "1"
         run: python3 tests/prometheus/run_promtool_tests.py
+
+      # #2854 rung B: the coverage-manifest gate. Distinct from the step above -
+      # `run_promtool_tests.py` proves the shipped rules parse and behave per
+      # `tests/prometheus/yuzu-alerts.test.yml`'s hand-written cases;
+      # `blind_band_sweep.py --check` proves the audit-retention alert family's
+      # measured COVERAGE across a swept range of restart cadences has not
+      # silently widened relative to the committed
+      # `tests/prometheus/blind_band_manifest.json`. Same opt-in, same pinned
+      # image (imported from the script above, not a second copy), same
+      # ubuntu-24.04 runner already carrying the PyYAML install above it.
+      - name: Audit-retention alert coverage manifest (promtool)
+        env:
+          YUZU_TEST_ENABLE_PROMTOOL_DOCKER: "1"
+        run: python3 tests/prometheus/blind_band_sweep.py --check

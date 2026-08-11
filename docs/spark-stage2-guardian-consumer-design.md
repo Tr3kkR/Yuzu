@@ -265,14 +265,29 @@ their normal lane cadence.
 
 **Landed (PARTIAL) 2026-07-20, commit `b30e93cf`:** the **transition-edge emission** + a
 **counted, sparse-heartbeat suppression signal** (`yuzu.guardian_unhealthy_suppressed`) shipped.
+
+**Landed (F5, #2298):** (a) the **slow periodic refresh** - `GuardianSparkRuntime::Config::
+errored_refresh_ms` (default 300 000 ms; 0 disables) re-emits `guard.unhealthy` for a still-
+errored rule at that cadence, carrying the CURRENT read-error detail (not the stale first-
+episode string), counted on its own `yuzu.guardian_unhealthy_refreshed` heartbeat tag - so a
+lost/coalesced edge can no longer leave the server's errored view stale forever
+(unhappy-path UP-1/2/4/11 closed); and (b) the **priority-lane eviction** -
+`pending_demote_sweeps`/`pending_demote_ms` (defaults 12 sweeps / 120 000 ms) demote a
+still-pending-initial rule off the 5 s priority lane to its normal type-lane cadence
+(service/registry ~60 s, file ~600 s) once EITHER threshold is crossed on a COMMITTED
+Convergence-reason Unknown, counted on `yuzu.guardian_priority_demoted` - closing the *read*
+flood (UP-6) the edge-only fix left open. Demotion is per-rule, not per-key (a key with a
+mixed demoted/non-demoted pending set still pays the read cost via its non-demoted sibling);
+the demoted rule keeps converging (and keeps re-arming errored_refresh_ms) at the slower
+cadence, so (a) backstops (b)'s resulting wire staleness. Both land in
+`guardian_spark_runtime.{hpp,cpp}` only - zero scheduler code change (the scheduler's
+existing type-lane sweeps already re-drive a demoted key's `evaluate_key`).
+
 Still OPEN and still gating the `prefer_spark` flip (folded into #2298 gate 6):
-(a) the **slow periodic refresh** - without it a lost/coalesced edge leaves the server's errored
-view stale until recovery (unhappy-path UP-1/2/4/11); (b) the **priority-lane eviction** - a
-stuck-Unknown rule still re-reads its target every ~5 s forever, so only the *wire* flood is
-fixed, not the *read* flood (UP-6); (c) the **server-side rollup/consumer** for the suppression
-tag (the signal is agent-heartbeat-only today) - this is **pilot-trust-blocking**, not just SOC2
+(c) the **server-side rollup/consumer** for the suppression/refresh/demotion tags (all three
+are agent-heartbeat-only today) - this is **pilot-trust-blocking**, not just SOC2
 evidence, because after suppression the only current-errored-state view is the no-TTL census, and
-`/status.errored_rules` is still the fail-closed placeholder. **(d) the four-artefact egress for
+`/status.errored_rules` is still the fail-closed placeholder (tracked as F6). **(d) the four-artefact egress for
 `arm_race_unwatch_failures_total` AND `disarm_unwatch_failures_total` (#2270)** - both heartbeat
 tags ship and both keys are registered in `spark_fleet_tags.hpp`, but no rollup consumes either,
 there is no `docs/user-manual/metrics.md` row and no alert rule, and no REST route or dashboard
@@ -392,8 +407,9 @@ IGuard"`/`"unaffected"`/`"remediated"` — false after the flip at `guardian_eng
 Guardian becomes a SparkEngine client. The seam:
 
 - **One queued consumer.** `GuardianEngine` calls `register_consumer(name,
-  handler, queue_cap)` (`spark_engine.hpp:159`) once at startup, and `arm(consumer,
-  SparkSpec)` (`:174`) once per enabled rule — replacing the per-rule guard
+  handler, queue_cap)` (`SparkEngine::register_consumer`'s declaration) once at
+  startup, and `arm(consumer, SparkSpec)` (`SparkEngine::arm`'s declaration) once
+  per enabled rule — replacing the per-rule guard
   construction in `start_guard_for_rule_locked()`. Arming is deduped by
   `spark_key`, so two rules watching the same unit/key share one watcher.
 - **Guardian keeps its meaning layer.** Everything that made a guard *Guardian's*
@@ -578,8 +594,9 @@ that a given enforce action stays inside budget. Registry write-back is the
 plausible first candidate; it is **not** promoted in Stage 2.
 
 Pre-Stage-3 dependency: `Service::watch()` SCM latency is currently unbounded
-under the ops lock (`spark_engine.hpp:358-361` warns a hung SCM RPC stalls it
-"with no bound at all"); #2011's per-mechanism-type lock (rung 0) removes only
+under the ops lock (`mech_ops_mu_by_type_`'s member comment: Registry and
+Service watch latencies are "entirely UNCHARACTERISED" and the per-type stall
+duration is unbounded); #2011's per-mechanism-type lock (rung 0) removes only
 *cross-mechanism* coupling. Gate rung 3 on a measured Service-arm-latency ceiling
 (or the walk-off-`mu_` restructure the header defers). (architect S4.)
 
@@ -1089,7 +1106,7 @@ Each rung is an independently-governed PR on `dev`, run through the full
        #2270 itself closes only the strong-guarantee half, so closing #2270 does not
        discharge this gate.
      - **#2818 gates PR-2 too.** The engine tears down a whole spark key
-       (`spark_engine.cpp:821-836`) while `GuardianSparkRuntime` arms one shared
+       (`SparkEngine::drop_key_locked`) while `GuardianSparkRuntime` arms one shared
        subscription per key on the 0->1 edge (`guardian_spark_runtime.cpp:159-166`),
        and nothing tells the consumer its subscription died: Guardian goes on
        believing it holds a live subscription, `backend_->disarm(sub)` is a no-op,
@@ -1155,19 +1172,20 @@ Each rung is an independently-governed PR on `dev`, run through the full
        discharged on the merits by security-guardian after the fix (pass-10 evidence
        row owed); `UP-4` deduped separately. A narrower residual remains, different in
        kind: two ops between the (now allocation-free) bookkeeping and the
-       contained `unwatch()` still propagate uncontained — the two `std::lock_guard`
-       constructions at `spark_engine.cpp:1033`/`:1035` (mutex acquisition can raise
-       `std::system_error`). `mech_ops_mu_by_type_.at(unwatch_type)` on the same
-       line does NOT: the map is populated in lockstep with `mechanisms_` at
-       registration and frozen after `start()`, so the lookup key is always present
-       (`spark_engine.hpp:221-222`, implemented at `spark_engine.cpp:183-195`). By
+       contained `unwatch()` still propagate uncontained — `disarm()`'s two
+       `std::lock_guard` constructions ahead of the released-`mu_` unwatch call,
+       `ops(mech_ops_mu_by_type_.at(unwatch_type))` and `lk(mu_)` (mutex
+       acquisition can raise `std::system_error`). The `.at(unwatch_type)` call
+       inside the first does NOT: the map is populated in lockstep with
+       `mechanisms_` at registration and frozen after `start()`, so the lookup
+       key is always present (`disarm()`'s declaration comment; implemented at
+       `SparkEngine::register_mechanism`'s lock-first `try_emplace` block). By
        this point `disarm`'s OWN bookkeeping (`armed_`/`sub_keys_`) is already
        committed, so a throw here does not desync the engine's own state the way
        the old defect did — the consequence is narrower: the `unwatch()` is never
        attempted, so neither counter increments and the OS watch is never even
        asked to release. `teardown_arm_race` documents the same residual on its
-       own declaration (`spark_engine.hpp:440-441`); `disarm` now does too
-       (`spark_engine.hpp:217-219`). (b) The `{os}` fleet
+       own declaration; `disarm`'s declaration now does too. (b) The `{os}` fleet
        rollup, the `metrics.md` row and the alert rule for BOTH
        `arm_race_unwatch_failures` and `disarm_unwatch_failures` —
        `spark_fleet_tags.hpp:82` defers all three to this flip IN CODE, so the flip

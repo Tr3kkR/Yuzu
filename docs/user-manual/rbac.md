@@ -137,7 +137,7 @@ decision (including what was deliberately excluded from the floor and why).
 | **Principal** | A user or group identity. Matches the authenticated username or an OIDC group claim. |
 | **Role** | A named collection of permissions. Can be system-defined or custom. |
 | **Securable type** | A category of resource that permissions apply to (e.g., `Infrastructure`, `Tag`). |
-| **Operation** | An action on a securable type (`Read`, `Write`, `Delete`, `Execute`, `Approve`, `Push`). |
+| **Operation** | An action on a securable type (`Read`, `Write`, `Delete`, `Execute`, `Approve`, `Push`, `Attest`, `Rotate`). |
 | **Permission** | A single `(securable_type, operation, effect)` entry. Effect is `Allow` or `Deny`. |
 | **Role assignment** | Binds a principal to a role, optionally scoped to a management group. |
 
@@ -147,10 +147,10 @@ Six roles are created automatically and cannot be deleted:
 
 | Role | Permissions | Use case |
 |---|---|---|
-| **Administrator** | All 5 CRUD operations on all 23 securable types, plus Push on GuaranteedState and Attest on AccessReview (117 permissions) | Server admins, security team leads |
+| **Administrator** | All 5 CRUD operations on all 23 securable types, plus Push on GuaranteedState, Attest on AccessReview, and Rotate on ApiToken (P2 #11, SOC 2 CC6.3 — self-service human token rotation) (118 permissions) | Server admins, security team leads |
 | **PlatformEngineer** | Full CRUD on InstructionDefinition and InstructionSet; Read on Execution, Schedule, Approval, Tag, AuditLog, Response, Inventory; Read/Write/Delete/Push on GuaranteedState | Authors and managers of YAML instruction definitions, sets, and Guardian rules |
 | **Operator** | Read/Write/Execute/Delete on InstructionDefinition, InstructionSet, Execution, Schedule, Tag; Read and Approve on Approval; Read on AuditLog, Response, and Inventory; Read and Push on GuaranteedState | Day-to-day instruction execution, schedule management, tagging, and Guardian rule distribution |
-| **ApiTokenManager** | Read, Write, Delete on ApiToken (3 permissions) | Create, revoke, and manage API tokens for programmatic access |
+| **ApiTokenManager** | Read, Write, Delete, Rotate on ApiToken (4 permissions) | Create, revoke, rotate, and manage API tokens for programmatic access |
 | **ITServiceOwner** | All 5 CRUD operations on 18 securable types, plus Push on GuaranteedState (91 permissions). Excludes UserManagement, Security, ApiToken, AccessReview, EnginePrincipal | Service desk leads, team managers with delegated control over their IT services |
 | **Viewer** | Read on 21 securable types (all except Infrastructure and AccessReview) (21 permissions) | Helpdesk staff, auditors, read-only dashboards |
 
@@ -190,6 +190,8 @@ Six roles are created automatically and cannot be deleted:
 | `Execute` | Run an instruction against devices |
 | `Approve` | Approve a pending workflow item |
 | `Push` | Distribute an existing rule set to scoped agents. Consumed **only** by `GuaranteedState` REST handlers and seeded **only** on `GuaranteedState` — separates deploy authority from authoring authority. Present in the operations catalogue so custom roles can adopt it, but the default seeds grant it on `GuaranteedState` alone. |
+| `Attest` | Record a reviewer's attestation decision on a periodic access review (SOC 2 CC6.2). Consumed **only** by `AccessReview` REST handlers and seeded **only** on `AccessReview` — gated via the dedicated `AccessReview` securable, never `AuditLog` (see "The authorization topology floor" below). |
+| `Rotate` (P2 #11, SOC 2 CC6.3) | Self-service overlap-pair rotation of a human-owned API token. Consumed **only** by `ApiToken` REST/MCP handlers and seeded **only** on `ApiToken`, to the same two roles that already hold `ApiToken:Write` (`Administrator`, `ApiTokenManager`) — deliberately a separate operation from `Write` so a narrower MCP-tier allowance can be granted for rotation without also widening token-mint access. |
 
 ## Permission Resolution
 
