@@ -53,6 +53,10 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
+    # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
+    # "Sizing"): a held-open SSE response can take up to 120s plus drain
+    # margin. Docker's 10s default SIGKILLs it mid-drain.
+    stop_grace_period: 150s
 
   # ── PostgreSQL (server storage substrate, ADR-0006) ─────────────────
   postgres:

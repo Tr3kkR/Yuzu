@@ -7540,10 +7540,10 @@ private:
         // its sibling above, from the same post-clamp number.
         metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
-        // A dormant, security-relevant toggle nobody can confirm is dormant is an
-        // operability gap. --max-sse-streams already surfaces its resolved value as a
-        // gauge; this does the same, so an operator can answer "is streamed POST live
-        // on this box" from /metrics rather than from ps.
+        // A security-relevant toggle nobody can confirm the state of is an operability
+        // gap. --max-sse-streams already surfaces its resolved value as a gauge; this
+        // does the same, so an operator can answer "is streamed POST live on this box"
+        // from /metrics rather than from ps.
         metrics_.gauge("yuzu_mcp_streamed_post_enabled")
             .set(cfg_.mcp_streamed_post_enable ? 1.0 : 0.0);
         spdlog::info("MCP streamed POST (SSE-on-POST): {}{}",

@@ -50,6 +50,10 @@ services:
     image: ghcr.io/tr3kkr/yuzu-server:${YUZU_VERSION:-0.13.0}
     container_name: yuzu-server
     restart: unless-stopped
+    # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
+    # "Sizing"): a held-open SSE response can take up to 120s plus drain
+    # margin. Docker's 10s default SIGKILLs it mid-drain.
+    stop_grace_period: 150s
     command:
       - "--listen=0.0.0.0:50051"
       - "--gateway-upstream=0.0.0.0:50055"
