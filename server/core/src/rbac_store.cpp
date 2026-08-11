@@ -1249,10 +1249,14 @@ void RbacStore::maybe_refresh_generation() const {
             // on-call sees the refresh is failing before the bound is
             // actually exceeded. Do NOT touch rbac_enabled_ in EITHER branch
             // — flipping it to disabled would be fail-open.
-            const bool within_stale_serve_bound =
-                generation_valid_ && !rbac_generation::is_stale_beyond_bound(
-                                          now_ms(), last_successful_refresh_ms_,
-                                          kRbacStaleServeBoundMs);
+            // Security-guardian (#2703 Gate 8, second re-review): this was a
+            // hand-written third copy of generation_view_stale_locked()'s
+            // exact formula (De Morgan's-equivalent to its negation) — the
+            // same drift risk the chokepoint exists to eliminate, sitting
+            // right next to a doc comment claiming there wasn't one.
+            // cache_mtx_ is already held here (line 1241), so the lock-free
+            // helper is safe to call.
+            const bool within_stale_serve_bound = !generation_view_stale_locked();
             fire_refresh_failed_degrade = true;
             refresh_failed_cache_dropped = !within_stale_serve_bound;
             if (!within_stale_serve_bound) {

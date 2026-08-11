@@ -1797,6 +1797,62 @@ TEST_CASE("RbacStore: a warm permission cache survives a generation-refresh "
     CHECK(replica_b.check_permission("bob", "Infrastructure", "Read"));
 }
 
+// cpp-safety (#2703 Gate 8, second re-review): the sibling test above proves
+// the within-bound side of check_permission()'s own trust decision (the
+// exact site that read generation_valid_ directly pre-fix, see 67df7e49d).
+// This proves the past-the-bound side end to end. Caveat, stated honestly:
+// starving the pool here means maybe_refresh_generation()'s OWN pre-existing
+// flip-on-detect path (unconditionally called at the top of
+// check_permission(), unrelated to this fix) also fires and flips
+// generation_valid_ false BEFORE check_permission()'s own trust check ever
+// runs -- so this does not, by itself, isolate the NEW check_permission()-
+// level substitution from the pre-existing mechanism the way the
+// rbac_enabled_view_degraded() test isolates its own fix (that one calls the
+// accessor directly, bypassing maybe_refresh_generation() entirely; nothing
+// analogous exists for check_permission(), which always refreshes first).
+// What this DOES prove: check_permission() correctly denies rather than
+// serving a stale cached ALLOW once past the bound, end to end -- real
+// regression coverage for a previously-untested boundary, even though the
+// genuinely-stuck-refresh scenario this fix specifically targets stays
+// covered only by the deferred live-lock harness, #3031.
+TEST_CASE("RbacStore: a warm permission cache is NOT served once the "
+          "generation refresh has genuinely failed PAST the stale-serve "
+          "bound (#2703 Gate 8, check_permission cache-trust fix)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    replica_a.set_rbac_enabled(true);
+    REQUIRE(replica_a.assign_role({"user", "bob", "Administrator"}).has_value());
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+
+    // Clear the refresh gate, let replica_b observe the durable enable +
+    // grant, and genuinely populate perm_cache_ with an ALLOW.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
+
+    // Starve the pool, then push wall time past kRbacStaleServeBoundMs
+    // (5000ms) with an explicit sleep before the next call. Unlike the
+    // sibling rbac_enforcement_in_effect fail-closed test above (whose
+    // 4200ms works because its baseline is CONSTRUCTION, never updated since
+    // every refresh attempt after it fails), this test's baseline is the
+    // SUCCESSFUL warming call just above -- last_successful_refresh_ms_ was
+    // genuinely updated to ~now there, so the sleep alone must exceed the
+    // 5000ms bound, not merely combine with an earlier one to reach it.
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+
+    // Past the bound, with the pool starved: the previously-cached ALLOW
+    // must NOT be served. check_permission()'s own internal
+    // maybe_refresh_generation() call fails (pool starved), the fallback
+    // pool acquire inside check_permission() itself also fails (same starved
+    // pool) -- both directions fail closed, landing on DENY.
+    CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "Read"));
+}
+
 // #2703 Gate 7 merge-slice item 1 commit B (operator-adjudicated: trip fast,
 // 2 consecutive failures), extended in commit C with the
 // yuzu_server_rbac_breaker_open gauge as PRIMARY evidence — a wall-clock
