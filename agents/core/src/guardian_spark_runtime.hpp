@@ -58,6 +58,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -162,6 +163,24 @@ public:
 
     struct Config {
         std::size_t outbox_capacity{4096};
+        /// M1 item (a): minutes-cadence backstop re-emission of guard.unhealthy for a
+        /// rule still stuck Unknown, so a lost/coalesced edge cannot leave the server's
+        /// errored view stale forever (edge-only emission made the edge the SOLE source
+        /// of truth). 0 disables refresh (edge-only, pre-F5 behaviour). Effective
+        /// granularity floors at the owning convergence lane's sweep cadence (file:
+        /// ~600s) since a refresh can only fire on a committed re-evaluation.
+        std::uint64_t errored_refresh_ms{300'000};
+        /// M1 item (b): consecutive COMMITTED Convergence-reason Unknown sweeps after
+        /// which a still-pending-initial rule is demoted off the 5s priority lane to
+        /// its normal type-lane cadence (the read flood, not the wire flood - errored_
+        /// refresh_ms above already bounds the wire side). 0 disables the sweep-count
+        /// demotion arm.
+        std::uint64_t pending_demote_sweeps{12};
+        /// Elapsed-time companion to pending_demote_sweeps: demote once this much time
+        /// has passed since the rule first went pending, even if convergence sweeps
+        /// were sparse (Event-driven eval alone never advances the sweep counter). 0
+        /// disables the elapsed-time demotion arm.
+        std::uint64_t pending_demote_ms{120'000};
     };
 
     /// The runtime OWNS the reader and backend (shared_ptr): a queued handler that
@@ -373,6 +392,22 @@ public:
     [[nodiscard]] std::uint64_t unhealthy_suppressed() const noexcept {
         return unhealthy_suppressed_.load(std::memory_order_relaxed);
     }
+    /// M1 item (a): guard.unhealthy re-emissions for a rule still stuck Unknown, sent
+    /// at errored_refresh_ms cadence so a lost/coalesced edge cannot leave the
+    /// server's errored view stale forever. Distinct from unhealthy_suppressed() -
+    /// this counts entries actually PUT ON THE WIRE (the refresh channel), the other
+    /// counts ticks that were NOT (still bounded by errored_refresh_ms in between).
+    [[nodiscard]] std::uint64_t unhealthy_refreshed() const noexcept {
+        return unhealthy_refreshed_.load(std::memory_order_relaxed);
+    }
+    /// M1 item (b): rule_ids demoted off the 5s convergence priority lane to their
+    /// normal type-lane cadence after pending_demote_sweeps consecutive committed
+    /// Convergence-reason Unknowns or pending_demote_ms elapsed, whichever first. A
+    /// counted metric, not a silent behavior change (Option-A: every loss/suppression/
+    /// resource-shedding channel is observable).
+    [[nodiscard]] std::uint64_t priority_demoted() const noexcept {
+        return priority_demoted_.load(std::memory_order_relaxed);
+    }
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
     /// inactive under the registry lock, so no in-flight or late eval commits.
@@ -387,8 +422,13 @@ public:
     [[nodiscard]] std::size_t outbox_size() const;
     [[nodiscard]] std::uint64_t outbox_backpressure_drops() const;
     /// rule_ids still awaiting a first Known eval on `key` (the pending-initial
-    /// dirty-set the convergence priority lane services).
+    /// dirty-set the convergence priority lane services). Includes DEMOTED rule_ids -
+    /// this reflects "never Known", not priority-lane membership; use
+    /// keys_with_pending_initial() to see which keys the priority lane still sweeps.
     [[nodiscard]] std::vector<std::string> pending_initial(const std::string& key) const;
+    /// Test seam: rule_ids on `key` that have been demoted off the priority lane
+    /// (M1 item (b)). A subset of pending_initial(key).
+    [[nodiscard]] std::vector<std::string> pending_demoted_for_test(const std::string& key) const;
     [[nodiscard]] bool stopping() const;
 
     /// A live status snapshot for one currently-attached rule, reflecting the
@@ -410,8 +450,13 @@ public:
     /// sweeps on its own cadence (so a slow file hash never blocks a service
     /// reconcile).
     [[nodiscard]] std::vector<std::string> keys_for_type(SparkType type) const;
-    /// Armed keys that still carry a pending-initial rule (the priority lane's
-    /// work-list).
+    /// Armed keys that still carry at least one NON-DEMOTED pending-initial rule (the
+    /// priority lane's work-list). M1 item (b): a key whose every pending rule has been
+    /// demoted (pending_demote_sweeps / pending_demote_ms) is excluded here - it still
+    /// converges at its normal type-lane cadence via keys_for_type(), just no longer at
+    /// the 5s priority cadence. A key with a MIX of demoted and non-demoted pending
+    /// rules is still returned (the read cost is per-key, so the non-demoted sibling
+    /// already pays it).
     [[nodiscard]] std::vector<std::string> keys_with_pending_initial() const;
     /// Install a waker the runtime invokes (OUTSIDE its lock) whenever a rule is
     /// newly attached with a pending initial eval, so the scheduler can service
@@ -482,6 +527,19 @@ private:
         RuleEvalState eval;           ///< mutated only under the key's eval_mu (single serialisation domain)
     };
 
+    /// M1 item (b) bookkeeping for one rule_id still awaiting its first Known eval.
+    /// registry_mu_-guarded (same as the map it lives in). `demoted` does NOT remove
+    /// the entry from pending_initial - membership there still means "never produced a
+    /// Known verdict" (pinned by existing tests); it only excludes the key from
+    /// keys_with_pending_initial()'s priority-lane worklist. A demoted rule keeps
+    /// converging (and keeps re-arming errored_refresh_ms) at its normal type-lane
+    /// cadence, which is what makes 6b the staleness backstop for 6c.
+    struct PendingState {
+        std::chrono::steady_clock::time_point first_seen{};
+        std::uint64_t unknown_sweeps{0}; ///< committed Convergence-reason Unknowns since first_seen
+        bool demoted{false};
+    };
+
     /// Per-spark_key shared-watcher state. One armed watcher per key (the engine
     /// dedups); SubscriptionId is PER-KEY. `eval_mu` serialises a whole
     /// evaluate_key pass (read + fan-out + commit) for this key. Heap-stable
@@ -490,7 +548,12 @@ private:
         SparkSpec spec;
         std::uint64_t subscription{0};
         std::mutex eval_mu;
-        std::set<std::string> pending_initial; ///< rule_ids awaiting a first Known eval (registry_mu_-guarded)
+        /// rule_ids awaiting a first Known eval (registry_mu_-guarded). A demoted
+        /// entry stays a MEMBER (see PendingState::demoted) - reads are per-KEY, so a
+        /// demoted rule sharing this key with a fresh non-demoted sibling still gets
+        /// priority-lane-cadence reads via that sibling; only when every entry on a
+        /// key is demoted does the key itself leave the priority worklist.
+        std::map<std::string, PendingState> pending_initial;
     };
 
     // Helpers (all assume the documented lock discipline; see the .cpp).
@@ -501,10 +564,15 @@ private:
                           const RegistryRead* reg,
                           const ReadResult<ServiceRunState>* svc);
     /// The outbox entries an outcome requires (0, 1, or 2): a recovery emits
-    /// guard.healthy AND the verdict, which enqueue_all lands atomically. Called
-    /// under registry_mu_ (make_event_id needs it).
+    /// guard.healthy AND the verdict, which enqueue_all lands atomically. `refresh`
+    /// (M1 item (a)) mints a health(false) for a NON-edge Unhealthy outcome - the
+    /// caller has already decided errored_refresh_ms elapsed; build_entries does not
+    /// re-check the clock. Mutually exclusive with out.unhealthy_edge in practice (the
+    /// caller only sets refresh when the edge did not already cover this tick), but
+    /// both are read independently so a future caller mistake fails loudly rather than
+    /// silently double-emitting. Called under registry_mu_ (make_event_id needs it).
     std::vector<OutboxEntry> build_entries(const RuleGeneration& gen, const EvalOutcome& out,
-                                           const std::string& agent_id);
+                                           const std::string& agent_id, bool refresh);
     /// Mint a wire event_id: `<agent_id>-<nonce>-<rule_id>-<wall_ms>-<seq>`
     /// (registry_mu_ held). agent_id (snapshotted at pass start) distinguishes
     /// agents, the boot nonce distinguishes restarts, wall_ms + seq distinguish
@@ -537,6 +605,13 @@ private:
     std::shared_ptr<IStateReader> reader_;   ///< OWNED: outlives any detached handler
     std::shared_ptr<ISparkBackend> backend_; ///< OWNED
     RuntimeClock clock_;
+    /// Immutable post-construction (set once in the ctor init list, never reassigned):
+    /// read from evaluate_key's registry_mu_-held commit section without a separate
+    /// lock. Only errored_refresh_ms / pending_demote_sweeps / pending_demote_ms are
+    /// consulted post-construction; outbox_capacity was already consumed to size
+    /// outbox_/lifecycle_log_ and is kept here only so the whole Config need not be
+    /// re-threaded piecemeal.
+    const Config cfg_;
     std::uint64_t gen_counter_{0};   ///< registry_mu_-guarded monotonic generation source
     std::uint64_t event_seq_{0};     ///< registry_mu_-guarded event_id source
     std::string boot_nonce_;         ///< random, fixed at construction; disambiguates event_ids across
@@ -577,6 +652,14 @@ private:
     std::atomic<std::uint64_t> unhealthy_suppressed_{0}; ///< repeat Unknown evals whose guard.unhealthy
                                                          ///< was edge-suppressed (rule stuck errored;
                                                          ///< NOT re-minted every ~5s convergence tick). M1.
+    std::atomic<std::uint64_t> unhealthy_refreshed_{0};  ///< M1 item (a): guard.unhealthy re-emitted at
+                                                         ///< errored_refresh_ms cadence for a rule still
+                                                         ///< stuck Unknown. Lock-free, mutated (like
+                                                         ///< unhealthy_suppressed_) from evaluate_key's
+                                                         ///< registry_mu_-held commit section.
+    std::atomic<std::uint64_t> priority_demoted_{0};     ///< M1 item (b): rule_ids demoted off the 5s
+                                                         ///< priority lane (pending_demote_sweeps /
+                                                         ///< pending_demote_ms). Lock-free, same call site.
 };
 
 } // namespace yuzu::agent
