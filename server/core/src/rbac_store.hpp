@@ -472,6 +472,9 @@ private:
     /// admitted (never call for a denied/skipped attempt — there is nothing
     /// to record). `success` resets the streak to 0 (closes the breaker);
     /// failure increments it (opens/keeps it open past the trip threshold).
+    /// On a closed<->open TRANSITION, also sets the
+    /// `yuzu_server_rbac_breaker_open` gauge (0/1) — AFTER releasing
+    /// `breaker_mtx_`, never while holding it (#2703 Gate 7 item 1 commit C).
     void breaker_note_result(bool success) const;
 };
 

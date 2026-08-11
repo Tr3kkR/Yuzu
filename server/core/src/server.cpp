@@ -1127,6 +1127,35 @@ public:
                           "counter");
         for (const auto result : {"fresh", "completed", "failed"})
             metrics_.counter("yuzu_server_rbac_backfill_total", {{"result", result}});
+        // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the
+        // existing shared-pool signals (yuzu_pg_acquire_wait_seconds,
+        // yuzu_pg_pool_in_use — both already cover every RbacStore acquire, since
+        // RbacStore shares pg_pool_ with every other store): the acquire-wait
+        // histogram only measures the ACQUIRE, so it reads fast even in the
+        // measured table-lock scenario where the acquire succeeds and the QUERY
+        // itself blocks on PgPool's injected lock_timeout — this histogram wraps
+        // check_permission() end-to-end (acquire + query + cache lookup) and is
+        // the only place that scenario's true cost is visible. Zero-seeded (a
+        // fresh gauge/histogram already reads 0/empty on first touch) so both
+        // exist on an idle server before the first authz check ever runs.
+        metrics_.describe(
+            "yuzu_server_rbac_authz_check_seconds",
+            "End-to-end latency of RbacStore::check_permission (acquire + query + "
+            "cache lookup, all outcomes including cache hits and breaker-denied "
+            "fast paths) — NOT the same as yuzu_pg_acquire_wait_seconds, which "
+            "reads fast even when the acquire succeeds but the query itself "
+            "blocks (e.g. cancelled by PgPool's injected lock_timeout).",
+            "histogram");
+        metrics_.histogram("yuzu_server_rbac_authz_check_seconds");
+        metrics_.describe(
+            "yuzu_server_rbac_breaker_open",
+            "1 when the authz-hot-path fail-fast breaker is open (2 consecutive "
+            "pool-acquire-timeout or query-error failures — #2703 Gate 7 item 1 "
+            "commit B), 0 when closed. While open, every authz check on this "
+            "replica is denied WITHOUT touching the pool except one probe per "
+            "kRbacGenerationRefreshMs. Per-process, per-replica — not fleet-wide.",
+            "gauge");
+        metrics_.gauge("yuzu_server_rbac_breaker_open");
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "

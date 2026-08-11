@@ -20,6 +20,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 #include <sqlite3.h>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -1723,15 +1724,18 @@ TEST_CASE("RbacStore: a warm permission cache survives a generation-refresh "
 }
 
 // #2703 Gate 7 merge-slice item 1 commit B (operator-adjudicated: trip fast,
-// 2 consecutive failures). Black-box: the breaker has no accessor, so this
-// verifies behaviourally — a genuinely denied-without-pool-touch call
-// completes near-instantly, while a real attempt against the starved pool
-// costs at least kAuthzAcquireTimeout (250ms). A cache MISS on every call
-// (a unique operation string each time) forces every call through the real
-// pool-fallback path so the measurement is not confounded by stale-serve.
+// 2 consecutive failures), extended in commit C with the
+// yuzu_server_rbac_breaker_open gauge as PRIMARY evidence — a wall-clock
+// assertion alone is exactly the flake class "Green on BigColin != CI" warns
+// about (a descheduled thread on a contended CI runner can blow a timing
+// budget on otherwise-correct code); the gauge transition is asserted
+// directly and does not depend on scheduling. The elapsed-time check is kept
+// as SECONDARY evidence only. A cache MISS on every call (a unique operation
+// string each time) forces every call through the real pool-fallback path
+// so neither measurement is confounded by stale-serve.
 TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
           "consecutive failures reach the trip threshold, then half-opens "
-          "on the next probe (#2703 Gate 7 item 1 commit B)",
+          "on the next probe (#2703 Gate 7 item 1 commits B+C)",
           "[rbac_store][pg]") {
     RBAC_STORE(replica_a);
     replica_a.set_rbac_enabled(true);
@@ -1741,6 +1745,9 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
     REQUIRE(pool_b.valid());
     RbacStore replica_b{pool_b};
     REQUIRE(replica_b.is_open());
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics); // wired AFTER construction — construction's
+                                     // own read (if any) cannot touch the gauge
 
     // Clear the refresh gate opened at construction so the first starved
     // call below genuinely attempts a fresh refresh rather than serving the
@@ -1751,33 +1758,43 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
     REQUIRE(held);
 
     // First call: maybe_refresh_generation's own attempt fails (streak 0->1,
-    // still under the threshold of 2) -> falls through to a genuine cache
-    // MISS ("probe1" was never checked) -> check_permission's OWN
-    // pool-fallback attempt ALSO fails (streak 1->2, now AT the threshold —
-    // breaker_admit() checks "< threshold", so this second attempt within
-    // the SAME call was still admitted; the trip is only visible starting
-    // the NEXT call). Denies fail-closed either way.
+    // still under the threshold of 2 — no gauge transition yet) -> falls
+    // through to a genuine cache MISS ("probe1" was never checked) ->
+    // check_permission's OWN pool-fallback attempt ALSO fails (streak 1->2,
+    // NOW at the threshold — this IS a closed->open transition, so the gauge
+    // goes to 1 within this same call). Denies fail-closed either way.
     CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "probe1"));
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
 
     // Second call, immediately after (well inside kRbacGenerationRefreshMs
     // of both the refresh gate AND the breaker's cooldown): maybe_refresh_
     // generation is gated (no pool touch, no breaker interaction) and
     // check_permission's own breaker_admit() now sees streak >= threshold
     // AND the cooldown ungated-since check fails too -> denies WITHOUT any
-    // pool touch. Measure wall time as the black-box proof: no acquire
-    // attempt means this completes in low single-digit ms, versus the
-    // >=250ms (kAuthzAcquireTimeout) a real attempt would cost.
+    // pool touch, and breaker_note_result is never called (no transition,
+    // gauge stays 1). Wall-clock is secondary evidence: no acquire attempt
+    // means this completes in low single-digit ms, versus the >=250ms
+    // (kAuthzAcquireTimeout) a real attempt would cost.
     const auto t0 = std::chrono::steady_clock::now();
     CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "probe2"));
     const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
     CHECK(elapsed < std::chrono::milliseconds(150));
 
     // Clear both the refresh gate and the breaker cooldown, then release
     // the starved connection so the next attempt (the half-open probe) can
-    // genuinely succeed and reset the streak to 0.
+    // genuinely succeed and reset the streak to 0 — an open->closed
+    // transition, so the gauge goes back to 0.
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     held.reset();
     CHECK(replica_b.check_permission("bob", "Infrastructure", "Read"));
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+
+    // The latency histogram (commit C) observes on every check_permission
+    // exit regardless of outcome — three calls above (probe1, probe2, Read),
+    // all counted whether denied or successful.
+    CHECK(metrics.serialize().find("yuzu_server_rbac_authz_check_seconds_count 3") !=
+          std::string::npos);
 }
 
 // quality-engineer (#2703): the F3 staleness predicate, pinned with synthetic

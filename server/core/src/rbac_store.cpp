@@ -254,6 +254,35 @@ bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, Degra
     return new_episode || (n % kReadDegradeLogSample) == 0;
 }
 
+// #2703 Gate 7 merge-slice item 1 commit C: observes on EVERY exit from its
+// enclosing scope (regardless of which return statement fires), so a single
+// instance at the top of check_permission covers every outcome — cache hit,
+// breaker-denied, pool timeout, query error, and success — without touching
+// each return site individually. The observe() call runs in the destructor,
+// which fires after every `{ std::lock_guard ... }` block in the caller has
+// already released, so this never holds cache_mtx_/breaker_mtx_ while
+// touching MetricsRegistry's own lock (the same hazard note_read_degrade's
+// call sites are already careful about, above).
+class ScopedLatencyObserver {
+public:
+    ScopedLatencyObserver(yuzu::MetricsRegistry* metrics, const char* metric_name)
+        : metrics_(metrics), metric_name_(metric_name),
+          start_(std::chrono::steady_clock::now()) {}
+    ~ScopedLatencyObserver() {
+        if (!metrics_)
+            return;
+        const auto elapsed = std::chrono::steady_clock::now() - start_;
+        metrics_->histogram(metric_name_).observe(std::chrono::duration<double>(elapsed).count());
+    }
+    ScopedLatencyObserver(const ScopedLatencyObserver&) = delete;
+    ScopedLatencyObserver& operator=(const ScopedLatencyObserver&) = delete;
+
+private:
+    yuzu::MetricsRegistry* metrics_;
+    const char* metric_name_;
+    std::chrono::steady_clock::time_point start_;
+};
+
 // ── PostgreSQL schema (ADR-0041): the final column set of the SQLite store's
 // four migrations, collapsed into one v1. Migrations v3/v4 were data cleanups
 // against a live rbac.db — a fresh PG database needs neither (nothing to clean),
@@ -1275,11 +1304,30 @@ bool RbacStore::breaker_admit() const {
 }
 
 void RbacStore::breaker_note_result(bool success) const {
-    std::lock_guard lock(breaker_mtx_);
-    if (success)
-        breaker_consecutive_failures_ = 0;
-    else
-        ++breaker_consecutive_failures_;
+    // #2703 Gate 7 item 1 commit C: compute the closed<->open TRANSITION as a
+    // plain optional<bool> under the lock (mirrors maybe_refresh_generation's
+    // existing fire_refresh_failed_degrade split, above) and fire the gauge
+    // only after releasing it — breaker_mtx_ sits on every authz call's
+    // gated paths, so it must never be held while touching MetricsRegistry's
+    // own lock (the same hazard note_read_degrade's call sites already
+    // avoid). Firing only on a TRANSITION (not on every call) also means
+    // this never adds registry-lock contention to the common closed/healthy
+    // path — a gauge doesn't need refreshing on every success once it is
+    // already known to be 0.
+    std::optional<bool> new_open_state;
+    {
+        std::lock_guard lock(breaker_mtx_);
+        const bool was_open = breaker_consecutive_failures_ >= kBreakerTripThreshold;
+        if (success)
+            breaker_consecutive_failures_ = 0;
+        else
+            ++breaker_consecutive_failures_;
+        const bool is_open = breaker_consecutive_failures_ >= kBreakerTripThreshold;
+        if (was_open != is_open)
+            new_open_state = is_open;
+    }
+    if (new_open_state && metrics_)
+        metrics_->gauge("yuzu_server_rbac_breaker_open").set(*new_open_state ? 1.0 : 0.0);
 }
 
 namespace {
@@ -2268,6 +2316,11 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
                                  const std::string& operation) const {
     if (!open_)
         return false; // fail-closed
+
+    // #2703 Gate 7 item 1 commit C: observes on every exit below, whichever
+    // return statement fires — excludes the trivial !open_ short-circuit
+    // above (a structural/administrative state, not a real check attempt).
+    ScopedLatencyObserver latency_obs(metrics_, "yuzu_server_rbac_authz_check_seconds");
 
     maybe_refresh_generation();
 
