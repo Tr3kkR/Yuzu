@@ -83,6 +83,21 @@ constexpr const char* kRevokeCoordLockSql =
 // generation token at most this often on the read hot path.
 constexpr std::int64_t kRbacGenerationRefreshMs = 1000;
 
+// Bounded stale-serve (governance re-review, #2703 Gate 7 — operator-adjudicated
+// design decision, availability-vs-strictness tradeoff): when a generation
+// refresh FAILS (pool timeout, query error — distinct from the gated/in-flight
+// case above, which never touches this), keep serving the last-known-good
+// cache/enabled-state for up to this long past the last successful refresh
+// before dropping trust in it. A refresh failure shorter than this window no
+// longer forces perm_cache_ to empty (avoiding a fleet-wide cache-miss storm on
+// a short Postgres blip) and no longer flips rbac_enforcement_in_effect() to
+// "enforce" for an RBAC-disabled fleet (avoiding a spurious deny-all on a
+// fleet that never turned RBAC on). Deliberately several multiples of
+// kRbacGenerationRefreshMs: it bounds how stale a cross-replica revocation can
+// observably be UNDER DEGRADE ONLY (the ~1s target above is for the healthy
+// case), not the routine steady-state latency.
+constexpr std::int64_t kRbacStaleServeBoundMs = 5000;
+
 // Read-degrade reason labels (ADR-0037 convention). A !open_ store fails boot
 // closed (never serves), so only the pool-timeout / query-error hot-path
 // degrades are counted here.
@@ -1124,12 +1139,28 @@ void RbacStore::maybe_refresh_generation() const {
     {
         std::lock_guard lock(cache_mtx_);
         if (!durable_gen) {
-            // Fail toward "assume changed": drop the cache and stop trusting
-            // it. Do NOT touch rbac_enabled_ — flipping it to disabled would
-            // be fail-open.
+            // Bounded stale-serve (#2703 Gate 7): a refresh failure inside
+            // kRbacStaleServeBoundMs of the last confirmed-good refresh keeps
+            // serving what we already trusted — perm_cache_ stays populated
+            // and generation_valid_/rbac_enabled_ stay as last observed,
+            // instead of unconditionally dropping trust on every transient
+            // blip. Still fires the degrade metric either way (below) so
+            // on-call sees the refresh is failing before the bound is
+            // actually exceeded. Do NOT touch rbac_enabled_ in EITHER branch
+            // — flipping it to disabled would be fail-open.
+            const bool within_stale_serve_bound =
+                generation_valid_ && !rbac_generation::is_stale_beyond_bound(
+                                          now_ms(), last_successful_refresh_ms_,
+                                          kRbacStaleServeBoundMs);
             fire_refresh_failed_degrade = true;
-            perm_cache_.clear();
-            generation_valid_ = false;
+            if (!within_stale_serve_bound) {
+                // Fail toward "assume changed": drop the cache and stop
+                // trusting it — the bound is exceeded, or we never had a
+                // confirmed-good refresh to begin with (generation_valid_
+                // false, e.g. right after construction on a broken pool).
+                perm_cache_.clear();
+                generation_valid_ = false;
+            }
         } else {
             // The refresh genuinely landed — this is the ONLY place (besides
             // boot and a local write) that earns a last_successful_refresh_ms_

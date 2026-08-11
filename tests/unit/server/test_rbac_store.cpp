@@ -1625,7 +1625,8 @@ TEST_CASE("RbacStore: a revoke invalidates a cached allow (generation token)",
 // its own size-1 pool is starved for its next refresh attempt, which
 // genuinely times out and lands in the !durable_gen branch.
 TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation refresh fails "
-          "while another replica has durably enabled RBAC (adversarial-review round, #2703)",
+          "PAST the bounded stale-serve window, while another replica has durably enabled "
+          "RBAC (adversarial-review round, #2703; bounded stale-serve, #2703 Gate 7)",
           "[rbac_store][pg]") {
     RBAC_STORE(replica_a);
     REQUIRE_FALSE(replica_a.is_rbac_enabled()); // fresh install default
@@ -1650,17 +1651,73 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
     // durable re-read rather than serving its just-constructed cache.
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
 
-    // Starve replica_b's own pool: its next maybe_refresh_generation() call
-    // cannot acquire a connection and must time out.
+    // Starve replica_b's own pool for the rest of the test: every subsequent
+    // maybe_refresh_generation() call on replica_b cannot acquire a
+    // connection and must time out (kReadTimeout, ~2s each) — so each of the
+    // two rbac_enforcement_in_effect() calls below costs ~2s of real wall
+    // time, not just whatever explicit sleep separates them.
     auto held = pool_b.acquire();
     REQUIRE(held);
 
-    // Pre-fix: is_rbac_enabled() correctly stays false (the existing
-    // contract), but rbac_enforcement_in_effect() ALSO returned false,
-    // wrongly admitting the full fleet. Post-fix: enforcement stays in
-    // effect because the view is degraded, not confirmed-disabled.
-    CHECK_FALSE(replica_b.is_rbac_enabled());
+    // Bounded stale-serve (#2703 Gate 7, operator-adjudicated): this FIRST
+    // failed refresh attempt lands at roughly construction + 1.1s (the sleep
+    // above) + ~2s (this call's own blocking kReadTimeout) =~ 3.1s -- well
+    // inside kRbacStaleServeBoundMs (5000ms) of replica_b's last confirmed-
+    // good refresh (its own construction). This is the whole point of the
+    // tolerance: a short blip must NOT immediately widen a genuinely-
+    // disabled fleet to enforce. is_open() stays true throughout (no
+    // store-level degrade), only the generation view is briefly unconfirmed.
+    // (Deliberately the ONLY read call in this window — is_rbac_enabled()
+    // and rbac_enforcement_in_effect() each independently trigger their own
+    // ~2s blocking attempt once ungated, so calling both here would consume
+    // TWO attempts and overshoot the bound before this assertion runs.)
+    CHECK_FALSE(rbac_enforcement_in_effect(&replica_b));
+
+    // Push past the bound: this SECOND call needs no extra sleep — the first
+    // call's own ~2s already re-opened the 1s gate, so this one fires
+    // immediately and lands at roughly 3.1s + ~2s =~ 5.1s since
+    // construction, now genuinely past kRbacStaleServeBoundMs.
+    //
+    // Pre-fix (adversarial-review round): is_rbac_enabled() correctly stayed
+    // false (the existing contract), but rbac_enforcement_in_effect() ALSO
+    // returned false, wrongly admitting the full fleet. Post-fix, and now
+    // past the stale-serve bound: enforcement is in effect because the view
+    // is genuinely degraded, not merely aging within tolerance. (Again
+    // deliberately the only read call in this window, for the same reason.)
     CHECK(rbac_enforcement_in_effect(&replica_b));
+}
+
+// #2703 Gate 7 (operator-adjudicated bounded stale-serve): a refresh failure
+// that lands INSIDE the tolerance window must not clear a warm perm_cache_ --
+// that's the entire point of tolerating it (avoid a fleet-wide cache-miss
+// storm on a short blip). Verified via a genuinely warm cache (a real granted
+// permission, actually served from cache), not just the generation flag.
+TEST_CASE("RbacStore: a warm permission cache survives a generation-refresh "
+          "failure inside the stale-serve bound (#2703 Gate 7)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    replica_a.set_rbac_enabled(true);
+    REQUIRE(replica_a.assign_role({"user", "bob", "Administrator"}).has_value());
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+
+    // Clear the refresh gate, let replica_b observe the durable enable +
+    // grant, and genuinely populate perm_cache_ with an ALLOW.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
+
+    // Starve the pool and force one failed refresh attempt inside the bound.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    // Still inside kRbacStaleServeBoundMs of the successful refresh above --
+    // the cached ALLOW must still be served, not silently dropped to a
+    // DB-round-trip (which would itself fail while the pool is starved).
+    CHECK(replica_b.check_permission("bob", "Infrastructure", "Read"));
 }
 
 // quality-engineer (#2703): the F3 staleness predicate, pinned with synthetic

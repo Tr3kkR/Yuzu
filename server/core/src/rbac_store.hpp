@@ -162,11 +162,17 @@ public:
     bool is_rbac_enabled() const;
     void set_rbac_enabled(bool enabled);
     /// True when the cached `rbac_enabled` view is NOT currently backed by a
-    /// successful durable-generation refresh (construction counts as one).
-    /// `rbac_enforcement_in_effect()` treats a degraded view the same as
-    /// "enabled" — a failed refresh must not extend trust in a cached
-    /// `false` any more than it may extend trust in a cached permission
-    /// verdict (ADR-0041 "must NOT extend trust").
+    /// successful durable-generation refresh (construction counts as one) AND
+    /// the last successful refresh is more than `kRbacStaleServeBoundMs`
+    /// (bounded stale-serve, #2703 Gate 7, an operator-adjudicated
+    /// availability-vs-strictness tradeoff) in the past. A refresh failure
+    /// shorter than that bound does NOT degrade the view — the cache keeps
+    /// serving last-known-good state through a short blip rather than
+    /// dropping trust on every transient Postgres timeout.
+    /// `rbac_enforcement_in_effect()` treats a genuinely degraded view the
+    /// same as "enabled" — a refresh failure that HAS exceeded the bound must
+    /// not extend trust in a cached `false` any more than it may extend trust
+    /// in a cached permission verdict (ADR-0041 "must NOT extend trust").
     [[nodiscard]] bool rbac_enabled_view_degraded() const;
 
     // ── Roles CRUD ───────────────────────────────────────────────────────
