@@ -1,6 +1,7 @@
 #include "rbac_store.hpp"
 
 #include "management_group_store.hpp"
+#include "migration_runner.hpp"
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -664,6 +665,73 @@ std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* legacy) {
         });
     if (!ok)
         return std::nullopt;
+
+    // Doomgoose (PR #2703 review, blocking item 2): this snapshot is read
+    // directly off the legacy file via raw SELECTs -- MigrationRunner::run()
+    // (the legacy SQLite migration path, v1-v4) never executes against a
+    // file destined for this Postgres cutover, so a legacy rbac.db that
+    // never itself booted a release carrying migrations v3/v4 still holds
+    // exactly the data those migrations exist to remove. v3 purges
+    // group_members rows for any IdP-sourced (non-local) group -- left in
+    // place, a row keyed on an old, mutable IdP display name becomes a
+    // resurrected confused-deputy hazard: a LOCAL user who later happens to
+    // share that display name silently inherits the group's roles. v4
+    // retires three specific role_permissions tuples (superseded Periodic
+    // Access Review grants). docs/user-manual/upgrading.md documents direct
+    // multi-version upgrades, so refusing outright on an old legacy file
+    // would break that promise for RBAC specifically -- apply the same
+    // predicates those migrations would have applied, inline, to this same
+    // snapshot instead. Both the real backfill and the holder-side
+    // fingerprint (canonicalize_legacy_snapshot, below) derive from THIS
+    // returned snapshot, so neither can see different content than what was
+    // actually decided here.
+    const int legacy_version = MigrationRunner::current_version(legacy, kStoreName);
+    // -1 means the version read itself failed -- no schema_meta table at all
+    // (a file that predates MigrationRunner's adoption in this store, #339,
+    // entirely) or a genuine I/O error. Treat as version 0 (before
+    // everything): the maximally safe assumption, since over-applying either
+    // filter below is bounded-cost (v3's drop re-populates on the affected
+    // user's next SSO login via reconcile_idp_memberships; v4's drop only
+    // risks silently re-removing a grant an operator deliberately restored
+    // after v4 originally ran, on this one-time cutover, a narrow edge case
+    // next to the confused-deputy hazard under-filtering risks).
+    const int effective_version = legacy_version < 0 ? 0 : legacy_version;
+    std::size_t members_dropped = 0, perms_dropped = 0;
+    if (effective_version < 3) {
+        std::unordered_set<std::string> idp_groups;
+        for (const auto& g : snap.groups)
+            if (g.source != "local")
+                idp_groups.insert(g.name);
+        const auto before = snap.members.size();
+        std::erase_if(snap.members,
+                      [&](const LMember& m) { return idp_groups.contains(m.group_name); });
+        members_dropped = before - snap.members.size();
+    }
+    if (effective_version < 4) {
+        struct RetiredTuple {
+            std::string_view role, securable_type, operation;
+        };
+        static constexpr std::array<RetiredTuple, 3> kRetired{{
+            {"Administrator", "AuditLog", "Attest"},
+            {"Reviewer", "AuditLog", "Read"},
+            {"Reviewer", "AuditLog", "Attest"},
+        }};
+        const auto before = snap.perms.size();
+        std::erase_if(snap.perms, [&](const LPerm& p) {
+            return std::any_of(kRetired.begin(), kRetired.end(), [&](const RetiredTuple& t) {
+                return p.role_name == t.role && p.securable_type == t.securable_type &&
+                       p.operation == t.operation;
+            });
+        });
+        perms_dropped = before - snap.perms.size();
+    }
+    if (members_dropped || perms_dropped) {
+        spdlog::warn(
+            "RbacStore: migrate_from_sqlite: legacy db is at schema_meta version {} (< 4) -- "
+            "applied v3/v4 cleanup predicates inline before backfill: dropped {} stale IdP "
+            "group-membership row(s), {} retired role_permissions tuple(s)",
+            legacy_version, members_dropped, perms_dropped);
+    }
     return snap;
 }
 

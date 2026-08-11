@@ -1238,6 +1238,54 @@ void make_legacy_rbac_db(const std::filesystem::path& path, bool enabled) {
     REQUIRE(sqlite3_exec(db.get(), cfg.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
 }
 
+// Doomgoose (PR #2703 review, blocking item 2): a legacy rbac.db carrying
+// exactly the two patterns migrations v3/v4 exist to remove — an IdP-sourced
+// group with a stale, display-name-keyed membership row, and one of the
+// three role_permissions tuples v4 retires — at a caller-chosen schema_meta
+// version (nullopt = no schema_meta table at all, matching a file that
+// predates MigrationRunner's adoption in this store, #339, entirely).
+// migrate_from_sqlite never runs MigrationRunner against this path, so
+// these rows only get cleaned up if migrate_from_sqlite's own inline v3/v4
+// filtering does it.
+void make_legacy_rbac_db_pre_cleanup(const std::filesystem::path& path,
+                                     std::optional<int> schema_version) {
+    SqliteDb db;
+    REQUIRE(sqlite3_open_v2(path.string().c_str(), db.addr(),
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+    const char* ddl =
+        "CREATE TABLE securable_types (name TEXT PRIMARY KEY, description TEXT, is_system INTEGER);"
+        "CREATE TABLE operations (id TEXT PRIMARY KEY, description TEXT, is_system INTEGER);"
+        "CREATE TABLE roles (name TEXT PRIMARY KEY, description TEXT, is_system INTEGER, created_at "
+        "INTEGER);"
+        "CREATE TABLE role_permissions (role_name TEXT, securable_type TEXT, operation TEXT, effect "
+        "TEXT);"
+        "CREATE TABLE principal_roles (principal_type TEXT, principal_id TEXT, role_name TEXT);"
+        "CREATE TABLE groups (name TEXT PRIMARY KEY, description TEXT, source TEXT, external_id "
+        "TEXT, created_at INTEGER);"
+        "CREATE TABLE group_members (group_name TEXT, username TEXT);"
+        "CREATE TABLE rbac_config (key TEXT PRIMARY KEY, value TEXT);"
+        // v3 hazard: an IdP-sourced group with a membership row keyed on a
+        // mutable display name a later LOCAL user could share.
+        "INSERT INTO groups VALUES ('stale-idp-team', 'old IdP group', 'entra', 'ext-1', 7);"
+        "INSERT INTO group_members VALUES ('stale-idp-team', 'jdoe');"
+        // v4 hazard: one of the three specifically-retired grant tuples — a
+        // fresh-install Reviewer never gets this (seed_defaults() doesn't
+        // grant it), so its post-migration presence is attributable ONLY to
+        // this row surviving unfiltered.
+        "INSERT INTO role_permissions VALUES ('Reviewer', 'AuditLog', 'Read', 'allow');"
+        "INSERT INTO rbac_config VALUES ('enabled', 'false');";
+    SqliteErrMsg err;
+    REQUIRE(sqlite3_exec(db.get(), ddl, nullptr, nullptr, err.addr()) == SQLITE_OK);
+    if (schema_version) {
+        const std::string meta =
+            "CREATE TABLE schema_meta (store TEXT PRIMARY KEY, version INTEGER NOT NULL, "
+            "upgraded_at INTEGER NOT NULL);"
+            "INSERT INTO schema_meta VALUES ('rbac_store', " + std::to_string(*schema_version) +
+            ", 0);";
+        REQUIRE(sqlite3_exec(db.get(), meta.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+}
+
 // governance re-review (PR #2703, BLOCKING — canonicalization collision):
 // minimal legacy DB with exactly ONE role, whose name/description are the
 // caller's choice — lets a test craft two field splits that would collide
@@ -1484,6 +1532,61 @@ TEST_CASE("RbacStore: migrate_from_sqlite verifies a matching fingerprint when t
     // branch retries move_legacy_aside — machine-check that it actually
     // ran, not just that migrate_from_sqlite returned true.
     CHECK_FALSE(std::filesystem::exists(legacy.path));
+}
+
+// Doomgoose (PR #2703 review, BLOCKING item 2): a legacy rbac.db with no
+// schema_meta table at all (the maximally-unmigrated case) carries the two
+// patterns migrations v3/v4 exist to clean up. migrate_from_sqlite must
+// apply the same predicates inline rather than blindly copying stale rows
+// forward — a stale IdP group membership becomes a resurrected confused-
+// deputy hazard (a later LOCAL user sharing the old display name silently
+// inherits the group's roles), and the retired role_permissions tuple
+// becomes a stale grant a fresh install would never have.
+TEST_CASE("RbacStore: migrate_from_sqlite applies v3/v4 legacy cleanup predicates inline for a "
+          "pre-migration legacy db (Doomgoose PR #2703 review, blocking item 2)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_precleanup_v0-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db_pre_cleanup(legacy.path, /*schema_version=*/std::nullopt);
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    // v3 hazard: the stale IdP-sourced membership must NOT have carried
+    // forward — a LOCAL user later named "jdoe" must not silently inherit
+    // stale-idp-team's roles via this row.
+    CHECK(store.get_group_members("stale-idp-team").empty());
+
+    // v4 hazard: the retired Reviewer/AuditLog/Read grant must NOT have
+    // carried forward. A fresh-install Reviewer never gets this permission
+    // (superseded by the dedicated AccessReview securable) — its presence
+    // here would be attributable only to the unfiltered legacy row.
+    REQUIRE(store.assign_role({"user", "carol", "Reviewer"}).has_value());
+    CHECK_FALSE(store.check_permission("carol", "AuditLog", "Read"));
+}
+
+// The control counterpart: a legacy db that already ran migrations v3/v4
+// (schema_meta version 4) must NOT have its content filtered — the v3/v4
+// predicates apply only to a legacy file that itself never ran them. Proves
+// the version check gates correctly in both directions, not just that
+// filtering happens at all.
+TEST_CASE("RbacStore: migrate_from_sqlite does NOT filter a legacy db that already ran "
+          "migrations v3/v4 (control for Doomgoose PR #2703 review, blocking item 2)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_precleanup_v4-"};
+    std::filesystem::remove(legacy.path);
+    // Same content as the hazard fixture, but stamped as already having run
+    // v4 -- a real post-v4 legacy file would never actually carry this
+    // content (the migrations would have deleted it on that release's own
+    // boot), but using the identical rows here isolates the version-gate
+    // logic itself from the fixture's own content, matching this file's
+    // established practice of testing one variable at a time.
+    make_legacy_rbac_db_pre_cleanup(legacy.path, /*schema_version=*/4);
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    CHECK(store.get_group_members("stale-idp-team") == std::vector<std::string>{"jdoe"});
+    REQUIRE(store.assign_role({"user", "carol", "Reviewer"}).has_value());
+    CHECK(store.check_permission("carol", "AuditLog", "Read"));
 }
 
 // governance re-review (PR #2703, HIGH — unhappy-path, EMPIRICALLY reproduced
