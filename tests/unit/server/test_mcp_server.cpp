@@ -2636,6 +2636,52 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
         CHECK(tool["inputSchema"].contains("type"));
     }
 
+    // #2972: mechanical completeness gate for A5's typed-output-schema
+    // requirement (docs/agentic-first-principle.md). Before this, the only
+    // outputSchema check in this file was the get_fleet_posture_fast
+    // special-case below - #2712's own filing named that as the reason the
+    // other ~45 gaps were invisible to CI. This closed, explicit exemption
+    // set is the retrofit backlog #2712 tracks (execute_*/writes family,
+    // not yet done); every tool NOT in it must advertise
+    // outputSchema, or this test fails - so a NEW tool merging without one
+    // fails immediately, and exempting one requires editing this literal
+    // list, a visible reviewable diff line rather than a silent gap. Mirrors
+    // the kToolAnnotation completeness check above
+    // (CHECK(classified == listed)). DEX + network family (#2712 batch 2) is
+    // no longer exempt - it now has real schemas, see the shared handler
+    // blocks in mcp_server.cpp.
+    //
+    // CAVEAT (adversarial review of PR #2978, 2026-08-11): this gate checks
+    // outputSchema PRESENCE, not typed-NESS - it does not reject the generic
+    // `kObjectOutputSchema` placeholder ({"type":"object",
+    // "additionalProperties":true}) for a non-exempt tool whose result shape
+    // is actually stable, per docs/agentic-first-principle.md A5 item 4's
+    // own text. assign_engine_role/unassign_engine_role/list_engine_roles
+    // were typed properly as a result of that review; a handful of other
+    // non-exempt tools (the discover_* family, classify_operational_
+    // question, get_incident_playbook, summarize_working_set) still ship
+    // the placeholder and pass this gate anyway - tracked as #2986, not
+    // silently ignored.
+    static const std::set<std::string> kOutputSchemaExempt = {
+        // execute_* + writes family (#2712 batch 3, not started)
+        "execute_instruction",
+        "execute_bundle",
+        "get_bundle_result",
+        "revoke_certificate",
+        "quarantine_device",
+        "delete_tag",
+        "set_tag",
+        "approve_request",
+        "reject_request",
+    };
+    for (const auto& tool : tools) {
+        const auto name = tool["name"].get<std::string>();
+        if (kOutputSchemaExempt.count(name))
+            continue;
+        INFO("tool = " << name);
+        CHECK(tool.contains("outputSchema"));
+    }
+
     // Spot-check specific tool names are present
     std::vector<std::string> expected_names = {"list_agents",
                                                "get_agent_details",
@@ -2708,6 +2754,20 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
     CHECK(agents[0]["hostname"] == "web-01");
     CHECK(agents[1]["agent_id"] == "agent-002");
     CHECK(agents[1]["os"] == "windows");
+
+    // #2712: structuredContent wraps the SAME rows under "agents" - a
+    // schema-conformant sibling of content, not a replacement for it. The
+    // bare-array content[0].text above is the pre-#2712 wire shape, unchanged
+    // for backward compat; a client that only reads content[0].text sees no
+    // behavior change at all.
+    REQUIRE(result.contains("structuredContent"));
+    auto& sc = result["structuredContent"];
+    REQUIRE(sc.contains("agents"));
+    REQUIRE(sc["agents"].is_array());
+    CHECK(sc["agents"].size() == 2);
+    CHECK(sc["agents"][0]["agent_id"] == "agent-001");
+    CHECK(sc["agents"][1]["agent_id"] == "agent-002");
+    CHECK(sc["agents"] == agents); // same rows, just wrapped
 
     // Verify audit was recorded
     REQUIRE(ts.audit_log.size() >= 1);
@@ -3049,6 +3109,13 @@ TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool ca
     CHECK(ts.audit_log.back() == "mcp.list_dex_signals|success");
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.signal.view") == std::string::npos);
+
+    // #2712 batch 2: content[0].text stays the bare array (backward compat);
+    // structuredContent wraps the SAME rows under "signals".
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("signals"));
+    CHECK(sc["signals"] == rows);
 }
 
 TEST_CASE("MCP DEX: list_dex_signals os filter scopes the catalogue rollup (A1 parity)",
@@ -3105,6 +3172,13 @@ TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as
             macos_types = r["distinct_types"].get<int>();
     CHECK(macos_types == 2); // process.crashed + storage.low
     CHECK(ts.audit_log.back() == "mcp.get_dex_signal_scope|success");
+
+    // #2712 batch 2: content[0].text stays the bare array (backward compat);
+    // structuredContent wraps the SAME rows under "platforms".
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("platforms"));
+    CHECK(sc["platforms"] == rows);
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
@@ -3323,6 +3397,41 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
     CHECK_FALSE(cohorts["cohorts"][1].contains("cpu_pct"));
 }
 
+// #2712 batch 2: get_dex_perf_fleet's payload is already object-shaped (no
+// array wrap needed - the shared block still routes it through
+// tool_result_split() with structured_payload==payload, same as content);
+// get_dex_perf_cohorts needs the suppressed cohort's stat fields OMITTED
+// from structuredContent too, not just from content[0].text - the
+// anonymization floor must hold in both.
+TEST_CASE("MCP DEX perf: structuredContent mirrors content for fleet + cohorts, "
+          "suppression omits stats in both",
+          "[mcp][integration][dex][perf]") {
+    McpTestServer ts;
+    ts.dex_perf_fn_for_test = mcp_perf_snapshot;
+    ts.start("readonly");
+
+    auto fleet_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":150,"params":{"name":"get_dex_perf_fleet","arguments":{}}})");
+    auto fleet_body = nlohmann::json::parse(fleet_res->body);
+    REQUIRE(fleet_body["result"].contains("structuredContent"));
+    auto fleet_text = nlohmann::json::parse(
+        fleet_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fleet_body["result"]["structuredContent"] == fleet_text);
+
+    auto cohorts_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":151,"params":{"name":"get_dex_perf_cohorts","arguments":{"key":"model"}}})");
+    auto cohorts_body = nlohmann::json::parse(cohorts_res->body);
+    REQUIRE(cohorts_body["result"].contains("structuredContent"));
+    auto cohorts_text = nlohmann::json::parse(
+        cohorts_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(cohorts_body["result"]["structuredContent"] == cohorts_text);
+    auto& sc = cohorts_body["result"]["structuredContent"];
+    CHECK(sc["cohorts"][0]["suppressed"] == false);
+    CHECK(sc["cohorts"][0].contains("cpu_pct")); // unsuppressed cohort keeps its stats
+    CHECK(sc["cohorts"][1]["suppressed"] == true);
+    CHECK_FALSE(sc["cohorts"][1].contains("cpu_pct")); // floor holds in structuredContent too
+}
+
 TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required params)",
           "[mcp][integration][dex][perf]") {
     McpTestServer ts;
@@ -3341,6 +3450,17 @@ TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required 
     CHECK(diff["a"]["suppressed"] == false);
     CHECK(diff["b"]["suppressed"] == true);
     CHECK(diff["delta_pct"]["cpu_pct"].is_null()); // b suppressed → no comparison
+
+    // #2712 batch 2: this tool's payload is always object-shaped, so
+    // structuredContent is the SAME string as content[0].text - pin that
+    // explicitly for this specific tool rather than relying on the sibling
+    // get_dex_perf_fleet/get_dex_perf_cohorts tests to stand in for it (they
+    // share a dispatch block but take a different ternary branch).
+    auto diff_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":57,"params":{"name":"get_dex_perf_cohort_diff","arguments":{"key":"model","a":"a","b":"b"}}})");
+    auto diff_body = nlohmann::json::parse(diff_res->body);
+    REQUIRE(diff_body["result"].contains("structuredContent"));
+    CHECK(diff_body["result"]["structuredContent"] == diff);
 
     // unknown cohort → found_b false, b null.
     auto missing = mcp_tool_payload(
@@ -3554,6 +3674,22 @@ TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit par
     CHECK(badcohort["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(badcohort["error"]["data"]["correlation_id"].is_string());
 
+    // #2712 batch 2: content[0].text stays the bare array (backward compat -
+    // this tool shipped pre-#2712 returning a bare array); structuredContent
+    // wraps the SAME rows under "devices" so it validates against an
+    // object-typed output schema.
+    auto wrap_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":62,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model"}}})");
+    auto wrap_body = nlohmann::json::parse(wrap_res->body);
+    REQUIRE(wrap_body["result"]["content"][0]["text"].get<std::string>().front() == '[');
+    REQUIRE(wrap_body["result"].contains("structuredContent"));
+    auto& wrap_sc = wrap_body["result"]["structuredContent"];
+    REQUIRE(wrap_sc.contains("devices"));
+    REQUIRE(wrap_sc["devices"].is_array());
+    CHECK(wrap_sc["devices"].size() == 16);
+    CHECK(wrap_sc["devices"] ==
+          nlohmann::json::parse(wrap_body["result"]["content"][0]["text"].get<std::string>()));
+
     // Invalid cohort key → kInvalidParams (REST 400 parity), also A4.
     auto badkey = nlohmann::json::parse(
         ts.call(
@@ -3664,6 +3800,16 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
         CHECK(p["cpu"]["after_mean"].get<double>() == Catch::Approx(4.5));
         CHECK(p["distribution"]["up"] == 2);
         CHECK_FALSE(p.contains("verdict")); // EVIDENTIAL — no pass/fail
+    }
+    SECTION("#2712 batch 2: structuredContent mirrors the already-object payload") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":93,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0"}}})");
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body["result"].contains("structuredContent"));
+        auto text = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        CHECK(body["result"]["structuredContent"] == text);
+        CHECK(body["result"]["structuredContent"]["cpu"]["after_mean"].get<double>() ==
+              Catch::Approx(4.5));
     }
     SECTION("baseline == candidate → kInvalidParams") {
         auto res = ts.call(
@@ -3820,6 +3966,45 @@ TEST_CASE("MCP network: fleet stats + devices (worst-first sort + limit parity)"
             ->body);
     REQUIRE(bad.contains("error"));
     CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+// #2712 batch 2: get_network_fleet's payload is already object-shaped (no
+// wrap); list_network_devices' content[0].text stays the bare array it
+// shipped pre-#2712, structuredContent wraps the SAME rows under "devices".
+TEST_CASE("MCP network: structuredContent mirrors fleet, wraps devices under "
+          "\"devices\"",
+          "[mcp][integration][network]") {
+    McpTestServer ts;
+    ts.net_perf_fn_for_test = [](const std::string&) {
+        yuzu::server::NetPerfSnapshot snap;
+        yuzu::server::NetPerfDevice d;
+        d.agent_id = "hi-0";
+        d.platform = "linux";
+        d.rtt_ms = 500.0;
+        d.cohort = "site-a";
+        snap.devices.push_back(d);
+        return snap;
+    };
+    ts.start("readonly");
+
+    auto fleet_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":160,"params":{"name":"get_network_fleet","arguments":{}}})");
+    auto fleet_body = nlohmann::json::parse(fleet_res->body);
+    REQUIRE(fleet_body["result"].contains("structuredContent"));
+    auto fleet_text =
+        nlohmann::json::parse(fleet_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fleet_body["result"]["structuredContent"] == fleet_text);
+
+    auto dev_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":161,"params":{"name":"list_network_devices","arguments":{}}})");
+    auto dev_body = nlohmann::json::parse(dev_res->body);
+    REQUIRE(dev_body["result"]["content"][0]["text"].get<std::string>().front() == '[');
+    REQUIRE(dev_body["result"].contains("structuredContent"));
+    auto& dev_sc = dev_body["result"]["structuredContent"];
+    REQUIRE(dev_sc.contains("devices"));
+    REQUIRE(dev_sc["devices"].size() == 1); // pin against a vacuous empty==empty pass
+    CHECK(dev_sc["devices"] ==
+          nlohmann::json::parse(dev_body["result"]["content"][0]["text"].get<std::string>()));
 }
 
 TEST_CASE("MCP network: tools report unavailable when no provider is wired",
@@ -4357,6 +4542,21 @@ TEST_CASE("MCP Integration: tools/call validate_scope", "[mcp][integration]") {
 
     auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
     CHECK(text["valid"] == true);
+
+    // #2712: the output schema uses oneOf (valid:true+expression XOR
+    // valid:false+error, never both) - the one union-type schema in this
+    // file's MCP tool set (no other existing precedent). Pin the branch this
+    // call actually exercises: structuredContent must carry expression, and
+    // must NOT carry error, matching the schema's exclusivity claim, not
+    // just the schema's own text.
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["valid"] == true);
+    CHECK(sc.contains("expression"));
+    CHECK_FALSE(sc.contains("error"));
+    // Echoed verbatim, not canonicalized (the schema description says so -
+    // verify the claim, don't just repeat it).
+    CHECK(sc["expression"] == "os == \"linux\"");
 }
 
 // ── 15. validate_scope with invalid expression ──────────────────────────────
@@ -4378,6 +4578,14 @@ TEST_CASE("MCP Integration: tools/call validate_scope invalid expression", "[mcp
     auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
     CHECK(text["valid"] == false);
     CHECK(text.contains("error"));
+
+    // #2712: the other oneOf branch - valid:false+error, and must NOT carry
+    // expression (the exclusivity the schema's oneOf claims).
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["valid"] == false);
+    CHECK(sc.contains("error"));
+    CHECK_FALSE(sc.contains("expression"));
 }
 
 // ── 16. Missing jsonrpc version field through HTTP ──────────────────────────
@@ -4445,6 +4653,13 @@ TEST_CASE("MCP Integration: tools/call get_agent_details", "[mcp][integration]")
     CHECK(text["agent_id"] == "agent-001");
     CHECK(text["hostname"] == "web-01");
     CHECK(text["os"] == "linux");
+
+    // #2712: this tool already returned a flat object pre-#2712 (no bare-
+    // array wire-format concern), so structuredContent is just the SAME
+    // payload the plain tool_result() overload emits - verify it's actually
+    // present and identical, not merely that the wrap-cases work.
+    REQUIRE(body["result"].contains("structuredContent"));
+    CHECK(body["result"]["structuredContent"] == text);
 }
 
 // ── 20. get_agent_details with unknown agent ────────────────────────────────
@@ -5899,6 +6114,21 @@ TEST_CASE("MCP query_responses: dropped success-audit surfaces audit_persisted:f
     // The rows are still returned (the read succeeded); only the evidence gap is flagged.
     auto rows = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
     CHECK(rows.size() == 1);
+
+    // #2712: structuredContent combines the rows (under "responses") AND the
+    // SAME conditional flag into one object - this is the tool whose legacy
+    // shape put audit_persisted/result_truncated_by_cap as siblings of
+    // content rather than inside it, so structuredContent's construction is
+    // bespoke (not the generic tool_result_split wrap every other tool in
+    // this batch uses). Pin that the conditional flag actually propagates
+    // into BOTH places, not just the legacy one.
+    REQUIRE(result.contains("structuredContent"));
+    auto& sc = result["structuredContent"];
+    REQUIRE(sc.contains("responses"));
+    CHECK(sc["responses"] == rows);
+    REQUIRE(sc.contains("audit_persisted"));
+    CHECK(sc["audit_persisted"] == false);
+    CHECK_FALSE(sc.contains("result_truncated_by_cap")); // not hit in this case
 }
 
 TEST_CASE("MCP query_responses: limit > INT_MAX clamps to the cap, not to 1 (#1550 LOW)",
@@ -7185,6 +7415,20 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
     }
     CHECK(saw_denied);
     CHECK(saw_success);
+
+    // #2712/adversarial-review-of-PR#2978: structuredContent wraps the SAME
+    // rows under "software" (content[0].text stays the legacy bare array),
+    // and carries devices_omitted as a genuine JSON INTEGER (not the
+    // quoted-string regression #2973 was wrongly filed against) - pin this
+    // on the one test that actually has a nonzero scope-drop count.
+    REQUIRE(envelope.at("result").contains("structuredContent"));
+    auto& sc = envelope.at("result").at("structuredContent");
+    REQUIRE(sc.contains("software"));
+    CHECK(sc["software"] == rows_json);
+    REQUIRE(sc.contains("devices_omitted"));
+    CHECK(sc["devices_omitted"].is_number_integer());
+    CHECK(sc["devices_omitted"].get<int>() == 1); // agent-out, the one dropped device
+    CHECK_FALSE(sc.contains("audit_persisted")); // fake test audit_fn succeeds
 }
 
 TEST_CASE("MCP query_installed_software: a degraded store errors, never success+[] "
@@ -7658,6 +7902,17 @@ TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + d
     }
     CHECK(saw_denied);
     CHECK(saw_success);
+
+    // #2712/adversarial-review-of-PR#2978: structuredContent wraps the SAME
+    // rows under "results" (content[0].text stays the legacy bare array) -
+    // pin this for the scope-filtered case specifically, since it's the one
+    // that also has the conditional audit_persisted sibling flag to get
+    // right in both shapes.
+    REQUIRE(result.contains("structuredContent"));
+    auto& sc = result["structuredContent"];
+    REQUIRE(sc.contains("results"));
+    CHECK(sc["results"] == groups);
+    CHECK_FALSE(sc.contains("audit_persisted")); // fake test audit_fn succeeds
 }
 
 TEST_CASE("MCP aggregate_responses: no filter when scope predicate is unwired (legacy-open) (#1634)",

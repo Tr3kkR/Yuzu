@@ -390,6 +390,7 @@ conditions and the triage differs. The current rule set is
 
 | Alert | What it means | Go to |
 |---|---|---|
+| `YuzuServerRestartLoop` | The server has restarted more than 3 times in the last 3 hours --- a process-health signal, not itself an audit-store fault, but a common CAUSE of the retention alerts below. | [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuserverrestartloop). |
 | `YuzuAuditRetentionClockAnomaly` | A pass declined. Nothing was deleted. | Read on. |
 | `YuzuAuditRetentionFailing` | The pass is **erroring**, not declining. | `yuzu_server_audit_cleanup_failed_total` in the metric table below. |
 | `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and the audit store grows without bound. | Triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionnotrunning) --- **start there**: it opens with the routine, self-clearing causes (a Prometheus restart false-pages for ~45 minutes) before the real diagnosis, and it states the cadence band where this rule cannot fire at all (measured: [`prometheus/blind-band-measurement.md`](../prometheus/blind-band-measurement.md)). Then `yuzu_server_audit_retention_passes_total` in the metric table below. |
