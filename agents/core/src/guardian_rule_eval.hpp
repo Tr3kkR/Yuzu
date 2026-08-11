@@ -153,6 +153,13 @@ struct RuleEvalState {
                                 ///< if the value is unchanged, so the server re-learns compliance after an
                                 ///< errored gap. Set on Unknown (EmitDeciderState otherwise untouched),
                                 ///< cleared by the forced verdict in `pack`.
+    /// M1 item (a), runtime-owned (not touched by eval_file/eval_registry/eval_service):
+    /// the clock reading at the last guard.unhealthy EMISSION for this rule, edge or
+    /// refresh. Default-constructed (epoch) so the FIRST edge always fires regardless
+    /// of errored_refresh_ms - only a later refresh check needs a real timestamp to
+    /// compare against. Mutated by GuardianSparkRuntime's commit section alongside the
+    /// scratch-then-commit pattern every other field here already follows.
+    std::chrono::steady_clock::time_point last_unhealthy_emit{};
 };
 
 /// What an evaluation decided.

@@ -732,9 +732,9 @@ static const ToolDef kTools[] = {
      "the tools/call params and notifications/progress frames (agents responded / targeted, with "
      "the execution_id in _meta under \"yuzu.execution_id\") are delivered as the fleet "
      "responds. WHERE they arrive is your choice, per request: send an SSE-capable Accept "
-     "(text/event-stream) with the token and - IF the server has streamed POST enabled "
-     "(--mcp-enable-streamed-post; OFF by default, so assume not unless you have "
-     "confirmed it) - THIS POST response is held open as the stream. Otherwise you get "
+     "(text/event-stream) with the token and - streamed POST is on by default "
+     "(--mcp-enable-streamed-post; assume enabled unless the server has opted out with "
+     "--no-mcp-streamed-post) - THIS POST response is held open as the stream. Otherwise you get "
      "a normal complete JSON answer and progress arrives on the session GET channel - "
      "progress frames first, the JSON-RPC result last, then EOF; send the token WITHOUT an SSE "
      "Accept and this POST answers immediately in JSON while the frames go to the session's GET "
@@ -6629,14 +6629,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // The three wiring deps are part of eligibility, not assertions: a
                 // build_handler caller that omits any of them (every pre-3b test)
                 // gets today's plain path rather than a stream it cannot service.
-                // 3b still ships DORMANT, but no longer because it is unsound: the
-                // four defects that gated the flip are fixed - #2739 (the response
-                // cap now fires on a busy execution: the drain-then-settle state in
+                // 3b now ships ON by default: the four defects that gated the flip
+                // are fixed - #2739 (the response cap now fires on a busy
+                // execution: the drain-then-settle state in
                 // mcp_stream_bridge.cpp's project_record), #2740 (an undelivered
                 // final no longer holds a session slot for good: the reclaim in
                 // McpStreamBridge::reserve), #2785 (POST frames carry the ring event
-                // id) and #2789 (per-principal reject coverage). Turning the default
-                // on is a SEPARATE rung, so this flag stays off here.
+                // id) and #2789 (per-principal reject coverage). An operator can
+                // still opt out with --no-mcp-streamed-post.
                 //
                 // nullptr reads as OFF, so every caller that does not opt in - incl.
                 // every pre-3b test - gets the plain path, matching the wiring-deps
