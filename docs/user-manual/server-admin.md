@@ -701,7 +701,8 @@ per-principal bullets above because they are no longer conditional on opting in
   Cloudflare) or running an MCP client whose HTTP transport can't consume a
   streamed response body**, verify SSE-on-POST actually reaches your client
   before upgrading (see the Reverse proxies bullet above) — otherwise a call
-  that previously answered promptly can appear to hang for up to the 120 s cap.
+  that previously answered promptly can appear to hang for up to the ~156 s
+  worst-case bound (see the Sizing bullet above), not just the 120 s cap.
   Pass `--no-mcp-streamed-post` if you'd rather verify after upgrading.
 
 **To opt out**, pass `--no-mcp-streamed-post` (or set
