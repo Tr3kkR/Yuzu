@@ -26,8 +26,8 @@ TWO SCENARIOS, because one rule cannot answer both restart-liveness questions.
 `anchored` seeds the stamp series at a constant non-zero unix time (a database
 that has run before, whose reaper died) and gates `YuzuAuditRetentionNotRunning`.
 `fresh` seeds it flat `0` (a database that has never run one) and gates
-`YuzuAuditRetentionNeverRan`. `YuzuAuditRetentionNeverRan` does not exist until
-rung D lands; a scenario whose alert is absent from the rules file is reported
+`YuzuAuditRetentionNeverRan` (shipped by rung D; during rungs B/C it did not
+exist yet). A scenario whose alert is absent from the rules file is reported
 as `alert_present: false` with EVERY sampled cadence uncovered by definition,
 not an abort - see the comment on `extract()`.
 
@@ -177,11 +177,11 @@ def extract(text: str, alert: str) -> tuple[dict, bool]:
     """The named alert's rule(s), and whether it exists in the file at all.
 
     DOES NOT sys.exit on absence, unlike the pre-rung-B version. `fresh`'s
-    alertname (`YuzuAuditRetentionNeverRan`) does not exist until rung D lands,
-    and rung B ships first by design (Sol's land-order review: the manifest
+    alertname (`YuzuAuditRetentionNeverRan`) did not exist until rung D landed,
+    and rung B shipped first by design (Sol's land-order review: the manifest
     and gate mechanics need independent review before the redesign changes
-    what they gate) - so "alert not in the rules file yet" is an ordinary,
-    expected state for this scenario during rung B/C, not a script bug. A
+    what they gate) - so "alert not in the rules file yet" was an ordinary,
+    expected state for this scenario during rungs B/C, not a script bug. A
     future reader who "fixes" this back to fail-fast breaks every `fresh`
     manifest entry the moment this rung merges.
     """
@@ -213,8 +213,8 @@ def case(cadence: int, interval_s: int, scenario: str, alert: str) -> dict:
 
     THE ASSERTION WRAPS IN `count(...)` rather than naming `ALERTS{}`'s full
     label set. That set is whatever the rule's own `labels:` block plus its
-    expression's inherited series labels produce, and differs between today's
-    rule, rung C's new rule and rung D's redesign - hardcoding it would make
+    expression's inherited series labels produce, and differs between the
+    rules this script has measured across its life - hardcoding it would make
     this generator brittle to a relabel that has nothing to do with coverage.
     `count(ALERTS{alertname=..., alertstate="firing"})` aggregates to a single
     anonymous sample (`exp_samples: [{"labels": "{}", "value": 1}]`) when
@@ -457,7 +457,8 @@ def full_sweep(mode: str, native_argv: list[str] | None, rules_ref: str | None,
         for interval_s in intervals:
             if not found:
                 # Selected-but-absent: fully uncovered by definition, not an
-                # abort and not a docker call - `fresh` before rung D lands.
+                # abort and not a docker call - `fresh`'s state during rungs
+                # B/C, and any future scenario that ships ahead of its alert.
                 by_interval[str(interval_s)] = list(cadences)
             else:
                 by_interval[str(interval_s)] = measure(
