@@ -203,6 +203,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -5575,6 +5576,51 @@ public:
 
         stop_requested_.store(true, std::memory_order_release);
 
+        // #2703 Gate 7 merge-slice item 2: stop admitting/serving new HTTP
+        // work as early as reasonably possible — moved up from the old
+        // position after the entire thread-join cascade below, which left
+        // the server fully live and EVERY route (except /readyz, which
+        // already checks draining_ above) admitted and FULLY PROCESSED for
+        // the whole cascade's duration, including racing new work against
+        // stores this same function tears down a few lines later. The 30s
+        // execution-drain window above already gives a load balancer a
+        // /readyz-503 grace period before this point, so closing the
+        // listening socket here does not shorten that signal.
+        //
+        // begin_closing() BEFORE web_server_->stop(): flips the shutdown
+        // signal the /events, /api/v1/events, and dashboard-executions-
+        // drawer SSE providers already re-check every <=3s tick
+        // (StreamBudget::closing()), so an idle held-open stream on one of
+        // those three surfaces closes within one tick instead of pinning
+        // its httplib worker until the client disconnects. Flipped here
+        // (not at the draining_.store(true) point above) so an EventSource
+        // client doesn't see its connection torn down mid-drain and start
+        // auto-reconnect churn for the whole 30s window — it only happens
+        // once the socket is genuinely about to stop accepting anyway.
+        //
+        // NOT wired into the MCP GET/streamed-POST surfaces: McpStreamPump's
+        // teardown is driven by session_alive_/session-registry
+        // revalidation, a materially different mechanism (see
+        // StreamBudget::closing()'s doc comment) — an open MCP stream still
+        // relies on the bounded web-thread join below as its backstop.
+        // Tracked as a named follow-up, not silently left uncovered.
+        if (stream_budget_)
+            stream_budget_->begin_closing();
+
+        // Stop cert reloader before web server (it holds a pointer to
+        // web_server_) — moved up alongside web_server_->stop() for the
+        // same early-admission-stop reason.
+        if (cert_reloader_) {
+            cert_reloader_->stop();
+            cert_reloader_.reset();
+        }
+        if (redirect_server_) {
+            redirect_server_->stop();
+        }
+        if (web_server_) {
+            web_server_->stop();
+        }
+
         // Signal AuthDB's provisional-MFA reaper to stop up front (it is owned
         // inside AuthDB, not a ServerImpl member thread, so it is not in the
         // joins below). This is signal-only — the join happens at
@@ -5663,23 +5709,60 @@ public:
         // reap_expired() is ticked from the result-set maintenance thread below,
         // which is joined before result_set_store_/guaranteed_state_store_ reset.
 
-        // Stop cert reloader before web server (it holds a pointer to web_server_)
-        if (cert_reloader_) {
-            cert_reloader_->stop();
-            cert_reloader_.reset();
-        }
-
-        if (redirect_server_) {
-            redirect_server_->stop();
-        }
+        // cert_reloader_/redirect_server_/web_server_ were already stopped
+        // early, above (#2703 Gate 7 item 2) — just the joins remain here.
+        // redirect_thread_ gets a bare join: the redirect server serves only
+        // 301s, never a held-open response, so unlike web_thread_ it has no
+        // plausible hang scenario and does not need the bounded treatment
+        // below.
         if (redirect_thread_.joinable()) {
             redirect_thread_.join();
         }
-        if (web_server_) {
-            web_server_->stop();
-        }
+
+        // #2703 Gate 7 merge-slice item 2 (operator-adjudicated: 15s
+        // shutdown grace bound). std::thread has no timed join, so
+        // web_thread_'s body signals web_thread_done_ right after
+        // web_server_->listen() returns (already closed above) and this
+        // waits on that signal instead of a bare join(). On the fast path —
+        // the common case once the close-signal above has drained every
+        // /events / /api/v1/events / dashboard-drawer stream — this returns
+        // within one keep-alive tick, well under the bound.
+        //
+        // Escalation is a deliberate std::_Exit, NOT the nvd_sync
+        // leak-and-continue precedent a few lines above: nvd_sync's leak
+        // works because releasing nvd_sync_ keeps everything the wedged
+        // thread references alive, and nothing ELSE in this function
+        // touches it again. A wedged HTTP worker captures `this` and half
+        // of ServerImpl's stores — continuing teardown (every
+        // reset()/destructor below) past a thread that might still be
+        // running a handler against those same stores is a use-after-free
+        // farm, not a leak. `_Exit` skips the remaining teardown below
+        // (including offload_target_store_->flush_all(), the RESTART-1 fix)
+        // exactly the same way a supervisor SIGKILL would — strictly no
+        // worse, and it only fires when the close-signal above did NOT
+        // reach every stream: an open MCP GET/streamed-POST connection (the
+        // one surface item 2 does not close-signal — see
+        // StreamBudget::closing()'s doc comment) or a genuinely wedged
+        // handler.
         if (web_thread_.joinable()) {
-            web_thread_.join();
+            std::unique_lock<std::mutex> lk(web_thread_done_mtx_);
+            const bool finished = web_thread_done_cv_.wait_for(
+                lk, std::chrono::seconds(15), [this] { return web_thread_done_; });
+            lk.unlock();
+            if (finished) {
+                web_thread_.join();
+            } else {
+                spdlog::critical(
+                    "ServerImpl::stop: web thread did not finish within the 15s "
+                    "shutdown grace bound (#2703 Gate 7 item 2) — most likely an "
+                    "open MCP GET/streamed-POST connection (not covered by the SSE "
+                    "close-signal above) or a genuinely wedged handler. "
+                    "Force-exiting rather than risking a use-after-free by "
+                    "continuing teardown past a thread that may still be running "
+                    "against these same stores.");
+                spdlog::default_logger()->flush();
+                std::_Exit(1);
+            }
         }
 
         // Phase 8.3 #255 — drain offload batch buffers BEFORE the store is
@@ -9556,8 +9639,9 @@ private:
             // of releasing early at post-routing.
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
-                    return detail::sse_content_provider(sink_state, offset, sink);
+                [sink_state, budget = stream_budget_.get()](size_t offset,
+                                                            httplib::DataSink& sink) -> bool {
+                    return detail::sse_content_provider(sink_state, offset, sink, budget);
                 },
                 detail::adopt_quota_slot_into_stream(
                     [sink_state, bus, lease](bool success) noexcept {
@@ -15655,6 +15739,15 @@ private:
                 spdlog::info("Web UI available at http://{}:{}/", cfg_.web_address, listen_port);
             }
             web_server_->listen(cfg_.web_address, listen_port);
+            // #2703 Gate 7 item 2: listen() returned (every worker drained back
+            // into the pool and the pool itself joined — see httplib's
+            // ThreadPool::shutdown()), so this thread is about to exit. Signal
+            // stop()'s bounded wait rather than making it guess.
+            {
+                std::lock_guard<std::mutex> lk(web_thread_done_mtx_);
+                web_thread_done_ = true;
+            }
+            web_thread_done_cv_.notify_all();
         });
     }
 
@@ -15856,6 +15949,15 @@ private:
     std::unique_ptr<grpc::Server> mgmt_server_;
     std::unique_ptr<httplib::Server> web_server_;
     std::thread web_thread_;
+    // #2703 Gate 7 merge-slice item 2: signalled by web_thread_'s body right
+    // after web_server_->listen() returns, so stop() can bound how long it
+    // waits before joining rather than blocking on web_thread_.join()
+    // indefinitely (std::thread has no timed join). A std::thread must still
+    // be join()'d somewhere or its destructor calls std::terminate — this
+    // pairs with a wait_for(15s) in stop(), never a bare wait().
+    std::mutex web_thread_done_mtx_;
+    std::condition_variable web_thread_done_cv_;
+    bool web_thread_done_{false};
 
     // HTTPS redirect server
     std::unique_ptr<httplib::Server> redirect_server_;

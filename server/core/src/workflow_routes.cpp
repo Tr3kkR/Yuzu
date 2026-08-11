@@ -820,17 +820,22 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  // adopt_quota_slot_into_stream in principal_quota_gate.hpp).
                  res.set_chunked_content_provider(
                      "text/event-stream",
-                     [sink_state](size_t offset, httplib::DataSink& s) -> bool {
+                     [sink_state, stream_budget](size_t offset, httplib::DataSink& s) -> bool {
                          // Re-implement the existing sse_content_provider in-line
                          // with id-aware framing. We can't reuse `format_sse`
                          // verbatim because it doesn't emit `id:`; the prefixed
                          // `<id>\n<data>` payload we queued above carries the id
                          // we need to peel off here.
                          std::unique_lock<std::mutex> lk(sink_state->mu);
+                         // #2703 Gate 7 item 2: shutdown close-signal, same
+                         // predicate shape as the /events and /api/v1/events
+                         // siblings — see StreamBudget::closing()'s doc comment.
                          sink_state->cv.wait_for(lk, std::chrono::seconds(3), [&] {
-                             return !sink_state->queue.empty() || sink_state->closed.load();
+                             return !sink_state->queue.empty() || sink_state->closed.load() ||
+                                    (stream_budget && stream_budget->closing());
                          });
-                         if (sink_state->closed.load())
+                         if (sink_state->closed.load() ||
+                             (stream_budget && stream_budget->closing()))
                              return false;
                          while (!sink_state->queue.empty()) {
                              auto ev = std::move(sink_state->queue.front());
