@@ -1314,6 +1314,12 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: auto-revokes an elapsed "
     const std::string rotation_group = successor->rotation_group;
     REQUIRE_FALSE(rotation_group.empty());
 
+    // UP-5: the sweep now only auto-revokes when the successor has been
+    // PRESENTED at least once (a never-used successor is left alone —
+    // see the dedicated test below) — present it here so this test keeps
+    // exercising the auto-revoke path it is named for.
+    REQUIRE(tokens->validate_token(*rotated).has_value());
+
     // BEFORE the window elapses: a sweep at `now` (or shortly after, still
     // < overlap_expires_at) finds nothing to do — idempotent, no early revoke.
     auto too_early = tokens->sweep_expired_rotations(now + 10);
