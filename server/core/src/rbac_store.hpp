@@ -175,18 +175,25 @@ public:
     /// raw accessor is for callers that only display or log the toggle.
     bool is_rbac_enabled() const;
     void set_rbac_enabled(bool enabled);
-    /// True when the cached `rbac_enabled` view is NOT currently backed by a
-    /// successful durable-generation refresh (construction counts as one) AND
+    /// True when the cached `rbac_enabled` view is no longer trustworthy —
+    /// checked as: `!generation_valid_` (a refresh attempt actually completed
+    /// and found itself past `kRbacStaleServeBoundMs`), OR, independently,
     /// the last successful refresh is more than `kRbacStaleServeBoundMs`
     /// (bounded stale-serve, #2703 Gate 7, an operator-adjudicated
-    /// availability-vs-strictness tradeoff) in the past. A refresh failure
-    /// shorter than that bound does NOT degrade the view — the cache keeps
-    /// serving last-known-good state through a short blip rather than
-    /// dropping trust on every transient Postgres timeout.
+    /// availability-vs-strictness tradeoff) in the past even with NO refresh
+    /// attempt ever completing — e.g. one stuck in flight on PG-side lock
+    /// contention (#3016) for longer than the bound (G11-CPPEXPERT-B2, #2703
+    /// Gate 8). This is an OR of two independent triggers, not an AND — a
+    /// refresh failure shorter than the bound does NOT degrade the view — the
+    /// cache keeps serving last-known-good state through a short blip rather
+    /// than dropping trust on every transient Postgres timeout.
     /// `rbac_enforcement_in_effect()` treats a genuinely degraded view the
     /// same as "enabled" — a refresh failure that HAS exceeded the bound must
     /// not extend trust in a cached `false` any more than it may extend trust
     /// in a cached permission verdict (ADR-0041 "must NOT extend trust").
+    /// Implemented via `generation_view_stale_locked()`, which is also the
+    /// chokepoint `check_permission()` uses for its own perm-cache trust
+    /// decision — do not reintroduce a second, divergent copy of this check.
     [[nodiscard]] bool rbac_enabled_view_degraded() const;
 
     // ── Roles CRUD ───────────────────────────────────────────────────────
@@ -451,14 +458,30 @@ private:
     /// on a read error (never flips a cached `true` to disabled/fail-open) —
     /// the OTHER direction (a cached `false` while the durable flag has since
     /// become `true`) is left to the caller: `rbac_enforcement_in_effect()`
-    /// checks `rbac_enabled_view_degraded()` (i.e. `!generation_valid_`, set
-    /// here) and treats a degraded view as enforced, closing that direction
-    /// without this function needing to guess at a value it could not read.
-    /// A concurrent
+    /// checks `rbac_enabled_view_degraded()` (which now ALSO checks elapsed
+    /// time, not just `generation_valid_` alone — see
+    /// `generation_view_stale_locked()`, G11-CPPEXPERT-B2) and treats a
+    /// degraded view as enforced, closing that direction without this
+    /// function needing to guess at a value it could not read. A concurrent
     /// caller that misses the gate while a refresh is in flight AND finds the
     /// cache already past the accepted bound counts a `stale_beyond_accepted_bound`
     /// degrade (fjarvis F3) — the acceptance is measured, not assumed.
     void maybe_refresh_generation() const;
+
+    /// The single source of truth for "is the generation/perm-cache view
+    /// currently trustworthy" — `!generation_valid_`, OR (generation_valid_
+    /// but) the last successful refresh is more than `kRbacStaleServeBoundMs`
+    /// in the past (G11-CPPEXPERT-B2, #2703 Gate 8: closes the gap where a
+    /// refresh stuck in flight past the bound — e.g. PG-side lock contention,
+    /// #3016 — left `generation_valid_` true and stale indefinitely, since
+    /// nothing else ever completes to flip it). MUST be called with
+    /// `cache_mtx_` already held — it does not lock itself, so every raw read
+    /// of `generation_valid_` that decides whether to TRUST existing cached
+    /// state (as opposed to deciding whether to CACHE a value just fetched
+    /// live, which is a different, unaffected question) must route through
+    /// this, not the bare field. `rbac_enabled_view_degraded()` and
+    /// `check_permission()`'s perm-cache trust check both do.
+    [[nodiscard]] bool generation_view_stale_locked() const;
 
     /// Apply a locally-committed durable generation: clear `perm_cache_`, set
     /// `cached_generation_`, mark valid, and re-anchor the refresh clock (the

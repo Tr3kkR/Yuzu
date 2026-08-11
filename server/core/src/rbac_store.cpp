@@ -1407,25 +1407,34 @@ bool RbacStore::is_rbac_enabled() const {
     return rbac_enabled_.load(std::memory_order_relaxed);
 }
 
-bool RbacStore::rbac_enabled_view_degraded() const {
-    std::lock_guard lock(cache_mtx_);
+bool RbacStore::generation_view_stale_locked() const {
     // G11-CPPEXPERT-B2 (#2703 Gate 8): `generation_valid_` alone is not a
-    // sufficient degraded signal. It only flips false once SOME thread's
+    // sufficient staleness signal. It only flips false once SOME thread's
     // maybe_refresh_generation() call actually completes a failed attempt
     // past kRbacStaleServeBoundMs -- but a query stuck on PG-side lock
     // contention (#3016, up to lock_timeout ~10s) can leave generation_valid_
     // TRUE, stale, and untouched for the whole stall: every OTHER caller in
     // that window either takes the gated fast-return path (no state change)
-    // or is itself still blocked inside its own query. A disabled+stale
-    // replica reads that untouched `true` as "confirmed disabled" and
-    // rbac_enforcement_in_effect() falls open. Checking elapsed time here
-    // directly (matching this accessor's own doc comment, which already
-    // promised this bound) closes the gap without depending on any
-    // in-flight refresh attempt ever completing.
+    // or is itself still blocked inside its own query. Checking elapsed time
+    // here directly (matching rbac_enabled_view_degraded()'s own doc comment,
+    // which already promised this bound) closes the gap without depending on
+    // any in-flight refresh attempt ever completing. This is the ONE
+    // chokepoint for that decision -- originally added only inside
+    // rbac_enabled_view_degraded(), then found (architect, Gate 3 re-review
+    // of this same fix) to have a sibling raw read of generation_valid_ in
+    // check_permission()'s perm-cache trust decision that bypassed it
+    // entirely, serving a stale cached ALLOW/DENY through the identical
+    // stuck-refresh window. Extracted here so both readers share one
+    // definition of "stale" rather than risking a second copy drifting.
     if (!generation_valid_)
         return true;
     return rbac_generation::is_stale_beyond_bound(now_ms(), last_successful_refresh_ms_,
                                                    kRbacStaleServeBoundMs);
+}
+
+bool RbacStore::rbac_enabled_view_degraded() const {
+    std::lock_guard lock(cache_mtx_);
+    return generation_view_stale_locked();
 }
 
 void RbacStore::set_rbac_enabled(bool enabled) {
@@ -2398,7 +2407,14 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
     bool gen_ok = false;
     {
         std::lock_guard lock(cache_mtx_);
-        gen_ok = generation_valid_;
+        // G11-CPPEXPERT-B2 (#2703 Gate 8): route through the same
+        // staleness check rbac_enabled_view_degraded() uses, not the raw
+        // generation_valid_ flag directly -- a stuck-in-flight refresh
+        // (PG-side lock contention, #3016) can leave generation_valid_ true
+        // and stale for the whole stall, and a raw read here would keep
+        // serving a stale cached ALLOW/DENY verdict through that window
+        // exactly like the already-fixed rbac_enabled path did.
+        gen_ok = !generation_view_stale_locked();
         gen_at_check = cached_generation_;
         if (gen_ok) {
             auto it = perm_cache_.find(key);
