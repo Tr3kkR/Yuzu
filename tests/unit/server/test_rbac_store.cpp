@@ -1589,6 +1589,54 @@ TEST_CASE("RbacStore: migrate_from_sqlite does NOT filter a legacy db that alrea
     CHECK(store.check_permission("carol", "AuditLog", "Read"));
 }
 
+// Doomgoose (PR #2703 review, BLOCKING item 3): an orphaned group_members row
+// (group_name with no corresponding groups row -- SQLite never enforces this
+// FK by default, so an operator deleting a group via a raw sqlite3
+// UPDATE/DELETE can leave one behind with nothing to catch it in the legacy
+// file) must not abort the WHOLE backfill. rbac_store.group_members.group_name
+// is a real FK in Postgres (REFERENCES groups(name) ON DELETE CASCADE) --
+// pre-fix, the single-transaction INSERT loop aborted entirely on this one
+// bad row, rolling back every legitimate role/grant/membership in the same
+// legacy file and leaving the completion marker unstamped, so every restart
+// repeated the failure (a permanent boot loop).
+TEST_CASE("RbacStore: migrate_from_sqlite skips (not aborts on) an orphaned legacy "
+          "group_members row via a per-row savepoint (Doomgoose PR #2703 review, blocking "
+          "item 3)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_orphan_member-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    // Add an orphaned membership row directly -- group_name "ghost-team" has
+    // no corresponding row in `groups`, matching exactly what a raw sqlite3
+    // DELETE FROM groups (foreign_keys=OFF, SQLite's default) would leave
+    // behind.
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(db.get(),
+                             "INSERT INTO group_members VALUES ('ghost-team', 'ghost-user');",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+
+    // Must succeed overall -- the orphaned row is skipped, not fatal.
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    // The orphaned row itself did not (and could not, given no group exists
+    // for it to attach to) migrate.
+    CHECK(store.get_group_members("ghost-team").empty());
+
+    // Everything ELSE in the same legacy file -- the fixture's own
+    // operator-authored role, grant, principal assignment, and its one
+    // legitimate group membership -- migrated intact. This is the actual
+    // point of the fix: one bad row must not take the rest down with it.
+    auto pr = store.get_principal_roles("user", "alice");
+    CHECK(pr.size() == 1);
+    CHECK(store.check_permission("alice", "Tag", "Read"));
+    CHECK(store.get_group_members("team-a") == std::vector<std::string>{"bob"});
+}
+
 // governance re-review (PR #2703, HIGH — unhappy-path, EMPIRICALLY reproduced
 // against a live Postgres before this fix): a marker stamped by the
 // pre-fingerprint-mechanism code (backfill_complete present, NO

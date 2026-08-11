@@ -3399,6 +3399,11 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                                     static_cast<std::int64_t>(principals.size()),
                                     static_cast<std::int64_t>(groups.size()),
                                     static_cast<std::int64_t>(members.size())};
+    // Doomgoose (PR #2703 review, blocking item 3): declared here (not inside
+    // the transaction lambda below) so step 6's reconciliation check can
+    // account for it -- an intentionally-skipped orphaned row is not the
+    // silent data loss that check exists to catch.
+    std::size_t skipped_orphan_members = 0;
 
     const bool insert_ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
         const auto run = [&](const char* sql, const std::vector<std::string>& p) -> bool {
@@ -3610,11 +3615,94 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                 return false;
             }
         }
-        for (const auto& m : members)
-            if (!run("INSERT INTO rbac_store.group_members (group_name, username) VALUES ($1, $2) "
-                     "ON CONFLICT DO NOTHING",
-                     {sanitize_pg_text(m.group_name), sanitize_pg_text(m.username)}))
+        // Doomgoose (PR #2703 review, blocking item 3): group_members.group_name
+        // is a real FK (REFERENCES groups(name) ON DELETE CASCADE) that SQLite
+        // never enforced by default, so an operator who deleted a group via a
+        // raw sqlite3 UPDATE/DELETE (foreign_keys=OFF, the SQLite default) could
+        // leave an orphaned group_members row in the legacy file with nothing
+        // ever catching it there. Unlike roles/perms/principals/groups
+        // themselves (irreducible operator intent -- this store's standing
+        // "never silently drop operator RBAC config" contract), a single
+        // group-membership pairing is the narrow exception: it's the one row
+        // class here an admin can trivially recreate (re-add the user to the
+        // group) and, same as InventoryStore's own established precedent
+        // (inventory_store.cpp, IB2/UP-1 -- SAVEPOINT per row, skip ONLY a
+        // genuine row-data-class SQLSTATE, fail closed on anything
+        // infra-shaped), one bad row must not be a permanent boot loop for
+        // every OTHER legitimate membership, role, and grant in this same
+        // transaction. Scoped to group_members ONLY -- roles/perms/principals/
+        // groups above keep the existing any-error-aborts-everything contract.
+        // (skipped_orphan_members is declared in the OUTER function scope --
+        // see the comment there -- so step 6's reconciliation can see it.)
+        for (const auto& m : members) {
+            pg::PgResult sp =
+                pg::exec_params(c, "SAVEPOINT legacy_group_member_backfill", std::vector<std::string>{});
+            if (sp.status() != PGRES_COMMAND_OK) {
+                spdlog::error("RbacStore: migrate_from_sqlite: SAVEPOINT failed (infra error, "
+                              "aborting backfill): {}",
+                              PQerrorMessage(c));
                 return false;
+            }
+            pg::PgResult ins = pg::exec_params(
+                c,
+                "INSERT INTO rbac_store.group_members (group_name, username) VALUES ($1, $2) "
+                "ON CONFLICT DO NOTHING",
+                std::vector<std::string>{sanitize_pg_text(m.group_name),
+                                         sanitize_pg_text(m.username)});
+            if (ins.status() == PGRES_COMMAND_OK) {
+                pg::PgResult rel = pg::exec_params(c, "RELEASE SAVEPOINT legacy_group_member_backfill",
+                                                   std::vector<std::string>{});
+                if (rel.status() != PGRES_COMMAND_OK) {
+                    spdlog::error("RbacStore: migrate_from_sqlite: RELEASE SAVEPOINT failed "
+                                  "(infra error, aborting backfill): {}",
+                                  PQerrorMessage(c));
+                    return false;
+                }
+                continue;
+            }
+            const char* sqlstate_p = PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE);
+            const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
+            const bool row_data_error =
+                sqlstate.size() == 5 && (sqlstate.starts_with("22") || sqlstate.starts_with("23") ||
+                                         sqlstate.starts_with("54"));
+            pg::PgResult back = pg::exec_params(c, "ROLLBACK TO SAVEPOINT legacy_group_member_backfill",
+                                                std::vector<std::string>{});
+            if (back.status() != PGRES_COMMAND_OK) {
+                spdlog::error("RbacStore: migrate_from_sqlite: ROLLBACK TO SAVEPOINT failed "
+                              "after a bad row (infra error, aborting backfill): {}",
+                              PQerrorMessage(c));
+                return false;
+            }
+            if (!row_data_error) {
+                spdlog::error(
+                    "RbacStore: migrate_from_sqlite: group_members insert failed with "
+                    "non-row-data SQLSTATE '{}' (group_name={} username={}): {} -- treating as "
+                    "an infrastructure error and aborting the backfill unstamped; the next boot "
+                    "retries",
+                    sqlstate.empty() ? "<none>" : sqlstate, m.group_name, m.username,
+                    PQresultErrorMessage(ins.get()));
+                return false;
+            }
+            pg::PgResult rel = pg::exec_params(c, "RELEASE SAVEPOINT legacy_group_member_backfill",
+                                               std::vector<std::string>{});
+            if (rel.status() != PGRES_COMMAND_OK) {
+                spdlog::error("RbacStore: migrate_from_sqlite: RELEASE SAVEPOINT failed (infra "
+                              "error, aborting backfill): {}",
+                              PQerrorMessage(c));
+                return false;
+            }
+            ++skipped_orphan_members;
+            spdlog::warn("RbacStore: migrate_from_sqlite: skipping orphaned legacy "
+                        "group_members row (SQLSTATE {}, likely a group deleted via raw SQL "
+                        "without FK enforcement): group_name={} username={}",
+                        sqlstate, m.group_name, m.username);
+        }
+        if (skipped_orphan_members > 0)
+            spdlog::warn(
+                "RbacStore: migrate_from_sqlite: skipped {} orphaned group_members row(s) "
+                "during backfill -- affected users may need to be re-added to their group(s) "
+                "manually",
+                skipped_orphan_members);
         return true;
     });
     if (!insert_ok) {
@@ -3646,14 +3734,25 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
             backfill_metric("failed");
             return false;
         }
+        // Doomgoose (PR #2703 review, blocking item 3): the members floor
+        // excludes rows this backfill deliberately, loggedly skipped as
+        // orphaned (no corresponding groups row) -- that is not the silent
+        // data loss this check exists to catch. Every other floor is
+        // unchanged: roles/perms/principals/groups still have zero tolerated
+        // skip path, matching their standing "never silently drop operator
+        // RBAC config" contract.
+        const std::int64_t expected_members =
+            legacy_counts.members - static_cast<std::int64_t>(skipped_orphan_members);
         if (pr < legacy_counts.roles || pp < legacy_counts.perms ||
             ppr < legacy_counts.principals || pg_ < legacy_counts.groups ||
-            pm < legacy_counts.members) {
+            pm < expected_members) {
             spdlog::error("RbacStore: migrate_from_sqlite: reconciliation FAILED — legacy "
-                          "(roles={},perms={},principals={},groups={},members={}) vs PG "
+                          "(roles={},perms={},principals={},groups={},members={}, {} orphaned "
+                          "member row(s) intentionally skipped) vs PG "
                           "(roles={},perms={},principals={},groups={},members={}); refusing marker",
                           legacy_counts.roles, legacy_counts.perms, legacy_counts.principals,
-                          legacy_counts.groups, legacy_counts.members, pr, pp, ppr, pg_, pm);
+                          legacy_counts.groups, legacy_counts.members, skipped_orphan_members, pr,
+                          pp, ppr, pg_, pm);
             backfill_metric("failed");
             return false;
         }
