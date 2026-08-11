@@ -486,6 +486,23 @@ TEST_CASE("every live is_rbac_enabled() call site is display-only "
              // filings).
              "if (!rbac_store || !rbac_store->is_rbac_enabled()) {",
          }},
+        {"auth_routes.cpp",
+         {
+             // security-guardian (Gate 8, MEDIUM): auth_routes.cpp had 4 of
+             // its own is_rbac_enabled() call sites, entirely unscanned
+             // before this entry. All 4 are single-target require_permission/
+             // require_scoped_permission preconditions ("RBAC must be
+             // enabled for this token/grant kind"), not the list-read/
+             // visible-agents confinement class this test otherwise guards —
+             // same disposition as rest_api_v1.cpp's precondition site above.
+             // Each is a deny-first compound gate (`!is_rbac_enabled() ||
+             // !check_...(...)`), so a stale raw view here can only ever
+             // bias toward wrongly DENYING a request, never toward
+             // over-disclosure. Two distinct trimmed shapes cover all 4
+             // sites (2 occurrences each).
+             "if (!rbac_store_->is_rbac_enabled() ||",
+             "if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {",
+         }},
     };
 
     std::vector<std::string> offenders;

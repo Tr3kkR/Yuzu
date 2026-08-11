@@ -1069,6 +1069,21 @@ yuzu_server_rbac_backfill_total{result="completed"} 1
 # HELP yuzu_server_rbac_authz_check_seconds End-to-end latency of RbacStore::check_permission
 # TYPE yuzu_server_rbac_authz_check_seconds histogram
 yuzu_server_rbac_authz_check_seconds_bucket{le="0.005"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.01"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.025"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.05"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.1"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.25"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.5"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="1"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="2.5"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="5"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="10"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="15"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="20"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="30"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="45"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="60"} 0
 yuzu_server_rbac_authz_check_seconds_bucket{le="+Inf"} 0
 yuzu_server_rbac_authz_check_seconds_sum 0
 yuzu_server_rbac_authz_check_seconds_count 0

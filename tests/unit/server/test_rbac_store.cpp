@@ -1822,10 +1822,16 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
 // before this fix, never called note_read_degrade() on any of them — a
 // degrade on the ADR-0017 admit-then-filter chokepoint (authorize_list_read,
 // which both feed) was invisible to yuzu_server_rbac_read_degrade_total and
-// the YuzuRbacReadDegraded alert. Reproduces both the pool-acquire-timeout
-// path (first two calls) and the breaker-denied fast path (third call, once
-// the two prior failures have tripped the breaker) on BOTH sibling methods,
-// asserting the counter — not merely that the calls return an error.
+// the YuzuRbacReadDegraded alert. Reproduces the pool-acquire-timeout path
+// (first two calls, one per sibling) and the breaker-denied fast path (calls
+// 3 and 4, once the first two have tripped the breaker) ON EACH sibling's OWN
+// code site — quality-engineer (Gate 8) found an earlier version of this
+// test exercised user_rbac_group_names' breaker-denied branch but not
+// role_effects_for's own (structurally identical, but a distinct site);
+// call 4 closes that. Query-error is intentionally NOT covered here (a
+// pre-existing, file-wide gap — check_permission's own query-error path has
+// never had a counter-asserting test either); asserts the counter directly,
+// not merely that the calls return an error.
 TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
           "read-degrade on pool-acquire-timeout and breaker-denied "
           "(#2703 Gate 7 item 3)",
@@ -1878,6 +1884,18 @@ TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
     CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
                           {{"reason", "pool_acquire_timeout"}})
               .value() == 3.0);
+
+    // Call 4 (role_effects_for, breaker-denied): quality-engineer (Gate 8) —
+    // call 3 above only exercised user_rbac_group_names' OWN breaker-denied
+    // branch; role_effects_for's own breaker-denied early return
+    // (structurally identical, but a distinct code site) was never directly
+    // hit. Still within the cooldown from call 2/3, so this denies WITHOUT a
+    // pool touch too.
+    auto r4 = acc.role_effects_for("Infrastructure", "Read");
+    REQUIRE_FALSE(r4.has_value());
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "pool_acquire_timeout"}})
+              .value() == 4.0);
 }
 
 // #2703 Gate 7 item Commit C (quality-engineer + consistency-auditor, Gate 3:

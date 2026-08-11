@@ -739,13 +739,14 @@ server `PgPool`).
   teardown. If you run under Kubernetes (or any orchestrator with a similar
   default), raise the grace period to comfortably exceed ~55 s rather than
   relying on the platform default. **Two things a longer grace period does
-  NOT fix:** (1) the 30 s drain window only waits on executions already
-  `running` in `execution_tracker_` when shutdown begins — it does not stop
-  the HTTP listener from accepting and starting NEW requests during that
-  window, so a request that lands late in the drain is not bounded by the
-  ~55 s figure at all; raising the grace period does not close this gap,
-  because the gap is about admission, not about how long the drain itself
-  waits. (2) if the 15 s HTTP-listener bound IS exceeded, the server
+  NOT fix:** (1) the 30 s drain window re-queries `execution_tracker_` for
+  `running` executions on each of its one-second iterations — so it also
+  picks up work that starts mid-drain, not just what was already running
+  when `SIGTERM` arrived — but it never stops the HTTP listener from
+  ACCEPTING new requests during that window, so a request that lands late in
+  the drain is not bounded by the ~55 s figure at all; raising the grace
+  period does not close this gap, because the gap is about admission, not
+  about how long the drain itself waits. (2) if the 15 s HTTP-listener bound IS exceeded, the server
   force-exits (`std::_Exit(1)`) on its OWN internal schedule, independent of
   whatever grace period the orchestrator was configured with — a longer
   external grace period only prevents the orchestrator from `SIGKILL`ing
