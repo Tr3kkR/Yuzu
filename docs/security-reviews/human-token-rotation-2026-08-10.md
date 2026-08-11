@@ -398,16 +398,44 @@ rather than incrementing.
   described above, and — because the durable column is a Postgres row, not
   process-local — also closes the "confirm cannot succeed on a replica that
   did not itself serve the rotate" sub-case for the identity check
-  specifically. **Bonus, not asked for by #2961 but closed as a consequence:**
-  a mint whose Postgres `COMMIT` succeeded but whose client never saw the
-  response (a dropped connection) was previously permanently unconfirmable —
-  the RAM grace-cache entry exists only on the replica that served the mint,
-  and the operator has no successor `token_id` to retry with, so that pair
-  could only ever be resolved by revoke. The durable column doesn't change
-  that the client still has no `token_id` of its own, but it does mean any
-  path that recovers the successor id out-of-band (`list_active_for_principal`,
-  an operator/support lookup) can now reach a confirmable pair instead of a
-  permanently-stuck one. **Not closed by this fix, and deliberately so:** the
+  specifically.
+
+  **WARNING — do NOT recover a successor id out-of-band in order to confirm.**
+  An earlier revision of this section framed that as a bonus of the durable
+  column. It is not; it is the one dangerous way to use this change, and the
+  `unhappy-path` gate caught the text recommending it (UP-2, I4 harmful
+  operator guidance).
+
+  If the rotate response or the raw successor secret was not received, do NOT
+  look the successor id up (via `list_active_for_principal` or a support
+  query) and call confirm. **Confirm attests that the successor secret was
+  received and retained, and it immediately revokes the predecessor.** Doing
+  it without the secret leaves an active credential nobody holds — zero usable
+  credentials for that principal. Instead, explicitly **revoke the unknown
+  successor**, which preserves the known predecessor, then start a new
+  rotation.
+
+  The durable initiator binding restores confirmation after a restart ONLY for
+  an operator who retained the original rotate response — its raw secret and
+  its successor id. It does not, and cannot, establish that the secret was
+  ever delivered.
+
+  Adjudicated (architect, `gpt-5.6-sol`, not the change author): the
+  pre-#2961 behaviour here was an ACCIDENTAL and incomplete guard, not a
+  control. The RAM entry proved the server had MINTED the secret, never that
+  the client received it — it is populated before the HTTP response is
+  written, so even pre-#2961 a lost-response caller who recovered the id could
+  already confirm on the same process. A restart merely happened to erase the
+  identity evidence as well. Losing that coupling is therefore not a
+  security-control regression, and the proposed `last_used_at != 0` guard was
+  REJECTED: it cannot distinguish "secret received but not yet deployed" from
+  "secret never received" (both are 0), and would break confirm-before-rollout
+  across a restart, which is precisely what #2961 exists to enable. The honest
+  mechanical fix is proof of possession at confirm — presenting the successor
+  secret, verifiable against the stored hash without persisting the raw — and
+  that is a separate API/MCP/UI and threat-model change, tracked separately.
+  Residual until then: an operator who obtains a successor id out-of-band and
+  falsely attests receipt can revoke the only credential they actually hold. **Not closed by this fix, and deliberately so:** the
   raw successor secret's grace-window re-serve (F4) stays RAM-only — a
   one-time reveal must not become durable, so that capability is still
   forfeited on restart. **Not closed, still tracked separately, and this fix

@@ -116,13 +116,27 @@ struct ApiToken {
     // `resolve_rotation_initiator`'s doc comment. Deliberately NOT consulted
     // by `try_reserve`'s raw-secret re-serve (F4 stays RAM-only); it exists
     // solely to survive a restart for `confirm_rotation`/
-    // `confirm_token_rotation`'s identity check (F5). Cleared back to '' the
-    // moment the rotation resolves — `confirm_rotation`/`confirm_token_rotation`'s
-    // in-txn cleanup and `resolve_rotation_pair_after_revoke`'s partner clear
-    // both zero it alongside `rotation_group`/`supersedes_token_id`/
-    // `overlap_expires_at` — so a resolved row does not keep a third-party
-    // operator's username (data minimisation on the ENGINE arm) for the
-    // row's remaining life.
+    // `confirm_token_rotation`'s identity check (F5).
+    //
+    // Cleared back to '' on the SURVIVING row at all FOUR sites that resolve
+    // rotation state, alongside `rotation_group`/`supersedes_token_id`/
+    // `overlap_expires_at`: both confirm arms' in-txn cleanup,
+    // `resolve_rotation_pair_after_revoke`'s partner clear, and the T12
+    // sweep's auto-revoke clear. (An earlier revision of this comment named
+    // only three and was corrected — the sweep site was missed by the fix
+    // brief, not by the implementer.)
+    //
+    // What that does NOT cover, stated because the earlier revision claimed
+    // otherwise: a row that is itself REVOKED keeps its stamp. Every clear is
+    // scoped to the partner or the pinned successor, so
+    // `revoke_token(<successor_id>)` clears the predecessor and leaves the
+    // revoked successor stamped, and `revoke_for_principal` resolves no pair
+    // at all. Rows are removed only by `delete_token`, so on the ENGINE arm a
+    // dead row can retain a third-party admin's username indefinitely. It is
+    // inert — no serializer, log, audit detail or metric label emits this
+    // field, and the resolver is only ever reached for a LIVE successor — but
+    // "a resolved row does not keep it for the row's remaining life" was too
+    // strong a claim and is withdrawn.
     std::string rotation_initiator;
 };
 

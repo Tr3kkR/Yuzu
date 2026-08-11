@@ -663,6 +663,14 @@ deliberately leaves BOTH credentials active** rather than revoke your only
 working token out from under you (a dropped rotate response, or simply
 never picking up the new secret, must not end in zero usable credentials).
 
+**That safeguard covers the automatic sweep only — it does not cover an
+explicit `confirm`.** `confirm` is your attestation that you received and
+retained the successor secret, and it revokes the predecessor straight away.
+If the rotate response was lost, do NOT look the successor's `token_id` up
+and confirm it: that revokes the credential you still hold in favour of one
+you never received. Revoke the unknown successor instead — that keeps the
+predecessor working — and start a new rotation.
+
 `confirm`'s check that you're the same operator who called `rotate` is
 stored durably, not just in memory, so a server restart no longer blocks
 confirming an in-flight rotation. The one exception is a rotation already

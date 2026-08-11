@@ -62,7 +62,12 @@ enum class EngineStoreErrorClass {
 
     // 2. Conflict strings that ALSO contain a broad transient substring —
     //    must win before the broad "unavailable" check below.
-    if (has("rotation confirmation unavailable")) // grace binding gone (restart / already-resolved)
+    // #2961: a plain restart no longer produces this for a v3-stamped pair — the
+    // durable `rotation_initiator` column now resolves the binding. The two live
+    // causes are (a) NEITHER source resolves an initiator (a pre-v3 pair, or a row
+    // that was never stamped) and (b) RAM and the durable column DISAGREE, which
+    // fails closed. Both are terminal, hence Conflict.
+    if (has("rotation confirmation unavailable"))
         return EngineStoreErrorClass::Conflict;
 
     // 2b. #2943: malformed pair found AFTER a positive `kPairInGroup` read —
