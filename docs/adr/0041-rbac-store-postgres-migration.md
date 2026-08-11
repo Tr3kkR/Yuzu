@@ -200,7 +200,12 @@ which is a worse availability posture than tolerating a few seconds of staleness
 the 5s bound is exceeded does the store fall back to the original "assume changed" behavior
 and clear the cache. A new fail-fast circuit breaker (2 consecutive pool-acquire/query
 failures) independently bounds how long an uncached check can block on a doomed pool, without
-itself affecting cache validity — see `docs/auth-architecture.md`'s "Cross-replica coherence"
+itself affecting cache validity. That bound is tight (well under a second) ONLY for pool
+exhaustion — a connection that cannot be acquired within the 250ms budget. A query that DOES
+acquire a connection and then blocks on a PostgreSQL-side lock is bounded instead by PgPool's
+`lock_timeout` (10s default); measured ~18.5s for 2 such attempts against a live held
+`ACCESS EXCLUSIVE` lock on `rbac_meta` (#3016) — both modes converge on the same fail-closed
+deny, not the same speed. See `docs/auth-architecture.md`'s "Cross-replica coherence"
 section and `docs/enterprise-readiness-soc2-first-customer.md`'s "Availability posture under
 PostgreSQL degradation" note for the full mechanism and its CAIQ characterization.
 

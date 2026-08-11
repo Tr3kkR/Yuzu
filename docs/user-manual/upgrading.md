@@ -682,11 +682,18 @@ server `PgPool`).
   cache validity*: once it sees **2 consecutive** pool-acquire/query
   failures, any check that is not already a cache hit denies immediately
   rather than blocking on the acquire budget first, and it stops touching
-  the pool for a ~1 s cooldown between recovery probes. Net effect on a
-  sustained outage: previously-seen decisions keep answering for up to ~5 s
-  regardless of breaker state; new/uncached decisions deny fast once the
-  breaker trips (as little as 2 failed attempts); once the 5 s bound
-  elapses, every check denies until the backend recovers. Watch
+  the pool for a ~1 s cooldown between recovery probes. **"How fast" depends
+  on the degradation mode:** pool exhaustion (no connection available) trips
+  the breaker in well under a second (2 × the 250 ms acquire budget); a
+  query blocked on a PostgreSQL-side lock (e.g. a migration touching
+  `rbac_meta`) instead inherits `PgPool`'s `lock_timeout` (10 s default) per
+  attempt — measured ~18.5 s for 2 such attempts against a live held lock
+  (#3016). Both converge on the same fail-closed deny, just not at the same
+  speed. Net effect on a sustained outage: previously-seen decisions keep
+  answering for up to ~5 s regardless of breaker state; new/uncached
+  decisions deny once the breaker trips, at whichever of the two speeds
+  above applies; once the 5 s bound elapses, every check denies until the
+  backend recovers. Watch
   `yuzu_server_rbac_breaker_open` (gauge) and
   `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade.
 - **Shutdown grace bounds now stack; raise your orchestrator's termination

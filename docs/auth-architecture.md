@@ -2327,7 +2327,14 @@ failure treated as "assume changed" (cache cleared) and counted as a
 (2 consecutive pool-acquire/query failures) independently bounds how long an
 **uncached** check can block on a doomed pool — it denies such checks
 immediately once open, but it does not itself clear the cache or shorten the
-5 s bound; a cache hit is served regardless of breaker state. See
+5 s bound; a cache hit is served regardless of breaker state. **The bound is
+tight only for pool-acquisition failure** (no connection available within
+the 250ms acquire budget — well under a second for 2 consecutive attempts).
+A query that acquires a connection and then blocks on a PostgreSQL-side lock
+inherits `PgPool`'s `lock_timeout` (10s default) instead — measured ~18.5s
+for 2 such attempts against a live held `ACCESS EXCLUSIVE` lock on
+`rbac_meta` (#3016); both modes still converge on a fail-closed deny, just
+not at the same speed. See
 `docs/enterprise-readiness-soc2-first-customer.md`'s "Availability posture
 under PostgreSQL degradation" note for the full mechanism and its CAIQ
 characterization. **The `rbac_enabled` flag propagates on the same durable
