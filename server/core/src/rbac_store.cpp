@@ -276,25 +276,32 @@ bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, Degra
 // each return site individually. The observe() call runs in the destructor,
 // which fires after every `{ std::lock_guard ... }` block in the caller has
 // already released, so this never holds cache_mtx_/breaker_mtx_ while
-// touching MetricsRegistry's own lock (the same hazard note_read_degrade's
+// touching the Histogram's own lock (the same hazard note_read_degrade's
 // call sites are already careful about, above).
+//
+// #2703 Gate 7 item Commit B (cpp-expert + performance, Gate 3 — 2 independent
+// reporters): takes a pre-resolved `Histogram*` rather than a
+// `MetricsRegistry*` + name pair, so a cache HIT — the common case — no
+// longer takes the registry's family-map lock or heap-allocates a
+// `std::string` from `metric_name` on every single call. The pointer is
+// resolved once by `RbacStore::set_metrics()` (see its doc comment) and
+// stays valid for the registry's lifetime; passing null (unwired metrics, the
+// default in unit tests) disables observation exactly as before.
 class ScopedLatencyObserver {
 public:
-    ScopedLatencyObserver(yuzu::MetricsRegistry* metrics, const char* metric_name)
-        : metrics_(metrics), metric_name_(metric_name),
-          start_(std::chrono::steady_clock::now()) {}
+    explicit ScopedLatencyObserver(yuzu::Histogram* hist)
+        : hist_(hist), start_(std::chrono::steady_clock::now()) {}
     ~ScopedLatencyObserver() {
-        if (!metrics_)
+        if (!hist_)
             return;
         const auto elapsed = std::chrono::steady_clock::now() - start_;
-        metrics_->histogram(metric_name_).observe(std::chrono::duration<double>(elapsed).count());
+        hist_->observe(std::chrono::duration<double>(elapsed).count());
     }
     ScopedLatencyObserver(const ScopedLatencyObserver&) = delete;
     ScopedLatencyObserver& operator=(const ScopedLatencyObserver&) = delete;
 
 private:
-    yuzu::MetricsRegistry* metrics_;
-    const char* metric_name_;
+    yuzu::Histogram* hist_;
     std::chrono::steady_clock::time_point start_;
 };
 
@@ -840,6 +847,18 @@ RbacStore::RbacStore(pg::PgPool& pool) : pool_(pool) {
 }
 
 RbacStore::~RbacStore() = default;
+
+void RbacStore::set_metrics(yuzu::MetricsRegistry* m) noexcept {
+    metrics_ = m;
+    // See the doc comment on the declaration for why this is resolved once
+    // here rather than cached as a function-local static. The buckets
+    // overload is idempotent with server.cpp's own zero-seed call — whichever
+    // runs first fixes the series' boundaries (Prometheus semantics), and
+    // both request the same extended buckets, so call order doesn't matter.
+    authz_check_seconds_hist_ =
+        m ? &m->histogram("yuzu_server_rbac_authz_check_seconds", yuzu::Histogram::seconds_buckets_60s())
+          : nullptr;
+}
 
 // ── Seed data (idempotent — ON CONFLICT DO NOTHING) ──────────────────────────
 
@@ -2354,7 +2373,7 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
     // #2703 Gate 7 item 1 commit C: observes on every exit below, whichever
     // return statement fires — excludes the trivial !open_ short-circuit
     // above (a structural/administrative state, not a real check attempt).
-    ScopedLatencyObserver latency_obs(metrics_, "yuzu_server_rbac_authz_check_seconds");
+    ScopedLatencyObserver latency_obs(authz_check_seconds_hist_);
 
     maybe_refresh_generation();
 
@@ -2571,11 +2590,24 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         return std::unexpected("rbac store not open");
     // Breaker-gated (#2703 Gate 7 item 1 commit B) — see check_permission's
     // pool-fallback gate for the shared rationale.
-    if (!breaker_admit())
+    if (!breaker_admit()) {
+        // #2703 Gate 7 item 3: this is the ADR-0017 admit-then-filter
+        // chokepoint (authorize_list_read) — a degrade here is invisible to
+        // yuzu_server_rbac_read_degrade_total / YuzuRbacReadDegraded without
+        // this call. Reuses check_permission's reason label so the alert's
+        // existing regex needs no change.
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn(
+                "RbacStore::user_rbac_group_names: circuit breaker open — DENY without pool touch");
         return std::unexpected("circuit breaker open");
+    }
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
     if (!lease) {
         breaker_note_result(false);
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("RbacStore::user_rbac_group_names: pool acquire timed out — DENY");
         return std::unexpected("pool acquire timeout");
     }
     pg::PgResult r = pg::exec_params(
@@ -2583,6 +2615,10 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
         std::vector<std::string>{username});
     if (r.status() != PGRES_TUPLES_OK) {
         breaker_note_result(false);
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("RbacStore::user_rbac_group_names: query failed: {} — DENY",
+                         PQerrorMessage(lease.get()));
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
     }
     breaker_note_result(true);
@@ -2598,11 +2634,21 @@ RbacStore::role_effects_for(const std::string& securable_type, const std::string
         return std::unexpected("rbac store not open");
     // Breaker-gated (#2703 Gate 7 item 1 commit B) — see check_permission's
     // pool-fallback gate for the shared rationale.
-    if (!breaker_admit())
+    if (!breaker_admit()) {
+        // #2703 Gate 7 item 3 — see user_rbac_group_names' matching call for
+        // the ADR-0017 chokepoint-visibility rationale; same reason labels.
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn(
+                "RbacStore::role_effects_for: circuit breaker open — DENY without pool touch");
         return std::unexpected("circuit breaker open");
+    }
     auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
     if (!lease) {
         breaker_note_result(false);
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn("RbacStore::role_effects_for: pool acquire timed out — DENY");
         return std::unexpected("pool acquire timeout");
     }
     pg::PgResult r = pg::exec_params(
@@ -2612,6 +2658,10 @@ RbacStore::role_effects_for(const std::string& securable_type, const std::string
         std::vector<std::string>{securable_type, operation});
     if (r.status() != PGRES_TUPLES_OK) {
         breaker_note_result(false);
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("RbacStore::role_effects_for: query failed: {} — DENY",
+                         PQerrorMessage(lease.get()));
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
     }
     breaker_note_result(true);

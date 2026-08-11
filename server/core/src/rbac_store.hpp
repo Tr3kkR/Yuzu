@@ -54,6 +54,7 @@
 
 namespace yuzu {
 class MetricsRegistry;
+class Histogram;
 }
 
 namespace yuzu::server::pg {
@@ -138,7 +139,20 @@ public:
     /// and the backfill counter. Set ONCE during single-threaded startup before
     /// serving; read without synchronisation on serving threads. Null (the
     /// default, e.g. unit tests) disables emission; every emit site is guarded.
-    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+    /// Also resolves and caches `authz_check_seconds_hist_` here (#2703 Gate 7
+    /// item Commit B) — a `Histogram&` obtained from a `MetricsRegistry` is
+    /// stable for that registry's lifetime (`MetricFamily` stores instances in
+    /// an `unordered_map`, which the standard guarantees does not invalidate
+    /// references on insertion/rehash), so resolving it once here, rather than
+    /// by name on every `check_permission()` call, is safe as long as the
+    /// pointer is never read before this has run. It is deliberately NOT a
+    /// function-local `static`: a static would bind to whichever
+    /// `MetricsRegistry` happened to call first and keep writing into it for
+    /// every later `RbacStore` instance/registry pairing — silently wrong
+    /// under multiple registries (e.g. sequential unit tests, each with its
+    /// own short-lived registry), and a dangling write once the first
+    /// registry is destroyed.
+    void set_metrics(yuzu::MetricsRegistry* m) noexcept;
 
     /// MANDATORY backfill (ADR-0009/0041). On first boot against an empty
     /// `rbac_store` with a legacy `rbac.db` present, migrates the `rbac_enabled`
@@ -360,9 +374,22 @@ public:
     std::vector<std::string> list_operations() const;
 
 private:
+    // #2703 Gate 7 item 3 — same shape as PreflightRoutesTestAccess /
+    // DashboardResultsColumnsTestAccess: user_rbac_group_names/role_effects_for
+    // are legitimately private (internal helpers `resolve_perm_groups` shares),
+    // but their OWN degrade-emission sites are what this fix adds, and
+    // resolve_perm_groups short-circuits on the FIRST failure — so a black-box
+    // test through the public `authorize_list_read()` chokepoint can only ever
+    // exercise user_rbac_group_names's sites, never role_effects_for's. The
+    // friend seam lets the test drive each directly.
+    friend struct RbacStoreTestAccess;
+
     pg::PgPool& pool_;
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
+    // Cached by set_metrics() — see that method's doc comment. Null whenever
+    // metrics_ is null (never observed).
+    yuzu::Histogram* authz_check_seconds_hist_{nullptr};
 
     // Durable-generation-validated view of the global enabled flag. The atomic
     // is the hot-path answer; `maybe_refresh_generation()` re-reads the durable

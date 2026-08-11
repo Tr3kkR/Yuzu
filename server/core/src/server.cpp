@@ -1122,7 +1122,12 @@ public:
                           "staleness condition rather than a denied check — see the alert's "
                           "reason filter before assuming any nonzero rate here pages). "
                           "A sustained non-zero rate in the denying reasons is a fleet-wide authz "
-                          "availability event, not mass access-denial — alert on it.",
+                          "availability event, not mass access-denial — alert on it. "
+                          "A circuit-breaker-open denial (#2703 Gate 7 item 1 commit B) is recorded "
+                          "under pool_acquire_timeout, not a distinct reason — it is one of that "
+                          "reason's own two contributing failure modes (see "
+                          "yuzu_server_rbac_breaker_open for whether the pool is actually being "
+                          "touched right now).",
                           "counter");
         for (const auto reason : {"pool_acquire_timeout", "query_error",
                                   "generation_refresh_failed", "generation_refresh_failed_within_bound",
@@ -1155,7 +1160,16 @@ public:
             "reads fast even when the acquire succeeds but the query itself "
             "blocks (e.g. cancelled by PgPool's injected lock_timeout).",
             "histogram");
-        metrics_.histogram("yuzu_server_rbac_authz_check_seconds");
+        // Gate 3 (architect + sre, 2 independent reporters): this histogram
+        // exists specifically to characterize the measured lock-contention
+        // tail (~18.5s, worst case ~40s analytically, #3016) — the default
+        // buckets cap at 10s, which would collapse that entire tail into a
+        // single +Inf bucket. Extended buckets, birthed ONCE here (#1686
+        // precedent, same as yuzu_pg_acquire_wait_seconds above) so the hot
+        // path's cached-pointer lookup in RbacStore::set_metrics() never has
+        // to allocate a bucket vector.
+        metrics_.histogram("yuzu_server_rbac_authz_check_seconds",
+                           yuzu::Histogram::seconds_buckets_60s());
         metrics_.describe(
             "yuzu_server_rbac_breaker_open",
             "1 when the authz-hot-path fail-fast breaker is open (2 consecutive "
@@ -5611,7 +5625,8 @@ public:
         // revalidation, a materially different mechanism (see
         // StreamBudget::closing()'s doc comment) — an open MCP stream still
         // relies on the bounded web-thread join below as its backstop.
-        // Tracked as a named follow-up, not silently left uncovered.
+        // Tracked as a named follow-up (#2371 comment, 2026-08-11), not
+        // silently left uncovered.
         if (stream_budget_)
             stream_budget_->begin_closing();
 
