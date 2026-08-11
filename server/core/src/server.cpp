@@ -1618,6 +1618,17 @@ public:
                           "surviving partner; NOT a lockout risk (the sweep cannot auto-revoke "
                           "a stranded partner). Non-zero means inspect manually.",
                           "counter");
+        // #2961 fix-round finding 4: not reachable through any live code
+        // path (both the RAM and durable initiator are written from the
+        // same requesting_user in the same mint call) - non-zero is a
+        // tamper/corruption signal on api_tokens.rotation_initiator, not an
+        // operational condition. Inspect the row's history manually.
+        metrics_.describe("yuzu_server_rotation_initiator_disagreements_total",
+                          "resolve_rotation_initiator RAM-vs-durable disagreements - not "
+                          "reachable in normal operation; non-zero means inspect "
+                          "api_tokens.rotation_initiator for out-of-band tampering or "
+                          "corruption.",
+                          "counter");
         metrics_.describe("yuzu_server_token_cache_size",
                           "Distinct API tokens currently held in the validate_token cache",
                           "gauge");
@@ -5144,6 +5155,10 @@ public:
                     metrics_.gauge("yuzu_server_rotation_pair_resolve_failures_total")
                         .set(static_cast<double>(
                             api_token_store_->rotation_pair_resolve_failures()));
+                    // #2961 fix-round finding 4 — same accessor pattern.
+                    metrics_.gauge("yuzu_server_rotation_initiator_disagreements_total")
+                        .set(static_cast<double>(
+                            api_token_store_->rotation_initiator_disagreements()));
                 }
                 // #2367: the same observability for the engine-principal
                 // revalidation cache. Without these the cache is invisible —

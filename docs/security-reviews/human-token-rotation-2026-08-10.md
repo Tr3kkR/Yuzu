@@ -386,6 +386,92 @@ rather than incrementing.
   deactivation/sign-out-everywhere). Filed by the `unhappy-path` reviewer
   (UP-1, UP-2, UP-3, UP-13); durability requires new persistent state, which
   is why it is a separate re-cut rather than a fold into this branch.
+
+  **RESOLVED 2026-08-11** (`feat/auth-rotation-confirm-durability`, migration
+  v3). `api_tokens.rotation_initiator` durably stamps the confirming
+  operator onto the successor row, inside the same advisory-locked mint
+  transaction, on **both** arms. `ApiTokenStore::resolve_rotation_initiator`
+  is the single chokepoint `confirm_rotation`/`confirm_token_rotation` now
+  read through: RAM (`rotation_grace_cache_`) first, the durable column as
+  the RAM-absent recovery path, fail closed if the two disagree, empty never
+  treated as a wildcard. This closes the plain-restart failure mode
+  described above, and — because the durable column is a Postgres row, not
+  process-local — also closes the "confirm cannot succeed on a replica that
+  did not itself serve the rotate" sub-case for the identity check
+  specifically.
+
+  **WARNING — do NOT recover a successor id out-of-band in order to confirm.**
+  An earlier revision of this section framed that as a bonus of the durable
+  column. It is not; it is the one dangerous way to use this change, and the
+  `unhappy-path` gate caught the text recommending it (UP-2, I4 harmful
+  operator guidance).
+
+  If the rotate response or the raw successor secret was not received, do NOT
+  look the successor id up (via `list_active_for_principal` or a support
+  query) and call confirm. **Confirm attests that the successor secret was
+  received and retained, and it immediately revokes the predecessor.** Doing
+  it without the secret leaves an active credential nobody holds — zero usable
+  credentials for that principal. Instead, explicitly **revoke the unknown
+  successor**, which preserves the known predecessor, then start a new
+  rotation.
+
+  The durable initiator binding restores confirmation after a restart ONLY for
+  an operator who retained the original rotate response — its raw secret and
+  its successor id. It does not, and cannot, establish that the secret was
+  ever delivered.
+
+  Adjudicated (architect, `gpt-5.6-sol`, not the change author): the
+  pre-#2961 behaviour here was an ACCIDENTAL and incomplete guard, not a
+  control. The RAM entry proved the server had MINTED the secret, never that
+  the client received it — it is populated before the HTTP response is
+  written, so even pre-#2961 a lost-response caller who recovered the id could
+  already confirm on the same process. A restart merely happened to erase the
+  identity evidence as well. Losing that coupling is therefore not a
+  security-control regression, and the proposed `last_used_at != 0` guard was
+  REJECTED: it cannot distinguish "secret received but not yet deployed" from
+  "secret never received" (both are 0), and would break confirm-before-rollout
+  across a restart, which is precisely what #2961 exists to enable. The honest
+  mechanical fix is proof of possession at confirm — presenting the successor
+  secret, verifiable against the stored hash without persisting the raw — and
+  that is a separate API/MCP/UI and threat-model change, tracked separately.
+  Residual until then: an operator who obtains a successor id out-of-band and
+  falsely attests receipt can revoke the only credential they actually hold. **Not closed by this fix, and deliberately so:** the
+  raw successor secret's grace-window re-serve (F4) stays RAM-only — a
+  one-time reveal must not become durable, so that capability is still
+  forfeited on restart. **Not closed, still tracked separately, and this fix
+  adds a NEW trigger for it:** the "grace entries leak across replicas"
+  (memory never evicted cross-process) sub-case above is a RAM-cache
+  lifecycle question, orthogonal to the identity check now having a durable
+  source, and remains open — but it used to be a narrow, largely theoretical
+  exposure (pre-fix, a confirm attempted on a replica that did not serve the
+  mint always failed closed at the identity check, so a successful
+  cross-replica confirm — the case that leaves the OTHER replica's cache
+  entry stranded — essentially never happened in practice). Post-fix,
+  cross-replica confirm is the durable fallback's whole reason to exist and
+  now succeeds routinely: when replica B confirms a rotation minted on
+  replica A, B's own (empty) cache has nothing to evict and A's entry is
+  never touched — `evict_rotation_raw` is process-local, so only the replica
+  that actually runs the confirm call clears its own copy. This converts the
+  leak from an occasional, largely-unreachable edge case into a systematic
+  one on any multi-replica deployment where mint and confirm land on
+  different instances. No secret is retained in the stranded entry (the raw
+  value is already scrubbed past the 120s reveal window by the time most
+  confirms happen) — the leaked residue is ~100 bytes of
+  `rotation_group`/`requesting_user`/`minted` per stranded entry — but the
+  eventual cross-replica cache-invalidation work (tracked separately, not
+  filed as its own issue by this pass) needs to know the trigger is now
+  routine, not rare. Confirm still has no time bound (#2962) and the
+  rotation sweep still lacks the full clock-guard shape (#2964) — neither is
+  touched by this fix. A rotation already in flight when v3 is applied has
+  an empty `rotation_initiator` and stays unconfirmable after a restart — it
+  fails closed rather than matching any caller; an operator mid-upgrade with
+  an in-flight rotation should confirm it before restarting if possible.
+  If not, the sweep resolves the pair on its own timer only if the
+  successor was presented at least once (UP-5) — if it was never
+  presented, the sweep never resolves this pair, and the operator must
+  revoke the specific credential no longer trusted via
+  `DELETE /api/v1/tokens/{token_id}`, never the terminal principal-level
+  `DELETE /api/v1/engine-principals/{id}` route.
 - **`#2962`** (Owner: unassigned) — two unrecoverable terminals in the
   rotation state machine, both reachable single-instance. (A) `confirm` has
   no time bound on the grace *entry* itself (only the raw-secret re-serve

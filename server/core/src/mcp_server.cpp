@@ -957,7 +957,12 @@ static const ToolDef kTools[] = {
      "no state change, so a blind retry can never confirm a later rotation. Replaying a confirm "
      "after this rotation already resolved (a network-dropped success, a double-submit) returns a "
      "TERMINAL already-confirmed/already-resolved error (not a retryable one) - do not retry; "
-     "re-rotate if a fresh rotation is needed. Note: the approval gate applies two independent "
+     "re-rotate if a fresh rotation is needed. If confirm instead reports 'rotation confirmation "
+     "unavailable' (the initiator binding is lost or in dispute), do NOT call "
+     "revoke_engine_principal - that is TERMINAL and destroys BOTH credentials plus the "
+     "principal itself; there is no MCP twin for per-credential revoke, so resolve this case via "
+     "REST: DELETE /api/v1/tokens/{token_id} on the SPECIFIC credential you no longer trust. "
+     "Note: the approval gate applies two independent "
      "checks before this logic runs. (1) An exact replay carrying an already-consumed "
      "approval_id is denied ('approval already used'; submit a new request for a fresh ticket). "
      "(2) Even a never-consumed, still-valid approval_id can be denied if the rotation's state "
@@ -1010,7 +1015,11 @@ static const ToolDef kTools[] = {
      "confirm a later rotation. Replaying a confirm after this rotation already resolved (a "
      "network-dropped success, a double-submit) returns a TERMINAL already-confirmed/already-"
      "resolved error (not a retryable one) — do not retry; rotate again if a fresh rotation is "
-     "needed. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Mirrors "
+     "needed. If confirm instead reports 'rotation confirmation unavailable' (the initiator "
+     "binding is lost or in dispute), revoke the SPECIFIC untrusted credential via "
+     "DELETE /api/v1/tokens/{token_id} — there is no engine-principal terminal route in play on "
+     "this human-token arm, but the same per-credential (never per-principal) revoke discipline "
+     "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Mirrors "
      "POST /api/v1/tokens/{id}/confirm. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
      R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"})j"
@@ -3687,13 +3696,25 @@ McpServer::HandlerFn McpServer::build_handler(
                     // effect depends on has moved on.
                     //
                     // NOT closed by this precondition: (1) a restart evicting the
-                    // Hermes F4/F5 initiator (grace-cache) binding. `active` alone
-                    // cannot see that state - it lives in an in-process cache that is
-                    // private to ApiTokenStore (see rotation_confirm_state.hpp's
-                    // pair_matches_pin doc comment). confirm_rotation's own
-                    // in-transaction check remains the only thing that catches it,
-                    // so that specific drift still burns the ticket. Tracked: #2946
-                    // (read-only initiator-binding accessor would close it here too).
+                    // Hermes F4/F5 initiator (grace-cache) binding. #2961 (migration
+                    // v3) added a durable echo of that binding
+                    // (`ApiToken::rotation_initiator`), so a PLAIN restart no longer
+                    // costs the confirm at all - confirm_rotation's in-transaction
+                    // check (ApiTokenStore::resolve_rotation_initiator) recovers the
+                    // initiator from the durable column when the grace-cache entry
+                    // is gone. The residual this precondition still cannot see is
+                    // narrower: a pair that began rotating BEFORE v3 shipped (durable
+                    // column never stamped), or a genuine RAM/durable disagreement
+                    // (resolve_rotation_initiator fails closed rather than guessing).
+                    // Either way `active` alone still cannot distinguish "will
+                    // recover from the durable column" from "will fail closed" - this
+                    // precondition only checks kPair/pin linkage, not the initiator
+                    // binding itself - so confirm_rotation's own in-transaction check
+                    // remains the only thing that catches it, and that narrower drift
+                    // still burns the ticket. Tracked: #2946 (a read-only
+                    // initiator-binding accessor, reading `rotation_initiator` off
+                    // the same `active` rows this precondition already has, would
+                    // close it here too).
                     // (2) two independently-approved tickets pinned to the SAME
                     // successor token_id (an operator double-approval mistake): both
                     // preconditions read the identical kPair/pin-matches state

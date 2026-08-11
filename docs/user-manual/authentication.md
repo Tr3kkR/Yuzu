@@ -663,6 +663,31 @@ deliberately leaves BOTH credentials active** rather than revoke your only
 working token out from under you (a dropped rotate response, or simply
 never picking up the new secret, must not end in zero usable credentials).
 
+**That safeguard covers the automatic sweep only — it does not cover an
+explicit `confirm`.** `confirm` is your attestation that you received and
+retained the successor secret, and it revokes the predecessor straight away.
+If the rotate response was lost, do NOT look the successor's `token_id` up
+and confirm it: that revokes the credential you still hold in favour of one
+you never received. Revoke the unknown successor instead — that keeps the
+predecessor working — and start a new rotation.
+
+`confirm`'s check that you're the same operator who called `rotate` is
+stored durably, not just in memory, so a server restart no longer blocks
+confirming an in-flight rotation. The one exception is a rotation already
+in flight *before* this durability guarantee was deployed to your server —
+that pair has no durable record of who initiated it, and a restart still
+leaves it permanently unconfirmable (it fails closed rather than accepting
+just anyone). If you're mid-rotation during an upgrade, confirm before
+restarting if you can. If you can't, the 60-second background sweep still
+resolves the pair on its own timer — **provided the successor was
+presented at least once** (the same carve-out described above): if so, no
+action is required. If the successor was never presented at all, the sweep
+never resolves this pair — both credentials stay active until you act. To
+resolve it by hand — either because the successor was never presented, or
+because you'd rather not wait — revoke whichever side (predecessor or
+successor) you no longer trust with `DELETE /api/v1/tokens/{token_id}`
+(see above), rather than retrying `confirm`.
+
 **MFA step-up is required on every call, if you have MFA enrolled — and
 that includes a repeat call.** Unlike most session activity, `rotate` and
 `confirm` re-validate a *fresh* step-up proof **every time**, including a
