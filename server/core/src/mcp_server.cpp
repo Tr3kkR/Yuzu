@@ -249,6 +249,24 @@ std::string tool_result(std::string_view payload, const char* output_schema_json
     return result.str();
 }
 
+// #2712: for a tool whose content[0].text predates output-schema wiring (a bare
+// JSON array, or an object with legacy sibling fields alongside content), MCP's
+// own output-schema contract requires structuredContent to be a top-level object
+// matching output_schema_json - which a bare array can never satisfy. Retrofitting
+// such a tool must NOT change content_text's wire shape (an existing consumer
+// parsing content[0].text today would break), so content_text and the
+// schema-conformant structured_payload are supplied SEPARATELY here rather than
+// sharing one string like the plain overload above. Additive: does not change
+// tool_result()'s existing 2-arg behavior or any of its current call sites.
+std::string tool_result_split(std::string_view content_text, std::string_view structured_payload,
+                               const char* output_schema_json) {
+    JObj result;
+    result.raw("content", JArr().add(JObj().add("type", "text").add("text", content_text)).str());
+    if (output_schema_json)
+        result.raw("structuredContent", structured_payload);
+    return result.str();
+}
+
 // #2530 H1: arbitrary-instant twin of utc_now_iso() below, for formatting a
 // PAST captured instant (e.g. KekOpResult::lock_holder_captured_at) rather
 // than "now".
@@ -299,21 +317,26 @@ std::string lower_copy(std::string v) {
 // docs/mcp-server.md "Adding a tool".
 static const ToolDef kTools[] = {
     {"list_agents", "List all connected agents with hostname, OS, architecture, and version.",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
 
     {"get_agent_details", "Get detailed info for a single agent including tags and inventory.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})"},
+     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version"]})j"},
 
     {"query_audit_log",
      "Query the audit log with filters. Returns timestamped entries showing who did what, when.",
-     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})"},
+     R"({"type":"object","properties":{"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"since":{"type":"integer","description":"Unix epoch lower bound"},"until":{"type":"integer","description":"Unix epoch upper bound"},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}})",
+     R"j({"type":"object","properties":{"entries":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"timestamp":{"type":"integer"},"principal":{"type":"string"},"action":{"type":"string"},"target_type":{"type":"string"},"target_id":{"type":"string"},"detail":{"type":"string"},"result":{"type":"string"}},"required":["id","timestamp","principal","action","target_type","target_id","detail","result"]}}},"required":["entries"]})j"},
 
     {"list_definitions",
      "List available instruction definitions (commands that can be dispatched to agents).",
-     R"({"type":"object","properties":{"plugin":{"type":"string"},"type":{"type":"string","enum":["question","action"]},"enabled":{"type":"boolean"}}})"},
+     R"({"type":"object","properties":{"plugin":{"type":"string"},"type":{"type":"string","enum":["question","action"]},"enabled":{"type":"boolean"}}})",
+     R"j({"type":"object","properties":{"definitions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"enabled":{"type":"boolean"}},"required":["id","name","version","type","plugin","action","description","enabled"]}}},"required":["definitions"]})j"},
 
     {"get_definition", "Get a single instruction definition with its parameter and result schemas.",
-     R"({"type":"object","properties":{"id":{"type":"string","description":"Definition ID"}},"required":["id"]})"},
+     R"({"type":"object","properties":{"id":{"type":"string","description":"Definition ID"}},"required":["id"]})",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"approval_mode":{"type":"string"},"parameter_schema":{"type":"string","description":"Serialized JSON Schema for the definition's parameters"},"result_schema":{"type":"string","description":"Serialized JSON Schema for the definition's result"},"yaml_source":{"type":"string"}},"required":["id","name","version","type","plugin","action","description","approval_mode","parameter_schema","result_schema","yaml_source"]})j"},
 
     {"query_responses",
      "Query command response data. Provide execution_id to collect exactly the "
@@ -327,7 +350,8 @@ static const ToolDef kTools[] = {
      "global Response:Read gate (a normal holder receives rows for all agents; "
      "effective scoping needs the #1634 gate change); its active effect today is "
      "failing closed (zero rows) when the RBAC store is corrupt.",
-     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j"},
+     R"j({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID returned by execute_instruction; exact-correlation collect of just that dispatch. Takes precedence over instruction_id."},"instruction_id":{"type":"string","description":"Instruction ID (required when execution_id is omitted)"},"agent_id":{"type":"string"},"status":{"type":"integer","description":"CommandResponse status enum; omit or -1 for any"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}},"anyOf":[{"required":["execution_id"]},{"required":["instruction_id"]}]})j",
+     R"j({"type":"object","properties":{"responses":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"execution_id":{"type":"string"},"status":{"type":"integer"},"output":{"type":"string"},"timestamp":{"type":"integer"}},"required":["agent_id","execution_id","status","output","timestamp"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"}},"required":["responses"]})j"},
 
     {"aggregate_responses",
      "Aggregate response data (COUNT, SUM, AVG) grouped by a column. A per-agent management-group "
@@ -336,19 +360,23 @@ static const ToolDef kTools[] = {
      "gate change). Active effect today: fails closed (a JSON-RPC error, never empty totals) when the "
      "RBAC store is corrupt or the response read errors. A denied-scope audit row is emitted on a "
      "drop.",
-     R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})"},
+     R"({"type":"object","properties":{"instruction_id":{"type":"string"},"group_by":{"type":"string"},"aggregate":{"type":"string","enum":["count","sum","avg","min","max"]}},"required":["instruction_id","group_by"]})",
+     R"j({"type":"object","properties":{"results":{"type":"array","items":{"type":"object","properties":{"group_value":{"type":"string"},"count":{"type":"integer"},"aggregate_value":{"type":"number"}},"required":["group_value","count","aggregate_value"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["results"]})j"},
 
     {"query_inventory",
      "Query GENERIC per-source inventory blobs across agents (filter by agent or plugin). For the "
      "typed installed-software inventory (name/version/publisher per device, fleet-queryable), use "
      "query_installed_software instead.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"limit":{"type":"integer","default":100}}})"},
+     R"({"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"limit":{"type":"integer","default":100}}})",
+     R"j({"type":"object","properties":{"records":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"plugin":{"type":"string"},"data":{"type":"string"},"collected_at":{"type":"integer"}},"required":["agent_id","plugin","data","collected_at"]}},"result_truncated_by_cap":{"type":"boolean"}},"required":["records","result_truncated_by_cap"]})j"},
 
     {"list_inventory_tables", "List available inventory data types with agent counts.",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"tables":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"agent_count":{"type":"integer"},"last_collected":{"type":"integer"}},"required":["plugin","agent_count","last_collected"]}}},"required":["tables"]})j"},
 
     {"get_agent_inventory", "Get all inventory data for a specific agent.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})"},
+     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
+     R"j({"type":"object","properties":{"records":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"data":{"type":"string"},"collected_at":{"type":"integer"}},"required":["plugin","data","collected_at"]}},"result_truncated_by_cap":{"type":"boolean"}},"required":["records","result_truncated_by_cap"]})j"},
 
     {"query_installed_software",
      "Query the typed installed-software inventory collected by the agent daily-sync framework "
@@ -365,51 +393,65 @@ static const ToolDef kTools[] = {
      "follow-up). A per-agent management-group drop filter is applied (devices_omitted reports the "
      "count) but is NOT yet effective under the global Inventory:Read gate, so results are not "
      "narrowed by management group today (ADR-0017); treat scope as global read until that gate lands.",
-     R"j({"type":"object","properties":{"name":{"type":"string","description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","description":"Exact agent/device filter; omit for fleet-wide"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})j"},
+     R"j({"type":"object","properties":{"name":{"type":"string","description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","description":"Exact agent/device filter; omit for fleet-wide"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})j",
+     R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"devices_omitted":{"type":"integer","description":"Count of devices dropped by the management-group filter"}},"required":["software","devices_omitted"]})j"},
 
     {"get_tags", "Get all tags for a specific agent.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})"},
+     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
+     R"j({"type":"object","properties":{"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"},"updated_at":{"type":"integer"}},"required":["key","value","source","updated_at"]}}},"required":["tags"]})j"},
 
     {"search_agents_by_tag", "Find agents that have a specific tag key (and optionally value).",
-     R"({"type":"object","properties":{"key":{"type":"string","description":"Tag key"},"value":{"type":"string","description":"Optional tag value filter"}},"required":["key"]})"},
+     R"({"type":"object","properties":{"key":{"type":"string","description":"Tag key"},"value":{"type":"string","description":"Optional tag value filter"}},"required":["key"]})",
+     R"j({"type":"object","properties":{"agent_ids":{"type":"array","items":{"type":"string"}}},"required":["agent_ids"]})j"},
 
     {"list_policies", "List compliance policies.",
-     R"({"type":"object","properties":{"enabled":{"type":"boolean"}}})"},
+     R"({"type":"object","properties":{"enabled":{"type":"boolean"}}})",
+     R"j({"type":"object","properties":{"policies":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"enabled":{"type":"boolean"},"scope_expression":{"type":"string"}},"required":["id","name","description","enabled","scope_expression"]}}},"required":["policies"]})j"},
 
     {"get_compliance_summary",
      "Get per-policy compliance breakdown (compliant/non-compliant/unknown counts).",
-     R"({"type":"object","properties":{"policy_id":{"type":"string","description":"Policy ID"}},"required":["policy_id"]})"},
+     R"({"type":"object","properties":{"policy_id":{"type":"string","description":"Policy ID"}},"required":["policy_id"]})",
+     R"j({"type":"object","properties":{"policy_id":{"type":"string"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"total":{"type":"integer"}},"required":["policy_id","compliant","non_compliant","unknown","fixing","error","total"]})j"},
 
     {"get_fleet_compliance", "Get fleet-wide compliance percentages across all policies.",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"total_checks":{"type":"integer"},"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"compliance_pct":{"type":"number"}},"required":["total_checks","compliant","non_compliant","unknown","compliance_pct"]})j"},
 
     {"list_management_groups", "List management groups (hierarchical device grouping).",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"groups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"parent_id":{"type":"string"},"membership_type":{"type":"string"},"scope_expression":{"type":"string"}},"required":["id","name","description","parent_id","membership_type","scope_expression"]}}},"required":["groups"]})j"},
 
     {"get_execution_status", "Check status of a running or completed command execution.",
-     R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"}},"required":["execution_id"]})"},
+     R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"}},"required":["execution_id"]})",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"}},"required":["id","definition_id","status","scope_expression","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct"]})j"},
 
     {"list_executions", "List recent command executions.",
-     R"({"type":"object","properties":{"definition_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer","default":50}}})"},
+     R"({"type":"object","properties":{"definition_id":{"type":"string"},"status":{"type":"string"},"limit":{"type":"integer","default":50}}})",
+     R"j({"type":"object","properties":{"executions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"}},"required":["id","definition_id","status","dispatched_by","dispatched_at","agents_targeted","agents_responded"]}}},"required":["executions"]})j"},
 
     {"list_schedules", "List scheduled (recurring) instructions.",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"schedules":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"definition_id":{"type":"string"},"frequency_type":{"type":"string"},"enabled":{"type":"boolean"},"next_execution_at":{"type":"integer"}},"required":["id","name","definition_id","frequency_type","enabled","next_execution_at"]}}},"required":["schedules"]})j"},
 
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
-     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression to validate"}},"required":["expression"]})"},
+     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression to validate"}},"required":["expression"]})",
+     R"j({"type":"object","properties":{"valid":{"type":"boolean"},"expression":{"type":"string","description":"The input expression, echoed back verbatim (not canonicalized) — present only when valid is true"},"error":{"type":"string","description":"Parse error message — present only when valid is false"}},"required":["valid"],"oneOf":[{"required":["expression"]},{"required":["error"]}]})j"},
 
     {"preview_scope_targets", "Show which agents match a scope expression.",
-     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression"}},"required":["expression"]})"},
+     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression"}},"required":["expression"]})",
+     R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
     {"list_pending_approvals", "List pending approval requests.",
-     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})"},
+     R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})",
+     R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","scope_expression"]}}},"required":["approvals"]})j"},
 
     {"get_guardian_schemas",
      "Get the Guardian (Guaranteed State) Guard authoring schema catalog — the "
      "spark/assertion/remediation types and their JSON Schemas. Use this to discover how to "
      "author a Guard. Identical to the REST GET /api/v1/guaranteed-state/schemas catalog.",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"schemas":{"type":"object","additionalProperties":true,"description":"category -> type -> JSON Schema; inherently open-ended as Guard types are added, so left loose"}},"required":["version","description","schemas"]})j"},
 
     // ── DEX (Digital Employee Experience) read tools — parity with /api/v1/dex/* ──
     {"list_dex_signals",
@@ -675,7 +717,8 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("limit":{"type":"integer","default":200,"maximum":1000,"description":"Max rows"},)j"
      R"j("offset":{"type":"integer","default":0,"description":"Pagination offset"})j"
-     R"j(}})j"},
+     R"j(}})j",
+     R"j({"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"serial_hex":{"type":"string"},"subject":{"type":"string"},"san":{"type":"string"},"purpose":{"type":"string"},"status":{"type":"string"},"not_after":{"type":"integer"},"issued_at":{"type":"integer"},"revoked_at":{"type":"integer"},"revocation_reason":{"type":"string"},"issued_by":{"type":"string"},"issuer_key_id":{"type":"string"}},"required":["serial_hex","subject","san","purpose","status","not_after","issued_at","revoked_at","revocation_reason","issued_by","issuer_key_id"]}},"count":{"type":"integer"},"limit":{"type":"integer"},"offset":{"type":"integer"},"has_more":{"type":"boolean"},"next_offset":{"type":"integer","description":"Present only when has_more is true"}},"required":["items","count","limit","offset","has_more"]})j"},
 
     {"revoke_certificate",
      "Revoke an issued certificate by serial and republish the CRL. Mirrors "
@@ -920,7 +963,9 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
      R"j("role":{"type":"string","description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
      R"j(},"required":["principal_id","role"]})j",
-     kObjectOutputSchema},
+     R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["assigned","principal_id","role"]})j"},
 
     {"unassign_engine_role",
      "Revoke a FLEET-WIDE RBAC role from an engine principal, immediately removing the "
@@ -932,7 +977,9 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
      R"j("role":{"type":"string","description":"The role name to revoke"})j"
      R"j(},"required":["principal_id","role"]})j",
-     kObjectOutputSchema},
+     R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["unassigned","principal_id","role"]})j"},
 
     {"list_engine_roles",
      "List the fleet-wide RBAC roles currently assigned to one engine principal — the "
@@ -942,7 +989,9 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"})j"
      R"j(},"required":["principal_id"]})j",
-     kObjectOutputSchema},
+     R"j({"type":"object","properties":{"principal_id":{"type":"string"},"count":{"type":"integer"},)j"
+     R"j("roles":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"}},"required":["principal_id","role"]}})j"
+     R"j(},"required":["principal_id","count","roles"]})j"},
 
     // ── Agentic demo/read tools — MCP-native high-level workflow helpers ──
     {"get_fleet_posture_fast",
@@ -3745,13 +3794,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("arch", a.value("arch", ""))
                                 .add("agent_version", a.value("agent_version", "")));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("agents", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -3801,15 +3850,10 @@ McpServer::HandlerFn McpServer::build_handler(
                             JObj().add("key", t.key).add("value", t.value).add("source", t.source));
                     agent_obj.raw("tags", tag_arr.str());
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr()
-                                 .add(JObj().add("type", "text").add("text", agent_obj.str()))
-                                 .str())
-                        .str();
                 mcp_audit("success", agent_id);
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id, tool_result(agent_obj.str(), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -3867,13 +3911,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("detail", e.detail)
                                 .add("result", e.result));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("entries", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -3909,13 +3953,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("description", d.description)
                                 .add("enabled", d.enabled));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(
+                        id, tool_result_split(arr.str(),
+                                              JObj().raw("definitions", arr.str()).str(),
+                                              kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -3955,13 +3999,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                .add("parameter_schema", def->parameter_schema)
                                .add("result_schema", def->result_schema)
                                .add("yaml_source", def->yaml_source);
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", obj.str())).str())
-                        .str();
                 mcp_audit("success", def_id);
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -4131,6 +4171,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 // shape — content[].text stays the bare rows array, unchanged).
                 if (hit_cap)
                     result_obj.raw("result_truncated_by_cap", "true");
+                // #2712: structuredContent combines the same rows + the same two
+                // conditional flags into ONE schema-conformant object (content[].text
+                // above stays the legacy bare array + sibling-field shape, unchanged,
+                // for backward compat with existing consumers).
+                JObj structured;
+                structured.raw("responses", arr.str());
+                if (!audit_ok)
+                    structured.add("audit_persisted", false);
+                if (hit_cap)
+                    structured.add("result_truncated_by_cap", true);
+                result_obj.raw("structuredContent", structured.str());
                 res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
             }
@@ -4268,7 +4319,27 @@ McpServer::HandlerFn McpServer::build_handler(
                 // (0 when none) so an agentic caller can tell "out of my scope" from "not
                 // installed anywhere" — the partial- and all-out-of-scope false-negative
                 // (gov UP-12 + enterprise SHOULD-1). The audit row carries it too.
+                // devices_omitted is a genuine JSON integer: .raw() splices
+                // std::to_string(dropped_agents)'s digits unquoted (confirmed by
+                // reading JObj::raw() vs JObj::add() - only add() quotes). An
+                // earlier round of this PR wrongly believed this was a string and
+                // filed #2973 on that premise; #2973 is closed as invalid, not
+                // fixed - there was nothing to fix here.
                 result_obj.raw("devices_omitted", std::to_string(dropped_agents));
+                // #2712: structuredContent combines the same rows + the same flags
+                // into ONE schema-conformant object (content[].text above stays the
+                // legacy shape, unchanged). devices_omitted uses .raw() here too,
+                // matching the legacy field's actual (integer) type - using .add()
+                // would quote it into a string, a NEW inconsistency within the same
+                // response that the legacy field never had.
+                JObj structured;
+                structured.raw("software", arr.str());
+                if (!audit_ok)
+                    structured.add("audit_persisted", false);
+                if (hit_cap)
+                    structured.add("result_truncated_by_cap", true);
+                structured.raw("devices_omitted", std::to_string(dropped_agents));
+                result_obj.raw("structuredContent", structured.str());
                 res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
             }
@@ -4398,6 +4469,14 @@ McpServer::HandlerFn McpServer::build_handler(
                                JArr().add(JObj().add("type", "text").add("text", arr.str())).str());
                 if (!audit_ok)
                     result_obj.raw("audit_persisted", "false");
+                // #2712: structuredContent combines the same rows + the same
+                // conditional flag into ONE schema-conformant object (content[].text
+                // above stays the legacy bare array + sibling-field shape, unchanged).
+                JObj structured;
+                structured.raw("results", arr.str());
+                if (!audit_ok)
+                    structured.add("audit_persisted", false);
+                result_obj.raw("structuredContent", structured.str());
                 res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
             }
@@ -4444,6 +4523,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         .raw("content",
                              JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
                         .add("result_truncated_by_cap", inventory_truncated)
+                        // #2712: structuredContent wraps the same rows under "records"
+                        // plus the same flag (content[].text above stays the legacy
+                        // bare array + sibling-field shape, unchanged).
+                        .raw("structuredContent", JObj()
+                                                      .raw("records", arr.str())
+                                                      .add("result_truncated_by_cap",
+                                                           inventory_truncated)
+                                                      .str())
                         .str();
                 mcp_audit("success");
                 res.set_content(success_response(id, result), "application/json");
@@ -4481,13 +4568,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("agent_count", t.agent_count)
                                 .add("last_collected", t.last_collected));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("tables", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -4534,6 +4621,14 @@ McpServer::HandlerFn McpServer::build_handler(
                         .raw("content",
                              JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
                         .add("result_truncated_by_cap", inventory_truncated)
+                        // #2712: structuredContent wraps the same rows under "records"
+                        // plus the same flag (content[].text above stays the legacy
+                        // bare array + sibling-field shape, unchanged).
+                        .raw("structuredContent", JObj()
+                                                      .raw("records", arr.str())
+                                                      .add("result_truncated_by_cap",
+                                                           inventory_truncated)
+                                                      .str())
                         .str();
                 mcp_audit("success", agent_id);
                 res.set_content(success_response(id, result), "application/json");
@@ -4664,13 +4759,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("source", t.source)
                                 .add("updated_at", t.updated_at));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success", agent_id);
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("tags", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -4695,13 +4790,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 JArr arr;
                 for (const auto& aid : agent_ids)
                     arr.add(aid);
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success", key);
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(
+                        id, tool_result_split(arr.str(),
+                                              JObj().raw("agent_ids", arr.str()).str(),
+                                              kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -4731,13 +4826,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("enabled", p.enabled)
                                 .add("scope_expression", p.scope_expression));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("policies", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -4766,13 +4861,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                .add("fixing", cs.fixing)
                                .add("error", cs.error)
                                .add("total", cs.total);
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", obj.str())).str())
-                        .str();
                 mcp_audit("success", policy_id);
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -4798,13 +4889,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                .add("non_compliant", fc.non_compliant)
                                .add("unknown", fc.unknown)
                                .add("compliance_pct", fc.compliance_pct);
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", obj.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -4835,13 +4922,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("membership_type", g.membership_type)
                                 .add("scope_expression", g.scope_expression));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("groups", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -4883,13 +4970,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         .add("agents_success", static_cast<int64_t>(exec->agents_success))
                         .add("agents_failure", static_cast<int64_t>(exec->agents_failure))
                         .add("progress_pct", static_cast<int64_t>(summary.progress_pct));
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", obj.str())).str())
-                        .str();
                 mcp_audit("success", exec_id);
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -4925,13 +5008,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("agents_targeted", static_cast<int64_t>(e.agents_targeted))
                                 .add("agents_responded", static_cast<int64_t>(e.agents_responded)));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(
+                        id, tool_result_split(arr.str(),
+                                              JObj().raw("executions", arr.str()).str(),
+                                              kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -4963,13 +5046,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("enabled", s.enabled)
                                 .add("next_execution_at", s.next_execution_at));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("schedules", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -4988,13 +5071,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 } else {
                     obj.add("valid", false).add("error", valid.error());
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", obj.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -5065,13 +5144,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                            " agents (>" + std::to_string(kMcpScopeWarnThreshold) +
                                            "). Phase 2 write operations targeting this scope will "
                                            "require approval.");
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", obj.str())).str())
-                        .str();
                 mcp_audit("success", expression);
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -5105,13 +5180,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("submitted_at", a.submitted_at)
                                 .add("scope_expression", a.scope_expression));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("approvals", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -5130,13 +5205,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // client and a REST client discover the IDENTICAL Guard authoring schemas
                 // (contract §4 decision 3 / §9 G9: discovery on every plane, not REST-only).
                 const auto& catalog = ::yuzu::server::guardian::guardian_schema_catalog();
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", catalog.json)).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id, tool_result(catalog.json, kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -8083,14 +8155,10 @@ McpServer::HandlerFn McpServer::build_handler(
                                           {"has_more", has_more}};
                 if (has_more)
                     payload["next_offset"] = offset + limit;
-                auto result = JObj()
-                                  .raw("content", JArr()
-                                                      .add(JObj().add("type", "text").add(
-                                                          "text", payload.dump()))
-                                                      .str())
-                                  .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
