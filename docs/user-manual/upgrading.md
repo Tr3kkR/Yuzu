@@ -1215,23 +1215,33 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
-- **`YuzuAuditRetentionNotRunning` now fires for a crash-looping server (#2553).**
-  Its young-server grace previously keyed on uptime alone, so a process restarting
-  more often than the 3-hour alert window never accumulated enough uptime to leave
-  the grace and was excused on every evaluation - silently, and for one of the
-  leading causes of the exact condition the rule detects. The grace now also
-  requires the uptime series to have at most one reset across the window. **If you
-  deployed this rule and have a crash-looping server, expect a new-to-you firing**
-  that reflects a pre-existing condition rather than a new fault. The rules file is
-  a copy you apply yourself; the server does not upgrade it for you. One limit is
-  worth knowing before you rely on the fix: `resets()` needs a continuous series per
-  server, so if a restart changes the `instance` label (dynamic-port or IP-based
-  service discovery, a rescheduled pod) the grace still applies forever and the rule
-  stays silent - target a stable identity in scrape config. The same re-apply also
-  removes an `on(instance)` join from that rule, so a server that was being
-  silenced by an unrelated young series sharing its `instance` value (a canary, an
-  HA pair, a federated series) can now correctly fire too - the same
-  new-to-you-firing shape as the crash-loop fix, for the same reason.
+- **`YuzuAuditRetentionNotRunning` now fires for a crash-looping server
+  (#2553, redesigned by #2854 rung D), and there is a new
+  `YuzuAuditRetentionNeverRan` alert to route.** The old rule's young-server
+  grace keyed on uptime, so a process restarting more often than the 3-hour
+  alert window never accumulated enough uptime to leave the grace and was
+  excused on every evaluation - silently, and for one of the leading causes of
+  the exact condition the rule detects. The grace is now the restart-surviving
+  last-pass stamp (`yuzu_server_audit_retention_last_pass_unixtime`, seeded
+  from the durable anchor at startup): the rule excuses only a database no
+  retention pass has EVER run against, fires at every restart cadence on an
+  anchored one, and stays firing while the reaper stays dead. The excused
+  never-ran state gets its own alert, `YuzuAuditRetentionNeverRan` (stamp
+  still `0` after 3 hours) - **a new alertname: give it an Alertmanager route**.
+  **If you re-apply this rules file and have a crash-looping server, expect a
+  new-to-you firing** that reflects a pre-existing condition rather than a new
+  fault - including on crash loops faster than the 60-minute first-pass sleep,
+  a true positive the old grace hid. The rules file is a copy you apply
+  yourself; the server does not upgrade it for you, and a stack that does not
+  re-apply it keeps the old blind rule and never gains the new alert. In a
+  staged rollout apply SERVERS first, rules second: an old, not-yet-upgraded
+  server restarting under the new rules reads a `0` stamp even on an anchored
+  database and pages `YuzuAuditRetentionNeverRan` with a fresh-install story
+  that is false for it (see the runbook's rollout note). The same
+  re-apply also removes an `on(instance)` join from the liveness rule, so a
+  server that was being silenced by an unrelated series sharing its `instance`
+  value (a canary, an HA pair, a federated series) can now correctly fire too -
+  the same new-to-you-firing shape as the crash-loop fix, for the same reason.
 - **You must ADD a new rule by hand: `YuzuAuditRetentionMetricMissing` (#2553).**
   `YuzuAuditRetentionNotRunning` cannot detect its own input going missing -
   `increase()` over a metric with no series is an empty vector, so the rule selects
