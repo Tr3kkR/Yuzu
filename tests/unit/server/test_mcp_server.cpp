@@ -2216,13 +2216,15 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
     // outputSchema check in this file was the get_fleet_posture_fast
     // special-case below - #2712's own filing named that as the reason the
     // other ~45 gaps were invisible to CI. This closed, explicit exemption
-    // set is the retrofit backlog #2712 tracks (DEX+network + execute_*/
-    // writes families, not yet done); every tool NOT in it must advertise
+    // set is the retrofit backlog #2712 tracks (execute_*/writes family,
+    // not yet done); every tool NOT in it must advertise
     // outputSchema, or this test fails - so a NEW tool merging without one
     // fails immediately, and exempting one requires editing this literal
     // list, a visible reviewable diff line rather than a silent gap. Mirrors
     // the kToolAnnotation completeness check above
-    // (CHECK(classified == listed)).
+    // (CHECK(classified == listed)). DEX + network family (#2712 batch 2) is
+    // no longer exempt - it now has real schemas, see the shared handler
+    // blocks in mcp_server.cpp.
     //
     // CAVEAT (adversarial review of PR #2978, 2026-08-11): this gate checks
     // outputSchema PRESENCE, not typed-NESS - it does not reject the generic
@@ -2233,22 +2235,9 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
     // were typed properly as a result of that review; a handful of other
     // non-exempt tools (the discover_* family, classify_operational_
     // question, get_incident_playbook, summarize_working_set) still ship
-    // the placeholder and pass this gate anyway - tracked as a follow-up,
-    // not silently ignored.
+    // the placeholder and pass this gate anyway - tracked as #2986, not
+    // silently ignored.
     static const std::set<std::string> kOutputSchemaExempt = {
-        // DEX + network family (#2712 batch 2, not started)
-        "list_dex_signals",
-        "get_dex_signal_scope",
-        "get_dex_perf_cohorts",
-        "get_dex_perf_fleet",
-        "get_dex_perf_cohort_diff",
-        "list_dex_perf_apps",
-        "list_dex_perf_devices",
-        "get_dex_app_perf",
-        "get_dex_group_app_perf",
-        "compare_app_perf_versions",
-        "get_network_fleet",
-        "list_network_devices",
         // execute_* + writes family (#2712 batch 3, not started)
         "execute_instruction",
         "execute_bundle",
@@ -2969,6 +2958,34 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
     CHECK_FALSE(cohorts["cohorts"][1].contains("cpu_pct"));
 }
 
+// #2712 batch 2: get_dex_perf_fleet's payload is already object-shaped (no
+// wrap needed - plain tool_result()); get_dex_perf_cohorts needs the
+// suppressed cohort's stat fields OMITTED from structuredContent too, not
+// just from content[0].text - the anonymization floor must hold in both.
+TEST_CASE("MCP DEX perf: structuredContent mirrors content for fleet + cohorts, "
+          "suppression omits stats in both",
+          "[mcp][integration][dex][perf]") {
+    McpTestServer ts;
+    ts.dex_perf_fn_for_test = mcp_perf_snapshot;
+    ts.start("readonly");
+
+    auto fleet_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":150,"params":{"name":"get_dex_perf_fleet","arguments":{}}})");
+    auto fleet_body = nlohmann::json::parse(fleet_res->body);
+    REQUIRE(fleet_body["result"].contains("structuredContent"));
+    auto fleet_text = nlohmann::json::parse(
+        fleet_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fleet_body["result"]["structuredContent"] == fleet_text);
+
+    auto cohorts_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":151,"params":{"name":"get_dex_perf_cohorts","arguments":{"key":"model"}}})");
+    auto cohorts_body = nlohmann::json::parse(cohorts_res->body);
+    REQUIRE(cohorts_body["result"].contains("structuredContent"));
+    auto& sc = cohorts_body["result"]["structuredContent"];
+    CHECK(sc["cohorts"][1]["suppressed"] == true);
+    CHECK_FALSE(sc["cohorts"][1].contains("cpu_pct")); // floor holds in structuredContent too
+}
+
 TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required params)",
           "[mcp][integration][dex][perf]") {
     McpTestServer ts;
@@ -3200,6 +3217,22 @@ TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit par
     CHECK(badcohort["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(badcohort["error"]["data"]["correlation_id"].is_string());
 
+    // #2712 batch 2: content[0].text stays the bare array (backward compat -
+    // this tool shipped pre-#2712 returning a bare array); structuredContent
+    // wraps the SAME rows under "devices" so it validates against an
+    // object-typed output schema.
+    auto wrap_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":62,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model"}}})");
+    auto wrap_body = nlohmann::json::parse(wrap_res->body);
+    REQUIRE(wrap_body["result"]["content"][0]["text"].get<std::string>().front() == '[');
+    REQUIRE(wrap_body["result"].contains("structuredContent"));
+    auto& wrap_sc = wrap_body["result"]["structuredContent"];
+    REQUIRE(wrap_sc.contains("devices"));
+    REQUIRE(wrap_sc["devices"].is_array());
+    CHECK(wrap_sc["devices"].size() == 16);
+    CHECK(wrap_sc["devices"] ==
+          nlohmann::json::parse(wrap_body["result"]["content"][0]["text"].get<std::string>()));
+
     // Invalid cohort key → kInvalidParams (REST 400 parity), also A4.
     auto badkey = nlohmann::json::parse(
         ts.call(
@@ -3310,6 +3343,16 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
         CHECK(p["cpu"]["after_mean"].get<double>() == Catch::Approx(4.5));
         CHECK(p["distribution"]["up"] == 2);
         CHECK_FALSE(p.contains("verdict")); // EVIDENTIAL — no pass/fail
+    }
+    SECTION("#2712 batch 2: structuredContent mirrors the already-object payload") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":93,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0"}}})");
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body["result"].contains("structuredContent"));
+        auto text = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        CHECK(body["result"]["structuredContent"] == text);
+        CHECK(body["result"]["structuredContent"]["cpu"]["after_mean"].get<double>() ==
+              Catch::Approx(4.5));
     }
     SECTION("baseline == candidate → kInvalidParams") {
         auto res = ts.call(
@@ -3466,6 +3509,44 @@ TEST_CASE("MCP network: fleet stats + devices (worst-first sort + limit parity)"
             ->body);
     REQUIRE(bad.contains("error"));
     CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+// #2712 batch 2: get_network_fleet's payload is already object-shaped (no
+// wrap); list_network_devices' content[0].text stays the bare array it
+// shipped pre-#2712, structuredContent wraps the SAME rows under "devices".
+TEST_CASE("MCP network: structuredContent mirrors fleet, wraps devices under "
+          "\"devices\"",
+          "[mcp][integration][network]") {
+    McpTestServer ts;
+    ts.net_perf_fn_for_test = [](const std::string&) {
+        yuzu::server::NetPerfSnapshot snap;
+        yuzu::server::NetPerfDevice d;
+        d.agent_id = "hi-0";
+        d.platform = "linux";
+        d.rtt_ms = 500.0;
+        d.cohort = "site-a";
+        snap.devices.push_back(d);
+        return snap;
+    };
+    ts.start("readonly");
+
+    auto fleet_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":160,"params":{"name":"get_network_fleet","arguments":{}}})");
+    auto fleet_body = nlohmann::json::parse(fleet_res->body);
+    REQUIRE(fleet_body["result"].contains("structuredContent"));
+    auto fleet_text =
+        nlohmann::json::parse(fleet_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fleet_body["result"]["structuredContent"] == fleet_text);
+
+    auto dev_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":161,"params":{"name":"list_network_devices","arguments":{}}})");
+    auto dev_body = nlohmann::json::parse(dev_res->body);
+    REQUIRE(dev_body["result"]["content"][0]["text"].get<std::string>().front() == '[');
+    REQUIRE(dev_body["result"].contains("structuredContent"));
+    auto& dev_sc = dev_body["result"]["structuredContent"];
+    REQUIRE(dev_sc.contains("devices"));
+    CHECK(dev_sc["devices"] ==
+          nlohmann::json::parse(dev_body["result"]["content"][0]["text"].get<std::string>()));
 }
 
 TEST_CASE("MCP network: tools report unavailable when no provider is wired",

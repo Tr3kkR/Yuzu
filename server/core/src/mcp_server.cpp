@@ -461,14 +461,14 @@ static const ToolDef kTools[] = {
      "/api/v1/dex/signals. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (any other value resolves to 7d)"},)j"
      R"j("os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Narrow to one OS's own signals (all = every OS)"}}})j",
-     /*output_schema_json=*/nullptr}, // content is a bare array of signal rows (matches the REST list twin); annotations generated (2g PR 2)
+     R"j({"type":"object","properties":{"signals":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","count","distinct_devices","last_seen"]}}},"required":["signals"]})j"}, // annotations generated (2g PR 2)
 
     {"get_dex_signal_scope",
      "Get DEX per-OS signal coverage: how many distinct observation types each platform reports, "
      "with total event count. Fleet aggregate. Mirrors GET /api/v1/dex/scope. Requires "
      "GuaranteedState:Read.",
      R"({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})",
-     /*output_schema_json=*/nullptr}, // content is a bare array of per-OS scope rows (tracked in #2363); annotations generated (2g PR 2)
+     R"j({"type":"object","properties":{"platforms":{"type":"array","items":{"type":"object","properties":{"platform":{"type":"string"},"distinct_types":{"type":"integer"},"total_events":{"type":"integer"}},"required":["platform","distinct_types","total_events"]}}},"required":["platforms"]})j"}, // annotations generated (2g PR 2)
 
     {"get_dex_signal_detail",
      "Drill into one DEX signal type: top subjects, per-OS split, most-affected devices, and the "
@@ -496,14 +496,27 @@ static const ToolDef kTools[] = {
      "numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab). A null "
      "metric means no device reported it (absent, never zero). Mirrors GET /api/v1/dex/perf/fleet. "
      "Requires GuaranteedState:Read.",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{)j"
+     R"j("cpu_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("commit_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("disk_lat_ms":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("reporting":{"type":"integer"},"windows_online":{"type":"integer"})j"
+     R"j(},"required":["cpu_pct","commit_pct","disk_lat_ms","reporting","windows_online"]})j"},
 
     {"get_dex_perf_cohorts",
      "Fleet-relative performance percentiles per cohort of an operator-chosen tag key (e.g. "
      "model, image). Cohorts under the statistical floor are suppressed=true with population "
      "only; devices without the key form the explicit cohort=\"\" (untagged) residual. Mirrors "
      "GET /api/v1/dex/perf/cohorts. Requires GuaranteedState:Read.",
-     R"j({"type":"object","properties":{"key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"}}})j"},
+     R"j({"type":"object","properties":{"key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"}}})j",
+     R"j({"type":"object","properties":{"key":{"type":"string"},"floor":{"type":"integer","description":"kDexCohortFloor - cohorts below this device count are suppressed"},)j"
+     R"j("cohorts":{"type":"array","items":{"type":"object","properties":{"cohort":{"type":"string"},"devices":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("cpu_pct":{"type":"object","properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not null) when suppressed is true"},)j"
+     R"j("commit_pct":{"type":"object","properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not null) when suppressed is true"},)j"
+     R"j("disk_lat_ms":{"type":"object","properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not null) when suppressed is true"}},)j"
+     R"j("required":["cohort","devices","suppressed"]}},"available_keys":{"type":"array","items":{"type":"string"}})j"
+     R"j(},"required":["key","floor","cohorts","available_keys"]})j"},
 
     {"get_dex_perf_cohort_diff",
      "Direct cohort-vs-cohort performance comparison (F2c): diffs two cohorts of a tag key "
@@ -517,7 +530,12 @@ static const ToolDef kTools[] = {
      R"j("key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"},)j"
      R"j("a":{"type":"string","description":"First cohort value (empty string = untagged residual)"},)j"
      R"j("b":{"type":"string","description":"Second cohort value (the baseline)"})j"
-     R"j(},"required":["a","b"]})j"},
+     R"j(},"required":["a","b"]})j",
+     R"j({"type":"object","properties":{"key":{"type":"string"},"floor":{"type":"integer"},"found_a":{"type":"boolean"},"found_b":{"type":"boolean"},)j"
+     R"j("a":{"type":["object","null"],"properties":{"cohort":{"type":"string"},"devices":{"type":"integer"},"suppressed":{"type":"boolean"},"cpu_pct":{"type":"object"},"commit_pct":{"type":"object"},"disk_lat_ms":{"type":"object"}},"description":"null when found_a is false"},)j"
+     R"j("b":{"type":["object","null"],"properties":{"cohort":{"type":"string"},"devices":{"type":"integer"},"suppressed":{"type":"boolean"},"cpu_pct":{"type":"object"},"commit_pct":{"type":"object"},"disk_lat_ms":{"type":"object"}},"description":"null when found_b is false"},)j"
+     R"j("delta_pct":{"type":"object","properties":{"cpu_pct":{"type":["number","null"]},"commit_pct":{"type":["number","null"]},"disk_lat_ms":{"type":["number","null"]}},"required":["cpu_pct","commit_pct","disk_lat_ms"]})j"
+     R"j(},"required":["key","floor","found_a","found_b","a","b","delta_pct"]})j"},
 
     {"list_dex_perf_devices",
      "The device list behind every fleet-performance drill: worst devices by a metric (default), "
@@ -530,7 +548,8 @@ static const ToolDef kTools[] = {
      R"j("cohort_key":{"type":"string","default":"model","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
      R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of cohort_key (empty string = untagged residual)"},)j"
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
-     R"j(}})j"},
+     R"j(}})j",
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"cohort":{"type":"string"},"cpu_pct":{"type":"number"},"commit_pct":{"type":"number"},"disk_lat_ms":{"type":"number"},"fleet_pctile":{"type":"integer"}},"required":["agent_id","cohort"]}}},"required":["devices"]})j"},
 
     // ── DEX app-perf-over-time tools — parity with /api/v1/dex/perf/app[s] ──
     {"list_dex_perf_apps",
@@ -540,7 +559,8 @@ static const ToolDef kTools[] = {
      "most recent UTC-midnight epoch day seen; truncated=true means the list hit the "
      "server cap. Fleet metadata — not individually identifying. Mirrors GET "
      "/api/v1/dex/perf/apps. Requires GuaranteedState:Read.",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"apps":{"type":"array","items":{"type":"object","properties":{"app_name":{"type":"string"},"versions":{"type":"integer"},"last_day":{"type":"string"}},"required":["app_name","versions","last_day"]}},"truncated":{"type":"boolean"}},"required":["apps","truncated"]})j"},
 
     {"get_dex_app_perf",
      "Fleet performance-over-time trend for ONE app — the 'over time' companion to "
@@ -557,7 +577,19 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
      R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
-     R"j(},"required":["app"]})j"},
+     R"j(},"required":["app"]})j",
+     R"j({"type":"object","properties":{"app":{"type":"string"},"version":{"type":"string"},)j"
+     R"j("points":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("version":{"type":"string"},"day":{"type":"string"},"device_count":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("cpu_mean":{"type":"number"},"cpu_max":{"type":"number"},)j"
+     R"j("cpu_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("cpu_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("ws_mean":{"type":"number"},"ws_max":{"type":"number"},)j"
+     R"j("ws_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("ws_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("hist_stale":{"type":"boolean"})j"
+     R"j(},"required":["version","day","device_count","suppressed"]}})j"
+     R"j(},"required":["app","version","points"]})j"},
 
     {"get_dex_group_app_perf",
      "App performance-over-time for ONE management group: the get_dex_app_perf fleet "
@@ -573,7 +605,19 @@ static const ToolDef kTools[] = {
      R"j("group_id":{"type":"string","maxLength":512,"description":"Management group id"},)j"
      R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
      R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
-     R"j(},"required":["group_id","app"]})j"},
+     R"j(},"required":["group_id","app"]})j",
+     R"j({"type":"object","properties":{"group_id":{"type":"string"},"app":{"type":"string"},"version":{"type":"string"},"floor":{"type":"integer"},)j"
+     R"j("points":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("version":{"type":"string"},"day":{"type":"string"},"device_count":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("cpu_mean":{"type":"number"},"cpu_max":{"type":"number"},)j"
+     R"j("cpu_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("cpu_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("ws_mean":{"type":"number"},"ws_max":{"type":"number"},)j"
+     R"j("ws_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("ws_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("hist_stale":{"type":"boolean"})j"
+     R"j(},"required":["version","day","device_count","suppressed"]}})j"
+     R"j(},"required":["group_id","app","version","floor","points"]})j"},
 
     {"compare_app_perf_versions",
      "Before/after app performance for an upgrade (the /auto VERIFY evidence): did "
@@ -597,7 +641,16 @@ static const ToolDef kTools[] = {
      R"j("baseline":{"type":"string","maxLength":512,"description":"The before version (canonicalized + matched)"},)j"
      R"j("candidate":{"type":"string","maxLength":512,"description":"The after version; must differ from baseline"},)j"
      R"j("window":{"type":"integer","minimum":1,"maximum":31,"description":"Days of each version per machine (default 7)"})j"
-     R"j(},"required":["app","group","baseline","candidate"]})j"},
+     R"j(},"required":["app","group","baseline","candidate"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("app":{"type":"string"},"group_id":{"type":"string"},"baseline_version":{"type":"string"},"candidate_version":{"type":"string"},)j"
+     R"j("window_days":{"type":"integer"},"cohort_size":{"type":"integer"},"paired":{"type":"integer"},"baseline_only":{"type":"integer"},"candidate_only":{"type":"integer"},"no_data":{"type":"integer"},)j"
+     R"j("small_cohort":{"type":"boolean"},"insufficient":{"type":"boolean"},"truncated":{"type":"boolean"},)j"
+     R"j("cpu":{"type":"object","properties":{"before_mean":{"type":"number"},"after_mean":{"type":"number"},"delta_median":{"type":"number"},"before_p95":{"type":"number"},"after_p95":{"type":"number"}},"required":["before_mean","after_mean","delta_median","before_p95","after_p95"]},)j"
+     R"j("ws":{"type":"object","properties":{"before_mean":{"type":"number"},"after_mean":{"type":"number"},"delta_median":{"type":"number"},"before_p95":{"type":"number"},"after_p95":{"type":"number"}},"required":["before_mean","after_mean","delta_median","before_p95","after_p95"]},)j"
+     R"j("distribution":{"type":"object","properties":{"up":{"type":"integer"},"flat":{"type":"integer"},"down":{"type":"integer"}},"required":["up","flat","down"]},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"})j"
+     R"j(},"required":["app","group_id","baseline_version","candidate_version","window_days","cohort_size","paired","baseline_only","candidate_only","no_data","small_cohort","insufficient","truncated","cpu","ws","distribution"]})j"},
 
     // ── N1: network quality read tools — parity with /api/v1/network/* ──
     {"get_network_fleet",
@@ -610,7 +663,14 @@ static const ToolDef kTools[] = {
      "honest RTT denominator. cooccurrence counts net-degraded devices that ALSO show device-perf "
      "pressure / app instability (measured co-occurrence, never a cause). Mirrors GET "
      "/api/v1/network/fleet. Requires GuaranteedState:Read.",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{)j"
+     R"j("rtt_ms":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("retrans_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("throughput_bps":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("reporting":{"type":"integer"},"rtt_reporting":{"type":"integer"},"online":{"type":"integer"},)j"
+     R"j("cooccurrence":{"type":"object","properties":{"degraded":{"type":"integer"},"also_device":{"type":"integer"},"also_app":{"type":"integer"},"network_only":{"type":"integer"}},"required":["degraded","also_device","also_app","network_only"]})j"
+     R"j(},"required":["rtt_ms","retrans_pct","throughput_bps","reporting","rtt_reporting","online","cooccurrence"]})j"},
 
     {"list_network_devices",
      "The device list behind every network-quality drill: worst devices by a metric (default rtt), "
@@ -625,7 +685,8 @@ static const ToolDef kTools[] = {
      R"j("key":{"type":"string","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
      R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of key (empty string = untagged residual)"},)j"
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
-     R"j(}})j"},
+     R"j(}})j",
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"platform":{"type":"string"},"cohort":{"type":"string"},"rtt_ms":{"type":"number"},"retrans_pct":{"type":"number"},"throughput_bps":{"type":"number"},"net_degraded":{"type":"boolean"},"under_pressure":{"type":"boolean"},"app_unstable":{"type":"boolean"},"fleet_pctile":{"type":"integer"}},"required":["agent_id","platform","cohort","net_degraded","under_pressure","app_unstable"]}}},"required":["devices"]})j"},
 
     // Phase 2 write tool
     {"execute_instruction",
@@ -5248,13 +5309,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("distinct_devices", r.distinct_devices)
                                 .add("last_seen", r.last_seen));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("signals", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -5282,13 +5343,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("distinct_types", r.distinct_types)
                                 .add("total_events", r.total_events));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("platforms", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -5615,13 +5676,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     payload = arr.str();
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
-                        .str();
+                // #2712: three of these four branches already build an object
+                // string (reused verbatim as structuredContent); list_dex_perf_devices
+                // is the one bare-array branch and needs the same wrap the Phase-1
+                // reads batch used for its own bare-array tools. content[].text stays
+                // exactly `payload` either way - unchanged wire format.
+                const std::string structured_payload =
+                    tool_name == "list_dex_perf_devices"
+                        ? JObj().raw("devices", payload).str()
+                        : payload;
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(
+                                     id, tool_result_split(payload, structured_payload,
+                                                            kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -5845,13 +5913,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .raw("points", points.str())
                                   .str();
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
-                        .str();
+                // #2712: all three branches of this block already build an
+                // object-shaped payload - no bare-array wrap needed, unlike the
+                // perf-cohort/network blocks above.
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -6001,12 +6068,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!audit_ok)
                     payload_obj.add("audit_persisted", false);
                 const std::string payload = payload_obj.str();
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
-                        .str();
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -6104,13 +6167,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     payload = arr.str();
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
-                        .str();
+                // #2712: get_network_fleet already builds an object string
+                // (reused verbatim as structuredContent); list_network_devices is
+                // the bare-array branch and needs the same wrap the Phase-1 reads
+                // batch used for its own bare-array tools. content[].text stays
+                // exactly `payload` either way - unchanged wire format.
+                const std::string structured_payload =
+                    tool_name == "list_network_devices"
+                        ? JObj().raw("devices", payload).str()
+                        : payload;
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(
+                                     id, tool_result_split(payload, structured_payload,
+                                                            kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
