@@ -97,6 +97,21 @@ public:
         /// connection (NAT/firewall reap) as a failed statement instead of an
         /// indefinite hang. 0 leaves libpq defaults.
         int keepalives_idle_s = 30;
+        /// TCP_USER_TIMEOUT (ms, libpq 12+/Linux+Windows — no-op where the
+        /// platform lacks the socket option), injected as `tcp_user_timeout=`
+        /// unless the conninfo sets its own. Distinct from keepalives_idle
+        /// above: keepalives only start probing once the connection goes
+        /// IDLE (no traffic either direction) and, with `keepalives_interval`/
+        /// `keepalives_count` left at OS defaults, total detection can run to
+        /// several minutes; this bounds how long UNACKNOWLEDGED data (e.g. a
+        /// query already sent, awaiting a reply that a dead network path will
+        /// never deliver) may sit before the OS gives up, independent of any
+        /// keepalive cycle. Does NOT race statement_timeout on a live
+        /// connection — TCP ACKs happen at the transport layer regardless of
+        /// how long the server takes to produce a response, so this only
+        /// fires on a genuinely dark path, never on an alive-but-slow query.
+        /// 0 leaves libpq defaults (unbounded).
+        int tcp_user_timeout_ms = 10000;
         /// Connect-failure circuit breaker (#1368 cheap-idle): after a failed
         /// connect, suppress further connect attempts for an
         /// exponentially-growing window (`base × 2^(failures-1)`, capped, with
@@ -264,10 +279,12 @@ private:
     int statement_timeout_ms_{30000};
     int lock_timeout_ms_{10000};
     int keepalives_idle_s_{30};
+    int tcp_user_timeout_ms_{10000};
     bool valid_{false};
     bool conninfo_has_timeout_{false};
     bool conninfo_has_options_{false};
     bool conninfo_has_keepalives_{false};
+    bool conninfo_has_tcp_user_timeout_{false};
     Observer observer_;
 
     mutable std::mutex mu_;
