@@ -1858,6 +1858,38 @@ walkthrough.
   `success` a one-time effect. The confirm is never a silent success no-op:
   the initiator grace binding is evicted post-confirm, so a success answer
   would attest without verifying initiation.
+- **Confirm-identity binding survives a server restart (#2961).** The
+  maker-checker check that only the operator who called `rotate` may
+  `confirm` used to be resolvable **only** from the in-process
+  `rotation_grace_cache_` — a restart mid-overlap (default window 7 days)
+  silently and permanently forfeited it, so `confirm` 409'd forever for that
+  pair and the sweep cut over on the timer with no error surfaced at cutover
+  time (filed as #2961; affects both arms). Migration v3 adds a durable
+  twin, `api_tokens.rotation_initiator`, stamped on the successor row
+  **inside the same advisory-locked mint transaction**. Both
+  `confirm_rotation` (engine arm) and `confirm_token_rotation` (human arm,
+  below) now resolve the identity check through the single chokepoint
+  `ApiTokenStore::resolve_rotation_initiator`: RAM first, the durable column
+  as the RAM-absent recovery path, **fail closed** if the two disagree, and
+  an empty durable value is **never** treated as a wildcard. That last point
+  is deliberate: a rotation already in flight when this migration is
+  applied has no durable initiator and stays unconfirmable after a restart
+  — an operator upgrading mid-rotation should confirm it first if possible.
+  If not, the T12 sweep resolves the pair on its own timer **provided the
+  successor was presented at least once** (the same UP-5 carve-out that
+  gates every sweep auto-revoke — "never presented" leaves both credentials
+  active indefinitely, sweep or no sweep); only in that presented case is no
+  action required. If the successor was never presented, or the pair must
+  be resolved by hand for any other reason, revoke the specific credential
+  no longer trusted via `DELETE /api/v1/tokens/{token_id}` (an engine
+  credential is an ordinary API token row), **never** the principal-level
+  revoke route, which is terminal and destroys both credentials plus the
+  principal. **Unaffected
+  — deliberately:** the 120-second raw
+  successor secret re-serve (bullet above, F4) stays RAM-only; a one-time
+  reveal must never become durable, so a restart still forfeits that
+  capability. Design record: `docs/security-reviews/human-token-rotation-2026-08-10.md`
+  "Open risks" (#2961, marked resolved).
 - **No-admin auditor** — `GET /api/v1/engine-principals/audit/no-admin` /
   MCP `audit_engine_no_admin` — independently resolves every engine
   principal's actual roles + effective permissions against the live RBAC

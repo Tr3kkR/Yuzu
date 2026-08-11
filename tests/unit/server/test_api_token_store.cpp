@@ -71,6 +71,191 @@ TEST_CASE("ApiTokenStore reports !is_open on a migration failure", "[pg][token][
     CHECK_FALSE(store.is_open()); // → server.cpp sets startup_failed_ (fail-closed)
 }
 
+// #2961 round-2 finding (item 6): the post-migration projection smoke-read
+// added alongside #3013's runner guard is a SECOND, independent line of
+// defence — it must catch the case the runner guard itself cannot: a
+// version already recorded in `public.schema_meta` (here forged directly,
+// modelling a DIFFERENT binary that stamped v3 without ever running the v3
+// ALTER) that does not match what the schema actually contains. Disabling
+// the smoke-read left [token] 184/184 green before this test existed.
+TEST_CASE("ApiTokenStore reports !is_open when schema_meta claims v3 but the schema is only "
+          "at v2 (post-migration smoke-read guard, #2961 round-2)",
+          "[pg][token][store][migration]") {
+    YUZU_REQUIRE_PG_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+        PgResult meta{PQexec(conn.get(),
+                             "CREATE TABLE public.schema_meta ("
+                             "  store       TEXT PRIMARY KEY,"
+                             "  version     INTEGER NOT NULL,"
+                             "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA api_token_store")};
+        REQUIRE(schema.ok());
+
+        // v1 + v2 DDL only, copied verbatim from migrations() in
+        // api_token_store.cpp — deliberately missing v3's rotation_initiator
+        // column.
+        PgResult v1{PQexec(conn.get(),
+                           "CREATE TABLE api_token_store.api_tokens ("
+                           "  token_id      TEXT PRIMARY KEY,"
+                           "  token_hash    TEXT NOT NULL UNIQUE,"
+                           "  name          TEXT NOT NULL,"
+                           "  principal_id  TEXT NOT NULL DEFAULT '',"
+                           "  scope_service TEXT NOT NULL DEFAULT '',"
+                           "  mcp_tier      TEXT NOT NULL DEFAULT '',"
+                           "  principal_kind TEXT NOT NULL DEFAULT 'human' "
+                           "    CHECK (principal_kind IN ('human','engine')),"
+                           "  created_at    BIGINT NOT NULL DEFAULT 0,"
+                           "  expires_at    BIGINT NOT NULL DEFAULT 0,"
+                           "  last_used_at  BIGINT NOT NULL DEFAULT 0,"
+                           "  revoked       BOOLEAN NOT NULL DEFAULT FALSE);"
+                           "CREATE INDEX api_tokens_principal_idx ON "
+                           "api_token_store.api_tokens (principal_id)")};
+        REQUIRE(v1.ok());
+        PgResult v2{PQexec(
+            conn.get(),
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN rotation_group TEXT NOT NULL "
+            "DEFAULT '';"
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN supersedes_token_id TEXT NOT "
+            "NULL DEFAULT '';"
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN overlap_expires_at BIGINT NOT "
+            "NULL DEFAULT 0;"
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN confirmed_at BIGINT NOT NULL "
+            "DEFAULT 0")};
+        REQUIRE(v2.ok());
+
+        // Stamp schema_meta at v3 — a LIE: the schema actually stopped at
+        // v2. Models a database another binary's runner believed it already
+        // migrated to v3 (so `PgMigrationRunner::run` sees nothing pending
+        // and returns true), never a real v3 upgrade run against this
+        // schema.
+        PgResult stamp{PQexec(conn.get(),
+                              "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                              "VALUES ('api_token_store', 3, extract(epoch FROM now())::bigint)")};
+        REQUIRE(stamp.ok());
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ApiTokenStore store{pool};
+    // The migration runner itself sees version 3 already recorded and
+    // returns true trivially — construction must NOT stop there. The
+    // smoke-read against every column this store's runtime queries select
+    // (including rotation_initiator, missing here) is what catches the
+    // forged version and fails the store closed.
+    CHECK_FALSE(store.is_open());
+}
+
+// UP-7 (#2961 fix-round finding, review): every other test in this file
+// clones `apitoken_pg_template`, which is already at v3 — the pre-v3 state
+// elsewhere in this file is modelled by an `UPDATE ... rotation_initiator =
+// ''` against an already-v3 schema, never a genuine unmigrated database. That
+// leaves the ACTUAL v2->v3 upgrade path — the migration runner applying
+// v3's `ALTER TABLE ... ADD COLUMN` against a real v2 database with rows
+// already in it, the one state a real rolling upgrade produces — completely
+// untested, and it's exactly where both the migration-numbering collision
+// (item 1) and the ACCESS EXCLUSIVE lock-timing note (UP-6,
+// docs/user-manual/server-admin.md) live. `YUZU_REQUIRE_PG_DB` (fresh,
+// non-template) is the documented vehicle for this, per CLAUDE.md's test
+// conventions section — hand-seeds v1+v2 by direct SQL (copied verbatim
+// from `migrations()` in api_token_store.cpp, since that vector is
+// file-local and not exported), plants `schema_meta` at v2, and inserts a
+// row BEFORE handing the database to a real `ApiTokenStore` construction —
+// so the v3 ALTER genuinely runs against a populated table through the real
+// `PgMigrationRunner::run` path, not a synthetic one.
+TEST_CASE("ApiTokenStore: a genuine v2->v3 upgrade (real ALTER against a populated table) "
+          "opens cleanly and the new column is usable end-to-end (#2961 UP-7)",
+          "[pg][token][store][migration]") {
+    YUZU_REQUIRE_PG_DB(db);
+    std::string preexisting_token_id;
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+        PgResult meta{PQexec(conn.get(),
+                             "CREATE TABLE public.schema_meta ("
+                             "  store       TEXT PRIMARY KEY,"
+                             "  version     INTEGER NOT NULL,"
+                             "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA api_token_store")};
+        REQUIRE(schema.ok());
+
+        // v1 + v2 DDL, copied verbatim from migrations() in api_token_store.cpp.
+        PgResult v1{PQexec(conn.get(),
+                           "CREATE TABLE api_token_store.api_tokens ("
+                           "  token_id      TEXT PRIMARY KEY,"
+                           "  token_hash    TEXT NOT NULL UNIQUE,"
+                           "  name          TEXT NOT NULL,"
+                           "  principal_id  TEXT NOT NULL DEFAULT '',"
+                           "  scope_service TEXT NOT NULL DEFAULT '',"
+                           "  mcp_tier      TEXT NOT NULL DEFAULT '',"
+                           "  principal_kind TEXT NOT NULL DEFAULT 'human' "
+                           "    CHECK (principal_kind IN ('human','engine')),"
+                           "  created_at    BIGINT NOT NULL DEFAULT 0,"
+                           "  expires_at    BIGINT NOT NULL DEFAULT 0,"
+                           "  last_used_at  BIGINT NOT NULL DEFAULT 0,"
+                           "  revoked       BOOLEAN NOT NULL DEFAULT FALSE);"
+                           "CREATE INDEX api_tokens_principal_idx ON "
+                           "api_token_store.api_tokens (principal_id)")};
+        REQUIRE(v1.ok());
+        PgResult v2{PQexec(
+            conn.get(),
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN rotation_group TEXT NOT NULL "
+            "DEFAULT '';"
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN supersedes_token_id TEXT NOT "
+            "NULL DEFAULT '';"
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN overlap_expires_at BIGINT NOT "
+            "NULL DEFAULT 0;"
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN confirmed_at BIGINT NOT NULL "
+            "DEFAULT 0")};
+        REQUIRE(v2.ok());
+        PgResult stamp{PQexec(conn.get(),
+                              "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                              "VALUES ('api_token_store', 2, extract(epoch FROM now())::bigint)")};
+        REQUIRE(stamp.ok());
+
+        // A row genuinely present BEFORE the v3 ALTER runs — the shape a
+        // real populated table has mid-upgrade, not an empty one.
+        preexisting_token_id = "pre-v3-token-deadbeef01";
+        const char* seed_values[] = {preexisting_token_id.c_str()};
+        PgResult seed{PQexecParams(
+            conn.get(),
+            "INSERT INTO api_token_store.api_tokens (token_id, token_hash, name, principal_id) "
+            "VALUES ($1, 'pre-v3-hash', 'pre-existing', 'restart-carol')",
+            1, nullptr, seed_values, nullptr, nullptr, 0)};
+        REQUIRE(seed.ok());
+    }
+
+    // The real construction path: PgMigrationRunner::run reads version 2 from
+    // schema_meta and applies v3's ALTER against the table seeded above.
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Pin the item-1(c) schema-projection smoke-read from the OUTSIDE too:
+    // every runtime query this store issues (list_tokens uses the same
+    // kTokenColsTail projection the constructor's own smoke-read checks) now
+    // succeeds against the upgraded schema, including for the row that
+    // predates the ALTER.
+    auto tokens = store.list_tokens("restart-carol");
+    REQUIRE(tokens.has_value());
+    REQUIRE(tokens->size() == 1);
+    CHECK(tokens->at(0).token_id == preexisting_token_id);
+    CHECK(tokens->at(0).rotation_initiator.empty()); // new column, DEFAULT '' on the old row
+
+    // And a fresh mint through the now-v3 schema round-trips end-to-end.
+    auto raw = store.create_token("post-upgrade", "restart-carol");
+    REQUIRE(raw.has_value());
+    auto validated = store.validate_token(*raw);
+    REQUIRE(validated.has_value());
+    CHECK(validated->principal_id == "restart-carol");
+}
+
 // #2964 fix round, chaos-injection finding: reproduces #3013's migration-
 // numbering-collision hazard directly, rather than a generic drift guard.
 // `PgMigrationRunner::run` skips any migration whose id is `<= the stored
@@ -78,7 +263,7 @@ TEST_CASE("ApiTokenStore reports !is_open on a migration failure", "[pg][token][
 // database that reached v3 via a DIFFERENT migration (e.g. this store's
 // sibling PR #2961, which independently claimed id 3 for an unrelated
 // column before the two were reconciled) reports `run()` success while
-// THIS store's own v3 (`rotation_retention_meta`) was never actually
+// THIS store's own v4 (`rotation_retention_meta`) was never actually
 // created. Pre-seed exactly that shape: a schema whose `api_tokens` table
 // matches the full v1+v2 projection (so the migration runner's own v1==0
 // schema-drift guard does not fire) but with NO `rotation_retention_meta`
@@ -89,7 +274,7 @@ TEST_CASE("ApiTokenStore reports !is_open on a migration failure", "[pg][token][
 // pool contention (finding 2's own `fail_reason`/`fail()` fix makes THAT
 // half diagnosable; this test is about refusing to open at all).
 TEST_CASE("ApiTokenStore fails closed at construction when rotation_retention_meta is missing "
-          "despite schema_meta already claiming v3 (#3013 migration-numbering collision)",
+          "despite schema_meta already claiming v4 (#3013 migration-numbering collision)",
           "[pg][token][store]") {
     YUZU_REQUIRE_PG_DB(db);
     {
@@ -108,7 +293,13 @@ TEST_CASE("ApiTokenStore fails closed at construction when rotation_retention_me
                           "  rotation_group TEXT NOT NULL DEFAULT '',"
                           "  supersedes_token_id TEXT NOT NULL DEFAULT '',"
                           "  overlap_expires_at BIGINT NOT NULL DEFAULT 0,"
-                          "  confirmed_at BIGINT NOT NULL DEFAULT 0)")};
+                          "  confirmed_at BIGINT NOT NULL DEFAULT 0,"
+                          // v3 (#2961), seeded deliberately: without it the SIBLING
+                          // projection smoke-read fails first on the missing column and
+                          // this test passes for the wrong reason — green while proving
+                          // nothing about the guard it names. Everything v1+v2+v3 should
+                          // contain is present; ONLY v4's table is absent.
+                          "  rotation_initiator TEXT NOT NULL DEFAULT '')")};
         REQUIRE(t.ok());
         PgResult meta{PQexec(conn.get(),
                              "CREATE TABLE IF NOT EXISTS public.schema_meta ("
@@ -118,7 +309,12 @@ TEST_CASE("ApiTokenStore fails closed at construction when rotation_retention_me
         REQUIRE(meta.ok());
         PgResult ins{PQexec(conn.get(),
                             "INSERT INTO public.schema_meta (store, version, upgraded_at) "
-                            "VALUES ('api_token_store', 3, 0)")};
+                            // Forge at 4 — this store's CURRENT top id after #2961's v3
+                            // landed first and this migration renumbered 3 -> 4. The runner
+                            // sees `4 <= 4`, skips, and reports success; nothing creates
+                            // rotation_retention_meta. Forging 3 would make it genuinely RUN
+                            // v4 and create the table, and the test would exercise nothing.
+                            "VALUES ('api_token_store', 4, 0)")};
         REQUIRE(ins.ok());
     }
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};

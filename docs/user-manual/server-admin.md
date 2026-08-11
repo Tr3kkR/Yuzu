@@ -865,6 +865,31 @@ credential) call `rotate`, not replay `confirm`. Agentic MCP clients honouring
 detail: `docs/user-manual/rest-api.md` (confirm error table) and
 `docs/user-manual/engine-principals.md`.
 
+### vNEXT — API-token rotation confirm-identity binding now survives a restart; first schema change to `api_tokens` (#2961)
+
+Migration v3 adds `api_tokens.rotation_initiator` (durable twin of the
+confirm-identity binding described in `docs/auth-architecture.md`
+"Confirm-identity binding survives a server restart"). This is the FIRST
+schema change ever applied to `api_tokens` since it shipped — every
+authenticated request validates a Bearer token against this table, so it is
+one of the hottest tables on the server.
+
+**Not breaking, but worth knowing before a rolling upgrade.** `ALTER TABLE
+... ADD COLUMN ... DEFAULT ''` takes Postgres's briefest possible form (a
+metadata-only "fast default" on PG 11+, not a table rewrite) but is still an
+`ACCESS EXCLUSIVE` DDL statement: it must wait for every transaction
+currently touching `api_tokens` to finish before it can run, and every new
+transaction on the table queues behind it in turn while it waits. During a
+rolling upgrade, an outgoing replica's still-open request handling can hold
+such a transaction open. This is bounded and loud, not silent: the pool's
+`lock_timeout` (10s, `pg_pool.hpp`) cancels the migration's `ALTER` if it
+queues that long, and `ApiTokenStore` construction fails closed exactly as
+it does for any other migration failure — the new binary refuses to start
+with a clear log line rather than serving degraded or hanging the table. If
+you see this on a rolling upgrade, retry once traffic quiesces (a load
+balancer draining the outgoing replica is usually enough); it is not a data
+integrity concern either way.
+
 ### vNEXT — the rotation sweep now carries the full clock-guarded-retention shape (#2964)
 
 **What changed.** `ApiTokenStore::sweep_expired_rotations` — the 60-second
@@ -873,7 +898,7 @@ engine-credential and human API-token overlap pairs — previously issued its
 delete on a bare local wall-clock comparison, capped per tick but with no
 persisted clock anchor and no anomaly detection. It now reads a
 Postgres-authoritative clock, persists a durable anchor in a new
-`rotation_retention_meta` table (schema v3), and classifies every tick
+`rotation_retention_meta` table (schema v4), and classifies every tick
 through the same guard `audit_store`'s retention pass uses — a clock anomaly
 or a not-yet-trustworthy anchor **declines** the tick outright rather than
 revoke on an unverified reading, leaving both credentials in every affected

@@ -149,6 +149,39 @@ struct ApiToken {
     std::string supersedes_token_id; // Successor -> predecessor token_id; empty on the predecessor.
     int64_t overlap_expires_at{0};   // Predecessor's scheduled auto-revoke instant; 0 = not rotating.
     int64_t confirmed_at{0};         // Set when an operator confirms cutover; 0 = unconfirmed.
+
+    // #2961, migration v3 (additive). Durable twin of the RAM-only grace
+    // cache's `requesting_user` — stamped ONLY on the SUCCESSOR row, inside
+    // the same locked mint transaction that inserts it (never backfilled onto
+    // the predecessor, and never heuristically backfilled onto a pre-v3 pair).
+    // Empty on every row that has never been a rotation successor, and on a
+    // pair that started rotating before this migration shipped. NEVER
+    // treated as a wildcard by the confirm-identity resolver — see
+    // `resolve_rotation_initiator`'s doc comment. Deliberately NOT consulted
+    // by `try_reserve`'s raw-secret re-serve (F4 stays RAM-only); it exists
+    // solely to survive a restart for `confirm_rotation`/
+    // `confirm_token_rotation`'s identity check (F5).
+    //
+    // Cleared back to '' on the SURVIVING row at all FOUR sites that resolve
+    // rotation state, alongside `rotation_group`/`supersedes_token_id`/
+    // `overlap_expires_at`: both confirm arms' in-txn cleanup,
+    // `resolve_rotation_pair_after_revoke`'s partner clear, and the T12
+    // sweep's auto-revoke clear. (An earlier revision of this comment named
+    // only three and was corrected — the sweep site was missed by the fix
+    // brief, not by the implementer.)
+    //
+    // What that does NOT cover, stated because the earlier revision claimed
+    // otherwise: a row that is itself REVOKED keeps its stamp. Every clear is
+    // scoped to the partner or the pinned successor, so
+    // `revoke_token(<successor_id>)` clears the predecessor and leaves the
+    // revoked successor stamped, and `revoke_for_principal` resolves no pair
+    // at all. Rows are removed only by `delete_token`, so on the ENGINE arm a
+    // dead row can retain a third-party admin's username indefinitely. It is
+    // inert — no serializer, log, audit detail or metric label emits this
+    // field, and the resolver is only ever reached for a LIVE successor — but
+    // "a resolved row does not keep it for the row's remaining life" was too
+    // strong a claim and is withdrawn.
+    std::string rotation_initiator;
 };
 
 class ApiTokenStore {
@@ -333,11 +366,22 @@ public:
     /// days) vastly outlives the short raw-reveal grace window, so the
     /// grace-cache entry's `requesting_user` is retained (not pruned by
     /// elapsed time, only evicted explicitly — see `grace_entry_owner`'s
-    /// doc comment) for as long as the rotation stays unresolved. A process
-    /// restart forfeits this binding along with the raw-secret re-serve
-    /// capability (same documented limitation as the grace cache generally)
-    /// — a confirm attempted after a restart is rejected with "rotation
-    /// confirmation unavailable", not silently allowed for any caller.
+    /// doc comment) for as long as the rotation stays unresolved.
+    ///
+    /// #2961: a process restart no longer forfeits this binding. The RAM-only
+    /// grace cache is still the primary path (and the raw-secret re-serve, F4,
+    /// stays RAM-only — restart still forfeits THAT), but the identity check
+    /// falls back to `ApiToken::rotation_initiator`, a durable column stamped
+    /// on the successor row at mint time — see `resolve_rotation_initiator`.
+    /// Confirm is rejected with "rotation confirmation unavailable" when
+    /// `resolve_rotation_initiator` returns `nullopt` — NEITHER the cache
+    /// entry nor the durable column resolves an initiator (e.g. a pair that
+    /// began rotating before this migration shipped, whose durable column is
+    /// empty). That is not the only rejection cause: the cache entry and the
+    /// durable column can both be present and DISAGREE, which is also
+    /// refused (fail closed, never prefer either) — see
+    /// `resolve_rotation_initiator`'s doc comment for the full resolution
+    /// table. Either way, never silently allowed for any caller.
     ///
     /// Rejected (no DB mutation) when there is no in-flight, recognizable
     /// rotation pair for `principal_id`. Since #2404 the rejection is
@@ -899,6 +943,22 @@ public:
         return rotation_pair_resolve_failures_.load(std::memory_order_relaxed);
     }
 
+    /// #2961 fix-round finding 4: count of `resolve_rotation_initiator`
+    /// RAM-vs-durable DISAGREEMENTS. Both sources are written from the SAME
+    /// `requesting_user` in the SAME mint call, and the durable column is
+    /// stamped inside the same locked transaction the RAM entry is only
+    /// ever populated FROM after (`store_rotation_raw` runs strictly after
+    /// that mint commits) — so this branch is not reachable through any
+    /// live code path in this store; the only way to produce it is an
+    /// out-of-band write to `api_tokens.rotation_initiator` (direct SQL, a
+    /// restored/edited backup) or a future bug. A non-zero count is
+    /// therefore a TAMPER/CORRUPTION signal on an authorization input, not
+    /// an operational condition — see the call site's log line, which
+    /// carries `rotation_group` only, never either disputed username.
+    uint64_t rotation_initiator_disagreements() const noexcept {
+        return rotation_initiator_disagreements_.load(std::memory_order_relaxed);
+    }
+
     uint64_t cache_hits() const noexcept { return cache_hits_.load(std::memory_order_relaxed); }
 
     /// Cumulative count of validate_token calls that fell through to Postgres.
@@ -958,6 +1018,33 @@ public:
     /// `rotation_grace_cache_`).
     std::function<void(PGconn*)> test_hook_before_mint_commit_;
 
+    /// #2961 fix-round finding 2: fired once per SUCCESSFUL mint attempt
+    /// (`rotate_engine_credential`'s 1-active arm, `rotate_token`'s mint
+    /// arm), AFTER `with_txn_for` has returned true — the mint's INSERT +
+    /// pair-stamp UPDATE are already committed and the mint's advisory lock
+    /// is already RELEASED — but BEFORE `store_rotation_raw` caches the raw
+    /// secret + initiating operator into `rotation_grace_cache_` for the
+    /// grace window (Hermes F4). Lets a test deterministically interleave a
+    /// confirm/sweep/revoke-partner-clear for the SAME rotation group in the
+    /// exact window `successor_rotation_still_pending` exists to close: once
+    /// the mint's transaction commits, its advisory lock is free, so a
+    /// confirm arriving here can resolve the initiator from the
+    /// JUST-COMMITTED durable `rotation_initiator` column (RAM is still
+    /// empty — the cache write hasn't run yet) and fully resolve the
+    /// rotation before this function ever reaches the cache write below.
+    /// Without the guard this hook lets a test exercise, that cache write
+    /// would go ahead regardless and insert an entry for an
+    /// already-resolved rotation group that no future confirm/sweep call
+    /// will ever touch again — permanently unevictable (not a
+    /// credential-disclosure risk on its own: see
+    /// `successor_rotation_still_pending`'s doc comment). No `PGconn*`
+    /// argument, unlike `test_hook_before_mint_commit_`/
+    /// `test_hook_before_rotate_group_read_` above: this point in the code
+    /// holds no live connection — the mint's transaction already returned
+    /// its lease to the pool by the time this fires. Same
+    /// single-threaded-setup-only contract as every other hook here.
+    std::function<void()> test_hook_before_store_rotation_raw_;
+
     /// Injects the engine-principal referential-integrity check used by
     /// `create_token`'s engine block (design doc §6). Unset by default —
     /// `create_token` fails closed (rejects every `principal_kind=="engine"`
@@ -983,6 +1070,12 @@ private:
 
     // Cache hit/miss counters (atomic, lock-free read for Prometheus scraping).
     std::atomic<uint64_t> rotation_pair_resolve_failures_{0};
+    // #2961 fix-round finding 4 — see rotation_initiator_disagreements()'s
+    // doc comment above: a tamper/corruption signal, not an operational one.
+    // `mutable`: bumped from resolve_rotation_initiator, which is `const`
+    // (a read-path helper; the atomic counter itself is the exception to
+    // that constness, same shape as cache_hits_/cache_misses_ below).
+    mutable std::atomic<uint64_t> rotation_initiator_disagreements_{0};
     mutable std::atomic<uint64_t> cache_hits_{0};
     mutable std::atomic<uint64_t> cache_misses_{0};
 
@@ -1101,14 +1194,63 @@ private:
                      std::string& out_requesting_user) const;
 
     /// Identity-only grace-cache accessor, NOT time-bounded to
-    /// `kRotationGraceSecs` (unlike `try_reserve`'s raw reveal) — used by
-    /// `confirm_rotation` (Hermes F5) to bind the confirm to the same
-    /// operator who initiated the rotation, for as long as the entry
-    /// remains (until explicitly evicted). False if no entry exists for
-    /// `rotation_group` (e.g. a process restart since the mint, or the
-    /// rotation already resolved).
+    /// `kRotationGraceSecs` (unlike `try_reserve`'s raw reveal) — its sole
+    /// caller is `resolve_rotation_initiator`, which folds it with the
+    /// durable column to bind confirm (Hermes F5) to the same operator who
+    /// initiated the rotation, for as long as the entry remains (until
+    /// explicitly evicted). False if no entry exists for `rotation_group`
+    /// (e.g. a process restart since the mint, or the rotation already
+    /// resolved).
     bool grace_entry_owner(const std::string& rotation_group,
                            std::string& out_requesting_user) const;
+
+    /// #2961 — the SINGLE chokepoint `confirm_rotation`/`confirm_token_rotation`
+    /// (Hermes F5) use to resolve the operator who initiated a rotation,
+    /// combining the RAM-only grace cache with the durable
+    /// `ApiToken::rotation_initiator` fallback so the binding survives a
+    /// server restart. `successor` is the ALREADY-READ, in-flight successor
+    /// row from THIS SAME locked transaction's positive read (never a fresh
+    /// query here) — the caller only reaches this once the surrounding
+    /// state-classifier has confirmed a genuine pair exists, so there is no
+    /// new read-failure mode to disambiguate: the row's `rotation_initiator`
+    /// is either the value stamped at mint, or empty because it predates the
+    /// v3 migration — never "unknown due to a swallowed read".
+    ///
+    /// F5-ONLY, never F4: `try_reserve`'s raw-secret re-serve MUST NEVER call
+    /// this — it stays RAM-only. Calling this from `try_reserve` would NOT,
+    /// by itself, resurrect the one-time-reveal contract: this function
+    /// returns an identity string only, never the raw secret, which is
+    /// still never persisted anywhere — so `try_reserve` would still fail
+    /// on its own grace-cache lookup before an identity check could even
+    /// matter. The boundary is still the correct one to keep (F4 and F5 are
+    /// deliberately different questions — "can I re-serve the secret" vs.
+    /// "who may confirm"), just not for that overstated consequence.
+    ///
+    /// Returns `std::nullopt` — never a wildcard match, never a distinguishable
+    /// "failed read" (`successor` is already-read, per above) — on every
+    /// ambiguous or unresolved case; `std::optional<std::string>` per
+    /// `docs/cpp-conventions.md`'s ban on output parameters in new code
+    /// (this function conveys no error, only resolved / not-resolved). The
+    /// empty guard below applies to WHICHEVER branch produced the value —
+    /// not just the durable one — so an empty resolved value can never
+    /// escape as though it were a real identity, in this branch or a future
+    /// one (e.g. #2946's read-only accessor, which has no `requesting_user`
+    /// of its own to compare against).
+    ///
+    /// Resolution, fails closed on every ambiguous case:
+    ///   - RAM present, durable present (non-empty), and they DIFFER ->
+    ///     `nullopt` — RAM is the primary source, durable is a RAM-absent
+    ///     recovery path only; never prefer either on conflict.
+    ///   - RAM present (durable absent/empty/agreeing) -> the RAM value,
+    ///     UNLESS it is empty, in which case `nullopt`.
+    ///   - RAM absent, durable present (non-empty) -> the durable value
+    ///     (the restart-recovery path this function exists for).
+    ///   - RAM absent, durable EMPTY (pre-v3 pair, or a row that was somehow
+    ///     never stamped) -> `nullopt`. Empty is NOT a wildcard that matches
+    ///     any caller.
+    ///   - Neither present -> `nullopt`.
+    [[nodiscard]] std::optional<std::string>
+    resolve_rotation_initiator(const ApiToken& successor) const;
 
     /// Removes a grace-cache entry outright. Called once a rotation
     /// resolves (`confirm_rotation` on success; the T12 sweep's auto-revoke
@@ -1141,6 +1283,59 @@ private:
     /// for the grace window (Hermes F4).
     void store_rotation_raw(const std::string& rotation_group, const std::string& raw,
                             const std::string& requesting_user);
+
+    /// #2961 fix-round finding 2: a fresh, OUTSIDE-the-lock re-read of a
+    /// just-minted successor row, called immediately before
+    /// `store_rotation_raw` below — both `rotate_engine_credential`'s
+    /// 1-active mint arm and `rotate_token`'s mint arm cache the raw secret
+    /// AFTER `with_txn_for` commits and RELEASES the principal's advisory
+    /// lock (deliberately, so the cache write never outruns the commit
+    /// outcome — see `store_rotation_raw`'s call-site comments). That
+    /// leaves a window, between the commit and the cache write, where a
+    /// confirm/sweep/revoke-partner-clear for the SAME rotation group can
+    /// slip in on the now-free lock and resolve/clear the pair BEFORE the
+    /// cache entry exists — `resolve_rotation_initiator` happily resolves
+    /// the initiator from the durable `rotation_initiator` column this same
+    /// commit just wrote, since RAM is still empty. That confirm's own
+    /// `evict_rotation_raw` call is then a no-op (nothing to evict yet), and
+    /// the cache write that follows inserts an entry for a rotation group
+    /// that is ALREADY fully resolved — permanently unevictable, since every
+    /// eviction site requires the pair to resolve AGAIN, which it never
+    /// will. Not a credential-disclosure risk: the caller's own raw secret
+    /// was already returned via the mint's own return value, so there is
+    /// nothing live left for `try_reserve`'s grace-window re-serve (F4) to
+    /// leak — this is a residue/lifetime defect (an unevictable map entry,
+    /// its `raw` still scrubbed by `scrub_elapsed_grace_secrets`'s own
+    /// timeout, same as any other entry), not a re-disclosure one.
+    ///
+    /// The successor's OWN `rotation_group` column is stamped to its OWN
+    /// `token_id` at mint time (see the mint INSERT in the .cpp) and
+    /// cleared to `''` by every site that resolves a rotation — both
+    /// confirm arms, `resolve_rotation_pair_after_revoke`, and the sweep's
+    /// auto-revoke (see `ApiToken::rotation_initiator`'s "cleared on the
+    /// surviving row" doc comment for the closed four-site list). So an
+    /// empty `rotation_group` on a fresh re-read means the rotation this
+    /// cache entry would be for was ALREADY resolved in the gap above.
+    ///
+    /// This check is itself a narrower instance of the SAME class of window
+    /// (a fresh, unlocked read followed by a decision) — it cannot close the
+    /// race outright without re-taking the advisory lock around the cache
+    /// write, which would reintroduce the very "cache write can outrun the
+    /// commit" ordering hazard `test_hook_before_mint_commit_` exists to
+    /// catch. Narrowing a residual window this far, rather than closing it
+    /// with a lock, matches this file's existing posture on comparably
+    /// narrow single-request races (see `revoke_generation_`'s own doc
+    /// comment in the header above).
+    ///
+    /// Fails OPEN (returns true — "still pending", i.e. cache it) on a lease
+    /// timeout or an ambiguous read, the same "we asked and did not get an
+    /// answer, so don't act on it" posture `list_active_for_principal`
+    /// takes: under-caching a legitimate in-flight rotation (refusing a
+    /// valid grace-window re-serve) is an availability regression this check
+    /// must never cause on a merely-contended store; the failure mode this
+    /// check exists to close (a permanently stranded entry) is comparatively
+    /// benign and already tolerated elsewhere in this class of race.
+    [[nodiscard]] bool successor_rotation_still_pending(const std::string& successor_token_id) const;
 
     /// Secret-hygiene sweep, distinct from `sweep_expired_rotations`'s
     /// DB-side auto-revoke half: scrubs (`yuzu::secure_zero`) every

@@ -199,10 +199,17 @@ classify_confirm_state_in_group(const std::vector<ApiToken>& principal_active,
 /// `active` vector from `list_active_for_principal`/`read_active_for_principal_on_conn`),
 /// so a caller with just the `kPair` result can run this too, no store access
 /// needed. It does NOT check the initiator binding (Hermes F4/F5's grace-cache
-/// `requesting_user` match) - that state lives in an in-process cache private
-/// to `ApiTokenStore` and is not visible from active-row data alone. A `true`
-/// here still leaves the initiator-binding check as the authoritative
-/// in-transaction gate; it only closes the LINKAGE/PIN half of the gap.
+/// `requesting_user` match): the AUTHORITATIVE binding is still `ApiTokenStore`'s
+/// in-process grace cache, which stays private and is never visible from
+/// active-row data alone. #2961 (migration v3) DOES put a durable echo of it
+/// on the row itself - `ApiToken::rotation_initiator`, public, riding
+/// `kTokenColsTail` - so a caller sitting on the same `active` vector this
+/// function reads already has that field in hand; it is a RAM-absent
+/// recovery value only, though, not a substitute for the authoritative check
+/// (`ApiTokenStore::resolve_rotation_initiator` still fails closed if the two
+/// disagree). A `true` here still leaves the initiator-binding check as the
+/// authoritative in-transaction gate; it only closes the LINKAGE/PIN half of
+/// the gap.
 ///
 /// `ApiTokenStore::confirm_rotation`'s own inline linkage+pin check
 /// (api_token_store.cpp, right after its `kPair` arm) does the SAME check

@@ -1302,7 +1302,7 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   several 900 s rollup ticks rather than in one statement.
 - **`ApiTokenStore` gains a THIRD, independent clock guard (#2964) — the
   rotation sweep that auto-revokes rotation predecessors.** Same shape as the
-  audit store's, same schema-v3 pattern (a new `rotation_retention_meta`
+  audit store's, same schema-migration pattern (a new `rotation_retention_meta`
   key/value table holding the durable anchor), same bootstrap-decline
   consequence, but a much shorter cadence: this sweep ticks every 60 seconds,
   not hourly. **If you are upgrading a populated store that already has
