@@ -534,6 +534,8 @@ if build_server
       'unit/server/test_route_sink_harness.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
+      'unit/server/test_rotation_sweep_naming.cpp', # P2 #11: sweep-driver metric/audit family discrimination by principal_kind
+      'unit/server/test_rotation_warn_dedup.cpp', # P2 #11: successor-unused log/count/audit cadence (audit is once per state, never per tick)
       'unit/server/test_engine_principal_store.cpp',
       'unit/server/test_engine_principal_integration.cpp',
       # #2367: test-only definition of EngineLivenessTestAccess::revalidate,
@@ -627,6 +629,8 @@ if build_server
       'unit/server/test_license_store.cpp',
       'unit/server/test_rest_api_t2.cpp',
       'unit/server/test_rest_api_tokens.cpp',
+      'unit/server/test_rest_api_tokens_rotation.cpp',   # P2 #11: human token-keyed rotate/confirm REST surface
+      'unit/server/test_token_rotation_lookup.cpp',   # P2 #11: derive_rotation_successor, DB-free unit coverage
       'unit/server/test_rest_tag_routes.cpp',   # K-05: REST tag-route authz wiring (CDX-03/CDX-R4-02/B4)
       'unit/server/test_rest_quarantine_routes.cpp',   # CDX-P1-02: REST quarantine-route authz wiring
       'unit/server/test_rest_api_events.cpp',

@@ -249,6 +249,30 @@ TEST_CASE("MCP Policy: operator tier allows Read + Tag Write + Execute", "[mcp][
     CHECK(!tier_allows("operator", "ManagementGroup", "Write"));
 }
 
+// P2 #11 security regression guard: operator-tier ApiToken:Write must stay
+// blocked. Full narrative (two abandoned fix attempts + why the shipped
+// ApiToken:Rotate split is correct) lives ONCE, at mcp_policy.hpp's
+// tier_allows() operator-tier comment — this pins only the answer.
+TEST_CASE("MCP Policy: operator tier does NOT allow ApiToken:Write "
+          "(round-3/4 security regression guard)",
+          "[mcp][policy][security]") {
+    CHECK_FALSE(tier_allows("operator", "ApiToken", "Write"));
+    // Confirm this isn't accidentally exempted by the same route/op the two
+    // rotation tools' RBAC check separately consults — Read stays allowed by
+    // the ordinary operator "Read on everything" rule, but Write must not be.
+    CHECK(tier_allows("operator", "ApiToken", "Read"));
+}
+
+// Positive half of the same finding — operator tier DOES allow the shipped
+// ApiToken:Rotate operation (see mcp_policy.hpp for why). REST-transport
+// twin: test_auth_routes.cpp's "operator MCP tier IS allowed ApiToken:Rotate"
+// on AuthRoutes::require_permission.
+TEST_CASE("MCP Policy: operator tier DOES allow the distinct ApiToken:Rotate "
+          "operation",
+          "[mcp][policy][security]") {
+    CHECK(tier_allows("operator", "ApiToken", "Rotate"));
+}
+
 TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
     CHECK(tier_allows("supervised", "Infrastructure", "Read"));
     CHECK(tier_allows("supervised", "Execution", "Execute"));
@@ -1451,7 +1475,10 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
 // mirrors"); here we only pin the mirror sizes so an accidental edit to one
 // array is caught even when the rbac_store suite is filtered out.
 TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mcp][2g]") {
-    CHECK(rbac_ops_for_test().size() == 7);
+    // 8th op: "Rotate" (P2 #11, SOC 2 CC6.3) — ApiToken-specific, deliberately
+    // distinct from "Write" (see mcp_policy.hpp's tier_allows() operator-tier
+    // comment for why a shared op would have been a privilege escalation).
+    CHECK(rbac_ops_for_test().size() == 8);
     CHECK(rbac_securables_for_test().size() == 23);
 }
 
@@ -1619,6 +1646,404 @@ TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams +
     CHECK(replay->body.find("rotation already confirmed") != std::string::npos);
     CHECK(confirm_metric("conflict") == 1.0);
     CHECK(confirm_metric("success") == 1.0); // unchanged by the replay
+}
+
+// ── Human API-token rotation (P2 #11, SOC 2 CC6.3) ──────────────────────────
+//
+// rotate_api_token / confirm_api_token_rotation — MCP twins of POST
+// /api/v1/tokens/{id}/rotate and /confirm. Reuses the SAME
+// engine_credential_store_for_test wiring as the engine arm above (one
+// ApiTokenStore instance backs both).
+
+TEST_CASE("MCP rotate_api_token/confirm_api_token_rotation: self-service round trip at the "
+          "operator tier, successor resolved via the shared helper, audit + confirm metric",
+          "[mcp][pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t predecessor_expiry = now + 90 * 24 * 3600;
+    // Predecessor carries mcp_tier="operator" to match the session's own
+    // tier below — the authority-inheritance guard (governance Gate 7)
+    // refuses rotation unless the caller's own tier/scope equal the
+    // predecessor's, so this round-trip test's session and predecessor must
+    // agree on tier (empty scope_service on both sides too).
+    REQUIRE(store.create_token("my-key", "test-user", predecessor_expiry, "", "operator")
+                .has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    // ApiToken:Write is reachable at operator (NOT supervised-only like the
+    // engine credential arm) — the whole point of the tier decision under
+    // test.
+    ts.start("operator");
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":950,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+    REQUIRE(rot->status == 200);
+    auto rot_body = nlohmann::json::parse(rot->body);
+    REQUIRE(rot_body.contains("result"));
+    auto rot_payload =
+        nlohmann::json::parse(rot_body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE_FALSE(rot_payload["raw_token"].get<std::string>().empty());
+    // Pin the TOOL'S OWN response — resolved via the shared
+    // derive_rotation_successor helper (token_rotation_lookup.hpp), not a
+    // private test-side lookup.
+    const auto successor_token_id = rot_payload["token_id"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+    // Lifetime-neutral: successor inherits the predecessor's expires_at
+    // verbatim — never accepted as a caller argument, never recomputed.
+    CHECK(rot_payload["expires_at"].get<int64_t>() == predecessor_expiry);
+    // overlap_expires_at is the PREDECESSOR's own stamp — non-zero, and must
+    // match what the store actually recorded on the predecessor row (never
+    // read off the successor, which never carries one).
+    auto predecessor_row = store.get_token(token_id).value();
+    REQUIRE(predecessor_row.has_value());
+    REQUIRE(predecessor_row->overlap_expires_at > 0);
+    CHECK(rot_payload["overlap_expires_at"].get<int64_t>() ==
+          predecessor_row->overlap_expires_at);
+
+    // Ground truth: the response's token_id really is the structural
+    // successor (its supersedes_token_id links back to the predecessor).
+    auto successor_row = store.get_token(successor_token_id).value();
+    REQUIRE(successor_row.has_value());
+    CHECK(successor_row->supersedes_token_id == token_id);
+
+    // api_token.reveal is the success audit for rotate (mirrors REST/engine).
+    bool reveal_audited = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "api_token.reveal|success")
+            reveal_audited = true;
+    CHECK(reveal_audited);
+
+    auto conf = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":951,)"
+        R"("params":{"name":"confirm_api_token_rotation","arguments":{"token_id":")" +
+        successor_token_id + R"("}}})");
+    REQUIRE(conf->status == 200);
+    auto conf_body = nlohmann::json::parse(conf->body);
+    REQUIRE(conf_body.contains("result"));
+    auto conf_payload =
+        nlohmann::json::parse(conf_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(conf_payload["confirmed"].get<bool>() == true);
+    CHECK(conf_payload["token_id"].get<std::string>() == successor_token_id);
+    CHECK(store.list_active_for_principal("test-user").size() == 1); // predecessor revoked
+
+    bool confirm_audited = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "api_token.confirm|success")
+            confirm_audited = true;
+    CHECK(confirm_audited);
+
+    // Sibling counter to REST's yuzu_api_token_confirm_total{surface="rest"}.
+    CHECK(reg.counter("yuzu_api_token_confirm_total", {{"surface", "mcp"}, {"result", "success"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("MCP rotate_api_token: a committed mint whose successor read-back fails is audited "
+          "'partial', never 'failure' (UP-11) — rotate_token already committed",
+          "[mcp][pg][token][rotation]") {
+    // UP-11: before this fix, the `!successor.found` branch (successor
+    // lookup fails AFTER rotate_token already succeeded and committed) wrote
+    // `api_token.rotate|failure` — a compliance record claiming no
+    // credential exists when one plainly does. Reproduced deterministically
+    // (no threading, no wall-clock race, no pool-timing dependency) via
+    // `test_hook_before_mint_commit_`, which hands the mint's OWN connection
+    // — still mid-transaction, after the successor INSERT/predecessor UPDATE
+    // have already run, right before COMMIT. Poisoning THAT SAME connection
+    // there (renaming a column `list_active_for_principal`'s SELECT
+    // references, but rotate_token's own now-finished reads never will
+    // again) survives the COMMIT and breaks every later query against it —
+    // sanctioned exactly by this hook's own doc comment ("run an invalid
+    // statement on the same connection").
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("my-key", "test-user", now + 90 * 24 * 3600, "", "operator")
+                .has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    store.test_hook_before_mint_commit_ = [&](PGconn* conn) {
+        pg::PgResult r{
+            PQexec(conn, "ALTER TABLE api_token_store.api_tokens RENAME COLUMN name TO up11_gone")};
+        REQUIRE(r.ok());
+    };
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    ts.mock_username = "test-user";
+    ts.start("operator");
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":970,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+
+    REQUIRE(rot);
+    REQUIRE(rot->status == 200); // MCP: transport-level 200, error lives in the JSON-RPC body
+    auto body = nlohmann::json::parse(rot->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("could not be read back") !=
+          std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == 2000); // A5: genuinely retryable
+
+    // THE ASSERTION THIS TEST EXISTS FOR: "partial", never "failure" — the
+    // domain-specific row AND the generic MCP gate-level row both reflect
+    // it, matching every other tool's outcome-string discipline.
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[0] == "api_token.rotate|partial");
+    CHECK(ts.audit_details[0].find("successor") != std::string::npos);
+    CHECK(ts.audit_log[1] == "mcp.rotate_api_token|partial");
+
+    // Ground truth: rotate_token really did mint and commit a live successor
+    // — the audit outcome above must match the database, not contradict it.
+    // Queried via a column list that does NOT touch the now-renamed `name`
+    // column, through a SECOND, independent connection (the pool's own
+    // connections all carry the renamed schema, but that only matters to
+    // queries that reference the missing name).
+    {
+        pg::PgConn side{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(side.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(side.get(),
+                              ("SELECT count(*) FROM api_token_store.api_tokens "
+                               "WHERE supersedes_token_id = '" +
+                               token_id + "' AND revoked = FALSE")
+                                  .c_str())};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "1");
+    }
+}
+
+TEST_CASE("MCP rotate_api_token: successor lookup is scoped to the predecessor being rotated, "
+          "not any linked row of the principal (round-3 BLOCKING regression, MCP twin of the "
+          "REST reproduction)",
+          "[mcp][pg][token][rotation][blocking]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    // mcp_tier="operator" on both predecessors, matching the session's own
+    // tier below — the authority-inheritance guard (governance Gate 7)
+    // refuses rotation on a tier mismatch, so an MCP-tiered session can only
+    // rotate a like-tiered predecessor.
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t expiry = now + 89 * 24 * 3600;
+    REQUIRE(store.create_token("token-a", "test-user", expiry, "", "operator").has_value());
+    REQUIRE(store.create_token("token-b", "test-user", expiry, "", "operator").has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(listing.size() == 2);
+    // list_tokens orders newest-first; token-b was created after token-a.
+    const std::string token_b = listing.front().token_id;
+    const std::string token_a = listing.back().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start("operator");
+
+    const auto rotate = [&](const std::string& id, int rpc_id) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                       std::to_string(rpc_id) +
+                       R"(,"params":{"name":"rotate_api_token","arguments":{"token_id":")" + id +
+                       R"("}}})");
+    };
+
+    // Rotate A first — test-user now has an in-flight rotation group for A.
+    auto rot_a = rotate(token_a, 952);
+    REQUIRE(rot_a->status == 200);
+    auto successor_a = nlohmann::json::parse(
+        nlohmann::json::parse(rot_a->body)["result"]["content"][0]["text"].get<std::string>())
+                            ["token_id"]
+                                .get<std::string>();
+
+    // Rotate B while A's rotation is still inside its overlap window — legal
+    // (the <=2-active ceiling is per ROTATION GROUP, never per principal).
+    auto rot_b = rotate(token_b, 953);
+    REQUIRE(rot_b->status == 200);
+    auto successor_b = nlohmann::json::parse(
+        nlohmann::json::parse(rot_b->body)["result"]["content"][0]["text"].get<std::string>())
+                            ["token_id"]
+                                .get<std::string>();
+
+    // The BLOCKING bug an unscoped scan would reproduce: matching "any"
+    // linked row deterministically returns A's successor (minted first) even
+    // though B is the token actually rotated.
+    CHECK(successor_b != successor_a);
+    auto b_row = store.get_token(successor_b).value();
+    REQUIRE(b_row.has_value());
+    CHECK(b_row->supersedes_token_id == token_b);
+
+    // Confirming B's successor must revoke ONLY B's predecessor.
+    auto conf_b = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":954,)"
+        R"("params":{"name":"confirm_api_token_rotation","arguments":{"token_id":")" +
+        successor_b + R"("}}})");
+    REQUIRE(conf_b->status == 200);
+    REQUIRE(nlohmann::json::parse(conf_b->body).contains("result"));
+
+    auto token_b_after = store.get_token(token_b).value();
+    REQUIRE(token_b_after.has_value());
+    CHECK(token_b_after->revoked);
+
+    auto token_a_after = store.get_token(token_a).value();
+    REQUIRE(token_a_after.has_value());
+    CHECK_FALSE(token_a_after->revoked); // A's predecessor must still be LIVE
+}
+
+TEST_CASE("MCP rotate_api_token: non-owner denied — self-service only, no admin bypass, no "
+          "enumeration oracle",
+          "[mcp][pg][token][rotation][owner][idor]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create_token("alice-key", "alice").has_value());
+    auto listing = store.list_tokens("alice").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.mock_username = "bob"; // NOT the owner
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":960,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() == "token not found");
+
+    // Two rows: the domain-specific api_token.rotate|denied (mirrors REST,
+    // detail carries the owner) plus the generic mcp.rotate_api_token|denied
+    // gate-level row every MCP tool call emits — MCP-only, REST has no
+    // equivalent second row.
+    REQUIRE(ts.audit_log.size() == 2);
+    CHECK(ts.audit_log[0] == "api_token.rotate|denied");
+    CHECK(ts.audit_details[0] == "owner=alice");
+    CHECK(ts.audit_log[1] == "mcp.rotate_api_token|denied");
+
+    // Store state unchanged — no rotation started.
+    auto looked_up = store.get_token(token_id).value();
+    REQUIRE(looked_up.has_value());
+    CHECK(looked_up->rotation_group.empty());
+
+    // Response body identical for a genuinely unknown token_id (enumeration
+    // oracle closed) — same "token not found" text, same kInvalidParams code.
+    auto unknown = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":961,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":"deadbeef1234567890"}}})");
+    REQUIRE(unknown->status == 200);
+    auto unknown_body = nlohmann::json::parse(unknown->body);
+    REQUIRE(unknown_body.contains("error"));
+    CHECK(unknown_body["error"]["code"] == body["error"]["code"]);
+    CHECK(unknown_body["error"]["message"] == body["error"]["message"]);
+}
+
+TEST_CASE("MCP rotate_api_token: readonly tier is denied before RBAC (tier-before-RBAC "
+          "ordering), overlap_days out of range rejected before the multiply",
+          "[mcp][pg][token][rotation][policy]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_token("my-key", "test-user").has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start("readonly"); // readonly allows only Read — ApiToken:Write must be denied
+
+    auto denied = nlohmann::json::parse(
+        ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":970,)"
+                R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+                token_id + R"("}}})")
+            ->body);
+    REQUIRE(denied.contains("error"));
+    CHECK(denied["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    // Store untouched by the tier denial.
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
+
+    // Operator tier passes the tier gate; an out-of-range overlap_days is
+    // rejected by the handler's own bounds check BEFORE the *86400 multiply
+    // (overflow guard, mirrors rotate_engine_credential).
+    McpTestServer ts2;
+    ts2.engine_credential_store_for_test = &store;
+    ts2.start("operator");
+    auto oob = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":971,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"(","overlap_days":3651}}})");
+    REQUIRE(oob->status == 200);
+    auto oob_body = nlohmann::json::parse(oob->body);
+    REQUIRE(oob_body.contains("error"));
+    CHECK(oob_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(oob_body["error"]["message"].get<std::string>().find("overlap_days out of range") !=
+          std::string::npos);
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
+
+    // #2970B (PR #2974 review): overlap_days present but the WRONG JSON TYPE
+    // must be rejected, not silently defaulted to 7. `30.0` is what a Python
+    // or JS client emits for a float, and the old `param_int` returned the
+    // default for it — the range check then passed because 7 is in range, so
+    // the caller asked for 30 days and got 7 with no error. The REST twin
+    // 400s the same shape, and the tool's own schema declares integer.
+    //
+    // Asserted on the STORE as well as the response: a silent default would
+    // have gone on to mint a real successor, so an error-only assertion could
+    // pass while the rotation still happened.
+    McpTestServer ts3;
+    ts3.engine_credential_store_for_test = &store;
+    ts3.start("operator");
+    auto flt = ts3.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":972,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"(","overlap_days":30.0}}})");
+    REQUIRE(flt->status == 200);
+    auto flt_body = nlohmann::json::parse(flt->body);
+    REQUIRE(flt_body.contains("error"));
+    CHECK(flt_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(flt_body["error"]["message"].get<std::string>().find("must be a JSON integer") !=
+          std::string::npos);
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
+
+    // A JSON string is the other shape a loosely-typed client sends.
+    auto str = ts3.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":973,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"(","overlap_days":"30"}}})");
+    REQUIRE(str->status == 200);
+    auto str_body = nlohmann::json::parse(str->body);
+    REQUIRE(str_body.contains("error"));
+    CHECK(str_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
 }
 
 TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drifted "
@@ -2216,13 +2641,15 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
     // outputSchema check in this file was the get_fleet_posture_fast
     // special-case below - #2712's own filing named that as the reason the
     // other ~45 gaps were invisible to CI. This closed, explicit exemption
-    // set is the retrofit backlog #2712 tracks (DEX+network + execute_*/
-    // writes families, not yet done); every tool NOT in it must advertise
+    // set is the retrofit backlog #2712 tracks (execute_*/writes family,
+    // not yet done); every tool NOT in it must advertise
     // outputSchema, or this test fails - so a NEW tool merging without one
     // fails immediately, and exempting one requires editing this literal
     // list, a visible reviewable diff line rather than a silent gap. Mirrors
     // the kToolAnnotation completeness check above
-    // (CHECK(classified == listed)).
+    // (CHECK(classified == listed)). DEX + network family (#2712 batch 2) is
+    // no longer exempt - it now has real schemas, see the shared handler
+    // blocks in mcp_server.cpp.
     //
     // CAVEAT (adversarial review of PR #2978, 2026-08-11): this gate checks
     // outputSchema PRESENCE, not typed-NESS - it does not reject the generic
@@ -2233,22 +2660,9 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
     // were typed properly as a result of that review; a handful of other
     // non-exempt tools (the discover_* family, classify_operational_
     // question, get_incident_playbook, summarize_working_set) still ship
-    // the placeholder and pass this gate anyway - tracked as a follow-up,
-    // not silently ignored.
+    // the placeholder and pass this gate anyway - tracked as #2986, not
+    // silently ignored.
     static const std::set<std::string> kOutputSchemaExempt = {
-        // DEX + network family (#2712 batch 2, not started)
-        "list_dex_signals",
-        "get_dex_signal_scope",
-        "get_dex_perf_cohorts",
-        "get_dex_perf_fleet",
-        "get_dex_perf_cohort_diff",
-        "list_dex_perf_apps",
-        "list_dex_perf_devices",
-        "get_dex_app_perf",
-        "get_dex_group_app_perf",
-        "compare_app_perf_versions",
-        "get_network_fleet",
-        "list_network_devices",
         // execute_* + writes family (#2712 batch 3, not started)
         "execute_instruction",
         "execute_bundle",
@@ -2695,6 +3109,13 @@ TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool ca
     CHECK(ts.audit_log.back() == "mcp.list_dex_signals|success");
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.signal.view") == std::string::npos);
+
+    // #2712 batch 2: content[0].text stays the bare array (backward compat);
+    // structuredContent wraps the SAME rows under "signals".
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("signals"));
+    CHECK(sc["signals"] == rows);
 }
 
 TEST_CASE("MCP DEX: list_dex_signals os filter scopes the catalogue rollup (A1 parity)",
@@ -2751,6 +3172,13 @@ TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as
             macos_types = r["distinct_types"].get<int>();
     CHECK(macos_types == 2); // process.crashed + storage.low
     CHECK(ts.audit_log.back() == "mcp.get_dex_signal_scope|success");
+
+    // #2712 batch 2: content[0].text stays the bare array (backward compat);
+    // structuredContent wraps the SAME rows under "platforms".
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("platforms"));
+    CHECK(sc["platforms"] == rows);
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
@@ -2969,6 +3397,41 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
     CHECK_FALSE(cohorts["cohorts"][1].contains("cpu_pct"));
 }
 
+// #2712 batch 2: get_dex_perf_fleet's payload is already object-shaped (no
+// array wrap needed - the shared block still routes it through
+// tool_result_split() with structured_payload==payload, same as content);
+// get_dex_perf_cohorts needs the suppressed cohort's stat fields OMITTED
+// from structuredContent too, not just from content[0].text - the
+// anonymization floor must hold in both.
+TEST_CASE("MCP DEX perf: structuredContent mirrors content for fleet + cohorts, "
+          "suppression omits stats in both",
+          "[mcp][integration][dex][perf]") {
+    McpTestServer ts;
+    ts.dex_perf_fn_for_test = mcp_perf_snapshot;
+    ts.start("readonly");
+
+    auto fleet_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":150,"params":{"name":"get_dex_perf_fleet","arguments":{}}})");
+    auto fleet_body = nlohmann::json::parse(fleet_res->body);
+    REQUIRE(fleet_body["result"].contains("structuredContent"));
+    auto fleet_text = nlohmann::json::parse(
+        fleet_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fleet_body["result"]["structuredContent"] == fleet_text);
+
+    auto cohorts_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":151,"params":{"name":"get_dex_perf_cohorts","arguments":{"key":"model"}}})");
+    auto cohorts_body = nlohmann::json::parse(cohorts_res->body);
+    REQUIRE(cohorts_body["result"].contains("structuredContent"));
+    auto cohorts_text = nlohmann::json::parse(
+        cohorts_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(cohorts_body["result"]["structuredContent"] == cohorts_text);
+    auto& sc = cohorts_body["result"]["structuredContent"];
+    CHECK(sc["cohorts"][0]["suppressed"] == false);
+    CHECK(sc["cohorts"][0].contains("cpu_pct")); // unsuppressed cohort keeps its stats
+    CHECK(sc["cohorts"][1]["suppressed"] == true);
+    CHECK_FALSE(sc["cohorts"][1].contains("cpu_pct")); // floor holds in structuredContent too
+}
+
 TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required params)",
           "[mcp][integration][dex][perf]") {
     McpTestServer ts;
@@ -2987,6 +3450,17 @@ TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required 
     CHECK(diff["a"]["suppressed"] == false);
     CHECK(diff["b"]["suppressed"] == true);
     CHECK(diff["delta_pct"]["cpu_pct"].is_null()); // b suppressed → no comparison
+
+    // #2712 batch 2: this tool's payload is always object-shaped, so
+    // structuredContent is the SAME string as content[0].text - pin that
+    // explicitly for this specific tool rather than relying on the sibling
+    // get_dex_perf_fleet/get_dex_perf_cohorts tests to stand in for it (they
+    // share a dispatch block but take a different ternary branch).
+    auto diff_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":57,"params":{"name":"get_dex_perf_cohort_diff","arguments":{"key":"model","a":"a","b":"b"}}})");
+    auto diff_body = nlohmann::json::parse(diff_res->body);
+    REQUIRE(diff_body["result"].contains("structuredContent"));
+    CHECK(diff_body["result"]["structuredContent"] == diff);
 
     // unknown cohort → found_b false, b null.
     auto missing = mcp_tool_payload(
@@ -3200,6 +3674,22 @@ TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit par
     CHECK(badcohort["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(badcohort["error"]["data"]["correlation_id"].is_string());
 
+    // #2712 batch 2: content[0].text stays the bare array (backward compat -
+    // this tool shipped pre-#2712 returning a bare array); structuredContent
+    // wraps the SAME rows under "devices" so it validates against an
+    // object-typed output schema.
+    auto wrap_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":62,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model"}}})");
+    auto wrap_body = nlohmann::json::parse(wrap_res->body);
+    REQUIRE(wrap_body["result"]["content"][0]["text"].get<std::string>().front() == '[');
+    REQUIRE(wrap_body["result"].contains("structuredContent"));
+    auto& wrap_sc = wrap_body["result"]["structuredContent"];
+    REQUIRE(wrap_sc.contains("devices"));
+    REQUIRE(wrap_sc["devices"].is_array());
+    CHECK(wrap_sc["devices"].size() == 16);
+    CHECK(wrap_sc["devices"] ==
+          nlohmann::json::parse(wrap_body["result"]["content"][0]["text"].get<std::string>()));
+
     // Invalid cohort key → kInvalidParams (REST 400 parity), also A4.
     auto badkey = nlohmann::json::parse(
         ts.call(
@@ -3310,6 +3800,16 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
         CHECK(p["cpu"]["after_mean"].get<double>() == Catch::Approx(4.5));
         CHECK(p["distribution"]["up"] == 2);
         CHECK_FALSE(p.contains("verdict")); // EVIDENTIAL — no pass/fail
+    }
+    SECTION("#2712 batch 2: structuredContent mirrors the already-object payload") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":93,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0"}}})");
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body["result"].contains("structuredContent"));
+        auto text = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        CHECK(body["result"]["structuredContent"] == text);
+        CHECK(body["result"]["structuredContent"]["cpu"]["after_mean"].get<double>() ==
+              Catch::Approx(4.5));
     }
     SECTION("baseline == candidate → kInvalidParams") {
         auto res = ts.call(
@@ -3466,6 +3966,45 @@ TEST_CASE("MCP network: fleet stats + devices (worst-first sort + limit parity)"
             ->body);
     REQUIRE(bad.contains("error"));
     CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+// #2712 batch 2: get_network_fleet's payload is already object-shaped (no
+// wrap); list_network_devices' content[0].text stays the bare array it
+// shipped pre-#2712, structuredContent wraps the SAME rows under "devices".
+TEST_CASE("MCP network: structuredContent mirrors fleet, wraps devices under "
+          "\"devices\"",
+          "[mcp][integration][network]") {
+    McpTestServer ts;
+    ts.net_perf_fn_for_test = [](const std::string&) {
+        yuzu::server::NetPerfSnapshot snap;
+        yuzu::server::NetPerfDevice d;
+        d.agent_id = "hi-0";
+        d.platform = "linux";
+        d.rtt_ms = 500.0;
+        d.cohort = "site-a";
+        snap.devices.push_back(d);
+        return snap;
+    };
+    ts.start("readonly");
+
+    auto fleet_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":160,"params":{"name":"get_network_fleet","arguments":{}}})");
+    auto fleet_body = nlohmann::json::parse(fleet_res->body);
+    REQUIRE(fleet_body["result"].contains("structuredContent"));
+    auto fleet_text =
+        nlohmann::json::parse(fleet_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fleet_body["result"]["structuredContent"] == fleet_text);
+
+    auto dev_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":161,"params":{"name":"list_network_devices","arguments":{}}})");
+    auto dev_body = nlohmann::json::parse(dev_res->body);
+    REQUIRE(dev_body["result"]["content"][0]["text"].get<std::string>().front() == '[');
+    REQUIRE(dev_body["result"].contains("structuredContent"));
+    auto& dev_sc = dev_body["result"]["structuredContent"];
+    REQUIRE(dev_sc.contains("devices"));
+    REQUIRE(dev_sc["devices"].size() == 1); // pin against a vacuous empty==empty pass
+    CHECK(dev_sc["devices"] ==
+          nlohmann::json::parse(dev_body["result"]["content"][0]["text"].get<std::string>()));
 }
 
 TEST_CASE("MCP network: tools report unavailable when no provider is wired",

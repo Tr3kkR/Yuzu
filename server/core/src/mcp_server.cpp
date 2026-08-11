@@ -12,6 +12,8 @@
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (streamed POST, 3b)
 #include "rotation_confirm_state.hpp" // classify_confirm_state (#2443 confirm_engine_rotation precondition)
+#include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric (shared REST/MCP metric symbol)
+#include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
 #include "discover_routes.hpp"          // A2 discovery builders shared with REST /discover/*
@@ -49,6 +51,7 @@
 #include <mutex>
 #include <random>
 #include <stdexcept>
+#include <optional> // param_int_strict (#2970B)
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -186,6 +189,30 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
     if (params.contains(key) && params[key].is_number_integer())
         return params[key].get<int64_t>();
     return def;
+}
+
+/// #2970B: `param_int` SILENTLY substitutes `def` when the key is present but
+/// the wrong JSON type — `{"overlap_days": 30.0}` (what a Python or JS client
+/// emits for a float) or `"30"` becomes the default, and any subsequent range
+/// check passes because the default is in range. The caller asked for 30 days
+/// and gets 7, with no error.
+///
+/// This returns `nullopt` for present-but-wrong-type so the caller can answer
+/// `kInvalidParams`, matching both the REST twin (which 400s the same shape)
+/// and the tool's own declared `"type": "integer"` input schema. Absent stays
+/// `def` — omitted is not malformed.
+///
+/// Deliberately a SIBLING rather than a change to `param_int`: that function
+/// has many callers across every tool, and silently tightening all of them
+/// from one rotation finding would be a much larger behavioural change than
+/// the one that was reviewed.
+std::optional<int64_t> param_int_strict(const nlohmann::json& params, const char* key,
+                                        int64_t def) {
+    if (!params.contains(key))
+        return def;
+    if (!params[key].is_number_integer())
+        return std::nullopt;
+    return params[key].get<int64_t>();
 }
 
 int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
@@ -461,14 +488,14 @@ static const ToolDef kTools[] = {
      "/api/v1/dex/signals. Requires GuaranteedState:Read.",
      R"j({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d","description":"Time window (any other value resolves to 7d)"},)j"
      R"j("os":{"type":"string","enum":["all","windows","linux","macos"],"default":"all","description":"Narrow to one OS's own signals (all = every OS)"}}})j",
-     /*output_schema_json=*/nullptr}, // content is a bare array of signal rows (matches the REST list twin); annotations generated (2g PR 2)
+     R"j({"type":"object","properties":{"signals":{"type":"array","items":{"type":"object","properties":{"obs_type":{"type":"string"},"count":{"type":"integer"},"distinct_devices":{"type":"integer"},"last_seen":{"type":"string"}},"required":["obs_type","count","distinct_devices","last_seen"]}}},"required":["signals"]})j"}, // annotations generated (2g PR 2)
 
     {"get_dex_signal_scope",
      "Get DEX per-OS signal coverage: how many distinct observation types each platform reports, "
      "with total event count. Fleet aggregate. Mirrors GET /api/v1/dex/scope. Requires "
      "GuaranteedState:Read.",
      R"({"type":"object","properties":{"window":{"type":"string","enum":["24h","7d","30d","all"],"default":"7d"}}})",
-     /*output_schema_json=*/nullptr}, // content is a bare array of per-OS scope rows (tracked in #2363); annotations generated (2g PR 2)
+     R"j({"type":"object","properties":{"platforms":{"type":"array","items":{"type":"object","properties":{"platform":{"type":"string"},"distinct_types":{"type":"integer"},"total_events":{"type":"integer"}},"required":["platform","distinct_types","total_events"]}}},"required":["platforms"]})j"}, // annotations generated (2g PR 2)
 
     {"get_dex_signal_detail",
      "Drill into one DEX signal type: top subjects, per-OS split, most-affected devices, and the "
@@ -496,14 +523,27 @@ static const ToolDef kTools[] = {
      "numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab). A null "
      "metric means no device reported it (absent, never zero). Mirrors GET /api/v1/dex/perf/fleet. "
      "Requires GuaranteedState:Read.",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{)j"
+     R"j("cpu_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("commit_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("disk_lat_ms":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("reporting":{"type":"integer"},"windows_online":{"type":"integer"})j"
+     R"j(},"required":["cpu_pct","commit_pct","disk_lat_ms","reporting","windows_online"]})j"},
 
     {"get_dex_perf_cohorts",
      "Fleet-relative performance percentiles per cohort of an operator-chosen tag key (e.g. "
      "model, image). Cohorts under the statistical floor are suppressed=true with population "
      "only; devices without the key form the explicit cohort=\"\" (untagged) residual. Mirrors "
      "GET /api/v1/dex/perf/cohorts. Requires GuaranteedState:Read.",
-     R"j({"type":"object","properties":{"key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"}}})j"},
+     R"j({"type":"object","properties":{"key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"}}})j",
+     R"j({"type":"object","properties":{"key":{"type":"string"},"floor":{"type":"integer","description":"kDexCohortFloor - cohorts below this device count are suppressed"},)j"
+     R"j("cohorts":{"type":"array","items":{"type":"object","properties":{"cohort":{"type":"string"},"devices":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("cpu_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("commit_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("disk_lat_ms":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"}},)j"
+     R"j("required":["cohort","devices","suppressed"]}},"available_keys":{"type":"array","items":{"type":"string"}})j"
+     R"j(},"required":["key","floor","cohorts","available_keys"]})j"},
 
     {"get_dex_perf_cohort_diff",
      "Direct cohort-vs-cohort performance comparison (F2c): diffs two cohorts of a tag key "
@@ -517,7 +557,18 @@ static const ToolDef kTools[] = {
      R"j("key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"},)j"
      R"j("a":{"type":"string","description":"First cohort value (empty string = untagged residual)"},)j"
      R"j("b":{"type":"string","description":"Second cohort value (the baseline)"})j"
-     R"j(},"required":["a","b"]})j"},
+     R"j(},"required":["a","b"]})j",
+     R"j({"type":"object","properties":{"key":{"type":"string"},"floor":{"type":"integer"},"found_a":{"type":"boolean"},"found_b":{"type":"boolean"},)j"
+     R"j("a":{"type":["object","null"],"properties":{"cohort":{"type":"string"},"devices":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("cpu_pct":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("commit_pct":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("disk_lat_ms":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"}},"description":"the whole 'a' slot is null when found_a is false"},)j"
+     R"j("b":{"type":["object","null"],"properties":{"cohort":{"type":"string"},"devices":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("cpu_pct":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("commit_pct":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("disk_lat_ms":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"}},"description":"the whole 'b' slot is null when found_b is false"},)j"
+     R"j("delta_pct":{"type":"object","properties":{"cpu_pct":{"type":["number","null"]},"commit_pct":{"type":["number","null"]},"disk_lat_ms":{"type":["number","null"]}},"required":["cpu_pct","commit_pct","disk_lat_ms"]})j"
+     R"j(},"required":["key","floor","found_a","found_b","a","b","delta_pct"]})j"},
 
     {"list_dex_perf_devices",
      "The device list behind every fleet-performance drill: worst devices by a metric (default), "
@@ -530,7 +581,8 @@ static const ToolDef kTools[] = {
      R"j("cohort_key":{"type":"string","default":"model","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
      R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of cohort_key (empty string = untagged residual)"},)j"
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
-     R"j(}})j"},
+     R"j(}})j",
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"cohort":{"type":"string"},"cpu_pct":{"type":"number"},"commit_pct":{"type":"number"},"disk_lat_ms":{"type":"number"},"fleet_pctile":{"type":"integer"}},"required":["agent_id","cohort"]}}},"required":["devices"]})j"},
 
     // ── DEX app-perf-over-time tools — parity with /api/v1/dex/perf/app[s] ──
     {"list_dex_perf_apps",
@@ -540,7 +592,8 @@ static const ToolDef kTools[] = {
      "most recent UTC-midnight epoch day seen; truncated=true means the list hit the "
      "server cap. Fleet metadata — not individually identifying. Mirrors GET "
      "/api/v1/dex/perf/apps. Requires GuaranteedState:Read.",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"apps":{"type":"array","items":{"type":"object","properties":{"app_name":{"type":"string"},"versions":{"type":"integer"},"last_day":{"type":"string"}},"required":["app_name","versions","last_day"]}},"truncated":{"type":"boolean"}},"required":["apps","truncated"]})j"},
 
     {"get_dex_app_perf",
      "Fleet performance-over-time trend for ONE app — the 'over time' companion to "
@@ -557,7 +610,19 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
      R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
-     R"j(},"required":["app"]})j"},
+     R"j(},"required":["app"]})j",
+     R"j({"type":"object","properties":{"app":{"type":"string"},"version":{"type":"string"},)j"
+     R"j("points":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("version":{"type":"string"},"day":{"type":"string"},"device_count":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("cpu_mean":{"type":"number","description":"Omitted, along with every other stat field on this point, when suppressed is true"},"cpu_max":{"type":"number"},)j"
+     R"j("cpu_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("cpu_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("ws_mean":{"type":"number"},"ws_max":{"type":"number"},)j"
+     R"j("ws_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("ws_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("hist_stale":{"type":"boolean"})j"
+     R"j(},"required":["version","day","device_count","suppressed"]}})j"
+     R"j(},"required":["app","version","points"]})j"},
 
     {"get_dex_group_app_perf",
      "App performance-over-time for ONE management group: the get_dex_app_perf fleet "
@@ -573,7 +638,19 @@ static const ToolDef kTools[] = {
      R"j("group_id":{"type":"string","maxLength":512,"description":"Management group id"},)j"
      R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
      R"j("version":{"type":"string","maxLength":512,"description":"Canonicalized + matched exactly; omit for all versions"})j"
-     R"j(},"required":["group_id","app"]})j"},
+     R"j(},"required":["group_id","app"]})j",
+     R"j({"type":"object","properties":{"group_id":{"type":"string"},"app":{"type":"string"},"version":{"type":"string"},"floor":{"type":"integer"},)j"
+     R"j("points":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("version":{"type":"string"},"day":{"type":"string"},"device_count":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("cpu_mean":{"type":"number","description":"Omitted, along with every other stat field on this point, when suppressed is true"},"cpu_max":{"type":"number"},)j"
+     R"j("cpu_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("cpu_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("ws_mean":{"type":"number"},"ws_max":{"type":"number"},)j"
+     R"j("ws_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("ws_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
+     R"j("hist_stale":{"type":"boolean"})j"
+     R"j(},"required":["version","day","device_count","suppressed"]}})j"
+     R"j(},"required":["group_id","app","version","floor","points"]})j"},
 
     {"compare_app_perf_versions",
      "Before/after app performance for an upgrade (the /auto VERIFY evidence): did "
@@ -597,7 +674,16 @@ static const ToolDef kTools[] = {
      R"j("baseline":{"type":"string","maxLength":512,"description":"The before version (canonicalized + matched)"},)j"
      R"j("candidate":{"type":"string","maxLength":512,"description":"The after version; must differ from baseline"},)j"
      R"j("window":{"type":"integer","minimum":1,"maximum":31,"description":"Days of each version per machine (default 7)"})j"
-     R"j(},"required":["app","group","baseline","candidate"]})j"},
+     R"j(},"required":["app","group","baseline","candidate"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("app":{"type":"string"},"group_id":{"type":"string"},"baseline_version":{"type":"string"},"candidate_version":{"type":"string"},)j"
+     R"j("window_days":{"type":"integer"},"cohort_size":{"type":"integer"},"paired":{"type":"integer"},"baseline_only":{"type":"integer"},"candidate_only":{"type":"integer"},"no_data":{"type":"integer"},)j"
+     R"j("small_cohort":{"type":"boolean"},"insufficient":{"type":"boolean"},"truncated":{"type":"boolean"},)j"
+     R"j("cpu":{"type":"object","properties":{"before_mean":{"type":"number"},"after_mean":{"type":"number"},"delta_median":{"type":"number"},"before_p95":{"type":"number"},"after_p95":{"type":"number"}},"required":["before_mean","after_mean","delta_median","before_p95","after_p95"]},)j"
+     R"j("ws":{"type":"object","properties":{"before_mean":{"type":"number"},"after_mean":{"type":"number"},"delta_median":{"type":"number"},"before_p95":{"type":"number"},"after_p95":{"type":"number"}},"required":["before_mean","after_mean","delta_median","before_p95","after_p95"]},)j"
+     R"j("distribution":{"type":"object","properties":{"up":{"type":"integer"},"flat":{"type":"integer"},"down":{"type":"integer"}},"required":["up","flat","down"]},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"})j"
+     R"j(},"required":["app","group_id","baseline_version","candidate_version","window_days","cohort_size","paired","baseline_only","candidate_only","no_data","small_cohort","insufficient","truncated","cpu","ws","distribution"]})j"},
 
     // ── N1: network quality read tools — parity with /api/v1/network/* ──
     {"get_network_fleet",
@@ -610,7 +696,14 @@ static const ToolDef kTools[] = {
      "honest RTT denominator. cooccurrence counts net-degraded devices that ALSO show device-perf "
      "pressure / app instability (measured co-occurrence, never a cause). Mirrors GET "
      "/api/v1/network/fleet. Requires GuaranteedState:Read.",
-     R"({"type":"object","properties":{}})"},
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{)j"
+     R"j("rtt_ms":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("retrans_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("throughput_bps":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
+     R"j("reporting":{"type":"integer"},"rtt_reporting":{"type":"integer"},"online":{"type":"integer"},)j"
+     R"j("cooccurrence":{"type":"object","properties":{"degraded":{"type":"integer"},"also_device":{"type":"integer"},"also_app":{"type":"integer"},"network_only":{"type":"integer"}},"required":["degraded","also_device","also_app","network_only"]})j"
+     R"j(},"required":["rtt_ms","retrans_pct","throughput_bps","reporting","rtt_reporting","online","cooccurrence"]})j"},
 
     {"list_network_devices",
      "The device list behind every network-quality drill: worst devices by a metric (default rtt), "
@@ -625,7 +718,8 @@ static const ToolDef kTools[] = {
      R"j("key":{"type":"string","description":"Tag key used to RESOLVE the cohort column (display; does not filter by itself)"},)j"
      R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of key (empty string = untagged residual)"},)j"
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
-     R"j(}})j"},
+     R"j(}})j",
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"platform":{"type":"string"},"cohort":{"type":"string"},"rtt_ms":{"type":"number"},"retrans_pct":{"type":"number"},"throughput_bps":{"type":"number"},"net_degraded":{"type":"boolean"},"under_pressure":{"type":"boolean"},"app_unstable":{"type":"boolean"},"fleet_pctile":{"type":"integer"}},"required":["agent_id","platform","cohort","net_degraded","under_pressure","app_unstable"]}}},"required":["devices"]})j"},
 
     // Phase 2 write tool
     {"execute_instruction",
@@ -853,6 +947,49 @@ static const ToolDef kTools[] = {
      R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"})j"
      R"j(},"required":["principal_id","token_id"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"principal_id":{"type":"string"}},"required":["confirmed","principal_id"]})j"},
+
+    {"rotate_api_token",
+     "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3): mints "
+     "a successor token alongside the still-valid predecessor for the overlap window (default+"
+     "minimum 7 days, floor 24h). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call within "
+     "a short grace window after the original mint re-serves the SAME successor secret (each "
+     "reveal — original or replay — is independently audited as api_token.reveal); once the "
+     "grace window lapses, a re-call errors and the caller must fall back to an explicit new "
+     "token or the compromise runbook — never an indefinite retry. Self-service ONLY: the "
+     "caller must own the token being rotated (token_id) — no admin override, matching POST "
+     "/api/v1/tokens/{id}/rotate's owner-vs-nonexistent posture (an unknown token_id and a "
+     "not-owned token_id are indistinguishable — not an enumeration oracle). The successor "
+     "ALWAYS inherits the predecessor's expires_at verbatim — rotation is lifetime-neutral, "
+     "never accepted as a caller argument. Requires ApiToken:Rotate (self-service, not an admin "
+     "operation — unlike the engine credential arm's Security:Write, and deliberately distinct "
+     "from the create/list/revoke ApiToken:Write axis). The returned token_id is "
+     "the SUCCESSOR's (scoped exactly to the predecessor rotated, never any other in-flight "
+     "rotation of the caller's — a caller may have several at once); overlap_expires_at is the "
+     "PREDECESSOR's own stamp (the successor row never carries one). Mirrors POST "
+     "/api/v1/tokens/{id}/rotate. Destructive — requires ApiToken:Rotate.",
+     R"j({"type":"object","properties":{)j"
+     R"j("token_id":{"type":"string","maxLength":64,"description":"The token_id of the predecessor token being rotated — must be owned by the calling principal"},)j"
+     R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
+     R"j(},"required":["token_id"]})j",
+     R"j({"type":"object","properties":{"token_id":{"type":"string","description":"The successor's token_id, scoped exactly to the predecessor rotated"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"expires_at":{"type":"integer","description":"The successor's expiry — inherited from the predecessor verbatim"},"overlap_expires_at":{"type":"integer","description":"The PREDECESSOR's own overlap-expiry stamp"}},"required":["token_id","raw_token","expires_at","overlap_expires_at"]})j"},
+
+    {"confirm_api_token_rotation",
+     "Explicit maker-checker confirmation that a rotated API token's successor secret has been "
+     "received/installed by its consumer (P2 #11, SOC 2 CC6.3 maker-checker). Distinct from "
+     "rotate_api_token itself — rotate is the 'here is the secret' reveal step; confirm is a "
+     "SEPARATE attestation that closes the loop, gated behind its own ApiToken:Rotate check "
+     "rather than being inferred from a successful rotate call. token_id here is the SUCCESSOR "
+     "token_id the rotate call returned — the confirm is pinned to that exact rotation and a "
+     "stale or mismatched id is rejected with no state change, so a blind retry can never "
+     "confirm a later rotation. Replaying a confirm after this rotation already resolved (a "
+     "network-dropped success, a double-submit) returns a TERMINAL already-confirmed/already-"
+     "resolved error (not a retryable one) — do not retry; rotate again if a fresh rotation is "
+     "needed. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Mirrors "
+     "POST /api/v1/tokens/{id}/confirm. Destructive — requires ApiToken:Rotate.",
+     R"j({"type":"object","properties":{)j"
+     R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"})j"
+     R"j(},"required":["token_id"]})j",
+     R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"token_id":{"type":"string"}},"required":["confirmed","token_id"]})j"},
 
     {"transfer_engine_principal_owner",
      "Reassign an engine principal's named responsible owner. Admin-forced — independent of the "
@@ -1232,6 +1369,9 @@ static const char* const kWriteToolsRaw[] = {
     // KEK rotation (#2395 track C) — rotate/rewrap mutate; get_kek_status is
     // read-only and deliberately absent from this set.
     "rotate_kek", "rewrap_secrets",
+    // Human API-token rotation (P2 #11, SOC 2 CC6.3) — MCP twins of POST
+    // /api/v1/tokens/{id}/rotate and /confirm.
+    "rotate_api_token", "confirm_api_token_rotation",
 };
 
 // Lookup set DERIVED from the raw sequence; collapse here is safe because the
@@ -1341,6 +1481,14 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_engine_principals", {"EnginePrincipal", "Read"}},
     {"get_engine_principal", {"EnginePrincipal", "Read"}},
     {"audit_engine_no_admin", {"AuditLog", "Read"}},
+    // Human API-token rotation (P2 #11, SOC 2 CC6.3) — self-service, NOT the
+    // admin Security:Write axis the engine credential arm above uses, and
+    // DELIBERATELY `Rotate`, not `Write` (mirrored in the REST rotate/confirm
+    // routes' perm_fn calls for true REST/MCP parity). Full narrative for why
+    // this pair must differ from plain ApiToken:Write lives ONCE, at
+    // mcp_policy.hpp's tier_allows() operator-tier comment.
+    {"rotate_api_token", {"ApiToken", "Rotate"}},
+    {"confirm_api_token_rotation", {"ApiToken", "Rotate"}},
     // PR 4.2 (design §4.1) — engine-principal role-assignment MCP twins of
     // /api/v1/engine-principals/{id}/roles. Mutations map to Security:Write
     // (this mapping drives ONLY the C8 tier/approval gate; each handler
@@ -1469,8 +1617,14 @@ struct ToolSecurityTuple {
 // harmlessly conservative: supervised tier_allows() permits every operation
 // while requires_approval() matches exact strings, so a typo'd op skips its
 // intended approval rule — fail OPEN. Reject at boot instead.
-constexpr std::string_view kRbacOps[] = {"Read",    "Write", "Execute", "Delete",
-                                         "Approve", "Push",  "Attest"};
+// "Rotate" (P2 #11, SOC 2 CC6.3) is deliberately its own operation, distinct
+// from "Write" — see mcp_policy.hpp's tier_allows() operator-tier comment for
+// why: rotate_api_token/confirm_api_token_rotation need an operator-tier
+// allowance that must NEVER be reachable from ApiToken:Write's create/list/
+// revoke surface, and a shared op string is exactly how a prior round's fix
+// attempt widened the wrong thing.
+constexpr std::string_view kRbacOps[] = {"Read",   "Write",  "Execute", "Delete",
+                                         "Approve", "Push",  "Attest",  "Rotate"};
 
 // Closed RBAC securable-type catalogue — mirrors rbac_store.cpp's seeded
 // `types[]` (MOVE TOGETHER; same binding test). A typo'd TYPE is the same
@@ -1768,6 +1922,17 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // resolved"). Pre-#2384 the hint was false (unpinned blind retry could
     // confirm a LATER rotation early).
     {"confirm_engine_rotation", {ToolEffect::Destructive, true, "Confirm engine credential rotation"}},
+    // rotate_api_token: same reasoning as rotate_engine_credential above, on the
+    // human token-keyed arm (ApiTokenStore::rotate_token) — Destructive, not
+    // generally idempotent (each grace-window re-serve is its own audited
+    // reveal; past the grace window a re-call errors).
+    {"rotate_api_token", {ToolEffect::Destructive, false, "Rotate API token"}},
+    // confirm_api_token_rotation: same #2384/#2404 pinned-replay reasoning as
+    // confirm_engine_rotation above, on the human token-keyed arm
+    // (ApiTokenStore::confirm_token_rotation) — a same-args replay either
+    // confirms the pinned pair once or errors with no additional effect.
+    {"confirm_api_token_rotation",
+     {ToolEffect::Destructive, true, "Confirm API token rotation"}},
     // assign/unassign_engine_role: INSERT OR IGNORE (additive) vs DELETE grant
     // (destructive). Both reach a fixed end state on retry → idempotent.
     {"assign_engine_role", {ToolEffect::Additive, true, "Assign fleet-wide role to engine principal"}},
@@ -5248,13 +5413,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("distinct_devices", r.distinct_devices)
                                 .add("last_seen", r.last_seen));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("signals", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -5282,13 +5447,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("distinct_types", r.distinct_types)
                                 .add("total_events", r.total_events));
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", arr.str())).str())
-                        .str();
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("platforms", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -5615,13 +5780,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     payload = arr.str();
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
-                        .str();
+                // #2712: three of these four branches already build an object
+                // string (reused verbatim as structuredContent); list_dex_perf_devices
+                // is the one bare-array branch and needs the same wrap the Phase-1
+                // reads batch used for its own bare-array tools. content[].text stays
+                // exactly `payload` either way - unchanged wire format.
+                const std::string structured_payload =
+                    tool_name == "list_dex_perf_devices"
+                        ? JObj().raw("devices", payload).str()
+                        : payload;
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(
+                                     id, tool_result_split(payload, structured_payload,
+                                                            kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -5845,13 +6017,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .raw("points", points.str())
                                   .str();
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
-                        .str();
+                // #2712: all three branches of this block already build an
+                // object-shaped payload - no bare-array wrap needed, unlike the
+                // perf-cohort/network blocks above.
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -6001,12 +6172,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!audit_ok)
                     payload_obj.add("audit_persisted", false);
                 const std::string payload = payload_obj.str();
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
-                        .str();
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -6104,13 +6271,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     payload = arr.str();
                 }
-                auto result =
-                    JObj()
-                        .raw("content",
-                             JArr().add(JObj().add("type", "text").add("text", payload)).str())
-                        .str();
+                // #2712: get_network_fleet already builds an object string
+                // (reused verbatim as structuredContent); list_network_devices is
+                // the bare-array branch and needs the same wrap the Phase-1 reads
+                // batch used for its own bare-array tools. content[].text stays
+                // exactly `payload` either way - unchanged wire format.
+                const std::string structured_payload =
+                    tool_name == "list_network_devices"
+                        ? JObj().raw("devices", payload).str()
+                        : payload;
                 mcp_audit("success");
-                res.set_content(success_response(id, result), "application/json");
+                res.set_content(success_response(
+                                     id, tool_result_split(payload, structured_payload,
+                                                            kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -8663,6 +8837,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 return true;
             };
 
+            // P2 #11: rotate_api_token/confirm_api_token_rotation are mapped
+            // below to `{"ApiToken","Rotate"}` in `kToolSecurity`, a DISTINCT
+            // operation from `ApiToken:Write` — the generic C8 gate above
+            // resolves tier admission from THIS mapping for every tool before
+            // any per-tool branch runs, so a call-site-local tier exception
+            // here would be structurally unreachable (dead code, pre-empted
+            // by the generic gate). Full narrative (two abandoned fix
+            // attempts + why the ApiToken:Rotate split is correct) lives
+            // ONCE, at mcp_policy.hpp's tier_allows() operator-tier comment.
+
             if (tool_name == "create_engine_principal") {
                 if (!tier_allows(tier, "Security", "Write")) {
                     res.set_content(
@@ -9101,7 +9285,19 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                int64_t overlap_days = param_int(args, "overlap_days", 7);
+                const auto overlap_days_opt = param_int_strict(args, "overlap_days", 7);
+                if (!overlap_days_opt) {
+                    // #2970B: present but not a JSON integer (a float like
+                    // 30.0, or "30"). REST 400s this; so does the tool's own
+                    // declared integer schema. Silently defaulting to 7 gave
+                    // the caller a window they did not ask for.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "overlap_days must be a JSON integer (days)"),
+                        "application/json");
+                    return;
+                }
+                const int64_t overlap_days = *overlap_days_opt;
                 // §7 / REST parity: reject an out-of-range overlap_days
                 // outright — never silently truncate it. ApiTokenStore's own
                 // 24h floor / 10y ceiling (kOverlapFloorSecs/kOverlapCeilSecs,
@@ -9262,6 +9458,351 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success", principal_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── Human API-token rotation (P2 #11, SOC 2 CC6.3) ────────────
+            //
+            // MCP twins of POST /api/v1/tokens/{id}/rotate and /confirm
+            // (rest_api_v1.cpp). Self-service on the ApiToken:Rotate axis, NOT
+            // the engine arm's admin Security:Write, and deliberately distinct
+            // from the create/list/revoke ApiToken:Write axis — see the
+            // mcp_policy.hpp tier_allows() extension and the kToolSecurityRows
+            // comment above.
+            // requesting_user is ALWAYS session->username (server-derived
+            // from the authenticated principal), never a tool argument — the
+            // store's ownership gate (rotate_token/confirm_token_rotation
+            // reject unless requesting_user == the resolved token row's own
+            // principal_id) is only as strong as this. Reuses
+            // engine_credential_store_ — the SAME ApiTokenStore instance
+            // server.cpp wires everywhere else, not a parallel store.
+
+            if (tool_name == "rotate_api_token") {
+                if (!tier_allows(tier, "ApiToken", "Rotate")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ApiToken", "Rotate"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
+                    mcp_audit("failure", "api token store unavailable");
+                    res.set_content(a4_error(kInternalError, "api token store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto token_id = param_str(args, "token_id");
+                if (token_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "token_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // §7 / REST parity: reject an out-of-range overlap_days
+                // outright — never truncated — BEFORE the `* 86400` multiply,
+                // which both matches ApiTokenStore's own 24h floor/10y
+                // ceiling and doubles as the overflow guard (mirrors
+                // rotate_engine_credential above).
+                const auto overlap_days_opt = param_int_strict(args, "overlap_days", 7);
+                if (!overlap_days_opt) {
+                    // #2970B: present but not a JSON integer (a float like
+                    // 30.0, or "30"). REST 400s this; so does the tool's own
+                    // declared integer schema. Silently defaulting to 7 gave
+                    // the caller a window they did not ask for.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "overlap_days must be a JSON integer (days)"),
+                        "application/json");
+                    return;
+                }
+                const int64_t overlap_days = *overlap_days_opt;
+                if (overlap_days < 1 || overlap_days > 3650) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "overlap_days out of range: must be between 1 (24h floor) "
+                                       "and 3650 (10y ceiling)"),
+                        "application/json");
+                    return;
+                }
+                const int64_t overlap_secs = overlap_days * 86400;
+
+                // Owner-vs-nonexistent belt (mirrors POST /api/v1/tokens/{id}/
+                // rotate and the DELETE route it mirrors): identical body for
+                // "no such token" and "not yours" so this is not an
+                // enumeration oracle. Self-service ONLY — no admin bypass;
+                // ApiTokenStore::rotate_token itself rejects any
+                // requesting_user other than the resolved row's own
+                // principal_id, so checking it here just keeps the error
+                // shape uniform and audited.
+                auto existing = engine_credential_store_->get_token(token_id);
+                if (!existing.has_value()) {
+                    mcp_audit("failure", "token store unavailable");
+                    res.set_content(a4_error(kInternalError, "token store unavailable — try again",
+                                             "retry the request", /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                auto& tok = *existing; // std::optional<ApiToken>
+                const bool denied = tok.has_value() && tok->principal_id != session->username;
+                if (!tok.has_value() || denied) {
+                    if (denied) {
+                        audit_fn(req, "api_token.rotate", "denied", "ApiToken", token_id,
+                                 "owner=" + tok->principal_id);
+                    }
+                    mcp_audit("denied", "token not found");
+                    res.set_content(error_response(id, kInvalidParams, "token not found"),
+                                    "application/json");
+                    return;
+                }
+
+                // Parsed/resolved after the whole gate belt (tier/perm/store/
+                // engine-session/owner) so nothing above can become an
+                // unauthenticated or ownership-enumeration oracle.
+                // session->mcp_tier/token_scope_service are the caller's OWN
+                // server-synthesized authority — threaded through so the
+                // store's authority-inheritance guard can refuse a rotation
+                // that would mint authority the caller does not already
+                // hold (governance Gate 7 CRITICAL fix; REST twin is
+                // rest_api_v1.cpp's POST /api/v1/tokens/{id}/rotate).
+                auto result = engine_credential_store_->rotate_token(
+                    token_id, overlap_secs, now_epoch(), session->username, session->mcp_tier,
+                    session->token_scope_service);
+                if (!result) {
+                    const bool denied_audit_ok = audit_fn(req, "api_token.rotate", "failure",
+                                                          "ApiToken", token_id, result.error());
+                    res.set_content(
+                        error_response(id, mcp_error_for_store_msg(result.error()), result.error(),
+                                       denied_audit_ok ? std::string_view{}
+                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    mcp_audit("failure", result.error());
+                    return;
+                }
+                // Locate the successor via the SHARED, DB-free lookup
+                // (token_rotation_lookup.hpp) — scoped exactly to THIS
+                // predecessor, never "any linked row of this principal"
+                // (round-3 BLOCKING finding, closed via the shared helper: a
+                // human principal routinely holds N unrelated active tokens,
+                // so an unscoped match can return a DIFFERENT in-flight
+                // rotation's successor — its raw secret paired with the
+                // wrong token_id, so confirming that id revokes the WRONG
+                // predecessor). One shared helper, not an inline loop — this
+                // tool calls the SAME derivation the REST twin uses, never a
+                // re-derived copy of it. This handler owns the store read
+                // (round-4: the helper takes a plain vector so its derivation
+                // logic is unit-testable without Postgres — see
+                // test_token_rotation_lookup.cpp).
+                auto active_after =
+                    engine_credential_store_->list_active_for_principal(tok->principal_id);
+                auto successor =
+                    yuzu::server::detail::derive_rotation_successor(active_after, token_id);
+                // rotate → found==false is a swallowed-read-failure signal,
+                // MUST fail closed (see the header's call-site-dependent
+                // contract). confirm_api_token_rotation below does NOT call
+                // this helper at all — confirm_token_rotation's response
+                // needs no successor lookup, it just echoes the caller-
+                // supplied successor token_id it was already given — so the
+                // confirm-side "found==false is benign" half of the contract
+                // has no call site in this file to misapply it to.
+                if (!successor.found) {
+                    // rotate_token above already succeeded — a real successor
+                    // row exists and `result` holds its live raw secret — but
+                    // the underlying list_active_for_principal read is
+                    // best-effort and swallows a lease/query failure into an
+                    // empty vector rather than propagating
+                    // (api_token_store.hpp), so a successor genuinely minted
+                    // moments ago failing to show up here is never a
+                    // legitimate "no rotation" case, only an ambiguous read
+                    // failure. Fail CLOSED rather than hand the caller a
+                    // one-time secret with no token_id to ever confirm it
+                    // against: retryable (kInternalError), and never place
+                    // the secret in the response body. Mirrors the REST
+                    // twin's 503 + Retry-After:2 posture — A5: retry_after_ms
+                    // is machine metadata here, not prose-only, matching
+                    // REST's Retry-After:2 header (2000ms). There is no MCP
+                    // `list_tokens` tool (ADR-1005 parity gap, recorded in
+                    // docs/mcp-server.md) — point at the REST route that
+                    // actually exists, matching the REST twin's own
+                    // remediation text exactly.
+                    //
+                    // UP-11: the audit outcome is "partial", never "failure"
+                    // — rotate_token above already succeeded and committed.
+                    // A successor row exists with a live secret in `*result`;
+                    // what failed is reading it back to hand to the caller,
+                    // not the mint itself. An audit row reading
+                    // `api_token.rotate failure` here would tell a CC6.3
+                    // reviewer no credential exists when one plainly does —
+                    // the worst direction for a credential-minting event's
+                    // compliance record to diverge from the database. This
+                    // is genuinely retryable (unlike the sibling !result
+                    // branch above), so the retry hint stays in the SAME A4
+                    // data object whether or not the audit itself persists.
+                    const bool audit_ok = audit_fn(
+                        req, "api_token.rotate", "partial", "ApiToken", token_id,
+                        "successor minted but its secret could not be read back for delivery "
+                        "— retry, or check GET /api/v1/tokens");
+                    JObj err_data;
+                    err_data.add("correlation_id", yuzu::server::detail::make_correlation_id())
+                        .add("retry_after_ms", 2000)
+                        .add("remediation", "retry, or check GET /api/v1/tokens");
+                    if (!audit_ok)
+                        err_data.add("audit_persisted", false);
+                    res.set_content(
+                        error_response(id, kInternalError,
+                                       "rotation succeeded but the successor could not be read "
+                                       "back — retry, or check GET /api/v1/tokens",
+                                       err_data.str()),
+                        "application/json");
+                    mcp_audit("partial", "successor minted but secret could not be read back "
+                                          "after mint");
+                    return;
+                }
+                // The reveal IS the success audit for this route (mirrors the
+                // engine rotate tool and the REST twin) — one row per reveal,
+                // mint or re-serve, never folded into a generic "rotation
+                // succeeded" event. Fired only once the successor is
+                // confirmed findable, so the failure branch above is never
+                // ALSO recorded as a success.
+                const bool reveal_audit_ok =
+                    audit_fn(req, "api_token.reveal", "success", "ApiToken", token_id, "rotate");
+
+                // overlap_expires_at is the PREDECESSOR's own stamp (see
+                // token_rotation_lookup.hpp) — the successor row never
+                // carries one.
+                JObj payload;
+                payload.add("token_id", successor.successor_token_id)
+                    .add("raw_token", *result)
+                    .add("expires_at", successor.successor_expires_at)
+                    .add("overlap_expires_at", successor.predecessor_overlap_expires_at);
+                if (!reveal_audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", successor.successor_token_id);
+                // G5 (secret hygiene) — same no-store contract the REST twin
+                // names: the response body carries a raw one-time credential.
+                // MUST NEVER BE STREAMED: plain JSON-RPC POST responses never
+                // enter mcp_stream.hpp's bounded per-session Last-Event-ID
+                // replay ring today (only SSE/streamed-POST frames do), so
+                // nothing is ringed yet — but if this tool is ever moved onto
+                // the streamed-POST/SSE path (track 2f), a raw credential
+                // response MUST be excluded from that ring, or a replayable
+                // buffer would retain a one-time secret past its single
+                // legitimate delivery.
+                res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+                res.set_header("Pragma", "no-cache");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // G7-equivalent: separate maker-checker confirmation tool — the
+            // MCP twin of POST /api/v1/tokens/{id}/confirm. Own
+            // ApiToken:Rotate gate (not inferred from a successful rotate
+            // call).
+            if (tool_name == "confirm_api_token_rotation") {
+                // #2404-equivalent confirm-outcome counter (surface=mcp),
+                // sibling to REST's yuzu_api_token_confirm_total{surface=rest}
+                // (rest_api_v1.cpp). Shares the SAME `kApiTokenConfirmTotalMetric`
+                // symbol (rotation_sweep_naming.hpp) as the REST handler —
+                // never a second literal, which is exactly the shadow-series
+                // drift the shared symbol exists to prevent. Scope contract
+                // identical to the engine confirm tool: store-reaching calls
+                // only (the store-open guard below, or a real
+                // confirm_token_rotation result) — never a tier, permission,
+                // or ownership early-out.
+                const auto confirm_metric = [metrics](const char* result) {
+                    if (metrics)
+                        metrics
+                            ->counter(kApiTokenConfirmTotalMetric,
+                                      {{"surface", "mcp"}, {"result", result}})
+                            .increment();
+                };
+                if (!tier_allows(tier, "ApiToken", "Rotate")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ApiToken", "Rotate"))
+                    return;
+                if (deny_if_engine_session())
+                    return;
+                if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
+                    confirm_metric("transient"); // store unavailable at the open guard
+                    mcp_audit("failure", "api token store unavailable");
+                    res.set_content(a4_error(kInternalError, "api token store unavailable",
+                                             "retry the request", /*retry_after_ms=*/5000),
+                                    "application/json");
+                    return;
+                }
+                const auto token_id = param_str(args, "token_id");
+                if (token_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "token_id is required",
+                                             "pass the token_id returned by rotate_api_token"),
+                                    "application/json");
+                    return;
+                }
+
+                // Owner-vs-nonexistent belt, same self-service-only posture
+                // as rotate above — no admin bypass, identical body for both
+                // missing-id and not-owner. NOT a store-reaching confirm call
+                // (deliberately excluded from the metric's scope, same as the
+                // REST/engine routes' pre-store denials).
+                auto existing = engine_credential_store_->get_token(token_id);
+                if (!existing.has_value()) {
+                    mcp_audit("failure", "token store unavailable");
+                    res.set_content(a4_error(kInternalError, "token store unavailable — try again",
+                                             "retry the request", /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                auto& tok = *existing; // std::optional<ApiToken>
+                const bool denied = tok.has_value() && tok->principal_id != session->username;
+                if (!tok.has_value() || denied) {
+                    if (denied) {
+                        audit_fn(req, "api_token.confirm", "denied", "ApiToken", token_id,
+                                 "owner=" + tok->principal_id);
+                    }
+                    mcp_audit("denied", "token not found");
+                    res.set_content(error_response(id, kInvalidParams, "token not found"),
+                                    "application/json");
+                    return;
+                }
+
+                // caller_mcp_tier/caller_scope_service threaded for the SAME
+                // reason as the rotate handler above — defence-in-depth
+                // re-check of the authority-inheritance guard (governance
+                // Gate 7).
+                auto confirmed = engine_credential_store_->confirm_token_rotation(
+                    token_id, session->username, session->mcp_tier, session->token_scope_service);
+                if (!confirmed) {
+                    // Increment BEFORE the audit emission so an audit-store
+                    // failure cannot suppress the operational counter.
+                    confirm_metric(yuzu::server::detail::confirm_result_label(
+                        yuzu::server::detail::classify_engine_store_error(confirmed.error())));
+                    const bool denied_audit_ok = audit_fn(req, "api_token.confirm", "failure",
+                                                          "ApiToken", token_id, confirmed.error());
+                    res.set_content(
+                        error_response(id, mcp_error_for_store_msg(confirmed.error()),
+                                       confirmed.error(),
+                                       denied_audit_ok ? std::string_view{}
+                                                       : std::string_view{R"({"audit_persisted":false})"}),
+                        "application/json");
+                    mcp_audit("failure", confirmed.error());
+                    return;
+                }
+                confirm_metric("success");
+                const bool audit_ok = audit_fn(req, "api_token.confirm", "success", "ApiToken",
+                                               token_id, "confirmed");
+                JObj payload;
+                payload.add("confirmed", true).add("token_id", token_id);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", token_id);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
                 return;

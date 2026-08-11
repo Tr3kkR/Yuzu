@@ -27,6 +27,7 @@
 /// (or a not-yet-replicated revoke) would make the terminal classification wrong
 /// on a genuinely live rotation. Keep the read primary + in-txn (UP-6, #2404).
 
+#include <cstddef>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,108 @@ classify_confirm_state(const std::vector<ApiToken>& active, const std::string& p
     return sole.confirmed_at != 0 ? RotationConfirmState::kSoleConfirmed
                                   : RotationConfirmState::kSoleResolved;
 }
+
+/// The disjoint states the human token-keyed arm's `confirm_token_rotation`
+/// (P2 #11, SOC 2 CC6.3) can observe — the group-aware sibling of
+/// `RotationConfirmState` above. `confirm_token_rotation` enforces the <=2
+/// ceiling PER ROTATION GROUP rather than per principal (a human routinely
+/// holds several unrelated concurrent tokens, unlike an engine principal's
+/// single credential), so the states it needs to discriminate are counted
+/// within one `rotation_group`, never across the whole principal. Mapped 1:1
+/// to a store error string by the caller exactly like `RotationConfirmState`
+/// above; the strings then classify via `engine_store_error_class.hpp`'s TRUE
+/// contract — every terminal state below maps to Conflict OR ClientValidation
+/// (never a blanket "this arm has no ClientValidation state": `kOverfullGroup`
+/// IS one — see its own line below; an earlier round of this comment asserted
+/// the blanket claim and was wrong, per round-6 review. Per-state, as classified
+/// by the store error string each one is mapped to in `api_token_store.cpp`,
+/// not decided here):
+///   kAmbiguousEmpty        -> Transient  (ambiguous with a swallowed read failure).
+///   kOverfullGroup         -> ClientValidation ("more than two active credentials...").
+///   kGroupEmpty            -> Conflict   (positive fact; #2404 exemption, round 5).
+///   kUnresolvedSoleInGroup -> Conflict   ("...unresolved rotation metadata...").
+///   kPairInGroup           -> not itself terminal; falls through to further
+///                             pin/initiator checks in `confirm_token_rotation`,
+///                             each with its own class (Transient or Conflict).
+enum class GroupRotationConfirmState {
+    kAmbiguousEmpty,        //!< The PRINCIPAL-WIDE active read was empty — ambiguous with a
+                             //!< swallowed SELECT failure (same UP-6 premise as kNoneActive
+                             //!< above) -> stays retryable/Transient.
+    kOverfullGroup,          //!< >2 active rows share this rotation_group -> defensive,
+                             //!< manual resolution (mirrors kOverfull) -> ClientValidation
+                             //!< (a permanent input/state condition, NOT a rotation-state
+                             //!< conflict — matches the ClientValidation-keyed "more than
+                             //!< two active credentials" substring the emitted string uses).
+    kGroupEmpty,             //!< The principal-wide read was NON-empty, but zero of those rows
+                             //!< carry this rotation_group. Unlike kAmbiguousEmpty this IS a
+                             //!< positive fact, not ambiguous — see the group-filtering note
+                             //!< below — so it is terminal -> Conflict, the SAME class
+                             //!< `kSoleOtherToken` above reaches for its own "the rotation was
+                             //!< resolved" positive fact (#2404 exemption; round 5).
+    kUnresolvedSoleInGroup,  //!< Exactly 1 active row carries this rotation_group. A resolved
+                             //!< standalone credential's rotation_group is cleared to '' and so
+                             //!< can never match a non-empty filter — so ANY row surviving the
+                             //!< filter is, by construction, still mid-rotation (a best-effort
+                             //!< pair-resolve failed, or the partner naturally expired without
+                             //!< a revoke). Terminal; do not rotate or confirm from here.
+    kPairInGroup,            //!< Exactly 2 active rows share this rotation_group -> the normal
+                             //!< pair-processing path (pin + initiator checked by the caller).
+};
+
+/// Classify the state `confirm_token_rotation` finds for one `rotation_group`,
+/// against the PRINCIPAL-WIDE active set `read_active_for_principal_on_conn`
+/// already returned (never a second, group-scoped SQL query — see below for
+/// why). Pure; total; no I/O.
+///
+/// GROUP-FILTERING NOTE (re-deriving the UP-6 premise above for a filtered
+/// read): a group-scoped SQL query (`WHERE rotation_group = $1 AND ...`)
+/// would reintroduce read_active_for_principal_on_conn's own ambiguity in a
+/// NEW place — its own zero-row result would be indistinguishable between
+/// "the query failed" and "genuinely nothing in this group". This function
+/// avoids that by filtering the ALREADY-FETCHED, already-classified
+/// `principal_active` vector IN MEMORY instead of issuing a second query. A
+/// NON-empty `principal_active` is positive evidence the underlying SELECT
+/// itself succeeded (the header note above: a non-empty vector is never a
+/// masked failure); once that is established, a rotation_group filter over
+/// it that finds zero matching rows is EQUALLY positive — the query worked,
+/// and this specific group simply has nothing active left — never ambiguous
+/// with a swallowed failure the way an empty `principal_active` is.
+///
+/// Callers MUST pass the principal's FULL active set — read on the primary,
+/// inside the same advisory-locked transaction that will act on it, exactly
+/// like `classify_confirm_state`'s callers — never a set already filtered by
+/// rotation_group at the SQL layer (that would silently discard the
+/// evidence this function's positive-read reasoning depends on).
+[[nodiscard]] inline GroupRotationConfirmState
+classify_confirm_state_in_group(const std::vector<ApiToken>& principal_active,
+                                const std::string& rotation_group) {
+    if (principal_active.empty())
+        return GroupRotationConfirmState::kAmbiguousEmpty;
+
+    std::size_t in_group = 0;
+    for (const auto& t : principal_active)
+        if (t.rotation_group == rotation_group)
+            ++in_group;
+
+    if (in_group == 0)
+        return GroupRotationConfirmState::kGroupEmpty;
+    if (in_group > 2)
+        return GroupRotationConfirmState::kOverfullGroup;
+    if (in_group == 2)
+        return GroupRotationConfirmState::kPairInGroup;
+    return GroupRotationConfirmState::kUnresolvedSoleInGroup;
+}
+
+// ---------------------------------------------------------------------------
+// Merge note (dev <- feat/auth-human-token-rotation). Two blocks were appended
+// to this header independently and BOTH are kept: the group-aware
+// `GroupRotationConfirmState` family above is the HUMAN token-keyed arm
+// (P2 #11); `pair_matches_pin` below is a linkage+pin precondition for the
+// ENGINE arm's `kPair` (#2443/#2953). They share this header and nothing else —
+// neither reads the other's state, and the human arm counts within one
+// `rotation_group` where the engine arm counts per principal. Do not fold them
+// together on the strength of the shared file.
+// ---------------------------------------------------------------------------
 
 /// A `kPair` classification from `classify_confirm_state` above says only
 /// "exactly two active rows" - it does not check whether those two rows are
