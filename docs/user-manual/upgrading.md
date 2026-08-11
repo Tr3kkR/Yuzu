@@ -673,6 +673,29 @@ server `PgPool`).
   revocation-latency envelope (heartbeat + session/token TTLs measured in
   minutes), and an accepted residual risk (`LISTEN/NOTIFY` is the named
   follow-up).
+- **Bounded stale-serve, then fail-fast deny, under backend degradation.** A
+  brief PostgreSQL blip does not deny immediately: for up to a **~5 s** bound
+  past the last confirmed-good refresh, a replica keeps answering from its
+  last-known-good cached permission set (bounded staleness for continuity).
+  Past that bound — or once a fail-fast breaker sees **2 consecutive**
+  pool-acquire/query failures, whichever comes first — the replica denies
+  authorization checks and stops touching the pool for a ~1 s cooldown
+  between probes, so a sustained outage collapses to a fast, predictable
+  deny-on-degrade rather than every caller separately re-discovering the
+  same failure. Watch `yuzu_server_rbac_breaker_open` (gauge) and
+  `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade.
+- **Shutdown grace bounds now stack; raise your orchestrator's termination
+  grace period if you don't see clean shutdowns.** A graceful `SIGTERM` walks
+  several independently-bounded waits in sequence — up to 30 s draining
+  in-flight executions, up to 5 s waiting on the NVD-sync background thread,
+  up to 15 s waiting on the HTTP listener thread (#2703 Gate 7 item 2), and
+  up to 5 s on the gRPC shutdown deadline — which can stack to **~55 s** in
+  the worst case if more than one is genuinely wedged. Kubernetes' default
+  `terminationGracePeriodSeconds` is **30**, so a pod with slow-draining work
+  in more than one of those stages can be `SIGKILL`ed mid-sequence before the
+  server finishes its own bounded teardown. If you run under Kubernetes (or
+  any orchestrator with a similar default), raise the grace period to
+  comfortably exceed ~55 s rather than relying on the platform default.
 - Confirm on first boot: the backfill completion log line, no `RbacStore`
   open/migrate errors, and that RBAC is still enabled if you had enabled it
   (Settings → RBAC, or check that confined operators still see only their
