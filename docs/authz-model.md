@@ -32,16 +32,20 @@ if the ADR is amended before PR1.9 lands, this schema may need a rework pass.
   which is PR1.9's job, not this one's.
 - **`operation`** — `yuzu::server::authz::Operation`. ADR-0033 §2 names "the existing six" as
   Read/Write/Execute/Delete/Approve/Push. `Attest` is a seventh, narrower operation
-  (`rbac_store.cpp` seed comment: Periodic Access Reviews, SOC 2 CC6.2) — deliberately excluded from
-  every CRUD loop there, and included in this model's enum for the same reason: a capability can
-  genuinely declare it.
+  (`rbac_store.cpp` seed comment: Periodic Access Reviews, SOC 2 CC6.2) and `Rotate` is an eighth
+  (`rbac_store.cpp` seed comment: human API-token self-service rotation, P2 #11, SOC 2 CC6.3) —
+  both deliberately excluded from every CRUD loop there, and included in this model's enum for the
+  same reason: a capability can genuinely declare either. `Rotate` is additionally DISTINCT from
+  `Write` on its own securable (`ApiToken`) — a round-3/4 security finding showed a shared op would
+  let an MCP tier allowance for rotation also admit token creation; see `mcp_policy.hpp`'s
+  `tier_allows()` operator-tier comment, the single narrative home for that finding.
 - **`risk_tier`** — `yuzu::server::authz::RiskTier` (Low/Medium/High/Critical). The routing input
   ADR-0033 §5 (D5)'s future auto-approval policy layer will consume; the ADR does not fix concrete
   thresholds (D5 is explicitly future work), so this is a deliberately small, ordered scale captured
   from day one rather than a speculative rule language. `min_risk_tier_for(operation)` is the one
   rule this PR commits to: a **floor**, so a capability cannot under-declare the risk of an
-  inherently sensitive operation class (Delete/Approve/Push floor at High; Write/Execute/Attest at
-  Medium; Read at Low). Declaring above the floor is always fine.
+  inherently sensitive operation class (Delete/Approve/Push floor at High; Write/Execute/Attest/
+  Rotate at Medium; Read at Low). Declaring above the floor is always fine.
 - **`mcp_tier_class`** — `yuzu::server::authz::McpTierClass` (read/write/execute). ADR-0033 §2: the
   routing input PR1.9 **will** feed into the shipped **tier-before-RBAC** ordering
   (`docs/mcp-server.md`, `mcp_policy.hpp::tier_allows`) so every built-in and declared tool routes

@@ -86,8 +86,10 @@ TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
     auto ops = store.list_operations();
     // Read, Write, Execute, Delete, Approve, Push (Push added for Guardian
     // distribute-rules-to-fleet operation; design v1.1 §9.2), Attest (added
-    // for Periodic Access Reviews, SOC 2 CC6.2 — AccessReview:Attest sign-off).
-    REQUIRE(ops.size() == 7);
+    // for Periodic Access Reviews, SOC 2 CC6.2 — AccessReview:Attest sign-off),
+    // Rotate (added for human API-token self-service rotation, P2 #11, SOC 2
+    // CC6.3 — ApiToken:Rotate, deliberately distinct from ApiToken:Write).
+    REQUIRE(ops.size() == 8);
 }
 
 // #2383 (governance C-3/UP-6): the MCP C8 boot validator carries closed-catalogue
@@ -113,11 +115,12 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
     auto perms = store.get_role_permissions("Administrator");
     // 23 types * 5 CRUD ops = 115 permissions, plus a single targeted Push
     // grant on GuaranteedState (= 116), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2) = 117 permissions total. Push and Attest
-    // are deliberately NOT cross-seeded on other securables — see the rationale
-    // in rbac_store.cpp seed_defaults(). (23rd type: EnginePrincipal, #2376;
-    // 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 117);
+    // (Periodic Access Reviews, CC6.2, = 117), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 118 permissions total. Push, Attest, and
+    // Rotate are deliberately NOT cross-seeded on other securables — see the
+    // rationale in rbac_store.cpp seed_defaults(). (23rd type: EnginePrincipal,
+    // #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing, ADR-0024.)
+    CHECK(perms.size() == 118);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -130,6 +133,18 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
         }
     }
     CHECK(push_count == 1);
+
+    // Confirm the Rotate grant (P2 #11) exists exactly once, and only on
+    // ApiToken — a cross-seeded Rotate on any other securable would be
+    // exactly the kind of silent widening the round-3 finding was about.
+    size_t rotate_count = 0;
+    for (const auto& p : perms) {
+        if (p.operation == "Rotate") {
+            ++rotate_count;
+            CHECK(p.securable_type == "ApiToken");
+        }
+    }
+    CHECK(rotate_count == 1);
 }
 
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store]") {
