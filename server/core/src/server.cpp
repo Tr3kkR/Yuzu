@@ -7547,7 +7547,7 @@ private:
         metrics_.gauge("yuzu_mcp_streamed_post_enabled")
             .set(cfg_.mcp_streamed_post_enable ? 1.0 : 0.0);
         spdlog::info("MCP streamed POST (SSE-on-POST): {}{}",
-                     cfg_.mcp_streamed_post_enable ? "ENABLED (default)" : "disabled (opted out)",
+                     cfg_.mcp_streamed_post_enable ? "ENABLED" : "disabled",
                      cfg_.mcp_streamed_post_enable
                          ? " - size shutdown grace above the 120s response cap plus a "
                            "drain margin (see the Sizing bullet in "

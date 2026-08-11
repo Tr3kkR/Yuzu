@@ -94,9 +94,11 @@ services:
     container_name: yuzu-server
     restart: unless-stopped
     # MCP streamed POST ships ON by default (docs/user-manual/server-admin.md
-    # "Sizing"): a held-open SSE response can take up to 120s plus drain
-    # margin. Docker's 10s default SIGKILLs it mid-drain.
-    stop_grace_period: 150s
+    # "Sizing"): a held-open SSE response's worst-case drain is the 120s
+    # response cap + 2x~3s pump ticks + the 30s socket write timeout
+    # (server.cpp set_write_timeout) = ~156s. Docker's 10s default SIGKILLs
+    # it mid-drain; 210s matches the systemd unit's existing margin.
+    stop_grace_period: 210s
     # The image's default CMD is already secure (no --no-tls/--no-https): it
     # auto-generates the CA + leaves and serves HTTPS on 8443. Override `command:`
     # only to bring your own certs or change ports — see the header.

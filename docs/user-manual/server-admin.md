@@ -672,8 +672,8 @@ POST arm back to plain JSON, not just GET/DELETE.
 
 ### vNEXT — streamed POST (`--mcp-enable-streamed-post`) now ships ON by default (breaking)
 
-The feature landed in the vNEXT entry above already existed; this entry is about
-its **default** changing. Every prerequisite that gated the on-by-default flip
+The feature described in the vNEXT entry above already existed; this entry is
+about its **default** changing. Every prerequisite that gated the on-by-default flip
 (#2739, #2740, #2785, #2789) is fixed, so a server started with no MCP flags now
 serves streamed POST for any `execute_instruction` call that sends
 `_meta.progressToken` with an SSE-capable `Accept` — no configuration required.
@@ -688,9 +688,9 @@ per-principal bullets above because they are no longer conditional on opting in
   had explicitly enabled the flag; it is now the default posture for every
   deployment that takes no action.
 - **A principal's steady-state held-open sum is `--mcp-max-streams-per-principal
-  + 4`**, universally — the streamed-POST allowance is no longer contingent on
-  opting in. That sum is not a hard ceiling (see the Per-principal ceiling
-  bullet above for the GET-reconnect transient).
+  + 4`** — the streamed-POST allowance is no longer contingent on opting in, it
+  applies to every deployment by default. That sum is not a hard ceiling (see
+  the Per-principal ceiling bullet above for the GET-reconnect transient).
 
 **To opt out**, pass `--no-mcp-streamed-post` (or set
 `YUZU_MCP_ENABLE_STREAMED_POST=false`) to keep the pre-flip plain-POST-only
