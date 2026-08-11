@@ -520,11 +520,12 @@ def compare(committed: dict, measured: dict, scenarios: list[str],
 
 def provenance_mismatches(committed: dict, measured: dict) -> list[str]:
     """Catches a manifest whose cadence sets still happen to match but whose
-    PROVENANCE has drifted - the image pin bumped, or `--low/--high/--step`/
-    `--intervals` changed - so the recorded grid no longer describes how the
-    committed cadence sets were actually measured. Separate from `compare()`
-    so its existing (scenario, interval, unexpected, stale) contract - and the
-    selftest pinning it - stays untouched by this addition."""
+    PROVENANCE has drifted - the image pin bumped, `--low/--high/--step`/
+    `--intervals` changed, or a scenario's recorded `alert`/`alert_present`
+    no longer matches what was measured (#2949) - so the record no longer
+    describes how the committed cadence sets were actually produced. Separate
+    from `compare()` so its existing (scenario, interval, unexpected, stale)
+    contract - and the selftest pinning it - stays untouched by this addition."""
     reasons = []
     if committed.get("promtool_image") != measured["promtool_image"]:
         reasons.append(f"promtool_image: committed={committed.get('promtool_image')!r} "
@@ -535,6 +536,22 @@ def provenance_mismatches(committed: dict, measured: dict) -> list[str]:
     if committed.get("intervals_s") != measured["intervals_s"]:
         reasons.append(f"intervals_s: committed={committed.get('intervals_s')!r} "
                        f"measured={measured['intervals_s']!r}")
+    # #2949: `alert` and `alert_present` are written per scenario (full_sweep)
+    # but were read by nothing, so an alertname rename - or a shipped alert
+    # whose measurement never replaced the absent-by-definition placeholder -
+    # passed --check as long as the cadence sets matched. A scenario missing
+    # from the committed manifest entirely is compare()'s missing-key finding,
+    # deliberately not repeated here.
+    c_uncovered = committed.get("uncovered", {})
+    for scenario, m_entry in measured.get("uncovered", {}).items():
+        c_entry = c_uncovered.get(scenario)
+        if c_entry is None:
+            continue
+        for field in ("alert", "alert_present"):
+            if c_entry.get(field) != m_entry.get(field):
+                reasons.append(
+                    f"{scenario}.{field}: committed={c_entry.get(field)!r} "
+                    f"measured={m_entry.get(field)!r}")
     return reasons
 
 
@@ -643,6 +660,27 @@ def selftest() -> int:
           len(provenance_mismatches(base, {**base, "grid": {"low": 25}})), 1)
     check("provenance_mismatches() catches an intervals_s change",
           len(provenance_mismatches(base, {**base, "intervals_s": [30, 60]})), 1)
+
+    # #2949: the per-scenario alert NAME and alert_present FLAG are provenance
+    # too. Cadence sets can match while either drifts - an alertname rename, or
+    # the rung-D absent->present flip where `fresh` goes from
+    # all-uncovered-by-definition to a real measurement - and a comparator that
+    # only diffs cadence sets waves both through.
+    def scen(alert="A", present=True):
+        return {**base,
+                "uncovered": {"anchored": {"alert": alert, "alert_present": present,
+                                           "by_interval": {"30": []}}}}
+    check("provenance_mismatches() finds nothing when scenario fields match",
+          provenance_mismatches(scen(), scen()), [])
+    check("provenance_mismatches() catches alertname drift",
+          len(provenance_mismatches(scen(alert="A"), scen(alert="B"))), 1)
+    check("provenance_mismatches() catches an absent->present alert_present flip",
+          len(provenance_mismatches(scen(present=False), scen(present=True))), 1)
+    check("provenance_mismatches() catches a present->absent alert_present flip",
+          len(provenance_mismatches(scen(present=True), scen(present=False))), 1)
+    check("provenance_mismatches() leaves a committed-side missing scenario "
+          "to compare()'s missing-key finding",
+          provenance_mismatches({**base, "uncovered": {}}, scen()), [])
 
     # resolve_scope(): the three CLI-validation branches, previously reachable
     # only by hand-running main() with a specific flag combination.
