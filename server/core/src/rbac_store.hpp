@@ -479,8 +479,10 @@ private:
     /// of `generation_valid_` that decides whether to TRUST existing cached
     /// state (as opposed to deciding whether to CACHE a value just fetched
     /// live, which is a different, unaffected question) must route through
-    /// this, not the bare field. `rbac_enabled_view_degraded()` and
-    /// `check_permission()`'s perm-cache trust check both do.
+    /// this, not the bare field. `rbac_enabled_view_degraded()`,
+    /// `check_permission()`'s perm-cache trust check, and
+    /// `maybe_refresh_generation()`'s own `within_stale_serve_bound` check
+    /// all do.
     [[nodiscard]] bool generation_view_stale_locked() const;
 
     /// Apply a locally-committed durable generation: clear `perm_cache_`, set

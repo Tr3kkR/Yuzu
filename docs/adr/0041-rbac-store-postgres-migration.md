@@ -221,3 +221,25 @@ PostgreSQL degradation" note for the full mechanism and its CAIQ characterizatio
 decision for a bounded window, then denies. The invariant this ADR's Decision protects
 (no engaged allow on a degraded read) holds throughout; only the timing of when a degraded
 read converts to a deny changed.
+
+**Addendum (2026-08-11, same day, pre-merge, never shipped) — a second trigger, not just a
+completed failure.** The paragraph above frames the 5s bound entirely in terms of "a refresh
+FAILURE" — pool-acquire timeout, query error, or breaker denial, all of which are outcomes of
+a refresh attempt that actually *ran to completion*. Gate 8 governance re-review
+(G11-CPPEXPERT-B2) found the implementation missed a second, distinct trigger the same
+5s bound needs to cover: a refresh attempt that never completes AT ALL — stuck in flight on
+the `ACCESS EXCLUSIVE`-class lock contention described above, for up to the full ~10s
+`lock_timeout`. Every OTHER caller during that stall either takes a fast gated-return path
+(no state touched) or is itself blocked inside its own query, so nothing ever ran the
+completed-failure code path that flips the cache to degraded — the cache could stay trusted
+and stale for the whole stuck-in-flight duration, not just the intended 5s. Fixed same-day by
+checking elapsed time directly (`rbac_generation::is_stale_beyond_bound`) rather than relying
+on a refresh attempt's own completion to signal staleness, at all three sites that decide
+whether cached state is still trustworthy (`rbac_enabled_view_degraded()`, `check_permission()`'s
+perm-cache trust check, and `maybe_refresh_generation()`'s own internal check — now one shared
+chokepoint, `generation_view_stale_locked()`). One disambiguation this addendum makes explicit:
+"the bound" in this document and `docs/auth-architecture.md` always means `kRbacStaleServeBoundMs`
+(~5s, the trust/staleness bound) — not to be confused with `kRbacGenerationRefreshMs` (~1s, an
+unrelated stampede-prevention/metrics-only interval governing how often a refresh may even be
+attempted). Never shipped to dev/main; no SOC 2 assessment period or deployed fleet carried the
+gap.

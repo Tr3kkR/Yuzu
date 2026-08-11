@@ -2352,6 +2352,29 @@ permission verdicts; only past the bound does the view count as degraded
 and `rbac_enforcement_in_effect()` fail closed (treats degraded the same as
 enabled) regardless of what the raw flag last read.
 
+**Terminology note:** every "the bound" reference in this paragraph and the
+ones above it means `kRbacStaleServeBoundMs` (~5 s, the trust/staleness
+bound governing when cached state stops being trusted) — a DIFFERENT
+constant from `kRbacGenerationRefreshMs` (~1 s, the propagation-target
+interval discussed earlier in this section, which only governs how often a
+refresh may even be attempted and carries no trust semantics of its own).
+
+**Addendum (2026-08-11, same day, pre-merge, never shipped, G11-CPPEXPERT-B2):**
+"a failed generation refresh" above describes only a refresh attempt that
+*ran to completion* and then failed. Gate 8 re-review found the fix missed a
+second trigger the same 5 s bound needs to cover just as strictly: a refresh
+attempt stuck in flight and never completing at all — e.g. blocked on the
+`ACCESS EXCLUSIVE`-class lock contention discussed above, for up to the full
+~10 s `lock_timeout`. Every concurrent caller during that stall either takes
+the gated fast-return path (no state touched) or is itself blocked inside its
+own query, so the completed-failure code path that degrades the cache never
+ran — trust could be extended for the whole stuck-in-flight duration, not
+just the intended 5 s. Fixed same-day: the staleness check now measures
+elapsed time directly rather than depending on a refresh attempt's own
+completion, at all three sites that decide whether cached state is still
+trustworthy (now one shared chokepoint, `generation_view_stale_locked()`).
+Never shipped; no SOC 2 assessment period or deployed fleet carried the gap.
+
 **Fail-closed BOOT on the `rbac_enabled` flag.** The `rbac_enabled` flag is
 durable in `rbac_meta`. An unreadable OR non-canonical flag at boot **refuses
 to start** — the server never serves RBAC-**off** on a fleet that had enabled
