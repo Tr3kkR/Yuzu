@@ -522,7 +522,9 @@ int main(int argc, char* argv[]) {
                    "streamed POST responses: those are capped separately at a fixed 4 concurrent "
                    "calls per principal — numerically the same as, but counted and enforced "
                    "separately from, any single session's own replay-ring pin-slot count — so a "
-                   "principal's held-open ceiling across both channels is this value + 4")
+                   "principal's steady-state held-open sum across both channels is this value "
+                   "+ 4 — not a hard ceiling; a GET-channel reconnect can transiently double "
+                   "the GET component (see docs/user-manual/server-admin.md)")
         // Range-checked like its two siblings above. 0 would admit nothing at all, so the
         // floor is 1; the ceiling matches --max-sse-streams (a per-principal cap above the
         // global capacity is meaningless, and the global cap clamps it anyway).
