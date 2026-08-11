@@ -1422,10 +1422,10 @@ groups:
       # of the servers it points at.
       #
       # `absent()` is deliberately a SEPARATE rule rather than an `or` folded
-      # into the one above: the young-server grace must not apply to it (a
-      # missing metric is not excused by a recent boot), and the two states want
-      # different remediation -- one is "the reaper stopped", this one is "you
-      # are not watching the reaper at all".
+      # into the liveness pair above: no grace may apply to it (a missing
+      # metric is not excused by anything), and the states want different
+      # remediation -- theirs are "the reaper stopped" / "it never started",
+      # this one is "you are not watching the reaper at all".
       #
       # NOTE it is fleet-wide, not per-server: `absent()` fires only when NO
       # series exists anywhere in this Prometheus. A single server that stops

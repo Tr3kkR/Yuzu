@@ -30,11 +30,12 @@ restart-liveness questions the alert family needs to:
   non-zero value: a database that has run before, whose reaper then died. Gates
   `YuzuAuditRetentionNotRunning`.
 - `fresh` — the same series held flat at `0`: a database that has never had a pass.
-  Gates `YuzuAuditRetentionNeverRan`, which does not exist until #2854 rung D lands. A
-  scenario whose alert is absent from the rules file measures as fully uncovered at
-  every cadence, by definition — not an instrument error, and not something `--check`
-  should be able to paper over by skipping the scenario. See `alert_present` in the
-  manifest.
+  Gates `YuzuAuditRetentionNeverRan` (shipped by #2854 rung D). A scenario whose alert
+  is absent from the rules file measures as fully uncovered at every cadence, by
+  definition — not an instrument error, and not something `--check` should be able to
+  paper over by skipping the scenario. See `alert_present` in the manifest, which
+  `--check` compares alongside the cadence sets (#2949), so an alertname rename or an
+  absent alert cannot pass on matching cadences alone.
 
 ## What the manifest records
 
@@ -46,24 +47,24 @@ alongside the result means the manifest reproduces from one invocation instead o
 pre-#2854 table here did, merging two runs swept at different resolutions with no way to
 tell which cadence came from which pass.
 
-**The current manifest is long, and that is expected, not an instrument bug.** The
-inverted assertion sees the auto-resolve hole for the first time: the young-server grace
-(`unless (uptime < 10800 and resets(uptime[3h]) <= 1)`) never actually expires for any
-cadence at or below 180 minutes (`uptime` never reaches the 10800s threshold when the
-process restarts that often), so the alert's coverage there depends entirely on
-`resets(uptime[3h])` staying above 1 continuously — which holds comfortably for very
-frequent restarts and starts to intermittently dip back to the grace once a 3-hour window
-no longer reliably holds two resets. Measured on the committed manifest: cadences up to
-~85 minutes stay fully covered (restarts frequent enough that `resets()` never drops to
-1), and coverage degrades from there through the historical 164–195 band and beyond, up to
-the swept ceiling. The `fresh` scenario is fully uncovered at every cadence today, simply
-because `YuzuAuditRetentionNeverRan` does not exist yet.
+**The current manifest is empty, and empty is the gate, not a coincidence.** The #2854
+rung D redesign replaced the young-server grace (`unless (uptime < 10800 and
+resets(uptime[3h]) <= 1)`) — whose coverage depended on `resets()` staying above 1
+continuously, degrading from ~85-minute cadences through the historical 164–195 band and
+beyond — with a grace on the restart-surviving stamp gauge, which no restart cadence can
+re-enter. Both scenarios now measure zero uncovered cadences at every swept interval:
+the `anchored` blind band and the intermittent auto-resolve hole closed together, and
+`fresh` measures for real against the shipped `YuzuAuditRetentionNeverRan`. A cadence
+appearing in a fresh `--emit` is a coverage regression for `--check` to redden on and a
+PR to argue about, never a number to quietly commit. (The pre-redesign measurements this
+paragraph used to describe are in this file's git history.)
 
 ## Why the assertion is `count(ALERTS{...})`, not a labelled match
 
 `ALERTS{alertname=X, alertstate="firing"}`'s label set is whatever the rule's own
 `labels:` block plus its expression's inherited series labels produce, and differs between
-the current rule, rung C's new rule, and rung D's redesign. Wrapping in `count(...)`
+the rules this instrument has measured across its life (the pre-redesign rule, rung C's,
+rung D's). Wrapping in `count(...)`
 collapses that to a single anonymous sample when firing (`exp_samples: [{"labels": "{}",
 "value": 1}]`) and to no sample at all when not — confirmed against the pinned promtool
 image with both a firing and a non-firing probe rule — so the generator never has to name
