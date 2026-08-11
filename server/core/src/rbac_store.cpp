@@ -1409,7 +1409,23 @@ bool RbacStore::is_rbac_enabled() const {
 
 bool RbacStore::rbac_enabled_view_degraded() const {
     std::lock_guard lock(cache_mtx_);
-    return !generation_valid_;
+    // G11-CPPEXPERT-B2 (#2703 Gate 8): `generation_valid_` alone is not a
+    // sufficient degraded signal. It only flips false once SOME thread's
+    // maybe_refresh_generation() call actually completes a failed attempt
+    // past kRbacStaleServeBoundMs -- but a query stuck on PG-side lock
+    // contention (#3016, up to lock_timeout ~10s) can leave generation_valid_
+    // TRUE, stale, and untouched for the whole stall: every OTHER caller in
+    // that window either takes the gated fast-return path (no state change)
+    // or is itself still blocked inside its own query. A disabled+stale
+    // replica reads that untouched `true` as "confirmed disabled" and
+    // rbac_enforcement_in_effect() falls open. Checking elapsed time here
+    // directly (matching this accessor's own doc comment, which already
+    // promised this bound) closes the gap without depending on any
+    // in-flight refresh attempt ever completing.
+    if (!generation_valid_)
+        return true;
+    return rbac_generation::is_stale_beyond_bound(now_ms(), last_successful_refresh_ms_,
+                                                   kRbacStaleServeBoundMs);
 }
 
 void RbacStore::set_rbac_enabled(bool enabled) {

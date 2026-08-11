@@ -1709,6 +1709,61 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
     CHECK(rbac_enforcement_in_effect(&replica_b));
 }
 
+// G11-CPPEXPERT-B2 (#2703 Gate 8, fixed): the sibling test above proves
+// rbac_enforcement_in_effect() fails closed once SOME refresh attempt
+// actually completes and finds itself past the bound. This test proves the
+// narrower, previously-open gap: elapsed time alone must degrade the view
+// even when NO refresh attempt is ever made at all -- e.g. every caller in
+// the window took the gated fast-return path, or is itself still blocked
+// inside a stuck query (PG-side lock contention, #3016, can block a single
+// query for the whole ~10s lock_timeout). Pre-fix, rbac_enabled_view_degraded()
+// was `!generation_valid_` only, which nothing in this scenario ever flips --
+// generation_valid_ stays true, untouched, indefinitely. No pool starving
+// here deliberately: the point is that this must degrade with ZERO refresh
+// attempts, successful or failed, so the test makes none.
+TEST_CASE("RbacStore: rbac_enabled_view_degraded fails closed on elapsed time alone, "
+          "with no refresh attempt ever completing (#2703 Gate 8, G11-CPPEXPERT-B2)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    REQUIRE_FALSE(replica_a.is_rbac_enabled()); // fresh install default
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 4}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+
+    // Fresh construction is a genuine completed refresh (the header's own
+    // "construction counts as one" contract) -- not degraded yet.
+    REQUIRE_FALSE(replica_b.rbac_enabled_view_degraded());
+
+    // Advance wall time past kRbacStaleServeBoundMs (5000ms) WITHOUT calling
+    // is_rbac_enabled()/check_permission()/anything that reaches
+    // maybe_refresh_generation() -- replica_b's pool is left healthy and
+    // untouched throughout, so if the old `!generation_valid_`-only check
+    // were still in place, nothing in this test would ever flip it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+
+    // Called directly (bypassing maybe_refresh_generation() entirely, unlike
+    // is_rbac_enabled()/rbac_enforcement_in_effect() which always trigger a
+    // fresh attempt first): elapsed time alone must now report degraded,
+    // even though generation_valid_ was never touched by a completed refresh
+    // attempt of any kind.
+    CHECK(replica_b.rbac_enabled_view_degraded());
+
+    // rbac_enforcement_in_effect() itself is NOT re-checked here for
+    // degraded=true: replica_b's pool is deliberately left healthy (no lock
+    // held, no starving), so is_rbac_enabled()'s own maybe_refresh_generation()
+    // call succeeds instantly and self-heals the view before
+    // rbac_enabled_view_degraded() would even be consulted -- correct
+    // behavior once nothing is actually blocking a fresh read, not a gap.
+    // The genuinely-stuck-query scenario this fix targets (a real held
+    // PG-side row lock, #3016) needs a second connection actively holding
+    // that lock to reproduce end-to-end; the direct check above is the
+    // precise unit-level proof that this fix's own code path is reachable
+    // and correct independent of that heavier live-lock harness.
+    CHECK_FALSE(rbac_enforcement_in_effect(&replica_b));
+}
+
 // #2703 Gate 7 (operator-adjudicated bounded stale-serve): a refresh failure
 // that lands INSIDE the tolerance window must not clear a warm perm_cache_ --
 // that's the entire point of tolerating it (avoid a fleet-wide cache-miss
