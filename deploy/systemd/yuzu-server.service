@@ -61,6 +61,11 @@ RestartSec=5
 # Stock systemd's 90s default would SIGKILL mid-recompute (data-safe — the txn rolls back
 # and keep-last-good holds — but it logs as a hard kill, which is operationally noisy).
 # 210s clears the worst-case sequential sum with margin. Raise if either rollup budget grows.
+# Also covers a SEPARATE, coincidentally similar bound: MCP streamed POST's worst-case
+# drain is ~156s (120s response cap + pump ticks + the 30s socket write timeout, see
+# docs/user-manual/server-admin.md "Sizing"). The two constraints share this one value by
+# coincidence, not by design — raising it for the rollup budget alone still covers MCP;
+# don't LOWER it without checking both.
 TimeoutStopSec=210
 
 # File-descriptor headroom. The default 1024 soft limit is comfortably

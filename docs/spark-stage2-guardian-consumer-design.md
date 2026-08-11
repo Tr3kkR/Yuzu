@@ -265,14 +265,29 @@ their normal lane cadence.
 
 **Landed (PARTIAL) 2026-07-20, commit `b30e93cf`:** the **transition-edge emission** + a
 **counted, sparse-heartbeat suppression signal** (`yuzu.guardian_unhealthy_suppressed`) shipped.
+
+**Landed (F5, #2298):** (a) the **slow periodic refresh** - `GuardianSparkRuntime::Config::
+errored_refresh_ms` (default 300 000 ms; 0 disables) re-emits `guard.unhealthy` for a still-
+errored rule at that cadence, carrying the CURRENT read-error detail (not the stale first-
+episode string), counted on its own `yuzu.guardian_unhealthy_refreshed` heartbeat tag - so a
+lost/coalesced edge can no longer leave the server's errored view stale forever
+(unhappy-path UP-1/2/4/11 closed); and (b) the **priority-lane eviction** -
+`pending_demote_sweeps`/`pending_demote_ms` (defaults 12 sweeps / 120 000 ms) demote a
+still-pending-initial rule off the 5 s priority lane to its normal type-lane cadence
+(service/registry ~60 s, file ~600 s) once EITHER threshold is crossed on a COMMITTED
+Convergence-reason Unknown, counted on `yuzu.guardian_priority_demoted` - closing the *read*
+flood (UP-6) the edge-only fix left open. Demotion is per-rule, not per-key (a key with a
+mixed demoted/non-demoted pending set still pays the read cost via its non-demoted sibling);
+the demoted rule keeps converging (and keeps re-arming errored_refresh_ms) at the slower
+cadence, so (a) backstops (b)'s resulting wire staleness. Both land in
+`guardian_spark_runtime.{hpp,cpp}` only - zero scheduler code change (the scheduler's
+existing type-lane sweeps already re-drive a demoted key's `evaluate_key`).
+
 Still OPEN and still gating the `prefer_spark` flip (folded into #2298 gate 6):
-(a) the **slow periodic refresh** - without it a lost/coalesced edge leaves the server's errored
-view stale until recovery (unhappy-path UP-1/2/4/11); (b) the **priority-lane eviction** - a
-stuck-Unknown rule still re-reads its target every ~5 s forever, so only the *wire* flood is
-fixed, not the *read* flood (UP-6); (c) the **server-side rollup/consumer** for the suppression
-tag (the signal is agent-heartbeat-only today) - this is **pilot-trust-blocking**, not just SOC2
+(c) the **server-side rollup/consumer** for the suppression/refresh/demotion tags (all three
+are agent-heartbeat-only today) - this is **pilot-trust-blocking**, not just SOC2
 evidence, because after suppression the only current-errored-state view is the no-TTL census, and
-`/status.errored_rules` is still the fail-closed placeholder. **(d) the four-artefact egress for
+`/status.errored_rules` is still the fail-closed placeholder (tracked as F6). **(d) the four-artefact egress for
 `arm_race_unwatch_failures_total` AND `disarm_unwatch_failures_total` (#2270)** - both heartbeat
 tags ship and both keys are registered in `spark_fleet_tags.hpp`, but no rollup consumes either,
 there is no `docs/user-manual/metrics.md` row and no alert rule, and no REST route or dashboard

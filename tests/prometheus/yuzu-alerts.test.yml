@@ -1006,6 +1006,56 @@ tests:
         eval_time: 30m
         exp_samples: []
 
+  # CASE 15b -- YuzuMcpStreamedPostDispatchThrewMidStream, added alongside PR D
+  # (feat/mcp-streamed-post-default-on, #2980-adjacent gap closure). No `for:`
+  # clause -- same immediate-fire shape as YuzuMcpBridgeStreamingBackstop and
+  # YuzuMcpStreamTerminalPublishFailures above, so a single occurrence inside
+  # the 15m window fires without a sustained-rate requirement. Deliberately
+  # self-clearing (unlike YuzuMcpBridgeProjectionDegraded's raw-counter
+  # never-clear below) -- a single throw is a transient reliability signal,
+  # not a permanent lost-payload fact, so the alert should stop firing once
+  # the throw ages out of the window. Same input series as CASE 15 above
+  # (`0x10 1x40`), whose comment already measured this exact series true from
+  # 11m through 24m and false from 25m against promtool 3.13.1 -- reused here
+  # rather than re-derived.
+  - interval: 1m
+    name: streamed POST dispatch-threw - a single occurrence fires within the window, then clears
+    input_series:
+      - series: 'yuzu_mcp_bridge_degrade_total{reason="post_dispatch_threw",job="yuzu",instance="s1"}'
+        values: "0x10 1x40"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPostDispatchThrewMidStream", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPostDispatchThrewMidStream", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuMcpStreamedPostDispatchThrewMidStream", alertstate="firing", instance="s1", job="yuzu", reason="post_dispatch_threw", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPostDispatchThrewMidStream", alertstate="firing"}'
+        eval_time: 24m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuMcpStreamedPostDispatchThrewMidStream", alertstate="firing", instance="s1", job="yuzu", reason="post_dispatch_threw", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPostDispatchThrewMidStream", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPostDispatchThrewMidStream", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE 15c -- a quiet reason on a sibling degrade label must never page this
+  # alert -- the label match is exact, not a family-wide trigger.
+  - interval: 1m
+    name: streamed POST dispatch-threw - a different degrade reason never fires this alert
+    input_series:
+      - series: 'yuzu_mcp_bridge_degrade_total{reason="reserve_rejected",job="yuzu",instance="s1"}'
+        values: "0+1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuMcpStreamedPostDispatchThrewMidStream", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
   # CASE 16 -- pins the "Why 15 minutes" derivation's own faster-than-the-window claim
   # (docs/ops-runbooks/mcp-stream-pin-displacement.md, "A cadence faster than the window
   # is a different case"). A 10-minute retry cadence is faster than the 15-minute window,

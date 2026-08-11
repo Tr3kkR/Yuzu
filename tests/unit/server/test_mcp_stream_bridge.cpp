@@ -423,8 +423,12 @@ TEST_CASE("bridge parked terminal - one pinned final, result_base merged, final 
           "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
+    // #2712: base now carries structuredContent too (as real execute_instruction
+    // responses do since batch 3) - the merge below must preserve it untouched
+    // alongside the top-level additions, not just the legacy content array.
     const std::string base =
-        R"({"content":[{"type":"text","text":"{\"execution_id\":\"exec-p\"}"}]})";
+        R"({"content":[{"type":"text","text":"{\"execution_id\":\"exec-p\"}"}],)"
+        R"("structuredContent":{"execution_id":"exec-p"}})";
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(9), json("tok"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(9), "exec-p"));
     REQUIRE(fx.bridge->arm(s.id, json(9), Bridge::ArmMode::kStreaming, base) ==
@@ -447,6 +451,13 @@ TEST_CASE("bridge parked terminal - one pinned final, result_base merged, final 
     CHECK(fin["result"]["agents_success"] == 3);
     CHECK(fin["result"]["agents_failure"] == 0);
     CHECK_FALSE(fin["result"]["content"][0].contains("status"));
+    // #2712: structuredContent is a THIRD top-level result sibling (alongside
+    // content and the status/agents_* additions) that must survive the merge
+    // completely unchanged - a deliberate, pinned decision (mcp_server.cpp's
+    // execute_instruction handler comment), not an accident of construction
+    // order.
+    REQUIRE(fin["result"].contains("structuredContent"));
+    CHECK(fin["result"]["structuredContent"] == json{{"execution_id", "exec-p"}});
 
     // A7: post-terminal progress (a real publisher sequence) is dropped.
     const auto frames_before = frames.size();

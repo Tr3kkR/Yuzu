@@ -2156,12 +2156,19 @@ public:
                                 // inert journal still adds no tags here.
                                 emit_guardian_journal_age_tags(tags, guardian_->journal_age_stats());
                                 // M1: a rule stuck Unknown re-evals every ~5s; guard.unhealthy is
-                                // edge-emitted and each suppressed repeat is counted, so the
-                                // suppression is observable (not silent). Sparse: non-zero only.
-                                // Key pinned in guardian_health_heartbeat.hpp (drift-proofs the
-                                // #2298 server-side rollup reader).
-                                emit_guardian_health_heartbeat_tags(tags,
-                                                                    guardian_->unhealthy_suppressed());
+                                // edge-emitted, each suppressed repeat is counted (unhealthy_
+                                // suppressed), and each errored_refresh_ms-cadence re-emission is
+                                // separately counted (unhealthy_refreshed, F5 6b) - so the split is
+                                // observable, not silent. priority_demoted (F5 6c) counts rules
+                                // evicted off the 5s priority lane. Sparse: non-zero only. Keys
+                                // pinned in guardian_health_heartbeat.hpp (drift-proofs the #2298
+                                // server-side rollup reader).
+                                emit_guardian_health_heartbeat_tags(
+                                    tags,
+                                    GuardianHealthStats{
+                                        .unhealthy_suppressed = guardian_->unhealthy_suppressed(),
+                                        .unhealthy_refreshed = guardian_->unhealthy_refreshed(),
+                                        .priority_demoted = guardian_->priority_demoted()});
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —

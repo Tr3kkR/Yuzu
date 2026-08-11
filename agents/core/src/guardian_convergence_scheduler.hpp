@@ -21,6 +21,15 @@
  * CV-woken the moment a rule is attached (set_pending_initial_waker) so a fresh
  * rule learns its compliance promptly instead of waiting a full cadence.
  *
+ * M1 item (b), decided entirely runtime-side (this scheduler's sweep is unchanged):
+ * a rule that stays Unknown across pending_demote_sweeps convergence passes (or
+ * pending_demote_ms elapsed) is DEMOTED off this lane's worklist
+ * (keys_with_pending_initial() excludes it) to its normal type lane above - the
+ * read flood a stuck-Unknown rule would otherwise cause on THIS 5s lane forever.
+ * It keeps converging at the slower cadence (still catches recovery); the
+ * runtime's minutes-cadence errored_refresh_ms backstops the resulting slower
+ * wire staleness.
+ *
  * Every wait is CV-interruptible: stop() wakes all lanes at once rather than
  * blocking a multi-minute sleep on shutdown. Lanes hard-join (they are Guardian-
  * owned, never detached like the SparkEngine consumer); a sweep observes the
