@@ -409,12 +409,15 @@ tests:
 
   # ── YuzuAuditRetentionNeverRan ────────────────────────────────────────────
   #
-  # The collapsed grace as a rule of its own: stamp exactly 0 for the whole
-  # window means no retention pass has EVER run against this database. Cases
-  # 32-38 (#2854 rung D). The readable acceptance argument these encode is the
-  # truth table in the rung D design; the machine-checked version of the
-  # coverage claim is tests/prometheus/blind_band_manifest.json, gated by
-  # blind_band_sweep.py --check.
+  # The collapsed grace as a rule of its own: no genuine stamp in the whole
+  # window - every sample 0 (never ran) or the INT64_MIN unreadable-anchor
+  # sentinel, with at least one 0 - means no retention pass has EVER run
+  # against this database. Cases 32-38 (#2854 rung D) plus 39-43 (the same
+  # PR's governance hardening round: mixed-seed regimes, the R2 window pin,
+  # and the pinned false-story states). The readable acceptance argument these
+  # encode is the truth table in the rung D design; the machine-checked
+  # version of the coverage claim is tests/prometheus/blind_band_manifest.json,
+  # gated by blind_band_sweep.py --check.
 
   # CASE 32 -- the state the rule exists for. Fresh database, reaper dead (a
   # failed migration closed the store at boot and start_cleanup()
@@ -472,10 +475,11 @@ tests:
   # CASE 34 -- a NEGATIVE stamp is a pass, not a never. A dead-CMOS host's
   # first pass stamps a negative epoch: the pass HAPPENED, so "never ran" is
   # false and this rule must clear exactly as case 33's positive stamp does.
-  # RED if the `min_over_time` conjunct is dropped: max{0, -100} == 0 stays
-  # true for the rest of the window and the rule false-fires at 3h5m. This is
-  # the case that makes both conjuncts load-bearing rather than one of them
-  # decorative.
+  # RED if the min arm is dropped (max{0, -100} == 0 stays true for the rest
+  # of the window and the rule false-fires at 3h5m) and RED if the two arms
+  # are joined with `or` instead of `and` (the max arm alone then suffices) -
+  # both mutation-verified against real promtool. This is the case that makes
+  # the arms load-bearing rather than decorative.
   - interval: 1m
     name: retention never ran - a negative dead-CMOS stamp is a pass, not a never
     input_series:
@@ -600,6 +604,139 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing", instance="s2", job="yuzu", severity="warning"}'
             value: 1
+
+  # CASE 39 -- the mixed 0/sentinel seed regime MUST page (#2854 rung D
+  # governance sec-F1, found by Gate 2 and MEASURED against the pre-hardening
+  # expressions: neither rule fired at 7h55m). A never-anchored database in a
+  # crash loop whose anchor read intermittently fails seeds 0 on the clean
+  # boots and INT64_MIN on the failed ones. Under an instant `stamp == 0`
+  # grace every 0 sample re-excused the liveness rule, and a min-only arm read
+  # the sentinel as "something happened" - a dead reaper paged NOTHING. The
+  # never-ran rule's sentinel branch owns this state now. RED against the
+  # pre-hardening expressions; reddens again if the sentinel or-branch is
+  # dropped.
+  - interval: 1m
+    name: retention never ran - a mixed 0/sentinel seed crash loop still pages
+    input_series:
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x199"
+      - series: 'yuzu_server_audit_retention_last_pass_unixtime{job="yuzu",instance="s1"}'
+        values: "0x9 -9223372036854775808x9 0x9 -9223372036854775808x9 0x9 -9223372036854775808x9 0x9 -9223372036854775808x9 0x9 -9223372036854775808x9 0x9 -9223372036854775808x9 0x9 -9223372036854775808x9 0x9 -9223372036854775808x9 0x9 -9223372036854775808x9 0x9 -9223372036854775808x9"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing"}'
+        eval_time: 3h10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      # The liveness rule stays excused (max over the window is exactly 0) -
+      # this state is the never-ran rule's, not unowned.
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
+        eval_time: 3h10m
+        exp_samples: []
+
+  # CASE 40 -- a 0/real-stamp flap MUST page the liveness rule (governance
+  # UP-1). An anchored database whose anchor row keeps being lost and restored
+  # (out-of-band restore loop; a relabel collision merging a fresh and an
+  # anchored server onto one instance reads the same) alternates a real stamp
+  # with 0 faster than `for: 15m`. Under the instant grace each 0 sample reset
+  # the `for:` clock and the rule never latched; the range-form grace sees the
+  # real stamp anywhere in [3h] and stays lifted. RED against the
+  # pre-hardening instant-grace expression.
+  - interval: 1m
+    name: retention not running - an anchor-loss flap mixing 0 with a real stamp fires
+    input_series:
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x209"
+      - series: 'yuzu_server_audit_retention_last_pass_unixtime{job="yuzu",instance="s1"}'
+        values: "1699000000x9 0x9 1699000000x9 0x9 1699000000x9 0x9 1699000000x9 0x9 1699000000x9 0x9 1699000000x9 0x9 1699000000x9 0x9 1699000000x9 0x9 1699000000x9 0x9 1699000000x9 0x9 1699000000x9"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing"}'
+        eval_time: 3h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      # And not the never-ran rule: a real stamp in-window disproves "never".
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNeverRan"}'
+        eval_time: 3h20m
+        exp_samples: []
+
+  # CASE 41 -- the never-ran rule's [3h] RANGE is pinned (governance QE-F1;
+  # the analogue of CASE 7's window pin for the liveness rule). A fresh
+  # database gets exactly one real pass at t=60m, then loses both the process
+  # and the anchor row at t=70m (restart reseeds 0, counter resets, reaper
+  # dead after). The genuine stamp leaves a [3h] window at t=250m, so the rule
+  # goes pending at ~251m and fires at ~431m. A [1h] window loses the stamp at
+  # 130m and fires ~311m - RED at the 5h15m quiet assertion below; a [6h]
+  # window holds it to 430m and fires ~610m - RED at the 7h20m firing
+  # assertion. Only the shipped [3h] satisfies both.
+  - interval: 1m
+    name: retention never ran - the 3h range is pinned by a lost-anchor rewind
+    input_series:
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x59 1x9 0x380"
+      - series: 'yuzu_server_audit_retention_last_pass_unixtime{job="yuzu",instance="s1"}'
+        values: "0x59 1699003600x9 0x380"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing"}'
+        eval_time: 5h15m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing"}'
+        eval_time: 7h20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 42 -- total scrape loss on a FRESH database: the never-ran rule keeps
+  # firing alone; the liveness rule must NOT join it (the fresh sibling of
+  # CASE 13's anchored double-page, governance CA-F3/arch-F4). Under the
+  # instant grace this WAS a measured double-page: staleness emptied the
+  # instant excusal ~5m after the last scrape while increase() still read the
+  # lingering samples. The range-form grace keeps reading the in-window 0
+  # samples, so the excusal survives exactly as long as the rule's own left
+  # side does. RED against the pre-hardening instant-grace expression.
+  - interval: 1m
+    name: total scrape loss on a fresh database - never-ran fires alone, liveness stays excused
+    input_series:
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0x199"
+      - series: 'yuzu_server_audit_retention_last_pass_unixtime{job="yuzu",instance="s1"}'
+        values: "0x199"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing"}'
+        eval_time: 3h44m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
+        eval_time: 3h44m
+        exp_samples: []
+
+  # CASE 43 -- a caller clock above kMaxPlausibleNow on a FRESH database is a
+  # PINNED false story, not a hole (governance CH-4/arch-F3/CA-F6, the fresh
+  # sibling of CASE 37). Passes complete and count, but every stamp is
+  # refused, so the stamp reads 0 forever and this rule fires "no pass has
+  # EVER run" while the reaper is demonstrably alive.
+  # YuzuAuditRetentionClockAnomaly co-fires in production (not expressible
+  # here - it keys on a different counter), and the runbook routes the
+  # responder there. Pinned so a future change to this behaviour - e.g. an
+  # increase()-based conjunct - has to be re-reasoned against this case
+  # rather than drifting silently; the design question is filed, not decided.
+  - interval: 1m
+    name: retention never ran - an always-refusing clock on a fresh database pages with a false story, pinned
+    input_series:
+      - series: 'yuzu_server_audit_retention_passes_total{job="yuzu",instance="s1"}'
+        values: "0+1x199"
+      - series: 'yuzu_server_audit_retention_last_pass_unixtime{job="yuzu",instance="s1"}'
+        values: "0x199"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing"}'
+        eval_time: 3h10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuditRetentionNeverRan", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuAuditRetentionNotRunning"}'
+        eval_time: 3h10m
+        exp_samples: []
 
   # ── YuzuAuditRetentionMetricMissing ───────────────────────────────────────
   #

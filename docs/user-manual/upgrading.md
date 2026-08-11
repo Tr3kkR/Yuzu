@@ -1233,7 +1233,11 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   fault - including on crash loops faster than the 60-minute first-pass sleep,
   a true positive the old grace hid. The rules file is a copy you apply
   yourself; the server does not upgrade it for you, and a stack that does not
-  re-apply it keeps the old blind rule and never gains the new alert. The same
+  re-apply it keeps the old blind rule and never gains the new alert. In a
+  staged rollout apply SERVERS first, rules second: an old, not-yet-upgraded
+  server restarting under the new rules reads a `0` stamp even on an anchored
+  database and pages `YuzuAuditRetentionNeverRan` with a fresh-install story
+  that is false for it (see the runbook's rollout note). The same
   re-apply also removes an `on(instance)` join from the liveness rule, so a
   server that was being silenced by an unrelated series sharing its `instance`
   value (a canary, an HA pair, a federated series) can now correctly fire too -

@@ -350,12 +350,18 @@ def build_canary_tree(dest: Path) -> None:
         (dest / rel).parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(REPO_ROOT / TESTS, dest / TESTS)
     text = (REPO_ROOT / RULES).read_text(encoding="utf-8")
-    if CANARY_FROM not in text:
+    # Exactly-one, not merely present (#2854 rung D governance UP-16): with
+    # `replace(..., 1)` a SECOND match added above the intended rule would be
+    # the one mutated - its own cases might redden, and the real target's
+    # grace would go unguarded while the canary reports success. Presence
+    # alone cannot see that; the count can.
+    n = text.count(CANARY_FROM)
+    if n != 1:
         sys.exit(
-            f"FAIL: canary anchor {CANARY_FROM!r} is no longer in {RULES}, so the "
-            f"canary would pass without proving anything - silently inert, which "
-            f"is the exact failure it exists to catch. Choose a new anchor whose "
-            f"removal MUST redden this suite, and update CANARY_FROM/CANARY_TO."
+            f"FAIL: canary anchor {CANARY_FROM!r} matches {n} times in {RULES} "
+            f"(need exactly 1), so the canary would mutate the wrong site or "
+            f"nothing - silently inert, which is the exact failure it exists to "
+            f"catch. Re-anchor CANARY_FROM/CANARY_TO to the intended rule."
         )
     (dest / RULES).write_text(text.replace(CANARY_FROM, CANARY_TO, 1),
                               encoding="utf-8")

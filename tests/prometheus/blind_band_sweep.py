@@ -370,17 +370,19 @@ def measure(mode: str, native_argv: list[str] | None, tmp_root: Path,
     junit_host = d / "out" / "result.xml"
 
     # 30s/90s, not 60s/300s. `full_sweep` makes one of these pairs PER
-    # (scenario, interval) - 3 today, more as scenarios gain shipped alerts -
-    # sequentially, so a per-call ceiling compounds into the JOB's ceiling,
-    # not just this call's. Measured warm total for all 3 pairs: ~16s: 90s
-    # already gives >10x headroom per call. Sized this way after build-ci's
-    # Gate 3 review measured that the ORIGINAL 60s/300s pair, summed across 3
-    # sequential calls (1080s), exceeded the 900s `prometheus-rules` job
-    # budget outright if promtool ever genuinely wedges - the exact
-    # opaque-job-timeout failure mode #2553 was fixed to avoid, reopened here
-    # by generous-looking per-call timeouts nobody had summed. Worst case now
-    # 3 x (30+90) = 360s, comfortably inside the budget alongside
-    # pull_with_retry's own documented ~195s ladder.
+    # (scenario, interval) - 6 with both alerts shipped (#2854 rung D), more
+    # as scenarios are added - sequentially, so a per-call ceiling compounds
+    # into the JOB's ceiling, not just this call's. 90s already gives >10x
+    # headroom per call (measured warm total for a full 3-pair run: ~16s).
+    # Sized this way after build-ci's Gate 3 review measured that the
+    # ORIGINAL 60s/300s pair, summed across sequential calls, exceeded the
+    # then-900s `prometheus-rules` job budget outright if promtool ever
+    # genuinely wedged - the exact opaque-job-timeout failure mode #2553 was
+    # fixed to avoid, reopened here by generous-looking per-call timeouts
+    # nobody had summed. Worst case now 6 x (30+90) = 720s, inside the
+    # budgets that enclose it alongside pull_with_retry's ~195s ladder - the
+    # full arithmetic lives in docs-lint.yml's timeout-minutes comment;
+    # re-derive there first when this loop grows.
     try:
         check_p = subprocess.run(base + ["check", "rules", rules_path],
                                  capture_output=True, text=True, timeout=30)

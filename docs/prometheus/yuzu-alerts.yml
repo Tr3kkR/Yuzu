@@ -1259,14 +1259,27 @@ groups:
       # keep_firing_for on this rule or the next: with the grace restart-proof
       # there is no single-evaluation flake to paper over, and it would extend
       # the documented Prometheus-restart false page below and delay every
-      # genuine RESOLVED. A negative stamp (a dead-CMOS caller clock stamped a
-      # pass that genuinely happened) and the INT64_MIN anomaly sentinel (the
-      # durable anchor could not be read or trusted; it self-corrects at the
-      # next pass with a plausible clock) are both NON-ZERO: neither earns the
-      # never-ran grace, which is fail-loud and correct -- a pass happened, or
-      # the anchor is garbage, and under both a dead reaper should page. Pinned
-      # in the test file. `unless` rather than `and` so an absent stamp series
-      # cannot silence the rule either -- also pinned.
+      # genuine RESOLVED.
+      #
+      # THE GRACE IS A RANGE, NOT AN INSTANT SAMPLE, and that is load-bearing
+      # twice over (governance sec-F1/UP-1, both measured against the instant
+      # form this replaced). An instant `stamp == 0` operand re-excuses the
+      # rule at EVERY 0-valued sample, so any series that mixes 0 with
+      # something else faster than `for: 15m` -- a per-boot alternation between
+      # a 0 seed and the INT64_MIN unreadable-anchor sentinel, or an
+      # anchor-loss flap mixing 0 with a real stamp -- reset the `for:` clock
+      # forever and NEITHER liveness rule fired on a genuinely dead reaper.
+      # `max_over_time(...[3h]) == 0` excuses only a window whose HIGHEST
+      # stamp sample is exactly 0 -- some sample reads 0 and none reads a
+      # genuine (positive) stamp: one real stamp sample in 3h lifts the grace
+      # for a full window, so the 0/real-stamp mix fires HERE, and the
+      # all-zero and zero/sentinel regimes are owned by
+      # YuzuAuditRetentionNeverRan below (whose min-arm deliberately accepts
+      # the sentinel -- see its comment). A negative dead-CMOS stamp keeps max_over_time negative,
+      # never 0, so it does not earn the grace either -- a pass happened, and a
+      # subsequently dead reaper still pages here. Pinned in the test file.
+      # `unless` rather than `and` so an absent stamp series cannot silence the
+      # rule either -- also pinned.
       #
       # THE MANIFEST IS THE GATE, NOT THIS COMMENT. Do not validate a change to
       # this expression (or the next rule's) against any band or bound quoted
@@ -1331,7 +1344,7 @@ groups:
         expr: |
           increase(yuzu_server_audit_retention_passes_total[3h]) == 0
           unless (
-            yuzu_server_audit_retention_last_pass_unixtime == 0
+            max_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == 0
           )
         for: 15m
         labels:
@@ -1343,10 +1356,11 @@ groups:
             being drained and rows are being retained past the configured window. Note the
             other retention COUNTERS cannot move in this state - they all key on a
             counter rising, and nothing is running to raise one. The only excused state
-            is a last-pass stamp of exactly 0, meaning no retention pass has EVER run
-            against this database - that state belongs to YuzuAuditRetentionNeverRan.
-            Any other stamp - including a negative one (dead-CMOS clock) and the
-            INT64_MIN anomaly sentinel (unreadable anchor) - does not excuse, so a
+            is a stamp whose HIGHEST sample over the last 3 hours is exactly 0 - a
+            database with no recorded pass, which belongs to
+            YuzuAuditRetentionNeverRan. Any window holding a genuine stamp - or only
+            negative values (a dead-CMOS clock's pass, or the INT64_MIN
+            unreadable-anchor sentinel with no 0 beside it) - does not excuse, so a
             crash-looping server on an anchored database fires here at every restart
             cadence, and this rule STAYS firing while the reaper stays dead: treat
             RESOLVED as recovery only alongside yuzu_server_audit_retention_passes_total
@@ -1357,8 +1371,10 @@ groups:
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/audit-log.md#the-retention-clock-guard"
 
       # YuzuAuditRetentionNeverRan -- the collapsed grace, standalone. The rule
-      # above excuses exactly one state (stamp == 0: a database no retention
-      # pass has ever run against); this rule OWNS that state, because "the
+      # above excuses exactly one state (no genuine stamp in the window: a
+      # database no retention pass has ever run against, seen through reads
+      # that may intermittently fail to the sentinel); this rule OWNS that
+      # state, because "the
       # first pass never landed" is as broken as a reaper that died -- a failed
       # migration closing the store at boot produces exactly this -- it just
       # deserves a first-pass grace (run_cleanup sleeps one full interval, 60
@@ -1371,16 +1387,28 @@ groups:
       # during each gap, and `for:` restarts from zero every time the vector
       # goes empty. min_over_time/max_over_time hold the samples that DID land
       # across those gaps, so the range form latches on exactly the series an
-      # instant vector keeps dropping.
+      # instant vector keeps dropping. (The same argument, plus the mixed-seed
+      # regimes, is why the rule ABOVE reads its grace through max_over_time
+      # rather than an instant sample -- see THE GRACE IS A RANGE up there.)
       #
-      # BOTH CONJUNCTS ARE LOAD-BEARING. `max_over_time == 0` alone false-fires
-      # on a dead-CMOS fresh install with a HEALTHY reaper: the first pass
-      # stamps a NEGATIVE now, and max{0, -100} == 0 keeps the expression true
-      # for the rest of the window. The min_over_time conjunct clears the moment
-      # ANY non-zero sample -- positive, negative, or the INT64_MIN sentinel --
-      # enters the window: each of those means "something has happened to this
-      # database", which is precisely not this rule's state. Pinned in the test
-      # file (the negative-stamp case reddens if min_over_time is dropped).
+      # BOTH ARMS ARE LOAD-BEARING, and they clear DIFFERENT states -- an
+      # earlier revision credited the min arm with clearing everything, which
+      # was false (governance CA-F2) and is exactly the mis-read this
+      # paragraph exists to prevent. The MAX arm is what clears on a genuine
+      # pass: a positive stamp anywhere in the window makes max non-zero
+      # (min may still read 0 from older samples). The MIN arm distinguishes
+      # what a window WITHOUT a genuine stamp means: a negative dead-CMOS
+      # stamp (min < 0, matching neither branch) is a PASS -- the rule clears,
+      # because "never ran" is disproven even though the clock was garbage --
+      # while exactly-0 and the INT64_MIN unreadable-anchor sentinel both keep
+      # the never-ran hypothesis alive. THE SENTINEL BRANCH IS DELIBERATE
+      # (governance sec-F1, measured): a failed anchor READ on a fresh
+      # database is not evidence a pass happened, and without it a crash loop
+      # alternating 0 seeds with sentinel seeds satisfied neither this rule
+      # (min read the sentinel, not 0) nor the one above (each 0 sample
+      # re-excused it) -- a dead reaper paged NOTHING. Pinned in the test
+      # file: the negative-stamp case reddens if the min arm is dropped, and
+      # the mixed 0/sentinel case reddens if the sentinel branch is dropped.
       #
       # SEPARATE RULE, NOT `or`-JOINED INTO THE ONE ABOVE. Different graces (15m
       # vs 3h), different remediations (dead reaper vs store-never-opened /
@@ -1389,23 +1417,28 @@ groups:
       # is pinned in the test file.
       - alert: YuzuAuditRetentionNeverRan
         expr: |
-          min_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == 0
-          and
           max_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == 0
+          and (
+            min_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == 0
+            or min_over_time(yuzu_server_audit_retention_last_pass_unixtime[3h]) == -9223372036854775808
+          )
         for: 3h
         labels:
           severity: warning
         annotations:
           summary: "No audit retention pass has ever run against this database"
           description: >-
-            yuzu_server_audit_retention_last_pass_unixtime has read exactly 0 for at
-            least the 3 hours of `for:` - this database has never had a retention pass
-            land. Not "not recently": NEVER - the gauge is seeded from the durable
-            audit_retention_meta anchor at startup (#2854), so 0 is a fact about the
-            DATABASE, not about a young process, and a fresh install's one legitimate
-            cleanup interval of silence is over long before this fires. Restarts do
-            not reset the clock: the [3h] window holds the 0-valued samples across
-            crash-loop gaps, so a fresh install stuck in a boot loop still pages.
+            yuzu_server_audit_retention_last_pass_unixtime has recorded no genuine
+            pass for at least the 3 hours of `for:` - every sample read 0 (never ran)
+            or the INT64_MIN unreadable-anchor sentinel, with at least one 0 - this
+            database has never had a retention pass land. Not "not recently": NEVER -
+            the gauge is seeded from the durable audit_retention_meta anchor at
+            startup (#2854), so 0 is a fact about the DATABASE, not about a young
+            process, and a fresh install's one legitimate cleanup interval of silence
+            is over long before this fires. Restarts do not reset the clock: the [3h]
+            window holds the samples across crash-loop gaps - including a boot whose
+            anchor read failed and seeded the sentinel - so a fresh install stuck in
+            a boot loop still pages.
             Check that the store opened at boot (a failed migration closes it and
             start_cleanup() then early-returns) and the server log for
             "AuditStore: retention pass threw".

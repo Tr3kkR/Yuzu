@@ -7,8 +7,18 @@ native `promtool` 3.x; the script pins the same image the CI gate uses). `--chec
 `prometheus-rules` job runs on every PR as of #2854 rung B — this file is the METHOD, the
 manifest is the RESULT and the gate. A change to `docs/prometheus/yuzu-alerts.yml` that
 widens or narrows coverage shows up as `--check` reddening; the fix is
-`python3 tests/prometheus/blind_band_sweep.py --emit > tests/prometheus/blind_band_manifest.json`
-(`--emit` only ever prints to stdout — it never writes the file itself) and commit the new
+
+```bash
+python3 tests/prometheus/blind_band_sweep.py --emit > /tmp/manifest.json \
+  && mv /tmp/manifest.json tests/prometheus/blind_band_manifest.json
+```
+
+(`--emit` only ever prints to stdout — it never writes the file itself. Emit to a
+scratch path and `mv` on success, as above: a bare `> tests/prometheus/...json`
+redirect TRUNCATES the committed copy before the sweep runs, so a transient
+docker failure — exit 2, "not a verdict" — leaves an empty file behind. The
+damage is loud, `--check` rejects it as unparseable, and `git checkout --`
+restores it, but the two-step avoids the confusing loop entirely.) Commit the new
 manifest alongside the rule change, explaining in the PR description which cadences moved
 and why, tied to the rule change — so the diff review sees exactly what moved and why,
 rather than a reflexive regenerate-to-green.

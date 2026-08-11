@@ -621,12 +621,15 @@ Five correction rounds here produced only transcription errors between the code
 and prose paraphrases of it; the paraphrases have been removed rather than
 sharpened.
 
-Seven metrics report on the retention guard. All but
-`yuzu_server_audit_rows_deleted_total` and
-`yuzu_server_audit_retention_last_pass_unixtime` ship with an alert rule in
-`docs/prometheus/yuzu-alerts.yml`; those two are read alongside the others
-(is the backlog moving? when did the reaper last run?) rather than alerted on
-directly. Do not collapse the first two:
+Eight metrics report on the retention guard. All but
+`yuzu_server_audit_rows_deleted_total` ship with an alert rule in
+`docs/prometheus/yuzu-alerts.yml` — since #2854 rung D that includes
+`yuzu_server_audit_retention_last_pass_unixtime`, which is an operand of BOTH
+liveness rules (`YuzuAuditRetentionNotRunning`'s grace and the whole of
+`YuzuAuditRetentionNeverRan`), so a relabel rule dropping it changes what
+pages (see the rules file's "WHAT WOULD BREAK THE ASSUMPTION" block).
+`rows_deleted_total` is read alongside the others (is the backlog moving?)
+rather than alerted on directly. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|

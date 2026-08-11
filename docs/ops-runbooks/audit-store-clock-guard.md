@@ -300,13 +300,18 @@ seeing the alert go away.
 
 Check that the store opened at boot (a failed migration closes it, and
 `start_cleanup()` then early-returns), and look for `AuditStore: retention pass
-threw` in the log. The rule's only grace is a last-pass stamp of exactly `0` —
-a database no retention pass has EVER run against, which is
-`YuzuAuditRetentionNeverRan`'s state below (the cleanup thread sleeps a full
-interval before its first pass, so a fresh install legitimately has no pass
-yet). Any other stamp value — including a negative dead-CMOS stamp or the
-INT64_MIN anomaly sentinel — does not excuse, so a crash-looping server on an
-anchored database fires here at EVERY restart cadence. The retired uptime
+threw` in the log. The rule's only grace is a stamp whose HIGHEST sample over
+the trailing 3 hours is exactly `0` — a database with no recorded pass, which
+is `YuzuAuditRetentionNeverRan`'s state below (the cleanup thread sleeps a
+full interval before its first pass, so a fresh install legitimately has no
+pass yet). The grace reads the whole window, not the instant sample, so a
+series that merely MIXES `0` with something else cannot flap it: one genuine
+stamp anywhere in 3 hours lifts the grace for a full window (an anchor-loss
+flap on an anchored database fires HERE), while a window of only zeros and
+unreadable-anchor sentinels belongs to `YuzuAuditRetentionNeverRan`. A
+negative dead-CMOS stamp never reads as `0`, so it does not excuse either — a
+crash-looping server on an anchored database fires here at EVERY restart
+cadence. The retired uptime
 grace's blind band (164-195 minute cadences, plus an intermittent-firing gap
 from ~90 minutes) is closed; the coverage claim is machine-checked on every PR
 against `tests/prometheus/blind_band_manifest.json` (empty = fully covered;
@@ -369,7 +374,10 @@ install still pages). A fresh install's one legitimate cleanup interval of
 silence is over long before this fires.
 
 This is `YuzuAuditRetentionNotRunning`'s excused state, given its own alert
-and a first-boot-sized grace: the two are mutually exclusive per server, and
+and a first-boot-sized grace: while the target is being scraped the two are
+mutually exclusive per server (after TOTAL scrape loss the anchored state
+still double-pages with `YuzuAuditRetentionMetricMissing` — see that section
+— while the fresh state keeps paging here alone), and
 the remediation differs — this one is almost never "the reaper died later",
 it is "the first pass never happened":
 
@@ -384,10 +392,23 @@ it is "the first pass never happened":
 - **The first pass keeps throwing.** `AuditStore: retention pass threw` in
   the log; see `YuzuAuditRetentionFailing` above.
 
-A NEGATIVE stamp or the INT64_MIN anomaly sentinel does not fire this rule —
-both mean "something has happened to this database" (a dead-CMOS pass, an
-unreadable anchor) and are `YuzuAuditRetentionNotRunning` /
-`YuzuAuditRetentionClockAnomaly` territory instead.
+A NEGATIVE stamp does not fire this rule — a dead-CMOS pass is still a pass,
+and disproves "never ran". The INT64_MIN unreadable-anchor sentinel is
+treated as UNKNOWN, not as evidence: a window of only sentinels leaves
+`YuzuAuditRetentionNotRunning` to page a dead reaper, but a window mixing
+sentinels with `0` seeds — a crash-looping fresh install whose anchor read
+intermittently fails — still fires HERE, because a failed read cannot
+disprove never-ran (#2854 governance sec-F1; the earlier form was silent in
+exactly that state).
+
+**During a staged rollout, expect this alert from old-but-anchored servers.**
+A server build that exports the stamp but predates the seed-from-anchor
+behaviour reads `0` after every restart even on a database with years of
+passes — a crash-looping NOT-yet-upgraded server therefore pages here, with
+a first-pass story that is FALSE for it. That is a rollout-ordering artifact,
+not a fresh-install signal: upgrade the server (or check
+`yuzu_server_audit_retention_passes_total`'s history for the truth) rather
+than working this section's decision tree.
 
 Recovery: the first completed pass writes a real stamp and the rule clears on
 the next evaluation. Confirm with `yuzu_server_audit_retention_passes_total`
@@ -443,7 +464,10 @@ apart.**
 
 It is **fleet-wide by construction**: `absent()` fires only when NO series exists
 anywhere in this Prometheus, so one server going quiet among many is invisible
-here.
+here — including the half-join variant where a relabel rule drops ONLY
+`..._retention_passes_total` for one server while its stamp and other series
+still flow: that server's liveness rule selects nothing, this rule stays
+suppressed by the fleet's surviving series, and its dashboards look healthy.
 
 **An `up`-based target-down alert does not cover that**, and this page said it did
 until #2553 pass 13. The server you are missing is alive and scraped - typically
