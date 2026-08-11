@@ -663,6 +663,16 @@ deliberately leaves BOTH credentials active** rather than revoke your only
 working token out from under you (a dropped rotate response, or simply
 never picking up the new secret, must not end in zero usable credentials).
 
+`confirm`'s check that you're the same operator who called `rotate` is
+stored durably, not just in memory, so a server restart no longer blocks
+confirming an in-flight rotation. The one exception is a rotation already
+in flight *before* this durability guarantee was deployed to your server —
+that pair has no durable record of who initiated it, and a restart still
+leaves it permanently unconfirmable (it fails closed rather than accepting
+just anyone). If you're mid-rotation during an upgrade, confirm before
+restarting, or resolve the pair via revoke afterward instead of retrying
+`confirm`.
+
 **MFA step-up is required on every call, if you have MFA enrolled — and
 that includes a repeat call.** Unlike most session activity, `rotate` and
 `confirm` re-validate a *fresh* step-up proof **every time**, including a

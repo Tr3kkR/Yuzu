@@ -638,6 +638,24 @@ for non-HTTP writers is unaffected).
     *both* credentials and flips the principal's `lifecycle_state` to
     `revoked` (terminal — see §3.1), so an operator responding to a leak
     never has to reason about which of two credentials was the stolen one.
+- **Confirm-identity durability (#2961, fixed).** The check in step 3 above
+  that only the operator who called `rotate` may `confirm` originally
+  resolved **only** from a process-local grace-cache map, so a server
+  restart mid-overlap silently and permanently blocked `confirm` for that
+  pair (the sweep still cut over on the timer, with no error surfaced —
+  the record showed nothing amiss). `api_tokens.rotation_initiator`
+  (migration v3) durably stamps the operator onto the successor row at
+  mint time, inside the same locked transaction; `confirm_rotation` now
+  resolves the identity check via `ApiTokenStore::resolve_rotation_initiator`
+  — RAM first, the durable column as the restart-recovery fallback, fail
+  closed on disagreement, empty never a wildcard. A pair already in flight
+  when v3 shipped has no durable value and stays unconfirmable after a
+  restart by design — revoke one side explicitly rather than expect the
+  migration to retroactively bind it. The raw successor secret's short
+  re-serve window (step 1 above) is unaffected and stays RAM-only, since a
+  one-time reveal must not become durable. The human-token rotation feature
+  (`docs/auth-architecture.md` "Human API-token rotation") shares this same
+  fix — one chokepoint, both arms.
 - This is the platform's first rotation workflow (the gap matrix in
   `.claude/skills/auth-and-authz/SKILL.md` lists token rotation as missing
   for all types); the design is deliberately credential-generic so the

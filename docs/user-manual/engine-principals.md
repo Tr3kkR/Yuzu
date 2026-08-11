@@ -138,6 +138,15 @@ rotate response returned: it pins the confirm to that exact rotation, so a
 blind retry of an old confirm can never resolve a **later** rotation early
 (a stale or mismatched id gets a `409` and changes nothing).
 
+`confirm`'s check that you're the same operator who called `rotate` is
+stored durably, not just in memory, so a server restart no longer blocks
+confirming an in-flight rotation. The one exception: a rotation already in
+flight *before* this durability guarantee was deployed has no durable
+record of who initiated it, and a restart still leaves it permanently
+unconfirmable (fails closed rather than accepting just anyone) — confirm
+before restarting during an upgrade, or resolve the pair via revoke
+afterward.
+
 If you replay a `confirm` **after it already succeeded** — a dropped `200`, a
 double-submit, or a client racing the auto-revoke sweep — you get a *terminal*
 `409` (`rotation already confirmed` / `no rotation in flight ... already the

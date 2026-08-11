@@ -105,6 +105,19 @@ struct ApiToken {
     std::string supersedes_token_id; // Successor -> predecessor token_id; empty on the predecessor.
     int64_t overlap_expires_at{0};   // Predecessor's scheduled auto-revoke instant; 0 = not rotating.
     int64_t confirmed_at{0};         // Set when an operator confirms cutover; 0 = unconfirmed.
+
+    // #2961, migration v3 (additive). Durable twin of the RAM-only grace
+    // cache's `requesting_user` — stamped ONLY on the SUCCESSOR row, inside
+    // the same locked mint transaction that inserts it (never backfilled onto
+    // the predecessor, and never heuristically backfilled onto a pre-v3 pair).
+    // Empty on every row that has never been a rotation successor, and on a
+    // pair that started rotating before this migration shipped. NEVER
+    // treated as a wildcard by the confirm-identity resolver — see
+    // `resolve_rotation_initiator`'s doc comment. Deliberately NOT consulted
+    // by `try_reserve`'s raw-secret re-serve (F4 stays RAM-only); it exists
+    // solely to survive a restart for `confirm_rotation`/
+    // `confirm_token_rotation`'s identity check (F5).
+    std::string rotation_initiator;
 };
 
 class ApiTokenStore {
@@ -289,11 +302,17 @@ public:
     /// days) vastly outlives the short raw-reveal grace window, so the
     /// grace-cache entry's `requesting_user` is retained (not pruned by
     /// elapsed time, only evicted explicitly — see `grace_entry_owner`'s
-    /// doc comment) for as long as the rotation stays unresolved. A process
-    /// restart forfeits this binding along with the raw-secret re-serve
-    /// capability (same documented limitation as the grace cache generally)
-    /// — a confirm attempted after a restart is rejected with "rotation
-    /// confirmation unavailable", not silently allowed for any caller.
+    /// doc comment) for as long as the rotation stays unresolved.
+    ///
+    /// #2961: a process restart no longer forfeits this binding. The RAM-only
+    /// grace cache is still the primary path (and the raw-secret re-serve, F4,
+    /// stays RAM-only — restart still forfeits THAT), but the identity check
+    /// falls back to `ApiToken::rotation_initiator`, a durable column stamped
+    /// on the successor row at mint time — see `resolve_rotation_initiator`.
+    /// Confirm is rejected with "rotation confirmation unavailable" only when
+    /// NEITHER the cache entry nor the durable column resolves an initiator
+    /// (e.g. a pair that began rotating before this migration shipped, whose
+    /// durable column is empty) — never silently allowed for any caller.
     ///
     /// Rejected (no DB mutation) when there is no in-flight, recognizable
     /// rotation pair for `principal_id`. Since #2404 the rejection is
@@ -827,6 +846,36 @@ private:
     /// rotation already resolved).
     bool grace_entry_owner(const std::string& rotation_group,
                            std::string& out_requesting_user) const;
+
+    /// #2961 — the SINGLE chokepoint `confirm_rotation`/`confirm_token_rotation`
+    /// (Hermes F5) use to resolve the operator who initiated a rotation,
+    /// combining the RAM-only grace cache with the durable
+    /// `ApiToken::rotation_initiator` fallback so the binding survives a
+    /// server restart. `successor` is the ALREADY-READ, in-flight successor
+    /// row from THIS SAME locked transaction's positive read (never a fresh
+    /// query here) — the caller only reaches this once the surrounding
+    /// state-classifier has confirmed a genuine pair exists, so there is no
+    /// new read-failure mode to disambiguate: the row's `rotation_initiator`
+    /// is either the value stamped at mint, or empty because it predates the
+    /// v3 migration — never "unknown due to a swallowed read".
+    ///
+    /// F5-ONLY, never F4: `try_reserve`'s raw-secret re-serve MUST NEVER call
+    /// this — it stays RAM-only, or a restart would resurrect a one-time-
+    /// reveal contract the design deliberately drops on restart.
+    ///
+    /// Resolution, fails closed on every ambiguous case:
+    ///   - RAM present, durable present (non-empty), and they DIFFER ->
+    ///     refused (`false`) — RAM is the primary source, durable is a
+    ///     RAM-absent recovery path only; never prefer either on conflict.
+    ///   - RAM present (durable absent/empty/agreeing) -> `true`, RAM value.
+    ///   - RAM absent, durable present (non-empty) -> `true`, durable value
+    ///     (the restart-recovery path this function exists for).
+    ///   - RAM absent, durable EMPTY (pre-v3 pair, or a row that was somehow
+    ///     never stamped) -> refused. Empty is NOT a wildcard that matches
+    ///     any caller.
+    ///   - Neither present -> refused.
+    [[nodiscard]] bool resolve_rotation_initiator(const ApiToken& successor,
+                                                  std::string& out_initiator) const;
 
     /// Removes a grace-cache entry outright. Called once a rotation
     /// resolves (`confirm_rotation` on success; the T12 sweep's auto-revoke

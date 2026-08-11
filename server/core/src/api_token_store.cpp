@@ -113,6 +113,16 @@ const std::vector<pg::PgMigration>& migrations() {
          "ALTER TABLE api_tokens ADD COLUMN supersedes_token_id TEXT NOT NULL DEFAULT '';"
          "ALTER TABLE api_tokens ADD COLUMN overlap_expires_at BIGINT NOT NULL DEFAULT 0;"
          "ALTER TABLE api_tokens ADD COLUMN confirmed_at BIGINT NOT NULL DEFAULT 0;"},
+        // v3 (#2961): durable twin of the RAM-only grace cache's
+        // `requesting_user`, so the confirm-identity binding (Hermes F5)
+        // survives a server restart mid-rotation. Additive only — every
+        // existing row (including an in-flight v2 pair) defaults to '',
+        // which the confirm-identity resolver treats as "not stamped", NEVER
+        // as a wildcard. Stamped ONLY on a fresh successor's own INSERT
+        // (`rotate_engine_credential`/`rotate_token`'s mint arms) — never
+        // backfilled onto a predecessor or onto a pre-existing pair.
+        {3,
+         "ALTER TABLE api_tokens ADD COLUMN rotation_initiator TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
 }
@@ -164,6 +174,7 @@ ApiToken read_token(PGresult* res, int row) {
     t.supersedes_token_id = col(res, row, c++);
     t.overlap_expires_at = to_i64(col(res, row, c++));
     t.confirmed_at = to_i64(col(res, row, c++));
+    t.rotation_initiator = col(res, row, c++);
     return t;
 }
 
@@ -174,7 +185,7 @@ ApiToken read_token(PGresult* res, int row) {
 constexpr const char* kTokenColsTail =
     "name, principal_id, scope_service, created_at, expires_at, last_used_at, revoked, "
     "mcp_tier, principal_kind, rotation_group, supersedes_token_id, overlap_expires_at, "
-    "confirmed_at";
+    "confirmed_at, rotation_initiator";
 
 // Same query `list_active_for_principal` runs, but against a caller-supplied
 // `conn` (no lease acquisition) and a caller-supplied `now` — used by
@@ -820,6 +831,34 @@ bool ApiTokenStore::grace_entry_owner(const std::string& rotation_group,
     return true;
 }
 
+bool ApiTokenStore::resolve_rotation_initiator(const ApiToken& successor,
+                                               std::string& out_initiator) const {
+    std::string ram_initiator;
+    const bool ram_present = grace_entry_owner(successor.rotation_group, ram_initiator);
+    const bool durable_present = !successor.rotation_initiator.empty();
+
+    if (ram_present && durable_present) {
+        if (ram_initiator != successor.rotation_initiator)
+            return false; // disagreement — fail closed, never prefer either
+        out_initiator = ram_initiator;
+        return true;
+    }
+    if (ram_present) {
+        out_initiator = ram_initiator;
+        return true;
+    }
+    if (durable_present) {
+        // The RAM-absent recovery path #2961 exists for: a restart forfeited
+        // the grace-cache entry, but the successor's own row still carries
+        // the operator who minted it.
+        out_initiator = successor.rotation_initiator;
+        return true;
+    }
+    // Neither present — empty is NOT a wildcard (pre-v3 pair, or a restart
+    // before v3 ever stamped this row).
+    return false;
+}
+
 void ApiTokenStore::evict_rotation_raw(const std::string& rotation_group) {
     std::lock_guard cache_lock(rotation_cache_mtx_);
     auto it = rotation_grace_cache_.find(rotation_group);
@@ -1037,13 +1076,14 @@ ApiTokenStore::rotate_engine_credential(const std::string& principal_id, int64_t
                 conn,
                 "INSERT INTO api_token_store.api_tokens "
                 "(token_id, token_hash, name, principal_id, scope_service, mcp_tier, "
-                " principal_kind, created_at, expires_at, rotation_group, supersedes_token_id) "
-                "VALUES ($1,$2,$3,$4,'', 'readonly', 'engine', $5::bigint, $6::bigint, $7, $8) "
+                " principal_kind, created_at, expires_at, rotation_group, supersedes_token_id, "
+                " rotation_initiator) "
+                "VALUES ($1,$2,$3,$4,'', 'readonly', 'engine', $5::bigint, $6::bigint, $7, $8, $9) "
                 "RETURNING token_id",
                 std::vector<std::string>{candidate_token_id, candidate_hash, predecessor.name,
                                          principal_id, std::to_string(now),
                                          std::to_string(candidate_expires_at), candidate_token_id,
-                                         predecessor.token_id});
+                                         predecessor.token_id, requesting_user});
             if (ins.status() != PGRES_TUPLES_OK || PQntuples(ins.get()) == 0) {
                 error_msg = "failed to mint successor credential";
                 return false;
@@ -1273,9 +1313,10 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
         // Hermes F4/F5: only the operator who initiated the rotation may
         // confirm it — same binding as the grace-window re-serve, but NOT
         // time-bounded to kRotationGraceSecs (see grace_entry_owner's doc
-        // comment).
+        // comment). #2961: resolve_rotation_initiator adds the durable
+        // fallback so this survives a restart — see its own doc comment.
         std::string initiator;
-        if (!grace_entry_owner(successor->rotation_group, initiator)) {
+        if (!resolve_rotation_initiator(*successor, initiator)) {
             error_msg = "rotation confirmation unavailable — retry via rotate or fall back to "
                        "revoke";
             return false;
@@ -1578,14 +1619,15 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
                 conn,
                 "INSERT INTO api_token_store.api_tokens "
                 "(token_id, token_hash, name, principal_id, scope_service, mcp_tier, "
-                " principal_kind, created_at, expires_at, rotation_group, supersedes_token_id) "
-                "VALUES ($1,$2,$3,$4,$5,$6,'human',$7::bigint,$8::bigint,$9,$10) "
+                " principal_kind, created_at, expires_at, rotation_group, supersedes_token_id, "
+                " rotation_initiator) "
+                "VALUES ($1,$2,$3,$4,$5,$6,'human',$7::bigint,$8::bigint,$9,$10,$11) "
                 "RETURNING token_id",
                 std::vector<std::string>{candidate_token_id, candidate_hash, predecessor.name,
                                          principal_id, predecessor.scope_service,
                                          predecessor.mcp_tier, std::to_string(now),
                                          std::to_string(candidate_expires_at), candidate_token_id,
-                                         predecessor.token_id});
+                                         predecessor.token_id, requesting_user});
             if (ins.status() != PGRES_TUPLES_OK || PQntuples(ins.get()) == 0) {
                 error_msg = "failed to mint successor credential";
                 return false;
@@ -1900,9 +1942,10 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
             return false;
         }
 
-        // Same operator-initiator binding as confirm_rotation (Hermes F4/F5).
+        // Same operator-initiator binding as confirm_rotation (Hermes F4/F5),
+        // including the #2961 durable fallback (resolve_rotation_initiator).
         std::string initiator;
-        if (!grace_entry_owner(rotation_group, initiator)) {
+        if (!resolve_rotation_initiator(*successor, initiator)) {
             error_msg = "rotation confirmation unavailable — retry via rotate or fall back to "
                        "revoke";
             return false;

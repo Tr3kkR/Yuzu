@@ -386,6 +386,31 @@ rather than incrementing.
   deactivation/sign-out-everywhere). Filed by the `unhappy-path` reviewer
   (UP-1, UP-2, UP-3, UP-13); durability requires new persistent state, which
   is why it is a separate re-cut rather than a fold into this branch.
+
+  **RESOLVED 2026-08-11** (`feat/auth-rotation-confirm-durability`, migration
+  v3). `api_tokens.rotation_initiator` durably stamps the confirming
+  operator onto the successor row, inside the same advisory-locked mint
+  transaction, on **both** arms. `ApiTokenStore::resolve_rotation_initiator`
+  is the single chokepoint `confirm_rotation`/`confirm_token_rotation` now
+  read through: RAM (`rotation_grace_cache_`) first, the durable column as
+  the RAM-absent recovery path, fail closed if the two disagree, empty never
+  treated as a wildcard. This closes the plain-restart failure mode
+  described above, and — because the durable column is a Postgres row, not
+  process-local — also closes the "confirm cannot succeed on a replica that
+  did not itself serve the rotate" sub-case for the identity check
+  specifically. **Not closed by this fix, and deliberately so:** the raw
+  successor secret's grace-window re-serve (F4) stays RAM-only — a one-time
+  reveal must not become durable, so that capability is still forfeited on
+  restart. **Not closed, still tracked separately:** the "grace entries leak
+  across replicas" (memory never evicted cross-process) sub-case above is a
+  RAM-cache lifecycle question, orthogonal to the identity check now having a
+  durable source, and remains open. Confirm still has no time bound (#2962)
+  and the rotation sweep still lacks the full clock-guard shape (#2964) —
+  neither is touched by this fix. A rotation already in flight when v3 is
+  applied has an empty `rotation_initiator` and stays unconfirmable after a
+  restart — it fails closed rather than matching any caller; an operator
+  mid-upgrade with an in-flight rotation should resolve it (confirm or
+  revoke one side) before restarting.
 - **`#2962`** (Owner: unassigned) — two unrecoverable terminals in the
   rotation state machine, both reachable single-instance. (A) `confirm` has
   no time bound on the grace *entry* itself (only the raw-secret re-serve
