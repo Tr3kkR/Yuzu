@@ -512,9 +512,9 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"key":{"type":"string","default":"model","description":"Tag key to cohort by (pattern [A-Za-z0-9_.:-]{1,64})"}}})j",
      R"j({"type":"object","properties":{"key":{"type":"string"},"floor":{"type":"integer","description":"kDexCohortFloor - cohorts below this device count are suppressed"},)j"
      R"j("cohorts":{"type":"array","items":{"type":"object","properties":{"cohort":{"type":"string"},"devices":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
-     R"j("cpu_pct":{"type":"object","properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not null) when suppressed is true"},)j"
-     R"j("commit_pct":{"type":"object","properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not null) when suppressed is true"},)j"
-     R"j("disk_lat_ms":{"type":"object","properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not null) when suppressed is true"}},)j"
+     R"j("cpu_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("commit_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("disk_lat_ms":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}},"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"}},)j"
      R"j("required":["cohort","devices","suppressed"]}},"available_keys":{"type":"array","items":{"type":"string"}})j"
      R"j(},"required":["key","floor","cohorts","available_keys"]})j"},
 
@@ -532,8 +532,14 @@ static const ToolDef kTools[] = {
      R"j("b":{"type":"string","description":"Second cohort value (the baseline)"})j"
      R"j(},"required":["a","b"]})j",
      R"j({"type":"object","properties":{"key":{"type":"string"},"floor":{"type":"integer"},"found_a":{"type":"boolean"},"found_b":{"type":"boolean"},)j"
-     R"j("a":{"type":["object","null"],"properties":{"cohort":{"type":"string"},"devices":{"type":"integer"},"suppressed":{"type":"boolean"},"cpu_pct":{"type":"object"},"commit_pct":{"type":"object"},"disk_lat_ms":{"type":"object"}},"description":"null when found_a is false"},)j"
-     R"j("b":{"type":["object","null"],"properties":{"cohort":{"type":"string"},"devices":{"type":"integer"},"suppressed":{"type":"boolean"},"cpu_pct":{"type":"object"},"commit_pct":{"type":"object"},"disk_lat_ms":{"type":"object"}},"description":"null when found_b is false"},)j"
+     R"j("a":{"type":["object","null"],"properties":{"cohort":{"type":"string"},"devices":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("cpu_pct":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("commit_pct":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("disk_lat_ms":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"}},"description":"the whole 'a' slot is null when found_a is false"},)j"
+     R"j("b":{"type":["object","null"],"properties":{"cohort":{"type":"string"},"devices":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("cpu_pct":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("commit_pct":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"},)j"
+     R"j("disk_lat_ms":{"type":["object","null"],"description":"Omitted entirely (not present) when suppressed is true; present but null when the cohort reports but zero of its devices exposed this specific metric"}},"description":"the whole 'b' slot is null when found_b is false"},)j"
      R"j("delta_pct":{"type":"object","properties":{"cpu_pct":{"type":["number","null"]},"commit_pct":{"type":["number","null"]},"disk_lat_ms":{"type":["number","null"]}},"required":["cpu_pct","commit_pct","disk_lat_ms"]})j"
      R"j(},"required":["key","floor","found_a","found_b","a","b","delta_pct"]})j"},
 
@@ -581,7 +587,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"app":{"type":"string"},"version":{"type":"string"},)j"
      R"j("points":{"type":"array","items":{"type":"object","properties":{)j"
      R"j("version":{"type":"string"},"day":{"type":"string"},"device_count":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
-     R"j("cpu_mean":{"type":"number"},"cpu_max":{"type":"number"},)j"
+     R"j("cpu_mean":{"type":"number","description":"Omitted, along with every other stat field on this point, when suppressed is true"},"cpu_max":{"type":"number"},)j"
      R"j("cpu_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
      R"j("cpu_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
      R"j("ws_mean":{"type":"number"},"ws_max":{"type":"number"},)j"
@@ -609,7 +615,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"group_id":{"type":"string"},"app":{"type":"string"},"version":{"type":"string"},"floor":{"type":"integer"},)j"
      R"j("points":{"type":"array","items":{"type":"object","properties":{)j"
      R"j("version":{"type":"string"},"day":{"type":"string"},"device_count":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
-     R"j("cpu_mean":{"type":"number"},"cpu_max":{"type":"number"},)j"
+     R"j("cpu_mean":{"type":"number","description":"Omitted, along with every other stat field on this point, when suppressed is true"},"cpu_max":{"type":"number"},)j"
      R"j("cpu_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
      R"j("cpu_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
      R"j("ws_mean":{"type":"number"},"ws_max":{"type":"number"},)j"

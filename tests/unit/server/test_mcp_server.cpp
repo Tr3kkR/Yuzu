@@ -2684,6 +2684,13 @@ TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool ca
     CHECK(ts.audit_log.back() == "mcp.list_dex_signals|success");
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.signal.view") == std::string::npos);
+
+    // #2712 batch 2: content[0].text stays the bare array (backward compat);
+    // structuredContent wraps the SAME rows under "signals".
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("signals"));
+    CHECK(sc["signals"] == rows);
 }
 
 TEST_CASE("MCP DEX: list_dex_signals os filter scopes the catalogue rollup (A1 parity)",
@@ -2740,6 +2747,13 @@ TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as
             macos_types = r["distinct_types"].get<int>();
     CHECK(macos_types == 2); // process.crashed + storage.low
     CHECK(ts.audit_log.back() == "mcp.get_dex_signal_scope|success");
+
+    // #2712 batch 2: content[0].text stays the bare array (backward compat);
+    // structuredContent wraps the SAME rows under "platforms".
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("platforms"));
+    CHECK(sc["platforms"] == rows);
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
@@ -2959,9 +2973,11 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
 }
 
 // #2712 batch 2: get_dex_perf_fleet's payload is already object-shaped (no
-// wrap needed - plain tool_result()); get_dex_perf_cohorts needs the
-// suppressed cohort's stat fields OMITTED from structuredContent too, not
-// just from content[0].text - the anonymization floor must hold in both.
+// array wrap needed - the shared block still routes it through
+// tool_result_split() with structured_payload==payload, same as content);
+// get_dex_perf_cohorts needs the suppressed cohort's stat fields OMITTED
+// from structuredContent too, not just from content[0].text - the
+// anonymization floor must hold in both.
 TEST_CASE("MCP DEX perf: structuredContent mirrors content for fleet + cohorts, "
           "suppression omits stats in both",
           "[mcp][integration][dex][perf]") {
@@ -2981,7 +2997,12 @@ TEST_CASE("MCP DEX perf: structuredContent mirrors content for fleet + cohorts, 
         R"({"jsonrpc":"2.0","method":"tools/call","id":151,"params":{"name":"get_dex_perf_cohorts","arguments":{"key":"model"}}})");
     auto cohorts_body = nlohmann::json::parse(cohorts_res->body);
     REQUIRE(cohorts_body["result"].contains("structuredContent"));
+    auto cohorts_text = nlohmann::json::parse(
+        cohorts_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(cohorts_body["result"]["structuredContent"] == cohorts_text);
     auto& sc = cohorts_body["result"]["structuredContent"];
+    CHECK(sc["cohorts"][0]["suppressed"] == false);
+    CHECK(sc["cohorts"][0].contains("cpu_pct")); // unsuppressed cohort keeps its stats
     CHECK(sc["cohorts"][1]["suppressed"] == true);
     CHECK_FALSE(sc["cohorts"][1].contains("cpu_pct")); // floor holds in structuredContent too
 }
@@ -3004,6 +3025,17 @@ TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required 
     CHECK(diff["a"]["suppressed"] == false);
     CHECK(diff["b"]["suppressed"] == true);
     CHECK(diff["delta_pct"]["cpu_pct"].is_null()); // b suppressed → no comparison
+
+    // #2712 batch 2: this tool's payload is always object-shaped, so
+    // structuredContent is the SAME string as content[0].text - pin that
+    // explicitly for this specific tool rather than relying on the sibling
+    // get_dex_perf_fleet/get_dex_perf_cohorts tests to stand in for it (they
+    // share a dispatch block but take a different ternary branch).
+    auto diff_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":57,"params":{"name":"get_dex_perf_cohort_diff","arguments":{"key":"model","a":"a","b":"b"}}})");
+    auto diff_body = nlohmann::json::parse(diff_res->body);
+    REQUIRE(diff_body["result"].contains("structuredContent"));
+    CHECK(diff_body["result"]["structuredContent"] == diff);
 
     // unknown cohort → found_b false, b null.
     auto missing = mcp_tool_payload(
@@ -3545,6 +3577,7 @@ TEST_CASE("MCP network: structuredContent mirrors fleet, wraps devices under "
     REQUIRE(dev_body["result"].contains("structuredContent"));
     auto& dev_sc = dev_body["result"]["structuredContent"];
     REQUIRE(dev_sc.contains("devices"));
+    REQUIRE(dev_sc["devices"].size() == 1); // pin against a vacuous empty==empty pass
     CHECK(dev_sc["devices"] ==
           nlohmann::json::parse(dev_body["result"]["content"][0]["text"].get<std::string>()));
 }
