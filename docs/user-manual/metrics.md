@@ -574,6 +574,47 @@ metric is the signal, the audit row is the evidence. See
 and successor-unused-warning half of human token rotation, distinct from
 confirm).
 
+## Rotation-durability tamper/corruption gauges (#2961)
+
+```
+# HELP yuzu_server_rotation_pair_resolve_failures_total resolve_rotation_pair_after_revoke partner-clear failures that were swallowed - the revoke they follow has already committed, so they cannot fail the caller. Leaves stale rotation metadata on the surviving partner; NOT a lockout risk (the sweep cannot auto-revoke a stranded partner). Non-zero means inspect manually.
+# TYPE yuzu_server_rotation_pair_resolve_failures_total gauge
+yuzu_server_rotation_pair_resolve_failures_total 0
+# HELP yuzu_server_rotation_initiator_disagreements_total resolve_rotation_initiator RAM-vs-durable disagreements - not reachable in normal operation; non-zero means inspect api_tokens.rotation_initiator for out-of-band tampering or corruption.
+# TYPE yuzu_server_rotation_initiator_disagreements_total gauge
+yuzu_server_rotation_initiator_disagreements_total 0
+```
+
+Both are `ApiTokenStore` counters, gauge-published from a store accessor on
+every `/metrics` scrape (same shape as `yuzu_server_token_cache_size` above
+— no counter pre-seed needed, since the scrape callback sets the value every
+time rather than relying on a startup registration).
+
+**`yuzu_server_rotation_initiator_disagreements_total`** is the tamper/
+corruption signal on an authorization input: `resolve_rotation_initiator`
+(`api_token_store.cpp`) refuses to resolve a confirm's initiator when the
+RAM grace-cache copy of `requesting_user` and the durable
+`api_tokens.rotation_initiator` column DISAGREE, rather than silently
+preferring either. Both sources are written from the SAME `requesting_user`
+inside the SAME locked mint transaction, so this is **not reachable through
+any live code path** — a non-zero value means an out-of-band write to
+`api_tokens.rotation_initiator` (direct SQL, a restored/edited backup) or a
+future bug, never normal operation. The corresponding confirm call fails
+closed with `rotation confirmation unavailable` (409/`Conflict`); this
+gauge is the only durable, alertable trace of *why* it failed closed (the
+error string alone does not distinguish a genuine "never stamped" pre-v3
+pair from a disagreement). Alert on any nonzero value —
+`yuzu_server_rotation_initiator_disagreements_total > 0` — rather than a
+rate threshold: even one occurrence warrants manual inspection of the
+row's history.
+
+**`yuzu_server_rotation_pair_resolve_failures_total`** covers a distinct,
+operability-only failure: `resolve_rotation_pair_after_revoke` failing to
+clear the surviving partner's rotation state after a revoke has already
+committed. See the metric's own `HELP` text above for the full scope —
+stale metadata, not a lockout risk, since the sweep structurally cannot
+auto-revoke a row this leaves stranded.
+
 ## Access review metrics
 
 Periodic access reviews (SOC 2 CC6.2, `docs/auth-architecture.md` "Periodic

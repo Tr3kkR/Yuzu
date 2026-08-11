@@ -175,6 +175,22 @@ bool PgMigrationRunner::run(PGconn* conn, std::string_view store_name,
     // vector order — never a re-sorted copy — so an author who lists two
     // migrations out of numeric order gets the same loud refusal a genuine
     // duplicate does, rather than the runner quietly reordering intent.
+    // The pairwise check below only orders migrations against EACH OTHER —
+    // it never anchors the vector against `read_version`'s own floor. Since
+    // `read_version` returns 0 for an untracked store, a vector beginning
+    // `{0, 1, 2, ...}` is strictly increasing and passes the pairwise check,
+    // but the apply loop's `m.version <= current` treats version 0 as
+    // already-applied and skips it forever — the same silent-skip shape
+    // #3013 closed for a duplicate/non-monotonic pair, at index 0 instead.
+    if (migrations.front().version <= 0) {
+        spdlog::error(
+            "PgMigrationRunner: store '{}' has a non-positive first migration version ({}) — "
+            "refusing to run any migration for this store. Migration versions must start at 1: "
+            "version 0 is indistinguishable from an untracked store and would be skipped "
+            "forever by the apply loop's <= current check.",
+            store, migrations.front().version);
+        return false;
+    }
     for (std::size_t i = 1; i < migrations.size(); ++i) {
         if (migrations[i].version <= migrations[i - 1].version) {
             spdlog::error(

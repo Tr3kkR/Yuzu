@@ -33,6 +33,20 @@ The NVD CVE sync exposes three server metrics — `yuzu_nvd_total_cves` (gauge),
 
 `yuzu_api_token_confirm_total{surface,result}` (P2 #11, SOC 2 CC6.3) registers the human-owned twin of `yuzu_engine_principal_confirm_total` immediately above: the same `surface` (`rest`|`mcp`) x `result` (`success`|`conflict`|`client_error`|`transient`) closed cross-product (8 series), pre-seeded to `0` at startup for the same `absent()`-alert reason, and exported as a `constexpr` symbol (`rotation_sweep_naming.hpp`'s `kApiTokenConfirmTotalMetric`) rather than a string literal so the registration site and the increment sites can't silently diverge into a shadow series. It shares the sweep-driver's kind-discrimination header alongside `yuzu_api_token_rotation_auto_revoked_total` and `yuzu_api_token_rotation_events_total{reason}` (the human twins of the two `yuzu_engine_principal_rotation_*` sweep counters — the T12 maintenance sweep in server.cpp routes each swept row to the engine or human family, never both, keyed on the row's own `principal_kind`; see `rotation_sweep_naming.hpp`'s header comment for the full chokepoint rationale). **`yuzu_api_token_confirm_total` is live — both transports increment it**: `rest_api_v1.cpp`'s `POST /api/v1/tokens/{id}/confirm` handler (`surface="rest"`) and `mcp_server.cpp`'s `confirm_api_token_rotation` tool handler (`surface="mcp"`), both through the shared `kApiTokenConfirmTotalMetric` symbol. It follows the identical scope contract and stamp-before-audit discipline as its engine twin, pairing with whatever audit action the confirm-rotation piece emits for per-principal forensics (distinct from the `api_token.rotation.auto_revoke` / `.successor_unused` rows this piece DOES ship — see [audit-log.md](user-manual/audit-log.md), those are the sweep-driven auto-revoke/successor-unused half, not confirm). See [metrics.md → Human API-token confirm metric](user-manual/metrics.md#human-api-token-confirm-metric-p2-11) for the full reference.
 
+`yuzu_server_rotation_initiator_disagreements_total` / `yuzu_server_rotation_pair_resolve_failures_total`
+(#2961) are `ApiTokenStore`-owned gauges, gauge-published on every `/metrics`
+scrape (no counter pre-seed needed — same shape as `yuzu_server_token_cache_size`).
+`_initiator_disagreements_total` is a **tamper/corruption signal on an
+authorization input**, not an operational one: `resolve_rotation_initiator`
+fails a confirm closed when its RAM grace-cache copy of `requesting_user`
+and the durable `api_tokens.rotation_initiator` column disagree, which is
+not reachable through any live code path (both are written from the same
+value in the same locked mint transaction) — alert on **any** nonzero
+value, not a rate threshold. `_pair_resolve_failures_total` is operability-
+only (a swallowed post-revoke partner-clear failure; stale metadata, not a
+lockout risk). See [metrics.md → Rotation-durability tamper/corruption gauges](user-manual/metrics.md#rotation-durability-tampercorruption-gauges-2961)
+for the full reference.
+
 Periodic access reviews (SOC 2 CC6.2, hardening round) added four bounded-label series wired at the REST handlers only (MCP twins not double-counted): `yuzu_access_review_export_total{format}` (`format` ∈ `json`|`csv`, pre-seeded to `0`), `yuzu_access_review_export_duration_seconds` (histogram, the `build_access_review` grant-population read latency), `yuzu_access_review_campaigns_opened_total` (no labels), and `yuzu_access_review_attestations_total{decision}` (`decision` ∈ `attested`|`flagged_revoke`, pre-seeded to `0`). All four are **operational, not `event="security"`** — a review export or a recorded decision is expected, self-audited operator activity (own audit rows: `access_review.exported`, `.campaign_opened`, `.attested`/`.flagged`), not an anomaly signal; pair the counters with the audit rows for evidence, same metric-is-the-signal/audit-row-is-the-evidence split used elsewhere on this page. See [metrics.md → Access review metrics](user-manual/metrics.md#access-review-metrics) for the full reference.
 
 ## Audit events

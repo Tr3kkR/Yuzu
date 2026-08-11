@@ -1875,12 +1875,16 @@ walkthrough.
   is deliberate: a rotation already in flight when this migration is
   applied has no durable initiator and stays unconfirmable after a restart
   — an operator upgrading mid-rotation should confirm it first if possible.
-  If not, the T12 sweep still resolves the pair on its own timer regardless
-  of `confirm`'s durability, so no action is required; if the pair must be
-  resolved by hand, revoke the specific credential no longer trusted via
-  `DELETE /api/v1/tokens/{token_id}` (an engine credential is an ordinary
-  API token row), **never** the principal-level revoke route, which is
-  terminal and destroys both credentials plus the principal. **Unaffected
+  If not, the T12 sweep resolves the pair on its own timer **provided the
+  successor was presented at least once** (the same UP-5 carve-out that
+  gates every sweep auto-revoke — "never presented" leaves both credentials
+  active indefinitely, sweep or no sweep); only in that presented case is no
+  action required. If the successor was never presented, or the pair must
+  be resolved by hand for any other reason, revoke the specific credential
+  no longer trusted via `DELETE /api/v1/tokens/{token_id}` (an engine
+  credential is an ordinary API token row), **never** the principal-level
+  revoke route, which is terminal and destroys both credentials plus the
+  principal. **Unaffected
   — deliberately:** the 120-second raw
   successor secret re-serve (bullet above, F4) stays RAM-only; a one-time
   reveal must never become durable, so a restart still forfeits that

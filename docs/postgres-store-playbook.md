@@ -292,7 +292,19 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
 - **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
   refused (never blindly re-run migration 1). Concurrent runners (multi-process boot) are
   serialized by a cluster-wide `pg_advisory_xact_lock`. Store/schema names must match
-  `[a-z_][a-z0-9_]{0,62}` and must not be `public`/`information_schema`/`pg_*`.
+  `[a-z_][a-z0-9_]{0,62}` and must not be `public`/`information_schema`/`pg_*`. **Duplicate/
+  non-monotonic version guard (#3013, #2961/#2964):** `run()` checks a store's own
+  `migrations()` vector up front — strictly increasing by `version`, first version `> 0` —
+  and refuses the WHOLE call (nothing applied) on a duplicate, a descending pair, or a
+  non-positive first version, rather than letting the apply loop's `version <= current` skip
+  silently swallow whichever migration collided. This catches a collision baked into the
+  CALLING binary's own vector; it cannot see a version already recorded in `schema_meta` by a
+  DIFFERENT binary that shipped before the guard existed — a second, independent line of
+  defence for that case is a post-migration projection smoke-read at the store's own
+  construction site (a `LIMIT 0` SELECT of every column the store's runtime queries actually
+  select, including any column masked to `''` in read-only projections — see
+  `ApiTokenStore`'s constructor for the reference shape), which fails the store closed
+  (`!is_open()`) rather than surfacing an `undefined column` on whichever request runs first.
 - **Error/RAII hygiene**: malformed-conninfo errors are reported as a fixed string (never
   libpq's token-quoting parse error, which can echo credential fragments); libpq-allocated
   buffers are freed only with `PQfreemem`/`PQconninfoFree`.

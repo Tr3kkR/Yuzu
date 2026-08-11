@@ -465,8 +465,13 @@ rather than incrementing.
   touched by this fix. A rotation already in flight when v3 is applied has
   an empty `rotation_initiator` and stays unconfirmable after a restart — it
   fails closed rather than matching any caller; an operator mid-upgrade with
-  an in-flight rotation should resolve it (confirm or revoke one side)
-  before restarting.
+  an in-flight rotation should confirm it before restarting if possible.
+  If not, the sweep resolves the pair on its own timer only if the
+  successor was presented at least once (UP-5) — if it was never
+  presented, the sweep never resolves this pair, and the operator must
+  revoke the specific credential no longer trusted via
+  `DELETE /api/v1/tokens/{token_id}`, never the terminal principal-level
+  `DELETE /api/v1/engine-principals/{id}` route.
 - **`#2962`** (Owner: unassigned) — two unrecoverable terminals in the
   rotation state machine, both reachable single-instance. (A) `confirm` has
   no time bound on the grace *entry* itself (only the raw-secret re-serve

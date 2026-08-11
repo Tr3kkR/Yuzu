@@ -316,21 +316,25 @@ ApiTokenStore::ApiTokenStore(pg::PgPool& pool) : pool_(pool) {
     // guard existed, or any other way this store's schema could have ended
     // up short a column `run()` itself believes it already applied. A
     // `LIMIT 0` projection read against every column this store's own
-    // runtime queries actually select touches zero rows (cheap even on a
-    // large table) and fails the exact same way a live `validate_token`/
-    // `list_tokens` call would on an `undefined column` — except here, at
-    // construction, fail-CLOSED (ADR-0012 §1) rather than in production
-    // traffic on whichever request happens to run first.
+    // runtime queries actually select — including `token_hash`, which
+    // `kTokenColsTail` deliberately omits (validate_token selects it as a
+    // real column; every other reader masks it behind a literal `''`) —
+    // touches zero rows (cheap even on a large table) and fails the exact
+    // same way a live `validate_token`/`list_tokens` call would on an
+    // `undefined column` — except here, at construction, fail-CLOSED
+    // (ADR-0012 §1) rather than in production traffic on whichever request
+    // happens to run first.
     {
         const std::string smoke_sql =
-            std::string("SELECT token_id, ") + kTokenColsTail +
+            std::string("SELECT token_id, token_hash, ") + kTokenColsTail +
             " FROM api_token_store.api_tokens LIMIT 0";
         pg::PgResult smoke = pg::exec_params(lease.get(), smoke_sql.c_str(), std::vector<std::string>{});
         if (smoke.status() != PGRES_TUPLES_OK) {
             spdlog::error("ApiTokenStore: post-migration schema projection check failed — "
-                          "api_tokens is missing an expected column (a skipped or partial "
-                          "migration?) — API token store disabled: {}",
-                          PQerrorMessage(lease.get()));
+                          "api_tokens is missing an expected column (hypothesis: a skipped or "
+                          "partial migration; could also be a dropped connection or other "
+                          "transient failure) — API token store disabled: {}",
+                          PQresultErrorMessage(smoke.get()));
             return;
         }
     }
@@ -1023,10 +1027,18 @@ bool ApiTokenStore::successor_rotation_still_pending(const std::string& successo
     auto lookup = read_token_by_id_on_conn(lease.get(), successor_token_id);
     if (!lookup.ok || !lookup.token)
         return true;
-    // Cleared to '' by every site that resolves a rotation — a non-empty
-    // value here (it is stamped to the successor's OWN token_id at mint
-    // time) means nothing has resolved this pair since the mint committed.
-    return !lookup.token->rotation_group.empty();
+    // `rotation_group` is cleared to '' by resolve_rotation_pair_after_revoke
+    // ON THE SURVIVING PARTNER (`token_id <> $2`) whenever EITHER side of a
+    // pair is revoked — but never on the revoked row itself, whose own
+    // `rotation_group` (stamped to the successor's OWN token_id at mint time)
+    // survives unchanged. So a non-empty `rotation_group` alone does NOT mean
+    // "nothing has resolved this pair since the mint committed" — it also
+    // matches a successor that was itself revoked in the window, which IS a
+    // resolution (measured: this happens whenever the successor is revoked
+    // before being confirmed). Check `revoked` explicitly rather than
+    // inferring resolution from `rotation_group` alone: a revoked successor
+    // is resolved and must not have its raw secret re-cached.
+    return !lookup.token->revoked && !lookup.token->rotation_group.empty();
 }
 
 void ApiTokenStore::scrub_elapsed_grace_secrets() {
@@ -1069,6 +1081,40 @@ ApiTokenStore::rotate_engine_credential(const std::string& principal_id, int64_t
     if (overlap_secs > kOverlapCeilSecs)
         return std::unexpected("overlap window exceeds the maximum (10 years)");
 
+    // Every local plaintext-secret slot the scrub guard below reaches is
+    // declared HERE, empty, and the guard is ARMED before any of them is
+    // populated — same declare-then-arm-then-generate discipline as
+    // `rotate_token`'s own guard (this file), closing the gap an earlier
+    // round of this diff left open here (see that guard's comment, which
+    // used to note this function as future work).
+    std::string candidate_raw, candidate_hash, candidate_token_id, candidate_error;
+    std::string error_msg;
+    std::string raw_out;
+    // Populated only by the 1-active mint branch, applied to the RAM grace
+    // cache AFTER the transaction below commits successfully.
+    std::string grace_group_out, grace_raw_out;
+    // Re-serve arm's local secret + owner, hoisted to FUNCTION scope (rather
+    // than declared inside the lambda below) so the scope-exit scrub guard
+    // immediately below can reach `cached_raw` regardless of how the
+    // transaction exits — a lambda-local variable is destroyed the moment
+    // the lambda returns, before any function-scope guard could run. Same
+    // rationale as `rotate_token`'s identical hoist.
+    std::string cached_raw, cached_user;
+
+    // Scrub every local plaintext secret copy, unconditionally, on EVERY
+    // exit from this function from this point on — including a thrown
+    // exception. Same four slots, same reasoning, as `rotate_token`'s own
+    // guard (this file) — see that guard's comment for the full rationale
+    // per slot; `raw_out` is included unconditionally there too, since the
+    // success path already moves it out via `return raw_out;` before this
+    // guard fires.
+    ScopeExit scrub_secrets{[&] {
+        yuzu::secure_zero(candidate_raw);
+        yuzu::secure_zero(grace_raw_out);
+        yuzu::secure_zero(cached_raw);
+        yuzu::secure_zero(raw_out);
+    }};
+
     // Candidate successor, prepared BEFORE the locked transaction below
     // (Hermes F2 — see this function's .hpp doc comment for why: both
     // `validate_engine_mint`'s referential-integrity call and CSPRNG
@@ -1080,7 +1126,6 @@ ApiTokenStore::rotate_engine_credential(const std::string& principal_id, int64_t
     auto candidate_validation =
         validate_engine_mint(principal_id, /*scope_service=*/{}, "readonly", candidate_expires_at,
                              now);
-    std::string candidate_raw, candidate_hash, candidate_token_id, candidate_error;
     if (candidate_validation.has_value()) {
         auto raw_result = generate_raw_token();
         if (raw_result.has_value()) {
@@ -1093,12 +1138,6 @@ ApiTokenStore::rotate_engine_credential(const std::string& principal_id, int64_t
     } else {
         candidate_error = candidate_validation.error();
     }
-
-    std::string error_msg;
-    std::string raw_out;
-    // Populated only by the 1-active mint branch, applied to the RAM grace
-    // cache AFTER the transaction below commits successfully.
-    std::string grace_group_out, grace_raw_out;
 
     // Hermes F1: the ENTIRE check -> mint -> stamp sequence commits inside
     // ONE transaction, opened with a principal-scoped Postgres advisory
@@ -1221,8 +1260,11 @@ ApiTokenStore::rotate_engine_credential(const std::string& principal_id, int64_t
             }
 
             // Idempotency window, cache side: the raw secret itself must
-            // still be resident and unexpired.
-            std::string cached_raw, cached_user;
+            // still be resident and unexpired. `cached_raw`/`cached_user`
+            // are the FUNCTION-scope variables declared above (not
+            // lambda-local) so the scope-exit scrub guard above can reach
+            // `cached_raw` on every exit from this function, not just this
+            // lambda's return.
             if (!try_reserve(successor->rotation_group, cached_raw, cached_user)) {
                 error_msg = "rotation grace window elapsed; confirm or revoke";
                 return false;
@@ -1622,9 +1664,9 @@ ApiTokenStore::rotate_token(const std::string& predecessor_token_id, int64_t ove
     //                      frame just because the function is about to
     //                      discard it (the underlying cache entry / minted
     //                      row, if any, is untouched either way).
-    // NOTE: rotate_engine_credential's own candidate_raw (this file, engine
-    // arm) has the same pre-existing gap — out of scope for this diff; a
-    // future sweep should close both together.
+    // `rotate_engine_credential` (this file, engine arm) carries the
+    // byte-identical guard, closing the gap this note used to describe as
+    // future work.
     ScopeExit scrub_secrets{[&] {
         yuzu::secure_zero(candidate_raw);
         yuzu::secure_zero(grace_raw_out);

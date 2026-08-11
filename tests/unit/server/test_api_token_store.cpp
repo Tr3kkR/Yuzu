@@ -71,6 +71,84 @@ TEST_CASE("ApiTokenStore reports !is_open on a migration failure", "[pg][token][
     CHECK_FALSE(store.is_open()); // → server.cpp sets startup_failed_ (fail-closed)
 }
 
+// #2961 round-2 finding (item 6): the post-migration projection smoke-read
+// added alongside #3013's runner guard is a SECOND, independent line of
+// defence — it must catch the case the runner guard itself cannot: a
+// version already recorded in `public.schema_meta` (here forged directly,
+// modelling a DIFFERENT binary that stamped v3 without ever running the v3
+// ALTER) that does not match what the schema actually contains. Disabling
+// the smoke-read left [token] 184/184 green before this test existed.
+TEST_CASE("ApiTokenStore reports !is_open when schema_meta claims v3 but the schema is only "
+          "at v2 (post-migration smoke-read guard, #2961 round-2)",
+          "[pg][token][store][migration]") {
+    YUZU_REQUIRE_PG_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+
+        PgResult meta{PQexec(conn.get(),
+                             "CREATE TABLE public.schema_meta ("
+                             "  store       TEXT PRIMARY KEY,"
+                             "  version     INTEGER NOT NULL,"
+                             "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult schema{PQexec(conn.get(), "CREATE SCHEMA api_token_store")};
+        REQUIRE(schema.ok());
+
+        // v1 + v2 DDL only, copied verbatim from migrations() in
+        // api_token_store.cpp — deliberately missing v3's rotation_initiator
+        // column.
+        PgResult v1{PQexec(conn.get(),
+                           "CREATE TABLE api_token_store.api_tokens ("
+                           "  token_id      TEXT PRIMARY KEY,"
+                           "  token_hash    TEXT NOT NULL UNIQUE,"
+                           "  name          TEXT NOT NULL,"
+                           "  principal_id  TEXT NOT NULL DEFAULT '',"
+                           "  scope_service TEXT NOT NULL DEFAULT '',"
+                           "  mcp_tier      TEXT NOT NULL DEFAULT '',"
+                           "  principal_kind TEXT NOT NULL DEFAULT 'human' "
+                           "    CHECK (principal_kind IN ('human','engine')),"
+                           "  created_at    BIGINT NOT NULL DEFAULT 0,"
+                           "  expires_at    BIGINT NOT NULL DEFAULT 0,"
+                           "  last_used_at  BIGINT NOT NULL DEFAULT 0,"
+                           "  revoked       BOOLEAN NOT NULL DEFAULT FALSE);"
+                           "CREATE INDEX api_tokens_principal_idx ON "
+                           "api_token_store.api_tokens (principal_id)")};
+        REQUIRE(v1.ok());
+        PgResult v2{PQexec(
+            conn.get(),
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN rotation_group TEXT NOT NULL "
+            "DEFAULT '';"
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN supersedes_token_id TEXT NOT "
+            "NULL DEFAULT '';"
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN overlap_expires_at BIGINT NOT "
+            "NULL DEFAULT 0;"
+            "ALTER TABLE api_token_store.api_tokens ADD COLUMN confirmed_at BIGINT NOT NULL "
+            "DEFAULT 0")};
+        REQUIRE(v2.ok());
+
+        // Stamp schema_meta at v3 — a LIE: the schema actually stopped at
+        // v2. Models a database another binary's runner believed it already
+        // migrated to v3 (so `PgMigrationRunner::run` sees nothing pending
+        // and returns true), never a real v3 upgrade run against this
+        // schema.
+        PgResult stamp{PQexec(conn.get(),
+                              "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                              "VALUES ('api_token_store', 3, extract(epoch FROM now())::bigint)")};
+        REQUIRE(stamp.ok());
+    }
+
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ApiTokenStore store{pool};
+    // The migration runner itself sees version 3 already recorded and
+    // returns true trivially — construction must NOT stop there. The
+    // smoke-read against every column this store's runtime queries select
+    // (including rotation_initiator, missing here) is what catches the
+    // forged version and fails the store closed.
+    CHECK_FALSE(store.is_open());
+}
+
 // UP-7 (#2961 fix-round finding, review): every other test in this file
 // clones `apitoken_pg_template`, which is already at v3 — the pre-v3 state
 // elsewhere in this file is modelled by an `UPDATE ... rotation_initiator =
@@ -143,11 +221,12 @@ TEST_CASE("ApiTokenStore: a genuine v2->v3 upgrade (real ALTER against a populat
         // A row genuinely present BEFORE the v3 ALTER runs — the shape a
         // real populated table has mid-upgrade, not an empty one.
         preexisting_token_id = "pre-v3-token-deadbeef01";
+        const char* seed_values[] = {preexisting_token_id.c_str()};
         PgResult seed{PQexecParams(
             conn.get(),
             "INSERT INTO api_token_store.api_tokens (token_id, token_hash, name, principal_id) "
             "VALUES ($1, 'pre-v3-hash', 'pre-existing', 'restart-carol')",
-            1, nullptr, (const char*[]){preexisting_token_id.c_str()}, nullptr, nullptr, 0)};
+            1, nullptr, seed_values, nullptr, nullptr, 0)};
         REQUIRE(seed.ok());
     }
 
@@ -1799,6 +1878,13 @@ TEST_CASE("ApiTokenStore: confirm_rotation fails closed when the RAM grace-cache
     CHECK(confirmed.error().find("unavailable") != std::string::npos);
     CHECK(confirmed.error().find("different operator") == std::string::npos);
 
+    // The tamper/corruption counter on this authorization input must fire
+    // exactly once — this is the only source of a RAM/durable disagreement
+    // through any live code path, so a silently-uncounted disagreement here
+    // is a monitoring gap on exactly the condition this counter exists to
+    // surface (#2961 fix-round finding).
+    CHECK(store.rotation_initiator_disagreements() == 1);
+
     // Nothing mutated — neither credential's confirmed_at moved.
     auto active = store.list_active_for_principal(principal);
     CHECK(active.size() == 2);
@@ -1864,6 +1950,10 @@ TEST_CASE("ApiTokenStore: confirm_token_rotation fails closed when the RAM grace
     REQUIRE_FALSE(confirmed.has_value());
     CHECK(confirmed.error().find("unavailable") != std::string::npos);
     CHECK(confirmed.error().find("different operator") == std::string::npos);
+
+    // Same tamper/corruption counter, human arm — see the engine-arm
+    // sibling test's identical assertion for the rationale.
+    CHECK(store.rotation_initiator_disagreements() == 1);
 
     // Nothing mutated.
     auto active = store.list_active_for_principal("disagreement-dave");
@@ -2899,6 +2989,57 @@ TEST_CASE("ApiTokenStore: rotate_token does not strand a grace-cache entry when 
     auto active = store.list_active_for_principal("race-erin");
     REQUIRE(active.size() == 1);
     CHECK(store.rotation_grace_cache_size() == 0);
+}
+
+// successor_rotation_still_pending's own doc comment (api_token_store.hpp)
+// is explicit that it fails OPEN — returns true, "still pending", i.e.
+// cache the raw secret — on a lease timeout or an ambiguous read, because
+// under-caching a legitimate in-flight rotation on a merely-contended pool
+// is an availability regression the check must never cause. Mutation-proven
+// (round-2 governance review): flipping BOTH of that function's `return
+// true` early-outs to `return false` left the entire server suite green
+// before this test existed — nothing pinned the posture from the outside.
+// Exercised via the SAME post-commit, pre-cache-write window the sibling
+// race tests above use (test_hook_before_store_rotation_raw_ fires strictly
+// after the mint's own transaction has committed and released its lease
+// back to the pool), except here the hook exhausts the pool instead of
+// resolving the rotation — forcing successor_rotation_still_pending's own
+// `try_acquire_for(kReadTimeout)` down its lease-timeout `return true` arm.
+TEST_CASE("ApiTokenStore: rotate_token still caches the grace-window raw secret when "
+          "successor_rotation_still_pending's own read is starved of a connection "
+          "(fail-OPEN posture, #2961 round-2 finding)",
+          "[pg][token][rotation][durability]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    // Pool of exactly one: rotate_token's own transaction reacquires and
+    // releases it as it goes, but by the time the hook below fires (strictly
+    // after that transaction's COMMIT), the pool's sole connection is free —
+    // until the hook itself hogs it.
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    auto predecessor_raw = store.create_token("my-pat", "fail-open-erin", now + k90Days);
+    REQUIRE(predecessor_raw.has_value());
+    const std::string predecessor_id =
+        store.list_active_for_principal("fail-open-erin")[0].token_id;
+
+    PgPool::Lease hog;
+    store.test_hook_before_store_rotation_raw_ = [&] {
+        hog = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(hog); // succeeds: the mint's own lease was already returned above
+    };
+    auto rotated = store.rotate_token(predecessor_id, kDefaultOverlapSecs, now, "fail-open-erin",
+                                      "", "");
+    store.test_hook_before_store_rotation_raw_ = nullptr;
+    hog.reset(); // release the hogged connection back to the pool
+    REQUIRE(rotated.has_value()); // the mint's own return value is unaffected
+
+    // successor_rotation_still_pending's try_acquire_for(kReadTimeout) had no
+    // connection available (the hook held the pool's only one) and failed
+    // OPEN — the raw secret WAS cached despite the ambiguous read, not
+    // silently dropped.
+    CHECK(store.rotation_grace_cache_size() == 1);
 }
 
 TEST_CASE("ApiTokenStore: rotate_token honours an explicit successor_expires_at override",

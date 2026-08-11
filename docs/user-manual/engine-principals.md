@@ -114,9 +114,13 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   and its metric fire once per pair per state, process-local — a restart
   re-emits once; the underlying log line, by contrast, repeats every tick
   once elapsed) — a sign the new secret was never actually picked up; once
-  that warning has fired for the elapsed state, resolve it explicitly
-  (confirm or revoke) rather than assume the sweep will eventually clean it
-  up.
+  that warning has fired for the elapsed state, do not assume the sweep will
+  eventually clean it up (it will not — see the "never presented" case
+  above) — either confirm once the successor genuinely is in use, or revoke
+  the *specific* credential you no longer trust via
+  `DELETE /api/v1/tokens/{token_id}` (never
+  `DELETE /api/v1/engine-principals/{id}` — see step 4's callout below for
+  why).
 
 ### 4. Confirm the rotation (optional but recommended)
 
