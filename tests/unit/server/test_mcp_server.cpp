@@ -7369,9 +7369,8 @@ TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + d
     // pin this for the scope-filtered case specifically, since it's the one
     // that also has the conditional audit_persisted sibling flag to get
     // right in both shapes.
-    auto full_result = nlohmann::json::parse(res->body)["result"];
-    REQUIRE(full_result.contains("structuredContent"));
-    auto& sc = full_result["structuredContent"];
+    REQUIRE(result.contains("structuredContent"));
+    auto& sc = result["structuredContent"];
     REQUIRE(sc.contains("results"));
     CHECK(sc["results"] == groups);
     CHECK_FALSE(sc.contains("audit_persisted")); // fake test audit_fn succeeds
