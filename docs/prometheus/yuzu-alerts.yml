@@ -2111,7 +2111,8 @@ groups:
   #
   # REASON 2 - NO CHURN-ROBUST NEW-INCREMENT ALERT EXISTS OVER THIS SHAPE. This one does
   # not clear at the cutover. It clears only when a per-agent axis exists for the
-  # JOURNAL: #2083 is spark-scoped, and the journal equivalent is not filed (see below).
+  # JOURNAL: #2083 is spark-scoped, and the journal equivalent is tracked at #2336
+  # (filed 2026-07-21; see below).
   # These are UNLABELLED fleet SUMS of per-agent CUMULATIVE counters over a CHURNING
   # population, and all three candidate forms fail (governance Gate-4 unhappy-path +
   # Gate-6 sre):
@@ -2155,7 +2156,7 @@ groups:
   # rules stay disabled even once the cutover clears REASON 1, and it is separate again
   # from prerequisites (a)-(d) below. Closing it needs the per-agent delta plus a
   # server-owned monotonic counter - #2083 is the spark-scoped tracker, and the journal
-  # side belongs on #2298's cutover-gate list and is not yet filed there.
+  # side is tracked at #2336 (filed 2026-07-21; referenced from #2298's gate list).
   #
   # UNTIL BOTH REASONS CLEAR THESE ARE MONITOR-ONLY: graph them, review them in
   # post-incident analysis, do not page on them.
