@@ -51,6 +51,7 @@
 #include <mutex>
 #include <random>
 #include <stdexcept>
+#include <optional> // param_int_strict (#2970B)
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -188,6 +189,30 @@ int64_t param_int(const nlohmann::json& params, const char* key, int64_t def = 0
     if (params.contains(key) && params[key].is_number_integer())
         return params[key].get<int64_t>();
     return def;
+}
+
+/// #2970B: `param_int` SILENTLY substitutes `def` when the key is present but
+/// the wrong JSON type — `{"overlap_days": 30.0}` (what a Python or JS client
+/// emits for a float) or `"30"` becomes the default, and any subsequent range
+/// check passes because the default is in range. The caller asked for 30 days
+/// and gets 7, with no error.
+///
+/// This returns `nullopt` for present-but-wrong-type so the caller can answer
+/// `kInvalidParams`, matching both the REST twin (which 400s the same shape)
+/// and the tool's own declared `"type": "integer"` input schema. Absent stays
+/// `def` — omitted is not malformed.
+///
+/// Deliberately a SIBLING rather than a change to `param_int`: that function
+/// has many callers across every tool, and silently tightening all of them
+/// from one rotation finding would be a much larger behavioural change than
+/// the one that was reviewed.
+std::optional<int64_t> param_int_strict(const nlohmann::json& params, const char* key,
+                                        int64_t def) {
+    if (!params.contains(key))
+        return def;
+    if (!params[key].is_number_integer())
+        return std::nullopt;
+    return params[key].get<int64_t>();
 }
 
 int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
@@ -9116,7 +9141,19 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                int64_t overlap_days = param_int(args, "overlap_days", 7);
+                const auto overlap_days_opt = param_int_strict(args, "overlap_days", 7);
+                if (!overlap_days_opt) {
+                    // #2970B: present but not a JSON integer (a float like
+                    // 30.0, or "30"). REST 400s this; so does the tool's own
+                    // declared integer schema. Silently defaulting to 7 gave
+                    // the caller a window they did not ask for.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "overlap_days must be a JSON integer (days)"),
+                        "application/json");
+                    return;
+                }
+                const int64_t overlap_days = *overlap_days_opt;
                 // §7 / REST parity: reject an out-of-range overlap_days
                 // outright — never silently truncate it. ApiTokenStore's own
                 // 24h floor / 10y ceiling (kOverlapFloorSecs/kOverlapCeilSecs,
@@ -9327,7 +9364,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 // which both matches ApiTokenStore's own 24h floor/10y
                 // ceiling and doubles as the overflow guard (mirrors
                 // rotate_engine_credential above).
-                int64_t overlap_days = param_int(args, "overlap_days", 7);
+                const auto overlap_days_opt = param_int_strict(args, "overlap_days", 7);
+                if (!overlap_days_opt) {
+                    // #2970B: present but not a JSON integer (a float like
+                    // 30.0, or "30"). REST 400s this; so does the tool's own
+                    // declared integer schema. Silently defaulting to 7 gave
+                    // the caller a window they did not ask for.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "overlap_days must be a JSON integer (days)"),
+                        "application/json");
+                    return;
+                }
+                const int64_t overlap_days = *overlap_days_opt;
                 if (overlap_days < 1 || overlap_days > 3650) {
                     res.set_content(
                         error_response(id, kInvalidParams,

@@ -2008,6 +2008,42 @@ TEST_CASE("MCP rotate_api_token: readonly tier is denied before RBAC (tier-befor
     CHECK(oob_body["error"]["message"].get<std::string>().find("overlap_days out of range") !=
           std::string::npos);
     CHECK(store.get_token(token_id).value()->rotation_group.empty());
+
+    // #2970B (PR #2974 review): overlap_days present but the WRONG JSON TYPE
+    // must be rejected, not silently defaulted to 7. `30.0` is what a Python
+    // or JS client emits for a float, and the old `param_int` returned the
+    // default for it — the range check then passed because 7 is in range, so
+    // the caller asked for 30 days and got 7 with no error. The REST twin
+    // 400s the same shape, and the tool's own schema declares integer.
+    //
+    // Asserted on the STORE as well as the response: a silent default would
+    // have gone on to mint a real successor, so an error-only assertion could
+    // pass while the rotation still happened.
+    McpTestServer ts3;
+    ts3.engine_credential_store_for_test = &store;
+    ts3.start("operator");
+    auto flt = ts3.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":972,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"(","overlap_days":30.0}}})");
+    REQUIRE(flt->status == 200);
+    auto flt_body = nlohmann::json::parse(flt->body);
+    REQUIRE(flt_body.contains("error"));
+    CHECK(flt_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(flt_body["error"]["message"].get<std::string>().find("must be a JSON integer") !=
+          std::string::npos);
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
+
+    // A JSON string is the other shape a loosely-typed client sends.
+    auto str = ts3.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":973,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"(","overlap_days":"30"}}})");
+    REQUIRE(str->status == 200);
+    auto str_body = nlohmann::json::parse(str->body);
+    REQUIRE(str_body.contains("error"));
+    CHECK(str_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
 }
 
 TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drifted "

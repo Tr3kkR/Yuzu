@@ -857,26 +857,38 @@ void ApiTokenStore::resolve_rotation_pair_after_revoke(const std::string& princi
         // execution failure rolls back.
         return r.status() == PGRES_COMMAND_OK;
     });
-    // MEDIUM fail-visibility fix (governance Gate 7): a swallowed failure here
-    // leaves the surviving partner still stamped with its `rotation_group`/
-    // `overlap_expires_at` — the T12 sweep then treats it as an unresolved
-    // predecessor and auto-revokes it once that (already-elapsed, since we
-    // are mid-revoke) overlap window trips, which can leave the principal
-    // with ZERO active credentials. Pre-existing on the engine arm too, but
-    // newly load-bearing here: for a human operator the outcome is lockout,
-    // not an engine-consumer restart. Logged only — never surfaced as a hard
-    // failure to the caller, since the revoke that triggered this call has
-    // already committed and there is no compensating action left to take
-    // here; this is diagnostic breadcrumb only, matching the
-    // `list_rotations_nearing_expiry_unused` swallowed-scan-failure log
-    // above.
+    // Fail-visibility (governance Gate 7; consequence CORRECTED by PR #2974
+    // review, K7). A swallowed failure here leaves the surviving partner
+    // still stamped with its `rotation_group`/`overlap_expires_at`, which is
+    // untidy and worth alerting on.
+    //
+    // An earlier revision of this comment claimed the sweep could then
+    // auto-revoke that partner and leave the principal with ZERO active
+    // credentials. **That chain is not reachable** and the claim was wrong.
+    // A reviewer traced the sweep SQL and I confirmed it: the predecessor
+    // scan requires `supersedes_token_id = ''`, which structurally excludes a
+    // stranded SUCCESSOR row whatever it is stamped with; and its `EXISTS`
+    // clause requires a LIVE (`revoked = FALSE`), used partner whose
+    // `supersedes_token_id` equals the scanned row's `token_id` — but in this
+    // failure path that partner is precisely the row that was just revoked.
+    // No stranded row can satisfy both predicates, in either revoke-half.
+    //
+    // The correction matters because the overstated consequence is what a
+    // future reader would prioritise off. This is an operability defect —
+    // a swallowed failure with no metric — not a lockout risk.
+    //
+    // Logged only, never surfaced to the caller: the revoke that triggered
+    // this call has already committed and there is no compensating action
+    // left to take. Now also counted, so a swallowed failure is alertable
+    // rather than log-only.
     if (!ok) {
+        rotation_pair_resolve_failures_.fetch_add(1, std::memory_order_relaxed);
         spdlog::error(
             "[{}] resolve_rotation_pair_after_revoke: failed to clear rotation state on the "
             "surviving partner of rotation_group='{}' after revoking token_id='{}' "
             "(principal_id='{}') — the partner may still be stamped as an unresolved "
-            "predecessor and could be auto-revoked by the next sweep pass, leaving this "
-            "principal with zero active credentials; inspect manually",
+            "predecessor; the sweep cannot auto-revoke it (see the comment above), so this "
+            "is stale metadata rather than a lockout risk, but inspect manually",
             kStoreName, rotation_group, revoked_token_id, principal_id);
     }
     evict_rotation_raw(rotation_group);
@@ -1859,7 +1871,24 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
         }
         if (predecessor == nullptr || successor == nullptr ||
             successor->supersedes_token_id != predecessor->token_id) {
-            error_msg = "no in-flight rotation to confirm";
+            // #2943: TERMINAL, not retryable. We only reach here after
+            // `classify_confirm_state_in_group` returned `kPairInGroup` — a
+            // POSITIVE read of exactly two active rows in this group, never
+            // the ambiguous 0-active case. So the #2404 positive-read
+            // exemption applies exactly as it does to `kGroupEmpty`,
+            // `kUnresolvedSoleInGroup` and the pin mismatch: the read
+            // succeeded, the state is simply unresolvable without an
+            // operator.
+            //
+            // Do NOT reuse "no in-flight rotation to confirm" here. That
+            // string is deliberately keyed Transient in
+            // `engine_store_error_class.hpp` for the AMBIGUOUS read, where a
+            // swallowed query failure and a genuinely empty set are
+            // indistinguishable — retrying is right there and wrong here. An
+            // agentic client retries a malformed pair forever; it cannot fix
+            // itself.
+            error_msg = "rotation pair is malformed — confirm cannot proceed; "
+                        "revoke one side explicitly";
             return false;
         }
 

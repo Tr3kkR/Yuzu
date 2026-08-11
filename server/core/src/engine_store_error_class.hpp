@@ -65,6 +65,18 @@ enum class EngineStoreErrorClass {
     if (has("rotation confirmation unavailable")) // grace binding gone (restart / already-resolved)
         return EngineStoreErrorClass::Conflict;
 
+    // 2b. #2943: malformed pair found AFTER a positive `kPairInGroup` read —
+    //     terminal, not retryable. Deliberately its OWN string rather than
+    //     reusing "no in-flight rotation to confirm" above: that key is keyed
+    //     Transient for the AMBIGUOUS read, and sharing it made a
+    //     positive-read terminal state retryable, which an agentic client
+    //     retries forever. Placed here, above the broad "unavailable" check
+    //     at step 7, for the same ordering reason as the entry above it.
+    //     Checked against every other key in this file for substring
+    //     collision when added (the hazard this file's own header documents).
+    if (has("rotation pair is malformed"))
+        return EngineStoreErrorClass::Conflict;
+
     // 3. Other rotation-state conflicts (no broad substring, order-independent).
     //    "does not match the pending rotation": the confirm token_id pin
     //    (#2384) — a stale/wrong successor id, i.e. the rotation state has

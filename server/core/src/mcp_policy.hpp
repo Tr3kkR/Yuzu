@@ -120,6 +120,35 @@ inline bool requires_approval(std::string_view mcp_tier,
         if (securable_type == "Security" && operation == "Execute") return true;
         if (securable_type == "UserManagement" && operation == "Write") return true;
         if (securable_type == "ManagementGroup" && operation == "Write") return true;
+
+        // ApiToken:Rotate is DELIBERATELY ABSENT — recorded here rather than
+        // left silent-by-omission (PR #2974 review).
+        //
+        // It is destructive by the usual test: it revokes a predecessor and
+        // reveals a fresh raw secret. What makes it different from the entries
+        // above is that it cannot move authority or reach another principal:
+        //
+        //   * self-service only — `requesting_user == principal_id` in the
+        //     store, no admin override, so a supervised token can only ever
+        //     rotate a token the SAME principal already owns;
+        //   * authority-inheriting — the successor inherits the predecessor's
+        //     (mcp_tier, scope_service) verbatim, and the caller's must EQUAL
+        //     the predecessor's, so nothing is gained;
+        //   * lifetime-neutral — the successor inherits `expires_at`, so it
+        //     cannot be used to extend a credential quietly.
+        //
+        // So the worst a supervised token achieves unapproved is replacing one
+        // of its own secrets with an equally-scoped one that dies at the same
+        // instant. Requiring four-eyes for that would gate routine credential
+        // hygiene — the CC6.3 behaviour this exists to encourage — behind an
+        // admin, on the tier most likely to be automating it.
+        //
+        // If that trade is ever revisited, the entry goes HERE and the
+        // `kToolSecurity` mapping for rotate_api_token /
+        // confirm_api_token_rotation must move with it — see the invariant
+        // note above `kToolSecurity`, and note `AuthRoutes::require_permission`
+        // mirrors this rule on non-MCP transports, so a partial change would
+        // open the same REST bypass #520/#1796 closed for quarantine.
     }
 
     // ── operator tier: tag deletes require approval, executions are auto-approved ──

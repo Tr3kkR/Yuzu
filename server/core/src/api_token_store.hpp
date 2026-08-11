@@ -607,6 +607,16 @@ public:
 
     /// Cumulative count of validate_token calls served from the in-memory cache.
     /// Exposed for Prometheus scraping; set via gauge in server.cpp's periodic loop.
+    /// #2974 review (K7): count of swallowed `resolve_rotation_pair_after_revoke`
+    /// partner-clear failures. That path cannot fail the caller — the revoke it
+    /// follows has already committed — so before this it was log-only and
+    /// therefore unalertable. NOT a lockout risk (the sweep provably cannot
+    /// auto-revoke a stranded partner; see the call site), but it leaves stale
+    /// rotation metadata and a silent failure path is worth a signal.
+    uint64_t rotation_pair_resolve_failures() const noexcept {
+        return rotation_pair_resolve_failures_.load(std::memory_order_relaxed);
+    }
+
     uint64_t cache_hits() const noexcept { return cache_hits_.load(std::memory_order_relaxed); }
 
     /// Cumulative count of validate_token calls that fell through to Postgres.
@@ -690,6 +700,7 @@ private:
     static constexpr auto kTokenCacheTtl = std::chrono::seconds(60);
 
     // Cache hit/miss counters (atomic, lock-free read for Prometheus scraping).
+    std::atomic<uint64_t> rotation_pair_resolve_failures_{0};
     mutable std::atomic<uint64_t> cache_hits_{0};
     mutable std::atomic<uint64_t> cache_misses_{0};
 

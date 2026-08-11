@@ -1605,6 +1605,18 @@ public:
                           "API token validate_token calls served from in-memory cache", "counter");
         metrics_.describe("yuzu_server_token_cache_misses_total",
                           "API token validate_token calls that fell through to SQLite", "counter");
+        // #2974 review (K7). Gauge-published from a store accessor like its
+        // token-cache siblings above, so it needs no counter() pre-seed to be
+        // present at 0 — the scrape callback sets it every time. (Contrast the
+        // rotation-sweep counters, which DO need an explicit pre-seed: see the
+        // note there.)
+        metrics_.describe("yuzu_server_rotation_pair_resolve_failures_total",
+                          "resolve_rotation_pair_after_revoke partner-clear failures that were "
+                          "swallowed - the revoke they follow has already committed, so they "
+                          "cannot fail the caller. Leaves stale rotation metadata on the "
+                          "surviving partner; NOT a lockout risk (the sweep cannot auto-revoke "
+                          "a stranded partner). Non-zero means inspect manually.",
+                          "counter");
         metrics_.describe("yuzu_server_token_cache_size",
                           "Distinct API tokens currently held in the validate_token cache",
                           "gauge");
@@ -5123,6 +5135,14 @@ public:
                         .set(static_cast<double>(api_token_store_->cache_misses()));
                     metrics_.gauge("yuzu_server_token_cache_size")
                         .set(static_cast<double>(api_token_store_->cache_size()));
+                    // #2974 review (K7): swallowed partner-clear failures in
+                    // resolve_rotation_pair_after_revoke. Published here rather
+                    // than incremented at the call site because the store holds
+                    // no MetricsRegistry — same accessor pattern as the token
+                    // cache counters above.
+                    metrics_.gauge("yuzu_server_rotation_pair_resolve_failures_total")
+                        .set(static_cast<double>(
+                            api_token_store_->rotation_pair_resolve_failures()));
                 }
                 // #2367: the same observability for the engine-principal
                 // revalidation cache. Without these the cache is invisible —

@@ -224,6 +224,12 @@ TEST_CASE("classify_engine_store_error: round-trip over every error string "
         // ── confirm_token_rotation ──────────────────────────────────────
         {"no such token to confirm", E::ClientValidation},
         {"no in-flight rotation to confirm", E::Transient},
+        // #2943 (PR #2974 review): a malformed pair found AFTER a positive
+        // two-row read is TERMINAL, so it gets its own string and classifies
+        // Conflict. Sharing "no in-flight rotation to confirm" above made it
+        // retryable, and an agentic client retries a malformed pair forever.
+        {"rotation pair is malformed - confirm cannot proceed; revoke one side explicitly",
+         E::Conflict},
         // Round 5: Conflict, not Transient — see the dedicated TEST_CASE
         // above and engine_store_error_class.hpp's step-3 rationale.
         {"no rotation currently pending for the supplied token_id — nothing to confirm; "
@@ -248,7 +254,7 @@ TEST_CASE("classify_engine_store_error: round-trip over every error string "
 
     // See the TEST_CASE-level comment: this pins accidental drift in THIS
     // table, not drift between this table and the source.
-    REQUIRE(cases.size() == 38);
+    REQUIRE(cases.size() == 39); // 38 -> 39: #2943 malformed-pair terminal string
 
     for (const auto& c : cases) {
         CAPTURE(c.message);
