@@ -2338,9 +2338,10 @@ strict parse is what refuses to boot if a bad value ever lands regardless.
 **Mandatory backfill (ADR-0009/0041).** Unlike the AuthDB fresh-start cutover,
 RBAC state is irreducible operator-authored config that **cannot be
 re-derived** — custom roles, every principal→role grant, groups, and
-membership — so the migration performs a one-time streamed, idempotent,
-resumable, reconciled, **fail-CLOSED** backfill from the legacy `rbac.db`
-(seed defaults first, then backfill operator rows via `ON CONFLICT DO NOTHING`;
+membership — so the migration performs a one-time, single-shot, idempotent
+(retried from scratch on interruption — not a cursor-resumed stream, unlike
+AuditStore's larger dataset), reconciled, **fail-CLOSED** backfill from the
+legacy `rbac.db` (seed defaults first, then backfill operator rows via `ON CONFLICT DO NOTHING`;
 operator edits to seeded permissions are preserved via `DO UPDATE`). A
 built-in default permission the operator explicitly revoked (`remove_permission`)
 before upgrading is **deleted** — matching legacy exactly, a plain absent row

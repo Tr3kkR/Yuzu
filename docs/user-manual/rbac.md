@@ -344,7 +344,7 @@ curl -s -b cookies.txt \
 
 ### Custom Roles (Planned)
 
-Custom roles can be created programmatically via `RbacStore::create_role()` and permissions assigned via `RbacStore::set_permission()`. REST API endpoints for role creation and role assignment are planned but **not yet implemented**. Currently, custom roles must be managed through the HTMX Settings UI or directly via the SQLite database.
+Custom roles can be created programmatically via `RbacStore::create_role()` and permissions assigned via `RbacStore::set_permission()`. REST API endpoints for role creation and role assignment are planned but **not yet implemented**. Currently, custom roles must be managed through the HTMX Settings UI or directly against the shared PostgreSQL `rbac_store` schema (see the "Storage (ADR-0041)" callout above — one `psql` session, not a per-node file).
 
 **Planned endpoints (not yet available):**
 
@@ -376,9 +376,13 @@ curl -s -b cookies.txt -X POST \
 Prevent a role from deleting infrastructure resources, even if other roles would allow it. This requires creating a custom role with a Deny permission (via the Settings UI or direct database access, since the role creation API is not yet available):
 
 ```sql
--- Example: create a deny role directly in the RBAC database
-INSERT INTO roles (name, description, is_system, created_at) VALUES ('NoDeletion', 'Explicit deny on infrastructure deletion', 0, strftime('%s','now'));
-INSERT INTO role_permissions VALUES ('NoDeletion', 'Infrastructure', 'Delete', 'deny');
+-- Example: create a deny role directly against the shared rbac_store schema
+-- (psql against the server's PostgreSQL instance — see the "Storage (ADR-0041)"
+-- callout above; this is a single shared store, not a per-node SQLite file).
+INSERT INTO rbac_store.roles (name, description, is_system, created_at)
+  VALUES ('NoDeletion', 'Explicit deny on infrastructure deletion', false, extract(epoch from now())::bigint);
+INSERT INTO rbac_store.role_permissions (role_name, securable_type, operation, effect)
+  VALUES ('NoDeletion', 'Infrastructure', 'Delete', 'deny');
 ```
 
 Assign this role alongside any other roles. Because deny overrides allow, the user will be unable to delete infrastructure resources regardless of their other role assignments.

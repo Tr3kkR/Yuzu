@@ -35,10 +35,12 @@
 ///  - **Backfill: MANDATORY (ADR-0009/0041).** RBAC state is irreducible
 ///    operator intent (custom roles, every grant, groups, membership) that
 ///    cannot be re-derived — `migrate_from_sqlite` seeds defaults then
-///    backfills operator rows (`ON CONFLICT DO NOTHING`), idempotent /
-///    resumable / row-count reconciled, and boot FAILS CLOSED on failure. The
-///    `rbac_enabled` flag is migrated FIRST and read-back-verified — losing it
-///    silently reverts the fleet to RBAC-off (catastrophic fail-open).
+///    backfills operator rows (`ON CONFLICT DO NOTHING`), idempotent / single-
+///    shot (retried from scratch on interruption — not a cursor-resumed
+///    stream, unlike AuditStore's larger dataset) / row-count reconciled, and
+///    boot FAILS CLOSED on failure. The `rbac_enabled` flag is migrated FIRST
+///    and read-back-verified — losing it silently reverts the fleet to
+///    RBAC-off (catastrophic fail-open).
 
 #include <atomic>
 #include <cstdint>

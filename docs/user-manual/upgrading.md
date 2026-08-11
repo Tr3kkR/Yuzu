@@ -624,7 +624,11 @@ server `PgPool`).
   genuinely holding the real file) but means an operator on a mixed-fleet
   first boot or a retained legacy file may see one of a few distinct
   refusals — `docs/ops-runbooks/rbac-store-backfill-recovery.md` covers each
-  and how to tell them apart. A verified-match boot also retries the
+  and how to tell them apart. **On a multi-replica upgrade, boot the replica
+  holding the real, authoritative `rbac.db` first** — this lets the actual
+  migration land before any fileless/stale sibling replica boots and stamps a
+  sourceless marker, avoiding the refusals above entirely rather than having
+  to recover from one. A verified-match boot also retries the
   move-aside automatically, so a once-failed rename does not need manual
   cleanup once the underlying problem (e.g. a permissions issue) is fixed.
   Keep the moved-aside copy until you have confirmed RBAC behaves as
@@ -634,8 +638,12 @@ server `PgPool`).
 
 - **Widened startup budget on large RBAC datasets.** A fleet with many custom
   roles / grants / groups will see a longer first-boot while the backfill
-  streams; this is one-time. Budget for it in the maintenance window and do not
-  kill the server mid-backfill (it is resumable, but let it finish).
+  runs; this is one-time. Budget for it in the maintenance window and avoid
+  killing the server mid-backfill if you can help it — it is **not** resumable
+  (unlike AuditStore's larger, cursor-resumed migration): a killed boot is
+  data-safe (nothing is left half-migrated), but the next boot restarts the
+  whole backfill from scratch rather than continuing where it left off, so an
+  interruption costs you the full window again.
 - **Routine (not just one-time) boot-time cost, every deployment.** Every
   server boot's `seed_defaults()` reseed now coordinates its built-in-default
   grants against any concurrent revoke via a cluster-wide advisory lock
