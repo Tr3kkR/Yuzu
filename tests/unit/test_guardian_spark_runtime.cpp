@@ -154,7 +154,8 @@ std::shared_ptr<GuardianSparkRuntime> make_rt(std::shared_ptr<FakeReader> r,
 // The M1 refresh/demotion intervals are minutes-scale - driving them off an uncontrolled
 // shared auto-tick would make elapsed-time assertions racy against test execution order.
 // Holds its counter in a shared_ptr (not a raw capture) so the runtime's clock stays
-// self-contained per its own lifetime contract (guardian_spark_runtime.hpp:174-178).
+// self-contained per its own lifetime contract (guardian_spark_runtime.hpp:186-193,
+// the constructor doc block).
 struct SettableClock {
     std::shared_ptr<std::atomic<std::int64_t>> ms{std::make_shared<std::atomic<std::int64_t>>(0)};
     void advance(std::int64_t delta_ms) { ms->fetch_add(delta_ms); }

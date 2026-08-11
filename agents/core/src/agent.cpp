@@ -2145,9 +2145,11 @@ public:
                                 // pinned in guardian_health_heartbeat.hpp (drift-proofs the #2298
                                 // server-side rollup reader).
                                 emit_guardian_health_heartbeat_tags(
-                                    tags, GuardianHealthStats{guardian_->unhealthy_suppressed(),
-                                                              guardian_->unhealthy_refreshed(),
-                                                              guardian_->priority_demoted()});
+                                    tags,
+                                    GuardianHealthStats{
+                                        .unhealthy_suppressed = guardian_->unhealthy_suppressed(),
+                                        .unhealthy_refreshed = guardian_->unhealthy_refreshed(),
+                                        .priority_demoted = guardian_->priority_demoted()});
                             }
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
                             // DEX signal observer (every platform with a real observer —
