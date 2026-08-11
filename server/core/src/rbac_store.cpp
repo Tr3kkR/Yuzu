@@ -41,6 +41,19 @@ constexpr const char* kStoreName = "rbac_store";
 // construction before serving, so a wide deadline is fine.
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
+// Availability hardening (governance re-review, #2703 Gate 7 — Fable-reviewed
+// merge slice, item 1 commit A). The hot authz path (`maybe_refresh_generation`,
+// `check_permission`'s own acquire, and `resolve_perm_groups`'s two acquires via
+// `user_rbac_group_names`/`role_effects_for`) is on the request-serving critical
+// path for EVERY confined operator action, so it uses this short acquire budget
+// instead of `kReadTimeout` — under a saturated pool a wave of concurrent authz
+// checks pins each HTTP worker for at most ~250ms instead of ~2s, bounding how
+// much of the shared `http_worker` pool a Postgres degrade can exhaust before
+// the item-1-commit-B breaker (next commit) trips. CRUD/admin RbacStore calls
+// (`assign_role`, `set_permission`, catalogue listings, etc.) are operator-driven,
+// not per-request, and keep the wider `kReadTimeout` — matches
+// `docs/postgres-store-playbook.md`'s hot-path-vs-admin acquire-budget split.
+constexpr std::chrono::milliseconds kAuthzAcquireTimeout{250};
 // sre (Gate 6, #2703): bounds `with_txn_for`'s connection ACQUIRE only
 // (`try_acquire_for`) — not the transaction's own duration once a connection
 // is held. The advisory lock this backfill now takes first (kRevokeCoordLockSql)
@@ -1102,7 +1115,7 @@ void RbacStore::maybe_refresh_generation() const {
     std::optional<std::uint64_t> durable_gen;
     std::optional<bool> durable_enabled;
     bool saw_non_canonical_enabled = false;
-    if (auto lease = pool_.try_acquire_for(kReadTimeout)) {
+    if (auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout)) {
         pg::PgResult r = pg::exec_params(
             lease.get(),
             "SELECT key, value FROM rbac_store.rbac_meta WHERE key IN "
@@ -2213,7 +2226,7 @@ bool RbacStore::check_permission(const std::string& username, const std::string&
         }
     }
 
-    auto lease = pool_.try_acquire_for(kReadTimeout);
+    auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
     if (!lease) {
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
@@ -2386,7 +2399,7 @@ RbacStore::user_rbac_group_names(const std::string& username) const {
     std::vector<std::string> groups;
     if (!open_)
         return std::unexpected("rbac store not open");
-    auto lease = pool_.try_acquire_for(kReadTimeout);
+    auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
     if (!lease)
         return std::unexpected("pool acquire timeout");
     pg::PgResult r = pg::exec_params(
@@ -2404,7 +2417,7 @@ RbacStore::role_effects_for(const std::string& securable_type, const std::string
     std::unordered_map<std::string, int> role_effect; // -1 deny (wins), 1 allow, 0 none
     if (!open_)
         return std::unexpected("rbac store not open");
-    auto lease = pool_.try_acquire_for(kReadTimeout);
+    auto lease = pool_.try_acquire_for(kAuthzAcquireTimeout);
     if (!lease)
         return std::unexpected("pool acquire timeout");
     pg::PgResult r = pg::exec_params(

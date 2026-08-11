@@ -1653,37 +1653,39 @@ TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation 
 
     // Starve replica_b's own pool for the rest of the test: every subsequent
     // maybe_refresh_generation() call on replica_b cannot acquire a
-    // connection and must time out (kReadTimeout, ~2s each) — so each of the
-    // two rbac_enforcement_in_effect() calls below costs ~2s of real wall
-    // time, not just whatever explicit sleep separates them.
+    // connection and must time out. That acquire now uses the short
+    // kAuthzAcquireTimeout (250ms, #2703 Gate 7 merge-slice item 1 commit A —
+    // bounds how long a saturated pool can pin an HTTP worker on the authz
+    // hot path), not the wider kReadTimeout, so a failed attempt's OWN
+    // blocking time is no longer large enough to reliably carry the clock
+    // across kRbacStaleServeBoundMs (5000ms) the way it could when the acquire
+    // itself took ~2s. This test now advances wall time with explicit sleeps
+    // instead of relying on that blocking duration.
     auto held = pool_b.acquire();
     REQUIRE(held);
 
     // Bounded stale-serve (#2703 Gate 7, operator-adjudicated): this FIRST
     // failed refresh attempt lands at roughly construction + 1.1s (the sleep
-    // above) + ~2s (this call's own blocking kReadTimeout) =~ 3.1s -- well
+    // above) + <=0.25s (this call's own blocking kAuthzAcquireTimeout) — well
     // inside kRbacStaleServeBoundMs (5000ms) of replica_b's last confirmed-
     // good refresh (its own construction). This is the whole point of the
     // tolerance: a short blip must NOT immediately widen a genuinely-
     // disabled fleet to enforce. is_open() stays true throughout (no
     // store-level degrade), only the generation view is briefly unconfirmed.
-    // (Deliberately the ONLY read call in this window — is_rbac_enabled()
-    // and rbac_enforcement_in_effect() each independently trigger their own
-    // ~2s blocking attempt once ungated, so calling both here would consume
-    // TWO attempts and overshoot the bound before this assertion runs.)
     CHECK_FALSE(rbac_enforcement_in_effect(&replica_b));
 
-    // Push past the bound: this SECOND call needs no extra sleep — the first
-    // call's own ~2s already re-opened the 1s gate, so this one fires
-    // immediately and lands at roughly 3.1s + ~2s =~ 5.1s since
-    // construction, now genuinely past kRbacStaleServeBoundMs.
-    //
+    // Push past the bound with an explicit sleep — comfortably clears both
+    // the 1s stampede gate (so the next call genuinely attempts a fresh
+    // refresh rather than serving the gated fast path) and, combined with
+    // the ~1.1-1.35s already elapsed, pushes total elapsed time since
+    // construction past kRbacStaleServeBoundMs (5000ms) with margin.
+    std::this_thread::sleep_for(std::chrono::milliseconds(4200));
+
     // Pre-fix (adversarial-review round): is_rbac_enabled() correctly stayed
     // false (the existing contract), but rbac_enforcement_in_effect() ALSO
     // returned false, wrongly admitting the full fleet. Post-fix, and now
     // past the stale-serve bound: enforcement is in effect because the view
-    // is genuinely degraded, not merely aging within tolerance. (Again
-    // deliberately the only read call in this window, for the same reason.)
+    // is genuinely degraded, not merely aging within tolerance.
     CHECK(rbac_enforcement_in_effect(&replica_b));
 }
 
