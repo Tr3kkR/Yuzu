@@ -1203,6 +1203,11 @@ bool RbacStore::is_rbac_enabled() const {
     return rbac_enabled_.load(std::memory_order_relaxed);
 }
 
+bool RbacStore::rbac_enabled_view_degraded() const {
+    std::lock_guard lock(cache_mtx_);
+    return !generation_valid_;
+}
+
 void RbacStore::set_rbac_enabled(bool enabled) {
     if (!open_)
         return;
@@ -1230,9 +1235,23 @@ void RbacStore::set_rbac_enabled(bool enabled) {
 
 bool rbac_enforcement_in_effect(const RbacStore* store) noexcept {
     // Permit the full-fleet fallback (return false) ONLY for a store that is
-    // loaded AND explicitly disabled. Null / load-failed (!is_open()) fail
-    // CLOSED — see the header for the #1498 rationale.
-    return !(store && store->is_open() && !store->is_rbac_enabled());
+    // loaded, explicitly disabled, AND whose disabled view is currently
+    // FRESH. Null / load-failed (!is_open()) fail CLOSED — see the header
+    // for the #1498 rationale.
+    if (!store || !store->is_open())
+        return true;
+    if (store->is_rbac_enabled())
+        return true;
+    // adversarial-review round (#2703): is_rbac_enabled()==false is not, on
+    // its own, proof RBAC is genuinely disabled — maybe_refresh_generation()
+    // (just invoked by the call above) deliberately never touches a stale
+    // cached rbac_enabled_ on a failed refresh, so a replica that has never
+    // itself observed a remote enable stays cached false indefinitely
+    // through an outage. Treat a degraded view (the refresh did not land)
+    // the same as "enabled" here — the one place this distinction is
+    // security-relevant, unlike the raw is_rbac_enabled() accessor other
+    // (non-confinement) callers use.
+    return store->rbac_enabled_view_degraded();
 }
 
 // ── Roles CRUD ───────────────────────────────────────────────────────────────

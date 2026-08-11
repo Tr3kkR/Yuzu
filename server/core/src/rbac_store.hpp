@@ -149,8 +149,23 @@ public:
     [[nodiscard]] bool migrate_from_sqlite(const std::filesystem::path& legacy_db_path);
 
     // ── Global toggle ────────────────────────────────────────────────────
+    /// The cached view of the durable `rbac_enabled` flag, refreshed at most
+    /// once per `kRbacGenerationRefreshMs`. Raw and NOT fail-closed on its
+    /// own: a failed refresh leaves this returning whatever was last
+    /// observed, which can be a stale `false` while the durable flag has
+    /// since flipped `true` elsewhere (adversarial-review round, #2703).
+    /// Confinement-critical callers MUST use `rbac_enforcement_in_effect()`
+    /// instead, which additionally fails closed on a degraded view — this
+    /// raw accessor is for callers that only display or log the toggle.
     bool is_rbac_enabled() const;
     void set_rbac_enabled(bool enabled);
+    /// True when the cached `rbac_enabled` view is NOT currently backed by a
+    /// successful durable-generation refresh (construction counts as one).
+    /// `rbac_enforcement_in_effect()` treats a degraded view the same as
+    /// "enabled" — a failed refresh must not extend trust in a cached
+    /// `false` any more than it may extend trust in a cached permission
+    /// verdict (ADR-0041 "must NOT extend trust").
+    [[nodiscard]] bool rbac_enabled_view_degraded() const;
 
     // ── Roles CRUD ───────────────────────────────────────────────────────
     std::vector<RbacRole> list_roles() const;
@@ -398,7 +413,13 @@ private:
     /// `write_generation` + `rbac_enabled` in ONE query; on a generation change
     /// clear `perm_cache_`; on ANY error clear the cache and mark it invalid
     /// (assume-changed — never extend trust). Leaves `rbac_enabled_` unchanged
-    /// on a read error (never flips to disabled/fail-open). A concurrent
+    /// on a read error (never flips a cached `true` to disabled/fail-open) —
+    /// the OTHER direction (a cached `false` while the durable flag has since
+    /// become `true`) is left to the caller: `rbac_enforcement_in_effect()`
+    /// checks `rbac_enabled_view_degraded()` (i.e. `!generation_valid_`, set
+    /// here) and treats a degraded view as enforced, closing that direction
+    /// without this function needing to guess at a value it could not read.
+    /// A concurrent
     /// caller that misses the gate while a refresh is in flight AND finds the
     /// cache already past the accepted bound counts a `stale_beyond_accepted_bound`
     /// degrade (fjarvis F3) — the acceptance is measured, not assumed.
@@ -416,9 +437,13 @@ private:
 /// Visibility policy for device-listing call sites that fall back to the full
 /// enrolled fleet when RBAC enforcement is OFF. Returns true when RBAC
 /// enforcement is IN EFFECT (caller must use its role-scoped, fail-closed
-/// path); false only for a store that is loaded AND explicitly disabled
-/// (`is_open() && !is_rbac_enabled()`). A null / load-failed store returns true
-/// and so fails CLOSED (#1498).
+/// path); false only for a store that is loaded, explicitly disabled, AND
+/// whose disabled view is currently FRESH (`is_open() && !is_rbac_enabled()
+/// && !rbac_enabled_view_degraded()`). A null / load-failed store returns
+/// true and so fails CLOSED (#1498); a DEGRADED view (the last durable-
+/// generation refresh failed) also returns true — a failed refresh must not
+/// extend trust in a cached "disabled" any more than a cached permission
+/// verdict (adversarial-review round, #2703).
 [[nodiscard]] bool rbac_enforcement_in_effect(const RbacStore* store) noexcept;
 
 /// Build the `groups.name` used for an IdP-sourced group: `source:external_id`.

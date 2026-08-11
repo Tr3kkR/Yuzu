@@ -1613,6 +1613,56 @@ TEST_CASE("RbacStore: a revoke invalidates a cached allow (generation token)",
     CHECK_FALSE(store.check_permission("cacheuser", "Execution", "Execute"));
 }
 
+// adversarial-review round (PR #2703): both external reviewers (Kimi, Codex)
+// independently found that maybe_refresh_generation()'s "never touch
+// rbac_enabled_ on a read error" contract only reasons about the true->false
+// fail-open direction -- a replica that has never itself observed a remote
+// enable stays cached false (enforcement NOT in effect, i.e. AdmitAll)
+// indefinitely through an outage, even after the durable flag has genuinely
+// flipped true elsewhere. Reproduces the real production code path: replica
+// A durably enables RBAC (bumping write_generation); replica B (a SEPARATE
+// store+pool against the SAME database) never observes that write because
+// its own size-1 pool is starved for its next refresh attempt, which
+// genuinely times out and lands in the !durable_gen branch.
+TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation refresh fails "
+          "while another replica has durably enabled RBAC (adversarial-review round, #2703)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    REQUIRE_FALSE(replica_a.is_rbac_enabled()); // fresh install default
+
+    // "Replica B": a separate store + size-1 pool against the SAME database,
+    // so it can be starved independently of replica_a's own pool.
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    REQUIRE_FALSE(replica_b.is_rbac_enabled());
+    // Baseline this test's failure branch must diverge from: genuinely
+    // fresh + disabled correctly reports enforcement NOT in effect.
+    REQUIRE_FALSE(rbac_enforcement_in_effect(&replica_b));
+
+    // Replica A durably enables RBAC -- bumps write_generation in the same
+    // txn (ADR-0041 contract).
+    replica_a.set_rbac_enabled(true);
+    REQUIRE(replica_a.is_rbac_enabled());
+
+    // Clear replica_b's refresh gate so its next read genuinely attempts a
+    // durable re-read rather than serving its just-constructed cache.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // Starve replica_b's own pool: its next maybe_refresh_generation() call
+    // cannot acquire a connection and must time out.
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    // Pre-fix: is_rbac_enabled() correctly stays false (the existing
+    // contract), but rbac_enforcement_in_effect() ALSO returned false,
+    // wrongly admitting the full fleet. Post-fix: enforcement stays in
+    // effect because the view is degraded, not confirmed-disabled.
+    CHECK_FALSE(replica_b.is_rbac_enabled());
+    CHECK(rbac_enforcement_in_effect(&replica_b));
+}
+
 // quality-engineer (#2703): the F3 staleness predicate, pinned with synthetic
 // timestamps — no DB, no real clock. rbac_generation_rules.hpp.
 TEST_CASE("rbac_generation::is_stale_beyond_bound", "[rbac_store]") {
