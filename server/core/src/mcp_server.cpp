@@ -336,7 +336,7 @@ static const ToolDef kTools[] = {
 
     {"get_definition", "Get a single instruction definition with its parameter and result schemas.",
      R"({"type":"object","properties":{"id":{"type":"string","description":"Definition ID"}},"required":["id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"approval_mode":{"type":"string"},"parameter_schema":{"type":"string","description":"Serialized JSON Schema for the definition's parameters"},"result_schema":{"type":"string","description":"Serialized JSON Schema for the definition's result"},"yaml_source":{"type":"string"}},"required":["id","name","version","type","plugin","action"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"type":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"approval_mode":{"type":"string"},"parameter_schema":{"type":"string","description":"Serialized JSON Schema for the definition's parameters"},"result_schema":{"type":"string","description":"Serialized JSON Schema for the definition's result"},"yaml_source":{"type":"string"}},"required":["id","name","version","type","plugin","action","description","approval_mode","parameter_schema","result_schema","yaml_source"]})j"},
 
     {"query_responses",
      "Query command response data. Provide execution_id to collect exactly the "
@@ -394,7 +394,7 @@ static const ToolDef kTools[] = {
      "count) but is NOT yet effective under the global Inventory:Read gate, so results are not "
      "narrowed by management group today (ADR-0017); treat scope as global read until that gate lands.",
      R"j({"type":"object","properties":{"name":{"type":"string","description":"Exact software name filter; omit for all"},"agent_id":{"type":"string","description":"Exact agent/device filter; omit for fleet-wide"},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}})j",
-     R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"devices_omitted":{"type":"string","description":"Count of devices dropped by the management-group filter, as a decimal string (#2973: should be an integer, tracked separately - not changed here to avoid a wire-format break)"}},"required":["software","devices_omitted"]})j"},
+     R"j({"type":"object","properties":{"software":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"string"},"publisher":{"type":"string"},"install_date":{"type":"string"},"kind":{"type":"string"},"ecosystem":{"type":"string"},"epoch":{"type":"string"},"release":{"type":"string"},"arch":{"type":"string"},"signature_status":{"type":"string"},"distro_id":{"type":"string"},"distro_version":{"type":"string"}},"required":["agent_id","name","version","publisher","install_date","kind","ecosystem","epoch","release","arch","signature_status","distro_id","distro_version"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when more rows exist past the limit cap"},"devices_omitted":{"type":"integer","description":"Count of devices dropped by the management-group filter"}},"required":["software","devices_omitted"]})j"},
 
     {"get_tags", "Get all tags for a specific agent.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
@@ -4313,23 +4313,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 // (0 when none) so an agentic caller can tell "out of my scope" from "not
                 // installed anywhere" — the partial- and all-out-of-scope false-negative
                 // (gov UP-12 + enterprise SHOULD-1). The audit row carries it too.
-                // #1634-adjacent, #2973: devices_omitted is a decimal STRING here
-                // (std::to_string, not a JSON integer) - a pre-existing type quirk, not
-                // fixed alongside #2712's schema work since changing a shipped field's
-                // JSON type is itself a wire-format break (same risk as the array-wrap
-                // question this whole batch had to reason about); tracked separately.
+                // devices_omitted is a genuine JSON integer: .raw() splices
+                // std::to_string(dropped_agents)'s digits unquoted (confirmed by
+                // reading JObj::raw() vs JObj::add() - only add() quotes). An
+                // earlier round of this PR wrongly believed this was a string and
+                // filed #2973 on that premise; #2973 is closed as invalid, not
+                // fixed - there was nothing to fix here.
                 result_obj.raw("devices_omitted", std::to_string(dropped_agents));
-                // #2712: structuredContent combines the same rows + the same flags into
-                // ONE schema-conformant object (content[].text above stays the legacy
-                // shape, unchanged; devices_omitted keeps its existing string type here
-                // too, matching the ToolDef schema and #2973's fix being separate).
+                // #2712: structuredContent combines the same rows + the same flags
+                // into ONE schema-conformant object (content[].text above stays the
+                // legacy shape, unchanged). devices_omitted uses .raw() here too,
+                // matching the legacy field's actual (integer) type - using .add()
+                // would quote it into a string, a NEW inconsistency within the same
+                // response that the legacy field never had.
                 JObj structured;
                 structured.raw("software", arr.str());
                 if (!audit_ok)
                     structured.add("audit_persisted", false);
                 if (hit_cap)
                     structured.add("result_truncated_by_cap", true);
-                structured.add("devices_omitted", std::to_string(dropped_agents));
+                structured.raw("devices_omitted", std::to_string(dropped_agents));
                 result_obj.raw("structuredContent", structured.str());
                 res.set_content(success_response(id, result_obj.str()), "application/json");
                 return;
