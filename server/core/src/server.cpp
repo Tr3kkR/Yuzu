@@ -21,6 +21,8 @@
 #include "store_errors.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "rotation_sweep_naming.hpp"
+#include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "body_cap_policy.hpp" // #2407: pre-auth request-body cap policy table
@@ -554,10 +556,11 @@ public:
                           "gauge");
         metrics_.describe("yuzu_mcp_streamed_post_enabled",
                           "1 if SSE-on-POST is enabled (--mcp-enable-streamed-post), else 0. "
-                          "Ships 0; the four defects that gated the on-by-default flip "
-                          "(#2739, #2740, #2785, #2789) are fixed, but the flip itself is a "
-                          "separate rung. If this reads 1, size shutdown grace per the Sizing "
-                          "bullet in docs/user-manual/server-admin.md",
+                          "Ships 1: the four defects that gated the on-by-default flip "
+                          "(#2739, #2740, #2785, #2789) are fixed. Size shutdown grace per the "
+                          "Sizing bullet in docs/user-manual/server-admin.md — that guidance is "
+                          "now the default posture. If this reads 0, the operator opted out "
+                          "with --no-mcp-streamed-post.",
                           "gauge");
         metrics_.describe("yuzu_mcp_stream_closes_total", "MCP SSE streams closed, by reason",
                           "counter");
@@ -1603,6 +1606,18 @@ public:
                           "API token validate_token calls served from in-memory cache", "counter");
         metrics_.describe("yuzu_server_token_cache_misses_total",
                           "API token validate_token calls that fell through to SQLite", "counter");
+        // #2974 review (K7). Gauge-published from a store accessor like its
+        // token-cache siblings above, so it needs no counter() pre-seed to be
+        // present at 0 — the scrape callback sets it every time. (Contrast the
+        // rotation-sweep counters, which DO need an explicit pre-seed: see the
+        // note there.)
+        metrics_.describe("yuzu_server_rotation_pair_resolve_failures_total",
+                          "resolve_rotation_pair_after_revoke partner-clear failures that were "
+                          "swallowed - the revoke they follow has already committed, so they "
+                          "cannot fail the caller. Leaves stale rotation metadata on the "
+                          "surviving partner; NOT a lockout risk (the sweep cannot auto-revoke "
+                          "a stranded partner). Non-zero means inspect manually.",
+                          "counter");
         metrics_.describe("yuzu_server_token_cache_size",
                           "Distinct API tokens currently held in the validate_token cache",
                           "gauge");
@@ -2040,10 +2055,53 @@ public:
         // never close (two live credentials persist). The per-tick try/catch
         // keeps the thread alive; this counter makes that degradation
         // alertable instead of log-only (Gate 8 UP8-6).
+        // P2 #11: this is the SHARED per-tick health counter for the ONE
+        // sweep loop below, which serves BOTH engine-credential AND
+        // human API-token rotation pairs — unlike the auto-revoked/events
+        // counters above (and their yuzu_api_token_rotation_* twins below),
+        // it stays a single un-split series: a failed tick is a tick-level
+        // fault (pool contention / query error), not attributable to one
+        // kind's rows. Name/label/semantics unchanged; only this describe
+        // text was amended so it no longer implies engine-only scope.
         metrics_.describe("yuzu_engine_principal_rotation_sweep_failures_total",
-                          "Cumulative engine-credential rotation-sweep ticks that failed with an "
-                          "exception (predecessor auto-revocation skipped for that tick)",
+                          "Cumulative rotation-sweep ticks that failed with an exception "
+                          "(predecessor auto-revocation skipped for that tick) - the sweep is "
+                          "shared across BOTH engine-credential and human API-token rotation "
+                          "pairs; this counter is not split by principal_kind",
                           "counter");
+        // describe() alone does not publish the family — serialize() emits
+        // nothing until counter() has been called at least once, so without
+        // this the series is ABSENT from /metrics (not present-at-zero)
+        // until the first failed tick, and an increase()>0 alert can miss
+        // the first (possibly only) failure.
+        metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total");
+        // UP-6 (clock-guarded-retention routed concern, part 5): the sweep's
+        // per-tick auto-revoke cap (kMaxAutoRevokesPerTick,
+        // api_token_store.cpp) was hit — more eligible predecessors existed
+        // than this tick processed. Same shared, un-split-by-principal_kind
+        // scope as sweep_failures_total above (the cap is a tick-level
+        // property, not attributable to one kind's rows) — makes an
+        // in-progress multi-tick drain (deliberate degradation, e.g. after a
+        // clock jump) visible/alertable rather than log-only.
+        //
+        // Deliberately kind-neutral NAME (`yuzu_rotation_sweep_capped_total`,
+        // not `yuzu_engine_principal_rotation_sweep_capped_total`): a capped
+        // tick is a tick-level property, not attributable to one kind's
+        // rows, so an `engine_principal`-scoped name would be dishonest
+        // naming under this file's own rule (see the "Deliberately a
+        // SEPARATE, parallel family" note in rotation_sweep_naming.hpp) even
+        // though the counter carries no per-kind label. Its sibling
+        // `..._sweep_failures_total` above keeps the engine-scoped name it
+        // shipped under — renaming an already-shipped series would break
+        // existing alerts, so only THIS series (new in this branch, never
+        // shipped) gets the honest name.
+        metrics_.describe("yuzu_rotation_sweep_capped_total",
+                          "Cumulative rotation-sweep ticks that hit the per-tick auto-revoke cap "
+                          "and deferred the remainder to later ticks - shared across BOTH "
+                          "engine-credential and human API-token rotation pairs, not split by "
+                          "principal_kind",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_capped_total");
         // #2404: confirm-rotation endpoint outcomes, so a 409-conflict or
         // 503-transient retry storm on confirm is alertable instead of
         // invisible (yuzu_http_requests_total has no per-route label). SCOPE
@@ -2065,6 +2123,56 @@ public:
         for (auto surface : {"rest", "mcp"}) {
             for (auto result : {"success", "conflict", "client_error", "transient"}) {
                 metrics_.counter("yuzu_engine_principal_confirm_total",
+                                 {{"surface", surface}, {"result", result}});
+            }
+        }
+        // P2 #11 (SOC 2 CC6.3): human-owned twin of the three engine-credential
+        // rotation families above. The T12 sweep (`sweep_expired_rotations`/
+        // `list_rotations_nearing_expiry_unused`) scans both `principal_kind`s
+        // with no filter — the driver below picks the family via
+        // `rotation_sweep_names_for_kind` (rotation_sweep_naming.hpp), the ONE
+        // chokepoint for this decision. Deliberately a SEPARATE family, never a
+        // `kind` label on the engine names above (dishonest naming under an
+        // `engine_principal`-named series, and it would silently widen that
+        // series' pre-seeded bounded cross-product) — see the header for the
+        // full rationale. Every name/label pulled from
+        // `kHumanRotationSweepNames` so the describe/pre-seed sites here can
+        // never drift from what the driver actually increments.
+        metrics_.describe(kHumanRotationSweepNames.metric_events,
+                          "Cumulative human API-token rotation sweep events, by reason (bounded "
+                          "label set) - the human-owned twin of "
+                          "yuzu_engine_principal_rotation_events_total",
+                          "counter");
+        metrics_.describe(kHumanRotationSweepNames.metric_auto_revoked,
+                          "Cumulative human API-token predecessors auto-revoked at overlap "
+                          "window end - the human-owned twin of "
+                          "yuzu_engine_principal_rotation_auto_revoked_total",
+                          "counter");
+        metrics_.counter(kHumanRotationSweepNames.metric_auto_revoked);
+        for (auto reason : {"successor_unused"}) {
+            metrics_.counter(kHumanRotationSweepNames.metric_events, {{"reason", reason}});
+        }
+        // Human-owned twin of yuzu_engine_principal_confirm_total (#2404):
+        // same scope contract — counts only calls that reached the credential
+        // store or found it unavailable at the store-open guard, `result`
+        // mirrors the same taxonomy plus success, no principal_id label
+        // (bounded cardinality only). Both transports increment this family —
+        // rest_api_v1.cpp's POST /api/v1/tokens/{id}/confirm handler and
+        // mcp_server.cpp's confirm_api_token_rotation tool — this registers +
+        // pre-seeds it so absent() alerts stay meaningful before the first
+        // real confirm. The name is the `kApiTokenConfirmTotalMetric` symbol
+        // (rotation_sweep_naming.hpp), not a repeated string literal, so the
+        // two increment call sites and this registration can never silently
+        // diverge into a shadow series.
+        metrics_.describe(kApiTokenConfirmTotalMetric,
+                          "Human API-token rotation confirm outcomes by surface (rest|mcp) and "
+                          "result (success|conflict|client_error|transient); store-reaching calls "
+                          "only, pre-store denials excluded - the human-owned twin of "
+                          "yuzu_engine_principal_confirm_total",
+                          "counter");
+        for (auto surface : {"rest", "mcp"}) {
+            for (auto result : {"success", "conflict", "client_error", "transient"}) {
+                metrics_.counter(kApiTokenConfirmTotalMetric,
                                  {{"surface", surface}, {"result", result}});
             }
         }
@@ -5028,6 +5136,14 @@ public:
                         .set(static_cast<double>(api_token_store_->cache_misses()));
                     metrics_.gauge("yuzu_server_token_cache_size")
                         .set(static_cast<double>(api_token_store_->cache_size()));
+                    // #2974 review (K7): swallowed partner-clear failures in
+                    // resolve_rotation_pair_after_revoke. Published here rather
+                    // than incremented at the call site because the store holds
+                    // no MetricsRegistry — same accessor pattern as the token
+                    // cache counters above.
+                    metrics_.gauge("yuzu_server_rotation_pair_resolve_failures_total")
+                        .set(static_cast<double>(
+                            api_token_store_->rotation_pair_resolve_failures()));
                 }
                 // #2367: the same observability for the engine-principal
                 // revalidation cache. Without these the cache is invisible —
@@ -5330,28 +5446,47 @@ public:
                 });
         }
 
-        // T12 (design doc §7): engine-credential overlap-pair rotation
-        // sweep — auto-revoke + successor-unused warning. Only started when
-        // api_token_store_ is actually open (nothing to sweep otherwise).
-        // 60s cadence: overlap windows floor at 24h (kOverlapFloorSecs in
-        // api_token_store.cpp), so a minute of sweep latency is immaterial
-        // to either half's correctness — the sweep is idempotent and a
-        // missed tick simply defers to the next one (see
-        // sweep_expired_rotations's doc comment).
+        // T12 (design doc §7): overlap-pair rotation sweep — auto-revoke +
+        // successor-unused warning, covering BOTH engine-credential and
+        // (P2 #11) human API-token rotation pairs; the scan itself has no
+        // principal_kind filter. Only started when api_token_store_ is
+        // actually open (nothing to sweep otherwise). 60s cadence: overlap
+        // windows floor at 24h (kOverlapFloorSecs in api_token_store.cpp),
+        // so a minute of sweep latency is immaterial to either half's
+        // correctness — the sweep is idempotent and a missed tick simply
+        // defers to the next one (see sweep_expired_rotations's doc
+        // comment). Each swept row/pair is routed to the engine or human
+        // metric family + audit action by `rotation_sweep_names_for_kind`
+        // (rotation_sweep_naming.hpp) — the ONE chokepoint for that
+        // decision, keyed on the predecessor's `principal_kind`.
         if (api_token_store_ && api_token_store_->is_open()) {
             engine_rotation_sweep_thread_ = std::thread([this]() {
-                spdlog::info("Engine-credential rotation sweep thread started (interval=60s)");
+                spdlog::info("Rotation sweep thread started (engine-credential + human "
+                             "API-token, interval=60s)");
                 // Successor-unused warnings are process-local, best-effort
                 // de-duplication (mirrors ApiTokenStore's own rotation-grace
                 // cache precedent) — keyed on rotation_group, so the SAME
-                // pair isn't re-audited/re-counted every tick while its
-                // window is still open. Pruned each tick to whatever
+                // pair isn't re-audited/re-counted every tick during its
+                // PRE-elapse lead-time window (a heads-up ahead of the
+                // scheduled auto-revoke). Crossing INTO the elapsed state
+                // (UP-5: a never-used successor's predecessor is no longer
+                // auto-revoked, so the pair can sit stuck-open indefinitely)
+                // is a distinct fact and gets its own warning, tracked in a
+                // second set — but the three signals do NOT share a cadence,
+                // and `rotation_warn_dedup.hpp` is the ONLY authority on
+                // which fires when. In short: the LOG LINE repeats every
+                // tick while the pair stays stuck; the AUDIT ROW and the
+                // METRIC fire once per pair per state. Do not restore
+                // per-tick emission of the row from this comment — an
+                // un-throttled row is ~1440/day per stuck pair into the SOC 2
+                // audit store, which is what it did once already.
+                // Pruned each tick to whatever
                 // list_rotations_nearing_expiry_unused still returns, so a
                 // resolved pair (revoked, confirmed, or finally used) frees
                 // its slot for a future rotation on the same principal. A
-                // process restart forfeits the de-dup state and re-warns
-                // once — acceptable for an operational signal.
-                std::unordered_set<std::string> warned_rotation_groups;
+                // process restart forfeits the pre-elapse de-dup state and
+                // re-warns once more — acceptable for an operational signal.
+                RotationWarnDedup warn_dedup;
                 // Warn once the predecessor's overlap window has this much
                 // time left — matches the 24h overlap floor: the operator
                 // gets a full floor-window's notice before auto-revoke, the
@@ -5388,23 +5523,35 @@ public:
                     // so without this the sweep-failures alert would stay at zero
                     // while rotated-out credentials silently outlive their window.
                     bool sweep_tick_failed = false;
-                    auto revoked = api_token_store_->sweep_expired_rotations(now, &sweep_tick_failed);
+                    bool sweep_tick_capped = false;
+                    auto revoked = api_token_store_->sweep_expired_rotations(
+                        now, &sweep_tick_failed, &sweep_tick_capped);
                     if (sweep_tick_failed) {
-                        spdlog::warn("Engine-credential rotation sweep tick could not run (pool "
+                        spdlog::warn("Rotation sweep tick could not run (pool "
                                      "contention / query failure) — predecessor auto-revoke deferred "
                                      "to the next tick");
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
                             .increment();
                     }
+                    // UP-6: the per-tick cap already logged the eligible/
+                    // processed counts inside the store — the counter here is
+                    // the alertable signal that a drain is in progress.
+                    if (sweep_tick_capped) {
+                        metrics_.counter("yuzu_rotation_sweep_capped_total").increment();
+                    }
                     for (const auto& predecessor : revoked) {
-                        metrics_.counter("yuzu_engine_principal_rotation_auto_revoked_total")
-                            .increment();
+                        // P2 #11: route to the engine or human family/audit
+                        // action by THIS row's own principal_kind — never
+                        // assume every swept row is engine-owned.
+                        const auto& names =
+                            rotation_sweep_names_for_kind(predecessor.principal_kind);
+                        metrics_.counter(names.metric_auto_revoked).increment();
                         if (audit_store_ && audit_store_->is_open()) {
                             (void)audit_store_->log(
                                 {.timestamp = now,
                                  .principal = "system",
                                  .principal_role = "system",
-                                 .action = "engine_principal.rotation.auto_revoke",
+                                 .action = names.audit_auto_revoke,
                                  .target_type = "ApiToken",
                                  .target_id = predecessor.token_id,
                                  .detail = "principal_id=" + predecessor.principal_id +
@@ -5416,7 +5563,7 @@ public:
                         // under (rotation_group == successor's token_id,
                         // never the predecessor's) is pruned below anyway,
                         // but drop it here too for clarity/promptness.
-                        warned_rotation_groups.erase(predecessor.rotation_group);
+                        warn_dedup.resolve(predecessor.rotation_group);
                     }
 
                     // Half 2: successor-unused warning — an OPERATIONAL
@@ -5429,26 +5576,54 @@ public:
                     std::unordered_set<std::string> still_nearing;
                     for (const auto& pair : nearing) {
                         still_nearing.insert(pair.successor.rotation_group);
-                        if (warned_rotation_groups.contains(pair.successor.rotation_group))
-                            continue; // already warned this rotation attempt — don't re-spam
-                        warned_rotation_groups.insert(pair.successor.rotation_group);
+                        // UP-5: `list_rotations_nearing_expiry_unused` now
+                        // also returns a pair whose predecessor window has
+                        // ALREADY elapsed — sweep_expired_rotations
+                        // deliberately declines to auto-revoke it while the
+                        // successor stays unused, so this is the only
+                        // remaining signal for it. The signals do NOT share a
+                        // cadence — `RotationWarnDedup` owns which fire on this
+                        // tick, and its header states why (an un-throttled
+                        // audit row on an indefinitely-stuck pair is ~1440/day
+                        // into the SOC 2 evidence store).
+                        const bool elapsed = pair.predecessor.overlap_expires_at <= now;
+                        const auto signals =
+                            warn_dedup.observe(pair.successor.rotation_group, elapsed);
 
+                        if (signals.log) {
+                            spdlog::warn(
+                                "Rotation predecessor {} (principal {}) is past its overlap "
+                                "window but the successor has never been used — auto-revoke "
+                                "was declined to avoid leaving zero usable credentials; both "
+                                "stay active until an operator confirms or revokes explicitly",
+                                pair.predecessor.token_id, pair.predecessor.principal_id);
+                        }
+                        if (!signals.record_event)
+                            continue; // already counted and audited for this state
+
+                        // P2 #11: same per-row discrimination as Half 1,
+                        // keyed on the predecessor (the pair shares one
+                        // principal_id, so predecessor/successor always
+                        // agree on principal_kind).
+                        const auto& names =
+                            rotation_sweep_names_for_kind(pair.predecessor.principal_kind);
                         metrics_
-                            .counter("yuzu_engine_principal_rotation_events_total",
-                                     {{"reason", "successor_unused"}})
+                            .counter(names.metric_events, {{"reason", "successor_unused"}})
                             .increment();
                         if (audit_store_ && audit_store_->is_open()) {
                             (void)audit_store_->log(
                                 {.timestamp = now,
                                  .principal = "system",
                                  .principal_role = "system",
-                                 .action = "engine_principal.rotation.successor_unused",
+                                 .action = names.audit_successor_unused,
                                  .target_type = "ApiToken",
                                  .target_id = pair.successor.token_id,
                                  .detail = "principal_id=" + pair.predecessor.principal_id +
                                            " predecessor_token_id=" + pair.predecessor.token_id +
                                            " overlap_expires_at=" +
-                                           std::to_string(pair.predecessor.overlap_expires_at),
+                                           std::to_string(pair.predecessor.overlap_expires_at) +
+                                           (elapsed ? " status=elapsed_unrevoked_successor_unused"
+                                                    : ""),
                                  .result = "warning"});
                         }
                     }
@@ -5456,22 +5631,20 @@ public:
                     // (resolved via revoke, confirm, or the successor
                     // finally being used) so a later rotation on the same
                     // principal can warn again.
-                    std::erase_if(warned_rotation_groups, [&](const std::string& group) {
-                        return !still_nearing.contains(group);
-                    });
+                    warn_dedup.prune(still_nearing);
                     } catch (const std::exception& e) {
-                        spdlog::error("Engine-credential rotation sweep tick failed: {}",
+                        spdlog::error("Rotation sweep tick failed: {}",
                                      e.what());
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
                             .increment();
                     } catch (...) {
-                        spdlog::error("Engine-credential rotation sweep tick failed: unknown "
+                        spdlog::error("Rotation sweep tick failed: unknown "
                                       "exception");
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
                             .increment();
                     }
                 }
-                spdlog::info("Engine-credential rotation sweep thread stopped");
+                spdlog::info("Rotation sweep thread stopped");
             });
         }
 
@@ -7539,19 +7712,19 @@ private:
         // its sibling above, from the same post-clamp number.
         metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
-        // A dormant, security-relevant toggle nobody can confirm is dormant is an
-        // operability gap. --max-sse-streams already surfaces its resolved value as a
-        // gauge; this does the same, so an operator can answer "is streamed POST live
-        // on this box" from /metrics rather than from ps.
+        // A security-relevant toggle nobody can confirm the state of is an operability
+        // gap. --max-sse-streams already surfaces its resolved value as a gauge; this
+        // does the same, so an operator can answer "is streamed POST live on this box"
+        // from /metrics rather than from ps.
         metrics_.gauge("yuzu_mcp_streamed_post_enabled")
             .set(cfg_.mcp_streamed_post_enable ? 1.0 : 0.0);
         spdlog::info("MCP streamed POST (SSE-on-POST): {}{}",
-                     cfg_.mcp_streamed_post_enable ? "ENABLED" : "disabled (default)",
+                     cfg_.mcp_streamed_post_enable ? "ENABLED" : "disabled",
                      cfg_.mcp_streamed_post_enable
                          ? " - size shutdown grace above the 120s response cap plus a "
                            "drain margin (see the Sizing bullet in "
                            "docs/user-manual/server-admin.md)"
-                         : " - enable with --mcp-enable-streamed-post");
+                         : " - re-enable with --mcp-enable-streamed-post");
         spdlog::info("HTTP worker pool: {} threads, sized for {} concurrent held-open responses "
                      "(plain-REST reserve {}). EVERY streaming surface leases from one budget: "
                      "GET /mcp/v1/, MCP streamed POST, GET /api/v1/events, the dashboard "

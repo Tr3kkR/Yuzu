@@ -19,7 +19,7 @@
 /// write `rbac.db`, and it enforces nothing on the wire — it is a header-only
 /// vocabulary + a handful of pure classification rules, seeded with the SAME
 /// securable/operation catalogue `RbacStore::seed_defaults()` hardcodes today
-/// (`rbac_store.cpp:291-327`+ops, 22 seeded types, read-only reference) so PR1.9 has real data
+/// (`rbac_store.cpp:291-327`+ops, 23 seeded types, read-only reference) so PR1.9 has real data
 /// to migrate rather than a speculative schema. `mcp_policy.hpp` is the other
 /// read-only reference for the existing (securable, operation) vocabulary in
 /// live use.
@@ -38,6 +38,10 @@ namespace yuzu::server::authz {
 /// `rbac_store.cpp` seed comment) — deliberately excluded from the CRUD
 /// loops there, and included here for the same reason: a Module capability
 /// can genuinely declare it (the seed catalogue below has an example).
+/// `Rotate` is an EIGHTH (P2 #11, SOC 2 CC6.3, `rbac_store.cpp` seed
+/// comment), same treatment, and DELIBERATELY DISTINCT from `Write` on its
+/// own securable (`ApiToken`) — why is mcp_policy.hpp's `tier_allows()`
+/// operator-tier comment, the single narrative home for that finding.
 enum class Operation : uint8_t {
     Read,
     Write,
@@ -46,6 +50,7 @@ enum class Operation : uint8_t {
     Approve,
     Push,
     Attest,
+    Rotate,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(Operation op) {
@@ -57,6 +62,7 @@ enum class Operation : uint8_t {
         case Operation::Approve: return "Approve";
         case Operation::Push: return "Push";
         case Operation::Attest: return "Attest";
+        case Operation::Rotate: return "Rotate";
     }
     return "";
 }
@@ -126,7 +132,7 @@ enum class RiskTier : uint8_t {
         return McpTierClass::Read;
     if (op == Operation::Execute)
         return McpTierClass::Execute;
-    return McpTierClass::Write; // Write/Delete/Approve/Push/Attest: all mutating effects
+    return McpTierClass::Write; // Write/Delete/Approve/Push/Attest/Rotate: all mutating effects
 }
 
 /// The rule for sensitive definitions: a floor `risk_tier` per operation, so
@@ -142,6 +148,10 @@ enum class RiskTier : uint8_t {
         case Operation::Write: return RiskTier::Medium;
         case Operation::Execute: return RiskTier::Medium;
         case Operation::Attest: return RiskTier::Medium;
+        // Same floor as Write — Rotate is a self-service mutating operation
+        // on its own securable (ApiToken), not a fleet-wide or irreversible
+        // one like Delete/Approve/Push.
+        case Operation::Rotate: return RiskTier::Medium;
         case Operation::Delete: return RiskTier::High;
         case Operation::Approve: return RiskTier::High;
         case Operation::Push: return RiskTier::High;
@@ -235,7 +245,7 @@ struct CapabilityDeclaration {
         // risk_tier needs a CEILING as well as the floor check below: a decoder
         // casting an unparseable value (CDX-R2-005) must not slip through just
         // because a high bit pattern sits above every operation's floor.
-        if (static_cast<uint8_t>(operation) > static_cast<uint8_t>(Operation::Attest) ||
+        if (static_cast<uint8_t>(operation) > static_cast<uint8_t>(Operation::Rotate) ||
             static_cast<uint8_t>(mcp_tier_class) > static_cast<uint8_t>(McpTierClass::Execute) ||
             static_cast<uint8_t>(risk_tier) > static_cast<uint8_t>(RiskTier::Critical))
             return false;
@@ -291,7 +301,7 @@ struct CapabilitySeed {
 }
 
 /// A small, representative seed catalogue — NOT a full mirror of
-/// `RbacStore`'s 21 securables × 7 operations. It exists so PR1.9 has real
+/// `RbacStore`'s 23 securables × 8 operations catalogue. It exists so PR1.9 has real
 /// rows to migrate and so this header's own tests exercise `is_valid`, not
 /// to be the registry itself (that is explicitly out of scope here). Covers
 /// an ordinary CRUD securable (`Response:Read`), a Tag write (mirrors

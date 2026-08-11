@@ -321,14 +321,12 @@ struct Config {
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only
     // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
     bool mcp_streaming_disable{false}; // --mcp-no-streaming: no sessions, GET/DELETE → 405
-    /// SSE-on-POST (streamed POST, 2f PR 3b). Ships OFF: the machinery is complete and
+    /// SSE-on-POST (streamed POST, 2f PR 3b). Ships ON: the machinery is complete and
     /// reviewed, and the four defects that gated the on-by-default flip (#2739, #2740,
-    /// #2785, #2789) are fixed. Turning the default on is a SEPARATE rung - this flag
-    /// stays off until then.
-    /// Same shape as Spark's `prefer_spark_`: land the machinery dormant, cut over
-    /// where the invariants actually hold. NOT --mcp-no-streaming, which disables the
-    /// whole transport (sessions + GET/DELETE) including rungs already shipped.
-    bool mcp_streamed_post_enable{false}; // --mcp-enable-streamed-post
+    /// #2785, #2789) are fixed. Pass --no-mcp-streamed-post to opt out.
+    /// NOT --mcp-no-streaming, which disables the whole transport (sessions +
+    /// GET/DELETE) including rungs already shipped.
+    bool mcp_streamed_post_enable{true}; // --mcp-enable-streamed-post
     /// Allowed Origin header values for /mcp/v1/ (scheme+host+port, exact match).
     /// Empty ⇒ any PRESENT Origin is rejected (secure default; absent Origin is
     /// allowed because the endpoint requires a credential). Wired via the

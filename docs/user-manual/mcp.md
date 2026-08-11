@@ -130,6 +130,7 @@ results.
 | `--mcp-disable` | `YUZU_MCP_DISABLE` | `false` | Disable the MCP endpoint entirely. All requests to `/mcp/v1/` (POST/GET/DELETE) return an error. |
 | `--mcp-read-only` | `YUZU_MCP_READ_ONLY` | `false` | Restrict MCP to read-only tools only. Write and execute operations are rejected regardless of the token's tier. |
 | `--mcp-no-streaming` | `YUZU_MCP_NO_STREAMING` | `false` | Disable the Streamable HTTP transport: no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` → `405`, plain JSON-RPC POST only. The `202`-on-notification status still applies. |
+| `--mcp-enable-streamed-post` / `--no-mcp-streamed-post` | `YUZU_MCP_ENABLE_STREAMED_POST` | `true` | Enable SSE-on-POST (streamed POST) for `execute_instruction` callers that send `_meta.progressToken` with an SSE-capable `Accept`. Pass `--no-mcp-streamed-post` to opt out and fall back to the pre-flip plain-POST-only behavior. |
 | `--mcp-allowed-origin` | `YUZU_MCP_ALLOWED_ORIGINS` | *(none)* | **Repeatable.** Allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/`. An absent `Origin` is always allowed (the endpoint requires a credential); an empty allowlist rejects any *present* `Origin` — browser-based MCP clients must be listed explicitly. |
 
 ### Examples
@@ -230,7 +231,7 @@ change: a notification POST now answers `202` instead of `204`).
   frames is indistinguishable from "nothing has happened yet". `execute_bundle` does
   **not** emit progress (poll `get_bundle_result`). Progress can be delivered two
   ways, and the client chooses per request **on a server that has enabled streamed
-  POST** (`--mcp-enable-streamed-post`, off by default): send an SSE-capable `Accept` alongside
+  POST** (`--mcp-enable-streamed-post`, on by default): send an SSE-capable `Accept` alongside
   the `progressToken` and the POST response itself streams the progress frames and
   then the result; send the token without an SSE `Accept` and the frames go to the
   session's `GET` stream after the POST has already answered. See
@@ -423,9 +424,9 @@ for the tool to execute.
 | 20 | `validate_scope` | Validate a scope expression without executing it. | (none -- always allowed) |
 | 21 | `preview_scope_targets` | Show which agents match a scope expression. | `Infrastructure:Read` |
 | 22 | `list_pending_approvals` | List pending approval requests (filterable by status, submitter). | `Approval:Read` |
-| 23 | `execute_instruction` | Execute a plugin action on agents. Returns `{command_id, execution_id, agents_reached, plugin, action}`; poll results with `query_responses` or subscribe to live events via REST `GET /api/v1/events?execution_id=<id>`. | `Execution:Execute` |
+| 23 | `execute_instruction` | Execute a plugin action on agents. Returns `{command_id, execution_id, agents_reached, plugin, action}` (`agents_reached` >= 1); poll results with `query_responses` or subscribe to live events via REST `GET /api/v1/events?execution_id=<id>`. If no agent was reachable, returns the OTHER outcome instead: `{status:"no_agents_reached", command_id, execution_id, agents_reached:0, plugin, action, message}` — the two shapes are mutually exclusive (`outputSchema`'s `oneOf`), never mixed. | `Execution:Execute` |
 | 24 | `list_issued_certs` | List certificates issued by the internal CA (serial, subject, purpose, status, expiry, revocation). MCP mirror of `GET /api/v1/ca/issued`. `limit`/`offset` args. | `Security:Read` |
-| 25 | `revoke_certificate` | Revoke an issued certificate by `serial_hex` and republish the CRL. MCP mirror of `POST /api/v1/ca/revoke`. Destructive. | `Security:Delete` |
+| 25 | `revoke_certificate` | Revoke an issued certificate by `serial_hex` and republish the CRL. MCP mirror of `POST /api/v1/ca/revoke`. Destructive. Returns `{revoked, serial_hex, crl_republished}` (plus `audit_persisted:false` on a dropped audit row). | `Security:Delete` |
 | 26 | `list_dex_signals` | DEX catalogue rollup: every observation type in the window with count, blast radius, last seen. Optional `os` (`all`/`windows`/`linux`/`macos`) narrows to one OS's signals. Mirrors `GET /api/v1/dex/signals`. | `GuaranteedState:Read` |
 | 27 | `get_dex_signal_scope` | DEX per-OS signal coverage (distinct types + total events per platform). Mirrors `GET /api/v1/dex/scope`. | `GuaranteedState:Read` |
 | 28 | `get_dex_signal_detail` | One DEX signal's drill-down (subjects, OS split, most-affected devices, trend). Optional `os` scopes subjects/devices/by_day (echoed in the result; OS split stays cross-OS). Behavioral — every call emits `dex.signal.view`. Mirrors `GET /api/v1/dex/signals/{obs_type}`. | `GuaranteedState:Read` |
@@ -442,11 +443,11 @@ for the tool to execute.
 | 39 | `get_dex_app_perf` | Fleet CPU/working-set trend for one application, by version, over the retained window. Mirrors `GET /api/v1/dex/perf/app`. | `GuaranteedState:Read` |
 | 40 | `get_dex_group_app_perf` | One management group's app-performance trend (sub-floor-suppressed below 10 devices). Mirrors `GET /api/v1/dex/perf/group`. | `GuaranteedState:Read` |
 | 41 | `compare_app_perf_versions` | Cohort-paired **before/after** comparison (the `/auto` VERIFY stage): did upgrading `app` from `baseline` to `candidate` change how the same machines in `group` perform? Per-machine paired delta, aggregated; EVIDENTIAL (no verdict). Identity-free aggregate; carries `truncated`/`small_cohort`/`insufficient` honesty flags. Recorded under the generic `mcp.compare_app_perf_versions` tool-call audit (subject in detail); `audit_persisted:false` in the body on a dropped row. Mirrors `GET /api/v1/dex/perf/compare`. | `GuaranteedState:Read` |
-| 42 | `set_tag` | Set a device tag (structured category or free-form) on `agent_id`. Structured-category keys (`role`/`environment`/`location`/`service`) are case-normalised and validated against their allowed set; a category change fires the agent tag-push. Returns `{set, agent_id, key}` (plus `audit_persisted:false` on a dropped audit row). Mirrors `PUT /api/v1/tags` — **one divergence:** setting a `service` tag via MCP does **not** auto-materialise the `Service: <value>` management group the REST/dashboard path creates (a tracked follow-up); the tag itself is written identically. Requires the **operator** or **supervised** tier. | `Tag:Write` |
-| 43 | `delete_tag` | Delete a device tag by `agent_id` + `key`. Destructive — **approval-gated** on the operator AND supervised tiers: the first call returns `kApprovalRequired` (-32006) with `approval_id` + `status_url`; after an admin approves, re-call with the `approval_id` argument to execute (one-time; replay rejected). Returns `{deleted, agent_id, key}`; a missing tag is a 404-equivalent (`kInvalidParams`, "tag not found"). Mirrors `DELETE /api/v1/tags/{agent_id}/{key}`. | `Tag:Delete` |
-| 44 | `approve_request` | Approve a pending approval request by `approval_id` (optional `comment`, audited). The reviewer is the MCP principal and **cannot be the submitter** (store-enforced), and only a **pending** request can be reviewed — a retry on an already-approved/rejected id returns `kInvalidParams` ("approval already reviewed"), **not** a success (approve is a one-shot state transition, not an idempotent write; treat a retry-after-timeout accordingly). Returns `{approved, approval_id}`. Mirrors `POST /api/approvals/{id}/approve`. Requires the **supervised** tier. | `Approval:Approve` |
-| 45 | `reject_request` | Reject a pending approval request by `approval_id` (optional `comment`). Same reviewer≠submitter + pending-only rules as `approve_request`. Returns `{rejected, approval_id}`. Mirrors `POST /api/approvals/{id}/reject`. Requires the **supervised** tier. | `Approval:Approve` |
-| 46 | `quarantine_device` | Isolate a device from the network. **Records** the quarantine (`POST /api/v1/quarantine` parity) **and dispatches** the live quarantine-plugin isolation (`plugin=quarantine`, `action=quarantine`), whitelisting the management server plus any extra IPs in the `whitelist` arg (comma-separated). Destructive — **approval-gated** on the supervised tier (ticket-then-recall). Returns `{command_id, agents_reached, quarantine_record}` (`agents_reached=0` if the agent was offline for the isolation dispatch — the record still persists). Not an executions-drawer producer. **No MCP release counterpart yet** — to lift a quarantine, use REST `DELETE /api/v1/quarantine/{agent_id}` or the dashboard (a `release_quarantine` MCP tool is a tracked follow-up). The live isolation keeps the agent's existing management connection alive (`ESTABLISHED,RELATED`); a device that fully drops and reconnects while quarantined may need out-of-band release. | `Security:Execute` |
+| 42 | `set_tag` | Set a device tag (structured category or free-form) on `agent_id`. Structured-category keys (`role`/`environment`/`location`/`service`) are case-normalised and validated against their allowed set; a category change fires the agent tag-push. Returns `{set, agent_id, key}` (plus `audit_persisted:false` on a dropped audit row) — a **superset** of REST `PUT /api/v1/tags`'s bare `{set:true}`. **One divergence beyond the response shape:** setting a `service` tag via MCP does **not** auto-materialise the `Service: <value>` management group the REST/dashboard path creates (a tracked follow-up); the tag itself is written identically. Requires the **operator** or **supervised** tier. | `Tag:Write` |
+| 43 | `delete_tag` | Delete a device tag by `agent_id` + `key`. Destructive — **approval-gated** on the operator AND supervised tiers: the first call returns `kApprovalRequired` (-32006) with `approval_id` + `status_url`; after an admin approves, re-call with the `approval_id` argument to execute (one-time; replay rejected). Returns `{deleted, agent_id, key}` (plus `audit_persisted:false` on a dropped audit row) — a **superset** of REST `DELETE /api/v1/tags/{agent_id}/{key}`'s bare `{deleted:true}`; a missing tag is a 404-equivalent (`kInvalidParams`, "tag not found"). | `Tag:Delete` |
+| 44 | `approve_request` | Approve a pending approval request by `approval_id` (optional `comment`, audited). The reviewer is the MCP principal and **cannot be the submitter** (store-enforced), and only a **pending** request can be reviewed — a retry on an already-approved/rejected id returns `kInvalidParams` ("approval already reviewed"), **not** a success (approve is a one-shot state transition, not an idempotent write; treat a retry-after-timeout accordingly). Returns `{approved, approval_id}` (plus `audit_persisted:false` on a dropped audit row). Writes through the same `ApprovalManager::approve()` as the legacy dashboard route `POST /api/approvals/{id}/approve`, but that route's response is `{"status":"approved"}` (an HTMX toast payload) — **NOT** the same wire shape; do not treat the two as interchangeable. Requires the **supervised** tier. | `Approval:Approve` |
+| 45 | `reject_request` | Reject a pending approval request by `approval_id` (optional `comment`). Same reviewer≠submitter + pending-only rules as `approve_request`. Returns `{rejected, approval_id}` (plus `audit_persisted:false` on a dropped audit row). Writes through the same `ApprovalManager::reject()` as the legacy dashboard route `POST /api/approvals/{id}/reject`, but that route returns `{"status":"rejected"}` (an HTMX toast payload) — **NOT** the same wire shape. Requires the **supervised** tier. | `Approval:Approve` |
+| 46 | `quarantine_device` | Isolate a device from the network. **Records** the quarantine (`POST /api/v1/quarantine` parity) **and dispatches** the live quarantine-plugin isolation (`plugin=quarantine`, `action=quarantine`), whitelisting the management server plus any extra IPs in the `whitelist` arg (comma-separated). Destructive — **approval-gated** on the supervised tier (ticket-then-recall). Returns `{command_id, agents_reached, quarantine_record}` (`agents_reached=0` if the agent was offline for the isolation dispatch — the record still persists) (plus `audit_persisted:false` on a dropped audit row). Not an executions-drawer producer. **No MCP release counterpart yet** — to lift a quarantine, use REST `DELETE /api/v1/quarantine/{agent_id}` or the dashboard (a `release_quarantine` MCP tool is a tracked follow-up). The live isolation keeps the agent's existing management connection alive (`ESTABLISHED,RELATED`); a device that fully drops and reconnects while quarantined may need out-of-band release. | `Security:Execute` |
 | 47 | `discover_permissions` | A2 discovery (roadmap Issue 17.1): RBAC permission catalog — every `securable_type` × `operation` pair, plus the full role → allowed-operations grid **for callers holding `UserManagement:Read`**; without it the tool still succeeds and returns the taxonomy with `roles_omitted: true` and a reason (declared, never silent). Mirrors `GET /api/v1/discover/permissions`, same builder function (no drift). | `Infrastructure:Read` (taxonomy); the `roles[]` grid additionally needs `UserManagement:Read` (#2376) |
 | 48 | `discover_instructions` | A2 discovery: published (`enabled_only=true`) `InstructionDefinition` catalog with `parameter_schema` as a nested JSON Schema object. Mirrors `GET /api/v1/discover/instructions`. | `InstructionDefinition:Read` |
 | 49 | `discover_routes` | A2 discovery: REST route catalog, a subset of the SAME OpenAPI document `GET /api/v1/openapi.json` serves. Carries `source:"openapi"` and a caveat that it is hand-maintained, not generated from the live route table. Mirrors `GET /api/v1/discover/routes`. | `Infrastructure:Read` |
@@ -470,6 +471,55 @@ for the tool to execute.
 | 67 | `get_access_review` (SOC 2 CC6.2) | Full evidentiary state of one review campaign: metadata plus every frozen attestation row (`pending`/`attested`/`flagged_revoke`) plus `pending_count`. Mirrors `GET /api/v1/access-reviews/{id}`. Self-audited as `access_review.get`. | `AccessReview:Read` |
 | 68 | `list_access_reviews` (SOC 2 CC6.2) | List every review campaign's metadata (**not** its attestations — use `get_access_review` for those), newest-first, capped at the most recent 500. The surface an auditor needs to prove reviews ran on cadence without already knowing a `campaign_id` out-of-band. Mirrors `GET /api/v1/access-reviews`. Self-audited as `access_review.list`. | `AccessReview:Read` |
 | 69 | `close_access_review` (SOC 2 CC6.2) | Close an open review campaign. Does **not** require every attestation to be decided first — a campaign closed with `pending` rows still outstanding is itself evidence (an incomplete review), not something this tool silently forces to completion. Closing is a **one-way lifecycle transition** (there is no reopen path) that permanently freezes every still-`pending` attestation — `destructiveHint:true`. It deletes no evidence (attestation rows are untouched), but the campaign's own `open`→`closed` state is irreversibly transitioned, which is what the hint reflects (corrected from a shipped `destructiveHint:false` — 2g PR 2). Mirrors `POST /api/v1/access-reviews/{id}/close`. Self-audited as `access_review.closed`. | `AccessReview:Attest` |
+| 70 | `rotate_api_token` (P2 #11, SOC 2 CC6.3) | Self-service overlap-pair rotation of a **human-owned** API token: mints a successor token alongside the still-valid predecessor for the overlap window (default 7 days, accepted range 1–3650, floor 24h — arg `overlap_days`, rejected outright — never truncated — below the floor). BOUNDED-IDEMPOTENT, not generally idempotent: a re-call within a short grace window after the original mint re-serves the SAME successor secret (each reveal — original or replay — is independently audited as `api_token.reveal`); past the grace window a re-call errors and the caller falls back to an explicit new token. Self-service ONLY: the caller must own the `token_id` being rotated — no admin override; an unknown `token_id` and a not-owned one are indistinguishable (`kInvalidParams`, "token not found" — not an enumeration oracle). The successor **always** inherits the predecessor's `expires_at` verbatim — not a caller argument. **Wire-shape divergence from the REST twin (deliberate):** REST takes `overlap_secs`, this tool takes `overlap_days` (matching `rotate_engine_credential`'s MCP shape) — bounds are checked BEFORE the `*86400` multiply as an overflow guard. The returned `token_id` is the successor's, resolved via the shared `derive_rotation_successor` helper (`token_rotation_lookup.hpp`) scoped exactly to the predecessor rotated — never "any linked row of this principal", which is unsound once a principal has more than one rotation in flight (this human arm's ceiling is ≤2 active **per rotation group**, unlike the engine arm's ≤2-active-**per-principal**); a lookup miss right after a successful rotate fails CLOSED (retryable error, never a success with an empty `token_id`) rather than risk pairing the real secret with the wrong id. `overlap_expires_at` is the **predecessor's** own stamp (the successor row never carries one). Mirrors `POST /api/v1/tokens/{id}/rotate`. Destructive — requires the `operator` tier (self-service, no approval gate — see the tier note below). | `ApiToken:Rotate` |
+| 71 | `confirm_api_token_rotation` (P2 #11, SOC 2 CC6.3) | Explicit maker-checker confirmation that a rotated API token's successor secret has been received/installed. Distinct from `rotate_api_token` itself — rotate is the "here is the secret" reveal step; confirm is a separate attestation that closes the loop. `token_id` is the **successor** `token_id` the rotate call returned — the confirm is pinned to that exact rotation, and a stale or mismatched id is rejected with no state change, so a blind retry can never confirm a later rotation. A confirm replayed **after its own rotation resolved** returns a *terminal* already-confirmed/already-resolved conflict (`kInvalidParams`), never a retryable error. Self-service ONLY, same owner-vs-nonexistent posture as `rotate_api_token`. Mirrors `POST /api/v1/tokens/{id}/confirm`. Destructive — requires the `operator` tier. | `ApiToken:Rotate` |
+
+> **`rotate_api_token`/`confirm_api_token_rotation` tier behavior (P2 #11, SOC 2
+> CC6.3) — deliberately NOT the engine-credential arm's answer, and NOT plain
+> `ApiToken:Write` either (round-4 security finding):** both tools map to
+> **`ApiToken:Rotate`**, a DISTINCT RBAC operation from the ordinary
+> `ApiToken:Write` that gates `POST /api/v1/tokens` (create) and its settings
+> twin. `mcp_policy.hpp`'s `tier_allows` carries an explicit `ApiToken:Rotate`
+> allowance for the **`operator`** tier, alongside the existing Tag
+> Write/Delete and Execution/Execute cases — **not** `supervised`-only like
+> the engine credential arm's `Security:Write`. This is a deliberate tier
+> choice, not an oversight: rotation here is self-service —
+> `ApiTokenStore::rotate_token`/`confirm_token_rotation` reject at the STORE
+> layer unless `requesting_user` equals the resolved token row's own
+> `principal_id`, so the caller can only ever touch their own credential, the
+> same "can only touch your own resource" shape as the `operator` tier's
+> existing Tag allowance.
+>
+> **Why a distinct operation, not a securable-wide `ApiToken:Write` allowance
+> (the shape a first fix attempt shipped and a security review caught):**
+> mcp_server.cpp's tools/call dispatch runs a GENERIC tier+approval gate for
+> every tool, keyed on the tool's registered `(securable_type, operation)`
+> pair — it is NOT possible to admit "only these two tools" at the operator
+> tier by widening `ApiToken:Write` itself, because `AuthRoutes::
+> require_permission`/`require_scoped_permission` (`auth_routes.cpp`) consult
+> the SAME `tier_allows()` for every REST route authenticated with an
+> MCP-tiered token. A securable-wide `ApiToken:Write` allowance for
+> `operator` would (and, for one round, did) also admit an operator-tier
+> token to REST `POST /api/v1/tokens` — which lets the caller choose the new
+> token's own `mcp_tier` (including omitting it, minting an untiered,
+> perpetual token) — a privilege escalation, not the self-service allowance
+> intended. `ApiToken:Rotate` is a NEW, separate operation seeded ONLY to
+> `Administrator` and `ApiTokenManager` (same population that already holds
+> `ApiToken:Write` — this taxonomy addition changes no role's RBAC-on access)
+> and mapped ONLY by these two tools' `kToolSecurityRows` entries and the
+> REST rotate/confirm routes' `perm_fn` calls — `ApiToken:Write` itself is
+> completely untouched, so `POST /api/v1/tokens` and its settings twin stay
+> supervised-tier-only. This also gives TRUE REST/MCP parity: an
+> operator-tier token can now reach REST
+> `POST /api/v1/tokens/{id}/rotate`/`/confirm` too.
+>
+> Neither tool is **approval-gated**: `requires_approval()` has no `ApiToken`
+> rule at all (for either operation), so no `kApprovalRequired` ticket-then-
+> recall step applies at any tier — matching the REST twin, which needs no
+> admin approval either (only step-up MFA, enforced on REST alone; the MCP
+> surface has no step-up concept). `requesting_user` is **always**
+> `session->username`, the authenticated MCP principal — never a tool
+> argument.
 
 > **Engine-principal tools — tier behavior (ADR-1005 item 2b, plan PR 4.3):**
 > the six **mutating** tools (`create_engine_principal`, `revoke_engine_principal`,
@@ -967,10 +1017,10 @@ are never required — a client may also simply omit the header and use plain PO
 > ring terminates the session server-side rather than answering with a gap:
 > `-32007` / HTTP 404, `error.message` "Replay window exceeded", audited as
 > `mcp.session.close` with `reason=replay_window_exceeded`. This is ordinary
-> ring eviction, reachable today — with `--mcp-enable-streamed-post` off — by
-> any GET-channel client that falls behind the ring's own capacity.
-> `--mcp-enable-streamed-post` adds a second, faster way to reach the same
-> state: a session whose client disconnects and retries repeatedly can hit a
+> ring eviction, reachable by any GET-channel client that falls behind the
+> ring's own capacity, independent of the streamed-POST flag.
+> `--mcp-enable-streamed-post` (on by default) adds a second, faster way to
+> reach the same state: a session whose client disconnects and retries repeatedly can hit a
 > further streamed call's admission reclaim (see "A pin released to admit a
 > new call" in `docs/mcp-server.md`) — each reclaim releases one undelivered
 > final's eviction exemption, after which ordinary ring eviction can reach it
@@ -1088,8 +1138,18 @@ in a tight loop — the cap is protecting the worker pool that also serves your 
 >   separately from, any single session's own replay-ring pin-slot count (the
 >   next checkpoint below) — and it is **not** governed by
 >   `--mcp-max-streams-per-principal`. That flag affects only the GET channel;
->   a principal's total held-open ceiling across both channels is that value +
->   4. Remediation: wait for one of your streamed calls to finish, or resend
+>   the two are separate steady-state allowances that happen to sum to
+>   `--mcp-max-streams-per-principal + 4` — not one combined pool of that
+>   size. During a GET-channel reconnect (a new GET superseding an old one
+>   on the same session), that sum can be transiently exceeded: a stream
+>   mid-handover counts twice against the GET-channel allowance — the
+>   superseded connection until it finishes draining, and the replacement
+>   once admitted. `McpStreamState` bounds this to at most one pending
+>   handover **per session**, not per principal — a principal holding its
+>   full `--mcp-max-streams-per-principal` GET sessions could in the worst
+>   case have every one of them mid-handover at once, so the GET-channel
+>   component of the aggregate can transiently reach twice
+>   `--mcp-max-streams-per-principal`, not just one extra. Remediation: wait for one of your streamed calls to finish, or resend
 >   the same request without an SSE-capable `Accept` for a plain
 >   (non-streamed) response.
 >
@@ -1132,11 +1192,11 @@ before it could be delivered on the stream (the buffered-result population hit i
 The real result was never lost - only its *streamed* copy was dropped.
 
 **Fix**: Fetch the result durably with the `execution_id` this very frame carries (`get_execution_status` / `query_responses`). Do NOT re-resume the GET channel: this error IS the answer to a resume, and per the Cause above only the *streamed* copy was dropped - re-attaching cannot conjure a final the server already force-expired. (GET + `Last-Event-ID` resume is the right first move for a *different* case — a stream that died before any frame reached you, so you never learned an `execution_id` at all.)
-The parked-result path this arises from is reachable only under
-`--mcp-enable-streamed-post`, which ships off; with it on, it activates whenever a
+The parked-result path this arises from is reachable whenever
+`--mcp-enable-streamed-post` is on, which is the default: it activates whenever a
 streamed POST is parked without having delivered its final (the client
 disconnected, the response cap elapsed, or the server could not complete the
-stream).
+stream). Pass `--no-mcp-streamed-post` to rule this path out entirely.
 
 ### A streamed final can be dropped entirely
 
@@ -1156,7 +1216,7 @@ supported recovery path for every streamed-result failure mode on this surface, 
 this one.
 
 Like the `-32014` case above, this arises from the parked-result path, which is
-reachable only under `--mcp-enable-streamed-post`: a streamed POST parked before
+reachable whenever `--mcp-enable-streamed-post` is on (the default): a streamed POST parked before
 delivering its final leaves the terminal to be collected by a `GET` resume or
 fetched durably by `execution_id`.
 

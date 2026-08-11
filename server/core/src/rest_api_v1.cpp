@@ -5,6 +5,7 @@
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"      // access-review read-model optional email enrichment
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
+#include "token_rotation_lookup.hpp"    // shared REST/MCP human-token rotation successor lookup (P2 #11)
 #include "baseline_store.hpp" // baseline-anchored per-device Guardian status route
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
@@ -24,6 +25,7 @@
 #include "rest_a4_envelope.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
@@ -713,11 +715,17 @@ const std::string& openapi_spec() {
         // unsplit form.
         R"json(,
     "/tokens": {
-      "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "responses": {"200": {"description": "List of API tokens"}, "503": {"description": "Token store unavailable (service unavailable)"}}},
+      "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "description": "Owner-scoped to the caller. An item includes rotation_group/supersedes_token_id/overlap_expires_at/confirmed_at only while a rotation is (or was) in flight for that token.", "responses": {"200": {"description": "List of API tokens"}, "503": {"description": "Token store unavailable (service unavailable)"}}},
       "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/tokens/{token_id}": {
       "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
+    },
+    "/tokens/{token_id}/rotate": {
+      "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Rotate and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. The successor always inherits the predecessor's expires_at verbatim (rotation is lifetime-neutral).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token/token_id/expires_at describe the successor (found structurally, scoped to THIS predecessor's token_id); overlap_expires_at describes the PREDECESSOR (echoed for convenience — the epoch it is auto-revoked). token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs present but not an integer, overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent), or the rotation succeeded but the successor could not be read back for the response (fails closed rather than return an uncorrelatable secret)"}}}
+    },
+    "/tokens/{token_id}/confirm": {
+      "post": {"summary": "Confirm receipt of a rotated API token's successor secret (P2 #11 maker-checker)", "tags": ["API Tokens"], "description": "token_id in the path is the SUCCESSOR token_id the rotate response returned — no request body. Requires ApiToken:Rotate and step-up. Self-service only.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The successor token_id returned by the rotate call"}], "responses": {"200": {"description": "Confirmed; predecessor token revoked"}, "400": {"description": "Terminal client-state conditions the store classifies ClientValidation: the caller's (mcp_tier, scope_service) does not equal the predecessor's, more than two active credentials share the rotation_group, or the token is not a human-owned credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry)"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, or the deliberately-ambiguous no-in-flight-rotation read (a swallowed query failure and a genuinely empty active set are indistinguishable, so it stays retryable). A MALFORMED pair found after a positive two-row read is terminal 409, not this (#2943)."}}}
     },
     "/ca/root": {
       "get": {"summary": "Internal CA root certificate (PEM, public)", "tags": ["Security"], "responses": {"200": {"description": "PEM CA certificate", "content": {"application/x-pem-file": {}}}, "404": {"description": "No CA root"}}}
@@ -2391,6 +2399,18 @@ void RestApiV1::register_routes(
                      // now, so it must be readable back).
                      if (!t.mcp_tier.empty())
                          item.add("mcp_tier", t.mcp_tier);
+                     // P2 #11: surface an in-flight rotation so it isn't
+                     // invisible from this list — omitted entirely for a
+                     // token that has never participated in one (empty/0 is
+                     // the store's own "never rotated" sentinel).
+                     if (!t.rotation_group.empty())
+                         item.add("rotation_group", t.rotation_group);
+                     if (!t.supersedes_token_id.empty())
+                         item.add("supersedes_token_id", t.supersedes_token_id);
+                     if (t.overlap_expires_at != 0)
+                         item.add("overlap_expires_at", t.overlap_expires_at);
+                     if (t.confirmed_at != 0)
+                         item.add("confirmed_at", t.confirmed_at);
                      arr.add(item);
                  }
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens->size())),
@@ -2681,6 +2701,297 @@ void RestApiV1::register_routes(
                  "owner=" + tok->principal_id);
         res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
     });
+
+    // POST /api/v1/tokens/{id}/rotate — human self-service overlap-pair
+    // rotation for a token the caller owns (P2 #11, SOC 2 CC6.3). Mirrors the
+    // engine arm's `/engine-principals/{id}/credentials/rotate` route (design
+    // §7 gate belt + reveal-audit discipline) but on the HUMAN permission
+    // axis. Gated on `ApiToken:Rotate`, a DISTINCT operation from
+    // `ApiToken:Write` (round-3 security finding): giving the MCP twin's
+    // operator-tier allowance the SAME op as `ApiToken:Write` would also
+    // admit an operator-tier MCP token to `POST /api/v1/tokens` (mint, with
+    // a caller-chosen `mcp_tier`) and the settings twin — a privilege
+    // escalation, not a REST/MCP parity fix (see `mcp_policy.hpp`'s
+    // `tier_allows()` operator-tier comment for the full analysis). Not
+    // `Security:Write` either — this is self-service, not an admin
+    // operation — with an owner-vs-nonexistent 404 belt (mirrors the DELETE
+    // route above) instead of the engine route's admin gate.
+    // `successor_expires_at` is deliberately NOT accepted from the request
+    // body — SENIOR RULING: rotation must read as lifetime-neutral in CC6.3
+    // evidence, so the successor always inherits the predecessor's expiry
+    // verbatim (ApiTokenStore::rotate_token's default, std::nullopt below).
+    sink.Post(
+        R"(/api/v1/tokens/([^/]+)/rotate)",
+        [perm_fn, auth_fn, audit_fn, step_up_fn, token_store](const httplib::Request& req,
+                                                               httplib::Response& res) {
+            if (!perm_fn(req, res, "ApiToken", "Rotate"))
+                return;
+            if (!token_store || !token_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "api_token.rotate", "ApiToken"))
+                return;
+            // CRITICAL (mirrors the engine route): step-up is re-validated on
+            // EVERY call, including an idempotent re-serve within the grace
+            // window — never skipped just because the same secret comes back.
+            if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/tokens/{id}/rotate"))
+                return;
+
+            auto token_id = req.matches[1].str();
+
+            // Owner-vs-nonexistent 404 belt (mirrors DELETE /api/v1/tokens/{id}
+            // above): identical body for both cases so the endpoint is not an
+            // enumeration oracle. SELF-SERVICE ONLY — unlike DELETE, admin
+            // JIT elevation does NOT bypass this: ApiTokenStore::rotate_token
+            // itself rejects any requesting_user other than the resolved
+            // row's own principal_id, so an admin override here would just
+            // fail one layer down with an indistinguishable store error;
+            // checking it here keeps the 404 shape uniform and audited.
+            auto existing = token_store->get_token(token_id);
+            if (!existing.has_value()) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res, "token store unavailable — try again"),
+                                "application/json");
+                return;
+            }
+            auto& tok = *existing; // std::optional<ApiToken>
+            bool denied = tok && tok->principal_id != session->username;
+            if (!tok || denied) {
+                if (denied) {
+                    audit_fn(req, "api_token.rotate", "denied", "ApiToken", token_id,
+                             "owner=" + tok->principal_id);
+                }
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "token not found"), "application/json");
+                return;
+            }
+
+            // Parsed AFTER the whole gate belt (perm/store/auth/deny/step-up/
+            // owner) so body validation can never become an unauthenticated
+            // or ownership-enumeration oracle. Defensive against a type
+            // mismatch — `body.value<int64_t>("overlap_secs", ...)` THROWS
+            // json::type_error.302 on e.g. `{"overlap_secs":"7d"}`, and this
+            // route has no exception handler installed, so an unguarded
+            // `.value()` call would surface as a bare httplib 500 with no A4
+            // envelope on a route whose OpenAPI promises 400 (round-3 review
+            // finding).
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            int64_t overlap_secs = 7 * 24 * 3600; // 7-day default overlap window
+            if (!body.is_discarded() && body.is_object() && body.contains("overlap_secs")) {
+                if (!body["overlap_secs"].is_number_integer()) {
+                    res.status = 400;
+                    res.set_content(
+                        detail::a4_error(res, "overlap_secs must be an integer (seconds)"),
+                        "application/json");
+                    return;
+                }
+                overlap_secs = body["overlap_secs"].get<int64_t>();
+            }
+
+            const int64_t now = static_cast<int64_t>(std::time(nullptr));
+            // requesting_user is the AUTHENTICATED session's own username —
+            // never a body/query field (security crux, task spec: the
+            // store-level self-service ownership gate is only as strong as
+            // this). successor_expires_at is deliberately left at its
+            // std::nullopt default per the SENIOR RULING above — this route
+            // never overrides it. caller_mcp_tier/caller_scope_service are
+            // the session's OWN server-synthesized authority
+            // (synthesize_token_session, auth_routes.cpp — never
+            // client-controllable) — threaded through so the store's
+            // authority-inheritance guard can refuse a rotation that would
+            // mint authority the caller does not already hold (governance
+            // Gate 7 CRITICAL fix; REQUIRED params since Gate 8 — see
+            // `rotate_token`'s own doc comment).
+            auto result = token_store->rotate_token(token_id, overlap_secs, now,
+                                                     session->username, session->mcp_tier,
+                                                     session->token_scope_service);
+            if (!result) {
+                res.status = engine_store_error_status(result.error());
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                (void)audit_fn(req, "api_token.rotate", "failure", "ApiToken", token_id,
+                               result.error());
+                return;
+            }
+
+            // Locate the successor via the SHARED, DB-free lookup
+            // (token_rotation_lookup.hpp) — scoped exactly to THIS
+            // predecessor, never "any linked row of this principal"
+            // (round-3 BLOCKING finding: a human principal routinely holds N
+            // unrelated active tokens, so an unscoped match can return a
+            // DIFFERENT in-flight rotation's successor — its raw secret
+            // paired with the wrong token_id, so confirming that id revokes
+            // the WRONG predecessor). One shared helper, not an inline loop,
+            // so the MCP twin of this route calls the SAME derivation rather
+            // than re-deriving its own copy — a second copy of this exact
+            // loop is how the bug happened the first time (copied from the
+            // engine rotate route, whose OWN per-principal <=2-active
+            // ceiling licensed the loop shape that is unsound here). The
+            // route owns the store read (round-4: the helper takes a plain
+            // vector so its derivation logic is unit-testable without Postgres).
+            auto active_after = token_store->list_active_for_principal(tok->principal_id);
+            auto successor =
+                yuzu::server::detail::derive_rotation_successor(active_after, token_id);
+            if (!successor.found) {
+                // rotate_token above already succeeded — a real successor
+                // row exists in the database and `result` holds its live raw
+                // secret — but the underlying list_active_for_principal read
+                // is best-effort and swallows a lease/query failure into an
+                // empty vector rather than propagating (api_token_store.hpp),
+                // so a successor genuinely minted moments ago failing to
+                // show up here is never a legitimate "no rotation" case,
+                // only an ambiguous read failure. Fail CLOSED rather than
+                // hand the caller a one-time secret with no token_id to ever
+                // confirm it against — this is the ROTATE-side meaning of
+                // `found == false` documented in token_rotation_lookup.hpp;
+                // it does NOT apply after a successful confirm (round-4
+                // clarification): 503, and never place the secret in the
+                // response body.
+                //
+                // UP-11: the audit outcome is "partial", never "failure" —
+                // rotate_token above already succeeded and committed. A
+                // successor row exists with a live secret in `*result`; what
+                // failed is reading it back to hand to the caller, not the
+                // mint itself. An audit row reading `api_token.rotate
+                // failure` here would tell a CC6.3 reviewer no credential
+                // exists when one plainly does — the worst direction for a
+                // credential-minting event's compliance record to diverge
+                // from the database. "partial" mirrors the convention the
+                // session-revoke routes use above for "the mutation
+                // committed but a downstream step of it did not". The
+                // caller-facing 503 is unchanged — this is about the audit
+                // row matching the database, not the response.
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(
+                    detail::a4_error(res, "rotation succeeded but the successor could not be "
+                                          "read back — retry, or check GET /api/v1/tokens"),
+                    "application/json");
+                (void)audit_fn(req, "api_token.rotate", "partial", "ApiToken", token_id,
+                               "successor minted but its secret could not be read back for "
+                               "delivery — retry, or check GET /api/v1/tokens");
+                return;
+            }
+            // The reveal IS the success audit for this route (mirrors the
+            // engine rotate route) — one row per reveal, mint or re-serve,
+            // never folded into a generic "rotation succeeded" event. Fired
+            // only once the successor is confirmed findable, so a 503 above
+            // is never ALSO recorded as a success.
+            (void)audit_fn(req, "api_token.reveal", "success", "ApiToken", token_id, "rotate");
+
+            // G5 (secret hygiene) — same no-store contract as the engine
+            // mint/rotate routes: the response body carries a raw one-time
+            // credential. `overlap_expires_at` is the PREDECESSOR's own
+            // stamp (see token_rotation_lookup.hpp) — the successor row
+            // never carries one.
+            res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+            res.set_header("Pragma", "no-cache");
+            res.set_content(ok_json(JObj()
+                                        .add("token", *result)
+                                        .add("token_id", successor.successor_token_id)
+                                        .add("expires_at", successor.successor_expires_at)
+                                        .add("overlap_expires_at",
+                                             successor.predecessor_overlap_expires_at)
+                                        .str()),
+                            "application/json");
+        });
+
+    // POST /api/v1/tokens/{id}/confirm — human self-service maker-checker
+    // confirmation that a rotation's successor secret has been received (P2
+    // #11 / SOC 2 CC6.3). {id} is the SUCCESSOR token_id the rotate response
+    // returned — ApiTokenStore::confirm_token_rotation resolves the
+    // principal and rotation group from that row, so no request body is
+    // needed at all.
+    sink.Post(
+        R"(/api/v1/tokens/([^/]+)/confirm)",
+        [perm_fn, auth_fn, audit_fn, step_up_fn, token_store, metrics_registry](
+            const httplib::Request& req, httplib::Response& res) {
+            // Human twin of yuzu_engine_principal_confirm_total (#2404) —
+            // SAME name discipline: `surface` is "rest" here (an MCP twin
+            // lands separately and will use "mcp"), `result` follows the
+            // engine's value set via the shared confirm_result_label
+            // classifier. Scope contract identical to the engine route:
+            // store-reaching calls only (the store-open guard below, or a
+            // real confirm_token_rotation result) — never a permission,
+            // step-up, or owner-check early-out. Incremented BEFORE the
+            // audit emission so an audit-store failure cannot suppress it.
+            const auto confirm_metric = [metrics_registry](const char* result) {
+                if (metrics_registry)
+                    metrics_registry
+                        ->counter(kApiTokenConfirmTotalMetric,
+                                  {{"surface", "rest"}, {"result", result}})
+                        .increment();
+            };
+            // ApiToken:Rotate, not ApiToken:Write — same reasoning as the
+            // rotate route above (round-3 security finding).
+            if (!perm_fn(req, res, "ApiToken", "Rotate"))
+                return;
+            if (!token_store || !token_store->is_open()) {
+                confirm_metric("transient"); // store unavailable at the open guard
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "api_token.confirm", "ApiToken"))
+                return;
+            if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/tokens/{id}/confirm"))
+                return;
+
+            auto token_id = req.matches[1].str();
+
+            // Owner-vs-nonexistent 404 belt, same self-service-only posture
+            // as rotate above — no admin bypass, identical body for both
+            // missing-id and not-owner. NOT a store-reaching confirm call
+            // (deliberately excluded from the metric's scope, same as the
+            // engine route's pre-store denials).
+            auto existing = token_store->get_token(token_id);
+            if (!existing.has_value()) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res, "token store unavailable — try again"),
+                                "application/json");
+                return;
+            }
+            auto& tok = *existing; // std::optional<ApiToken>
+            bool denied = tok && tok->principal_id != session->username;
+            if (!tok || denied) {
+                if (denied) {
+                    audit_fn(req, "api_token.confirm", "denied", "ApiToken", token_id,
+                             "owner=" + tok->principal_id);
+                }
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "token not found"), "application/json");
+                return;
+            }
+
+            // caller_mcp_tier/caller_scope_service threaded for the SAME
+            // reason as the rotate route above — defence-in-depth re-check
+            // of the authority-inheritance guard (governance Gate 7).
+            auto confirmed = token_store->confirm_token_rotation(
+                token_id, session->username, session->mcp_tier, session->token_scope_service);
+            if (!confirmed) {
+                // Increment BEFORE the audit emission so an audit-store
+                // failure cannot suppress the operational counter (#2404).
+                confirm_metric(yuzu::server::detail::confirm_result_label(
+                    yuzu::server::detail::classify_engine_store_error(confirmed.error())));
+                res.status = engine_store_error_status(confirmed.error());
+                res.set_content(detail::a4_error(res, confirmed.error()), "application/json");
+                (void)audit_fn(req, "api_token.confirm", "failure", "ApiToken", token_id,
+                               confirmed.error());
+                return;
+            }
+            confirm_metric("success");
+            (void)audit_fn(req, "api_token.confirm", "success", "ApiToken", token_id, "confirmed");
+            res.set_content(ok_json(JObj().add("confirmed", true).str()), "application/json");
+        });
 
     // ── Engine Principals (/api/v1/engine-principals) — PR 4.3 ────────────
     //
