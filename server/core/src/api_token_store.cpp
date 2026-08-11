@@ -2024,7 +2024,22 @@ std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* 
         // it regardless of why the scan returned more (a genuine clock jump,
         // or simply more legitimate in-flight rotations than the cap allows
         // this tick). The next tick(s) pick up the remainder.
-        const std::size_t take = std::min(row_count, kMaxAutoRevokesPerTick);
+        // `(std::min)` parenthesised, not `std::min` — matching the repo
+        // convention (app_perf_daily_store.cpp, dex_app_perf_model.cpp).
+        // <windows.h> defines min/max as FUNCTION-LIKE MACROS and the build
+        // does not define NOMINMAX, so a bare `std::min(a, b)` expands to
+        // `std::(...)` and MSVC rejects it with C2589 "illegal token on right
+        // side of '::'". Wrapping the name in parentheses makes it a
+        // non-call token sequence, which suppresses the expansion.
+        //
+        // Load-bearing HERE specifically: this TU did not pull <windows.h>
+        // until this change promoted `#include <libpq-fe.h>` into
+        // api_token_store.hpp (on Windows that header reaches winsock for
+        // SOCKET; the Linux copy does not, which is why a Linux build and a
+        // Linux-side header-closure review both pass). This was the first
+        // std::min in the file — dev has none — so CI caught it, not the
+        // local build. Do not "simplify" the parentheses away.
+        const std::size_t take = (std::min)(row_count, kMaxAutoRevokesPerTick);
         if (row_count > kMaxAutoRevokesPerTick) {
             if (tick_capped)
                 *tick_capped = true;
