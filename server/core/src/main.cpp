@@ -500,9 +500,9 @@ int main(int argc, char* argv[]) {
                  "Disable MCP Streamable HTTP (sessions, GET/DELETE channels); plain "
                  "JSON-RPC POST only")
         ->envname("YUZU_MCP_NO_STREAMING");
-    app.add_flag("--mcp-enable-streamed-post", cfg.mcp_streamed_post_enable,
+    app.add_flag("--mcp-enable-streamed-post,!--no-mcp-streamed-post", cfg.mcp_streamed_post_enable,
                  "Enable SSE-on-POST for execute_instruction callers that send a "
-                 "progressToken (OFF by default; turning it on is a separate rung)")
+                 "progressToken (default: true). Pass --no-mcp-streamed-post to disable.")
         ->envname("YUZU_MCP_ENABLE_STREAMED_POST");
     app.add_option("--mcp-allowed-origin", cfg.mcp_allowed_origins,
                    "Allowed Origin header value for /mcp/v1/ (scheme+host+port, exact match; "
@@ -519,9 +519,12 @@ int main(int argc, char* argv[]) {
     app.add_option("--mcp-max-streams-per-principal", cfg.mcp_max_streams_per_principal,
                    "Max concurrent MCP GET SSE streams for a single principal — an anti-monopoly "
                    "policy, not a capacity limit (capacity is --max-sse-streams). Does NOT govern "
-                   "streamed POST responses, whose per-session allowance is a fixed 4 twinned to "
-                   "the replay ring's pin slots, so a principal's held-open ceiling is this value "
-                   "+ 4")
+                   "streamed POST responses: those are capped separately at a fixed 4 concurrent "
+                   "calls per principal — numerically the same as, but counted and enforced "
+                   "separately from, any single session's own replay-ring pin-slot count — so a "
+                   "principal's steady-state held-open sum across both channels is this value "
+                   "+ 4 — not a hard ceiling; a GET-channel reconnect can transiently double "
+                   "the GET component (see docs/user-manual/server-admin.md)")
         // Range-checked like its two siblings above. 0 would admit nothing at all, so the
         // floor is 1; the ceiling matches --max-sse-streams (a per-principal cap above the
         // global capacity is meaningless, and the global cap clamps it anyway).
