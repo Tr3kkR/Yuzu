@@ -673,16 +673,21 @@ server `PgPool`).
   revocation-latency envelope (heartbeat + session/token TTLs measured in
   minutes), and an accepted residual risk (`LISTEN/NOTIFY` is the named
   follow-up).
-- **Bounded stale-serve, then fail-fast deny, under backend degradation.** A
-  brief PostgreSQL blip does not deny immediately: for up to a **~5 s** bound
-  past the last confirmed-good refresh, a replica keeps answering from its
-  last-known-good cached permission set (bounded staleness for continuity).
-  Past that bound — or once a fail-fast breaker sees **2 consecutive**
-  pool-acquire/query failures, whichever comes first — the replica denies
-  authorization checks and stops touching the pool for a ~1 s cooldown
-  between probes, so a sustained outage collapses to a fast, predictable
-  deny-on-degrade rather than every caller separately re-discovering the
-  same failure. Watch `yuzu_server_rbac_breaker_open` (gauge) and
+- **Bounded stale-serve, then fail-fast deny, under backend degradation —
+  two independent mechanisms.** An already-cached authorization decision
+  keeps answering from cache for up to a **~5 s** bound past the last
+  confirmed-good refresh, regardless of anything else failing (bounded
+  staleness for continuity) — a brief blip does not deny cached decisions
+  immediately. Separately, a fail-fast breaker governs *pool access, not
+  cache validity*: once it sees **2 consecutive** pool-acquire/query
+  failures, any check that is not already a cache hit denies immediately
+  rather than blocking on the acquire budget first, and it stops touching
+  the pool for a ~1 s cooldown between recovery probes. Net effect on a
+  sustained outage: previously-seen decisions keep answering for up to ~5 s
+  regardless of breaker state; new/uncached decisions deny fast once the
+  breaker trips (as little as 2 failed attempts); once the 5 s bound
+  elapses, every check denies until the backend recovers. Watch
+  `yuzu_server_rbac_breaker_open` (gauge) and
   `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade.
 - **Shutdown grace bounds now stack; raise your orchestrator's termination
   grace period if you don't see clean shutdowns.** A graceful `SIGTERM` walks

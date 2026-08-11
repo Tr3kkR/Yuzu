@@ -2315,13 +2315,25 @@ not silently assumed: a durable-completion timestamp tracks only actual
 refresh successes (separately from the stampede-gating timestamp), and a
 reader who misses the gate while already past the bound counts a
 `stale_beyond_accepted_bound` degrade (fjarvis #2703 F3) — the read still
-proceeds from the existing cache; nothing is denied. A failed generation
-refresh does NOT extend trust — it is treated as "assume changed" (clear
-cache) and counted as a `generation_refresh_failed` degrade. **The
-`rbac_enabled` flag propagates on the same durable path.** The ~1 s bounded
-stale-allow window is an **accepted, gate-recorded residual risk** (well
-inside the fleet's minutes-scale revocation-latency envelope); `LISTEN/NOTIFY`
-(window → 0) is the named follow-up.
+proceeds from the existing cache; nothing is denied. **Updated 2026-08-11
+(#2703 Gate 7 merge-slice, ADR-0041 "Update" section — supersedes the
+original "assume changed" text below it):** a failed generation refresh no
+longer clears the cache immediately. Trust is extended for a bounded **~5 s**
+window (`kRbacStaleServeBoundMs`) past the last confirmed-good refresh — a
+deliberate bounded-staleness-for-continuity tradeoff, layered underneath the
+~1 s propagation target above. Only once that 5 s bound is exceeded is the
+failure treated as "assume changed" (cache cleared) and counted as a
+`generation_refresh_failed` degrade. A separate fail-fast circuit breaker
+(2 consecutive pool-acquire/query failures) independently bounds how long an
+**uncached** check can block on a doomed pool — it denies such checks
+immediately once open, but it does not itself clear the cache or shorten the
+5 s bound; a cache hit is served regardless of breaker state. See
+`docs/enterprise-readiness-soc2-first-customer.md`'s "Availability posture
+under PostgreSQL degradation" note for the full mechanism and its CAIQ
+characterization. **The `rbac_enabled` flag propagates on the same durable
+path.** The ~1 s bounded stale-allow window is an **accepted, gate-recorded
+residual risk** (well inside the fleet's minutes-scale revocation-latency
+envelope); `LISTEN/NOTIFY` (window → 0) is the named follow-up.
 
 **Fail-closed BOOT on the `rbac_enabled` flag.** The `rbac_enabled` flag is
 durable in `rbac_meta`. An unreadable OR non-canonical flag at boot **refuses

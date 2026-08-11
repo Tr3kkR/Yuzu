@@ -181,3 +181,31 @@ added (the generation refresh is inline, bounded).
 - If the gates choose LISTEN/NOTIFY over the generation-token interval, it lands as a hardening
   round with its own perf measurement.
 - Wave 2 continues with `ManagementGroupStore` (authz/targeting) next.
+
+## Update (2026-08-11) — bounded stale-serve on refresh failure supersedes "assume changed"
+
+The Decision section above states, as a mandatory requirement: "a failed generation refresh
+must NOT extend trust — treat as 'assume changed' → clear cache". A follow-on availability-
+hardening pass (#2703 Gate 7 merge-slice items 1A-1C, operator-adjudicated design parameters)
+deliberately supersedes that specific requirement — the rest of the Decision (durable
+generation token, ~1s refresh interval, deny-on-degrade as the eventual outcome) is unchanged.
+
+**What changed:** a failed generation refresh (pool-acquire timeout, query error, or a
+fail-fast circuit breaker denying the attempt without touching the pool) no longer clears
+`perm_cache_` immediately. Trust is extended for a bounded **~5s** window
+(`kRbacStaleServeBoundMs`) past the last confirmed-good refresh — a deliberate
+bounded-staleness-for-continuity tradeoff, chosen because clearing the cache on every
+transient blip turned a brief pool hiccup into an immediate fleet-wide authorization outage,
+which is a worse availability posture than tolerating a few seconds of staleness. Only once
+the 5s bound is exceeded does the store fall back to the original "assume changed" behavior
+and clear the cache. A new fail-fast circuit breaker (2 consecutive pool-acquire/query
+failures) independently bounds how long an uncached check can block on a doomed pool, without
+itself affecting cache validity — see `docs/auth-architecture.md`'s "Cross-replica coherence"
+section and `docs/enterprise-readiness-soc2-first-customer.md`'s "Availability posture under
+PostgreSQL degradation" note for the full mechanism and its CAIQ characterization.
+
+**Why this doesn't weaken the deny-on-degrade invariant:** the store never falls through to an
+*allow* it hasn't already validated — it continues serving a previously-validated cached
+decision for a bounded window, then denies. The invariant this ADR's Decision protects
+(no engaged allow on a degraded read) holds throughout; only the timing of when a degraded
+read converts to a deny changed.
