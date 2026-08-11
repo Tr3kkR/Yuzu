@@ -27,7 +27,9 @@
 
 #include <libpq-fe.h>
 
+#include <chrono>
 #include <string>
+#include <thread>
 
 using yuzu::server::pg::PgAdvisoryLockKey;
 using yuzu::server::pg::PgConn;
@@ -40,6 +42,24 @@ PgConn connect(const std::string& dsn) {
     PgConn conn{PQconnectdb(dsn.c_str())};
     REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
     return conn;
+}
+
+// Bounded poll for a backend pid to vanish from `pg_stat_activity`, as seen
+// from `observer` — `pg_terminate_backend` is asynchronous from the caller's
+// point of view (it requests termination, it does not wait for it), so
+// asserting on the very next statement would be racy. 100 x 50ms = 5s
+// budget, generous for a local/CI Postgres to actually tear a backend down.
+bool wait_for_pid_gone(PGconn* observer, std::int64_t pid) {
+    const std::string check_sql = "SELECT 1 FROM pg_stat_activity WHERE pid = " +
+                                  std::to_string(pid);
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        PgResult check{PQexec(observer, check_sql.c_str())};
+        REQUIRE(check.status() == PGRES_TUPLES_OK);
+        if (PQntuples(check.get()) == 0)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return false;
 }
 
 } // namespace
@@ -137,4 +157,94 @@ TEST_CASE("PgSessionAdvisoryLockGuard: an unlock attempted on an ABORTED transac
     const std::string unlock_sql = key.unlock_sql();
     PgResult cleanup{PQexec(observer.get(), unlock_sql.c_str())};
     (void)cleanup;
+}
+
+TEST_CASE("PgSessionAdvisoryLockGuard: an unlock-QUERY failure on an otherwise-IDLE "
+          "connection falls straight to the terminate-backend fallback — the branch neither "
+          "existing test in this file exercises",
+          "[pg][server][pg-session-advisory-lock]") {
+    YUZU_REQUIRE_PG_DB(db);
+
+    // `unlock_sql()` built from THIS key is `SELECT pg_advisory_unlock(1/0)` —
+    // a division-by-zero ERROR every time it runs, on a connection that is
+    // otherwise perfectly IDLE (never inside a transaction at all), so the
+    // aborted-transaction recovery branch does not apply (`PQtransactionStatus`
+    // reads `PQTRANS_IDLE`, never `PQTRANS_INERROR`) and the destructor has
+    // nothing left but the terminate-backend fallback.
+    const auto key = PgAdvisoryLockKey::single("1/0");
+
+    auto holder = connect(db.dsn());
+    std::int64_t holder_pid = 0;
+    {
+        PgResult pid_res{PQexec(holder.get(), "SELECT pg_backend_pid()")};
+        REQUIRE(pid_res.status() == PGRES_TUPLES_OK);
+        holder_pid = std::stoll(PQgetvalue(pid_res.get(), 0, 0));
+    }
+    REQUIRE(PQtransactionStatus(holder.get()) == PQTRANS_IDLE);
+
+    {
+        PgSessionAdvisoryLockGuard guard{holder.get(), key, "test terminate-fallback"};
+        (void)guard;
+    }
+
+    // THE ASSERTION THIS TEST EXISTS FOR: the terminate fallback actually
+    // ran and actually reached PostgreSQL — the holder's own backend pid is
+    // gone from `pg_stat_activity`. A destructor that silently swallowed the
+    // unlock failure without ever attempting the terminate call (e.g. an
+    // early return before that statement) would leave this backend alive
+    // indefinitely and this check would time out failing.
+    auto observer = connect(db.dsn());
+    CHECK(wait_for_pid_gone(observer.get(), holder_pid));
+}
+
+TEST_CASE("PgSessionAdvisoryLockGuard: a connection already dead when the destructor runs "
+          "takes the dead-connection early return and completes cleanly, without hanging or "
+          "throwing",
+          "[pg][server][pg-session-advisory-lock]") {
+    YUZU_REQUIRE_PG_DB(db);
+
+    const auto key = PgAdvisoryLockKey::single(
+        "hashtextextended('test:pg_session_advisory_lock:dead-connection', 0)");
+
+    auto holder = connect(db.dsn());
+    std::int64_t holder_pid = 0;
+    {
+        PgResult pid_res{PQexec(holder.get(), "SELECT pg_backend_pid()")};
+        REQUIRE(pid_res.status() == PGRES_TUPLES_OK);
+        holder_pid = std::stoll(PQgetvalue(pid_res.get(), 0, 0));
+    }
+    {
+        const std::string try_lock_sql = key.try_lock_sql();
+        PgResult lock_res{PQexec(holder.get(), try_lock_sql.c_str())};
+        REQUIRE(lock_res.status() == PGRES_TUPLES_OK);
+        REQUIRE(std::string(PQgetvalue(lock_res.get(), 0, 0)) == "t");
+    }
+
+    // Kill the holder's backend from a SEPARATE connection, and wait for the
+    // kill to actually land BEFORE the guard's destructor ever runs — unlike
+    // the terminate-fallback test above, where the DESTRUCTOR itself is what
+    // kills the backend, this test's session (and the lock it held) must
+    // already be gone when the destructor starts.
+    {
+        auto killer = connect(db.dsn());
+        const std::string kill_sql =
+            "SELECT pg_terminate_backend(" + std::to_string(holder_pid) + ")";
+        PgResult kill{PQexec(killer.get(), kill_sql.c_str())};
+        REQUIRE(kill.status() == PGRES_TUPLES_OK);
+        REQUIRE(wait_for_pid_gone(killer.get(), holder_pid));
+    }
+
+    // THE ASSERTION THIS TEST EXISTS FOR: the destructor returns cleanly —
+    // no throw, no hang — when the connection is already dead, via the
+    // dead-connection early-return branch rather than the terminate
+    // fallback. `PQstatus(holder.get())` does NOT update purely from the
+    // server-side kill above (libpq only notices on its own next I/O
+    // attempt), so this genuinely exercises the destructor's own detection
+    // (its first `PQexec` unlock attempt, which fails against the closed
+    // socket) rather than a pre-known-dead `PQstatus` short-circuit.
+    { PgSessionAdvisoryLockGuard guard{holder.get(), key, "test dead-connection"}; (void)guard; }
+    // Reaching here at all is the assertion — a hang or an uncaught
+    // exception escaping the destructor would fail this test by
+    // timeout/crash rather than by a false CHECK.
+    SUCCEED("destructor completed without throwing on an already-dead connection");
 }

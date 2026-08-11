@@ -105,15 +105,19 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   (next step), a **60-second background sweep** enforces predecessor
   auto-revoke on your behalf, with this SLA: **a predecessor is revoked
   within one 60-second tick of its overlap window elapsing; on the first
-  occurrence of a given clock-anomaly type the tick declines instead and
+  occurrence of a given clock-guard anomaly the tick declines instead and
   revocation defers to the next tick (roughly 120 seconds total), after
   which an identical anomaly drains normally on the following tick; every
   decline is counted and logged — a fresh deployment's first-ever bootstrap
   decline (no durable clock reading yet) increments
-  `yuzu_rotation_sweep_bootstrap_declines_total`, a genuine clock anomaly
-  (implausible reading or a big step) increments
-  `yuzu_rotation_sweep_declined_total`; the two are deliberately separate
-  series (see [metrics.md](metrics.md#rotation-sweep-clock-guard-metrics-2964)).**
+  `yuzu_rotation_sweep_bootstrap_declines_total`, any other decline (an
+  implausible reading, or a big step since the last accepted tick)
+  increments `yuzu_rotation_sweep_declined_total`; the two are deliberately
+  separate series (see [metrics.md](metrics.md#rotation-sweep-clock-guard-metrics-2964)).**
+  A big-step decline is **not necessarily a clock fault** — the sweep's
+  3600s big-step threshold is crossed just as readily by a multi-tick gap
+  with a perfectly correct clock (a maintenance window, a database
+  failover, an instance left off overnight) as by an actual clock jump.
   One case is not "eventually" but **never**, by design, until an operator
   acts: **the successor was never presented at all** — the sweep leaves BOTH
   credentials active indefinitely rather than revoke your only working

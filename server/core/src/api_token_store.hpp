@@ -91,26 +91,52 @@ namespace yuzu::server {
 // to a retention window (this store has none to scale against — only a 60s
 // tick cadence, `server.cpp`).
 //
-// #2964 round 3 review (finding 1b): the FIRST value here (86'400, a bare
-// copy of `audit_store`'s constant) failed the routed concern's own "copy
-// the SHAPE, never the numbers" rule — `audit_store` re-anchors far less
-// often than every 60s, so a one-day floor on a 60-second cadence silently
-// tolerated a forward jump of just under 24 hours, which is precisely the
-// sub-86400 hole this store's (now-removed) would-wipe probe was being
-// asked to cover instead (see the DELIBERATE NON-ADOPTION comment in the
-// .cpp). This value is derived from THIS store's own re-anchor cadence: 60
-// consecutive missed re-anchors at the 60s tick cadence (`server.cpp`'s
-// sweep-thread loop period) is itself remarkable — either the sweep has
-// gone genuinely unable to reach a verdict for an hour straight (a real
-// outage, still "multi-hour" territory once it is noticed and reported —
-// the guard reports at the first tick past threshold, not at hour one
-// exactly) or the clock moved by more than an hour, and either warrants a
-// decline+report rather than a silent drain. An ordinary transient blip
-// (one failed pool acquire, one skipped-lock tick) is one to a handful of
-// ticks, nowhere near this floor, so this does not fire on routine
-// contention. Namespace-scope (not a class member) so a test can reference
-// it without duplicating the magic number — mirrors `audit_store.hpp`'s
-// `kAuditMinBigStepSec`.
+// A bare copy of `audit_store`'s constant (86'400, one day) fails the
+// routed concern's own "copy the SHAPE, never the numbers" rule:
+// `audit_store` re-anchors far less often than every 60s, so a one-day
+// floor on a 60-second cadence would silently tolerate a forward jump of
+// just under 24 hours — precisely the sub-86400 hole this store's
+// (now-removed) would-wipe probe was being asked to cover instead (see the
+// DELIBERATE NON-ADOPTION comment in the .cpp). The value below is instead
+// derived from THIS store's own re-anchor cadence: 60 consecutive missed
+// re-anchors at the 60s tick cadence (`server.cpp`'s sweep-thread loop
+// period) is itself remarkable — either the sweep has gone genuinely unable
+// to reach a verdict for an hour straight (a real outage) or the clock
+// moved by more than an hour, and either warrants a decline+report rather
+// than a silent drain. An ordinary transient blip (one failed pool
+// acquire, one skipped-lock tick) is one to a handful of ticks, nowhere
+// near this floor, so this does not fire on routine contention.
+//
+// DOMINANT TRIGGER: at the 86'400 floor a planned no-verdict gap (a
+// maintenance window, a DB failover, a dev instance left off overnight)
+// was rare enough to ignore; at this 3'600 floor it is the MOST COMMON
+// `Step` trigger — an hour of `Failed` ticks reaches this threshold on its
+// own, no clock fault required. Every operator-facing surface for this
+// guard (`describe()` below, the user-manual/metrics/alert-runbook docs)
+// must present "clock fault" as ONE possible cause of `Step`, never the
+// only one.
+//
+// RESIDUAL: a forward jump strictly UNDER this floor is undetected by
+// every detector in this store's fact set and can retire predecessors up
+// to just under an hour early. This is a DELIBERATE, bounded gap, not an
+// oversight — UP-5 (the per-pair re-assertion under the row lock) proves
+// the successor was actually presented before any predecessor in the pair
+// is touched, and `kOverlapCeilSecs` (10 years) means no legitimate
+// overlap window is anywhere near this floor's scale, so the earliest a
+// sub-floor jump can cut a window short is still bounded by that window's
+// own length, never by an unbounded amount.
+//
+// MULTIPLIER: "60 ticks" is a CHOSEN point for this store, not a derived
+// one — the routed concern requires the number be argued from THIS
+// store's own substrate (done above), not that the multiplier itself be
+// self-evident. Sibling guards choose their own multiples of their own
+// cadences for the same reason (e.g. `audit_store.hpp`'s
+// `kAuditMinBigStepSec`, 7 days against a re-anchor cadence far coarser
+// than this store's 60s) — copy the SHAPE (derive from this store's own
+// cadence), never a sibling's chosen multiplier.
+//
+// Namespace-scope (not a class member) so a test can reference it without
+// duplicating the magic number.
 inline constexpr std::int64_t kRotationSweepBigStepSecs = 60 * 60; // 60 ticks x 60s/tick = 1h
 
 // Forward-declared rather than pulling in engine_principal_store.hpp here —
@@ -837,18 +863,16 @@ public:
     /// replica sees `SkippedLock` and never touches it), this reads the ONE
     /// shared row every replica's clock guard writes, so every replica's
     /// gauge reports the identical cluster-wide last-verdict instant
-    /// regardless of which replica actually held the lock that tick. Part 5
-    /// of the routed concern, applied to this sweep's own observability: a
-    /// store-wide session lock serialises the sweep, so `SkippedLock` on
-    /// N-1 replicas is routine and staleness must be judged against the ONE
-    /// shared anchor, never a per-replica one. Part 2 of the routed concern
-    /// (compare against PostgreSQL's OWN clock, not N independently-
-    /// drifting replica clocks) plus its unnumbered SINGLE-WRITER clause
-    /// ("on a Postgres store the reading and the dedup state must become
-    /// SHARED rows under an ... advisory lock, because process-local state
-    /// paces at N x cap across replicas") — NOT part 5 (#2964 round 3 review
-    /// finding 6; an earlier revision of this comment mis-cited part 5,
-    /// which is the unconditional per-tick cap, unrelated to this claim).
+    /// regardless of which replica actually held the lock that tick. This
+    /// is part 2 of the routed concern (compare against PostgreSQL's OWN
+    /// clock, not N independently-drifting replica clocks) plus its
+    /// unnumbered SINGLE-WRITER clause ("on a Postgres store the reading and
+    /// the dedup state must become SHARED rows under an ... advisory lock,
+    /// because process-local state paces at N x cap across replicas"),
+    /// applied to this sweep's own observability: a store-wide session lock
+    /// serialises the sweep, so `SkippedLock` on N-1 replicas is routine and
+    /// staleness must be judged against the ONE shared anchor, never a
+    /// per-replica one.
     /// `nullopt` on a lease/query failure or when no pass has ever reached a
     /// verdict (fresh install) — the caller must not fabricate a reading.
     [[nodiscard]] std::optional<int64_t> rotation_sweep_last_pass_now() const;

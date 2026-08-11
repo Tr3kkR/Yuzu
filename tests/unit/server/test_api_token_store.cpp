@@ -4001,6 +4001,72 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: a tree of only never-used-suc
     CHECK(swept.revoked.empty());
 }
 
+TEST_CASE("ApiTokenStore::sweep_expired_rotations: a large, wholly-expired eligible "
+          "population still drains as Ok, with no last_anomaly_facts row — pins the "
+          "DELIBERATE NON-ADOPTION of routed-concern part 1's would-wipe half against a "
+          "silent reintroduction",
+          "[pg][token][rotation][sweep][clock-guard][up6]") {
+    // THE ASSERTION THIS TEST EXISTS FOR: this store does NOT adopt the
+    // clock-guarded-retention routed concern's part-1 would-wipe probe (see
+    // the DELIBERATE NON-ADOPTION comment near `kRotationSweepBigStepSecs`'s
+    // definition) — 100% eligible expiry is this store's ROUTINE drain
+    // shape, not evidence of a clock anomaly. Nothing existing pins this:
+    // the fact-set dedup tests above assert `decline_anomaly ==
+    // Anomaly::Step`, and `classify`'s precedence (`BadState > Step > Wipe
+    // > NoAnchor`) means Step already outranks Wipe in every scenario those
+    // tests construct — a reintroduced would-wipe probe stays completely
+    // hidden behind Step there. This test constructs a population with NO
+    // big-step, NO bad-state, and NO missing anchor — ONLY a large, wholly
+    // expired eligible set — so a reintroduced would-wipe probe has nothing
+    // else to hide behind: it would surface here as `Declined`,
+    // `Anomaly::Wipe`, zero revocations, and a `last_anomaly_facts` row,
+    // none of which a correctly non-adopting sweep produces.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto now = test_now_epoch();
+    anchor_sweep_guard(store, now);
+
+    // A population well past any plausible would-wipe population floor a
+    // reintroduced probe might use (`kMinWipeProbePopulation`, since
+    // removed — the DELIBERATE NON-ADOPTION comment's own account of that
+    // first attempt is why no floor closes this gap).
+    constexpr int kPairs = 50;
+    for (int i = 0; i < kPairs; ++i) {
+        const std::string principal = "s5-pin-would-wipe-" + std::to_string(i);
+        REQUIRE(store.create_token("pred", principal, now + k90Days).has_value());
+        const std::string pred_id = store.list_active_for_principal(principal)[0].token_id;
+        auto rotated = store.rotate_token(pred_id, kDay, now, principal, "", "");
+        REQUIRE(rotated.has_value());
+        REQUIRE(store.validate_token(*rotated).has_value()); // UP-5: successor presented
+        force_overlap_expires_at(pool, pred_id, pg_now(pool) - 1);
+    }
+
+    auto swept = store.sweep_expired_rotations(now);
+    // THE FIELD THIS TEST PINS: a wholly-expired population is a ROUTINE
+    // drain, never a decline.
+    REQUIRE(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
+    CHECK(swept.revoked.size() == static_cast<std::size_t>(kPairs));
+
+    // No `last_anomaly_facts` row survives this all-Ok tick. A reintroduced
+    // would-wipe probe that classified this population as `Wipe` would have
+    // written one when it declined — its continued absence here is
+    // asserted directly, not merely inferred from the outcome above.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "SELECT value FROM api_token_store.rotation_retention_meta WHERE key = "
+            "'last_anomaly_facts'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        CHECK(PQntuples(r.get()) == 0);
+    }
+}
+
 TEST_CASE("ApiTokenStore::sweep_expired_rotations: the anchor sanitiser treats an "
           "ahead-of-now, a negative, and an unparseable reading as an anomaly",
           "[pg][token][rotation][sweep][clock-guard]") {

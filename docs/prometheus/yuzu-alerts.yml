@@ -1021,19 +1021,29 @@ groups:
             docs/ops-runbooks/rotation-sweep-clock-guard.md.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
 
-      # #2964 round 3 review (finding 6): yuzu_rotation_sweep_lost_revocations_total
-      # existed with a metric describe() and TWO in-code cross-references
-      # ("the signal for THAT failure mode", see YuzuRotationSweepNotRunning's
-      # own annotation above) telling an operator to alert on it -- with no
-      # rule that actually did. An `Ok`, un-declined tick that loses every one
-      # of its per-pair revoke transactions to pool contention is invisible
-      # to every OTHER rule in this file (the classification transaction
-      # still commits, so the liveness gauge stays fresh and nothing declines
-      # -- see this metric's own describe() text in server.cpp). `> 0` over
-      # 15m, `for: 10m`: a single blip self-heals (each affected predecessor
-      # remains eligible and is retried the very next tick, per the metric's
-      # own doc comment), so this alert is scoped to a LOSS THAT PERSISTS
-      # across multiple ticks, not a one-off.
+      # yuzu_rotation_sweep_lost_revocations_total existed with a metric
+      # describe() and TWO in-code cross-references ("the signal for THAT
+      # failure mode", see YuzuRotationSweepNotRunning's own annotation
+      # above) telling an operator to alert on it -- with no rule that
+      # actually did. An `Ok`, un-declined tick that loses every one of its
+      # per-pair revoke transactions to pool contention is invisible to
+      # every OTHER rule in this file (the classification transaction still
+      # commits, so the liveness gauge stays fresh and nothing declines --
+      # see this metric's own describe() text in server.cpp).
+      #
+      # `> 0` over 15m, `for: 10m` -- NOT scoped to a persisting loss:
+      # `increase(...[15m]) > 0` stays true for the WHOLE 15m window a
+      # single, non-repeating bump remains inside it, so this rule DOES fire
+      # on one lost revocation just as readily as on a run of them (verified
+      # against a synthetic single-bump promtool case). That is the correct
+      # shape here, not a gap to close: one lost revocation is itself a real
+      # overdue-auto-revoke signal (the affected predecessor stays live past
+      # its promised overlap window until the next tick retries it), and
+      # `for:` sitting below the `increase()` window -- so the rule pages
+      # once the window has had time to accumulate evidence, not only once a
+      # loss has visibly repeated -- is this file's established convention,
+      # not unique to this rule (see YuzuRotationSweepLockContentionUnexpected
+      # above).
       - alert: YuzuRotationSweepLostRevocations
         expr: |
           increase(yuzu_rotation_sweep_lost_revocations_total[15m]) > 0
@@ -1094,17 +1104,24 @@ groups:
             minutes and stayed elevated for at least 10 -- more than the
             single decline the fact-set dedup rule's own "one extra tick,
             then drains" SLA predicts for an anomaly that settles on one
-            shape. The likely cause is a clock fault whose SHAPE keeps
-            changing tick to tick (a jittering clock rather than one clean
-            step), since dedup only suppresses a repeat of the IDENTICAL
-            fact set -- each distinct fact set declines fresh. Check
-            PostgreSQL's own clock on the server the same way
+            shape (dedup only suppresses a repeat of the IDENTICAL fact set
+            -- each distinct fact set declines fresh). A likely cause, given
+            several DISTINCT declines inside a short window, is a clock
+            fault whose SHAPE keeps changing tick to tick (a jittering
+            clock rather than one clean step) -- but it is not the only
+            one: a non-clock cause of BadState recurring with a different
+            shape each time (e.g. a corrupted/hand-edited durable reading)
+            produces the identical alert shape with a perfectly correct
+            clock, so check both rather than assuming the clock moved.
+            Check PostgreSQL's own clock on the server the same way
             YuzuAuditRetentionClockAnomaly's own first triage step does (this
             sweep reads the identical SELECT EXTRACT(EPOCH FROM now())), and
             check api_token_store.rotation_retention_meta directly for the
-            recorded last_anomaly_facts history. Both credentials in every
-            affected pair stay active while this persists -- see the runbook
-            for what that costs. Runbook:
+            recorded last_anomaly_facts value -- a single-row upsert holding
+            the MOST RECENT declined fact set only, never a history of past
+            declines. Both credentials in every affected pair stay active
+            while this persists -- see the runbook for what that costs.
+            Runbook:
             docs/ops-runbooks/rotation-sweep-clock-guard.md.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/rotation-sweep-clock-guard.md"
 

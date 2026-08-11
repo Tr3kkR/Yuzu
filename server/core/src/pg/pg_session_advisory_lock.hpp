@@ -12,10 +12,16 @@
 /// transaction is currently ABORTED, rather than actually releasing the
 /// lock. Left there, the lock survives whatever ROLLBACK eventually
 /// happens, the connection itself stays `CONNECTION_OK`, and
-/// `PgPool::release()` (which only checks `PQstatus`) recycles a connection
-/// still holding it. Session advisory locks are re-entrant per backend, so
-/// the wedge is asymmetric: whichever request next draws the poisoned
-/// connection succeeds while every other connection is denied indefinitely.
+/// `PgPool::release()` recycles it: that method checks both `PQstatus` AND
+/// `PQtransactionStatus` and issues its own defensive `ROLLBACK` when the
+/// latter reads non-idle (`pg_pool.cpp`), so it does clear an ABORTED
+/// transaction on the way back into the pool — but that rollback runs
+/// AFTER this guard's own destructor has already tried and failed to
+/// unlock, and it does not retry the unlock itself, so a lock still held at
+/// that point outlives the rollback and is handed back to the pool anyway.
+/// Session advisory locks are re-entrant per backend, so the wedge is
+/// asymmetric: whichever request next draws the poisoned connection
+/// succeeds while every other connection is denied indefinitely.
 ///
 /// THE RECOVERY PROTOCOL this guard's destructor runs on an unlock-query
 /// failure: (1) if the connection is already dead, nothing leaked — the
@@ -190,16 +196,34 @@ public:
                 return;
             }
 
-            // #2964 round 3 review (finding 3): before assuming the lock is
-            // unrecoverably wedged, try to actually RECOVER it. The ordinary
-            // cause of a live-connection unlock failure is an ABORTED
-            // transaction — every statement other than ROLLBACK (or COMMIT,
-            // which behaves the same way here) fails identically in that
-            // state, INCLUDING the `pg_terminate_backend` call this used to
-            // fall to directly. Roll back, then retry the SAME targeted
-            // unlock once — measured against live Postgres to take a leak
-            // from 1 to 0.
-            if (PQtransactionStatus(conn_) != PQTRANS_IDLE) {
+            // Before assuming the lock is unrecoverably wedged, try to
+            // actually RECOVER it. The ordinary cause of a live-connection
+            // unlock failure is an ABORTED transaction — every statement
+            // other than ROLLBACK (or COMMIT, which behaves the same way
+            // here) fails identically in that state, INCLUDING the
+            // `pg_terminate_backend` call this falls to below. Roll back,
+            // then retry the SAME targeted unlock once — measured against
+            // live Postgres to take a leak from 1 to 0.
+            //
+            // Deliberately `== PQTRANS_INERROR`, not `!= PQTRANS_IDLE`: the
+            // wider test also matches `PQTRANS_INTRANS` — a HEALTHY
+            // uncommitted transaction, not an aborted one — and would roll
+            // it back on this guard's say-so, discarding whatever work it
+            // held. Unreachable at both of today's call sites (neither
+            // constructs this guard mid a live, uncommitted transaction),
+            // but a future third consumer must not inherit that assumption
+            // silently — narrowed here rather than left to the caller to
+            // notice.
+            //
+            // What narrowing does NOT do, stated because the paragraph above
+            // could be read as promising it: an INTRANS connection whose
+            // unlock failed still loses its transaction. It falls through to
+            // the terminate below, which kills the backend and rolls the
+            // transaction back with it. The difference is not that the work
+            // survives — it is that the caller finds out, because the
+            // connection is marked bad and discarded rather than silently
+            // rolled back and handed to the next borrower.
+            if (PQtransactionStatus(conn_) == PQTRANS_INERROR) {
                 pg::PgResult rollback{PQexec(conn_, "ROLLBACK")};
                 if (rollback.ok()) {
                     pg::PgResult retry{PQexec(conn_, unlock_sql_.c_str())};
@@ -223,12 +247,27 @@ public:
             // same way the unlock did if the connection is broken for some
             // other reason — but killing one pooled connection on a
             // best-effort basis is still strictly better than doing nothing.
-            spdlog::critical("{}: could not release the advisory lock on a live connection: {} "
-                             "— terminating this backend on a best-effort basis to try to "
-                             "guarantee the lock is released",
-                             label_, PQerrorMessage(conn_));
+            //
+            // The terminate call runs BEFORE the log line below, never
+            // after: this whole destructor is wrapped in `try`/`catch(...)`
+            // specifically so a throw here cannot propagate out of a
+            // destructor, and a throwing log sink is exactly such a throw —
+            // logging first would let that same `catch(...)` silently skip
+            // the terminate call, leaving the backend alive and the lock
+            // still held, with the guard that exists to make this
+            // destructor safe being what disabled its own last-resort
+            // release. `err_detail` is captured before the terminate call
+            // runs, since `PQerrorMessage` reflects the connection's most
+            // recent result and would otherwise report the terminate
+            // statement's own outcome instead of the unlock failure this
+            // message is about.
+            const std::string err_detail = PQerrorMessage(conn_);
             pg::PgResult kill{PQexec(conn_, "SELECT pg_terminate_backend(pg_backend_pid())")};
             (void)kill; // best-effort; the connection is discarded either way
+            spdlog::critical("{}: could not release the advisory lock on a live connection: {} "
+                             "— terminated this backend on a best-effort basis to try to "
+                             "guarantee the lock is released",
+                             label_, err_detail);
         } catch (...) {
             // Nothing safe left to do during unwind.
         }

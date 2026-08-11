@@ -95,11 +95,16 @@ static_assert(kRawTokenTotalLen > 22,
 // cap-hit log line + counter below) rather than a single fleet-wide event.
 constexpr std::size_t kMaxAutoRevokesPerTick = 200;
 
-// Shared overflow guard for both the caller's clock and PostgreSQL's own —
-// mirrors `audit_store.cpp`'s `kMaxPlausibleNow`: `pg_now + kOverlapCeilSecs
-// + 86400` below is a signed-overflow-adjacent add near INT64_MAX. UPPER
-// bound only — a deeply negative reading is the legitimate dead-CMOS case
-// this guard exists for.
+// Shared implausible-reading UPPER bound for both the caller's clock and
+// PostgreSQL's own, checked before either reading is trusted for anything —
+// mirrors `audit_store.cpp`'s `kMaxPlausibleNow` in shape (same bound, same
+// role as the routed clock-guarded-retention concern's part-1 "excluding
+// rows stamped implausibly far ahead" probe applied to the reading itself
+// rather than a row), though this file has no `now + window + slack`
+// overflow-prone add for it to protect the way `audit_store.cpp`'s does
+// today — `moved_at_least` (`audit_retention_rules.hpp`) is overflow-free by
+// construction for every representable pair. UPPER bound only — a deeply
+// negative reading is the legitimate dead-CMOS case this guard exists for.
 //
 // Parenthesised `(std::numeric_limits<std::int64_t>::max)()`: this TU
 // includes <windows.h> DIRECTLY (above, under `#ifdef _WIN32`) with
@@ -2433,19 +2438,16 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
 
 ApiTokenStore::SweepResult ApiTokenStore::sweep_expired_rotations(int64_t now) {
     SweepResult result;
-    // GOVERNANCE CHAOS-INJECTION FINDING (#2964 fix round): every internal
-    // failure below used to set `outcome = Failed` and return with NO log
-    // line and no reason carried on `result` at all — measured: 16 of 18
-    // `Failed` sites emitted nothing. A permanent schema defect (e.g. a
-    // missing `rotation_retention_meta` table from a botched migration-
-    // number reconciliation, #3013 — this branch's own NUMBERING NOTE above
-    // warns of the collision that produces it) then read IDENTICALLY,
-    // forever, to a one-off transient pool blip, and the caller's own
-    // generic "pool contention / query failure" log text named neither
-    // correctly. `fail` is the ONE place every post-connection `Failed`
-    // outcome is produced from here down, so every site logs the actual
-    // libpq error text and carries it in `SweepResult::fail_reason` for the
-    // caller — mirrors `decline_reason`'s role for the `Declined` outcome.
+    // `fail` is the ONE place every post-connection `Failed` outcome is
+    // produced from here down, so every site logs the actual libpq error
+    // text and carries it in `SweepResult::fail_reason` for the caller —
+    // mirrors `decline_reason`'s role for the `Declined` outcome. This
+    // distinguishes a permanent schema defect (e.g. a missing
+    // `rotation_retention_meta` table from a botched migration-number
+    // reconciliation, #3013 — this branch's own NUMBERING NOTE above warns
+    // of the collision that produces it) from a one-off transient pool
+    // blip, which a shared generic "pool contention / query failure" log
+    // text would not.
     auto fail = [&](const char* stage, PGconn* conn) {
         const std::string detail = PQerrorMessage(conn);
         spdlog::error("[{}] sweep_expired_rotations: {} failed: {}", kStoreName, stage, detail);
@@ -2495,8 +2497,8 @@ ApiTokenStore::SweepResult ApiTokenStore::sweep_expired_rotations(int64_t now) {
     // that follow it, on OTHER connections, for the whole call. Acquired
     // with a bounded TRY on one leased connection.
     //
-    // POOL-SIZE FLOOR (found in review, #2964 fix round): `lease` below is
-    // held for the ENTIRE function body, including the up-to-200 per-pair
+    // POOL-SIZE FLOOR: `lease` below is held for the ENTIRE function body,
+    // including the up-to-200 per-pair
     // `pool_.with_txn_for` calls further down — each of THOSE acquires its
     // own, SECOND connection from this same pool while `lease` is still
     // held. A pool configured with fewer than 2 connections can therefore
@@ -2509,8 +2511,8 @@ ApiTokenStore::SweepResult ApiTokenStore::sweep_expired_rotations(int64_t now) {
     // practice today (production pool 16, test fixtures 4, and the only
     // size-1 pool in this codebase never runs this sweep).
     // ONE definition of this lock's key, generating matching try-lock/unlock
-    // SQL (`pg::PgAdvisoryLockKey`, #2964 round 3 review finding 3) — a
-    // hand-written pair of string constants could drift (a drift unlocks a
+    // SQL (`pg::PgAdvisoryLockKey`) — a hand-written pair of string
+    // constants could drift (a drift unlocks a
     // key never locked; Postgres reports `false`, and the release guard
     // treats `false` as "released" — a silent leak of the key actually
     // held).
@@ -2562,24 +2564,15 @@ ApiTokenStore::SweepResult ApiTokenStore::sweep_expired_rotations(int64_t now) {
     // (`pg/pg_session_advisory_lock.hpp`) is the same reusable release
     // protocol `KekOpLockGuard` uses.
     //
-    // GOVERNANCE CHAOS-INJECTION FINDING (#2964 fix round): this call
-    // site's own earlier revision hand-rolled the same release with a
-    // `pg_advisory_unlock_all()` "fallback" and an in-code claim that the
-    // fallback was a working safety net on failure — that claim was FALSE
-    // (`pg_advisory_unlock_all()` fails identically to the targeted unlock
-    // in the aborted-transaction case it would be relied on for; deleted
-    // rather than kept as a second copy of the same failure). Induction
-    // against live Postgres separately showed that specific aborted-
-    // transaction failure mode is NOT actually reachable at THIS call
-    // site: `unlock_guard` is declared before `pg::PgTxn txn` below, so
+    // `unlock_guard` is declared before `pg::PgTxn txn` below, so
     // reverse-destruction-order guarantees `~PgTxn`'s ROLLBACK always runs
-    // before the unlock attempt, leaving the connection clean every time.
-    // Adopting the shared guard here is therefore about removing an
-    // UNPINNED dependency on that declaration order (nothing enforces it,
-    // and a future edit could silently break it) and deleting the false
-    // comment — not about closing a reachable wedge in the code as it
-    // stands today. See `pg_session_advisory_lock.hpp`'s own file header
-    // for the full account.
+    // before the unlock attempt, leaving the connection clean every time —
+    // an aborted-transaction unlock failure is therefore not reachable at
+    // THIS call site. That ordering is UNPINNED (nothing enforces it, and a
+    // future edit could silently break it), which is why this uses the
+    // shared guard rather than a hand-rolled release tied to declaration
+    // order. See `pg_session_advisory_lock.hpp`'s own file header for the
+    // full account of the guard's release protocol.
     pg::PgSessionAdvisoryLockGuard unlock_guard{lease.get(), kRotationSweepLockKey, lock_label};
 
     // ── Classification transaction: PG-authoritative clock, durable meta
@@ -2630,14 +2623,13 @@ ApiTokenStore::SweepResult ApiTokenStore::sweep_expired_rotations(int64_t now) {
         "('last_pass_now','last_anomaly_facts','bootstrap_settled')",
         std::vector<std::string>{});
     if (meta.status() != PGRES_TUPLES_OK) {
-        // GOVERNANCE CHAOS-INJECTION FINDING (#2964 fix round): THIS is the
-        // site that fails with libpq's `relation "api_token_store.rotation_
-        // retention_meta" does not exist` when the table is missing (e.g. a
-        // botched migration-number reconciliation, #3013) — a permanent
-        // schema defect, not a transient fault. `fail()` is what carries
-        // that specific text to the caller instead of the generic "pool
-        // contention / query failure" label every Failed outcome used to
-        // share.
+        // This is the site that fails with libpq's `relation
+        // "api_token_store.rotation_retention_meta" does not exist` when
+        // the table is missing (e.g. a botched migration-number
+        // reconciliation, #3013) — a permanent schema defect, not a
+        // transient fault; `fail()` carries that specific text to the
+        // caller rather than a generic "pool contention / query failure"
+        // label.
         fail("durable meta read", conn);
         return result;
     }
@@ -2785,6 +2777,18 @@ ApiTokenStore::SweepResult ApiTokenStore::sweep_expired_rotations(int64_t now) {
             // `Wipe` cannot reach here at all — this store's `would_wipe`
             // fact is hardcoded `false` (see the DELIBERATE NON-ADOPTION
             // comment near `kRotationSweepBigStepSecs`'s definition).
+            // Triage payload for the non-bootstrap branch below: `prev`,
+            // `pg_now` and their delta — an operator staring at "facts=e-s--"
+            // alone cannot tell a genuine clock jump from a several-tick
+            // outage without them (ops runbook, "The retention clock guard"
+            // — do not drop these once added, that gap is what this exists
+            // to close). `prev` may be unset here (e.g. an unparseable
+            // durable reading, or one reset by the part-3 ahead-of-now/
+            // negative sanitiser above) — reported honestly as "none" rather
+            // than a fabricated 0.
+            const std::string prev_str = prev.has_value() ? std::to_string(*prev) : "none";
+            const std::string delta_str =
+                prev.has_value() ? std::to_string(pg_now - *prev) : "n/a";
             result.decline_reason =
                 anomaly == audit_retention::Anomaly::NoAnchor
                     ? "no usable previous rotation-sweep clock reading and predecessors are "
@@ -2792,6 +2796,8 @@ ApiTokenStore::SweepResult ApiTokenStore::sweep_expired_rotations(int64_t now) {
                       "both credentials in each affected pair stay active until the next tick, "
                       "which has a comparison point and proceeds"
                     : "rotation-sweep clock guard declined this tick (facts=" + facts_ser +
+                          ", prev=" + prev_str + ", pg_now=" + std::to_string(pg_now) +
+                          ", delta=" + delta_str +
                           ") — both credentials in each affected pair stay active; an identical "
                           "next tick will drain, capped";
             return result; // committed the stamp + anomaly record above
@@ -2852,16 +2858,16 @@ ApiTokenStore::SweepResult ApiTokenStore::sweep_expired_rotations(int64_t now) {
     }
     result.outcome = SweepOutcome::Ok;
 
-    // Found in review (#2964 fix round, finding 6): the per-pair lambda's
-    // `bool` return below conflates three DIFFERENT reasons for "false" —
-    // couldn't acquire the per-principal lock (genuine fault), the
-    // predecessor was already resolved out from under this sweep (benign,
-    // expected idempotent no-op), or the clear UPDATE's own execution
-    // genuinely failed (fault) — so a tick that selected N candidates and
-    // had every single one resolve as a no-op was indistinguishable from
-    // one where every single one hit a hard fault; both left
-    // `result.revoked` empty and `result.outcome == Ok`. This typed outcome
-    // is what `result.failed_pairs` below is derived from.
+    // A bare `bool` return from the per-pair lambda below would conflate
+    // three DIFFERENT reasons for "false" — couldn't acquire the
+    // per-principal lock (genuine fault), the predecessor was already
+    // resolved out from under this sweep (benign, expected idempotent
+    // no-op), or the clear UPDATE's own execution genuinely failed (fault)
+    // — leaving a tick where every candidate resolved as a no-op
+    // indistinguishable from one where every candidate hit a hard fault
+    // (both would leave `result.revoked` empty and `result.outcome ==
+    // Ok`). This typed outcome is what `result.failed_pairs` below is
+    // derived from.
     enum class PairRevokeOutcome { kFailed, kNoOp, kRevoked };
 
     // Up to 200 SEPARATE per-pair transactions, each on its OWN connection
@@ -2986,19 +2992,17 @@ ApiTokenStore::SweepResult ApiTokenStore::sweep_expired_rotations(int64_t now) {
         // default `kFailed` — correctly counted as a genuine fault, not a
         // no-op, since the lambda never got to decide.
         //
-        // #2964 round 3 review (finding 6): the ORIGINAL condition here —
-        // `pair_outcome == kFailed` — missed the COMMIT path. `with_txn_for`
-        // can return `false` AFTER the lambda already set `pair_outcome =
-        // kRevoked` and returned `true` (the `PQTRANS_INTRANS` guard, or
-        // `commit()` itself failing); that pair then enters neither
-        // `result.revoked` (guarded by `if (ok)` below) NOR
-        // `result.failed_pairs` (guarded by the old, too-narrow condition
-        // here) — silently vanishing from both. Reproduced with a deferred-
-        // constraint trigger that fails exactly at COMMIT. The correct
-        // condition is "the transaction did not actually succeed, and this
-        // was not the benign idempotent no-op" — `kNoOp` is excluded because
-        // the lambda deliberately returns `false` there too (already
-        // resolved under the lock), and that path must stay uncounted.
+        // Testing `pair_outcome == kFailed` alone would miss the COMMIT
+        // path: `with_txn_for` can return `false` AFTER the lambda already
+        // set `pair_outcome = kRevoked` and returned `true` (the
+        // `PQTRANS_INTRANS` guard, or `commit()` itself failing); that pair
+        // would then enter neither `result.revoked` (guarded by `if (ok)`
+        // below) NOR `result.failed_pairs`, silently vanishing from both.
+        // The correct condition is "the transaction did not actually
+        // succeed, and this was not the benign idempotent no-op" — `kNoOp`
+        // is excluded because the lambda deliberately returns `false` there
+        // too (already resolved under the lock), and that path must stay
+        // uncounted.
         if (!ok && pair_outcome != PairRevokeOutcome::kNoOp)
             ++result.failed_pairs;
 
@@ -3027,17 +3031,17 @@ ApiTokenStore::list_rotations_nearing_expiry_unused(int64_t warn_within_secs) co
     if (!lease)
         return result;
 
-    // Finding 7 (#2964 fix round): PostgreSQL's OWN clock, read once here,
-    // drives both this scan's window AND (via `result.pg_now`) the caller's
-    // own "has this pair's overlap window already elapsed" derivation —
-    // never the caller's process clock. Before this fix the two halves of
-    // the T12 sweep compared against two DIFFERENT clocks (this query's own
-    // PG read vs the caller's `std::chrono::system_clock::now()` in
-    // server.cpp), so under exactly the skew the whole clock-guarded-
-    // retention shape exists to survive, the caller could log/audit an
-    // "overlap window elapsed" state for a pair `sweep_expired_rotations`
-    // — reading the SAME PG clock via its own, separate query — does not
-    // (yet) consider elapsed at all.
+    // PostgreSQL's OWN clock, read once here, drives both this scan's
+    // window AND (via `result.pg_now`) the caller's own "has this pair's
+    // overlap window already elapsed" derivation — never the caller's
+    // process clock. The two halves of the T12 sweep must compare against
+    // the SAME clock: under exactly the skew the whole clock-guarded-
+    // retention shape exists to survive, comparing this scan's window
+    // against the caller's `std::chrono::system_clock::now()` in
+    // server.cpp instead could log/audit an "overlap window elapsed" state
+    // for a pair that `sweep_expired_rotations` — reading the SAME PG
+    // clock via its own, separate query — does not (yet) consider elapsed
+    // at all.
     pg::PgResult clk =
         pg::exec_params(lease.get(), "SELECT EXTRACT(EPOCH FROM now())::bigint",
                         std::vector<std::string>{});

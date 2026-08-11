@@ -104,16 +104,35 @@ newly-plausible clock reading (the anomaly case) and proceeds.
 1. Read the `spdlog::warn` line at the point of decline — it names which case
    fired (`decline_reason` on the typed `SweepOutcome::Declined` result) and
    states the cost in the same sentence. Do not infer the cause from the
-   counter alone.
-2. If the reason names a clock anomaly, check PostgreSQL's OWN clock — the
-   same first step as `YuzuAuditRetentionClockAnomaly`
+   counter alone. For a big-step/bad-state decline, `decline_reason` also
+   carries the raw `prev`, `pg_now`, and their delta (`facts=...,
+   prev=..., pg_now=..., delta=...`) — read these before reaching for
+   `pg_locks`/`rotation_retention_meta`, they are often enough on their own
+   to tell a real clock jump (a huge, implausible delta) from an ordinary
+   outage (a delta a little over one hour).
+2. **A big-step decline is NOT proof the clock moved — check for a
+   multi-tick gap FIRST.** At this sweep's 3600s big-step threshold, the
+   single most common trigger is a perfectly correct clock that simply
+   didn't reach a verdict for over an hour: a maintenance window, a
+   database failover, a server restart, or a dev/staging instance left off
+   overnight all produce the IDENTICAL log line and fact set
+   (`decline_reason`'s `facts=...` payload) as a genuine forward clock
+   jump — the guard cannot and does not distinguish the two on its own.
+   Check the server's own uptime/restart history and any known maintenance
+   window BEFORE concluding the clock moved; the `delta` value from step 1
+   only tells you HOW FAR the reading moved, not WHY.
+3. Only once a multi-tick outage is ruled out, check PostgreSQL's OWN
+   clock — the same first step as `YuzuAuditRetentionClockAnomaly`
    (`docs/ops-runbooks/audit-store-clock-guard.md`) — since this sweep reads
    the identical `SELECT EXTRACT(EPOCH FROM now())` on the same server. A
    fault on the Postgres host affects both guards simultaneously; if only
    this one is declining, look at `api_token_store.rotation_retention_meta`
    specifically (`SELECT * FROM api_token_store.rotation_retention_meta;`),
-   not the audit store's own anchor table — they are independent rows.
-3. If the reason names the bootstrap case (no durable anchor yet, with
+   not the audit store's own anchor table — they are independent rows. That
+   table's `last_anomaly_facts` row is a single-row upsert holding the
+   MOST RECENT declined fact set only, never a history of past declines —
+   do not expect to find prior anomalies there once a later one has landed.
+4. If the reason names the bootstrap case (no durable anchor yet, with
    already-eligible predecessors), expect this **at most once per database**
    — the declining tick also settles `rotation_retention_meta.bootstrap_settled`
    (key `bootstrap_settled`), so the next tick proceeds with a comparison
@@ -121,7 +140,7 @@ newly-plausible clock reading (the anomaly case) and proceeds.
    `YuzuAuditRetentionAnchorNotSurviving`) — check whether
    `rotation_retention_meta` is being restored/rolled back independently of
    the rest of `api_token_store`.
-4. **A declined tick is not free even though it is safe.** A pair whose
+5. **A declined tick is not free even though it is safe.** A pair whose
    successor HAS been used stays valid past its promised overlap window for
    at least one more tick — read that as extended exposure to a possibly
    compromised predecessor credential, not as a no-op.

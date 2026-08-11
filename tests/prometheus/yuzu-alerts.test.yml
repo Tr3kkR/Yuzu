@@ -988,3 +988,88 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuRotationSweepLockContentionUnexpected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
+
+  # ── YuzuRotationSweepLostRevocations (#2964, round-4 review) ────────────
+  #
+  # `increase(yuzu_rotation_sweep_lost_revocations_total[15m]) > 0`,
+  # `for: 10m`. Deliberately NOT scoped to a loss that persists across
+  # multiple ticks -- `increase(...[15m]) > 0` stays true for the WHOLE 15m
+  # window a single, non-repeating bump remains inside, so a lone lost
+  # revocation satisfies the `for: 10m` requirement on its own and pages.
+  # That is correct: one lost revocation is itself a real overdue
+  # auto-revoke signal (see the rule's own comment). These two cases exist
+  # because an earlier revision of the rule's comment claimed the opposite
+  # ("scoped to a loss that persists, not a one-off") -- a claim CASE 38
+  # below disproves directly, and because a metric-name typo in this exact
+  # `expr` was separately measured passing every OTHER promtool gate
+  # undetected before this file gained a case for it.
+
+  # CASE 37 -- the healthy case: no lost revocations, ever. Must stay quiet.
+  - interval: 1m
+    name: rotation sweep lost revocations - a healthy sweep is quiet
+    input_series:
+      - series: 'yuzu_rotation_sweep_lost_revocations_total{job="yuzu",instance="s1"}'
+        values: "0x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRotationSweepLostRevocations", alertstate="firing"}'
+        eval_time: 4h
+        exp_samples: []
+
+  # CASE 38 -- THE ASSERTION THIS CASE EXISTS FOR: a SINGLE, non-repeating
+  # loss of 3 predecessor revocations at t=5m, with nothing else lost after
+  # it, still pages once `for: 10m` has had a chance to observe the bump
+  # continuously (checked well inside the ~14-minute window the bump stays
+  # visible in `increase(...[15m])`), then clears again once the bump ages
+  # out of that window -- pinning both halves of the corrected comment: NOT
+  # scoped to a persisting loss, and self-heals rather than paging forever.
+  - interval: 1m
+    name: rotation sweep lost revocations - a single non-repeating loss still pages, then clears
+    input_series:
+      - series: 'yuzu_rotation_sweep_lost_revocations_total{job="yuzu",instance="s1"}'
+        values: "0x5 3x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRotationSweepLostRevocations", alertstate="firing"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuRotationSweepLostRevocations", alertstate="firing"}'
+        eval_time: 18m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRotationSweepLostRevocations", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuRotationSweepLostRevocations", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples: []
+
+  # ── YuzuRotationSweepDeclinedSustained (#2964, round-4 review) ──────────
+  #
+  # `increase(yuzu_rotation_sweep_declined_total[15m]) > 1`, `for: 10m` --
+  # unlike its LostRevocations sibling above, THIS rule is deliberately
+  # scoped past the single ordinary decline the fact-set dedup SLA predicts
+  # (see docs/user-manual/authentication.md "Rotating a Token"): a lone
+  # decline must stay quiet, a sustained run of distinct declines must page.
+
+  # CASE 39 -- a single ordinary decline (the "one extra tick, then drains"
+  # SLA case) must stay quiet at any eval time -- `> 1` never reached.
+  - interval: 1m
+    name: rotation sweep declined sustained - a single ordinary decline stays quiet
+    input_series:
+      - series: 'yuzu_rotation_sweep_declined_total{job="yuzu",instance="s1"}'
+        values: "0x5 1x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRotationSweepDeclinedSustained", alertstate="firing"}'
+        eval_time: 4h
+        exp_samples: []
+
+  # CASE 40 -- repeated, distinct declines (a jittering-clock or recurring
+  # bad-state fault) sustained past the 15m/10m thresholds must page.
+  - interval: 1m
+    name: rotation sweep declined sustained - repeated distinct declines page
+    input_series:
+      - series: 'yuzu_rotation_sweep_declined_total{job="yuzu",instance="s1"}'
+        values: "0+1x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRotationSweepDeclinedSustained", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRotationSweepDeclinedSustained", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1

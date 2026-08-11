@@ -2118,29 +2118,41 @@ public:
                           "principal_kind",
                           "counter");
         metrics_.counter("yuzu_rotation_sweep_capped_total");
-        // #2964: the sweep's clock guard DECLINED a tick on a genuine clock
-        // anomaly (a would-wipe/big-step/bad-state verdict) — both
-        // credentials in every affected pair stay active rather than being
-        // auto-revoked on an unverified reading. A decline must never be
-        // indistinguishable from "nothing was eligible this tick" (both
-        // leave zero rows revoked) — this counter, plus the caller's own
-        // actionable log line, are what make the two distinguishable. Same
-        // shared, un-split-by-principal_kind scope as its sweep_failures/
-        // capped siblings above — the decline is a tick-level clock-guard
-        // verdict, not attributable to one kind's rows.
+        // The sweep's clock guard DECLINED a tick (a big-step/bad-state
+        // verdict) — both credentials in every affected pair stay active
+        // rather than being auto-revoked on an unverified reading. A
+        // decline must never be indistinguishable from "nothing was
+        // eligible this tick" (both leave zero rows revoked) — this
+        // counter, plus the caller's own actionable log line, are what make
+        // the two distinguishable. Same shared, un-split-by-principal_kind
+        // scope as its sweep_failures/capped siblings above — the decline
+        // is a tick-level clock-guard verdict, not attributable to one
+        // kind's rows.
+        //
+        // `big-step` (`Step`) is NOT a clock-anomaly-only signal at this
+        // store's 3'600s threshold (`kRotationSweepBigStepSecs`, its own
+        // doc comment in `api_token_store.hpp`) — an hour of `Failed` ticks
+        // (a maintenance window, a DB failover, a dev instance left off
+        // overnight) crosses it just as a clock jump would, with no clock
+        // fault involved. `describe()` below states both causes; do not
+        // narrow this text to "clock anomaly" alone.
         //
         // Deliberately EXCLUDES the no-durable-anchor decline (routed-concern
-        // policy floor, #2964 fix round finding 4) — see
-        // `yuzu_rotation_sweep_bootstrap_declines_total` below for why that
-        // one is a SEPARATE series, never folded into this one.
+        // policy floor) — see `yuzu_rotation_sweep_bootstrap_declines_total`
+        // below for why that one is a SEPARATE series, never folded into
+        // this one.
         metrics_.describe("yuzu_rotation_sweep_declined_total",
-                          "Cumulative rotation-sweep ticks the clock guard declined on a genuine "
-                          "clock anomaly (big-step / bad-state - this store does not adopt the "
-                          "would-wipe half of the routed-concern probe, see api_token_store.cpp's "
-                          "DELIBERATE NON-ADOPTION comment) - shared across BOTH engine-credential "
-                          "and human API-token rotation pairs, not split by principal_kind. "
-                          "Excludes bootstrap declines (no durable anchor yet) - see "
-                          "yuzu_rotation_sweep_bootstrap_declines_total",
+                          "Cumulative rotation-sweep ticks the clock guard declined (big-step / "
+                          "bad-state - this store does not adopt the would-wipe half of the "
+                          "routed-concern probe, see api_token_store.cpp's DELIBERATE "
+                          "NON-ADOPTION comment). A big-step decline is NOT necessarily a clock "
+                          "fault: at this store's 3600s threshold it is most often a planned or "
+                          "unplanned multi-tick outage (maintenance window, DB failover, an "
+                          "instance left off overnight) with a perfectly correct clock - check "
+                          "both before assuming the clock moved. Shared across BOTH "
+                          "engine-credential and human API-token rotation pairs, not split by "
+                          "principal_kind. Excludes bootstrap declines (no durable anchor yet) - "
+                          "see yuzu_rotation_sweep_bootstrap_declines_total",
                           "counter");
         metrics_.counter("yuzu_rotation_sweep_declined_total");
         // #2964 fix round finding 4 (routed-concern POLICY FLOOR: a bootstrap
