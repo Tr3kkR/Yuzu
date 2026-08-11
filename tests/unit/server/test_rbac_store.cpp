@@ -38,6 +38,25 @@ using namespace yuzu::server;
 namespace pg = yuzu::server::pg;
 using yuzu::server::pg::PgPool;
 
+namespace yuzu::server {
+
+// #2703 Gate 7 item 3 — friend seam (rbac_store.hpp) for exercising
+// user_rbac_group_names/role_effects_for directly; same shape as
+// PreflightRoutesTestAccess (test_preflight_routes.cpp) /
+// DashboardResultsColumnsTestAccess. See the friend declaration's comment for
+// why authorize_list_read() alone can't reach role_effects_for's own sites.
+struct RbacStoreTestAccess {
+    RbacStore& store;
+    auto user_rbac_group_names(const std::string& username) {
+        return store.user_rbac_group_names(username);
+    }
+    auto role_effects_for(const std::string& securable_type, const std::string& operation) {
+        return store.role_effects_for(securable_type, operation);
+    }
+};
+
+} // namespace yuzu::server
+
 namespace {
 // Pre-migrated + seeded template (RbacStore construction runs the migration AND
 // seed_defaults). Every store-behaviour case clones this instead of
@@ -1795,6 +1814,138 @@ TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
     // all counted whether denied or successful.
     CHECK(metrics.serialize().find("yuzu_server_rbac_authz_check_seconds_count 3") !=
           std::string::npos);
+}
+
+// #2703 Gate 7 item 3 (BLOCKING, consistency-auditor Gate 4 + compliance-officer
+// Gate 6): user_rbac_group_names and role_effects_for share check_permission's
+// 3 degrade exits (breaker-denied, pool-acquire-timeout, query-error) but,
+// before this fix, never called note_read_degrade() on any of them — a
+// degrade on the ADR-0017 admit-then-filter chokepoint (authorize_list_read,
+// which both feed) was invisible to yuzu_server_rbac_read_degrade_total and
+// the YuzuRbacReadDegraded alert. Reproduces both the pool-acquire-timeout
+// path (first two calls) and the breaker-denied fast path (third call, once
+// the two prior failures have tripped the breaker) on BOTH sibling methods,
+// asserting the counter — not merely that the calls return an error.
+TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
+          "read-degrade on pool-acquire-timeout and breaker-denied "
+          "(#2703 Gate 7 item 3)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    (void)replica_a;
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    RbacStoreTestAccess acc{replica_b};
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics); // wired AFTER construction, same as the
+                                     // breaker test — construction's own read
+                                     // (if any) must not touch the counter.
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
+
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    // Call 1 (user_rbac_group_names): breaker still closed (streak 0) ->
+    // genuine pool-acquire attempt -> times out -> streak 0->1, denying,
+    // reason=pool_acquire_timeout.
+    auto r1 = acc.user_rbac_group_names("bob");
+    REQUIRE_FALSE(r1.has_value());
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "pool_acquire_timeout"}})
+              .value() == 1.0);
+
+    // Call 2 (role_effects_for): breaker still closed (streak 1 < threshold
+    // 2) -> genuine pool-acquire attempt -> times out -> streak 1->2, a
+    // closed->open transition, reason=pool_acquire_timeout again.
+    auto r2 = acc.role_effects_for("Infrastructure", "Read");
+    REQUIRE_FALSE(r2.has_value());
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "pool_acquire_timeout"}})
+              .value() == 2.0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+
+    // Call 3 (user_rbac_group_names again): breaker now OPEN and within its
+    // cooldown -> denies WITHOUT a pool touch, via each sibling's own
+    // breaker-denied branch (the other half of this fix — that branch was
+    // ALSO silent pre-fix). Reason is still pool_acquire_timeout (breaker-
+    // denied is recorded under the same label as check_permission's own
+    // breaker-denied branch, not a distinct reason — see the HELP text).
+    auto r3 = acc.user_rbac_group_names("bob");
+    REQUIRE_FALSE(r3.has_value());
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "pool_acquire_timeout"}})
+              .value() == 3.0);
+}
+
+// #2703 Gate 7 item Commit C (quality-engineer + consistency-auditor, Gate 3:
+// zero test coverage for the generation_refresh_failed /
+// generation_refresh_failed_within_bound reason split — the exact
+// false-green-shaped gap this session already hit once with the sibling-
+// method omission above). Asserts the COUNTER + its reason label directly,
+// not just the behavioural side effect (a warm/dropped cache) the two
+// existing generation tests already cover.
+TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
+          "reason label inside vs. past the bounded stale-serve window "
+          "(#2703 Gate 7 item Commit C)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    replica_a.set_rbac_enabled(true);
+    REQUIRE(replica_a.assign_role({"user", "bob", "Administrator"}).has_value());
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics);
+
+    // Genuinely populate replica_b's cache with a confirmed-good refresh.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
+    // check_permission's own success path never fires a degrade — sanity
+    // check that this test starts from a clean counter before starving.
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed_within_bound"}})
+              .value() == 0.0);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed"}})
+              .value() == 0.0);
+
+    // Starve the pool and force one failed refresh attempt INSIDE the bound.
+    // check_permission() is the trigger (maybe_refresh_generation() is
+    // private) — same technique as the pre-existing generation tests above.
+    // The cache stays warm through this call (within-bound keeps
+    // perm_cache_), so it's served from cache and never reaches
+    // check_permission's OWN pool-fallback branch — only
+    // maybe_refresh_generation()'s degrade fires.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+    CHECK(replica_b.check_permission("bob", "Infrastructure", "Read")); // served from cache
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed_within_bound"}})
+              .value() == 1.0);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed"}})
+              .value() == 0.0); // the denying reason must NOT fire while still tolerated
+
+    // Push past the bound with an explicit sleep (mirrors the existing
+    // rbac_enforcement_in_effect fail-closed test's technique). This second
+    // failed refresh drops the cache, so THIS call also falls through to
+    // check_permission's own (still-starved) pool-fallback branch — that
+    // fires its own pool_acquire_timeout degrade too, a different reason
+    // label from the two asserted below, so it doesn't affect them.
+    std::this_thread::sleep_for(std::chrono::milliseconds(4200));
+    CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "Read"));
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed"}})
+              .value() == 1.0); // now denying — the cache was actually dropped
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed_within_bound"}})
+              .value() == 1.0); // unchanged — that call's reason was the other one
 }
 
 // quality-engineer (#2703): the F3 staleness predicate, pinned with synthetic
