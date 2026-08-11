@@ -1621,6 +1621,545 @@ TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams +
     CHECK(confirm_metric("success") == 1.0); // unchanged by the replay
 }
 
+TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drifted "
+          "ticket WITHOUT consuming it (#2443)",
+          "[mcp][pg][engine_principal][confirm][approval]") {
+    // The scenario #2443's issue body names: an approval ticket for
+    // confirm_engine_rotation is minted and approved, then, before it is
+    // recalled, the SAME rotation resolves through a different path (here:
+    // a direct store confirm, standing in for a manual/out-of-band cutover).
+    // Without the precondition wired, the recall would match, CONSUME the
+    // ticket, and only then fail at the handler, burning a human-approved
+    // one-time capability on a no-op. With it wired, the recall must deny
+    // WITHOUT consuming, leaving the ticket recallable.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-precondition";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    // Mint the rotation pair directly at the store (not under test here).
+    REQUIRE(store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "admin").has_value());
+    std::string successor_token_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            successor_token_id = t.token_id;
+    REQUIRE_FALSE(successor_token_id.empty());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_precond_appr-"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised"); // Security:Write requires approval at this tier
+
+    const auto refused_metric = [&]() {
+        return reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "confirm_engine_rotation"}})
+            .value();
+    };
+    CHECK(refused_metric() == 0.0);
+
+    // 1. Mint - no approval_id yet.
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+                            .dump());
+    REQUIRE(mint->status == 200);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    CHECK(mint_body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+
+    // 2. Approve.
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // 3. DRIFT: the rotation resolves out from under the ticket, through a
+    // path that never touches the approval store - the same
+    // `requesting_user` ("admin") that minted it confirms directly.
+    REQUIRE(store.confirm_rotation(principal, successor_token_id, "admin").has_value());
+    REQUIRE(store.list_active_for_principal(principal).size() == 1);
+
+    // 4. Recall. Must be denied - and must NOT be the pre-#2443 "approval
+    // already used" wording, which would misdescribe a ticket that is still
+    // sitting there unconsumed. The client message is deliberately GENERIC
+    // (no rotation-state specifics): the precondition runs before this
+    // tool's own RBAC check, so a specific answer here would be a
+    // credential-state oracle for a tier-eligible, RBAC-less caller.
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id},
+            {"principal_id", principal},
+            {"token_id", successor_token_id}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("error"));
+    const std::string message = recall_body["error"]["message"].get<std::string>();
+    CHECK(message.find("already used") == std::string::npos);
+    CHECK(message.find("already confirmed") == std::string::npos); // NOT leaked pre-RBAC
+    const std::string remediation =
+        recall_body["error"]["data"]["remediation"].get<std::string>();
+    CHECK(remediation.find("NOT consumed") != std::string::npos);
+    // Remediation must not promise a retry will succeed: this drift is
+    // terminal for THIS ticket's pinned token_id.
+    CHECK(remediation.find("retry this exact call") == std::string::npos);
+
+    // 5. The ticket is UNTOUCHED - still consumed_at == 0, still recallable -
+    // not silently burned on the failed recall.
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+    CHECK(row->status == "approved");
+
+    // 6. The generic audit path runs ahead of the kind-specific client
+    // message and carries the specific fact the client message withholds -
+    // confirm both: the kind is named, AND the specific rotation-state fact
+    // is present server-side even though it's absent from the client body.
+    bool precondition_denied_audited = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("approval_id=" + approval_id) != std::string::npos &&
+            d.find("refused: precondition: rotation already confirmed") != std::string::npos)
+            precondition_denied_audited = true;
+    CHECK(precondition_denied_audited);
+
+    // 6b. The generic refusal-rate metric fires too (same shared path, ahead
+    // of the kind-specific branch) - this is what an operator would alert on.
+    CHECK(refused_metric() == 1.0);
+
+    // 7. Handler never ran for the drifted recall - no SECOND success audit
+    // for the credential.confirm domain event beyond what step 3's direct
+    // store call would have produced (none, since that bypassed MCP).
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     std::string("engine_principal.credential.confirm|success")) == 0);
+}
+
+TEST_CASE("MCP confirm_engine_rotation: a NEWER rotation's mismatched pin is caught by "
+          "the precondition, not just confirm_rotation's own check (#2443)",
+          "[mcp][pg][engine_principal][confirm][approval]") {
+    // The burn this closes: `classify_confirm_state` alone would read TWO
+    // active credentials as `kPair` regardless of WHICH pair - so a ticket
+    // pinned to an OLDER rotation's successor, recalled after that rotation
+    // resolved and a NEWER one started, would pass a precondition that only
+    // checked the count, get the ticket consumed, and then fail
+    // confirm_rotation's own token_id pin check. `pair_matches_pin` closes
+    // that gap by checking linkage + pin from the same public data.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-newer-pair";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    // First rotation: predecessor P0 -> successor A.
+    REQUIRE(store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "admin").has_value());
+    std::string token_a;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            token_a = t.token_id;
+    REQUIRE_FALSE(token_a.empty());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_newer_pair_appr-"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    // Mint + approve a ticket pinned to token_a.
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", principal}, {"token_id", token_a}}}}}}
+                            .dump());
+    const std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // DRIFT: token_a's rotation resolves (revoked directly, standing in for
+    // an out-of-band cutover), and a NEW rotation starts - P0 -> successor B.
+    // active is now {P0, B}: still exactly 2 rows, still classify_confirm_state
+    // -> kPair, but the pin the ticket was minted for (token_a) is neither
+    // row.
+    REQUIRE(store.revoke_token(token_a).has_value());
+    REQUIRE(store.list_active_for_principal(principal).size() == 1);
+    REQUIRE(store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "admin").has_value());
+    REQUIRE(store.list_active_for_principal(principal).size() == 2);
+
+    // Recall with the OLD pin (token_a). Must be denied WITHOUT consuming -
+    // not silently pass as kPair and burn on confirm_rotation's own pin
+    // check.
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id}, {"principal_id", principal}, {"token_id", token_a}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("error"));
+
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0); // NOT burned
+    CHECK(row->status == "approved");
+
+    bool precondition_denied_audited = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("approval_id=" + approval_id) != std::string::npos &&
+            d.find("refused: precondition") != std::string::npos)
+            precondition_denied_audited = true;
+    CHECK(precondition_denied_audited);
+}
+
+TEST_CASE("MCP confirm_engine_rotation: precondition ALLOWS an undrifted recall through to "
+          "a successful confirm (#2443)",
+          "[mcp][pg][engine_principal][confirm][approval]") {
+    // Every other #2443 test in this file exercises a DENY branch. None
+    // proves the precondition's allow path (kPair + pair_matches_pin=true ->
+    // `return {}`) actually lets a legitimate, undrifted recall reach the
+    // handler and succeed end-to-end (quality-engineer, Gate 3) - a
+    // regression that flips the switch's default arm to deny-everything
+    // would pass every existing #2443 test in this file while breaking the
+    // tool for every real caller.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-allow-path";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+    // Rotated by "test-user" - McpTestServer's mock session username - so the
+    // recall below actually reaches a REAL confirm_rotation success. Every
+    // sibling #2443 test rotates as "admin" because they all deny before
+    // confirm_rotation's own Hermes F4/F5 initiator-binding check would ever
+    // run; this is the one test where that check is live and must pass.
+    REQUIRE(
+        store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "test-user").has_value());
+    std::string successor_token_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            successor_token_id = t.token_id;
+    REQUIRE_FALSE(successor_token_id.empty());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_allow_appr-"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised");
+
+    const auto refused_metric = [&]() {
+        return reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "confirm_engine_rotation"}})
+            .value();
+    };
+    const auto precondition_denied_metric = [&]() {
+        return reg
+            .counter("yuzu_mcp_approval_precondition_denied_total",
+                     {{"tool", "confirm_engine_rotation"}})
+            .value();
+    };
+
+    // Mint + approve. No drift between approve and recall.
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+                            .dump());
+    const std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // Recall: active is still the clean {predecessor, successor} pair,
+    // linked, pinned to successor_token_id - the precondition's kPair +
+    // pair_matches_pin arm must return {} and let this reach the handler.
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id},
+            {"principal_id", principal},
+            {"token_id", successor_token_id}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("result")); // NOT "error" - the precondition let it through
+    auto result_payload = nlohmann::json::parse(
+        recall_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(result_payload["confirmed"] == true);
+    CHECK(result_payload["principal_id"] == principal);
+
+    // The ticket IS consumed on the success path - this is the mirror image
+    // of every deny-branch test above, which assert consumed_at == 0.
+    // consumed_at is the ONLY consumption signal: `status` has no distinct
+    // "consumed" value and stays "approved" (the consuming CAS is `WHERE
+    // status = 'approved' AND consumed_at = 0`, and never writes `status`).
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at != 0);
+    CHECK(row->status == "approved");
+
+    // Neither refusal counter fired - this recall was never denied.
+    CHECK(refused_metric() == 0.0);
+    CHECK(precondition_denied_metric() == 0.0);
+
+    // The store itself reflects the cutover: successor is now sole active,
+    // confirmed_at stamped.
+    const auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 1);
+    CHECK(active.front().token_id == successor_token_id);
+    CHECK(active.front().confirmed_at != 0);
+}
+
+TEST_CASE("MCP confirm_engine_rotation: a revoke-to-zero (kNoneActive) denies WITHOUT "
+          "consuming, not a silent pass-through (#2443)",
+          "[mcp][pg][engine_principal][confirm][approval]") {
+    // architect + consistency-auditor (Gate 3/4): an empty active-credential
+    // read is ambiguous with a masked store-read failure, but a precondition
+    // denial never consumes the ticket either way, so "deny, don't guess" is
+    // strictly safer than passing an ambiguous read through to burn the
+    // ticket on what may be a fully-resolved rotation. Drive the active set
+    // to genuinely zero (both pair members revoked) so this test exercises
+    // the real revoke-to-zero cause, not the masked-failure cause.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-revoke-to-zero";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "admin").has_value());
+    std::string predecessor_token_id, successor_token_id;
+    for (const auto& t : store.list_active_for_principal(principal)) {
+        if (!t.supersedes_token_id.empty())
+            successor_token_id = t.token_id;
+        else
+            predecessor_token_id = t.token_id;
+    }
+    REQUIRE_FALSE(successor_token_id.empty());
+    REQUIRE_FALSE(predecessor_token_id.empty());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_none_active_appr-"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised");
+
+    const auto precondition_denied_metric = [&]() {
+        return reg
+            .counter("yuzu_mcp_approval_precondition_denied_total",
+                     {{"tool", "confirm_engine_rotation"}})
+            .value();
+    };
+
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+                            .dump());
+    const std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // DRIFT: revoke BOTH pair members - active drops to genuinely zero, not
+    // masked by a read failure.
+    REQUIRE(store.revoke_token(predecessor_token_id).has_value());
+    REQUIRE(store.revoke_token(successor_token_id).has_value());
+    REQUIRE(store.list_active_for_principal(principal).empty());
+
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id},
+            {"principal_id", principal},
+            {"token_id", successor_token_id}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("error")); // denied, not passed through to the handler
+
+    // The specific fact stays server-side (audit-only, checked below) - this
+    // precondition runs before RBAC, so a specific answer here would be a
+    // credential-state oracle for a tier-eligible, RBAC-less caller
+    // (security-guardian, Gate 8: regression-pin the anti-oracle property,
+    // not just confirm it by inspection).
+    CHECK(recall->body.find("no active credential") == std::string::npos);
+
+    // The ticket is UNTOUCHED - the whole point of denying instead of
+    // guessing on an ambiguous empty read.
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+    CHECK(row->status == "approved");
+
+    CHECK(precondition_denied_metric() == 1.0);
+
+    bool precondition_denied_audited = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("approval_id=" + approval_id) != std::string::npos &&
+            d.find("refused: precondition: no active credential found") != std::string::npos)
+            precondition_denied_audited = true;
+    CHECK(precondition_denied_audited);
+}
+
+TEST_CASE("MCP confirm_engine_rotation: a closed/unwired engine-credential store "
+          "denies WITHOUT consuming, not a pass-through that burns the ticket "
+          "at the handler's own guard (#2443, fjarvis Gate-8-followup review)",
+          "[mcp][engine_principal][confirm][approval]") {
+    // The precondition's own closed-store check used to `return {}`
+    // (pass-through), reasoning that "the handler's own store-open guard
+    // reports this" - but the handler's guard runs AFTER consume_ticket, not
+    // before, so that pass-through consumed the ticket and only then hit the
+    // handler's guard: burning a human-approved capability on a no-op,
+    // exactly the kNoneActive shape two tests above. No live PG token store
+    // needed here - the whole point is the precondition never reaches one.
+    yuzu::test::TempDbFile adb{
+        std::string_view{"yuzu_test_mcp_confirm_closed_store_appr-"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    // Deliberately NOT set: ts.engine_credential_store_for_test - the
+    // precondition's `!engine_credential_store_` arm is what this test
+    // exercises.
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised");
+
+    const auto precondition_denied_metric = [&]() {
+        return reg
+            .counter("yuzu_mcp_approval_precondition_denied_total",
+                     {{"tool", "confirm_engine_rotation"}})
+            .value();
+    };
+
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", "engine:mcp-confirm-closed-store"},
+                         {"token_id", "deadbeefdeadbeefdeadbeef"}}}}}}
+                            .dump());
+    REQUIRE(mint->status == 200);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id},
+            {"principal_id", "engine:mcp-confirm-closed-store"},
+            {"token_id", "deadbeefdeadbeefdeadbeef"}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("error")); // denied, not passed through to the handler
+
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0); // NOT burned on a store that was never open
+    CHECK(row->status == "approved");
+
+    CHECK(precondition_denied_metric() == 1.0);
+
+    bool precondition_denied_audited = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("approval_id=" + approval_id) != std::string::npos &&
+            d.find("refused: precondition: engine credential store unavailable") !=
+                std::string::npos)
+            precondition_denied_audited = true;
+    CHECK(precondition_denied_audited);
+}
+
 // ── 2. ping ─────────────────────────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: ping returns empty result", "[mcp][integration]") {
