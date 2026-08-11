@@ -1278,8 +1278,8 @@ groups:
       # rule's `for:` can accumulate still starves both (measured: sentinel
       # filler with single-scrape 0 excursions at a 180-195m period; requires
       # a never-anchored database, a dead reaper, and a scrape phase-locked
-      # to the short boot). Closing that is a `for:`/window retune tracked in
-      # its own issue -- do not narrow either `for:` here without re-timing
+      # to the short boot). Closing that is a `for:`/window retune tracked as
+      # #2997 -- do not narrow either `for:` here without re-timing
       # every case in the test file and re-running the sweep. Excused means "the
       # window carries no evidence a pass ever happened": every sample is 0
       # or the unreadable-anchor sentinel, with at least one 0. ANY evidence

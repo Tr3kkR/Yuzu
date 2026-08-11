@@ -381,7 +381,8 @@ least three hours: NO retention pass has ever run against this database. Not
 `audit_store.audit_retention_meta` anchor at startup (#2854), so `0` is a fact
 about the DATABASE, not about a young process, and restarts do not reset the
 clock (the rule reads the whole `[3h]` window, so a crash-looping fresh
-install still pages). A fresh install's one legitimate cleanup interval of
+install still pages — mixed-seed loops carry one filed exception, #2997,
+detailed below). A fresh install's one legitimate cleanup interval of
 silence is over long before this fires.
 
 This is `YuzuAuditRetentionNotRunning`'s excused state, given its own alert
