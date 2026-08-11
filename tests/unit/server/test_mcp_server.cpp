@@ -6047,7 +6047,7 @@ TEST_CASE("MCP CA: revoke_certificate supervised + approval manager mints a tick
 TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches revoked:true "
           "(#2712)",
           "[mcp][integration][pki][security][approval]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
+    yuzu::test::TempDbFile db{std::string_view{"yuzu_test_mcp_ca_"}};
     yuzu::server::CaStore store(db.path);
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "CAFE";
@@ -6056,10 +6056,21 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
     rec.not_after = 4102444800;
     REQUIRE(store.record_issued(rec));
 
-    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
     appr.create_tables();
 
     McpTestServer ts;
@@ -6069,6 +6080,7 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
 
     auto res1 = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"CAFE","reason":"compromised"}}})");
+    REQUIRE(res1);
     auto body1 = nlohmann::json::parse(res1->body);
     REQUIRE(body1.contains("error"));
     std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
@@ -6077,6 +6089,7 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
     std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"CAFE","reason":"compromised","approval_id":")" +
                          approval_id + R"("}}})";
     auto res2 = ts.call(recall);
+    REQUIRE(res2);
     auto body2 = nlohmann::json::parse(res2->body);
     REQUIRE(body2.contains("result")); // SUCCESS
     auto payload =
@@ -6089,7 +6102,6 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
     // #2712: structuredContent mirrors content[0].text exactly.
     REQUIRE(body2["result"].contains("structuredContent"));
     CHECK(body2["result"]["structuredContent"] == payload);
-    sqlite3_close(raw);
 }
 
 // ── #2395 track D: KEK rotation MCP tools (parity with kek_routes.cpp) ────────
@@ -6969,11 +6981,12 @@ TEST_CASE("MCP get_bundle_result tolerates non-UTF-8 plugin output (no envelope 
     // exactly this kind of replaced-character content.
     REQUIRE(body["result"].contains("structuredContent"));
     CHECK(body["result"]["structuredContent"] == p);
-    // The invalid byte itself must not survive into either representation -
-    // confirms error_handler_t::replace actually fired, not just that nothing
-    // threw.
+    // Exact-equality, matching the REST twin's identical scenario
+    // (test_rest_bundle.cpp:455) - confirms the invalid byte was REPLACED
+    // with U+FFFD (not silently dropped/truncated, which a bare
+    // absence-of-0xff check could not distinguish from this).
     const auto out = p["steps"][0]["output"].get<std::string>();
-    CHECK(out.find('\xff') == std::string::npos);
+    CHECK(out == "\xEF\xBF\xBD" "binary");
 }
 
 // ── query_installed_software (ADR-0016 typed store + management-group scope) ──
@@ -9749,14 +9762,25 @@ TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCC
     // execute_instruction's normal-branch minimum:1 onto this tool would be
     // exactly the wrong constraint here (Fable's review of the #2712 batch 3
     // plan flagged this as the natural mistake to avoid).
-    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
+    yuzu::test::TempDbFile qdb{std::string_view{"yuzu_test_mcp_quar_"}};
     yuzu::server::QuarantineStore quar(qdb.path);
     REQUIRE(quar.is_open());
 
-    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
     appr.create_tables();
 
     McpTestServer ts;
@@ -9773,6 +9797,7 @@ TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCC
 
     auto res1 = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":242,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-offline","reason":"malware"}}})");
+    REQUIRE(res1);
     auto body1 = nlohmann::json::parse(res1->body);
     REQUIRE(body1.contains("error"));
     std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
@@ -9781,6 +9806,7 @@ TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCC
     std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":243,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-offline","reason":"malware","approval_id":")" +
                          approval_id + R"("}}})";
     auto res2 = ts.call(recall);
+    REQUIRE(res2);
     auto body2 = nlohmann::json::parse(res2->body);
     REQUIRE(body2.contains("result")); // SUCCESS, not an error - recording still worked
     auto payload2 = write_tool_payload(res2);
@@ -9793,7 +9819,6 @@ TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCC
     // #2712: structuredContent mirrors content[0].text exactly, including the
     // agents_reached:0 value the schema must accept (minimum:0).
     CHECK(write_tool_structured(res2) == payload2);
-    sqlite3_close(raw);
 }
 
 TEST_CASE("MCP write tools are advertised in tools/list", "[mcp][integration][tag]") {

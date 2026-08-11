@@ -987,7 +987,9 @@ static const ToolDef kTools[] = {
     // approval and returns approval_id + status_url; after an admin approves
     // it, re-call with that approval_id to execute (one-time; replay-safe).
     {"set_tag",
-     "Set a device tag (structured category or free-form). Mirrors PUT /api/v1/tags. "
+     "Set a device tag (structured category or free-form). Mirrors PUT /api/v1/tags (same "
+     "store write, same tag-push trigger) — response shape is a SUPERSET of the REST twin's "
+     "bare {\"set\":true}: this tool also echoes agent_id/key. "
      "Requires the operator or supervised MCP tier (Tag:Write). Fires the agent tag-push on "
      "a structured-category change, exactly like the REST path.",
      R"j({"type":"object","properties":{)j"
@@ -1000,7 +1002,9 @@ static const ToolDef kTools[] = {
      R"j(},"required":["set","agent_id","key"]})j"},
 
     {"delete_tag",
-     "Delete a device tag by agent_id + key. Mirrors DELETE /api/v1/tags/{agent_id}/{key}. "
+     "Delete a device tag by agent_id + key. Mirrors DELETE /api/v1/tags/{agent_id}/{key} (same "
+     "store write) — response shape is a SUPERSET of the REST twin's bare {\"deleted\":true}: "
+     "this tool also echoes agent_id/key. "
      "Destructive (Tag:Delete): approval-gated on the operator AND supervised tiers — the first "
      "call returns an approval ticket (kApprovalRequired), re-call with the returned approval_id "
      "after an admin approves.",
@@ -1014,8 +1018,12 @@ static const ToolDef kTools[] = {
      R"j(},"required":["deleted","agent_id","key"]})j"},
 
     {"approve_request",
-     "Approve a pending approval request by id. Mirrors POST /api/approvals/{id}/approve "
-     "(Approval:Approve, supervised MCP tier). The reviewer cannot be the submitter.",
+     "Approve a pending approval request by id (same ApprovalManager::approve() write as "
+     "the legacy dashboard route POST /api/approvals/{id}/approve, but NOT a wire-format "
+     "mirror of it: that HTMX-facing route returns {\"status\":\"approved\"} for a toast, "
+     "while this tool returns {approved, approval_id} below - do not assume the two are "
+     "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
+     "reviewer cannot be the submitter.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","description":"Id of the pending approval to approve"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
@@ -1025,8 +1033,12 @@ static const ToolDef kTools[] = {
      R"j(},"required":["approved","approval_id"]})j"},
 
     {"reject_request",
-     "Reject a pending approval request by id. Mirrors POST /api/approvals/{id}/reject "
-     "(Approval:Approve, supervised MCP tier). The reviewer cannot be the submitter.",
+     "Reject a pending approval request by id (same ApprovalManager::reject() write as "
+     "the legacy dashboard route POST /api/approvals/{id}/reject, but NOT a wire-format "
+     "mirror of it: that HTMX-facing route returns {\"status\":\"rejected\"} for a toast, "
+     "while this tool returns {rejected, approval_id} below - do not assume the two are "
+     "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
+     "reviewer cannot be the submitter.",
      R"j({"type":"object","properties":{)j"
      R"j("approval_id":{"type":"string","description":"Id of the pending approval to reject"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
