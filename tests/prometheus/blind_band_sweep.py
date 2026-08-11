@@ -131,22 +131,25 @@ SCENARIO_ALERTS = {
 
 # TIMEOUT BUDGET WARNING (Gate 4 consistency-auditor + Gate 6 sre, both
 # independently, same review wave). `full_sweep()` skips `measure()` entirely
-# for any scenario whose alert isn't in the rules file yet - today that's
-# `fresh`, so only 3 real (scenario, interval) pairs run. The moment a rung D
-# PR adds `YuzuAuditRetentionNeverRan` to `docs/prometheus/yuzu-alerts.yml`,
-# `fresh` becomes real too and this doubles to 6 pairs - roughly doubling
-# step 2's worst-case ceiling in `docs-lint.yml`'s `prometheus-rules` job
-# (see that file's own timeout-minutes comment for the current arithmetic).
-# RE-DERIVE both `docs-lint.yml`'s `timeout-minutes` and
-# `tests/meson.build`'s `'audit retention alert coverage manifest'` `timeout:`
-# in the SAME PR that ships a second scenario's alert - don't leave the old
-# numbers sized for 3 pairs while 6 now run.
+# for any scenario whose alert isn't in the rules file - with both alerts
+# shipped (#2854 rung D), all 6 (scenario, interval) pairs run for real, and
+# `docs-lint.yml`'s `timeout-minutes` plus `tests/meson.build`'s
+# `'audit retention alert coverage manifest'` `timeout:` are sized to that
+# worst case (see each one's own arithmetic comment). Adding a THIRD scenario
+# grows it to 9 pairs: RE-DERIVE both budgets in the SAME PR that adds it -
+# rung B shipped with budgets sized to typical runtime instead of worst-case
+# ceilings and rung D inherited the re-derivation; don't repeat that.
 
 DEFAULT_INTERVALS_S = (30, 60, 300)
 DEFAULT_LOW, DEFAULT_HIGH, DEFAULT_STEP = 30, 240, 5
 DEFAULT_MANIFEST = REPO_ROOT / "tests" / "prometheus" / "blind_band_manifest.json"
 
-SETTLE_MIN = 3 * 60 + 20   # past the [3h] window plus the 15m `for:`
+# The binding constraint is YuzuAuditRetentionNeverRan's fire time: its
+# condition is true from the first sample, so it fires at its `for: 3h` plus
+# one evaluation interval (<= 185m at the widest 300s interval); 200m leaves
+# >= 15m of margin at every interval. It also sits past
+# YuzuAuditRetentionNotRunning's [3h] window plus 15m `for:`.
+SETTLE_MIN = 3 * 60 + 20
 
 
 def rules_text(ref: str | None) -> str:
@@ -473,10 +476,14 @@ def build_manifest(uncovered: dict, low: int, high: int, step: int,
     return {
         "note": (
             "Reflects TODAY'S rules file, measured with the inverted "
-            "must-be-firing assertion. This is expected to be much wider than "
-            "the historical 164-195 blind band, because the inversion sees the "
-            "auto-resolve duty-cycle hole for the first time too - a long list "
-            "here is the redesign's (#2854 rung D) target, not an instrument bug."
+            "must-be-firing assertion: a listed cadence is one where the "
+            "scenario's alert did NOT stay continuously firing. Empty lists "
+            "are the #2854 rung D redesign's shipped state - the stamp-based "
+            "grace closed both the historical 164-195 minute blind band and "
+            "the ~90-minute-up intermittent auto-resolve gap the inversion "
+            "measured (each documented in this file's git history). A cadence "
+            "appearing here again is a regression to re-reason, not a number "
+            "to commit."
         ),
         "promtool_image": PROMTOOL_IMAGE,
         "grid": {"settle_minutes": SETTLE_MIN, "low": low, "high": high, "step": step},
