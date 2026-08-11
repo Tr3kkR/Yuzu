@@ -656,12 +656,27 @@ curl -s -b cookies.txt -X POST \
 
 `confirm` revokes the predecessor immediately and promotes the successor to
 the token's sole active credential. If you skip it, a 60-second background
-sweep auto-revokes the predecessor once the overlap window elapses on its
-own — a longer-running but hands-off path to the same end state — **unless
-the successor was never presented at all, in which case the sweep
-deliberately leaves BOTH credentials active** rather than revoke your only
-working token out from under you (a dropped rotate response, or simply
-never picking up the new secret, must not end in zero usable credentials).
+sweep does it for you, with this SLA: **a predecessor is revoked within one
+60-second tick of its overlap window elapsing; on the first occurrence of a
+given clock-anomaly type the tick declines instead and revocation defers to
+the next tick (roughly 120 seconds total), after which an identical anomaly
+drains normally on the following tick; every decline is counted and
+logged — a fresh deployment's first-ever bootstrap decline (no durable
+clock reading yet) increments `yuzu_rotation_sweep_bootstrap_declines_total`,
+a genuine clock anomaly (implausible reading, big step, or would-wipe)
+increments `yuzu_rotation_sweep_declined_total`; the two are deliberately
+separate series (see
+[metrics.md](metrics.md#rotation-sweep-clock-guard-metrics-2964)).** Two cases are not
+"eventually" but **never**, by design, until an operator acts: **the
+successor was never presented at all** — the sweep leaves BOTH credentials
+active indefinitely rather than revoke your only working token out from
+under you (a dropped rotate response, or simply never picking up the new
+secret, must not end in zero usable credentials); and a **sustained** clock
+or store-wide-lock fault — an identical anomaly repeating tick after tick,
+or every replica losing the sweep's advisory lock to a wedged holder —
+which `docs/ops-runbooks/rotation-sweep-clock-guard.md` and the
+`YuzuRotationSweepNotRunning` alert exist to surface, since neither is
+distinguishable from "one declined tick" using this page alone.
 
 **MFA step-up is required on every call, if you have MFA enrolled — and
 that includes a repeat call.** Unlike most session activity, `rotate` and

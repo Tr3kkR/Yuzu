@@ -71,6 +71,64 @@ TEST_CASE("ApiTokenStore reports !is_open on a migration failure", "[pg][token][
     CHECK_FALSE(store.is_open()); // → server.cpp sets startup_failed_ (fail-closed)
 }
 
+// #2964 fix round, chaos-injection finding: reproduces #3013's migration-
+// numbering-collision hazard directly, rather than a generic drift guard.
+// `PgMigrationRunner::run` skips any migration whose id is `<= the stored
+// SCALAR high-water mark` — there is no applied-SET table behind it — so a
+// database that reached v3 via a DIFFERENT migration (e.g. this store's
+// sibling PR #2961, which independently claimed id 3 for an unrelated
+// column before the two were reconciled) reports `run()` success while
+// THIS store's own v3 (`rotation_retention_meta`) was never actually
+// created. Pre-seed exactly that shape: a schema whose `api_tokens` table
+// matches the full v1+v2 projection (so the migration runner's own v1==0
+// schema-drift guard does not fire) but with NO `rotation_retention_meta`
+// table, and a `schema_meta` row already claiming v3. Before the
+// construction-time smoke-read this test pins, the store opened anyway —
+// every subsequent `sweep_expired_rotations` tick then returned `Failed`
+// forever with the schema fault silently indistinguishable from ordinary
+// pool contention (finding 2's own `fail_reason`/`fail()` fix makes THAT
+// half diagnosable; this test is about refusing to open at all).
+TEST_CASE("ApiTokenStore fails closed at construction when rotation_retention_meta is missing "
+          "despite schema_meta already claiming v3 (#3013 migration-numbering collision)",
+          "[pg][token][store]") {
+    YUZU_REQUIRE_PG_DB(db);
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult s{PQexec(conn.get(), "CREATE SCHEMA api_token_store")};
+        REQUIRE(s.ok());
+        PgResult t{PQexec(conn.get(),
+                          "CREATE TABLE api_token_store.api_tokens ("
+                          "  token_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,"
+                          "  name TEXT NOT NULL, principal_id TEXT NOT NULL DEFAULT '',"
+                          "  scope_service TEXT NOT NULL DEFAULT '', mcp_tier TEXT NOT NULL DEFAULT '',"
+                          "  principal_kind TEXT NOT NULL DEFAULT 'human',"
+                          "  created_at BIGINT NOT NULL DEFAULT 0, expires_at BIGINT NOT NULL DEFAULT 0,"
+                          "  last_used_at BIGINT NOT NULL DEFAULT 0, revoked BOOLEAN NOT NULL DEFAULT FALSE,"
+                          "  rotation_group TEXT NOT NULL DEFAULT '',"
+                          "  supersedes_token_id TEXT NOT NULL DEFAULT '',"
+                          "  overlap_expires_at BIGINT NOT NULL DEFAULT 0,"
+                          "  confirmed_at BIGINT NOT NULL DEFAULT 0)")};
+        REQUIRE(t.ok());
+        PgResult meta{PQexec(conn.get(),
+                             "CREATE TABLE IF NOT EXISTS public.schema_meta ("
+                             "  store       TEXT PRIMARY KEY,"
+                             "  version     INTEGER NOT NULL,"
+                             "  upgraded_at BIGINT NOT NULL)")};
+        REQUIRE(meta.ok());
+        PgResult ins{PQexec(conn.get(),
+                            "INSERT INTO public.schema_meta (store, version, upgraded_at) "
+                            "VALUES ('api_token_store', 3, 0)")};
+        REQUIRE(ins.ok());
+    }
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ApiTokenStore store{pool};
+    // The migration runner itself reports success (nothing to apply, v3
+    // already "claimed") — the smoke-read is what refuses to open.
+    CHECK_FALSE(store.is_open());
+}
+
 // ── Regression guard: behaviour preserved verbatim across the PG port ────
 
 TEST_CASE("ApiTokenStore: create and validate token", "[pg][token][crud]") {
@@ -906,14 +964,92 @@ TEST_CASE("ApiTokenStore::list_rotations_nearing_expiry_unused: a HUMAN pair nea
     wire_manual_rotation_pair(pool, predecessor->token_id, predecessor->token_id,
                               successor->token_id, now + 3600);
 
-    auto nearing = store.list_rotations_nearing_expiry_unused(now, 24 * 3600);
-    REQUIRE(nearing.size() == 1);
-    CHECK(nearing[0].predecessor.token_id == predecessor->token_id);
-    CHECK(nearing[0].successor.token_id == successor->token_id);
+    // #2964 fix round finding 7: this half now reads PostgreSQL's own clock
+    // internally (see `NearingExpiryResult::pg_now`) instead of taking a
+    // caller-supplied `now` — mirrors the `sweep_expired_rotations` tests'
+    // existing `pg_now(pool)`/`force_overlap_expires_at` idiom above.
+    auto nearing = store.list_rotations_nearing_expiry_unused(24 * 3600);
+    REQUIRE(nearing.pairs.size() == 1);
+    CHECK(nearing.pairs[0].predecessor.token_id == predecessor->token_id);
+    CHECK(nearing.pairs[0].successor.token_id == successor->token_id);
     // Both halves must carry "human" — server.cpp's successor-unused path
     // keys its family/action off pair.predecessor.principal_kind.
-    CHECK(nearing[0].predecessor.principal_kind == "human");
-    CHECK(nearing[0].successor.principal_kind == "human");
+    CHECK(nearing.pairs[0].predecessor.principal_kind == "human");
+    CHECK(nearing.pairs[0].successor.principal_kind == "human");
+}
+
+// #2964 fix round item 4: pin the rotation SLA `docs/user-manual/authentication.md`
+// and `docs/user-manual/engine-principals.md` now state explicitly — "a
+// predecessor is revoked within one 60-second tick of its overlap window
+// elapsing; on the first occurrence of a given clock-anomaly type the tick
+// declines instead and revocation defers to the next tick (roughly 120
+// seconds total)". Deliberately does NOT call `anchor_sweep_guard` first
+// (every other sweep test in this file does, precisely to AVOID exercising
+// this path) — the very first sweep this store ever runs, against the very
+// first rotation pair it ever sees, IS the bootstrap case the SLA text is
+// making a claim about, and it needs a genuinely fresh
+// `YUZU_REQUIRE_PG_DB_TPL` clone (no prior `rotation_retention_meta` row) to
+// reach it.
+//
+// Chaos-injection measured the PRE-fix behaviour as TWO declined ticks
+// (facts "ew--b" then "ew---") for exactly this scenario, because
+// `would_wipe` was true for a lone elapsed pair with no `kMinWipeProbePopulation`
+// floor — the bootstrap tick declined on the COMBINED no-anchor+would-wipe
+// fact set, and the very next tick (anchor now settled, would_wipe still
+// true) declined AGAIN on a fact set that had changed only in its `no_anchor`
+// bit, so fact-set dedup did not suppress it. `kMinWipeProbePopulation`
+// (`api_token_store.cpp`, #2964 fix round finding 3) closes that: a
+// single-pair population never sets `would_wipe` on its own, so the
+// bootstrap tick's facts are `e---b` (has_expired + no_anchor only) —
+// `Anomaly::NoAnchor` — and the tick immediately after re-anchors with
+// `no_anchor` now false and (given the ~60s the test itself takes, nowhere
+// close to `kRotationSweepBigStepSecs` = 1 day) `big_step` false too, so its
+// facts are `e----` and `classify()` returns `Anomaly::None` — an ordinary
+// accepted, draining tick.
+TEST_CASE("ApiTokenStore::sweep_expired_rotations: a fresh database's FIRST-ever rotation "
+          "declines exactly ONE bootstrap tick, then drains on the very next tick — the "
+          "SLA docs/user-manual/authentication.md and engine-principals.md promise",
+          "[pg][token][rotation][sweep][clock-guard]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string principal = "alice-sla-bootstrap";
+    auto now = test_now_epoch();
+    REQUIRE(store.create_token("pred", principal, now + k90Days).has_value());
+    const std::string pred_id = store.list_active_for_principal(principal)[0].token_id;
+
+    auto succ_raw = store.rotate_token(pred_id, kDefaultOverlapSecs, now, principal, "", "");
+    REQUIRE(succ_raw.has_value());
+    // UP-5: the sweep only auto-revokes once the successor has been
+    // presented at least once.
+    REQUIRE(store.validate_token(*succ_raw).has_value());
+
+    auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 2);
+    const ApiToken* predecessor = active[0].token_id == pred_id ? &active[0] : &active[1];
+
+    // Overlap window already elapsed relative to PostgreSQL's own clock —
+    // the sweep's decision reads that, not a caller-supplied `now`.
+    force_overlap_expires_at(pool, predecessor->token_id, pg_now(pool) - 1);
+
+    // Tick 1: the very first pass this store has ever run, over a table with
+    // one eligible, already-elapsed pair and no durable anchor yet — the
+    // bootstrap case. Must decline, not revoke.
+    auto tick1 = store.sweep_expired_rotations(now);
+    CHECK(tick1.outcome == ApiTokenStore::SweepOutcome::Declined);
+    CHECK(tick1.decline_anomaly == audit_retention::Anomaly::NoAnchor);
+    CHECK(tick1.revoked.empty());
+
+    // Tick 2 (the "next 60-second tick" the docs describe): the anchor is
+    // now settled, so this pass proceeds to classify and drain normally —
+    // this is the assertion that PINS the docs' "~120 seconds total, not
+    // two declined ticks" claim.
+    auto tick2 = store.sweep_expired_rotations(now);
+    CHECK(tick2.outcome == ApiTokenStore::SweepOutcome::Ok);
+    REQUIRE(tick2.revoked.size() == 1);
+    CHECK(tick2.revoked[0].token_id == predecessor->token_id);
 }
 
 TEST_CASE("ApiTokenStore: rotate_engine_credential rejects an overlap window below the 24h "
@@ -3252,9 +3388,14 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: a NEVER-USED successor's pred
     // list_rotations_nearing_expiry_unused no longer stops surfacing an
     // unused-successor pair once `overlap_expires_at <= now` (the old
     // "strictly future" floor this fix removes for exactly this case).
-    auto nearing = store.list_rotations_nearing_expiry_unused(now + kDay + 1, 3600);
+    // #2964 fix round finding 7: no longer takes a caller `now` — the
+    // predecessor's `overlap_expires_at` was already forced into the past
+    // relative to PostgreSQL's own clock above (`force_overlap_expires_at`),
+    // so it is found regardless of which instant this half's own internal
+    // PG clock read lands on.
+    auto nearing = store.list_rotations_nearing_expiry_unused(3600);
     bool found = false;
-    for (const auto& pair : nearing)
+    for (const auto& pair : nearing.pairs)
         if (pair.predecessor.token_id == predecessor_id)
             found = true;
     CHECK(found);
@@ -3577,9 +3718,13 @@ TEST_CASE("ApiTokenStore: list_rotations_nearing_expiry_unused surfaces a "
             successor_id = tok.token_id;
     REQUIRE_FALSE(successor_id.empty());
 
-    auto nearing = store.list_rotations_nearing_expiry_unused(now, /*warn_within_secs=*/2 * kDay);
+    // #2964 fix round finding 7: no longer takes a caller `now` (reads
+    // PostgreSQL's own clock internally) — the predecessor's overlap window
+    // was set relative to `now` above, which is real wall-clock time here,
+    // so this is equivalent.
+    auto nearing = store.list_rotations_nearing_expiry_unused(/*warn_within_secs=*/2 * kDay);
     bool found = false;
-    for (const auto& pair : nearing) {
+    for (const auto& pair : nearing.pairs) {
         if (pair.predecessor.token_id == predecessor_id) {
             found = true;
             CHECK(pair.successor.token_id == successor_id);
@@ -3597,8 +3742,8 @@ TEST_CASE("ApiTokenStore: list_rotations_nearing_expiry_unused surfaces a "
     auto rotated2 =
         store.rotate_token(vt2->token_id, kDefaultOverlapSecs, now, "tanya", "", ""); // 7d overlap
     REQUIRE(rotated2.has_value());
-    auto nearing2 = store.list_rotations_nearing_expiry_unused(now, /*warn_within_secs=*/2 * kDay);
-    for (const auto& pair : nearing2)
+    auto nearing2 = store.list_rotations_nearing_expiry_unused(/*warn_within_secs=*/2 * kDay);
+    for (const auto& pair : nearing2.pairs)
         CHECK(pair.predecessor.token_id != vt2->token_id);
 }
 

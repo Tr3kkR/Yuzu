@@ -1453,20 +1453,24 @@ TEST_CASE("ApiTokenStore::list_rotations_nearing_expiry_unused: flags an unused 
     REQUIRE(rotated.has_value());
     const std::string raw_successor = *rotated;
 
+    // #2964 fix round finding 7: no longer takes a caller `now` (reads
+    // PostgreSQL's own clock internally) — `now` above is real wall-clock
+    // time, so this is equivalent.
+    //
     // Far from the window end: not yet in the warn set.
-    auto too_early = tokens->list_rotations_nearing_expiry_unused(now, 3600);
-    CHECK(too_early.empty());
+    auto too_early = tokens->list_rotations_nearing_expiry_unused(3600);
+    CHECK(too_early.pairs.empty());
 
     // Within the warn lead time, successor unused: flagged.
-    auto nearing = tokens->list_rotations_nearing_expiry_unused(now, 24 * 3600 + 10);
-    REQUIRE(nearing.size() == 1);
-    CHECK(nearing[0].predecessor.principal_id == "engine:sweepwarn");
-    CHECK(nearing[0].successor.last_used_at == 0);
+    auto nearing = tokens->list_rotations_nearing_expiry_unused(24 * 3600 + 10);
+    REQUIRE(nearing.pairs.size() == 1);
+    CHECK(nearing.pairs[0].predecessor.principal_id == "engine:sweepwarn");
+    CHECK(nearing.pairs[0].successor.last_used_at == 0);
 
     // Once the successor is presented (validate_token bumps last_used_at),
     // it drops out of the "unused" set.
     auto validated = tokens->validate_token(raw_successor);
     REQUIRE(validated.has_value());
-    auto nearing_after_use = tokens->list_rotations_nearing_expiry_unused(now, 24 * 3600 + 10);
-    CHECK(nearing_after_use.empty());
+    auto nearing_after_use = tokens->list_rotations_nearing_expiry_unused(24 * 3600 + 10);
+    CHECK(nearing_after_use.pairs.empty());
 }

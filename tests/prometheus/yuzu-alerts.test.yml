@@ -845,3 +845,96 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuResponseIngestDrops", alertstate="firing", reason="pool_acquire_timeout", severity="warning"}'
             value: 1
+
+  # ── YuzuRotationSweepNotRunning (#2964) ─────────────────────────────────
+  #
+  # Reads `yuzu_rotation_sweep_last_pass_timestamp_seconds` (server.cpp) --
+  # the durable, cluster-wide `rotation_retention_meta.last_pass_now`
+  # reading. Pre-seeded to 0 at boot (server.cpp, matching the three sweep
+  # counters' own describe()+pre-seed pattern) so the series is present from
+  # t=0, never absent-until-first-tick.
+  #
+  # Shape mirrors YuzuInventoryCatalogRollupStale (the other shipped
+  # `(time() - gauge) > threshold and gauge > 0` staleness rule in this file):
+  # the `and gauge > 0` guard exists because the gauge is seeded to 0 (never
+  # run) rather than left absent, so a naive `time() - gauge > 900` alone
+  # would page permanently on every database that has not yet completed its
+  # first tick.
+
+  # CASE 32 -- the healthy case: the gauge tracks wall-clock time every tick
+  # (never more than one 60s scrape behind), for 4 hours straight. Must stay
+  # quiet throughout -- pins that an ordinary healthy sweep does not page.
+  - interval: 1m
+    name: rotation sweep not running - a healthy sweep is quiet
+    input_series:
+      - series: 'yuzu_rotation_sweep_last_pass_timestamp_seconds{job="yuzu",instance="s1"}'
+        values: "0+60x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRotationSweepNotRunning", alertstate="firing"}'
+        eval_time: 4h
+        exp_samples: []
+
+  # CASE 33 -- the regression case: the sweep thread dies after 30 healthy
+  # minutes and the gauge freezes. Must stay quiet while the staleness is
+  # still short (10m since the freeze), and must fire once it has been stale
+  # well past the 900s threshold plus the 15m `for:`.
+  - interval: 1m
+    name: rotation sweep not running - a dead sweep pages
+    input_series:
+      - series: 'yuzu_rotation_sweep_last_pass_timestamp_seconds{job="yuzu",instance="s1"}'
+        values: "0+60x30 1800x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRotationSweepNotRunning", alertstate="firing"}'
+        eval_time: 40m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuRotationSweepNotRunning", alertstate="firing"}'
+        eval_time: 65m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRotationSweepNotRunning", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 34 -- the `and gauge > 0` guard. A database that has never completed
+  # a single tick holds the gauge at its seeded 0 forever; time() - 0 is huge
+  # from t=0, so a naive form without the guard would page permanently. Must
+  # stay quiet even 4h30m in. RED against dropping the `and ... > 0` clause
+  # (confirmed against a mutated copy of the rule with that clause removed).
+  - interval: 1m
+    name: rotation sweep not running - a database that never ran a tick is excused
+    input_series:
+      - series: 'yuzu_rotation_sweep_last_pass_timestamp_seconds{job="yuzu",instance="s1"}'
+        values: "0x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRotationSweepNotRunning", alertstate="firing"}'
+        eval_time: 4h30m
+        exp_samples: []
+
+  # ── YuzuRotationSweepLockContentionUnexpected (#2964) ───────────────────
+  #
+  # Single-replica-scoped by design (see the rule's own comment) -- these
+  # cases pin the `> 1` / `for: 5m` shape, not any replica-topology claim.
+
+  # CASE 35 -- a single isolated skip (one overlapping tick during a
+  # graceful restart/cutover) must stay quiet, at any eval time.
+  - interval: 1m
+    name: rotation sweep lock contention - a single blip stays quiet
+    input_series:
+      - series: 'yuzu_rotation_sweep_lock_skipped_total{job="yuzu",instance="s1"}'
+        values: "0x10 1x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRotationSweepLockContentionUnexpected", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE 36 -- a wedged second writer skips every tick, sustained -- must
+  # page.
+  - interval: 1m
+    name: rotation sweep lock contention - a sustained wedge pages
+    input_series:
+      - series: 'yuzu_rotation_sweep_lock_skipped_total{job="yuzu",instance="s1"}'
+        values: "0+1x300"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuRotationSweepLockContentionUnexpected", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuRotationSweepLockContentionUnexpected", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1

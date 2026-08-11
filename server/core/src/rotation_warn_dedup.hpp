@@ -72,8 +72,13 @@ public:
     /// decision. Call exactly once per pair per tick — it mutates state.
     ///
     /// `elapsed` is `predecessor.overlap_expires_at <= now`: the pair is past
-    /// its overlap window and `sweep_expired_rotations` has declined to
-    /// auto-revoke it because the successor was never presented.
+    /// its overlap window and `sweep_expired_rotations` has WITHHELD
+    /// auto-revoke on it because the successor was never presented — a
+    /// per-pair eligibility gate, not the SAME "declined" as
+    /// `ApiTokenStore::SweepOutcome::Declined` (the sweep's tick-level clock
+    /// guard verdict, #2964) — the two are deliberately worded differently
+    /// in every caller-facing log/audit string so they read as distinct
+    /// concepts, which they are.
     RotationWarnSignals observe(const std::string& rotation_group, bool elapsed) {
         RotationWarnSignals out;
         if (elapsed) {

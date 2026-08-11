@@ -1193,7 +1193,7 @@ If a migration fails:
 
 ## Upgrade notes by release
 
-### Retention clock guards (#2360 server audit store, #2361 TAR agent warehouse)
+### Retention clock guards (#2360 server audit store, #2361 TAR agent warehouse, #2964 rotation sweep)
 
 Both retention paths used to issue an unbounded `DELETE` driven by the local wall
 clock, so one forward clock step could wipe a store in a single statement. They
@@ -1300,6 +1300,26 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **TAR row-count retention is now paced.** Its ceiling semantics are unchanged,
   but a large excess (after a long disable, or an upgrade backlog) drains over
   several 900 s rollup ticks rather than in one statement.
+- **`ApiTokenStore` gains a THIRD, independent clock guard (#2964) — the
+  rotation sweep that auto-revokes rotation predecessors.** Same shape as the
+  audit store's, same schema-v3 pattern (a new `rotation_retention_meta`
+  key/value table holding the durable anchor), same bootstrap-decline
+  consequence, but a much shorter cadence: this sweep ticks every 60 seconds,
+  not hourly. **If you are upgrading a populated store that already has
+  elapsed, not-yet-swept rotation pairs** — a predecessor whose overlap
+  window has already ended, sitting there because nothing has run the guard
+  against it before — **expect the sweep's first tick after the migration to
+  decline once**, the same "no durable anchor yet, and there is already
+  something eligible" bootstrap case #2579 describes for the audit store.
+  Both credentials in every affected pair simply stay active for that one
+  tick; the very next tick has an anchor and proceeds normally, so at a
+  60-second cadence this resolves in roughly two minutes, not the audit
+  store's next-hourly-pass timescale. Nothing is lost or at risk here (an
+  auto-revoke deferred by one tick is the intended failure mode, not the
+  audit store's deletion-risk case) — this is a heads-up so the log line and
+  the one-off decline are not mistaken for something wrong with the upgrade.
+  See `docs/user-manual/metrics.md` "Rotation-sweep clock guard metrics" and
+  `docs/ops-runbooks/rotation-sweep-clock-guard.md`.
 
 New Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`, which is the
 current set. The declined-pass and failed-pass
