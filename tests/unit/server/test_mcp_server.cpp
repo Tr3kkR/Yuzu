@@ -2223,6 +2223,18 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
     // list, a visible reviewable diff line rather than a silent gap. Mirrors
     // the kToolAnnotation completeness check above
     // (CHECK(classified == listed)).
+    //
+    // CAVEAT (adversarial review of PR #2978, 2026-08-11): this gate checks
+    // outputSchema PRESENCE, not typed-NESS - it does not reject the generic
+    // `kObjectOutputSchema` placeholder ({"type":"object",
+    // "additionalProperties":true}) for a non-exempt tool whose result shape
+    // is actually stable, per docs/agentic-first-principle.md A5 item 4's
+    // own text. assign_engine_role/unassign_engine_role/list_engine_roles
+    // were typed properly as a result of that review; a handful of other
+    // non-exempt tools (the discover_* family, classify_operational_
+    // question, get_incident_playbook, summarize_working_set) still ship
+    // the placeholder and pass this gate anyway - tracked as a follow-up,
+    // not silently ignored.
     static const std::set<std::string> kOutputSchemaExempt = {
         // DEX + network family (#2712 batch 2, not started)
         "list_dex_signals",
@@ -6864,6 +6876,20 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
     }
     CHECK(saw_denied);
     CHECK(saw_success);
+
+    // #2712/adversarial-review-of-PR#2978: structuredContent wraps the SAME
+    // rows under "software" (content[0].text stays the legacy bare array),
+    // and carries devices_omitted as a genuine JSON INTEGER (not the
+    // quoted-string regression #2973 was wrongly filed against) - pin this
+    // on the one test that actually has a nonzero scope-drop count.
+    REQUIRE(envelope.at("result").contains("structuredContent"));
+    auto& sc = envelope.at("result").at("structuredContent");
+    REQUIRE(sc.contains("software"));
+    CHECK(sc["software"] == rows_json);
+    REQUIRE(sc.contains("devices_omitted"));
+    CHECK(sc["devices_omitted"].is_number_integer());
+    CHECK(sc["devices_omitted"].get<int>() == 1); // agent-out, the one dropped device
+    CHECK_FALSE(sc.contains("audit_persisted")); // fake test audit_fn succeeds
 }
 
 TEST_CASE("MCP query_installed_software: a degraded store errors, never success+[] "
@@ -7337,6 +7363,18 @@ TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + d
     }
     CHECK(saw_denied);
     CHECK(saw_success);
+
+    // #2712/adversarial-review-of-PR#2978: structuredContent wraps the SAME
+    // rows under "results" (content[0].text stays the legacy bare array) -
+    // pin this for the scope-filtered case specifically, since it's the one
+    // that also has the conditional audit_persisted sibling flag to get
+    // right in both shapes.
+    auto full_result = nlohmann::json::parse(res->body)["result"];
+    REQUIRE(full_result.contains("structuredContent"));
+    auto& sc = full_result["structuredContent"];
+    REQUIRE(sc.contains("results"));
+    CHECK(sc["results"] == groups);
+    CHECK_FALSE(sc.contains("audit_persisted")); // fake test audit_fn succeeds
 }
 
 TEST_CASE("MCP aggregate_responses: no filter when scope predicate is unwired (legacy-open) (#1634)",

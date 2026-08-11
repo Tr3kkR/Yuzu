@@ -963,7 +963,9 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
      R"j("role":{"type":"string","description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
      R"j(},"required":["principal_id","role"]})j",
-     kObjectOutputSchema},
+     R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["assigned","principal_id","role"]})j"},
 
     {"unassign_engine_role",
      "Revoke a FLEET-WIDE RBAC role from an engine principal, immediately removing the "
@@ -975,7 +977,9 @@ static const ToolDef kTools[] = {
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
      R"j("role":{"type":"string","description":"The role name to revoke"})j"
      R"j(},"required":["principal_id","role"]})j",
-     kObjectOutputSchema},
+     R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
+     R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
+     R"j(},"required":["unassigned","principal_id","role"]})j"},
 
     {"list_engine_roles",
      "List the fleet-wide RBAC roles currently assigned to one engine principal — the "
@@ -985,7 +989,9 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"})j"
      R"j(},"required":["principal_id"]})j",
-     kObjectOutputSchema},
+     R"j({"type":"object","properties":{"principal_id":{"type":"string"},"count":{"type":"integer"},)j"
+     R"j("roles":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"}},"required":["principal_id","role"]}})j"
+     R"j(},"required":["principal_id","count","roles"]})j"},
 
     // ── Agentic demo/read tools — MCP-native high-level workflow helpers ──
     {"get_fleet_posture_fast",
