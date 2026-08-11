@@ -398,19 +398,47 @@ rather than incrementing.
   described above, and — because the durable column is a Postgres row, not
   process-local — also closes the "confirm cannot succeed on a replica that
   did not itself serve the rotate" sub-case for the identity check
-  specifically. **Not closed by this fix, and deliberately so:** the raw
-  successor secret's grace-window re-serve (F4) stays RAM-only — a one-time
-  reveal must not become durable, so that capability is still forfeited on
-  restart. **Not closed, still tracked separately:** the "grace entries leak
-  across replicas" (memory never evicted cross-process) sub-case above is a
-  RAM-cache lifecycle question, orthogonal to the identity check now having a
-  durable source, and remains open. Confirm still has no time bound (#2962)
-  and the rotation sweep still lacks the full clock-guard shape (#2964) —
-  neither is touched by this fix. A rotation already in flight when v3 is
-  applied has an empty `rotation_initiator` and stays unconfirmable after a
-  restart — it fails closed rather than matching any caller; an operator
-  mid-upgrade with an in-flight rotation should resolve it (confirm or
-  revoke one side) before restarting.
+  specifically. **Bonus, not asked for by #2961 but closed as a consequence:**
+  a mint whose Postgres `COMMIT` succeeded but whose client never saw the
+  response (a dropped connection) was previously permanently unconfirmable —
+  the RAM grace-cache entry exists only on the replica that served the mint,
+  and the operator has no successor `token_id` to retry with, so that pair
+  could only ever be resolved by revoke. The durable column doesn't change
+  that the client still has no `token_id` of its own, but it does mean any
+  path that recovers the successor id out-of-band (`list_active_for_principal`,
+  an operator/support lookup) can now reach a confirmable pair instead of a
+  permanently-stuck one. **Not closed by this fix, and deliberately so:** the
+  raw successor secret's grace-window re-serve (F4) stays RAM-only — a
+  one-time reveal must not become durable, so that capability is still
+  forfeited on restart. **Not closed, still tracked separately, and this fix
+  adds a NEW trigger for it:** the "grace entries leak across replicas"
+  (memory never evicted cross-process) sub-case above is a RAM-cache
+  lifecycle question, orthogonal to the identity check now having a durable
+  source, and remains open — but it used to be a narrow, largely theoretical
+  exposure (pre-fix, a confirm attempted on a replica that did not serve the
+  mint always failed closed at the identity check, so a successful
+  cross-replica confirm — the case that leaves the OTHER replica's cache
+  entry stranded — essentially never happened in practice). Post-fix,
+  cross-replica confirm is the durable fallback's whole reason to exist and
+  now succeeds routinely: when replica B confirms a rotation minted on
+  replica A, B's own (empty) cache has nothing to evict and A's entry is
+  never touched — `evict_rotation_raw` is process-local, so only the replica
+  that actually runs the confirm call clears its own copy. This converts the
+  leak from an occasional, largely-unreachable edge case into a systematic
+  one on any multi-replica deployment where mint and confirm land on
+  different instances. No secret is retained in the stranded entry (the raw
+  value is already scrubbed past the 120s reveal window by the time most
+  confirms happen) — the leaked residue is ~100 bytes of
+  `rotation_group`/`requesting_user`/`minted` per stranded entry — but the
+  eventual cross-replica cache-invalidation work (tracked separately, not
+  filed as its own issue by this pass) needs to know the trigger is now
+  routine, not rare. Confirm still has no time bound (#2962) and the
+  rotation sweep still lacks the full clock-guard shape (#2964) — neither is
+  touched by this fix. A rotation already in flight when v3 is applied has
+  an empty `rotation_initiator` and stays unconfirmable after a restart — it
+  fails closed rather than matching any caller; an operator mid-upgrade with
+  an in-flight rotation should resolve it (confirm or revoke one side)
+  before restarting.
 - **`#2962`** (Owner: unassigned) — two unrecoverable terminals in the
   rotation state machine, both reachable single-instance. (A) `confirm` has
   no time bound on the grace *entry* itself (only the raw-secret re-serve

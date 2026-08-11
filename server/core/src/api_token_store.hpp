@@ -116,7 +116,13 @@ struct ApiToken {
     // `resolve_rotation_initiator`'s doc comment. Deliberately NOT consulted
     // by `try_reserve`'s raw-secret re-serve (F4 stays RAM-only); it exists
     // solely to survive a restart for `confirm_rotation`/
-    // `confirm_token_rotation`'s identity check (F5).
+    // `confirm_token_rotation`'s identity check (F5). Cleared back to '' the
+    // moment the rotation resolves — `confirm_rotation`/`confirm_token_rotation`'s
+    // in-txn cleanup and `resolve_rotation_pair_after_revoke`'s partner clear
+    // both zero it alongside `rotation_group`/`supersedes_token_id`/
+    // `overlap_expires_at` — so a resolved row does not keep a third-party
+    // operator's username (data minimisation on the ENGINE arm) for the
+    // row's remaining life.
     std::string rotation_initiator;
 };
 
@@ -309,10 +315,15 @@ public:
     /// stays RAM-only — restart still forfeits THAT), but the identity check
     /// falls back to `ApiToken::rotation_initiator`, a durable column stamped
     /// on the successor row at mint time — see `resolve_rotation_initiator`.
-    /// Confirm is rejected with "rotation confirmation unavailable" only when
-    /// NEITHER the cache entry nor the durable column resolves an initiator
-    /// (e.g. a pair that began rotating before this migration shipped, whose
-    /// durable column is empty) — never silently allowed for any caller.
+    /// Confirm is rejected with "rotation confirmation unavailable" when
+    /// `resolve_rotation_initiator` returns `nullopt` — NEITHER the cache
+    /// entry nor the durable column resolves an initiator (e.g. a pair that
+    /// began rotating before this migration shipped, whose durable column is
+    /// empty). That is not the only rejection cause: the cache entry and the
+    /// durable column can both be present and DISAGREE, which is also
+    /// refused (fail closed, never prefer either) — see
+    /// `resolve_rotation_initiator`'s doc comment for the full resolution
+    /// table. Either way, never silently allowed for any caller.
     ///
     /// Rejected (no DB mutation) when there is no in-flight, recognizable
     /// rotation pair for `principal_id`. Since #2404 the rejection is
@@ -838,12 +849,13 @@ private:
                      std::string& out_requesting_user) const;
 
     /// Identity-only grace-cache accessor, NOT time-bounded to
-    /// `kRotationGraceSecs` (unlike `try_reserve`'s raw reveal) — used by
-    /// `confirm_rotation` (Hermes F5) to bind the confirm to the same
-    /// operator who initiated the rotation, for as long as the entry
-    /// remains (until explicitly evicted). False if no entry exists for
-    /// `rotation_group` (e.g. a process restart since the mint, or the
-    /// rotation already resolved).
+    /// `kRotationGraceSecs` (unlike `try_reserve`'s raw reveal) — its sole
+    /// caller is `resolve_rotation_initiator`, which folds it with the
+    /// durable column to bind confirm (Hermes F5) to the same operator who
+    /// initiated the rotation, for as long as the entry remains (until
+    /// explicitly evicted). False if no entry exists for `rotation_group`
+    /// (e.g. a process restart since the mint, or the rotation already
+    /// resolved).
     bool grace_entry_owner(const std::string& rotation_group,
                            std::string& out_requesting_user) const;
 
@@ -863,19 +875,31 @@ private:
     /// this — it stays RAM-only, or a restart would resurrect a one-time-
     /// reveal contract the design deliberately drops on restart.
     ///
+    /// Returns `std::nullopt` — never a wildcard match, never a distinguishable
+    /// "failed read" (`successor` is already-read, per above) — on every
+    /// ambiguous or unresolved case; `std::optional<std::string>` per
+    /// `docs/cpp-conventions.md`'s ban on output parameters in new code
+    /// (this function conveys no error, only resolved / not-resolved). The
+    /// empty guard below applies to WHICHEVER branch produced the value —
+    /// not just the durable one — so an empty resolved value can never
+    /// escape as though it were a real identity, in this branch or a future
+    /// one (e.g. #2946's read-only accessor, which has no `requesting_user`
+    /// of its own to compare against).
+    ///
     /// Resolution, fails closed on every ambiguous case:
     ///   - RAM present, durable present (non-empty), and they DIFFER ->
-    ///     refused (`false`) — RAM is the primary source, durable is a
-    ///     RAM-absent recovery path only; never prefer either on conflict.
-    ///   - RAM present (durable absent/empty/agreeing) -> `true`, RAM value.
-    ///   - RAM absent, durable present (non-empty) -> `true`, durable value
+    ///     `nullopt` — RAM is the primary source, durable is a RAM-absent
+    ///     recovery path only; never prefer either on conflict.
+    ///   - RAM present (durable absent/empty/agreeing) -> the RAM value,
+    ///     UNLESS it is empty, in which case `nullopt`.
+    ///   - RAM absent, durable present (non-empty) -> the durable value
     ///     (the restart-recovery path this function exists for).
     ///   - RAM absent, durable EMPTY (pre-v3 pair, or a row that was somehow
-    ///     never stamped) -> refused. Empty is NOT a wildcard that matches
+    ///     never stamped) -> `nullopt`. Empty is NOT a wildcard that matches
     ///     any caller.
-    ///   - Neither present -> refused.
-    [[nodiscard]] bool resolve_rotation_initiator(const ApiToken& successor,
-                                                  std::string& out_initiator) const;
+    ///   - Neither present -> `nullopt`.
+    [[nodiscard]] std::optional<std::string>
+    resolve_rotation_initiator(const ApiToken& successor) const;
 
     /// Removes a grace-cache entry outright. Called once a rotation
     /// resolves (`confirm_rotation` on success; the T12 sweep's auto-revoke

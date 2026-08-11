@@ -1420,6 +1420,20 @@ TEST_CASE("ApiTokenStore: confirm_rotation survives a server restart mid-rotatio
     REQUIRE(store2.is_open());
     REQUIRE(store2.rotation_grace_cache_size() == 0);
 
+    // architect A3: F4 (the raw-secret re-serve) MUST stay RAM-only even
+    // though F5 (confirm) is now durable — #2961 deliberately did not touch
+    // `try_reserve`. Replaying the mint call's 2-active idempotent-retry arm
+    // after the restart must still be refused: the durable
+    // `rotation_initiator` column exists and would happily resolve an
+    // identity, but the raw secret itself was never persisted anywhere, so
+    // there is nothing this arm could re-serve — it fails on the grace-cache
+    // lookup (`try_reserve`) before it would even reach an identity check.
+    // This is what actually proves the one-time-reveal contract still holds
+    // after a restart, not just that confirm durably resolves identity.
+    auto replay = store2.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE_FALSE(replay.has_value());
+    CHECK(replay.error().find("grace window elapsed") != std::string::npos);
+
     auto confirmed = store2.confirm_rotation(principal, successor_id, "admin");
     REQUIRE(confirmed.has_value());
 
@@ -1572,6 +1586,65 @@ TEST_CASE("ApiTokenStore: confirm_rotation still rejects a DIFFERENT operator af
     // restart.
     auto real_confirm = store2.confirm_rotation(principal, successor_id, "admin");
     CHECK(real_confirm.has_value());
+}
+
+TEST_CASE("ApiTokenStore: confirm_rotation fails closed when the RAM grace-cache initiator "
+          "and the durable rotation_initiator column DISAGREE — never prefer either "
+          "(#2961, resolve_rotation_initiator)",
+          "[pg][token][rotation][confirm][durability]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+
+    const std::string principal = "engine:rotation-initiator-disagreement";
+    auto now = test_now_epoch();
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check([](const std::string&) { return EngineLookupStatus::Active; });
+
+    REQUIRE(store.create_token("svc", principal, now + k90Days, "", "readonly", "engine")
+                .has_value());
+    auto rotated = store.rotate_engine_credential(principal, kDefaultOverlapSecs, now, "admin");
+    REQUIRE(rotated.has_value());
+    std::string successor_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            successor_id = t.token_id;
+    REQUIRE_FALSE(successor_id.empty());
+    // Deliberately NOT restarting `store`/`pool` — the RAM-only grace-cache
+    // entry stays populated with requesting_user == "admin", the same
+    // process that minted it.
+    REQUIRE(store.rotation_grace_cache_size() == 1);
+
+    // Directly corrupt the durable twin so it disagrees with the still-live
+    // RAM entry — same pool.acquire() + pg::exec_params pattern the
+    // pre-v3-pair test above uses to model state the store's own API never
+    // produces. Scoped so the lease returns to the (size-4) pool before
+    // confirm_rotation below needs its own connection.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto upd = pg::exec_params(
+            lease.get(),
+            "UPDATE api_token_store.api_tokens SET rotation_initiator = $1 WHERE token_id = $2",
+            std::vector<std::string>{"mallory", successor_id});
+        REQUIRE(upd.ok());
+    }
+
+    // RAM says "admin", durable says "mallory" — resolve_rotation_initiator
+    // refuses rather than picking a side, so this is REJECTED with
+    // "unavailable", the same message the neither-present case uses — NOT
+    // "different operator", which is reserved for a resolved initiator that
+    // simply doesn't match the caller.
+    auto confirmed = store.confirm_rotation(principal, successor_id, "admin");
+    REQUIRE_FALSE(confirmed.has_value());
+    CHECK(confirmed.error().find("unavailable") != std::string::npos);
+    CHECK(confirmed.error().find("different operator") == std::string::npos);
+
+    // Nothing mutated — neither credential's confirmed_at moved.
+    auto active = store.list_active_for_principal(principal);
+    CHECK(active.size() == 2);
+    for (const auto& t : active)
+        CHECK(t.confirmed_at == 0);
 }
 
 TEST_CASE("ApiTokenStore: confirm_rotation sole-credential states are terminal, but a "

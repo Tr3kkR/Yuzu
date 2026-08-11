@@ -3631,13 +3631,25 @@ McpServer::HandlerFn McpServer::build_handler(
                     // effect depends on has moved on.
                     //
                     // NOT closed by this precondition: (1) a restart evicting the
-                    // Hermes F4/F5 initiator (grace-cache) binding. `active` alone
-                    // cannot see that state - it lives in an in-process cache that is
-                    // private to ApiTokenStore (see rotation_confirm_state.hpp's
-                    // pair_matches_pin doc comment). confirm_rotation's own
-                    // in-transaction check remains the only thing that catches it,
-                    // so that specific drift still burns the ticket. Tracked: #2946
-                    // (read-only initiator-binding accessor would close it here too).
+                    // Hermes F4/F5 initiator (grace-cache) binding. #2961 (migration
+                    // v3) added a durable echo of that binding
+                    // (`ApiToken::rotation_initiator`), so a PLAIN restart no longer
+                    // costs the confirm at all - confirm_rotation's in-transaction
+                    // check (ApiTokenStore::resolve_rotation_initiator) recovers the
+                    // initiator from the durable column when the grace-cache entry
+                    // is gone. The residual this precondition still cannot see is
+                    // narrower: a pair that began rotating BEFORE v3 shipped (durable
+                    // column never stamped), or a genuine RAM/durable disagreement
+                    // (resolve_rotation_initiator fails closed rather than guessing).
+                    // Either way `active` alone still cannot distinguish "will
+                    // recover from the durable column" from "will fail closed" - this
+                    // precondition only checks kPair/pin linkage, not the initiator
+                    // binding itself - so confirm_rotation's own in-transaction check
+                    // remains the only thing that catches it, and that narrower drift
+                    // still burns the ticket. Tracked: #2946 (a read-only
+                    // initiator-binding accessor, reading `rotation_initiator` off
+                    // the same `active` rows this precondition already has, would
+                    // close it here too).
                     // (2) two independently-approved tickets pinned to the SAME
                     // successor token_id (an operator double-approval mistake): both
                     // preconditions read the identical kPair/pin-matches state

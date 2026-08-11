@@ -831,32 +831,36 @@ bool ApiTokenStore::grace_entry_owner(const std::string& rotation_group,
     return true;
 }
 
-bool ApiTokenStore::resolve_rotation_initiator(const ApiToken& successor,
-                                               std::string& out_initiator) const {
+std::optional<std::string>
+ApiTokenStore::resolve_rotation_initiator(const ApiToken& successor) const {
     std::string ram_initiator;
     const bool ram_present = grace_entry_owner(successor.rotation_group, ram_initiator);
     const bool durable_present = !successor.rotation_initiator.empty();
 
+    std::optional<std::string> resolved;
     if (ram_present && durable_present) {
         if (ram_initiator != successor.rotation_initiator)
-            return false; // disagreement — fail closed, never prefer either
-        out_initiator = ram_initiator;
-        return true;
-    }
-    if (ram_present) {
-        out_initiator = ram_initiator;
-        return true;
-    }
-    if (durable_present) {
+            return std::nullopt; // disagreement — fail closed, never prefer either
+        resolved = ram_initiator;
+    } else if (ram_present) {
+        resolved = ram_initiator;
+    } else if (durable_present) {
         // The RAM-absent recovery path #2961 exists for: a restart forfeited
         // the grace-cache entry, but the successor's own row still carries
         // the operator who minted it.
-        out_initiator = successor.rotation_initiator;
-        return true;
+        resolved = successor.rotation_initiator;
     }
-    // Neither present — empty is NOT a wildcard (pre-v3 pair, or a restart
-    // before v3 ever stamped this row).
-    return false;
+    // Neither present falls through with `resolved` unset — empty is NOT a
+    // wildcard (pre-v3 pair, or a restart before v3 ever stamped this row).
+    //
+    // The empty guard below applies to WHICHEVER branch produced `resolved`
+    // — not just the durable one. `grace_entry_owner` only ever returns an
+    // empty `requesting_user` if it were ever stored empty, which no current
+    // caller does, but the guard lives HERE precisely so a future caller
+    // (e.g. #2946's read-only accessor) can't reintroduce that gap.
+    if (resolved && resolved->empty())
+        return std::nullopt;
+    return resolved;
 }
 
 void ApiTokenStore::evict_rotation_raw(const std::string& rotation_group) {
@@ -888,7 +892,8 @@ void ApiTokenStore::resolve_rotation_pair_after_revoke(const std::string& princi
         pg::PgResult r = pg::exec_params(
             conn,
             "UPDATE api_token_store.api_tokens "
-            "SET rotation_group = '', supersedes_token_id = '', overlap_expires_at = 0 "
+            "SET rotation_group = '', supersedes_token_id = '', overlap_expires_at = 0, "
+            "    rotation_initiator = '' "
             "WHERE rotation_group = $1 AND token_id <> $2 AND revoked = FALSE",
             std::vector<std::string>{rotation_group, revoked_token_id});
         // Zero rows is fine (partner already resolved/gone); no RETURNING, so a
@@ -1315,13 +1320,13 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
         // time-bounded to kRotationGraceSecs (see grace_entry_owner's doc
         // comment). #2961: resolve_rotation_initiator adds the durable
         // fallback so this survives a restart — see its own doc comment.
-        std::string initiator;
-        if (!resolve_rotation_initiator(*successor, initiator)) {
+        std::optional<std::string> initiator = resolve_rotation_initiator(*successor);
+        if (!initiator) {
             error_msg = "rotation confirmation unavailable — retry via rotate or fall back to "
                        "revoke";
             return false;
         }
-        if (initiator != requesting_user) {
+        if (*initiator != requesting_user) {
             error_msg = "rotation in progress by a different operator";
             return false;
         }
@@ -1353,10 +1358,15 @@ ApiTokenStore::confirm_rotation(const std::string& principal_id, const std::stri
         }
         revoked_hash = PQgetvalue(revoke_res.get(), 0, 0);
 
+        // #2961: also clear rotation_initiator — a resolved successor row has
+        // no further use for the initiator binding (confirm is over), and on
+        // the ENGINE arm that value is a third-party admin's username, so
+        // this is data minimisation as well as lifecycle hygiene.
         pg::PgResult clear_res = pg::exec_params(
             conn,
             "UPDATE api_token_store.api_tokens "
-            "SET rotation_group = '', supersedes_token_id = '', overlap_expires_at = 0 "
+            "SET rotation_group = '', supersedes_token_id = '', overlap_expires_at = 0, "
+            "    rotation_initiator = '' "
             "WHERE token_id = $1 AND revoked = FALSE RETURNING token_id",
             std::vector<std::string>{successor->token_id});
         if (clear_res.status() != PGRES_TUPLES_OK || PQntuples(clear_res.get()) == 0) {
@@ -1944,13 +1954,13 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
 
         // Same operator-initiator binding as confirm_rotation (Hermes F4/F5),
         // including the #2961 durable fallback (resolve_rotation_initiator).
-        std::string initiator;
-        if (!resolve_rotation_initiator(*successor, initiator)) {
+        std::optional<std::string> initiator = resolve_rotation_initiator(*successor);
+        if (!initiator) {
             error_msg = "rotation confirmation unavailable — retry via rotate or fall back to "
                        "revoke";
             return false;
         }
-        if (initiator != requesting_user) {
+        if (*initiator != requesting_user) {
             error_msg = "rotation in progress by a different operator";
             return false;
         }
@@ -1982,10 +1992,13 @@ ApiTokenStore::confirm_token_rotation(const std::string& successor_token_id,
         }
         revoked_hash = PQgetvalue(revoke_res.get(), 0, 0);
 
+        // #2961: also clear rotation_initiator — see confirm_rotation's
+        // matching comment.
         pg::PgResult clear_res = pg::exec_params(
             conn,
             "UPDATE api_token_store.api_tokens "
-            "SET rotation_group = '', supersedes_token_id = '', overlap_expires_at = 0 "
+            "SET rotation_group = '', supersedes_token_id = '', overlap_expires_at = 0, "
+            "    rotation_initiator = '' "
             "WHERE token_id = $1 AND revoked = FALSE RETURNING token_id",
             std::vector<std::string>{successor->token_id});
         if (clear_res.status() != PGRES_TUPLES_OK || PQntuples(clear_res.get()) == 0) {
@@ -2206,7 +2219,8 @@ std::vector<ApiToken> ApiTokenStore::sweep_expired_rotations(int64_t now, bool* 
             pg::PgResult r2 = pg::exec_params(
                 conn,
                 "UPDATE api_token_store.api_tokens "
-                "SET rotation_group = '', supersedes_token_id = '', overlap_expires_at = 0 "
+                "SET rotation_group = '', supersedes_token_id = '', overlap_expires_at = 0, "
+                "rotation_initiator = '' "
                 "WHERE rotation_group = $1 AND supersedes_token_id = $2 AND revoked = FALSE",
                 std::vector<std::string>{predecessor.rotation_group, predecessor.token_id});
             // Zero rows is the expected idempotent case (successor already
