@@ -149,6 +149,28 @@ std::shared_ptr<GuardianSparkRuntime> make_rt(std::shared_ptr<FakeReader> r,
         [] { return clk::time_point{} + std::chrono::milliseconds(tick.fetch_add(1000)); });
 }
 
+// F5 (6b/6c): a PER-TEST clock the test explicitly advances, unlike make_rt's TU-global
+// clock above which auto-advances +1s on every call regardless of which test invoked it.
+// The M1 refresh/demotion intervals are minutes-scale - driving them off an uncontrolled
+// shared auto-tick would make elapsed-time assertions racy against test execution order.
+// Holds its counter in a shared_ptr (not a raw capture) so the runtime's clock stays
+// self-contained per its own lifetime contract (guardian_spark_runtime.hpp:174-178).
+struct SettableClock {
+    std::shared_ptr<std::atomic<std::int64_t>> ms{std::make_shared<std::atomic<std::int64_t>>(0)};
+    void advance(std::int64_t delta_ms) { ms->fetch_add(delta_ms); }
+    [[nodiscard]] RuntimeClock as_runtime_clock() const {
+        auto m = ms;
+        return [m] { return clk::time_point{} + std::chrono::milliseconds(m->load()); };
+    }
+};
+std::shared_ptr<GuardianSparkRuntime> make_rt_with_clock(std::shared_ptr<FakeReader> r,
+                                                         std::shared_ptr<FakeBackend> b,
+                                                         const SettableClock& sc,
+                                                         GuardianSparkRuntime::Config cfg = {}) {
+    return std::make_shared<GuardianSparkRuntime>(std::move(r), std::move(b), cfg,
+                                                  sc.as_runtime_clock());
+}
+
 // A replayable lifecycle entry for try_page_batch tests.
 OutboxEntry lc_entry(const std::string& rule, const std::string& eid, const std::string& kind = "armed") {
     return OutboxEntry::lifecycle(rule, 1, eid, 1'700'000'000'000'000'000, kind, "file", "n");
@@ -554,6 +576,432 @@ TEST_CASE("Unknown flood guard: two rules on one key each count suppression inde
     rt->evaluate_key(key, EvalReason::Event);
     REQUIRE(drain_all(*rt).empty());
     REQUIRE(rt->unhealthy_suppressed() == 2);
+}
+
+// --- F5 6b: errored-refresh backstop -----------------------------------------------
+
+TEST_CASE("M1 refresh: a repeat Unknown before errored_refresh_ms elapses stays suppressed (F5 6b)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt_with_clock(r, b, sc); // default errored_refresh_ms = 300'000
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Initial); // edge
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    sc.advance(1'000); // well short of the 300s default
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).empty());
+    REQUIRE(rt->unhealthy_suppressed() == 1);
+    REQUIRE(rt->unhealthy_refreshed() == 0);
+}
+
+TEST_CASE("M1 refresh: a repeat Unknown past errored_refresh_ms re-emits with the CURRENT "
+          "detail (F5 6b)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt_with_clock(r, b, sc);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_unknown<FileSnapshot>("eacces");
+    rt->evaluate_key(key, EvalReason::Initial); // edge, detail="eacces"
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    sc.advance(300'000); // exactly errored_refresh_ms - the ">=" boundary
+    r->file = read_unknown<FileSnapshot>("enodev"); // the reason CHANGED mid-episode
+    rt->evaluate_key(key, EvalReason::Event);
+    const auto got = drain_all(*rt);
+    REQUIRE(got.size() == 1);
+    REQUIRE(got[0].domain == OutboxDomain::Health);
+    REQUIRE_FALSE(got[0].healthy);
+    // The refresh re-surfaces the CURRENT reason - unlike a merely-suppressed tick, this is
+    // the retired staleness trade (build_entries doc): a changed error is not silently held
+    // back until recovery.
+    REQUIRE(got[0].health_detail == "enodev");
+    REQUIRE(rt->unhealthy_refreshed() == 1);
+    REQUIRE(rt->unhealthy_suppressed() == 0);
+}
+
+TEST_CASE("M1 refresh: errored_refresh_ms=0 disables refresh - stays edge-only (F5 6b)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.errored_refresh_ms = 0;
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Initial); // edge
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    sc.advance(10'000'000); // arbitrarily far past any real cadence
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).empty()); // still nothing - refresh is OFF
+    REQUIRE(rt->unhealthy_suppressed() == 1);
+    REQUIRE(rt->unhealthy_refreshed() == 0);
+}
+
+TEST_CASE("M1 refresh: suppressed and refreshed partition every committed repeat-Unknown, "
+          "keyed off the LAST emission not the original edge (F5 6b)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt_with_clock(r, b, sc);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Initial); // edge @ t=0
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    sc.advance(100'000); // t=100s: < 300s since the edge
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).empty());
+    REQUIRE(rt->unhealthy_suppressed() == 1);
+
+    sc.advance(100'000); // t=200s: still < 300s since the edge
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).empty());
+    REQUIRE(rt->unhealthy_suppressed() == 2);
+
+    sc.advance(150'000); // t=350s: >= 300s since the edge -> refresh
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).size() == 1);
+    REQUIRE(rt->unhealthy_refreshed() == 1);
+    REQUIRE(rt->unhealthy_suppressed() == 2); // unchanged by the refresh
+
+    sc.advance(50'000); // t=400s: only 50s since the REFRESH (not 400s since the edge)
+    rt->evaluate_key(key, EvalReason::Event);
+    REQUIRE(drain_all(*rt).empty()); // too soon since the LAST emission -> suppressed again
+    REQUIRE(rt->unhealthy_suppressed() == 3);
+    REQUIRE(rt->unhealthy_refreshed() == 1);
+}
+
+TEST_CASE("M1 refresh: two rules sharing one key each refresh independently, per-rule not "
+          "per-key (F5 6b)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt_with_clock(r, b, sc);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Initial); // both edge
+    REQUIRE(drain_all(*rt).size() == 2);
+
+    sc.advance(300'000);
+    r->file = read_unknown<FileSnapshot>("io2");
+    rt->evaluate_key(key, EvalReason::Event);
+    const auto got = drain_all(*rt);
+    REQUIRE(got.size() == 2); // BOTH refresh, not one per key
+    for (const auto& e : got) {
+        REQUIRE(e.domain == OutboxDomain::Health);
+        REQUIRE(e.health_detail == "io2");
+    }
+    REQUIRE(rt->unhealthy_refreshed() == 2);
+}
+
+TEST_CASE("M1 refresh: rejected at outbox cap is retried, never counted (F5 6b)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 2; // the floor
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+    const auto kc = spark_key(file_spec("/c"));
+    rt->attach_rule("rc", file_spec("/c"), file_exists_rule("rc"), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(kc, EvalReason::Initial); // edge @ t=0
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    sc.advance(300'000); // rc's next Unknown is refresh-due
+
+    // Fill the outbox with two unrelated drifts (r->file must read KNOWN for these).
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->attach_rule("r1", file_spec("/x"), file_exists_rule("r1", /*present=*/false), true);
+    rt->attach_rule("r2", file_spec("/y"), file_exists_rule("r2", /*present=*/false), true);
+    rt->evaluate_key(spark_key(file_spec("/x")), EvalReason::Initial);
+    rt->evaluate_key(spark_key(file_spec("/y")), EvalReason::Initial);
+    REQUIRE(rt->outbox_size() == 2);
+
+    // rc's refresh is due but the outbox is full: rejected, nothing commits, not counted.
+    r->file = read_unknown<FileSnapshot>("io2");
+    rt->evaluate_key(kc, EvalReason::Convergence);
+    REQUIRE(rt->outbox_size() == 2);
+    REQUIRE(rt->unhealthy_refreshed() == 0);
+    REQUIRE(rt->unhealthy_suppressed() == 0); // not suppressed either - it will retry, not lose
+
+    // Free a slot; the STILL-due refresh re-attempts and lands (last_unhealthy_emit was never
+    // advanced by the rejected attempt, so it is STILL past the interval).
+    drain_all(*rt);
+    rt->evaluate_key(kc, EvalReason::Convergence);
+    const auto got = drain_all(*rt);
+    REQUIRE(got.size() == 1);
+    REQUIRE(got[0].health_detail == "io2");
+    REQUIRE(rt->unhealthy_refreshed() == 1);
+}
+
+TEST_CASE("M1 refresh: recovery after a refresh still emits guard.healthy and re-arms the "
+          "edge (F5 6b)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt_with_clock(r, b, sc);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Initial); // edge
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    sc.advance(300'000);
+    rt->evaluate_key(key, EvalReason::Event); // refresh
+    REQUIRE(drain_all(*rt).size() == 1);
+    REQUIRE(rt->unhealthy_refreshed() == 1);
+
+    r->file = read_known(FileSnapshot{.exists = true}); // recovers
+    rt->evaluate_key(key, EvalReason::Event);
+    const auto recovered = drain_all(*rt);
+    REQUIRE(std::any_of(recovered.begin(), recovered.end(), [](const OutboxEntry& e) {
+        return e.domain == OutboxDomain::Health && e.healthy;
+    }));
+
+    // A FRESH errored episode re-arms the edge immediately (not gated on errored_refresh_ms -
+    // the edge is the primary emission and always fires on the false->true transition).
+    r->file = read_unknown<FileSnapshot>("io3");
+    rt->evaluate_key(key, EvalReason::Event);
+    const auto got = drain_all(*rt);
+    REQUIRE(got.size() == 1);
+    REQUIRE(got[0].health_detail == "io3");
+    REQUIRE(rt->unhealthy_refreshed() == 1); // unchanged - that was an edge, not a refresh
+    REQUIRE(rt->unhealthy_suppressed() == 0);
+}
+
+// --- F5 6c: priority-lane demotion -------------------------------------------------
+
+TEST_CASE("M1 demotion: K consecutive committed Convergence-reason Unknown sweeps demote a "
+          "still-pending rule off the priority lane (F5 6c)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.pending_demote_sweeps = 3;
+    cfg.pending_demote_ms = 0; // isolate the sweep-count arm
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    r->file = read_unknown<FileSnapshot>("io");
+
+    for (int i = 0; i < 2; ++i)
+        rt->evaluate_key(key, EvalReason::Convergence); // sweeps 1 (edge) + 2
+    REQUIRE(rt->pending_demoted_for_test(key).empty());
+    REQUIRE(rt->priority_demoted() == 0);
+    const auto before = rt->keys_with_pending_initial();
+    REQUIRE(std::find(before.begin(), before.end(), key) != before.end());
+
+    rt->evaluate_key(key, EvalReason::Convergence); // sweep 3 -> demote
+    REQUIRE(rt->pending_demoted_for_test(key) == std::vector<std::string>{"r1"});
+    REQUIRE(rt->priority_demoted() == 1);
+    REQUIRE(rt->keys_with_pending_initial().empty()); // off the priority worklist
+    REQUIRE_FALSE(rt->pending_initial(key).empty());  // still "never Known" - membership unchanged
+}
+
+TEST_CASE("M1 demotion: elapsed time demotes even with sparse sweeps (F5 6c)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.pending_demote_sweeps = 0; // isolate the elapsed-time arm
+    cfg.pending_demote_ms = 120'000;
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // first_seen @ t=0
+    r->file = read_unknown<FileSnapshot>("io");
+
+    rt->evaluate_key(key, EvalReason::Convergence); // t=0: not yet
+    REQUIRE(rt->priority_demoted() == 0);
+
+    sc.advance(120'000); // t=120s
+    rt->evaluate_key(key, EvalReason::Convergence);
+    REQUIRE(rt->priority_demoted() == 1);
+    REQUIRE(rt->pending_demoted_for_test(key) == std::vector<std::string>{"r1"});
+}
+
+TEST_CASE("M1 demotion: Event-reason evals never advance the sweep counter (F5 6c)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.pending_demote_sweeps = 1; // would demote on the very first COUNTED sweep
+    cfg.pending_demote_ms = 0;
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    r->file = read_unknown<FileSnapshot>("io");
+
+    for (int i = 0; i < 5; ++i)
+        rt->evaluate_key(key, EvalReason::Event); // never Convergence
+    REQUIRE(rt->priority_demoted() == 0);
+    REQUIRE(rt->pending_demoted_for_test(key).empty());
+
+    rt->evaluate_key(key, EvalReason::Convergence); // the FIRST counted sweep
+    REQUIRE(rt->priority_demoted() == 1);
+}
+
+TEST_CASE("M1 demotion: a Known verdict before K sweeps clears pending_initial normally, "
+          "without demoting (F5 6c)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.pending_demote_sweeps = 5;
+    cfg.pending_demote_ms = 0;
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+    r->file = read_unknown<FileSnapshot>("io");
+
+    for (int i = 0; i < 2; ++i)
+        rt->evaluate_key(key, EvalReason::Convergence); // sweeps 1+2, well below K=5
+
+    r->file = read_known(FileSnapshot{.exists = true}); // recovers to compliant -> Known
+    rt->evaluate_key(key, EvalReason::Convergence);
+    REQUIRE(rt->pending_initial(key).empty()); // ordinary erase-on-Known
+    REQUIRE(rt->priority_demoted() == 0);
+}
+
+TEST_CASE("M1 demotion: a demoted key still converges via its type lane and a later Known "
+          "eval erases + emits recovery (F5 6c)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.pending_demote_sweeps = 1;
+    cfg.pending_demote_ms = 0;
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", /*present=*/true), true);
+    r->file = read_unknown<FileSnapshot>("io");
+
+    rt->evaluate_key(key, EvalReason::Convergence); // K=1: demotes on the very first sweep
+    REQUIRE(rt->priority_demoted() == 1);
+    REQUIRE(rt->keys_with_pending_initial().empty()); // off the priority lane
+
+    // The scheduler's type lane (keys_for_type()) is unfiltered by demotion - drive that
+    // same call directly, as guardian_convergence_scheduler.cpp's sweep_lane() would.
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(key, EvalReason::Convergence);
+    const auto got = drain_all(*rt);
+    REQUIRE(std::any_of(got.begin(), got.end(), [](const OutboxEntry& e) {
+        return e.domain == OutboxDomain::Health && e.healthy;
+    }));
+    REQUIRE(rt->pending_initial(key).empty()); // Known -> erased; demotion is moot now
+}
+
+TEST_CASE("M1 demotion: re-attaching a rule resets its demotion state (F5 6c)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.pending_demote_sweeps = 1;
+    cfg.pending_demote_ms = 0;
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    r->file = read_unknown<FileSnapshot>("io");
+
+    rt->evaluate_key(key, EvalReason::Convergence);
+    REQUIRE(rt->priority_demoted() == 1);
+    REQUIRE(rt->keys_with_pending_initial().empty());
+
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); // fresh generation
+    const auto after = rt->keys_with_pending_initial();
+    REQUIRE(std::find(after.begin(), after.end(), key) != after.end()); // back on the priority lane
+    REQUIRE(rt->pending_demoted_for_test(key).empty());
+}
+
+TEST_CASE("M1 demotion: pending_demote_sweeps=0 and pending_demote_ms=0 each disable their "
+          "arm - never demote-on-first-Unknown (F5 6c)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.pending_demote_sweeps = 0;
+    cfg.pending_demote_ms = 0;
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    r->file = read_unknown<FileSnapshot>("io");
+
+    for (int i = 0; i < 20; ++i) {
+        rt->evaluate_key(key, EvalReason::Convergence);
+        sc.advance(1'000'000); // also exercises the elapsed-time arm being off
+    }
+    REQUIRE(rt->priority_demoted() == 0);
+    REQUIRE(rt->pending_demoted_for_test(key).empty());
+    const auto still = rt->keys_with_pending_initial();
+    REQUIRE(std::find(still.begin(), still.end(), key) != still.end());
+}
+
+TEST_CASE("M1 demotion: a mixed demoted/non-demoted pending set on one key keeps the key on "
+          "the priority worklist (F5 6c)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.pending_demote_sweeps = 2;
+    cfg.pending_demote_ms = 0;
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    r->file = read_unknown<FileSnapshot>("io");
+
+    rt->evaluate_key(key, EvalReason::Convergence); // r1 sweep 1
+    rt->evaluate_key(key, EvalReason::Convergence); // r1 sweep 2 -> demote
+    REQUIRE(rt->pending_demoted_for_test(key) == std::vector<std::string>{"r1"});
+    REQUIRE(rt->keys_with_pending_initial().empty()); // sole pending rule demoted -> key off
+
+    // A fresh sibling on the SAME key (the watcher already exists - shared-watcher branch).
+    rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+    const auto mixed = rt->keys_with_pending_initial();
+    REQUIRE(std::find(mixed.begin(), mixed.end(), key) != mixed.end()); // back on the worklist
+    REQUIRE(rt->pending_demoted_for_test(key) == std::vector<std::string>{"r1"}); // r2 not demoted
+    const auto pend = rt->pending_initial(key);
+    REQUIRE(std::find(pend.begin(), pend.end(), "r1") != pend.end()); // still a member
+    REQUIRE(std::find(pend.begin(), pend.end(), "r2") != pend.end());
+
+    // Sweeping again advances ONLY r2's counter - r1 is frozen once demoted (guarded by
+    // !pit->second.demoted before incrementing).
+    rt->evaluate_key(key, EvalReason::Convergence); // r2 sweep 1
+    REQUIRE(rt->priority_demoted() == 1);           // still just r1
+    rt->evaluate_key(key, EvalReason::Convergence); // r2 sweep 2 -> demote
+    REQUIRE(rt->priority_demoted() == 2);
+    REQUIRE(rt->keys_with_pending_initial().empty()); // both demoted now -> key fully off
 }
 
 TEST_CASE("on_event after begin_stop commits nothing", "[spark][runtime]") {
