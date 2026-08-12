@@ -618,16 +618,20 @@ TEST_CASE("oidc_login_denied_deprovisioned U1 (c): inactive (not deleted) stays 
     CHECK_FALSE(reactivated.scim_id.has_value());
 }
 
-// MUTATION-CHECK (ADR-2001 §4 / U1 task spec): pins the reprovision gate's
-// load-bearing behaviour by proving test (b) above (genuinely deleted, no
-// re-create) is the one that would break if the orphaned branch were made
-// to unconditionally proceed (skipping the find_unique_active_by_external_id
-// gate entirely) — i.e. reverting U1's fix all the way to "any orphaned
-// link proceeds", which reopens the codex bypass this whole backstop exists
-// to close (a genuinely-deprovisioned identity re-authenticating).
-TEST_CASE("oidc_login_denied_deprovisioned U1: mutation-check — an unconditionally-"
-          "proceeding orphaned branch would reopen the codex bypass on a genuinely "
-          "deleted (never re-created) identity",
+// Gate 8 quality-engineer NICE fold: this test does NOT compile or run a
+// mutant build — it re-runs the real (correct) decision and separately
+// asserts the underlying store predicate the orphaned branch consults,
+// which is the same green-path shape as U1 test (b) above (this is
+// intentionally a duplicate of that scenario, kept as a second, more
+// granular angle on it — not an automated mutation test). The bypass this
+// scenario guards against was empirically confirmed by hand: the
+// quality-engineer manually edited the orphaned branch in
+// oidc_scim_link.cpp to an unconditional `return {.denied = false, ...}`
+// and observed `real_decision.denied` go from PASS to FAIL — no automated
+// mutant build is claimed or wired into this test.
+TEST_CASE("oidc_login_denied_deprovisioned U1: DENY on a genuinely deleted (never "
+          "re-created) identity, with the underlying reprovision predicate pinned "
+          "directly",
           "[pg][oidc][scim][2001][deny-at-login][u1][failclosed]") {
     YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -636,10 +640,10 @@ TEST_CASE("oidc_login_denied_deprovisioned U1: mutation-check — an uncondition
     REQUIRE(store.is_open());
 
     const std::string iss = "https://idp.example.com/";
-    const std::string sub = "sub-mutcheck-u1";
-    const std::string external_id = "ext-mutcheck-u1";
+    const std::string sub = "sub-u1-predicate";
+    const std::string external_id = "ext-u1-predicate";
 
-    auto r = store.create_resource("mutcheck-u1-user", external_id);
+    auto r = store.create_resource("u1-predicate-user", external_id);
     REQUIRE(r.has_value());
     REQUIRE(store.upsert_link(iss, sub, r->scim_id));
     REQUIRE(store.delete_by_scim_id(r->scim_id).value());
@@ -650,17 +654,11 @@ TEST_CASE("oidc_login_denied_deprovisioned U1: mutation-check — an uncondition
     auto real_decision = oidc_login_denied_deprovisioned(&store, iss, sub, external_id);
     CHECK(real_decision.denied);
 
-    // The counterfactual an unconditional-proceed mutation would produce for
-    // this SAME orphaned state, verified directly against the store: the
-    // orphaned branch's condition is exactly
-    // `!find_unique_active_by_external_id(link_claim_value)`. Proving that
-    // predicate is FALSE here (i.e. there genuinely is no active match) is
-    // what makes DENY the only correct outcome — a mutated
-    // "always proceed on orphan" build would instead let this identity
-    // through, which is the bypass this test exists to catch. (Manually
-    // verified during development: replacing the reprovision `if` in
-    // oidc_scim_link.cpp with an unconditional `return {.denied = false,
-    // ...}` makes the `real_decision.denied` assertion above FAIL.)
+    // The orphaned branch's gate condition, asserted directly against the
+    // store: `find_unique_active_by_external_id(link_claim_value)` returns
+    // no value here (genuinely no active match) — this is exactly what
+    // makes DENY the only correct outcome for the decision above, and is
+    // the predicate U1 (b) exercises indirectly through the decision alone.
     CHECK_FALSE(store.find_unique_active_by_external_id(external_id).has_value());
 }
 
@@ -719,5 +717,92 @@ TEST_CASE("U6: the audit reason-string mapping distinguishes store-unavailable f
         CHECK(reason_for(decision) ==
               "reason=linked_scim_resource_inactive;scim_id=" + *decision.scim_id);
         CHECK(reason_for(decision) == "reason=linked_scim_resource_inactive;scim_id=" + r->scim_id);
+    }
+}
+
+// Gate 8 quality-engineer MEDIUM fold: the U6 test above pins only the
+// PRIMARY deny site's `reason=` ternary. There are TWO deny sites in
+// auth_routes.cpp — this ADR-2001 routed-concern row (§4, PR3) names all
+// three deny-at-login invariants catastrophic-if-violated, so the
+// POST-MINT RE-CHECK site's construction (which appends
+// `;post_mint_recheck=true;sessions_invalidated=N[;db_persisted=false]`
+// after the SAME `reason=` ternary) deserves the identical pin, not just
+// the primary site's. Neither site is reachable through an HTTP-level
+// `/auth/callback` test (see the file-header docstring), so — mirroring
+// the primary-site U6 test's approach exactly — this pins the mapping via
+// a local lambda that reproduces auth_routes.cpp's exact post-mint
+// `recheck_detail` construction byte-for-byte. LIMITATION: this is a
+// hand-maintained mirror of production string-building code, not a shared
+// testable function: if that construction is refactored, this mirror must
+// be updated alongside it (the primary-site U6 lambda carries the same
+// limitation).
+TEST_CASE("U6: the post-mint re-check reason-string mapping also distinguishes "
+          "store-unavailable from resolved-deprovisioned",
+          "[pg][oidc][scim][2001][deny-at-login][u6]") {
+    // Mirrors auth_routes.cpp's exact post-mint-recheck construction:
+    //   recheck_detail = decision.scim_id
+    //       ? "reason=linked_scim_resource_inactive;scim_id=" + *scim_id
+    //       : "reason=scim_store_unavailable";
+    //   recheck_detail += ";post_mint_recheck=true;sessions_invalidated=" + count;
+    //   if (!db_persisted) recheck_detail += ";db_persisted=false";
+    auto recheck_reason_for = [](const OidcLoginDenyDecision& decision, std::size_t sessions_count,
+                                 bool db_persisted) {
+        std::string recheck_detail =
+            decision.scim_id
+                ? "reason=linked_scim_resource_inactive;scim_id=" + *decision.scim_id
+                : "reason=scim_store_unavailable";
+        recheck_detail += ";post_mint_recheck=true;sessions_invalidated=" +
+                          std::to_string(sessions_count);
+        if (!db_persisted)
+            recheck_detail += ";db_persisted=false";
+        return recheck_detail;
+    };
+
+    SECTION("store-unavailable DENY (scim_id absent) -> "
+           "reason=scim_store_unavailable;post_mint_recheck=true;sessions_invalidated=N") {
+        PgPool broken_pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1}};
+        ScimStore broken_store{broken_pool};
+        REQUIRE_FALSE(broken_store.is_open());
+
+        auto decision = oidc_login_denied_deprovisioned(&broken_store, "https://idp.example.com/",
+                                                         "sub-u6-recheck-unavailable",
+                                                         "ext-u6-recheck-unavailable");
+        REQUIRE(decision.denied);
+        REQUIRE_FALSE(decision.scim_id.has_value());
+
+        CHECK(recheck_reason_for(decision, /*sessions_count=*/1, /*db_persisted=*/true) ==
+              "reason=scim_store_unavailable;post_mint_recheck=true;sessions_invalidated=1");
+
+        // The db_persisted=false variant (RevokeResult's DB-write half
+        // failed) appends the same suffix the primary site's sibling
+        // suffix-handling already proved for db_persisted=true.
+        CHECK(recheck_reason_for(decision, /*sessions_count=*/1, /*db_persisted=*/false) ==
+              "reason=scim_store_unavailable;post_mint_recheck=true;sessions_invalidated=1"
+              ";db_persisted=false");
+    }
+
+    SECTION("resolved-deprovisioned DENY (scim_id present) -> "
+           "reason=linked_scim_resource_inactive;scim_id=<id>;post_mint_recheck=true;"
+           "sessions_invalidated=N") {
+        YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        ScimStore store{pool};
+        REQUIRE(store.is_open());
+
+        auto r = store.create_resource("u6-recheck-inactive-user", "ext-u6-recheck-inactive");
+        REQUIRE(r.has_value());
+        REQUIRE(store.upsert_link("https://idp.example.com/", "sub-u6-recheck-inactive",
+                                  r->scim_id));
+        REQUIRE(store.set_active(r->scim_id, false));
+
+        auto decision = oidc_login_denied_deprovisioned(
+            &store, "https://idp.example.com/", "sub-u6-recheck-inactive", "ext-u6-recheck-inactive");
+        REQUIRE(decision.denied);
+        REQUIRE(decision.scim_id.has_value());
+
+        CHECK(recheck_reason_for(decision, /*sessions_count=*/2, /*db_persisted=*/true) ==
+              "reason=linked_scim_resource_inactive;scim_id=" + r->scim_id +
+                  ";post_mint_recheck=true;sessions_invalidated=2");
     }
 }
