@@ -99,14 +99,29 @@ struct OidcLoginDenyDecision {
 /// sites share exactly one decision function rather than each hand-rolling
 /// the mapping.
 ///
+/// `link_claim_value` is the SAME externalId candidate link-formation uses
+/// (`cfg_.oidc_scim_link_claim == "oid" ? claims.oid : claims.sub` at the
+/// call site) — needed to distinguish "genuinely deleted" from
+/// "DELETE'd then re-CREATE'd under a new scim_id" on the orphaned-link
+/// path below (governance unhappy-path finding U1: without this, a
+/// returning re-provisioned user is permanently locked out, because the
+/// re-link that would repoint their stale `identity_links` row to the new
+/// `scim_id` runs at `link_oidc_login_to_scim`, AFTER this check).
+///
 /// `denied == true` iff:
 ///  - `scim_store` is present but could not answer
 ///    (`linked_resource_active`'s OUTER `nullopt`) — fail-closed, never
-///    treated as "no link"; `scim_id` is `nullopt` (no resource to name);
-///  - the linked resource resolved INACTIVE (engaged, `scim_id` set,
-///    `active` either `nullopt` — an orphaned link whose `scim_resources`
-///    row was hard-deleted — or `false` — deactivated); `scim_id` carries
-///    the linked resource's id in both sub-cases.
+///    treated as "no link"; `scim_id` is `nullopt` (no resource to name —
+///    the caller's audit row must say "store unavailable", never
+///    "resource inactive", U6);
+///  - the linked resource resolved DEACTIVATED (engaged, `scim_id` set,
+///    `active == false`) — `scim_id` carries the linked resource's id;
+///  - the linked resource resolved ORPHANED (engaged, `scim_id` set,
+///    `active == nullopt` — the `scim_resources` row was hard-deleted) AND
+///    no ACTIVE resource exists for `link_claim_value`
+///    (`ScimStore::find_unique_active_by_external_id` returns `nullopt`) —
+///    i.e. genuinely deprovisioned, not re-provisioned; `scim_id` carries
+///    the stale (now-gone) linked resource's id.
 ///
 /// `denied == false` (`scim_id` always `nullopt`) iff:
 ///  - `scim_store` is null — SCIM/ADR-2001 linkage is not configured at all
@@ -117,15 +132,38 @@ struct OidcLoginDenyDecision {
 ///  - no `identity_links` row exists for this identity (engaged,
 ///    `scim_id == nullopt`) — an unlinked OIDC identity is not a
 ///    deprovisioned SCIM user;
-///  - the linked resource resolved ACTIVE (engaged, `active == true`).
+///  - the linked resource resolved ACTIVE (engaged, `active == true`);
+///  - the linked resource resolved ORPHANED, but an ACTIVE resource now
+///    exists for `link_claim_value` — the identity was DELETE'd then
+///    re-CREATE'd under a new `scim_id` (a returning, re-provisioned
+///    user). PROCEED lets the login continue; the re-link at
+///    `link_oidc_login_to_scim` (which runs right after this check
+///    succeeds) repoints the stale `(iss, sub)` link row to the new
+///    `scim_id`, so the NEXT login resolves clean via the ordinary
+///    active-link path. `find_unique_active_by_external_id` is issuer-
+///    blind by externalId (ADR-2001 §5's documented single-issuer
+///    precondition — same one link-formation already relies on), so this
+///    reprovision check is safe only under that same single-issuer
+///    assumption.
+///
+/// The INACTIVE (deactivated, not orphaned) branch deliberately does NOT
+/// run this reprovision check: reactivation is `active:true` on the SAME
+/// `scim_id`, which `linked_resource_active` already resolves back to
+/// PROCEED on the very next read (no latched denial — see the
+/// `test_oidc_scim_link.cpp` "reactivated identity" case), and the partial-
+/// unique index on `scim_resources.external_id` prevents a SECOND active
+/// resource sharing the externalId while the inactive row still holds it —
+/// so only the orphaned (hard-deleted) case can have a reprovision-under-
+/// new-id sibling to find.
 ///
 /// Pure decision function: no audit, no metrics, no redirect — the caller
 /// owns every side effect of a DENY (the byte-identical `sso_failed`
 /// redirect, the `auth.oidc.deprovisioned_denied` audit row carrying
-/// `scim_id`, the `yuzu_auth_oidc_deprovisioned_denied_total` bump, and —
-/// on the post-mint call only — invalidating the session just minted).
+/// `scim_id` when known, the `yuzu_auth_oidc_deprovisioned_denied_total`
+/// bump, and — on the post-mint call only — invalidating the session just
+/// minted).
 [[nodiscard]] OidcLoginDenyDecision
 oidc_login_denied_deprovisioned(ScimStore* scim_store, const std::string& iss,
-                                const std::string& sub);
+                                const std::string& sub, const std::string& link_claim_value);
 
 } // namespace yuzu::server::oidc

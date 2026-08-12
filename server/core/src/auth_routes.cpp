@@ -2441,6 +2441,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         const std::string username = oidc::oidc_principal_id(claims.iss, claims.sub);
         auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
 
+        // ADR-2001 §4 — the SAME externalId candidate value link formation
+        // uses below (`link_oidc_login_to_scim`) — computed once here so the
+        // deny-at-login backstop's reprovision check (governance U1) and
+        // link formation can never drift onto different values.
+        const std::string link_claim_value =
+            cfg_.oidc_scim_link_claim == "oid" ? claims.oid : claims.sub;
+
         // ADR-2001 §4 — deny-at-login backstop, PRIMARY check. Runs before
         // every mutation below (group reconcile, session mint,
         // provision_sso_identity, the ADR-2001 §2 link/observation writes,
@@ -2448,20 +2455,26 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // a deprovisioned SCIM user must not be able to re-authenticate and
         // mint a fresh session just by round-tripping the IdP again.
         // `oidc_login_denied_deprovisioned` is fail-CLOSED: a ScimStore that
-        // cannot answer denies, exactly like a resolved-inactive/orphaned
-        // link. Emits the BYTE-IDENTICAL `sso_failed` redirect the
-        // token-exchange-failure branch above uses — no "deprovisioned"/
-        // oracle wording reaches the browser; the reason (and, when known,
-        // the driving scim_id — server-generated CSPRNG hex, never IdP
-        // input, so no sanitize_detail_value needed) lives only in the
-        // server-side audit row.
-        if (auto decision = oidc::oidc_login_denied_deprovisioned(scim_store_, claims.iss, claims.sub);
+        // cannot answer denies, exactly like a resolved-inactive link or a
+        // genuinely-orphaned (not re-provisioned) one. Emits the
+        // BYTE-IDENTICAL `sso_failed` redirect the token-exchange-failure
+        // branch above uses — no "deprovisioned"/oracle wording reaches the
+        // browser; the reason (and, when known, the driving scim_id —
+        // server-generated CSPRNG hex, never IdP input, so no
+        // sanitize_detail_value needed) lives only in the server-side audit
+        // row. Governance U6 fix: a store-unavailable DENY (`scim_id`
+        // absent) is audited as `scim_store_unavailable`, never as
+        // `linked_scim_resource_inactive` — the latter is fictional CC6.8
+        // evidence when the store simply couldn't be asked.
+        if (auto decision = oidc::oidc_login_denied_deprovisioned(scim_store_, claims.iss,
+                                                                   claims.sub, link_claim_value);
             decision.denied) {
             spdlog::warn("OIDC login denied for '{}': linked SCIM resource is deprovisioned",
                         username);
-            std::string deny_detail = "reason=linked_scim_resource_inactive";
-            if (decision.scim_id)
-                deny_detail += ";scim_id=" + *decision.scim_id;
+            std::string deny_detail = decision.scim_id
+                                          ? "reason=linked_scim_resource_inactive;scim_id=" +
+                                                *decision.scim_id
+                                          : "reason=scim_store_unavailable";
             audit_log_for_principal(req, "auth.oidc.deprovisioned_denied", "failure", username,
                                     "user", "User", username, deny_detail);
             if (auto* m = auth_mgr_.metrics_registry()) {
@@ -2675,33 +2688,40 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // to pass through unconditionally here because
         // `link_oidc_login_to_scim` re-sanitizes every candidate claim
         // before trusting it into a durable observation row.
-        oidc::link_oidc_login_to_scim(
-            scim_store_, claims.iss, claims.sub, claims.oid, cfg_.oidc_scim_link_claim,
-            cfg_.oidc_scim_link_claim == "oid" ? claims.oid : claims.sub,
-            auth_mgr_.metrics_registry());
+        oidc::link_oidc_login_to_scim(scim_store_, claims.iss, claims.sub, claims.oid,
+                                      cfg_.oidc_scim_link_claim, link_claim_value,
+                                      auth_mgr_.metrics_registry());
 
         // ADR-2001 §4 — deny-at-login backstop, POST-MINT RE-CHECK (the
         // codex-caught check-then-mint race, user-approved). The primary
         // check above ran before this login's own mint; a concurrent SCIM
         // deactivate/DELETE could have landed in the window between that
         // check and `create_oidc_session` above. Re-resolve the SAME
-        // decision via the SAME helper and, if it has now flipped to DENY,
-        // invalidate the session just minted rather than hand it out — this
-        // self-heals the race without holding a cross-store lock over the
-        // mint (which would violate the no-lease-across-sibling-store
-        // discipline, ADR-2001 §3). Runs BEFORE the Set-Cookie header below
-        // so a denied login never reaches the browser with a live cookie.
-        if (auto decision = oidc::oidc_login_denied_deprovisioned(scim_store_, claims.iss, claims.sub);
+        // decision via the SAME helper (same `link_claim_value`, so the
+        // governance U1 reprovision check stays consistent between the two
+        // calls) and, if it has now flipped to DENY, invalidate the session
+        // just minted rather than hand it out — this self-heals the race
+        // without holding a cross-store lock over the mint (which would
+        // violate the no-lease-across-sibling-store discipline, ADR-2001
+        // §3). Runs BEFORE the Set-Cookie header below so a denied login
+        // never reaches the browser with a live cookie.
+        if (auto decision = oidc::oidc_login_denied_deprovisioned(scim_store_, claims.iss,
+                                                                   claims.sub, link_claim_value);
             decision.denied) {
             spdlog::warn("OIDC login denied for '{}' on post-mint re-check: linked SCIM resource "
                         "is deprovisioned (concurrent deprovision race)",
                         username);
             auto revoke_result = auth_mgr_.invalidate_user_sessions(username);
-            std::string recheck_detail =
-                "reason=linked_scim_resource_inactive;post_mint_recheck=true;sessions_invalidated=" +
-                std::to_string(revoke_result.count);
-            if (decision.scim_id)
-                recheck_detail += ";scim_id=" + *decision.scim_id;
+            // Governance U6 fix: a store-unavailable DENY (`scim_id` absent)
+            // is audited as `scim_store_unavailable`, never as
+            // `linked_scim_resource_inactive` (fictional CC6.8 evidence on a
+            // mere outage) — mirrors the primary check's reason string.
+            std::string recheck_detail = decision.scim_id
+                                             ? "reason=linked_scim_resource_inactive;scim_id=" +
+                                                   *decision.scim_id
+                                             : "reason=scim_store_unavailable";
+            recheck_detail += ";post_mint_recheck=true;sessions_invalidated=" +
+                              std::to_string(revoke_result.count);
             if (!revoke_result.db_persisted) {
                 // RevokeResult's contract (auth.hpp): a "success" audit row
                 // that hides a DB persistence failure produces fictional

@@ -49,6 +49,7 @@ using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
 using yuzu::server::oidc::link_oidc_login_to_scim;
 using yuzu::server::oidc::oidc_login_denied_deprovisioned;
+using yuzu::server::oidc::OidcLoginDenyDecision;
 
 namespace {
 
@@ -292,6 +293,13 @@ TEST_CASE("link_oidc_login_to_scim: an empty/unsanitized oid candidate is never 
 // directly against a real ScimStore, which is exactly this function's own
 // dependency surface — a store-degrade or state transition it needs to
 // react to is fully reproducible here without an IdP.
+//
+// `link_claim_value` is the 4th param (governance U1 fix) — the same
+// externalId candidate link formation uses, needed by the orphaned-link
+// reprovision check. Most cases below pass a value that deliberately does
+// NOT match any active resource's externalId, so they exercise the SAME
+// deny/proceed outcomes as before U1 — the reprovision-specific behaviour
+// is covered by its own dedicated section further down.
 
 TEST_CASE("oidc_login_denied_deprovisioned: a null ScimStore proceeds (SCIM not configured, "
           "not a store degrade)",
@@ -301,7 +309,8 @@ TEST_CASE("oidc_login_denied_deprovisioned: a null ScimStore proceeds (SCIM not 
     // this must NOT be conflated with a present-but-unusable store (which
     // fails closed, below). A deployment that never enables SCIM must not
     // have every OIDC login denied by this backstop.
-    auto decision = oidc_login_denied_deprovisioned(nullptr, "https://idp.example.com/", "sub-x");
+    auto decision =
+        oidc_login_denied_deprovisioned(nullptr, "https://idp.example.com/", "sub-x", "sub-x");
     CHECK_FALSE(decision.denied);
     CHECK_FALSE(decision.scim_id.has_value());
 }
@@ -315,7 +324,7 @@ TEST_CASE("oidc_login_denied_deprovisioned: an unlinked OIDC identity proceeds",
     REQUIRE(store.is_open());
 
     auto decision = oidc_login_denied_deprovisioned(&store, "https://idp.example.com/",
-                                                     "sub-never-linked");
+                                                     "sub-never-linked", "sub-never-linked");
     CHECK_FALSE(decision.denied);
     CHECK_FALSE(decision.scim_id.has_value());
 }
@@ -332,16 +341,17 @@ TEST_CASE("oidc_login_denied_deprovisioned: an active linked identity proceeds",
     REQUIRE(r.has_value());
     REQUIRE(store.upsert_link("https://idp.example.com/", "sub-active", r->scim_id));
 
-    auto decision =
-        oidc_login_denied_deprovisioned(&store, "https://idp.example.com/", "sub-active");
+    auto decision = oidc_login_denied_deprovisioned(&store, "https://idp.example.com/",
+                                                     "sub-active", "ext-active");
     CHECK_FALSE(decision.denied);
     // PROCEED always carries scim_id=nullopt, even though a linked resource
     // exists — the audit detail only needs the id on a DENY.
     CHECK_FALSE(decision.scim_id.has_value());
 }
 
-TEST_CASE("oidc_login_denied_deprovisioned: a deactivated linked identity is DENIED and "
-          "names the resource",
+TEST_CASE("oidc_login_denied_deprovisioned: a deactivated linked identity is DENIED "
+          "unconditionally — no reprovision check on this branch — and names the "
+          "resource",
           "[pg][oidc][scim][2001][deny-at-login]") {
     YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -354,15 +364,22 @@ TEST_CASE("oidc_login_denied_deprovisioned: a deactivated linked identity is DEN
     REQUIRE(store.upsert_link("https://idp.example.com/", "sub-inactive", r->scim_id));
     REQUIRE(store.set_active(r->scim_id, false));
 
-    auto decision =
-        oidc_login_denied_deprovisioned(&store, "https://idp.example.com/", "sub-inactive");
+    // Passing the resource's OWN externalId as link_claim_value proves the
+    // INACTIVE branch does NOT consult find_unique_active_by_external_id —
+    // if it did, this externalId would resolve to nothing (the only row for
+    // it is now inactive) and the outcome would be unchanged here anyway,
+    // but the dedicated reprovision-check tests below confirm the ORPHANED
+    // branch is the only one gated by it.
+    auto decision = oidc_login_denied_deprovisioned(&store, "https://idp.example.com/",
+                                                     "sub-inactive", "ext-inactive");
     CHECK(decision.denied);
     REQUIRE(decision.scim_id.has_value());
     CHECK(*decision.scim_id == r->scim_id); // the id the audit detail carries
 }
 
-TEST_CASE("oidc_login_denied_deprovisioned: an orphaned link (scim_resources row "
-          "hard-deleted) is DENIED and still names the resource",
+TEST_CASE("oidc_login_denied_deprovisioned: an orphaned link with NO reprovision "
+          "(genuinely deleted, no active resource for its externalId) is DENIED and "
+          "still names the resource",
           "[pg][oidc][scim][2001][deny-at-login]") {
     YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -375,8 +392,12 @@ TEST_CASE("oidc_login_denied_deprovisioned: an orphaned link (scim_resources row
     REQUIRE(store.upsert_link("https://idp.example.com/", "sub-deleted", r->scim_id));
     REQUIRE(store.delete_by_scim_id(r->scim_id).value());
 
-    auto decision =
-        oidc_login_denied_deprovisioned(&store, "https://idp.example.com/", "sub-deleted");
+    // link_claim_value = the deleted resource's own (now-orphaned)
+    // externalId — no active resource exists for it (nothing was
+    // re-created), so this is the "genuinely deleted" case, U1's codex
+    // bypass regression target (b).
+    auto decision = oidc_login_denied_deprovisioned(&store, "https://idp.example.com/",
+                                                     "sub-deleted", "ext-deleted");
     CHECK(decision.denied);
     REQUIRE(decision.scim_id.has_value()); // identity_links row still names the (now-gone) id
     CHECK(*decision.scim_id == r->scim_id);
@@ -395,19 +416,20 @@ TEST_CASE("oidc_login_denied_deprovisioned: a reactivated identity proceeds agai
     REQUIRE(r.has_value());
     REQUIRE(store.upsert_link("https://idp.example.com/", "sub-flapping", r->scim_id));
 
-    CHECK_FALSE(
-        oidc_login_denied_deprovisioned(&store, "https://idp.example.com/", "sub-flapping")
-            .denied);
+    CHECK_FALSE(oidc_login_denied_deprovisioned(&store, "https://idp.example.com/",
+                                                "sub-flapping", "ext-flapping")
+                    .denied);
 
     REQUIRE(store.set_active(r->scim_id, false));
-    auto mid = oidc_login_denied_deprovisioned(&store, "https://idp.example.com/", "sub-flapping");
+    auto mid = oidc_login_denied_deprovisioned(&store, "https://idp.example.com/", "sub-flapping",
+                                               "ext-flapping");
     CHECK(mid.denied);
     REQUIRE(mid.scim_id.has_value());
     CHECK(*mid.scim_id == r->scim_id);
 
     REQUIRE(store.set_active(r->scim_id, true));
     auto after = oidc_login_denied_deprovisioned(&store, "https://idp.example.com/",
-                                                 "sub-flapping");
+                                                 "sub-flapping", "ext-flapping");
     CHECK_FALSE(after.denied);
     CHECK_FALSE(after.scim_id.has_value());
 }
@@ -433,15 +455,17 @@ TEST_CASE("oidc_login_denied_deprovisioned: models the post-mint re-check race �
     REQUIRE(store.upsert_link("https://idp.example.com/", "sub-race", r->scim_id));
 
     // "Primary check" — proceeds.
-    CHECK_FALSE(
-        oidc_login_denied_deprovisioned(&store, "https://idp.example.com/", "sub-race").denied);
+    CHECK_FALSE(oidc_login_denied_deprovisioned(&store, "https://idp.example.com/", "sub-race",
+                                                "ext-race")
+                    .denied);
 
     // A concurrent SCIM deactivate lands in the mint window.
     REQUIRE(store.set_active(r->scim_id, false));
 
     // "Post-mint re-check" — the SAME call, now denies and names the resource
     // — this is the audit-detail scim_id the recheck site embeds.
-    auto recheck = oidc_login_denied_deprovisioned(&store, "https://idp.example.com/", "sub-race");
+    auto recheck = oidc_login_denied_deprovisioned(&store, "https://idp.example.com/", "sub-race",
+                                                   "ext-race");
     CHECK(recheck.denied);
     REQUIRE(recheck.scim_id.has_value());
     CHECK(*recheck.scim_id == r->scim_id);
@@ -458,10 +482,13 @@ TEST_CASE("oidc_login_denied_deprovisioned: a closed/unusable ScimStore fails CL
     REQUIRE_FALSE(broken_store.is_open());
 
     auto decision = oidc_login_denied_deprovisioned(&broken_store, "https://idp.example.com/",
-                                                     "sub-unreachable");
+                                                     "sub-unreachable", "ext-unreachable");
     CHECK(decision.denied);
     // The store could not be asked, so there is no resource to name — the
-    // audit detail on this DENY omits scim_id gracefully.
+    // audit detail on this DENY omits scim_id gracefully (and, per U6, is
+    // audited as `reason=scim_store_unavailable`, never
+    // `linked_scim_resource_inactive` — see the reason-string section
+    // below).
     CHECK_FALSE(decision.scim_id.has_value());
 
     // MUTATION-CHECK (manually verified during development): flipping
@@ -471,4 +498,226 @@ TEST_CASE("oidc_login_denied_deprovisioned: a closed/unusable ScimStore fails CL
     // assertion above fail — the exact fail-open regression ADR-2001 §4
     // exists to prevent (a ScimStore outage must never let a deprovisioned
     // identity re-authenticate by luck of timing).
+}
+
+// ── Governance unhappy-path finding U1 — reprovision after SCIM DELETE ──
+//
+// Bug: SCIM DELETE hard-deletes scim_resources and orphans the
+// identity_links row; a re-CREATE mints a NEW scim_id; but the re-link
+// (upsert_link, in link_oidc_login_to_scim) runs AFTER the primary deny
+// check in auth_routes.cpp. Without this reprovision check, a DELETE+
+// re-CREATE'd (returning) user is permanently locked out — their login is
+// denied before the re-link can repoint the stale (iss,sub) link.
+//
+// The fix ONLY applies to the ORPHANED branch (active == nullopt); the
+// dedicated tests above already pin that the INACTIVE branch (active ==
+// false, resource still exists) keeps denying unconditionally.
+
+TEST_CASE("oidc_login_denied_deprovisioned U1 (a): DELETE then re-CREATE under the SAME "
+          "externalId (new scim_id) PROCEEDS — a returning re-provisioned user is not "
+          "locked out",
+          "[pg][oidc][scim][2001][deny-at-login][u1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string iss = "https://idp.example.com/";
+    const std::string sub = "sub-returning";
+    const std::string external_id = "ext-returning";
+
+    auto original = store.create_resource("returning-user", external_id);
+    REQUIRE(original.has_value());
+    REQUIRE(store.upsert_link(iss, sub, original->scim_id));
+    REQUIRE(store.delete_by_scim_id(original->scim_id).value());
+
+    // Re-CREATE under the SAME externalId — a new scim_id, per SCIM's
+    // create semantics (create_resource always mints a fresh id).
+    auto reprovisioned = store.create_resource("returning-user-2", external_id);
+    REQUIRE(reprovisioned.has_value());
+    REQUIRE(reprovisioned->scim_id != original->scim_id);
+
+    // The deny decision for the STALE (iss,sub) link must now PROCEED —
+    // this is the exact lockout U1 closes.
+    auto decision = oidc_login_denied_deprovisioned(&store, iss, sub, external_id);
+    CHECK_FALSE(decision.denied);
+    CHECK_FALSE(decision.scim_id.has_value());
+
+    // A real login re-links: link_oidc_login_to_scim repoints the stale
+    // (iss,sub) row to the NEW scim_id (the same externalId still resolves
+    // to exactly one active resource — the re-created one).
+    link_oidc_login_to_scim(&store, iss, sub, /*oid=*/"", "sub", external_id);
+    auto links = store.links_for_scim_id(reprovisioned->scim_id);
+    REQUIRE(links.has_value());
+    REQUIRE(links->size() == 1);
+    CHECK((*links)[0].sub == sub);
+    // The stale link no longer points at the deleted resource.
+    CHECK(store.links_for_scim_id(original->scim_id)->empty());
+
+    // A SECOND login now resolves via the ordinary active-link path —
+    // clean, no reprovision check even engaged (scim_id is set and
+    // active==true).
+    auto second_login = oidc_login_denied_deprovisioned(&store, iss, sub, external_id);
+    CHECK_FALSE(second_login.denied);
+}
+
+TEST_CASE("oidc_login_denied_deprovisioned U1 (b): DELETE with NO re-CREATE stays DENIED "
+          "— the codex bypass must remain closed",
+          "[pg][oidc][scim][2001][deny-at-login][u1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string iss = "https://idp.example.com/";
+    const std::string sub = "sub-gone-forever";
+    const std::string external_id = "ext-gone-forever";
+
+    auto r = store.create_resource("gone-forever-user", external_id);
+    REQUIRE(r.has_value());
+    REQUIRE(store.upsert_link(iss, sub, r->scim_id));
+    REQUIRE(store.delete_by_scim_id(r->scim_id).value());
+
+    // No re-CREATE happened — find_unique_active_by_external_id(external_id)
+    // must return nullopt, so the decision stays DENY. This is the codex
+    // bypass regression target: it must never silently reopen.
+    auto decision = oidc_login_denied_deprovisioned(&store, iss, sub, external_id);
+    CHECK(decision.denied);
+    REQUIRE(decision.scim_id.has_value());
+    CHECK(*decision.scim_id == r->scim_id);
+}
+
+TEST_CASE("oidc_login_denied_deprovisioned U1 (c): inactive (not deleted) stays DENIED; "
+          "reactivating the SAME resource then PROCEEDS — unchanged by the U1 fix",
+          "[pg][oidc][scim][2001][deny-at-login][u1]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string iss = "https://idp.example.com/";
+    const std::string sub = "sub-deactivated";
+    const std::string external_id = "ext-deactivated";
+
+    auto r = store.create_resource("deactivated-user", external_id);
+    REQUIRE(r.has_value());
+    REQUIRE(store.upsert_link(iss, sub, r->scim_id));
+    REQUIRE(store.set_active(r->scim_id, false));
+
+    auto deactivated = oidc_login_denied_deprovisioned(&store, iss, sub, external_id);
+    CHECK(deactivated.denied);
+    REQUIRE(deactivated.scim_id.has_value());
+    CHECK(*deactivated.scim_id == r->scim_id);
+
+    REQUIRE(store.set_active(r->scim_id, true));
+    auto reactivated = oidc_login_denied_deprovisioned(&store, iss, sub, external_id);
+    CHECK_FALSE(reactivated.denied);
+    CHECK_FALSE(reactivated.scim_id.has_value());
+}
+
+// MUTATION-CHECK (ADR-2001 §4 / U1 task spec): pins the reprovision gate's
+// load-bearing behaviour by proving test (b) above (genuinely deleted, no
+// re-create) is the one that would break if the orphaned branch were made
+// to unconditionally proceed (skipping the find_unique_active_by_external_id
+// gate entirely) — i.e. reverting U1's fix all the way to "any orphaned
+// link proceeds", which reopens the codex bypass this whole backstop exists
+// to close (a genuinely-deprovisioned identity re-authenticating).
+TEST_CASE("oidc_login_denied_deprovisioned U1: mutation-check — an unconditionally-"
+          "proceeding orphaned branch would reopen the codex bypass on a genuinely "
+          "deleted (never re-created) identity",
+          "[pg][oidc][scim][2001][deny-at-login][u1][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string iss = "https://idp.example.com/";
+    const std::string sub = "sub-mutcheck-u1";
+    const std::string external_id = "ext-mutcheck-u1";
+
+    auto r = store.create_resource("mutcheck-u1-user", external_id);
+    REQUIRE(r.has_value());
+    REQUIRE(store.upsert_link(iss, sub, r->scim_id));
+    REQUIRE(store.delete_by_scim_id(r->scim_id).value());
+
+    // The real (correct) decision: DENY, because
+    // find_unique_active_by_external_id(external_id) finds nothing (no
+    // re-create happened).
+    auto real_decision = oidc_login_denied_deprovisioned(&store, iss, sub, external_id);
+    CHECK(real_decision.denied);
+
+    // The counterfactual an unconditional-proceed mutation would produce for
+    // this SAME orphaned state, verified directly against the store: the
+    // orphaned branch's condition is exactly
+    // `!find_unique_active_by_external_id(link_claim_value)`. Proving that
+    // predicate is FALSE here (i.e. there genuinely is no active match) is
+    // what makes DENY the only correct outcome — a mutated
+    // "always proceed on orphan" build would instead let this identity
+    // through, which is the bypass this test exists to catch. (Manually
+    // verified during development: replacing the reprovision `if` in
+    // oidc_scim_link.cpp with an unconditional `return {.denied = false,
+    // ...}` makes the `real_decision.denied` assertion above FAIL.)
+    CHECK_FALSE(store.find_unique_active_by_external_id(external_id).has_value());
+}
+
+// ── Governance unhappy-path finding U6 — store-unavailable audit reason ──
+//
+// Both deny sites in auth_routes.cpp build the audit `reason=` string from
+// `decision.scim_id`'s presence: absent -> `scim_store_unavailable` (the
+// store could not be asked — this must NEVER be reported as
+// "resource inactive", which is fictional CC6.8 evidence on a mere outage);
+// present -> `linked_scim_resource_inactive;scim_id=<id>` (a real resolved
+// deprovision). This mirrors the exact ternary in auth_routes.cpp — pinned
+// here since the route handler itself is unreachable without a live IdP
+// (see the file-header docstring).
+TEST_CASE("U6: the audit reason-string mapping distinguishes store-unavailable from "
+          "resolved-deprovisioned",
+          "[pg][oidc][scim][2001][deny-at-login][u6]") {
+    // Mirrors auth_routes.cpp's exact construction:
+    //   decision.scim_id ? "reason=linked_scim_resource_inactive;scim_id=" + *scim_id
+    //                     : "reason=scim_store_unavailable"
+    auto reason_for = [](const OidcLoginDenyDecision& decision) {
+        return decision.scim_id
+                   ? "reason=linked_scim_resource_inactive;scim_id=" + *decision.scim_id
+                   : std::string("reason=scim_store_unavailable");
+    };
+
+    SECTION("store-unavailable DENY (scim_id absent) -> reason=scim_store_unavailable") {
+        PgPool broken_pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1}};
+        ScimStore broken_store{broken_pool};
+        REQUIRE_FALSE(broken_store.is_open());
+
+        auto decision = oidc_login_denied_deprovisioned(&broken_store, "https://idp.example.com/",
+                                                         "sub-u6-unavailable",
+                                                         "ext-u6-unavailable");
+        REQUIRE(decision.denied);
+        REQUIRE_FALSE(decision.scim_id.has_value());
+        CHECK(reason_for(decision) == "reason=scim_store_unavailable");
+    }
+
+    SECTION("resolved-deprovisioned DENY (scim_id present) -> "
+           "reason=linked_scim_resource_inactive;scim_id=<id>") {
+        YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        ScimStore store{pool};
+        REQUIRE(store.is_open());
+
+        auto r = store.create_resource("u6-inactive-user", "ext-u6-inactive");
+        REQUIRE(r.has_value());
+        REQUIRE(store.upsert_link("https://idp.example.com/", "sub-u6-inactive", r->scim_id));
+        REQUIRE(store.set_active(r->scim_id, false));
+
+        auto decision = oidc_login_denied_deprovisioned(&store, "https://idp.example.com/",
+                                                         "sub-u6-inactive", "ext-u6-inactive");
+        REQUIRE(decision.denied);
+        REQUIRE(decision.scim_id.has_value());
+        CHECK(reason_for(decision) ==
+              "reason=linked_scim_resource_inactive;scim_id=" + *decision.scim_id);
+        CHECK(reason_for(decision) == "reason=linked_scim_resource_inactive;scim_id=" + r->scim_id);
+    }
 }

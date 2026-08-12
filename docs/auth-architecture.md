@@ -1683,12 +1683,19 @@ Both deny sites emit the **byte-identical** `/login?error=sso_failed`
 redirect the existing token-exchange-failure branch uses (no
 "deprovisioned" wording reaches the browser — no oracle), a server-side
 audit row `auth.oidc.deprovisioned_denied` (`result=failure`, principal =
-the OIDC username, `detail=reason=linked_scim_resource_inactive` plus
-`;scim_id=<id>` when a resource drove the denial, and — on the post-mint
-path only — `;post_mint_recheck=true;sessions_invalidated=<N>`, and
-`;db_persisted=false` if the session-revoke write itself did not persist),
-and increment the pre-seeded counter
-`yuzu_auth_oidc_deprovisioned_denied_total`.
+the OIDC username), and increment the pre-seeded counter
+`yuzu_auth_oidc_deprovisioned_denied_total`. `detail` distinguishes the two
+denial causes rather than folding them into one reason: `reason=
+linked_scim_resource_inactive` plus `;scim_id=<id>` when an actually
+resolved (deactivated or orphaned) SCIM resource drove the denial, versus
+`reason=scim_store_unavailable` (no `scim_id` — there is no resource to
+name; the store itself could not be asked) on the fail-closed
+store-unavailable path — this path denies **every** OIDC login while it
+persists, not only deprovisioned ones (`docs/user-manual/scim-provisioning.md`
+"Availability: a ScimStore/Postgres outage denies ALL OIDC logins"). On the
+post-mint re-check path only, `detail` additionally carries
+`;post_mint_recheck=true;sessions_invalidated=<N>`, and
+`;db_persisted=false` if the session-revoke write itself did not persist.
 
 **The honest guarantee — read this before describing CC6.8 as fully
 closed.** Deny-at-login **fully closes** the dominant case: a re-login
@@ -1701,21 +1708,31 @@ check and the mint, concurrently with a deprovision landing in that same
 gap, is caught by the post-mint re-check in the overwhelming majority of
 timings — but a microsecond check-then-mint window remains theoretically
 possible and is **deliberately not closed by lock-serialization** (the
-cross-store-lock deadlock hazard above). That residual is bounded by the
-eager revoke PR1/PR2 already provide (a session that does slip through is
-revoked on the next deprovision/reconciliation pass) plus the ~60s
-`ApiTokenStore` validate-cache window for API/MCP tokens. Do not describe
-this as "the race has nothing left to win" — that overclaims what a
-lock-free, cross-store design can guarantee; see
+cross-store-lock deadlock hazard above). **That residual's bound differs by
+credential kind — the two must not be collapsed into one figure.** An
+API/MCP token caught in the race is bounded by the existing ~60s
+`ApiTokenStore` validate-cache window. A session that slips through is
+**not** on the same clock: `AuthManager::validate_session` re-checks only
+the session's own expiry/idle timeout on every request, never SCIM-linked
+deprovision state, so a slipped session remains valid for up to the
+**session's own TTL** (the absolute `kSessionDuration`, 8h by default, or a
+shorter configured `--session-inactivity-secs` idle timeout) — it is cut
+short early only if a *subsequent* deprovision call happens to land against
+the same identity, which an IdP is not guaranteed to send again once it
+believes the resource is already deactivated. Do not describe a slipped
+session as bounded by ~60s, and do not describe this residual overall as
+"the race has nothing left to win" — that overclaims what a lock-free,
+cross-store design can guarantee; see
 `docs/adr/2001-scim-oidc-identity-linkage.md` "Known residuals" for the
-full statement.
+full statement, including the forward caveat on single-primary Postgres
+reads (this guarantee assumes no read-replica routing).
 
 ### New audit actions (ADR-2001)
 
 | Action | Result | When |
 |---|---|---|
 | `scim.user.deprovision_role_refused_with_link` | `failure` | D1: a role-refused deprovision (`deprovision_role_ok` 404) for a slug with ≥1 active linked OIDC identity that was NOT auto-revoked |
-| `auth.oidc.deprovisioned_denied` | `failure` | §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned, or the store could not answer). Emitted from `/auth/callback`, not a `/scim/v2/*` route. `detail` carries `reason=linked_scim_resource_inactive`, `scim_id=<id>` when a resource drove the denial, and on the post-mint re-check path only, `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that revoke itself failed to persist) |
+| `auth.oidc.deprovisioned_denied` | `failure` | §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned) or because `ScimStore` could not answer at all (fail-closed). Emitted from `/auth/callback`, not a `/scim/v2/*` route. `detail` carries `reason=linked_scim_resource_inactive;scim_id=<id>` when an actually resolved resource drove the denial, or `reason=scim_store_unavailable` (no `scim_id`) when the store itself could not be asked, and on the post-mint re-check path only, `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that revoke itself failed to persist) |
 
 The existing `scim.user.deactivated`/`.deleted` rows (see Audit actions
 above) now also carry `api_tokens_revoked=N sessions_revoked=N

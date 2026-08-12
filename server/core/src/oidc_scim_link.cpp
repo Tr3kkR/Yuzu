@@ -82,7 +82,8 @@ void link_oidc_login_to_scim(ScimStore* scim_store, const std::string& iss, cons
 }
 
 OidcLoginDenyDecision oidc_login_denied_deprovisioned(ScimStore* scim_store, const std::string& iss,
-                                                      const std::string& sub) {
+                                                      const std::string& sub,
+                                                      const std::string& link_claim_value) {
     // No store configured at all — SCIM/ADR-2001 linkage cannot have formed,
     // so there is nothing to deny against. This is deliberately DIFFERENT
     // from a non-null-but-unusable store (below), which fails closed.
@@ -96,9 +97,36 @@ OidcLoginDenyDecision oidc_login_denied_deprovisioned(ScimStore* scim_store, con
     if (!result->scim_id)
         return {.denied = false, .scim_id = std::nullopt}; // no linked identity: proceed
 
-    if (!result->active || !*result->active) {
-        // Orphaned (active == nullopt) or explicitly deactivated (active ==
-        // false) — either way, deny and name the resource that drove it.
+    if (!result->active) {
+        // Orphaned: the linked scim_id's scim_resources row is gone
+        // (hard-DELETEd). Governance U1 fix — distinguish "genuinely
+        // deleted" from "DELETE'd then re-CREATE'd under a new scim_id"
+        // before denying, or a returning re-provisioned user is
+        // permanently locked out (the re-link that would repoint their
+        // stale (iss,sub) row runs AFTER this check, at
+        // link_oidc_login_to_scim). Deliberately NOT applied to the
+        // explicit-inactive branch below — see the .hpp doc comment for
+        // why only the orphaned case can have a reprovision sibling.
+        if (scim_store->find_unique_active_by_external_id(link_claim_value)) {
+            // An ACTIVE resource now exists for this externalId — the
+            // identity was re-provisioned under a new scim_id. Proceed;
+            // the imminent link_oidc_login_to_scim call repoints the
+            // stale link row to the new id, so the NEXT login resolves
+            // clean via the ordinary active-link path.
+            return {.denied = false, .scim_id = std::nullopt};
+        }
+        // No active resource for this externalId — genuinely deprovisioned
+        // (not re-provisioned). Deny and name the stale (now-gone) resource.
+        return {.denied = true, .scim_id = result->scim_id};
+    }
+
+    if (!*result->active) {
+        // Explicitly deactivated (active == false, resource still exists) —
+        // deny unconditionally. No reprovision check here: reactivation is
+        // active:true on the SAME scim_id (the very next read already
+        // resolves PROCEED), and the partial-unique index on
+        // scim_resources.external_id blocks a second active resource
+        // sharing this externalId while the inactive row still holds it.
         return {.denied = true, .scim_id = result->scim_id};
     }
 
