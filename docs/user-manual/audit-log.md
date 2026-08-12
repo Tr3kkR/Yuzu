@@ -617,7 +617,7 @@ fix --- not hand-deletion.
   the stated window (#2510).
 
 **Where the rule lives.** The decision rule is `classify()` in
-`server/core/src/audit_retention_rules.hpp` together with the fact construction in
+`common/include/yuzu/audit_retention_rules.hpp` together with the fact construction in
 `AuditStore::cleanup_once`, pinned by an exhaustive truth table in
 `tests/unit/server/test_audit_retention_rules.cpp` and store-level cases in
 `tests/unit/server/test_audit_store.cpp`. This page deliberately does not restate

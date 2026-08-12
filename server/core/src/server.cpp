@@ -21,7 +21,7 @@
 #include "store_errors.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
-#include "audit_retention_rules.hpp" // audit_retention::Anomaly — the rotation sweep's
+#include <yuzu/audit_retention_rules.hpp> // audit_retention::Anomaly — the rotation sweep's
                                      // SweepResult::decline_anomaly type (the human-readable
                                      // decline REASON only — the metric split below routes on
                                      // the raw SweepResult::no_anchor fact instead, #2964 round
