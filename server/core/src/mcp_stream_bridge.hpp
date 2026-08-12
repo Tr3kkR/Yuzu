@@ -914,6 +914,17 @@ private:
         /// evidence on the same record; the first to set this under mu owns the
         /// teardown, the loser skips (no double synthesis/audit).
         bool torn_down = false;
+        /// Set by teardown_claimed's Step 1, right after the publish switch, to
+        /// whichever is true first: `decision == kNone` (nothing was ever owed) or
+        /// the ladder was actually called (`rung != kNotAttempted` - published OR
+        /// poisoned). NOT set when the frame build itself failed, which is the one
+        /// state that leaves this record's terminal disposition genuinely
+        /// unresolved. Distinct from `terminal_projected` (settle bookkeeping, set
+        /// only by project_record) and `final_written` (POST-wire delivery) -
+        /// overloading either risks re-claim/projection interactions this flag is
+        /// deliberately narrow enough to avoid. shutdown()'s walk reads this to find
+        /// a claimed-but-terminal-unresolved record a raced sweep abandoned (#2517).
+        bool teardown_terminal_handled = false;
         std::uint64_t pinned_event_id = 0;
         std::uint64_t parked_seq = 0;      ///< assigned on entry to kRingOnly
         /// The live streamed-POST wake channel, bound while phase == kStreaming.

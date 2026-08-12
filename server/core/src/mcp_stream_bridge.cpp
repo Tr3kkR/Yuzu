@@ -172,14 +172,56 @@ void McpStreamBridge::shutdown() {
             records_.clear();
             streamed_unpinned_.clear();
         }
+        std::size_t poisoned_unresolved = 0;
         for (const auto& rec : reaped) {
+            bool should_poison = false;
             {
                 // Settle charge bookkeeping for consistency (the ledger map is
                 // already gone; the flag must not read as "held" to a late observer).
                 std::lock_guard<std::mutex> lk(rec->mu);
                 rec->streamed_charge_held = false;
+                // A pressure-visitor claim (torn_down set under Channel::mu) can be
+                // abandoned mid-teardown: teardown_claimed re-checks
+                // shutdown_started_ and returns before Step 1 ever runs, so this
+                // walk is the only reclaimer left. It still never PUBLISHES against
+                // a torn-down record - that would race a possibly-still-running
+                // teardown_claimed and break the exactly-once arbitration
+                // teardown_claimed's own comment describes - but it CAN poison one
+                // whose terminal was never resolved (teardown_terminal_handled
+                // false), so a client still connected learns its stream is gone
+                // instead of heart-beating past process exit (#2517). A concurrent
+                // sweep() mid-teardown_claimed (not joined here, only the projector
+                // is) can race this and cause a spurious poison of a record that
+                // actually published - harmless: poisoning is idempotent and the
+                // client's remediation is the same fetch-by-execution_id either way.
+                should_poison = rec->torn_down && !rec->teardown_terminal_handled &&
+                                !rec->terminal_projected.load(std::memory_order_acquire) &&
+                                !rec->final_written;
+            }
+            if (should_poison) {
+                rec->stream->poison_terminal();  // noexcept (#2531); idempotent
+                ++poisoned_unresolved;
             }
             flush_record_obs(*rec);
+        }
+        if (poisoned_unresolved > 0) {
+            // ONE aggregate row, not one per record: a closed campaign of shutdown
+            // reaps is not evidence-silent (#2489 comp-S1), but per-record teardown
+            // evidence is exactly what the abandoned records never got and cannot
+            // get now (publishing against them here would be the arbitration
+            // violation the poison-only design above avoids). No metric: the
+            // process is exiting and the series would never be scraped - this
+            // audit row is the durable evidence.
+            audit_contained("mcp.bridge.shutdown_reap", /*execution_id=*/"", /*stage=*/"",
+                            "poisoned " + std::to_string(poisoned_unresolved) +
+                                " claimed-but-unpublished record(s) at shutdown; every "
+                                "result remains fetchable by execution_id");
+            try {
+                spdlog::info("MCP bridge shutdown: poisoned {} claimed-but-unpublished "
+                            "record(s); every result remains fetchable by execution_id",
+                            poisoned_unresolved);
+            } catch (...) {  // NOLINT(bugprone-empty-catch) - nothing left we could safely do
+            }
         }
         flush_core_obs();
         publish_records_gauge(0);
@@ -2487,6 +2529,17 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         }
         case TeardownFinal::kNone:
             break;  // real final already pinned, or nothing to publish
+    }
+
+    // Record whether Step 1 resolved this record's terminal disposition, so
+    // shutdown()'s walk can tell "nothing was ever owed / the ladder ran" apart
+    // from "the frame build failed and nothing happened" - the latter is the one
+    // state shutdown must poison rather than silently abandon (#2517). Set here,
+    // under the record lock, regardless of what Steps 2-4 below do next.
+    {
+        std::lock_guard<std::mutex> rlk(rec->mu);
+        rec->teardown_terminal_handled =
+            decision == TeardownFinal::kNone || rung != TerminalRung::kNotAttempted;
     }
 
     // Derived ONCE and passed to every audit site below, bail or not. See

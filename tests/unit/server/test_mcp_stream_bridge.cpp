@@ -1475,7 +1475,115 @@ TEST_CASE("bridge pressure - a sweep claim racing shutdown reaps once, no double
     fx.bridge->shutdown();
     sweeper.get();
     CHECK(fx.bridge->record_count() == 0);
-    CHECK(fx.audit_count("mcp.bridge.forced_expire") <= 1);  // 0 (shutdown) or 1 (sweep), never 2
+    // Mutually exclusive per record: teardown_claimed either resolves the terminal
+    // itself (forced_expire, from the sweep completing Step 1) or never reaches Step 1
+    // at all (shutdown's walk finds teardown_terminal_handled still false and reaps
+    // it instead, #2517) - never both, regardless of which side of the race won.
+    const std::size_t forced = fx.audit_count("mcp.bridge.forced_expire");
+    const std::size_t reaped = fx.audit_count("mcp.bridge.shutdown_reap");
+    CHECK(forced + reaped <= 1);
+
+    auto attached = s.stream->attach_and_replay(0, nullptr, "alice");
+    if (reaped == 1) {
+        // shutdown's walk poisons an abandoned claim unconditionally (#2517).
+        CHECK(attached.status == mcp::McpStreamState::AttachStatus::kPoisoned);
+    } else if (forced == 0) {
+        // Neither reclaimer touched the record - it was never claimed, so it was
+        // never poisoned either.
+        CHECK(attached.status != mcp::McpStreamState::AttachStatus::kPoisoned);
+    }
+    // forced == 1 alone does not pin poisoned-vs-not: the sweep's own ladder may
+    // have settled on kPrimary/kFallback/kPoisoned - that's the existing coverage
+    // on publish_terminal_ladder, not this race.
+}
+
+TEST_CASE("bridge shutdown poisons a claimed-but-terminal-unresolved record and "
+          "evidences the reap (#2517, #2489 comp-S1)",
+          "[mcp][bridge][2f]") {
+    // Forces teardown_claimed PAST the claim but INTO a Step-1 build failure (so
+    // teardown_terminal_handled stays false) and then a Step-4 erase failure (so the
+    // record is retained in records_ rather than erased) - deterministically
+    // reproducing the shape a shutdown race against sweep() produces non-deterministically
+    // in the qa-B2 test above.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-reap-a"));
+    REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-reap-b"));
+    REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+    fx.bus.publish("exec-reap-b", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+    // "a" is now the pressure victim: terminal-less, decision kSynthesizeUnavailable.
+
+    fx.bridge->inject_terminal_build_fault_for_test(1);  // Step 1 build fails
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
+    REQUIRE_NOTHROW(fx.bridge->sweep());
+    // "b" is untouched (its final already pinned); "a" is claimed, torn_down, and
+    // retained (erase failed).
+    REQUIRE(fx.bridge->record_count() == 2);
+    // This is the mechanical-incomplete row from the erase failure itself - a
+    // DIFFERENT fact (a resource leaked) from what shutdown's reap will evidence
+    // (the terminal was never resolved). Both are correct and both fire.
+    CHECK(fx.audit_count("mcp.bridge.forced_expire") == 1);
+
+    fx.bridge->shutdown();
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 1);
+    {
+        std::lock_guard<std::mutex> lk(fx.audit_mu);
+        bool saw_reap = false;
+        for (const auto& row : fx.audits) {
+            if (row.action == "mcp.bridge.shutdown_reap") {
+                saw_reap = true;
+                CHECK(row.detail.find("1") != std::string::npos);
+                CHECK(row.detail.find("execution_id") != std::string::npos);
+                CHECK(row.result == "success");
+            }
+        }
+        CHECK(saw_reap);
+    }
+    CHECK(s.stream->attach_and_replay(0, nullptr, "alice").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+}
+
+TEST_CASE("bridge shutdown does NOT reap a record whose terminal Step 1 already "
+          "resolved, even if a later step failed (#2517)",
+          "[mcp][bridge][2f]") {
+    // The negative case the flag exists to get right: Step 1 PUBLISHES successfully
+    // (teardown_terminal_handled becomes true) and only Step 2 fails afterward. The
+    // record is retained (same as the positive test above), but its terminal is
+    // already resolved, so shutdown must leave it alone.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-noreap-a"));
+    REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-noreap-b"));
+    REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+    fx.bus.publish("exec-noreap-b", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe,
+                                                            1000));
+    REQUIRE_NOTHROW(fx.bridge->sweep());
+    // "b" is untouched; "a" is claimed, torn_down, and retained (unsubscribe failed).
+    REQUIRE(fx.bridge->record_count() == 2);
+    CHECK(fx.audit_count("mcp.bridge.forced_expire") == 1);  // Step 1 published fine
+
+    fx.bridge->shutdown();
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 0);
+    CHECK(s.stream->attach_and_replay(0, nullptr, "alice").status !=
+          mcp::McpStreamState::AttachStatus::kPoisoned);
 }
 
 TEST_CASE("bridge session-death sweep - non-touching exists, registry untouched",
