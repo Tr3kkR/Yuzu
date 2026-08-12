@@ -1,6 +1,6 @@
 #include "result_set_store.hpp"
 
-#include "audit_retention_rules.hpp"
+#include <yuzu/audit_retention_rules.hpp>
 
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"

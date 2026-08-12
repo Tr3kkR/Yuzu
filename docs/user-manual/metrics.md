@@ -126,9 +126,9 @@ and pre-seeded at boot, so `absent()` alerting stays meaningful.
 |---|---|---|
 | `yuzu_mcp_tool_args_invalid_total{tool}` | counter | Calls denied by the C8 pre-approval schema gate: arguments did not match the tool's served `inputSchema`, checked before an approval ticket is minted or consumed (#2405). `tool` is bounded to the approval-gated set. |
 | `yuzu_mcp_tool_args_too_large_total{tool,reason}` | counter | Calls denied by a handler-side input bound (#2437), on every tier including operator. `reason` is a closed set: `ident_len`, `scope_len`, `scope_type`, `scope_empty`, `param_count`, `param_key_len`, `param_value_len`, `agent_ids_count`, `agent_id_len`, `agent_id_type`, `agent_ids_type`, `agent_ids_empty`, `ident_empty`. The paired audit row is `mcp.<tool>|denied` with detail `input bound exceeded: <reason> correlation_id=<cid>`, carrying the same correlation id as the client's error envelope. |
-| `yuzu_mcp_approval_refused_total{tool}` | counter | MCP approval-ticket recalls refused at the **ticket-lookup** step (#2786) or the **consume** step (#2442) — a replay of a spent ticket, a ticket minted on a surface other than MCP, or an approval-store failure at either step. Pre-seeded for every approval-gated tool, so `absent()` stays meaningful. A store failure is already exposed to the caller through the A4 retry envelope (`-32603` vs `-32003`); what stays withheld is the split **within** a `-32003` consume denial — a cross-surface refusal is made indistinguishable from an ordinary replay so the recall cannot be used to probe which surface minted a ticket — so this counter deliberately carries **no `reason` label**, and `/metrics` is not a stronger reader than the caller — it is exempt for localhost and otherwise needs only a resolved session. Publishing the kind here would hand it back to the same principal. The kind is recorded server-side only, in the paired audit row `mcp.<tool>\|denied` with detail `approval_id=<id> refused: <precondition\|not_consumable\|store_error\|foreign_origin>` — a lookup-step store failure appends ` (lookup)`, and a consume-step failure at the #2442 origin check appends ` (origin unverified)`, to distinguish the site. A `kPrecondition` denial (#2443) additionally appends `: <specific fact> (ticket not consumed)` (e.g. `refused: precondition: rotation already confirmed; nothing to confirm (ticket not consumed)`) — the only kind that carries a specific reason in this string; the client-facing message stays generic (see `docs/mcp-server.md`). Alert on the rate; read the audit trail for the reason. |
-| `yuzu_mcp_approval_masked_denials_total{tool}` | counter | MCP approval-ticket recalls refused by a store fault at a point where the #2442 cross-surface origin check could not run — the lookup step, or the consume step's own origin-check read (#2786 arm 1). A foreign-origin ticket is exactly as likely to be behind one of these refusals as an innocent one while the fault holds, so this counter is the signal that the forgery-detection event was not simply lost. Pre-seeded for every approval-gated tool. No `reason` label, same anti-oracle posture as `yuzu_mcp_approval_refused_total` — what this counter withholds is already withheld there. |
-| `yuzu_mcp_approval_precondition_denied_total{tool}` | counter | MCP approval-ticket recalls refused specifically by a pre-consume precondition (#2443) — a subset of `yuzu_mcp_approval_refused_total`, broken out because a precondition denial is already distinguishable to the caller from the response body (unlike `not_consumable`/`foreign_origin`, which must stay mutually indistinguishable; `store_error` is already distinguishable by response code, `-32603` vs `-32003`). Pre-seeded only for tools that actually have a precondition wired — today just `confirm_engine_rotation` — not the full approval-gated set, since the label's reachable set is narrower than the two counters above. |
+| `yuzu_mcp_approval_refused_total{tool}` | counter | MCP approval-ticket recalls refused at the **ticket-lookup** step (#2786) or the **consume** step (#2442) — a replay of a spent ticket, a ticket minted on a surface other than MCP, a ticket recalled by a principal other than its submitter, or an approval-store failure at either step. Pre-seeded for every approval-gated tool, so `absent()` stays meaningful. A store failure is already exposed to the caller through the A4 retry envelope (`-32603` vs `-32003`); what stays withheld is the split **within** a `-32003` consume denial — a cross-surface or cross-submitter refusal is made indistinguishable from an ordinary replay so the recall cannot be used to probe which surface minted a ticket or who it belongs to — so this counter deliberately carries **no `reason` label**, and `/metrics` is not a stronger reader than the caller — it is exempt for localhost and otherwise needs only a resolved session. Publishing the kind here would hand it back to the same principal. The kind is recorded server-side only, in the paired audit row `mcp.<tool>\|denied` with detail `approval_id=<id> refused: <precondition\|not_consumable\|store_error\|foreign_origin\|foreign_submitter>` — a lookup-step store failure appends ` (lookup)`, and a consume-step failure at the #2442 origin+submitter binding check appends ` (origin/submitter unverified)`, to distinguish the site. A `kPrecondition` denial (#2443) additionally appends `: <specific fact> (ticket not consumed)` (e.g. `refused: precondition: rotation already confirmed; nothing to confirm (ticket not consumed)`) — the only kind that carries a specific reason in this string; the client-facing message stays generic (see `docs/mcp-server.md`). Alert on the rate; read the audit trail for the reason. |
+| `yuzu_mcp_approval_masked_denials_total{tool}` | counter | MCP approval-ticket recalls refused by a store fault at a point where the #2442 cross-surface/cross-submitter binding check could not run — the lookup step, or the consume step's own binding-check read (#2786 arm 1). A foreign-origin or foreign-submitter ticket is exactly as likely to be behind one of these refusals as an innocent one while the fault holds, so this counter is the signal that the forgery-detection event was not simply lost. Pre-seeded for every approval-gated tool. No `reason` label, same anti-oracle posture as `yuzu_mcp_approval_refused_total` — what this counter withholds is already withheld there. |
+| `yuzu_mcp_approval_precondition_denied_total{tool}` | counter | MCP approval-ticket recalls refused specifically by a pre-consume precondition (#2443) — a subset of `yuzu_mcp_approval_refused_total`, broken out because a precondition denial is already distinguishable to the caller from the response body (unlike `not_consumable`/`foreign_origin`/`foreign_submitter`, which must stay mutually indistinguishable; `store_error` is already distinguishable by response code, `-32603` vs `-32003`). Pre-seeded only for tools that actually have a precondition wired — today just `confirm_engine_rotation` — not the full approval-gated set, since the label's reachable set is narrower than the two counters above. |
 | `yuzu_server_dispatch_target_rejected_total{route,reason}` | counter | REST dispatch calls denied because a **supplied** targeting argument named nothing (#2500) — the twin of the targeting reasons above, deliberately a separate family so `yuzu_mcp_*` never counts a call that did not touch MCP. `route` is a closed set: `command` (`POST /api/command`), `instruction_execute` (`POST /api/instructions/{id}/execute`), `result_set_parent` (the `POST /api/v1/result-sets/from-*` producers, where `parent_id` is the targeting argument), `policy_remediate` (`POST /api/policies/{id}/remediate`, where an empty target means every non-compliant agent; it also refuses `scope` outright with `scope_unsupported`, since remediation selects targets by `agent_ids` only), and `dispatch_closure` (the shared dispatch closure's last-line-of-defence arm, reached only when a CALLER — route or background runner — names no target at all; a non-zero value there is a code defect, not a client one). `reason` is a closed set with two halves, both in `dispatch_target_shape.hpp`: `kTargetingShapeReasons` (`agent_ids_type`, `agent_ids_empty`, `agent_id_type`, `scope_type`, `scope_empty`, `target_conflict`) emitted by the shared shape check, and `kRouteRejectReasons` (`body_type`, `parent_id_type`, `parent_id_empty`, `closure_no_target`, `scope_unsupported`) emitted by the routes and the shared dispatch closure. Seeding is **per route, not the cross-product** — the dispatch routes can emit the five targeting reasons plus `body_type`; `result_set_parent` can emit only the two `parent_id_*` ones. Seeding the full product would publish series no code path can reach, which reads on a dashboard as "never happened" when the truth is "cannot happen". The paired audit row is `command.dispatch\|denied` (detail `reason=<reason> <plugin>:<action>`, both caller-supplied fields sanitised and capped at 128 bytes), `instruction.execute\|denied` (detail `reason=<reason>`) or `result_set.create\|denied` (detail `reason=<reason> source_kind=<kind>`). `dispatch_closure` is **counter-only** — that arm lives inside a closure with no request context and is reached by background runners as well as routes, so there is deliberately no audit row to correlate. Alert: `YuzuDispatchTargetRejected` fires when the 15-minute increase exceeds 3 (`>3/15m`) — deliberately NOT `>0`, because a single malformed request would page and the rule would be silenced within a week, taking the genuine near-miss with it. The per-event evidence is the audit row, not the alert. A non-zero rate here means a client believes it is targeting specific devices and is not — before this counter existed those calls dispatched to the whole fleet and reported success. |
 
 ## Audit-store metrics
@@ -1159,6 +1159,78 @@ sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
 # One-time confinement backfill failed → server refused to boot (ADR-0042).
 sum(rate(yuzu_server_mgmt_group_backfill_total{result="failed"}[15m])) > 0
 ```
+
+## RBAC store metrics (authorization substrate, ADR-0041)
+
+The `RbacStore` — the PostgreSQL authorization substrate (schema `rbac_store`)
+that backs `require_permission` / `require_scoped_permission` /
+`authorize_list_read` — exports two counters, a histogram, and a gauge.
+Authorization reads **fail closed (deny-on-degrade)**: when the store cannot
+answer, it **denies** rather than allowing, so a degrade is a **fleet-wide
+authorization-availability event**, not a silent partial outage.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `yuzu_server_rbac_read_degrade_total` | counter | `reason` | An authorization-cache read against `rbac_store` was affected by a degrade. **Three reasons DENY**: `pool_acquire_timeout` (no PG connection available in time — also recorded here when the fail-fast circuit breaker denies without touching the pool, since a breaker-open denial is one of this reason's two contributing failure modes, not a distinct reason), `query_error` (the authz query failed), `generation_refresh_failed` (the durable cross-replica cache-coherence token could not be re-read PAST the bounded ~5s stale-serve window — treated as "assume changed", cache cleared) — a non-zero rate on these means callers are being denied because the substrate is unhealthy. **Three reasons are OBSERVE-ONLY and deny nothing** (fjarvis #2703 F2/F3 + the 2026-08-11 bounded-stale-serve split): `rbac_enabled_non_canonical` (a periodic refresh read a durable `rbac_enabled` value that wasn't exactly `"true"`/`"false"`; the cached enabled-state is left unchanged rather than coerced), `stale_beyond_accepted_bound` (a reader landed inside an in-flight generation refresh that was already past the accepted ~1s staleness bound; the read still proceeds from the pre-refresh cache), and `generation_refresh_failed_within_bound` (a generation refresh failed but the store is still inside the bounded ~5s stale-serve window from ADR-0041's "Update" — the existing cache keeps answering unchanged; early warning only, nobody is denied). The `YuzuRbacReadDegraded` alert is scoped to the three denying reasons only. |
+| `yuzu_server_rbac_backfill_total` | counter | `result` | Outcome of the one-time legacy-`rbac.db` → PostgreSQL backfill at boot. `result` ∈ `fresh` (empty legacy store — nothing to migrate), `completed` (backfill reconciled and committed), `failed` (backfill could not complete — the server **fails the boot closed** and retries on the next start). |
+| `yuzu_server_rbac_authz_check_seconds` | histogram | none | End-to-end latency of `check_permission` — acquire + query + cache lookup, every outcome including cache hits and breaker-denied fast paths. Extended buckets out to 60s (not the default 10s ceiling), because the measured lock-contention tail on this path runs to ~18.5s and, per the dark-network analysis in the SOC2 doc's availability-posture note, as far as ~40s. Distinct from `yuzu_pg_acquire_wait_seconds`, which reads fast even when the acquire itself succeeds but the query afterward blocks on `PgPool`'s injected `lock_timeout` — this histogram is the only place that scenario's true end-to-end cost is visible. |
+| `yuzu_server_rbac_breaker_open` | gauge | none | `1` when the authz-hot-path fail-fast circuit breaker is open (2 consecutive `pool_acquire_timeout`/`query_error` failures), `0` when closed. Per-process/per-replica, not fleet-wide — a fleet-wide view needs `count(yuzu_server_rbac_breaker_open == 1)` across replicas. |
+
+**Example output:**
+
+```
+# HELP yuzu_server_rbac_read_degrade_total RBAC authorization-cache reads affected by a degrade (see label docs — not all reasons deny)
+# TYPE yuzu_server_rbac_read_degrade_total counter
+yuzu_server_rbac_read_degrade_total{reason="pool_acquire_timeout"} 0
+yuzu_server_rbac_read_degrade_total{reason="query_error"} 0
+yuzu_server_rbac_read_degrade_total{reason="generation_refresh_failed"} 0
+yuzu_server_rbac_read_degrade_total{reason="generation_refresh_failed_within_bound"} 0
+yuzu_server_rbac_read_degrade_total{reason="rbac_enabled_non_canonical"} 0
+yuzu_server_rbac_read_degrade_total{reason="stale_beyond_accepted_bound"} 0
+
+# HELP yuzu_server_rbac_backfill_total Outcome of the RbacStore Postgres backfill at boot
+# TYPE yuzu_server_rbac_backfill_total counter
+yuzu_server_rbac_backfill_total{result="completed"} 1
+
+# HELP yuzu_server_rbac_authz_check_seconds End-to-end latency of RbacStore::check_permission
+# TYPE yuzu_server_rbac_authz_check_seconds histogram
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.005"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.01"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.025"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.05"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.1"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.25"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="0.5"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="1"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="2.5"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="5"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="10"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="15"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="20"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="30"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="45"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="60"} 0
+yuzu_server_rbac_authz_check_seconds_bucket{le="+Inf"} 0
+yuzu_server_rbac_authz_check_seconds_sum 0
+yuzu_server_rbac_authz_check_seconds_count 0
+
+# HELP yuzu_server_rbac_breaker_open 1 when the authz fail-fast breaker is open, 0 when closed
+# TYPE yuzu_server_rbac_breaker_open gauge
+yuzu_server_rbac_breaker_open 0
+```
+
+**Suggested alert (a degrade on one of the three denying reasons denies authz fleet-wide):**
+
+```promql
+# Scoped to the three DENYING reasons only — rbac_enabled_non_canonical,
+# stale_beyond_accepted_bound, and generation_refresh_failed_within_bound
+# share this metric but deny nothing, so folding them into this expression
+# would page a false "callers denied fleet-wide".
+sum(rate(yuzu_server_rbac_read_degrade_total{reason=~"pool_acquire_timeout|query_error|generation_refresh_failed"}[5m])) by (reason) > 0
+```
+
+The shipped rule is `YuzuRbacReadDegraded` (plus the optional
+`YuzuRbacBackfillFailing`) in `docs/prometheus/yuzu-alerts.yml`.
 
 ## Useful PromQL queries
 

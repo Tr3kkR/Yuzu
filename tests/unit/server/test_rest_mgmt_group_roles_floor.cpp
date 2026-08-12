@@ -29,6 +29,7 @@
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
 #include "test_mgmt_group_pg_helper.hpp"
+#include "test_rbac_store_pg_helper.hpp" // PG-backed RbacStore (ADR-0041)
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
@@ -49,8 +50,8 @@ namespace {
 
 struct GroupRolesHarness {
     yuzu::test::ManagementGroupStorePg mgmt_bundle; // SKIPs without a PG DSN
-    yuzu::test::TempDbFile rbac_db_file{"yuzu_test_mgmt_roles_floor_rbac_"};
-    RbacStore rbac{rbac_db_file.path};
+    yuzu::test::RbacStorePg rbac_bundle;             // SKIPs without a PG DSN
+    RbacStore& rbac = *rbac_bundle;
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
     yuzu::server::test::TestRouteSink sink;
