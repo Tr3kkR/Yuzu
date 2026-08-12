@@ -1622,17 +1622,28 @@ audit row can itself carry a severity level — filter on `action=
 notion of a "critical audit."
 
 **D2 — the fail-loud detector for a mismatched/misconfigured link claim.**
-When a deprovision resolves a principal set of size 1 (slug only — no
-linked identity) but a recorded login observation shows the slug's
-`externalId` was presented as a claim value at some prior OIDC login, that
-is a real signal: the user **did** authenticate via OIDC, but the link
-never formed — almost always a misconfigured `--oidc-scim-link-claim` (or,
-per the worked-examples table above, an IdP whose `externalId` has no
-matching OIDC claim at all). This bumps `yuzu_scim_deprovision_unlinked_total`
+Every OIDC login records **both** the `sub` and `oid` candidate claim
+values it observed, not only the value of the claim `--oidc-scim-link-claim`
+is currently configured to use. When a deprovision resolves a principal set
+of size 1 (slug only — no linked identity) but a recorded login observation
+shows the slug's `externalId` matches **either** candidate value at some
+prior OIDC login, that is a real signal: the user **did** authenticate via
+OIDC, but the link never formed — almost always a misconfigured
+`--oidc-scim-link-claim` (or, per the worked-examples table above, an IdP
+whose `externalId` has no matching OIDC claim at all). Recording both
+candidates (rather than only the configured one) is what makes D2 able to
+catch the specific, common failure mode where the *wrong* claim is
+configured — e.g. an Entra deployment left on the default `sub` whose
+`externalId` actually matches `oid` — instead of a case where the
+configured-but-wrong claim's value happens never to have been observed at
+all. This bumps `yuzu_scim_deprovision_unlinked_total`
 (`ScimRoutes::maybe_flag_d2_unlinked`). **A non-zero rate here means some
 federated population's tokens are NOT being revoked by SCIM deprovision
 today** — investigate the flag value before trusting the CC6.8 claim for
-that population.
+that population. D2 is a detection signal conditioned on a login-then-
+deprovision pair actually occurring in the observed window, not a
+standing guarantee — a zero rate means "nothing detected yet," not
+"every federated user is provably linked."
 
 ### New audit actions (ADR-2001)
 
@@ -1687,14 +1698,25 @@ revoke — see "Deprovision-time revoke" above), in addition to the existing
   `mfa_totp_secret` envelope-encryption (shipped, see MFA/TOTP above) is a
   genuinely different case because TOTP verification needs the *plaintext*
   secret back, not just a compare.
-- **ADR-2001 deny-at-login backstop (§4/PR3) has NOT shipped.** A federated
-  identity whose linked SCIM slug is already deprovisioned is not yet
-  refused at OIDC login — its tokens are correctly revoked by every
-  deprovision pass (see the linkage subsection above), but re-authenticating
-  would mint a fresh session until this lands, so the deprovision + re-login
-  window is not yet closed the way the ADR's full design closes it. **ADR-2001
-  is also fundamentally unable to revoke a federated population whose IdP
-  SCIM `externalId` shares no value with any OIDC claim Yuzu validates** — no
+- **ADR-2001 deny-at-login backstop (§4/PR3) has NOT shipped — including a
+  genuine login-vs-deprovision TOCTOU, not only the simpler "re-login after
+  deprovision" case.** Two related but distinct gaps stay open until PR3
+  lands: (1) a federated identity whose linked SCIM slug is **already**
+  deprovisioned is not yet refused at OIDC login — re-authenticating mints a
+  fresh session/tokens (correctly revoked again by the *next* deprovision
+  pass, since the link persists, but live in the meantime); (2) a login that
+  races an **in-flight** deprovision of the same slug — authenticating and
+  forming/refreshing the identity link between that deprovision's principal-
+  set resolution and its account-deactivation write — can walk away with a
+  fresh session/tokens the in-flight pass never saw and therefore never
+  revoked at all, not merely "revoked on the next pass." Both close together
+  once login is refused for a deprovisioned linked slug, because a refused
+  login can never mint a credential for either race to win. Until then, do
+  not describe CC6.8 as fully closed for the federated population without
+  naming this window — see "Known residuals" in
+  `docs/adr/2001-scim-oidc-identity-linkage.md`. **ADR-2001 is also
+  fundamentally unable to revoke a federated population whose IdP SCIM
+  `externalId` shares no value with any OIDC claim Yuzu validates** — no
   `--oidc-scim-link-claim` setting helps in that case; see the "SCIM ↔ OIDC
   identity linkage" subsection above for the D2 metric that surfaces this.
 

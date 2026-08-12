@@ -2624,26 +2624,31 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         // ADR-2001 §2/D2 — form a durable SCIM identity link (if the
         // configured link-claim value matches EXACTLY ONE active SCIM
-        // resource) and ALWAYS record the login observation, regardless of
-        // whether a link formed. Goes through ScimStore's own leased
-        // accessors — no AuthManager::mu_ is held here (both
-        // create_oidc_session above and provision_sso_identity have already
-        // returned, releasing their own internal locks). `link_oidc_login_to_scim`
-        // is fail-OPEN by construction (never throws, never returns an
-        // error to check) — it must never fail this login, which has
-        // already succeeded above. A missing link is instead caught later
-        // by the D2 detector (`observation_matches`) against the
-        // observation written here.
+        // resource) and ALWAYS record a login observation for EACH
+        // candidate claim (sub AND oid — governance Gate 7 BLOCKING fix, the
+        // D2 tripwire), regardless of whether a link formed. Goes through
+        // ScimStore's own leased accessors — no AuthManager::mu_ is held
+        // here (both create_oidc_session above and provision_sso_identity
+        // have already returned, releasing their own internal locks).
+        // `link_oidc_login_to_scim` is fail-OPEN by construction (never
+        // throws, never returns an error to check) — it must never fail
+        // this login, which has already succeeded above. A missing link is
+        // instead caught later by the D2 detector (`observation_matches`)
+        // against the observations written here.
         //
         // `--oidc-scim-link-claim` (default "sub"; allow-list {sub, oid}
         // enforced fail-closed at boot, main.cpp) selects which validated
-        // claim value is the SCIM externalId join key. `oid` is validated
-        // sub-equivalently by OidcProvider::validate_claims ONLY when it is
-        // the configured link claim, so it is safe to read unconditionally
-        // here.
+        // claim value is the SCIM externalId join key for LINK FORMATION
+        // only. `claims.oid` is parsed unconditionally by
+        // OidcProvider::parse_id_token but validated sub-equivalently by
+        // validate_claims ONLY when it is the configured link claim — safe
+        // to pass through unconditionally here because
+        // `link_oidc_login_to_scim` re-sanitizes every candidate claim
+        // before trusting it into a durable observation row.
         oidc::link_oidc_login_to_scim(
-            scim_store_, claims.iss, claims.sub, cfg_.oidc_scim_link_claim,
-            cfg_.oidc_scim_link_claim == "oid" ? claims.oid : claims.sub);
+            scim_store_, claims.iss, claims.sub, claims.oid, cfg_.oidc_scim_link_claim,
+            cfg_.oidc_scim_link_claim == "oid" ? claims.oid : claims.sub,
+            auth_mgr_.metrics_registry());
 
         res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
 

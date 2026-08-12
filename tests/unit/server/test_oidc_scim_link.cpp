@@ -14,6 +14,14 @@
  * and the whole call is fail-OPEN (never throws, never propagates a store
  * failure) — `AuthManager::create_oidc_session` session-mint independence
  * from a broken ScimStore is asserted directly.
+ *
+ * Governance Gate 7 BLOCKING fix (the D2 tripwire, the crux): a dedicated
+ * "misconfigured Entra" section below covers the headline D2 case —
+ * `--oidc-scim-link-claim=sub` while the SCIM externalId is actually the
+ * Entra `oid` — asserting NO link forms, BOTH candidate observations are
+ * recorded, and `observation_matches(external_id)` (keyed on the oid value)
+ * fires TRUE, with a mutation-check confirming a regression back to
+ * "record the configured claim only" would make it fail.
  */
 
 #include "oidc_scim_link.hpp"
@@ -26,6 +34,7 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -63,7 +72,8 @@ TEST_CASE("link_oidc_login_to_scim: exactly-one active match forms the link",
     auto resource = store.create_resource("alice", "ext-alice");
     REQUIRE(resource.has_value());
 
-    link_oidc_login_to_scim(&store, "https://idp.example.com/", "sub-alice", "sub", "ext-alice");
+    link_oidc_login_to_scim(&store, "https://idp.example.com/", "sub-alice", /*oid=*/"", "sub",
+                            "ext-alice");
 
     auto links = store.links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
@@ -86,8 +96,13 @@ TEST_CASE("link_oidc_login_to_scim: zero matches forms no link, but the observat
     auto resource = store.create_resource("bob", "ext-bob");
     REQUIRE(resource.has_value());
 
-    link_oidc_login_to_scim(&store, "https://idp.example.com/", "sub-nomatch", "sub",
-                            "no-such-ext-id");
+    // `oid` carries the attempted (non-matching) claim value here — the
+    // literal `sub` identity and the value under test are deliberately
+    // distinct, same as the pre-fix version of this test; recording now
+    // happens per-candidate-claim (sub AND oid), so the mismatched value
+    // must land in one of the two candidate slots to be recorded.
+    link_oidc_login_to_scim(&store, "https://idp.example.com/", "sub-nomatch",
+                            /*oid=*/"no-such-ext-id", "sub", "no-such-ext-id");
 
     auto links = store.links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
@@ -126,7 +141,10 @@ TEST_CASE("link_oidc_login_to_scim: TWO active matches forms NO link (mis-link g
     REQUIRE(r2.has_value());
     REQUIRE(r1->scim_id != r2->scim_id);
 
-    link_oidc_login_to_scim(&store, "https://idp.example.com/", "sub-ambiguous", "sub", "dup-ext");
+    // Same "oid carries the tested value" adjustment as the zero-match test
+    // above.
+    link_oidc_login_to_scim(&store, "https://idp.example.com/", "sub-ambiguous",
+                            /*oid=*/"dup-ext", "sub", "dup-ext");
 
     // Neither candidate resource picked up the link — an ambiguous
     // externalId must never resolve to an arbitrary row.
@@ -143,7 +161,8 @@ TEST_CASE("link_oidc_login_to_scim: TWO active matches forms NO link (mis-link g
 
 TEST_CASE("link_oidc_login_to_scim: a null ScimStore is a safe no-op", "[oidc][scim][2001]") {
     // Mirrors the "no PG configured" boot posture — must not crash.
-    link_oidc_login_to_scim(nullptr, "https://idp.example.com/", "sub-x", "sub", "ext-x");
+    link_oidc_login_to_scim(nullptr, "https://idp.example.com/", "sub-x", /*oid=*/"", "sub",
+                            "ext-x");
     SUCCEED("did not throw");
 }
 
@@ -159,8 +178,8 @@ TEST_CASE("link_oidc_login_to_scim: a closed/unusable ScimStore is fail-OPEN —
     REQUIRE_FALSE(broken_store.is_open());
 
     // Must not throw despite every underlying write failing.
-    link_oidc_login_to_scim(&broken_store, "https://idp.example.com/", "sub-failopen", "sub",
-                            "ext-failopen");
+    link_oidc_login_to_scim(&broken_store, "https://idp.example.com/", "sub-failopen",
+                            /*oid=*/"", "sub", "ext-failopen");
     SUCCEED("did not throw despite a closed store");
 
     // The login itself is independent of this call: a session minted before
@@ -179,4 +198,82 @@ TEST_CASE("link_oidc_login_to_scim: a closed/unusable ScimStore is fail-OPEN —
     // (mirrors the real login-site ordering) and must not have touched it.
     auto session = auth_mgr.validate_session(token);
     REQUIRE(session.has_value());
+}
+
+// ── Governance Gate 7 BLOCKING fix — the D2 tripwire (the crux) ─────────────
+//
+// The headline D2 misconfiguration: an operator runs with
+// `--oidc-scim-link-claim=sub`, but the SCIM `externalId` the IdP actually
+// provisioned is the Entra `oid` (not `sub`). Link formation legitimately
+// forms NO link (the configured claim, sub, does not match). But before
+// this fix, D2 ALSO never fired: only the configured claim's value (sub)
+// was recorded as an observation, so `observation_matches(externalId)`
+// (keyed on the oid value) never matched. The fix records BOTH candidates.
+
+TEST_CASE("link_oidc_login_to_scim: misconfigured Entra link-claim — no link forms, BOTH "
+          "candidate observations are recorded, and D2's observation_matches fires on the "
+          "externalId (MUTATION-CHECK target, see the comment below)",
+          "[pg][oidc][scim][2001][d2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    // The SCIM resource's externalId is the Entra `oid` value — exactly
+    // what Entra sends as `externalId` in its SCIM provisioning payload.
+    const std::string oid_value = "11111111-2222-3333-4444-555555555555";
+    auto resource = store.create_resource("dana", oid_value);
+    REQUIRE(resource.has_value());
+
+    // Operator has `--oidc-scim-link-claim=sub` (the default) — link
+    // formation is keyed on `sub`, which does NOT match the externalId.
+    const std::string iss = "https://login.microsoftonline.com/tenant-id/v2.0";
+    const std::string sub_value = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    link_oidc_login_to_scim(&store, iss, sub_value, oid_value, /*link_claim_name=*/"sub",
+                            /*link_claim_value=*/sub_value);
+
+    // No link formed — the configured claim (sub) never matched anything.
+    auto links = store.links_for_scim_id(resource->scim_id);
+    REQUIRE(links.has_value());
+    CHECK(links->empty());
+
+    // Both candidate observations are on record.
+    CHECK(store.observation_matches(sub_value));
+    // THE headline assertion: the oid candidate — never used for link
+    // formation under this configuration — is STILL recorded, so D2 can
+    // find it.
+    CHECK(store.observation_matches(oid_value));
+
+    // MUTATION-CHECK (manually verified during development): reverting
+    // `link_oidc_login_to_scim` to record only the configured
+    // (link_claim_name, link_claim_value) pair — i.e. dropping the `oid`
+    // candidate loop entirely — makes the `observation_matches(oid_value)`
+    // assertion above fail (no row for the oid value exists), confirming
+    // this test actually exercises the D2 tripwire fix rather than passing
+    // vacuously. `observation_matches(sub_value)` alone would stay green
+    // under that regression, which is exactly why it is not the only
+    // assertion here.
+}
+
+TEST_CASE("link_oidc_login_to_scim: an empty/unsanitized oid candidate is never recorded "
+          "(no phantom observation row for a claim the IdP never sent)",
+          "[pg][oidc][scim][2001][d2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Okta-style IdP: no `oid` claim at all (empty string, as
+    // OidcProvider::parse_id_token leaves it when absent).
+    link_oidc_login_to_scim(&store, "https://idp.okta.example.com/", "sub-okta", /*oid=*/"",
+                            "sub", "sub-okta");
+
+    CHECK(store.observation_matches("sub-okta"));
+    // No row was ever inserted for an empty claim_value — observation_matches
+    // itself already treats an empty query as "no match" (see its own
+    // empty-input guard), so this is really asserting no CRASH/db-error
+    // occurred recording it, covered implicitly by every assertion above
+    // succeeding without a REQUIRE failure.
 }

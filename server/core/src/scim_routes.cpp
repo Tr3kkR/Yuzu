@@ -791,7 +791,11 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
     auto revoke_result = revoke_deprovision_credentials(*token_store, *auth_mgr, *principals);
     detail_out = "api_tokens_revoked=" + std::to_string(revoke_result.api_tokens_revoked) +
                 " sessions_revoked=" + std::to_string(revoke_result.sessions_revoked) +
-                " principals=" + std::to_string(principals->size());
+                " principals=" + std::to_string(principals->size()) +
+                // Governance Gate 7 SHOULD fix (UP-5): enumerate the actual
+                // principal strings, not just the count, so the audit row is
+                // self-contained CC6.8 evidence.
+                enumerate_principals_for_audit(*principals);
     if (!revoke_result.api_tokens_persisted) {
         detail_out += " api_tokens_db_error=true";
         spdlog::error("ScimRoutes: revoke_for_principal did not persist for one or more "
@@ -1272,6 +1276,30 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                      input.user_name, "userName already exists (concurrent revive/create)");
                 record_request(auth_mgr, "create", 409);
                 return;
+            }
+            // Governance Gate 7 SHOULD fix (UP-1): a NEW userName carrying an
+            // externalId already held by a DIFFERENT (typically inactive)
+            // row hits `scim_resources_external_id_uniq` the same way the
+            // concurrent-revive race above does, but for a distinct reason —
+            // distinguish it with its own 409 rather than falling through to
+            // the opaque 500 below. `find_by_external_id` is the plain
+            // (not-active-filtered) lookup: an inactive row still legitimately
+            // holds the externalId. Same M-ORPHAN rollback rule as the 500
+            // branch just below applies here too — this IS a genuine create
+            // failure, just a distinguishable one.
+            if (!input.external_id.empty()) {
+                if (auto colliding = scim_store->find_by_external_id(input.external_id);
+                    colliding.has_value() && colliding->username != input.user_name) {
+                    if (created_auth_row_this_call)
+                        auth_mgr->remove_user(input.user_name);
+                    send_scim_error(res, 409, "externalId already mapped to another resource",
+                                    "uniqueness");
+                    audit(auth_mgr, audit_store, req, "scim.user.provisioned", "denied",
+                         input.user_name,
+                         "externalId already mapped to scim_id=" + colliding->scim_id);
+                    record_request(auth_mgr, "create", 409);
+                    return;
+                }
             }
             // No mapping — a genuine create failure. Roll back to a
             // deactivated tombstone ONLY if THIS call created the auth row

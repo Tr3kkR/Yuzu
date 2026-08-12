@@ -4450,7 +4450,11 @@ void SettingsRoutes::register_routes(
             revoke_detail =
                 "api_tokens_revoked=" + std::to_string(revoke_result.api_tokens_revoked) +
                 " sessions_revoked=" + std::to_string(revoke_result.sessions_revoked) +
-                " principals=" + std::to_string(principals->size());
+                " principals=" + std::to_string(principals->size()) +
+                // Governance Gate 7 SHOULD fix (UP-5): enumerate the actual
+                // principal strings, not just the count — mirrors the SCIM
+                // seam's `revoke_linked_credentials_or_fail`.
+                enumerate_principals_for_audit(*principals);
             if (!revoke_result.api_tokens_persisted) {
                 revoke_detail += " api_tokens_db_error=true";
                 spdlog::error("DELETE /api/settings/users: revoke_for_principal did not "
@@ -4468,20 +4472,33 @@ void SettingsRoutes::register_routes(
                 return;
             }
         } else {
-            // Nullable — same deferred-wiring posture as engine_principal_
-            // store_ above (see its doc comment just above this guard):
-            // server.cpp constructs ApiTokenStore unconditionally whenever
-            // pg_pool_ is set and fails the whole boot otherwise, so a live
-            // server NEVER reaches this handler with a null store. The
-            // null path exists solely so this file's pre-existing
-            // SettingsRoutesHarness (which predates ADR-2001 and does not
-            // wire ApiTokenStore) keeps passing. If a future change ever
-            // makes ApiTokenStore constructible without a hard-fail boot
-            // path, this skip becomes a real fail-open and MUST be
-            // revisited — do not carry this comment forward unexamined.
-            spdlog::warn("DELETE /api/settings/users: no ApiTokenStore wired — skipping the "
-                        "credentials-first revoke for '{}' (ADR-2001)",
-                        username);
+            // Governance Gate 7 BLOCKING fix (UP-7): FAIL CLOSED here —
+            // mirror the SCIM seam's `revoke_linked_credentials_or_fail`
+            // (scim_routes.cpp), which 503s + audits
+            // "api_token_store_unavailable" rather than skip-and-proceed
+            // when its token_store is null/not open. A null ApiTokenStore
+            // means credentials CANNOT be revoked, and proceeding to
+            // `remove_user` below anyway would silently leave every linked
+            // principal's API tokens live — exactly the CC6.8 gap ADR-2001
+            // exists to close. server.cpp constructs ApiTokenStore
+            // unconditionally whenever pg_pool_ is set and fails the whole
+            // boot otherwise, so a live server NEVER reaches this handler
+            // with a null store — this branch is test-harness-only
+            // (SettingsRoutesHarness/SettingsOwnerDeleteHarness, which
+            // predate ADR-2001) and every wired-store outcome is covered by
+            // SettingsAdr2001Harness's PG-backed tests.
+            spdlog::error("DELETE /api/settings/users: no ApiTokenStore wired — refusing to "
+                         "delete '{}' without being able to revoke its credentials (ADR-2001)",
+                         username);
+            audit_fn_(req, "user.delete", "failure", "User", username,
+                     "api_token_store_unavailable");
+            res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Credential store unavailable — try )"
+                R"(again","level":"error"}})");
+            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            return;
         }
 
         if (auth_mgr_->remove_user(username)) {

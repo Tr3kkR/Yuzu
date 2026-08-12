@@ -150,6 +150,21 @@ public:
     std::optional<bool> resource_exists(const std::string& scim_id) const;
     std::optional<ScimResource> get_by_username(const std::string& username) const;
 
+    /// Tri-state variant of `get_by_username` distinguishing "the store
+    /// could not answer" from "genuinely no such resource" (governance
+    /// Gate 7 BLOCKING fix, UP-7): the OUTER `nullopt` means a store error
+    /// (closed store, lease timeout, or a failed statement) — the caller
+    /// MUST treat this as "unknown", never as "not found", exactly the
+    /// `resource_exists`/`list_group_member_user_scim_ids` tri-state
+    /// pattern above. The INNER `nullopt` (i.e. an engaged
+    /// `std::optional<ScimResource>` holding no value) means the store
+    /// answered and genuinely has no row for `username`. Use this (not
+    /// `get_by_username`) anywhere a negative answer feeds a fail-
+    /// open/fail-closed branch — `get_by_username`'s many plain read-only
+    /// call sites keep their existing collapsed contract.
+    std::optional<std::optional<ScimResource>>
+    get_by_username_checked(const std::string& username) const;
+
     /// Empty `external_id` always returns `nullopt` (an empty externalId is
     /// not a meaningful lookup key).
     std::optional<ScimResource> find_by_external_id(const std::string& external_id) const;
@@ -323,15 +338,22 @@ public:
 
     // ── OIDC login observations (ADR-2001 D2 detector) ───────────────────
     //
-    // Records every OIDC login's attempted link-claim value — regardless of
-    // whether it matched a SCIM resource — so a later deprovision can
-    // surface a should-have-matched candidate under a misconfigured
-    // `--oidc-scim-link-claim` (a real, actionable "your link claim is
-    // wrong for this IdP" signal instead of a silent gap).
+    // Records every OIDC login's attempted CANDIDATE claim value(s) —
+    // regardless of whether any of them matched a SCIM resource — so a
+    // later deprovision can surface a should-have-matched candidate under a
+    // misconfigured `--oidc-scim-link-claim` (a real, actionable "your link
+    // claim is wrong for this IdP" signal instead of a silent gap). Callers
+    // record one row PER CANDIDATE claim (`sub` and, when present, `oid`),
+    // not just the configured link claim — governance Gate 7 BLOCKING fix:
+    // under the prior (iss, sub)-only key, only the configured claim's
+    // value survived the upsert, so a login presenting the OTHER candidate
+    // (the exact "operator configured the wrong claim" case) left nothing
+    // for `observation_matches` to find.
 
-    /// Idempotent upsert keyed `(iss, sub)` (one observation per identity,
-    /// refreshed on every login). Returns false on db failure or an empty
-    /// `iss`/`sub`/`claim_name`.
+    /// Idempotent upsert keyed `(iss, sub, claim_name)` — one observation
+    /// PER CANDIDATE CLAIM per identity, refreshed on every login (a login
+    /// that presents both `sub` and `oid` upserts two rows). Returns false
+    /// on db failure or an empty `iss`/`sub`/`claim_name`.
     bool record_login_observation(const std::string& iss, const std::string& sub,
                                   const std::string& claim_name, const std::string& claim_value);
 

@@ -341,6 +341,15 @@ has the same effect:
 > validates — there is no join key to link on, so nothing federated can be
 > revoked by SCIM for that population (see D2 below).
 
+Deprovision is **credentials-first**: tokens and sessions are revoked for
+the slug and every linked identity *before* the account is marked inactive
+or deleted, and if any token revoke does not durably persist, the whole
+deprovision call fails with a **`500`** rather than reporting success — this
+is new behavior your IdP connector's retry/alerting should account for: a
+`500` on a deactivate/delete call means the underlying store had a transient
+problem persisting the revoke, and the IdP should retry the call rather
+than treat it as a permanent rejection.
+
 **SCIM will not deactivate an account that is currently `role=admin`,**
 whether that admin role came from a dashboard promotion or from
 [Groups → role mapping](#groups--role-mapping) — that account drops out of
@@ -443,18 +452,32 @@ close it out by hand.
 ### D2 — a federated user logged in but their tokens weren't revoked
 
 `yuzu_scim_deprovision_unlinked_total` fires when a deprovision finds
-evidence that the user actually authenticated via OIDC (a recorded login
-observation matching their `externalId`), but no link had formed to catch
-their tokens in the revoke. **This is the tripwire for "my CC6.8 coverage
-for federated users is a false green."** A non-zero rate means:
+evidence that the user actually authenticated via OIDC, but no link had
+formed to catch their tokens in the revoke. Every OIDC login records
+**both** the `sub` and `oid` claim values it observed (not only the one
+`--oidc-scim-link-claim` is currently configured to use), so this detector
+also catches the specific, common misconfiguration where the *wrong* claim
+is set — e.g. an Entra deployment left on the default `sub`, whose
+`externalId` actually matches the login's `oid` value: the login observation
+for `oid` still matches the slug's `externalId` at deprovision time even
+though the link itself never formed on the `sub`-configured comparison.
+**This is the tripwire for "my CC6.8 coverage for federated users is a
+false green."** A non-zero rate means:
 
 - Re-check `--oidc-scim-link-claim` against the [worked examples
   table](#choosing-the-link-claim-for-your-idp) above — the most common
   cause is Entra deployments left on the default `sub` instead of `oid`.
 - If the claim is already correct for your IdP, your IdP's `externalId`
-  simply doesn't correspond to any claim Yuzu trusts for this join (see
-  above) — SCIM cannot revoke this population's federated tokens, treat
-  manual revocation as a required offboarding step.
+  simply doesn't correspond to either claim Yuzu records (`sub` or `oid`) —
+  SCIM cannot revoke this population's federated tokens, treat manual
+  revocation as a required offboarding step.
+
+**What this does not do:** D2 is a detection signal, not a guarantee — it
+only fires once a federated user has both logged in **and** later been
+deprovisioned. A federated population that never triggers a deprovision
+call in the window you're checking produces no signal either way; treat a
+zero rate as "nothing detected yet," not as proof every federated user is
+correctly linked.
 
 ## Reprovisioning a returning employee
 
@@ -497,6 +520,14 @@ with a **currently-active** account.
   [Deprovisioning order matters for group-granted admins](#deprovisioning-order-matters-for-group-granted-admins).
   Remove the user from the admin group first; the deactivate/delete call
   then succeeds on the next sync.
+- **The server refuses to start after upgrading, on a fresh SCIM
+  migration.** As of this release, `scim_resources.external_id` is unique
+  (excluding empty values) — a pre-existing duplicate `external_id` (e.g.
+  from a stale, uncleaned-up resource) fails the migration and the server
+  will not boot. This applies regardless of whether `--scim-enable` is set
+  on this boot. See "A duplicate SCIM `externalId` now refuses to boot" in
+  [`docs/user-manual/server-admin.md`](server-admin.md#upgrade-notes) for
+  the detection query and remediation steps.
 
 ## See also
 

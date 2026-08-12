@@ -6,6 +6,8 @@
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/scim_store.hpp>
 
+#include <algorithm>
+
 namespace yuzu::server {
 
 std::optional<std::vector<std::string>>
@@ -33,15 +35,44 @@ resolve_deprovision_principals_for_username(ScimStore* scim_store, const std::st
         // link-lookup failure on a KNOWN SCIM user, below).
         return std::vector<std::string>{username};
     }
-    auto resource = scim_store->get_by_username(username);
-    if (!resource) {
-        // Not a SCIM-provisioned user (or an ambiguous read that this
-        // wrapper — matching get_by_username's existing collapsed contract
-        // — treats the same way): no possible identity_links row either
-        // way.
+    // Governance Gate 7 BLOCKING fix (UP-7): `get_by_username` collapses a
+    // genuine "no such resource" with "the store could not answer" (lease
+    // timeout / query error) into the same bare `nullopt` — so under pool
+    // exhaustion a KNOWN linked user's OIDC identities were silently
+    // dropped from the deprovision (this degraded to the slug-only set
+    // exactly as if the user had never been SCIM-provisioned). Use the
+    // tri-state `get_by_username_checked` instead so the two cases are
+    // told apart.
+    auto checked = scim_store->get_by_username_checked(username);
+    if (!checked.has_value()) {
+        // OUTER nullopt: the store could not answer. FAIL CLOSED — never
+        // degrade to slug-only here, that is precisely the silent-under-
+        // revocation gap this function otherwise avoids for a resolution
+        // failure past this point.
+        return std::nullopt;
+    }
+    if (!checked->has_value()) {
+        // INNER nullopt: the store answered and genuinely has no resource
+        // for `username` — not a SCIM-provisioned user, so no possible
+        // identity_links row either way.
         return std::vector<std::string>{username};
     }
-    return resolve_deprovision_principals(*scim_store, resource->scim_id, username);
+    return resolve_deprovision_principals(*scim_store, (*checked)->scim_id, username);
+}
+
+std::string enumerate_principals_for_audit(const std::vector<std::string>& principals) {
+    if (principals.empty())
+        return {};
+    const std::size_t n = std::min(principals.size(), kMaxEnumeratedPrincipals);
+    std::string out = " revoked_principals=";
+    for (std::size_t i = 0; i < n; ++i) {
+        if (i != 0)
+            out += ",";
+        out += principals[i];
+    }
+    if (principals.size() > n)
+        out += " (+" + std::to_string(principals.size() - n) + " more)";
+    return out;
 }
 
 DeprovisionRevokeResult

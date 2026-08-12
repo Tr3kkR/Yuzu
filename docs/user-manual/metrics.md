@@ -79,6 +79,22 @@ Every SAML and OIDC login attempt — success or failure — increments its prov
 | `yuzu_auth_oidc_login_total{result, role}` | counter | OIDC `/auth/callback` outcomes. Same `{result, role}` shape as the SAML counter above — `role="none"` on all error-path increments (IdP-returned error, missing `code`/`state`, and token-exchange/claim-validation failure). |
 | `yuzu_saml_group_cap_truncated_total` | counter, no labels | Bumped once per SAML login (not once per dropped group value) when the assertion's `groups` attribute exceeded the 64-value cap and real group values were dropped. A non-zero rate means some SAML-asserted group-based RBAC role mappings may not be taking effect for the affected principal — check the assertion's attribute statement. OIDC has no equivalent counter: OIDC group claims are bounded by JWT/ID-token size rather than a fixed value-count cap, so the two providers hit different limits and are not expected to have parity here. |
 
+## SCIM deprovision-linkage metrics (ADR-2001, CC6.8)
+
+Two detective counters for the SCIM↔OIDC identity-link revoke seam — a SCIM
+deprovision revokes API/MCP tokens across a slug's linked federated (SSO)
+identities as well as the slug itself. Both are always-on (no feature flag)
+and both pair with a dedicated audit action,
+`scim.user.deprovision_role_refused_with_link` — see
+`docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision"
+and `docs/user-manual/scim-provisioning.md` "SCIM ↔ OIDC identity linkage"
+for the full operator runbook.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_scim_deprovision_role_refused_with_active_link_total` | counter, no labels | D1: a deprovision was refused (the slug's role is not `user`, per the #2021 provenance guard) for a slug with an active linked federated identity — that identity's tokens were deliberately **not** auto-revoked (auto-revoking on an IdP's unilateral say-so would reopen the #2021 hazard). A human must terminate the linked identity's credentials manually. |
+| `yuzu_scim_deprovision_unlinked_total` | counter, no labels | D2: a deprovision resolved a principal set of one (slug only) but found a recorded OIDC login observation (`sub` or `oid` candidate) matching the slug's `externalId` — the user demonstrably authenticated via OIDC, but no link had formed to catch their tokens. Almost always a misconfigured `--oidc-scim-link-claim` (Entra left on the default `sub` is the common case), or an IdP whose `externalId` has no matching OIDC claim at all. A non-zero rate means some federated population's tokens are **not** being revoked by SCIM deprovision — investigate before trusting the CC6.8 claim for that population. |
+
 ## DEX live-read metrics
 
 The synchronous live-read endpoint (`POST /api/v1/dex/devices/{id}/live`) is bounded by a server-wide concurrency cap; these metrics surface its saturation and outcomes.

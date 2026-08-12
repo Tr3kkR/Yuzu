@@ -1217,6 +1217,80 @@ TEST_CASE("resolve_deprovision_principals: fails closed (nullopt) when links_for
     CHECK_FALSE(principals.has_value());
 }
 
+// ── ADR-2001 governance Gate 7 BLOCKING fix (UP-7) ───────────────────────────
+//
+// `resolve_deprovision_principals_for_username` (the dashboard-delete
+// variant) used to call `ScimStore::get_by_username`, which collapses "no
+// such resource" and "the store could not answer" into the same bare
+// `nullopt` — so under a pool-exhaustion blip a KNOWN linked user's OIDC
+// identities were silently dropped (degraded to the slug-only set, the same
+// outcome as "never a SCIM user"). The fix routes through the tri-state
+// `get_by_username_checked` instead.
+
+TEST_CASE("resolve_deprovision_principals_for_username: degrades to {username} when the "
+         "username genuinely has no SCIM resource",
+         "[pg][scim][adr2001][resolver]") {
+    Fixture f;
+    // Nothing created for this username — a genuine (store-answered) miss.
+    auto principals =
+        resolve_deprovision_principals_for_username(f.scim_store.get(), "never-provisioned");
+    REQUIRE(principals.has_value());
+    REQUIRE(principals->size() == 1);
+    CHECK((*principals)[0] == "never-provisioned");
+}
+
+TEST_CASE("resolve_deprovision_principals_for_username: resolves the full principal set for a "
+         "KNOWN SCIM-linked username",
+         "[pg][scim][adr2001][resolver]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("linked-dash-user");
+    REQUIRE(resource.has_value());
+    REQUIRE(f.scim_store->upsert_link("https://idp.example.com/", "sub-dash", resource->scim_id));
+
+    auto principals =
+        resolve_deprovision_principals_for_username(f.scim_store.get(), "linked-dash-user");
+    REQUIRE(principals.has_value());
+    REQUIRE(principals->size() == 2);
+    CHECK(std::find(principals->begin(), principals->end(), "linked-dash-user") !=
+         principals->end());
+    CHECK(std::find(principals->begin(), principals->end(),
+                    oidc::oidc_principal_id("https://idp.example.com/", "sub-dash")) !=
+         principals->end());
+}
+
+TEST_CASE("resolve_deprovision_principals_for_username: FAILS CLOSED (nullopt) on a store "
+         "blip for a KNOWN username — MUTATION-CHECK target, see the comment below",
+         "[pg][scim][adr2001][resolver][failclosed]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("blip-user");
+    REQUIRE(resource.has_value());
+
+    // A second ScimStore handle over a DEDICATED size-1 pool to the SAME
+    // database — the "hog the pool" idiom (test_api_token_store.cpp "an
+    // EXHAUSTED connection pool is kUnavailable"; also used just above at
+    // line ~1462 for the PATCH-fails-closed mutation-check) forces the
+    // second store's runtime `try_acquire_for` calls to time out, without
+    // touching `f`'s own healthy store/pool. Construct THEN hog — the
+    // store's own migration lease must be taken and released first, or the
+    // hog below would deadlock the constructor's blocking `acquire()`.
+    yuzu::server::pg::PgPool starved{{.conninfo = f.auth_db.dsn(), .size = 1}};
+    ScimStore starved_store{starved};
+    REQUIRE(starved_store.is_open());
+    auto hog = starved.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog); // holds the pool's only connection
+
+    auto principals =
+        resolve_deprovision_principals_for_username(&starved_store, "blip-user");
+    // MUTATION-CHECK (manually verified during development): reverting
+    // `resolve_deprovision_principals_for_username` to call
+    // `get_by_username` (which collapses "not found" and "store error" into
+    // one bare nullopt, then unconditionally degrades to
+    // `{username}`) turns this into an ENGAGED `{blip-user}` vector instead
+    // of `nullopt` — confirming this REQUIRE actually exercises the tri-
+    // state fail-closed path rather than passing vacuously.
+    CHECK_FALSE(principals.has_value());
+}
+
 TEST_CASE("revoke_deprovision_credentials: revokes tokens and sessions for EVERY principal in "
          "the resolved set",
          "[pg][scim][adr2001][orchestrator]") {

@@ -2058,6 +2058,39 @@ public:
                           "group-membership recompute - a sustained non-zero rate means role "
                           "changes are silently not taking effect",
                           "counter");
+        // ADR-2001 D1/D2 (governance Gate 7 BLOCKING fix, #3): describe()'d
+        // unconditionally here rather than left to lazily create at first
+        // increment (scim_routes.cpp) — a purely-lazy metric is absent from
+        // /metrics until the first incident, which is exactly the wrong
+        // moment for an alert rule to discover the series does not exist
+        // yet. Mirrors every other SCIM counter in this block.
+        metrics_.describe("yuzu_scim_deprovision_role_refused_with_active_link_total",
+                          "Total SCIM deprovisions refused (#2021's role-refusal fork) for a "
+                          "slug that has at least one active linked OIDC identity — the "
+                          "termination did NOT complete: the federated identity's tokens were "
+                          "NOT auto-revoked and a human must terminate them manually",
+                          "counter");
+        metrics_.describe("yuzu_scim_deprovision_unlinked_total",
+                          "ADR-2001 D2 tripwire: a deprovision resolved NO linked OIDC identity "
+                          "for a slug, but a recorded login-observation claim value matches that "
+                          "slug's externalId — the user DID authenticate via OIDC but the "
+                          "identity link never formed, almost certainly a misconfigured "
+                          "--oidc-scim-link-claim (a deprovision that revoked nothing for a "
+                          "federated user who exists)",
+                          "counter");
+        // ADR-2001 §2 (governance Gate 7 SHOULD fix, #6): a ScimStore outage
+        // during a login window previously only spdlog::warn'd on a failed
+        // upsert_link/record_login_observation, leaving un-linked
+        // identities invisible until the next login (or never, if the
+        // write keeps failing). Bumped by link_oidc_login_to_scim on either
+        // failure.
+        metrics_.describe("yuzu_scim_oidc_link_write_failures_total",
+                          "Total ADR-2001 identity-link/login-observation writes that failed "
+                          "during OIDC login (ScimStore outage) — the login itself always "
+                          "succeeds (fail-OPEN by design), but a sustained non-zero rate means "
+                          "identity links and/or D2 login observations are silently not being "
+                          "recorded",
+                          "counter");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -3123,9 +3156,23 @@ public:
         if (pg_pool_ && !startup_failed_) {
             scim_store_ = std::make_unique<ScimStore>(*pg_pool_);
             if (!scim_store_->is_open()) {
-                spdlog::error("[PG] Refusing to start: SCIM store migration/open failed "
-                              "(database reachable but the scim_store schema could not be "
-                              "created/opened)");
+                // Governance Gate 7 SHOULD fix (#7): name the likely cause —
+                // migration v3's partial-unique index on external_id
+                // (scim_resources_external_id_uniq) fails to CREATE, and so
+                // the whole migration (and this store's boot) fails closed,
+                // when a pre-existing deployment already has a duplicate
+                // non-empty external_id across two scim_resources rows.
+                // `docs/user-manual/*` (docs-writer's ADR-2001 runbook)
+                // documents the operator remediation for the diagnostic
+                // query below.
+                spdlog::error(
+                    "[PG] Refusing to start: SCIM store migration/open failed (database "
+                    "reachable but the scim_store schema could not be created/opened). Most "
+                    "likely cause: migration v3's partial-unique index on scim_resources."
+                    "external_id rejected a PRE-EXISTING DUPLICATE non-empty external_id "
+                    "across two rows. Diagnose with: SELECT external_id, COUNT(*) FROM "
+                    "scim_store.scim_resources WHERE external_id IS NOT NULL GROUP BY "
+                    "external_id HAVING COUNT(*) > 1;");
                 startup_failed_ = true;
             }
         }

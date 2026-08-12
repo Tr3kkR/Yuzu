@@ -239,6 +239,109 @@ constexpr std::string_view kShortPasswordToast =
 
 } // namespace
 
+// ── ADR-2001 Task 3: dashboard DELETE deprovision revoke ────────────────────
+//
+// `SettingsRoutesHarness` above is config-file-only (no AuthDB/ScimStore/
+// ApiTokenStore) — the pre-existing shape this file predates, and DELETE's
+// null-`api_token_store_` path (settings_routes.cpp) FAILS CLOSED (503,
+// governance Gate 7 BLOCKING fix, UP-7) rather than skip-and-proceed, so any
+// assertion that a delete actually SUCCEEDS needs the REAL PG-backed stores.
+// Declared here (ahead of the plain-harness test cases below) so both the
+// "admin can delete other users" / "unknown user" cases further down and the
+// dedicated credential-revoke assertions at the end of this file can use it.
+
+namespace {
+
+/// PG-gated SettingsRoutes harness wiring a real AuthDB (yuzu::test::
+/// AuthDbPg) + ScimStore + ApiTokenStore sharing one PgPool — the same
+/// "one PgPool, independent connections" pattern test_scim_routes.cpp's
+/// Fixture uses — so the ADR-2001 credentials-first revoke actually runs
+/// (SettingsRoutesHarness above passes `api_token_store=nullptr`, which
+/// deliberately fails closed on delete). Local to these ADR-2001 cases only.
+struct SettingsAdr2001Harness {
+    yuzu::test::AuthDbPg auth_db;
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    auth::AutoApproveEngine auto_approve{};
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    std::unique_ptr<ScimStore> scim_store;
+    std::unique_ptr<ApiTokenStore> token_store;
+    SettingsRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+
+    std::string session_user{"admin"};
+    auth::Role session_role{auth::Role::admin};
+    std::vector<AuditCall> audit_calls;
+
+    SettingsAdr2001Harness() {
+        auth_mgr.set_auth_db(auth_db.get());
+        REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", auth::Role::admin));
+        REQUIRE(auth_mgr.upsert_user("bob", "bobpassword12", auth::Role::user));
+
+        scim_store = std::make_unique<ScimStore>(auth_db.pool());
+        REQUIRE(scim_store->is_open());
+        token_store = std::make_unique<ApiTokenStore>(auth_db.pool());
+        REQUIRE(token_store->is_open());
+        routes.set_scim_store(scim_store.get());
+
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
+            if (session_user.empty())
+                return std::nullopt;
+            auth::Session s;
+            s.username = session_user;
+            s.role = session_role;
+            return s;
+        };
+        auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
+            if (session_user.empty() || session_role != auth::Role::admin) {
+                res.status = 403;
+                return false;
+            }
+            return true;
+        };
+        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                          const std::string&) { return true; };
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string& target_type,
+                               const std::string& target_id, const std::string& detail) -> bool {
+            audit_calls.push_back({action, result, target_type, target_id, detail});
+            return true;
+        };
+        auto gateway_count_fn = []() -> std::size_t { return 0; };
+        auto agents_json_fn = []() -> std::string { return "[]"; };
+
+        routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
+                               auto_approve, token_store.get(),
+                               /*mgmt_group_store=*/nullptr,
+                               /*tag_store=*/nullptr,
+                               /*update_registry=*/nullptr,
+                               /*runtime_config_store=*/nullptr,
+                               /*audit_store=*/nullptr,
+                               /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
+                               oidc_mu, oidc_provider);
+    }
+
+    auto delete_user(const std::string& username) {
+        return sink.Delete("/api/settings/users/" + username);
+    }
+
+    /// True if any captured audit call matches all four fields — mirrors
+    /// `SettingsRoutesHarness::has_audit` above.
+    bool has_audit(std::string_view action, std::string_view result,
+                   std::string_view target_type, std::string_view target_id) const {
+        for (const auto& a : audit_calls) {
+            if (a.action == action && a.result == result &&
+                a.target_type == target_type && a.target_id == target_id)
+                return true;
+        }
+        return false;
+    }
+};
+
+} // namespace
+
 // ── Self-deletion guard — handler side (#397) ────────────────────────────────
 
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin cannot delete self",
@@ -260,17 +363,43 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin cannot delete self",
 }
 
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: admin can delete other users",
-          "[settings][users]") {
+          "[pg][settings][users]") {
+    // Governance Gate 7 BLOCKING fix (UP-7): a null ApiTokenStore now fails
+    // CLOSED (503), so a plain `SettingsRoutesHarness` (which wires
+    // `api_token_store=nullptr`) can no longer exercise a successful
+    // delete — this needs the PG-backed harness so the credentials-first
+    // revoke actually runs and the delete completes.
+    SettingsAdr2001Harness h;
+    auto res = h.delete_user("bob");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(h.auth_mgr.get_user_role("bob").has_value());
+    // Successful destructive op also requires an audit entry (CO-1).
+    CHECK(h.has_audit("user.delete", "success", "User", "bob"));
+}
+
+TEST_CASE("SettingsRoutes DELETE /api/settings/users: a null ApiTokenStore fails CLOSED "
+         "(503) rather than skip-and-proceed — MUTATION-CHECK target, see the comment below",
+         "[settings][users][adr2001][failclosed]") {
+    // SettingsRoutesHarness deliberately wires api_token_store=nullptr
+    // (config-file-only, no PG) — governance Gate 7 BLOCKING fix (UP-7):
+    // this null branch used to spdlog::warn and proceed straight to
+    // remove_user, silently skipping the credentials-first revoke. It must
+    // now refuse instead, mirroring the SCIM seam's
+    // `api_token_store_unavailable` fail-closed branch.
     SettingsRoutesHarness h;
     h.session_user = "admin";
     h.session_role = auth::Role::admin;
 
     auto res = h.Delete("/api/settings/users/bob");
     REQUIRE(res);
-    CHECK(res->status == 200);
-    CHECK_FALSE(h.has_user("bob"));
-    // Successful destructive op also requires an audit entry (CO-1).
-    CHECK(h.has_audit("user.delete", "success", "User", "bob"));
+    CHECK(res->status == 503);
+    // MUTATION-CHECK (manually verified during development): reverting the
+    // null-`api_token_store_` branch in settings_routes.cpp back to
+    // spdlog::warn-and-proceed makes this assertion fail — bob is deleted
+    // (has_user returns false) and the response is 200, not 503.
+    CHECK(h.has_user("bob"));
+    CHECK(h.has_audit("user.delete", "failure", "User", "bob"));
 }
 
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: non-admin session rejected",
@@ -628,12 +757,15 @@ TEST_CASE("SettingsRoutes DELETE /api/settings/users: invalid username audited a
 }
 
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: unknown user audited and 404",
-          "[settings][users][audit]") {
-    SettingsRoutesHarness h;
-    h.session_user = "admin";
-    h.session_role = auth::Role::admin;
+          "[pg][settings][users][audit]") {
+    // Governance Gate 7 BLOCKING fix (UP-7): the credentials-first revoke
+    // (which now fails closed on a null ApiTokenStore) runs BEFORE the
+    // `remove_user` not-found check below it, so this needs the PG-backed
+    // harness to reach that 404 at all — see the comment on "admin can
+    // delete other users" above.
+    SettingsAdr2001Harness h;
 
-    auto res = h.Delete("/api/settings/users/nosuchuser");
+    auto res = h.delete_user("nosuchuser");
     REQUIRE(res);
     CHECK(res->status == 404);
     CHECK(h.has_audit("user.delete", "denied", "User", "nosuchuser"));
@@ -769,92 +901,9 @@ TEST_CASE("SettingsRoutes POST role: non-admin session rejected by admin_fn",
 
 // ── ADR-2001 Task 3: dashboard DELETE deprovision revoke ────────────────────
 //
-// `SettingsRoutesHarness` above is config-file-only (no AuthDB/ScimStore/
-// ApiTokenStore) — the pre-existing shape this file predates, and DELETE's
-// null-`api_token_store_` skip (settings_routes.cpp) exists precisely so it
-// keeps passing unmodified. These credential-revoke assertions need the
-// REAL PG-backed stores, so they get a dedicated PG-gated harness rather
-// than retrofitting PG onto the harness every other test in this file uses.
-
-namespace {
-
-/// PG-gated SettingsRoutes harness wiring a real AuthDB (yuzu::test::
-/// AuthDbPg) + ScimStore + ApiTokenStore sharing one PgPool — the same
-/// "one PgPool, independent connections" pattern test_scim_routes.cpp's
-/// Fixture uses — so the ADR-2001 credentials-first revoke actually runs
-/// (SettingsRoutesHarness above passes `api_token_store=nullptr`, which
-/// deliberately skips it). Local to these ADR-2001 cases only.
-struct SettingsAdr2001Harness {
-    yuzu::test::AuthDbPg auth_db;
-    Config cfg{};
-    auth::AuthManager auth_mgr{};
-    auth::AutoApproveEngine auto_approve{};
-    std::shared_mutex oidc_mu;
-    std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
-    std::unique_ptr<ScimStore> scim_store;
-    std::unique_ptr<ApiTokenStore> token_store;
-    SettingsRoutes routes;
-    yuzu::server::test::TestRouteSink sink;
-
-    std::string session_user{"admin"};
-    auth::Role session_role{auth::Role::admin};
-    std::vector<AuditCall> audit_calls;
-
-    SettingsAdr2001Harness() {
-        auth_mgr.set_auth_db(auth_db.get());
-        REQUIRE(auth_mgr.upsert_user("admin", "adminpassword1", auth::Role::admin));
-        REQUIRE(auth_mgr.upsert_user("bob", "bobpassword12", auth::Role::user));
-
-        scim_store = std::make_unique<ScimStore>(auth_db.pool());
-        REQUIRE(scim_store->is_open());
-        token_store = std::make_unique<ApiTokenStore>(auth_db.pool());
-        REQUIRE(token_store->is_open());
-        routes.set_scim_store(scim_store.get());
-
-        auto auth_fn = [this](const httplib::Request&,
-                              httplib::Response&) -> std::optional<auth::Session> {
-            if (session_user.empty())
-                return std::nullopt;
-            auth::Session s;
-            s.username = session_user;
-            s.role = session_role;
-            return s;
-        };
-        auto admin_fn = [this](const httplib::Request&, httplib::Response& res) {
-            if (session_user.empty() || session_role != auth::Role::admin) {
-                res.status = 403;
-                return false;
-            }
-            return true;
-        };
-        auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
-                          const std::string&) { return true; };
-        auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& result, const std::string& target_type,
-                               const std::string& target_id, const std::string& detail) -> bool {
-            audit_calls.push_back({action, result, target_type, target_id, detail});
-            return true;
-        };
-        auto gateway_count_fn = []() -> std::size_t { return 0; };
-        auto agents_json_fn = []() -> std::string { return "[]"; };
-
-        routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
-                               auto_approve, token_store.get(),
-                               /*mgmt_group_store=*/nullptr,
-                               /*tag_store=*/nullptr,
-                               /*update_registry=*/nullptr,
-                               /*runtime_config_store=*/nullptr,
-                               /*audit_store=*/nullptr,
-                               /*gateway_enabled=*/false, gateway_count_fn, agents_json_fn,
-                               oidc_mu, oidc_provider);
-    }
-
-    auto delete_user(const std::string& username) {
-        return sink.Delete("/api/settings/users/" + username);
-    }
-};
-
-} // namespace
+// `SettingsAdr2001Harness` (declared above, ahead of the plain-harness cases)
+// wires the REAL PG-backed stores so these credential-revoke assertions
+// actually exercise the credentials-first revoke.
 
 TEST_CASE("SettingsRoutes DELETE /api/settings/users: revokes a slug-keyed API token before "
          "the account is removed (ADR-2001)",

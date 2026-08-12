@@ -1182,6 +1182,13 @@ struct SettingsOwnerDeleteHarness {
     auth::AutoApproveEngine auto_approve{};
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    // Governance Gate 7 BLOCKING fix (UP-7): settings_routes.cpp's DELETE
+    // handler now FAILS CLOSED (503) on a null ApiTokenStore rather than
+    // skip-and-proceed — this harness's owner-delete-guard tests exercise
+    // the delete actually SUCCEEDING past the guard, so they need a real
+    // (PG-backed, shared/TRUNCATE-reset) store wired, same as
+    // SettingsAdr2001Harness in test_settings_routes_users.cpp.
+    yuzu::test::ApiTokenStorePgShared token_store;
     SettingsRoutes routes;
 
     yuzu::server::test::TestRouteSink sink;
@@ -1228,8 +1235,7 @@ struct SettingsOwnerDeleteHarness {
         auto agents_json_fn = []() -> std::string { return "[]"; };
 
         routes.register_routes(sink, auth_fn, admin_fn, perm_fn, audit_fn, cfg, auth_mgr,
-                               auto_approve,
-                               /*api_token_store=*/nullptr,
+                               auto_approve, token_store.get(),
                                /*mgmt_group_store=*/nullptr,
                                /*tag_store=*/nullptr,
                                /*update_registry=*/nullptr,

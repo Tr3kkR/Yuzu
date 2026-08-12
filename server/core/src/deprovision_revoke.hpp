@@ -69,14 +69,18 @@ resolve_deprovision_principals(ScimStore& scim_store, const std::string& scim_id
 /// `resolve_deprovision_principals`.
 ///
 /// Degrades to the slug-only set `{username}` (never fails closed) when
-/// `scim_store` is null/not open, OR when `username` does not resolve to a
-/// live SCIM resource — BOTH cases mean "this account was never SCIM-
+/// `scim_store` is null/not open, OR when `username` GENUINELY does not
+/// resolve to a live SCIM resource (per `ScimStore::get_by_username_checked`'s
+/// tri-state contract) — BOTH cases mean "this account was never SCIM-
 /// provisioned, so no `identity_links` row could possibly reference it",
 /// which is a well-understood absence, not a read failure. This differs
 /// deliberately from `resolve_deprovision_principals`'s `nullopt` fail-
 /// closed contract, which is reserved for a genuine link-lookup failure on a
 /// KNOWN SCIM user (the case this wrapper still propagates unchanged once it
-/// has resolved a `scim_id`).
+/// has resolved a `scim_id`) — AND (governance Gate 7 BLOCKING fix, UP-7)
+/// for a `get_by_username_checked` STORE ERROR (lease timeout / query
+/// error), which this wrapper now also propagates as `nullopt` rather than
+/// misreading it as "not a SCIM user" and quietly degrading to slug-only.
 std::optional<std::vector<std::string>>
 resolve_deprovision_principals_for_username(ScimStore* scim_store, const std::string& username);
 
@@ -112,5 +116,23 @@ struct DeprovisionRevokeResult {
 DeprovisionRevokeResult
 revoke_deprovision_credentials(ApiTokenStore& token_store, auth::AuthManager& auth_mgr,
                                const std::vector<std::string>& principals);
+
+/// Governance Gate 7 SHOULD fix (UP-5, CC6.8 evidence): a shared audit-detail
+/// fragment enumerating the resolved principal set — `oidc:<iss>#<sub>`
+/// strings, plus the plain slug — so the deprovision's audit row is
+/// self-contained CC6.8 evidence rather than a bare count. Both
+/// `scim_routes.cpp`'s `revoke_linked_credentials_or_fail` and
+/// `settings_routes.cpp`'s dashboard DELETE seam call this — a second
+/// hand-rolled copy is the drift this shared helper exists to avoid.
+///
+/// Capped at the first `kMaxEnumeratedPrincipals` entries (append order,
+/// i.e. slug first then every linked identity) with a "(+N more)" suffix,
+/// so a slug with an unusually large number of linked identities cannot
+/// blow out the audit detail string. Returns an empty string for an empty
+/// `principals` (nothing to enumerate — callers append this directly onto
+/// their existing detail string, so a leading space is included when
+/// non-empty).
+constexpr std::size_t kMaxEnumeratedPrincipals = 10;
+std::string enumerate_principals_for_audit(const std::vector<std::string>& principals);
 
 } // namespace yuzu::server
