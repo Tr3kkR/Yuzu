@@ -10674,19 +10674,51 @@ void RestApiV1::register_routes(
     // stay placeholder 0 deliberately: this rung is minimal by design (#2298 D3) and
     // full status ingest (action=="status") lands separately at a later rung.
     //
-    // Count = DISTINCT rule_ids with >=1 census row in state "errored", fleet-wide. Two
-    // deliberate deltas from the dashboard's guards_errored card (guardian_routes.cpp):
-    // no intersection against the live rule catalogue (a census row for a since-deleted
-    // rule is impossible — rows are deleted with the rule, guaranteed_state_store.cpp)
-    // and no offline-agent fold to "unknown". Documented in the note field, not silently
-    // reproduced-then-diverging.
+    // Count = DISTINCT rule_ids with >=1 census row in state "errored" AND still present
+    // in the live rule catalogue, fleet-wide — intersected against rule_names() the same
+    // way guardian_routes.cpp's dashboard rollup_by_rule is. A census row is NOT
+    // guaranteed to be deleted atomically with its rule: delete_rule's own status
+    // cleanup is a SEPARATE, explicitly best-effort statement (no changes-count check,
+    // warn-only on failure) with no FK enforcing it, and a late/racing event can upsert
+    // a row after deletion — an earlier version of this comment claimed an orphan row
+    // was "impossible"; that was wrong (adversarial-review finding). One remaining
+    // deliberate delta from the dashboard: no offline-agent fold to "unknown" (this
+    // route counts a rule as errored if ANY agent currently reports it errored,
+    // regardless of that agent's liveness) — documented in the note field.
+    //
+    // World-A / ADR-0017: a service-scoped API token is denied outright rather than
+    // admitted fleet-wide. This route aggregates across every agent's census, and
+    // `require_permission`'s service-scoped-token branch checks only the ITServiceOwner
+    // ROLE (never the token's own service-tag scope) — so the bare `perm_fn` check
+    // alone would let a token scoped to ONE service read a fleet-wide count. Full
+    // management-group confinement (`RbacStore::authorize_list_read`) for a
+    // non-service-scoped, group-confined human operator is a separate, tracked
+    // follow-up — that chokepoint has no production caller anywhere yet and needs its
+    // own seam design; closing the concrete service-scoped-token disclosure (adversarial-
+    // review finding, demonstrated exploit) was the priority fix for this rung.
     sink.Get(
         "/api/v1/guaranteed-state/status",
-        [perm_fn, guaranteed_state_store](const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, auth_fn, guaranteed_state_store](const httplib::Request& req,
+                                                    httplib::Response& res) {
             if (!perm_fn(req, res, "GuaranteedState", "Read"))
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (!session->token_scope_service.empty()) {
+                // sec-M2-class denial (same posture as the session-revoke self-target
+                // guard, :3903 above): a narrow-scope automation token must not read
+                // fleet-wide aggregate compliance data outside its own scope.
+                res.status = 403;
+                res.set_content(
+                    detail::error_json_a4(
+                        403, "service-scoped tokens cannot read the fleet-wide status rollup",
+                        cid),
+                    "application/json");
+                return;
+            }
             if (!guaranteed_state_store) {
                 spdlog::error("guaranteed-state.status: store null — registration-order "
                               "defect; cid={}",
@@ -10696,29 +10728,33 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            const auto rules = guaranteed_state_store->rule_count();
             // ADR-0038 catastrophic-read: a degrade must render 503, never a silent "0
-            // errored" that would misreport the fleet as compliant.
+            // errored"/"0 rules" that would misreport the fleet as compliant. total_rules
+            // now comes from this SAME degrade-checked rule_names() read, replacing the
+            // former separate (non-degrade-checked, silently-zero-on-failure) rule_count().
+            auto rule_names_result = guaranteed_state_store->rule_names();
             auto statuses_result = guaranteed_state_store->agent_rule_statuses();
-            if (!statuses_result) {
+            if (!rule_names_result || !statuses_result) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
                                 "application/json");
                 spdlog::warn("guaranteed-state.status store degraded (503) cid={}", cid);
                 return;
             }
+            const auto& rule_names = *rule_names_result;
             std::unordered_set<std::string> errored_rule_ids;
             for (const auto& st : *statuses_result)
-                if (st.state == "errored")
+                if (st.state == "errored" && rule_names.count(st.rule_id))
                     errored_rule_ids.insert(st.rule_id);
             res.set_content(
                 ok_json(JObj()
-                            .add("total_rules", static_cast<int64_t>(rules))
+                            .add("total_rules", static_cast<int64_t>(rule_names.size()))
                             .add("compliant_rules", 0)
                             .add("drifted_rules", 0)
                             .add("errored_rules", static_cast<int64_t>(errored_rule_ids.size()))
                             .add("note", "errored_rules is real (M1 census-derived, #2298 "
-                                        "item 6d); compliant_rules/drifted_rules land with "
+                                        "item 6d), intersected against the live rule "
+                                        "catalogue; compliant_rules/drifted_rules land with "
                                         "full status ingest in a later rung")
                             .str()),
                 "application/json");
@@ -10726,15 +10762,21 @@ void RestApiV1::register_routes(
 
     // GET /status/{agent_id} — per-agent Guaranteed State rollup (#2298 gate 3, item 6d).
     // errored_rules is the SAME census derivation as the fleet route above, scoped to
-    // this one agent's rows. Per-device behavioral read: adopts the same scoped_perm_fn
-    // + guardian.device.view audit shape as GET /guaranteed-state/device-compliance
-    // (World-A / ADR-0017 routed concern) — wiring real per-agent data behind only the
-    // bare global perm_fn would be exactly the confinement gap that concern forbids.
-    // total_rules here means "rules with ANY census entry for this agent" (the same
-    // store call, no extra query) — NOT the fleet catalogue size, and NOT a
-    // baseline-scoped "applicable rules" count (that needs baseline+scope evaluation,
-    // the same tradeoff device-compliance's own header comment documents; out of this
-    // rung's minimal scope).
+    // this one agent's rows and intersected against the live rule catalogue (a census
+    // row can outlive its rule — see the fleet route's comment above for why; an
+    // earlier version of this claimed otherwise and was wrong). Per-device behavioral
+    // read: adopts the same scoped_perm_fn + guardian.device.view audit shape as GET
+    // /guaranteed-state/device-compliance (World-A / ADR-0017 routed concern) — wiring
+    // real per-agent data behind only the bare global perm_fn would be exactly the
+    // confinement gap that concern forbids. `require_scoped_permission` (behind
+    // scoped_perm_fn) DOES apply a service-scoped token's own service-tag confinement
+    // per target (agent_service != token_scope_service -> deny), unlike the bare
+    // `require_permission` the fleet route above had to defend against separately.
+    // total_rules here means "rules with ANY census entry for this agent, still present
+    // in the live catalogue" — NOT the fleet catalogue size, and NOT a baseline-scoped
+    // "applicable rules" count (that needs baseline+scope evaluation, the same tradeoff
+    // device-compliance's own header comment documents; out of this rung's minimal
+    // scope).
     sink.Get(
         R"(/api/v1/guaranteed-state/status/([A-Za-z0-9._\-]+))",
         [scoped_perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
@@ -10742,6 +10784,16 @@ void RestApiV1::register_routes(
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             auto agent_id = req.matches[1].str();
+            // Same length ceiling as GET /guaranteed-state/device-compliance's agent_id
+            // query param (auth::kMaxAgentIdLength, 256 — the cap enrollment enforces).
+            // The route regex already excludes control/most special characters; this
+            // closes the remaining unbounded-length gap on the path segment.
+            if (agent_id.size() > auth::kMaxAgentIdLength) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "agent_id too long", cid),
+                                "application/json");
+                return;
+            }
             if (!scoped_perm_fn) {
                 spdlog::error("guaranteed-state.status.agent: scoped_perm_fn unwired — "
                               "misconfigured call site; failing closed; cid={}",
@@ -10792,19 +10844,41 @@ void RestApiV1::register_routes(
                              cid, agent_id);
                 return;
             }
-            int64_t errored = 0;
+            // Intersect against the live rule catalogue, bounded to just this agent's
+            // reported rule_ids (same shape as device-compliance's rule_names_for call).
+            std::vector<std::string> rule_ids;
+            rule_ids.reserve(statuses_result->size());
             for (const auto& st : *statuses_result)
+                rule_ids.push_back(st.rule_id);
+            auto rule_names_result = guaranteed_state_store->rule_names_for(rule_ids);
+            if (!rule_names_result) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
+                                "application/json");
+                spdlog::warn("guaranteed-state.status.agent store degraded (503) cid={} "
+                             "agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+            const auto& rule_names = *rule_names_result;
+            int64_t total_rules = 0, errored = 0;
+            for (const auto& st : *statuses_result) {
+                if (!rule_names.count(st.rule_id))
+                    continue; // orphan census row for a since-deleted rule
+                ++total_rules;
                 if (st.state == "errored")
                     ++errored;
+            }
             res.set_content(
                 ok_json(JObj()
                             .add("agent_id", agent_id)
-                            .add("total_rules", static_cast<int64_t>(statuses_result->size()))
+                            .add("total_rules", total_rules)
                             .add("compliant_rules", 0)
                             .add("drifted_rules", 0)
                             .add("errored_rules", errored)
                             .add("note", "errored_rules is real (M1 census-derived, #2298 "
-                                        "item 6d); compliant_rules/drifted_rules land with "
+                                        "item 6d), intersected against the live rule "
+                                        "catalogue; compliant_rules/drifted_rules land with "
                                         "full status ingest in a later rung")
                             .str()),
                 "application/json");

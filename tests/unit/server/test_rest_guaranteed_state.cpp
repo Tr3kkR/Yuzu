@@ -125,7 +125,10 @@ struct RestGsHarness {
     // fleet-wide /guaranteed-state/events branch denies these outright, since
     // require_permission's service-token branch checks only the ITServiceOwner
     // role and never the token's own service-tag scope). Default empty
-    // preserves every other test's ordinary-operator session.
+    // preserves every other test's ordinary-operator session. Also used by
+    // the /guaranteed-state/status service-token-denial test below (#2298
+    // item 6d) — same underlying mechanism, one field, not a per-route
+    // duplicate.
     std::string session_token_scope_service;
 
     // When false, perm_fn denies (403) — lets a test prove the permission gate
@@ -1141,8 +1144,15 @@ TEST_CASE("REST gs.status: errored_rules is real, census-derived and DISTINCT-ru
     // #2298 item 6d. Two agents share one errored rule (counted ONCE — distinct
     // rule_ids, not devices/rows); a second rule is errored on only one agent; a
     // third rule is compliant and must not contribute. compliant_rules/drifted_rules
-    // stay the documented placeholder 0.
+    // stay the documented placeholder 0. Rules seeded first — errored_rules is
+    // intersected against the live catalogue (adversarial-review finding).
     RestGsHarness h;
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r2", "rule-2"))
+                ->status == 201);
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r3", "rule-3"))
+                ->status == 201);
     h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
     h.seed_status("e2", "WS-2", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
     h.seed_status("e3", "WS-1", "r2", "guard.unhealthy", "2026-06-20T10:00:00Z");
@@ -1155,6 +1165,45 @@ TEST_CASE("REST gs.status: errored_rules is real, census-derived and DISTINCT-ru
     CHECK(j["data"]["errored_rules"].get<int>() == 2); // r1 (once) + r2
     CHECK(j["data"]["compliant_rules"].get<int>() == 0);
     CHECK(j["data"]["drifted_rules"].get<int>() == 0);
+    CHECK(j["data"]["total_rules"].get<int>() == 3);
+}
+
+TEST_CASE("REST gs.status: an errored census row for a DELETED rule is excluded (not counted)",
+          "[pg][rest][guaranteed_state][status]") {
+    // Adversarial-review finding: delete_rule's own status-table cleanup is
+    // explicitly best-effort (no changes-count check, warn-only on failure) with no
+    // FK — so a census row can outlive its rule. errored_rules must intersect
+    // against the live catalogue, or a deleted rule inflates the count forever.
+    RestGsHarness h;
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r-live", "live"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r-live", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    // r-orphan has a census row but was NEVER created as a rule (models the
+    // best-effort-cleanup-failed / late-event-after-delete case without needing to
+    // race the actual delete path).
+    h.seed_status("e2", "WS-1", "r-orphan", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["errored_rules"].get<int>() == 1); // r-live only
+    CHECK(j["data"]["total_rules"].get<int>() == 1);
+}
+
+TEST_CASE("REST gs.status: a service-scoped token is denied outright (World-A / ADR-0017)",
+          "[pg][rest][guaranteed_state][status]") {
+    // Adversarial-review finding: require_permission's service-scoped-token branch
+    // checks only the ITServiceOwner role, never the token's own service tag scope —
+    // so a bare perm_fn pass alone would let a token scoped to one service read the
+    // fleet-wide aggregate. This route denies a service-scoped token outright.
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("errored_rules") == std::string::npos);
 }
 
 // ── #2298 item 6d: per-agent status route (previously untested at REST level) ──
@@ -1162,10 +1211,17 @@ TEST_CASE("REST gs.status: errored_rules is real, census-derived and DISTINCT-ru
 TEST_CASE("REST gs.status/{agent_id}: errored_rules is real, scoped to this agent's census",
           "[pg][rest][guaranteed_state][status]") {
     RestGsHarness h;
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r2", "rule-2"))
+                ->status == 201);
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r3", "rule-3"))
+                ->status == 201);
     h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
     h.seed_status("e2", "WS-1", "r2", "guard.compliant", "2026-06-20T10:00:00Z");
     // A different agent's errored rule must NOT leak into WS-1's count.
     h.seed_status("e3", "WS-2", "r3", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.audit_log.clear(); // drop the 3 rule.create audit rows from setup above
 
     auto res = h.sink.Get("/api/v1/guaranteed-state/status/WS-1");
     REQUIRE(res);
@@ -1185,6 +1241,22 @@ TEST_CASE("REST gs.status/{agent_id}: errored_rules is real, scoped to this agen
     CHECK(h.audit_log[0].action == "guardian.device.view");
     CHECK(h.audit_log[0].result == "success");
     CHECK(h.audit_log[0].target_id == "WS-1");
+}
+
+TEST_CASE("REST gs.status/{agent_id}: an errored census row for a DELETED rule is excluded",
+          "[pg][rest][guaranteed_state][status]") {
+    RestGsHarness h;
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r-live", "live"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r-live", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-1", "r-orphan", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["total_rules"].get<int>() == 1);
+    CHECK(j["data"]["errored_rules"].get<int>() == 1);
 }
 
 TEST_CASE("REST gs.status/{agent_id}: per-device scope denies an out-of-scope caller",
