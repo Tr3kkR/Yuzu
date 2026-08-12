@@ -392,6 +392,78 @@ TEST_CASE("DiscoveryStore: backfill migrates legacy devices and is idempotent",
     CHECK(scalar(db.dsn(), "SELECT count(*) FROM discovery_store.discovered_devices") == "2");
 }
 
+// Holder-side verification, mismatch branch (mirrors
+// test_rbac_store.cpp's "verifies a matching fingerprint" test's negative
+// counterpart): a SECOND store instance against the SAME already-migrated
+// Postgres database, holding its OWN legacy file with DIFFERENT real
+// content, must refuse rather than silently accept a completion its own
+// devices were never part of.
+TEST_CASE("DiscoveryStore: backfill refuses on a fingerprint mismatch (holder-side verification)",
+          "[pg][discovery][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    // "Replica A" migrates its own legacy file — stamps the real marker +
+    // fingerprint, moves its file aside.
+    {
+        DiscoveryStore store_a{pool};
+        REQUIRE(store_a.is_open());
+        yuzu::test::TempDbFile legacy_a{"yuzu_test_discovery_fp_a_"};
+        std::filesystem::remove(legacy_a.path);
+        make_legacy_discovery_db(legacy_a.path, {make_device("10.1.1.1")});
+        REQUIRE(store_a.migrate_from_sqlite(legacy_a.path));
+    }
+
+    // "Replica B" — same shared Postgres, but boots holding a DIFFERENT
+    // legacy file with different real content, after the marker is already
+    // stamped with Replica A's fingerprint.
+    DiscoveryStore store_b{pool};
+    REQUIRE(store_b.is_open());
+    yuzu::test::TempDbFile legacy_b{"yuzu_test_discovery_fp_b_"};
+    std::filesystem::remove(legacy_b.path);
+    make_legacy_discovery_db(legacy_b.path, {make_device("10.2.2.2")});
+
+    CHECK_FALSE(store_b.migrate_from_sqlite(legacy_b.path));
+    // Refused, not silently accepted or silently re-migrated: Replica B's
+    // file survives untouched, and its content never lands in Postgres.
+    CHECK(std::filesystem::exists(legacy_b.path));
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM discovery_store.discovered_devices "
+                          "WHERE ip_address = '10.2.2.2'") == "0");
+}
+
+// Holder-side verification, sourceless-marker branch (mirrors
+// test_rbac_store.cpp's "refuses a sourceless sibling's marker on a later
+// boot" test): a fileless sibling stamps the marker sourceless first; a
+// later replica that DOES hold real content must refuse rather than
+// fall-through and migrate on top of state the store may have already
+// accepted live (e.g. a scan that landed between the two boots).
+TEST_CASE("DiscoveryStore: backfill refuses a sourceless sibling's marker when this replica holds "
+          "real legacy content",
+          "[pg][discovery][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    // "Replica A" — no local legacy file, stamps the shared marker sourceless.
+    {
+        DiscoveryStore store_a{pool};
+        REQUIRE(store_a.is_open());
+        REQUIRE(store_a.migrate_from_sqlite("/nonexistent-yuzu-test/discovery-a.db"));
+    }
+
+    // "Replica B" — same shared Postgres, genuinely holds a legacy file with
+    // real content, boots AFTER the marker was already stamped sourceless.
+    DiscoveryStore store_b{pool};
+    REQUIRE(store_b.is_open());
+    yuzu::test::TempDbFile legacy{"yuzu_test_discovery_sourceless_race_"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_discovery_db(legacy.path, {make_device("10.3.3.3")});
+
+    CHECK_FALSE(store_b.migrate_from_sqlite(legacy.path));
+    CHECK(std::filesystem::exists(legacy.path)); // untouched
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM discovery_store.discovered_devices "
+                          "WHERE ip_address = '10.3.3.3'") == "0");
+}
+
 TEST_CASE("DiscoveryStore: backfill refuses a corrupt legacy file (fail-closed)",
           "[pg][discovery][backfill]") {
     YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);

@@ -1275,6 +1275,25 @@ public:
                           "counter");
         for (const auto result : {"completed", "fresh", "failed"})
             metrics_.counter("yuzu_server_mgmt_group_backfill_total", {{"result", result}});
+        // DiscoveryStore observability (ADR-0043). The read-degrade counter is
+        // the fail-open signal: a non-zero rate means list_devices could not
+        // answer (store_not_open/pool_acquire_timeout/query_error) — /readyz
+        // stays green under pure pool saturation, so this is the read-path
+        // degrade signal for the discovered-device inventory.
+        metrics_.describe("yuzu_server_discovery_read_degrade_total",
+                          "DiscoveryStore list_devices reads that returned a degrade (nullopt) "
+                          "rather than a result, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error)",
+                          "counter");
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+            metrics_.counter("yuzu_server_discovery_read_degrade_total", {{"reason", reason}});
+        metrics_.describe("yuzu_server_discovery_backfill_total",
+                          "DiscoveryStore legacy-SQLite backfill outcomes by result "
+                          "(completed = rows migrated + reconciled; fresh = no legacy DB / empty; "
+                          "failed = fail-closed refusal). One-time at boot (ADR-0043)",
+                          "counter");
+        for (const auto result : {"completed", "fresh", "failed"})
+            metrics_.counter("yuzu_server_discovery_backfill_total", {{"result", result}});
         // Generic InventoryStore observability (ADR-0037 hardening round).
         metrics_.describe(
             "yuzu_inventory_ingest_dropped_total",
@@ -9386,6 +9405,10 @@ private:
             // rows above document. A degraded confinement store fails RbacStore's
             // list gate closed, so surface it.
             bool mgmt_group_ok = mgmt_group_store_ && mgmt_group_store_->is_open();
+            // DiscoveryStore (ADR-0043) — wired into /readyz; adding here too so
+            // this store never joins the readyz-vs-healthz drift class the rows
+            // above were added to fix.
+            bool discovery_ok = discovery_store_ && discovery_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -9393,7 +9416,7 @@ private:
                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok;
+                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -9419,7 +9442,8 @@ private:
                   {"inventory_store", inventory_ok ? "ok" : "error"},
                   {"rbac_store", rbac_ok ? "ok" : "error"},
                   {"result_set_store", result_set_ok ? "ok" : "error"},
-                  {"management_group_store", mgmt_group_ok ? "ok" : "error"}}},
+                  {"management_group_store", mgmt_group_ok ? "ok" : "error"},
+                  {"discovery_store", discovery_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -9659,12 +9683,13 @@ private:
                 {"scim_store", !cfg_.scim_enable ||
                                    (scim_store_ && scim_store_->is_open() &&
                                     scim_store_->has_token())},
-                // Wave 2 migrated Postgres store (ADR-0006/0009, schema
+                // Wave 2 migrated Postgres store (ADR-0006/0009/0043, schema
                 // `discovery_store`). AUTHORITATIVE per ADR-0012 §1 — the
-                // operator-set `managed` flag is real state; a not-open
-                // post-boot state would make POST /api/discovery/scan and
-                // GET /api/discovery/results silently 503 per-request
-                // unnoticed rather than being visible at /readyz.
+                // operator-set `managed` flag is real state. Construction
+                // fail-closed already makes a not-open state unreachable in
+                // production (startup_failed_ stops the server before it
+                // serves), so this is belt-and-braces against a runtime
+                // is_open() flip, matching result_set_store's equivalent row.
                 {"discovery_store", discovery_store_ && discovery_store_->is_open()},
             };
 
