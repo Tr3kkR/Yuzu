@@ -52,6 +52,8 @@ namespace yuzu::server {
 
 class AuditStore;
 class EnginePrincipalStore;
+class ApiTokenStore;
+class AnalyticsEventStore;
 struct Config;
 
 /// Testable core of the `--scim-enable` fail-closed boot guard (SOC 2 CC6.2,
@@ -76,14 +78,42 @@ public:
     /// is `Config::scim_admin_group` (`--scim-admin-group`/
     /// `YUZU_SCIM_ADMIN_GROUP`) — empty means no SCIM group ever promotes to
     /// admin (see `recompute_scim_user_role`).
+    ///
+    /// `token_store` (ADR-2001 Sec.3, nullable -- same non-null-in-practice
+    /// posture as scim_store/auth_mgr/audit_store above: server.cpp
+    /// constructs ApiTokenStore unconditionally alongside ScimStore, both
+    /// born-on-PG) is where the deprovision seams (deactivate(), the DELETE
+    /// handler, and create-with-active:false) revoke API tokens
+    /// credentials-FIRST, across the resolved slug + linked-OIDC principal
+    /// set, before the account is marked inactive. A null/closed
+    /// token_store fails the deprovision closed (503) rather than silently
+    /// skipping the revoke.
+    ///
+    /// `analytics_store` (ADR-2001 D1, nullable, same deferred-wiring
+    /// posture) — the D1 "make it LOUD" signal needs a real SEVERITY
+    /// channel, and `AuditEvent`/`AuditStore` (what every other call on
+    /// this surface writes to) has no severity field at all: its `result`
+    /// column is success/denied/failure/partial, never a severity level.
+    /// The one severity-carrying mechanism in this codebase is
+    /// `AnalyticsEvent::severity` via `AnalyticsEventStore` — the same
+    /// channel `AuthRoutes::emit_event` uses for `Severity::kCritical`
+    /// break-glass-login events. D1 reuses that mechanism rather than
+    /// inventing a parallel one; a null store degrades to "no critical
+    /// analytics event" (the AuditStore row + the
+    /// `yuzu_scim_deprovision_role_refused_with_active_link_total` metric
+    /// still fire either way).
     void register_routes(httplib::Server& svr, ScimStore* scim_store, auth::AuthManager* auth_mgr,
                          AuditStore* audit_store, std::string scim_admin_group = {},
-                         EnginePrincipalStore* engine_principal_store = nullptr);
+                         EnginePrincipalStore* engine_principal_store = nullptr,
+                         ApiTokenStore* token_store = nullptr,
+                         AnalyticsEventStore* analytics_store = nullptr);
 
     /// Testable overload — register against an in-process sink (no socket).
     void register_routes(HttpRouteSink& sink, ScimStore* scim_store, auth::AuthManager* auth_mgr,
                          AuditStore* audit_store, std::string scim_admin_group = {},
-                         EnginePrincipalStore* engine_principal_store = nullptr);
+                         EnginePrincipalStore* engine_principal_store = nullptr,
+                         ApiTokenStore* token_store = nullptr,
+                         AnalyticsEventStore* analytics_store = nullptr);
 };
 
 } // namespace yuzu::server

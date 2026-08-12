@@ -195,6 +195,11 @@ struct Config {
     std::string oidc_admin_group;   // Entra group ID that maps to admin role
     bool oidc_skip_tls_verify{
         false}; // Disable TLS cert verification for OIDC (insecure, for dev only)
+    // ADR-2001 §1 — which validated ID token claim is used as the
+    // SCIM-externalId join key at OIDC login. Allow-list {sub, oid} is
+    // enforced at boot (main.cpp, CLI::IsMember) — fail-closed on anything
+    // else, never a silent fallback to the default.
+    std::string oidc_scim_link_claim{"sub"};
 
     // SAML 2.0 SSO
     // Enabled when idp_sso_url + idp_cert + sp_entity_id + sp_acs_url are all non-empty

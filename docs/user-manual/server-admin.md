@@ -68,6 +68,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. Env: `YUZU_OIDC_REDIRECT_URI`. |
 | `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. (Value is trimmed automatically, same as `--saml-admin-group` — #1830.) |
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
+| `--oidc-scim-link-claim` | `sub` | ADR-2001 (SCIM↔OIDC identity linkage, CC6.8). Which validated ID-token claim is compared against a SCIM resource's `externalId` to form the durable link a SCIM deprovision revokes API/MCP tokens across. Only `sub` and `oid` are accepted — the server **refuses to start** on any other value. Okta: leave as the default `sub`. Microsoft Entra ID: set `oid` — Entra's SCIM `externalId` rides the ID token as the `oid` claim, not `sub`. See `docs/user-manual/scim-provisioning.md` "SCIM ↔ OIDC identity linkage". Env: `YUZU_OIDC_SCIM_LINK_CLAIM`. |
 | `--saml-idp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI of the IdP (must match what the IdP uses in its assertions). Required and validated at startup — omitting it (along with the other four `--saml-*` flags) leaves SAML disabled. Env: `YUZU_SAML_IDP_ENTITY_ID`. |
 | `--saml-idp-sso-url` | *(none)* | **SAML 2.0 SP.** IdP's HTTP-Redirect SSO endpoint URL. Env: `YUZU_SAML_IDP_SSO_URL`. |
 | `--saml-idp-cert` | *(none)* | **SAML 2.0 SP.** Filesystem path to the IdP's assertion-signing certificate (PEM, max 64 KiB). The cert at this path is the **sole** trusted signing authority — in-document `<KeyInfo>` values are ignored. Env: `YUZU_SAML_IDP_CERT`. |
@@ -193,6 +194,23 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 ---
 
 ## Upgrade Notes
+
+### vNEXT — a duplicate SCIM `externalId` now refuses to boot (ADR-2001, CC6.8) (breaking)
+
+**What changed.** This release adds a partial unique index, `scim_resources_external_id_uniq ON scim_resources (external_id) WHERE external_id IS NOT NULL`, applied by the `ScimStore` migration that runs at construction — **unconditionally, regardless of whether `--scim-enable` is set**. Postgres itself detects any pre-existing duplicate non-empty `external_id` and raises a `unique_violation`, which fails the migration; `ScimStore` then reports `!is_open()` and the server refuses to start, the same fail-closed posture every born-on-PG store uses on a failed migration. This is deliberate, not a bug to work around: a duplicate `externalId` is exactly the mis-link hazard ADR-2001's SCIM↔OIDC token-revoke linkage exists to prevent (a duplicate would let link formation pick a SCIM resource arbitrarily and revoke — or fail to revoke — the wrong principal's tokens), so the index is a **stronger** posture than what shipped before, not a regression to relax.
+
+**Who this affects.** Any deployment with existing SCIM data (has ever run `--scim-enable`, even if it isn't set on this upgrade) where two or more `scim_resources` rows share the same non-empty `external_id` — most likely from an IdP connector bug, a manual data-fix gone wrong, or a resource re-provisioned under a new SCIM `id` without the old row ever being cleaned up.
+
+**Before upgrading, run this against your existing database to check:**
+
+```sql
+SELECT external_id, COUNT(*) FROM scim_store.scim_resources
+WHERE external_id IS NOT NULL
+GROUP BY external_id
+HAVING COUNT(*) > 1;
+```
+
+**If it returns any rows,** the upgrade will fail to boot until you resolve the duplicates first — deactivate or delete the stale/incorrect row(s) for each `external_id` this query surfaces (keep whichever row is the IdP's actual current resource), then re-run the query until it returns nothing. If it returns no rows, this note does not affect you and the migration applies silently on next boot.
 
 ### vNEXT — pre-auth request-body caps now apply to (almost) every route, not just `/mcp/` (#2407) (breaking)
 
@@ -1715,6 +1733,7 @@ OIDC can be configured via CLI flags at startup or through the Settings page:
 | Redirect URI | `--oidc-redirect-uri` | Callback URL registered with the identity provider. Must point to the Yuzu server's `/auth/callback` path. |
 | Admin Group | `--oidc-admin-group` | Entra ID group object ID that maps to the admin role. |
 | Skip TLS Verify | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only). Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
+| Link Claim | `--oidc-scim-link-claim` | ADR-2001 (SCIM↔OIDC identity linkage, CC6.8) — which validated ID-token claim (`sub` default, or `oid` for Entra) links a SCIM slug to its OIDC login identity so a SCIM deprovision can also revoke that identity's API/MCP tokens. **Not a Settings-page form field** — this page saves the OIDC config CLI/env already set for this value unchanged rather than resetting it to the struct default. See [SCIM ↔ OIDC identity linkage](scim-provisioning.md#scim--oidc-identity-linkage-federated-token-revocation). Env: `YUZU_OIDC_SCIM_LINK_CLAIM`. |
 
 ### Identity Provider Setup
 

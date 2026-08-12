@@ -323,16 +323,32 @@ has the same effect:
   `scim.user.deleted`), giving you a timestamped record for termination
   evidence (CC6.8).
 
-> **API/MCP tokens are not automatically revoked.** SCIM deprovisioning
-> terminates the user's login and revokes their active **sessions**, but it
-> does **not** revoke any API or MCP token that user previously generated for
-> themselves. A terminated employee who holds a long-lived personal API token
-> keeps the ability to authenticate with it until an admin revokes that token
-> by hand. If a deprovisioned user may have minted an API token, revoke it
-> manually from the dashboard (Settings → API Tokens) or via the REST API.
-> This is a pre-existing gap shared with the dashboard's manual "disable
-> user" path, not something specific to SCIM — tracked as
-> [#2022](https://github.com/Tr3kkR/Yuzu/issues/2022).
+> **API/MCP tokens ARE now revoked on deprovision — including federated
+> (SSO) tokens, if the user is linked.** SCIM deprovisioning (and the
+> dashboard's manual delete) revokes the user's **sessions and their API/MCP
+> tokens**, both for the SCIM slug itself and for any OIDC identity linked
+> to it (see [SCIM ↔ OIDC identity linkage](#scim--oidc-identity-linkage-federated-token-revocation)
+> below for how the link forms and what to configure). Revocation is durable
+> within roughly **60 seconds** of the deprovision reaching Yuzu — a
+> concurrently in-flight request can still see a token as valid for that
+> brief window (the `ApiTokenStore` in-memory validate cache), but the
+> revoke itself has already committed. This closes the former gap tracked as
+> [#2022](https://github.com/Tr3kkR/Yuzu/issues/2022). **Two things this does
+> NOT cover:** (1) a SCIM slug that was elevated to admin *outside* SCIM —
+> its linked federated identity's tokens are deliberately NOT
+> auto-revoked; a human must terminate them manually (see D1 below); (2) an
+> IdP whose SCIM `externalId` shares no value with any OIDC claim Yuzu
+> validates — there is no join key to link on, so nothing federated can be
+> revoked by SCIM for that population (see D2 below).
+
+Deprovision is **credentials-first**: tokens and sessions are revoked for
+the slug and every linked identity *before* the account is marked inactive
+or deleted, and if any token revoke does not durably persist, the whole
+deprovision call fails with a **`500`** rather than reporting success — this
+is new behavior your IdP connector's retry/alerting should account for: a
+`500` on a deactivate/delete call means the underlying store had a transient
+problem persisting the revoke, and the IdP should retry the call rather
+than treat it as a permanent rejection.
 
 **SCIM will not deactivate an account that is currently `role=admin`,**
 whether that admin role came from a dashboard promotion or from
@@ -353,6 +369,115 @@ If the person is later re-added in the IdP, the same SCIM resource is
 reactivated (`active: true`): the account comes back, any lockout state is
 cleared, but **MFA is not restored** — they will re-enroll TOTP the next
 time they sign in.
+
+## SCIM ↔ OIDC identity linkage (federated token revocation)
+
+If your users sign in via SSO (OIDC — Okta, Entra, etc.) rather than a
+Yuzu-local password, their API/MCP tokens are minted under a **separate**
+`oidc:<issuer>#<subject>` identity, not their SCIM slug. Without a link
+between the two, SCIM deprovisioning the slug would leave those federated
+tokens untouched. Yuzu forms this link automatically at login and revokes
+across it on deprovision — this section covers the one flag you may need
+to set, plus the two detection signals that tell you if it isn't working
+for a given IdP.
+
+### Choosing the link claim for your IdP
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--oidc-scim-link-claim` | `YUZU_OIDC_SCIM_LINK_CLAIM` | Which validated OIDC ID-token claim is compared against a SCIM resource's `externalId` to form the link. Default `sub`. Only `sub` and `oid` are accepted — boot fails closed on any other value. |
+
+**Set this per IdP, not by guessing:**
+
+| Your IdP | What SCIM's `externalId` actually is | Set `--oidc-scim-link-claim` to |
+|---|---|---|
+| Okta | The user's OIDC `sub` | `sub` — the default; no change needed |
+| Microsoft Entra ID | The Azure AD object id, which shows up in the ID token as the `oid` claim (Entra's `sub` is a *different*, app-specific value) | `oid` |
+
+If you are not sure which your IdP uses, check the D2 signal
+(`yuzu_scim_deprovision_unlinked_total`, below) after a real federated user
+has both logged in once and later been deprovisioned — a non-zero bump
+means the claim you configured did not match, and it's worth trying the
+other allowed value.
+
+**Some IdPs cannot be linked at all, by design, no matter what you set
+here.** If your IdP's SCIM `externalId` is neither the OIDC `sub` nor the
+`oid` claim — no shared, IdP-asserted value exists between the SCIM push and
+the OIDC login — there is no join key available and federated tokens for
+that population cannot be revoked by SCIM. This is a design limitation
+(only IdP-asserted, stable claims are trusted for a security-relevant join;
+mutable fields like email are never used), not a bug to work around. Treat
+manual token revocation as a required, explicit offboarding step for that
+IdP until it exposes a shared claim.
+
+### The ~60 second window
+
+A deprovision revokes tokens and sessions **immediately** at the store
+level, but an already-validated API/MCP token can keep passing validation
+for **up to ~60 seconds** afterward due to an in-memory cache — a
+concurrently in-flight request may briefly still see the old "valid"
+answer. Cookie sessions have no such cache and are revoked instantly. The
+honest guarantee is "revoked within about a minute of the deprovision
+reaching Yuzu," not instantaneous — plan any time-sensitive incident
+response (e.g. a hostile termination) with that window in mind, and
+consider pairing it with a device-level action (Guardian/EDR) for anything
+requiring sub-minute containment.
+
+### D1 — a deprovision refused because the account was elevated outside SCIM
+
+`deprovision_role_ok` (see [Deprovisioning order matters for group-granted
+admins](#deprovisioning-order-matters-for-group-granted-admins) above)
+already refuses to deprovision an account that isn't `role=user` — this is
+deliberate, so a compromised or misbehaving IdP can't unilaterally tear down
+an admin. When that refusal happens for a slug that also has an active
+linked federated identity, Yuzu does **not** silently leave the situation
+alone: it always writes an audit row (`scim.user
+.deprovision_role_refused_with_link`, `result=failure`) and always bumps
+`yuzu_scim_deprovision_role_refused_with_active_link_total`. **Alert on the
+metric or the audit action — that is the reliable, always-on signal.** (If
+you also have analytics event collection enabled — the default, unless you
+pass `--no-analytics` — the same event additionally lands there at critical
+severity; that is a bonus channel for a deployment that already consumes
+analytics events, not the primary detection mechanism, and it is not
+present if analytics collection is disabled.)
+
+**What to do:** the underlying account was terminated by the IdP but is
+still elevated in Yuzu (either promoted by an admin, or via Groups → role
+mapping), so SCIM refuses to touch it and its linked federated identity's
+tokens are still live. Terminate that identity's tokens manually — from the
+dashboard (Settings → API Tokens) or the REST API — and either demote the
+account (letting the next IdP sync deprovision it normally) or otherwise
+close it out by hand.
+
+### D2 — a federated user logged in but their tokens weren't revoked
+
+`yuzu_scim_deprovision_unlinked_total` fires when a deprovision finds
+evidence that the user actually authenticated via OIDC, but no link had
+formed to catch their tokens in the revoke. Every OIDC login records
+**both** the `sub` and `oid` claim values it observed (not only the one
+`--oidc-scim-link-claim` is currently configured to use), so this detector
+also catches the specific, common misconfiguration where the *wrong* claim
+is set — e.g. an Entra deployment left on the default `sub`, whose
+`externalId` actually matches the login's `oid` value: the login observation
+for `oid` still matches the slug's `externalId` at deprovision time even
+though the link itself never formed on the `sub`-configured comparison.
+**This is the tripwire for "my CC6.8 coverage for federated users is a
+false green."** A non-zero rate means:
+
+- Re-check `--oidc-scim-link-claim` against the [worked examples
+  table](#choosing-the-link-claim-for-your-idp) above — the most common
+  cause is Entra deployments left on the default `sub` instead of `oid`.
+- If the claim is already correct for your IdP, your IdP's `externalId`
+  simply doesn't correspond to either claim Yuzu records (`sub` or `oid`) —
+  SCIM cannot revoke this population's federated tokens, treat manual
+  revocation as a required offboarding step.
+
+**What this does not do:** D2 is a detection signal, not a guarantee — it
+only fires once a federated user has both logged in **and** later been
+deprovisioned. A federated population that never triggers a deprovision
+call in the window you're checking produces no signal either way; treat a
+zero rate as "nothing detected yet," not as proof every federated user is
+correctly linked.
 
 ## Reprovisioning a returning employee
 
@@ -395,6 +520,14 @@ with a **currently-active** account.
   [Deprovisioning order matters for group-granted admins](#deprovisioning-order-matters-for-group-granted-admins).
   Remove the user from the admin group first; the deactivate/delete call
   then succeeds on the next sync.
+- **The server refuses to start after upgrading, on a fresh SCIM
+  migration.** As of this release, `scim_resources.external_id` is unique
+  (excluding empty values) — a pre-existing duplicate `external_id` (e.g.
+  from a stale, uncleaned-up resource) fails the migration and the server
+  will not boot. This applies regardless of whether `--scim-enable` is set
+  on this boot. See "A duplicate SCIM `externalId` now refuses to boot" in
+  [`docs/user-manual/server-admin.md`](server-admin.md#upgrade-notes) for
+  the detection query and remediation steps.
 
 ## See also
 
@@ -408,3 +541,6 @@ with a **currently-active** account.
 - `docs/security-reviews/scim-groups-role-2026-07-13.md` — security review
   for Groups → role mapping (threat model, provenance-guard extension,
   deprovision-ordering decision).
+- `docs/adr/2001-scim-oidc-identity-linkage.md` — the ADR behind
+  [SCIM ↔ OIDC identity linkage](#scim--oidc-identity-linkage-federated-token-revocation)
+  above (design rationale, the D1/D2 forks, the deferred deny-at-login PR3).
