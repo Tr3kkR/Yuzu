@@ -41,10 +41,14 @@ enum class ApprovalOrigin {
     /// The MCP approval-ticket gate (mcp_server.cpp).
     kMcp,
     /// A stored value this build does not know — a row written by a newer
-    /// binary, or a corrupted column. DISTINCT from kUnspecified because
-    /// kUnspecified is the value that GRANTS redemption (#2442): folding an
-    /// unknown string into it would make an unrecognised surface redeemable,
-    /// which is the fail-open direction. Never written, only decoded.
+    /// binary, or a corrupted column. DISTINCT from kUnspecified because they
+    /// are different FACTS ("declared nothing" vs. "this build cannot
+    /// attribute it to any surface") even though both refuse at redemption
+    /// today (#2442's closing half retired the era where kUnspecified
+    /// granted): folding an unknown string into kUnspecified would erase that
+    /// distinction in the stored evidence, which matters for audit even
+    /// though it would not currently change whether the ticket redeems.
+    /// Never written, only decoded.
     kUnrecognised,
 };
 

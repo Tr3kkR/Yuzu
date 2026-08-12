@@ -10,11 +10,15 @@
   ordinary spent ticket to the caller (`approval already used (one-time ticket)`); the audit
   trail records the distinct cause as `refused: foreign_submitter`, and
   `yuzu_mcp_approval_masked_denials_total` covers a store fault at this same check the same way
-  it already covers one at the origin check. Not breaking: the sole production redemption path
-  has only ever redeemed a ticket as the principal that minted it, so no legitimate flow changes.
-  Delegated recall (a different principal redeeming on the original submitter's behalf) does not
-  exist anywhere in the tree today; a straight equality is the correct binding, not a placeholder
-  for a delegation model this release does not need.
+  it already covers one at the origin check. An intentional security-tightening compatibility
+  break, not expected to affect any supported flow: the sole production redemption path in this
+  codebase has only ever redeemed a ticket as the principal that minted it, verified by an
+  exhaustive sweep of every mint/consume call site — but that proves no in-tree delegation path,
+  not that no external integration ever relied on handing an `approval_id` to a different
+  principal. Delegated recall does not exist anywhere in this codebase today, so a straight
+  equality is the correct binding here, not a placeholder for a delegation model this release
+  does not need; an integration that needs one should file it rather than work around the
+  refusal.
 
   Related, separately tracked: #1803, the disclosure half this closes only a consequence of — the
   full id is still returned by `GET /api/approvals` to any `Approval:Read` holder. Either fix

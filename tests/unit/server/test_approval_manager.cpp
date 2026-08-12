@@ -1266,6 +1266,33 @@ TEST_CASE("ApprovalManager: the foreign-submitter refusal is a distinct kind but
     CHECK(denied.error().message == replay.error().message);
 }
 
+TEST_CASE("ApprovalManager: a ticket wrong on BOTH origin and submitter reports "
+          "kForeignOrigin, the more specific fact",
+          "[approval_manager][approval][security]") {
+    // The origin check runs first in the shared binding block, so it wins
+    // when both are true — pinned here rather than left as a claim in a
+    // comment. Not a security-relevant choice (both kinds are refused
+    // identically to the caller; this only affects which audit token is
+    // written), but a future reordering that silently flips it should fail a
+    // test, not just a review.
+    TestDb tdb;
+    ApprovalManager mgr(tdb.db);
+    mgr.create_tables();
+
+    // Declared non-MCP surface AND a different submitter than the one
+    // recalling it — wrong on both axes at once.
+    auto id = mgr.submit("mcp.quarantine_device", "operator1", "{\"agent_id\":\"a1\"}", "",
+                         ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+
+    auto denied = mgr.consume_ticket(*id, "operator2", {});
+    REQUIRE(!denied.has_value());
+    CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin);
+    CHECK(denied.error().message == kNotConsumableMessage);
+    CHECK(mgr.get(*id)->consumed_at == 0); // untouched either way
+}
+
 TEST_CASE("ApprovalManager: a store fault AT the binding check masks a foreign-submitter "
           "ticket's kind — until the fault clears",
           "[approval_manager][approval][security]") {

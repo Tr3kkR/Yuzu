@@ -9,11 +9,12 @@
   the argument — it is a compile error instead.
 
   **What breaks:** an undeclared origin (`ApprovalOrigin::kUnspecified` — an empty `origin`
-  column, or a row that predates the column and decoded to it) is no longer redeemable at the
-  MCP recall; it now refuses exactly like a declared foreign surface, reported with the same
-  generic "not consumable" message so the recall still cannot be used to fingerprint which
-  case applies. **Any MCP approval ticket already minted and still outstanding (pending or
-  approved-but-unconsumed) when you upgrade is refused, and must be re-requested** — re-call
-  the tool without `approval_id` to mint a fresh, correctly-declared ticket. Scheduled
-  approvals are unaffected: `ScheduleRunner` redeems by matching its own schedule id, never
-  through the MCP recall, so this guard never sees one.
+  column) is no longer redeemable at the MCP recall; it now refuses exactly like a declared
+  foreign surface, reported with the same generic "not consumable" message so the recall still
+  cannot be used to fingerprint which case applies. (A row that predates the `origin` column
+  entirely already refused before this release — migration v7 back-fills those to a distinct
+  `kUnrecognised` sentinel, not to `kUnspecified`.) **Any MCP approval ticket already minted and
+  still outstanding (pending or approved-but-unconsumed) when you upgrade is refused, and must
+  be re-requested** — re-call the tool without `approval_id` to mint a fresh, correctly-declared
+  ticket. Scheduled approvals are unaffected: `ScheduleRunner` redeems by matching its own
+  schedule id, never through the MCP recall, so this guard never sees one.

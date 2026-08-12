@@ -78,7 +78,9 @@ const char* to_string(ApprovalOrigin origin) {
     case ApprovalOrigin::kUnspecified:
     case ApprovalOrigin::kUnrecognised:
         // Neither is written as a surface. kUnrecognised only ever comes OUT of
-        // a decode; storing it would round-trip to kUnspecified, which grants.
+        // a decode; storing it would round-trip to kUnspecified, collapsing
+        // "this build cannot attribute it to any surface" into "declared
+        // nothing" — different facts even though both refuse today.
         break;
     }
 #if defined(__GNUC__) || defined(__clang__)
@@ -705,8 +707,14 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // the row, and must be exactly `mcp.<tool>` for the surface confusion to
     // work at all — that is the premise of the reserved prefix.)
     //
-    // get_checked, not get: a FAILED read must not decode as "no declared
-    // origin" or "no submitter", either of which is a value that grants.
+    // get_checked, not get: a FAILED read must not decode as an absent row —
+    // `get` collapsed the two, and a transient store fault reading as "no
+    // such row" is exactly the burn class the guard clause below (masked
+    // denial) exists to close. There is no submitter-side equivalent of
+    // kUnspecified's old grant: an empty `submitted_by` never equals a
+    // non-empty `consumed_by` (the empty-argument guard above already
+    // refused an empty `consumed_by`), so a missing submitter simply
+    // mismatches and refuses like any other wrong value.
     //
     // Runs BEFORE the precondition block because that block is conditional —
     // a caller supplying no precondition must not skip this.

@@ -3911,10 +3911,11 @@ McpServer::HandlerFn McpServer::build_handler(
                                            ? " (origin/submitter unverified)"
                                            : ""));
 
-                        // CLIENT message stays uniform for the two that must not
-                        // be distinguishable: a foreign-origin refusal reads
-                        // exactly like an ordinary replay, or the recall becomes
-                        // a probe for which surface minted a ticket.
+                        // CLIENT message stays uniform for the three that must
+                        // not be distinguishable: a foreign-origin or
+                        // foreign-submitter refusal reads exactly like an
+                        // ordinary replay, or the recall becomes a probe for
+                        // which surface minted a ticket or who it belongs to.
                         //
                         // kStoreError is NOT one of those. It leaves the ticket
                         // UNTOUCHED, so telling the caller it was "already used"

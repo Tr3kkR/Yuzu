@@ -407,7 +407,7 @@ that is still outstanding when you upgrade.
 does not grow after the upgrade — every ticket minted by the new server declares its surface
 at mint time, so nothing outstanding from this point on can hit this case.
 
-### vNEXT — MCP approval recall is now bound to its submitter (#2442) (not breaking)
+### vNEXT — MCP approval recall is now bound to its submitter (#2442) (intentional compatibility break, no supported flow affected)
 
 **What changes.** An approval ticket's `approval_id` is a bearer capability — presenting it is
 what authorizes the recall — and an id can be **disclosed** to a third party: `GET
@@ -418,11 +418,17 @@ MCP recall now refuses a ticket whose recorded submitter does not match the reca
 the same way it already refuses one minted on a foreign surface — same client message, a distinct
 audit token (`refused: foreign_submitter`) for the log.
 
-**Who this affects.** Nobody's legitimate flow: the one production redemption path (the MCP
-recall) has only ever redeemed a ticket as the same principal that minted it — this closes an
-attack a Viewer-plus-tool-RBAC principal could otherwise carry out, not a capability any operator
-relied on. Nothing to do at upgrade; there is no outstanding-ticket population this affects,
-because a legitimately-outstanding ticket was always going to be recalled by its own submitter.
+**Who this affects.** No supported flow: the one production redemption path in this codebase
+(the MCP recall) has only ever redeemed a ticket as the same principal that minted it, verified
+by an exhaustive sweep of every mint and consume call site in the tree, and the non-binding was
+documented as this issue's own hazard, never as an intended capability. What this cannot rule
+out is an external integration that relied on the old behavior to hand an `approval_id` between
+two different authenticated principals deliberately — nothing in this codebase does that, but an
+operator's own tooling might have. If something in your deployment presented a ticket as a
+different principal than the one that minted it, that now fails; there is no supported
+replacement for it today (see #2442 if you need one). Nothing to do at upgrade for the ordinary
+case: there is no outstanding-ticket population affected by this specific change, because a
+legitimately-outstanding ticket was always going to be recalled by its own submitter.
 
 ### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
 
@@ -431,12 +437,15 @@ shipped or bundled content uses that prefix, so a deployment running only Yuzu-s
 needs no action *for this item* — but the outstanding-approval entry above applies regardless of
 what content you run.
 
-**Why.** `mcp.<tool>` names an MCP approval ticket. The MCP recall matches a ticket on its
-definition id and scope expression and does not bind the submitter, so a definition authored
-under that prefix could line up with an MCP tool's canonical arguments — a ticket raised on one
-surface being redeemable on another. Consuming it still required the schema check, the tier
-gate, per-handler RBAC and a human approval, so this closes a namespace confusion rather than an
-open escalation.
+**Why.** `mcp.<tool>` names an MCP approval ticket. At the time this shipped, the MCP recall
+matched a ticket on its definition id and scope expression alone, so a definition authored under
+that prefix could line up with an MCP tool's canonical arguments — a ticket raised on one surface
+being redeemable on another. (Two later releases closed the redemption side of this directly, by
+binding the recall to the ticket's recorded origin and separately to its submitter — see the two
+entries above. This prefix reservation is the narrower, mint-time-adjacent half: it stops a
+definition from being authored under `mcp.` at all.) Consuming a confused ticket still required
+the schema check, the tier gate, per-handler RBAC and a human approval, so this closes a
+namespace confusion rather than an open escalation.
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
 authoring route that accepts an explicit id — `POST /api/instructions`, `POST

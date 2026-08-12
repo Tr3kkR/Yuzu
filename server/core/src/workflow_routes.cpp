@@ -1567,9 +1567,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 //
                 // It does NOT bar this path from minting into the reserved
                 // namespace — nothing does, deliberately. So this argument is
-                // load-bearing rather than decorative: drop it and the ticket
-                // becomes `kUnspecified`, which is the value that GRANTS at
-                // redemption.
+                // load-bearing rather than decorative: `submit()`'s `origin`
+                // parameter is no longer defaulted (#2442's closing half), so
+                // dropping it is a compile error today, not a silent
+                // `kUnspecified` — but get it wrong (e.g. pass kMcp for a
+                // non-MCP mint) and the ticket is falsely refusable or, worse,
+                // falsely exempt.
                 auto result = approval_manager->submit(def_id, session->username, scope_expr, "",
                                                        ApprovalOrigin::kInstruction);
                 if (!result) {
