@@ -4690,13 +4690,19 @@ public:
                 discovery_store_->set_metrics(&metrics_);
                 auto discovery_db = cfg_.db_dir() / "discovery.db";
                 if (!discovery_store_->migrate_from_sqlite(discovery_db)) {
-                    spdlog::error("[PG] Refusing to start: discovery legacy-SQLite backfill "
-                                  "failed (see prior log lines) — discovery_store is "
-                                  "AUTHORITATIVE and must not serve partially-migrated data. "
-                                  "Operator remediation: repair {} or move it aside to skip the "
-                                  "backfill (discovered devices in it, including the operator-set "
-                                  "managed flag, will NOT carry over)",
-                                  discovery_db.string());
+                    spdlog::error(
+                        "[PG] Refusing to start: discovery legacy-SQLite backfill failed — "
+                        "discovery_store is AUTHORITATIVE and must not serve partially-migrated "
+                        "data. Operator remediation depends on the SPECIFIC reason logged above, "
+                        "not on this line alone: if it names a corrupt/truncated/unreadable {} "
+                        "or a fingerprint refusal BEFORE any insert happened, nothing has been "
+                        "migrated yet and moving it aside safely skips the backfill (its "
+                        "devices, including the operator-set managed flag, will NOT carry "
+                        "over). If it instead names a reconciliation FAILED or completion-marker "
+                        "problem, this replica's rows may ALREADY be durably inserted in "
+                        "Postgres — do NOT move the file aside without first checking "
+                        "discovery_store.discovered_devices for the affected IP(s).",
+                        discovery_db.string());
                     startup_failed_ = true;
                 }
             }
