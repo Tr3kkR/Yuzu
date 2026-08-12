@@ -210,6 +210,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -231,6 +232,12 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#ifdef _WIN32
+#include <io.h> // _write — async-signal-safe stderr write, stop()'s escalation log (#2703 Gate 7 item 2)
+#else
+#include <unistd.h> // ::write — same
+#endif
 
 // Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kDashboardIndexHtml;
@@ -1151,6 +1158,80 @@ public:
                           "transaction hold time per ingest, by source and phase "
                           "(full = full-payload replace; hash_only = hash-skip compare)",
                           "histogram");
+        // RbacStore observability (ADR-0041). Described + zero-seeded up front so
+        // the HELP/TYPE lines and closed dims exist on an idle server — critical
+        // here because a degrade means fleet-wide authz DENY (a PG blip denies
+        // every authorized request), so absent-series alerting must work before
+        // the first degrade ever fires (Gate 6 sre BLOCKING / Gate 4 consistency).
+        metrics_.describe("yuzu_server_rbac_read_degrade_total",
+                          "Authorization reads/refreshes that hit a degraded store, by reason "
+                          "(pool_acquire_timeout/query_error = a check denied fail-closed rather "
+                          "than returning data; generation_refresh_failed = the cross-replica "
+                          "generation/enabled-flag refresh failed PAST the bounded ~5s stale-serve "
+                          "window and the perm cache was dropped — denying; "
+                          "generation_refresh_failed_within_bound/rbac_enabled_non_canonical/"
+                          "stale_beyond_accepted_bound are OBSERVE-ONLY — the store still served "
+                          "its existing decision from cache, this counts a data-quality or "
+                          "staleness condition rather than a denied check — see the alert's "
+                          "reason filter before assuming any nonzero rate here pages). "
+                          "A sustained non-zero rate in the denying reasons is a fleet-wide authz "
+                          "availability event, not mass access-denial — alert on it. "
+                          "A circuit-breaker-open denial (#2703 Gate 7 item 1 commit B) is recorded "
+                          "under pool_acquire_timeout, not a distinct reason — it is one of that "
+                          "reason's own two contributing failure modes (see "
+                          "yuzu_server_rbac_breaker_open for whether the pool is actually being "
+                          "touched right now).",
+                          "counter");
+        for (const auto reason : {"pool_acquire_timeout", "query_error",
+                                  "generation_refresh_failed", "generation_refresh_failed_within_bound",
+                                  "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
+            metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
+        metrics_.describe("yuzu_server_rbac_backfill_total",
+                          "One-time legacy rbac.db → rbac_store PostgreSQL backfill outcome on "
+                          "first PG boot, by result (fresh = no legacy DB, marked complete; "
+                          "completed = migrated + reconciled; failed = fail-closed, boot refused, "
+                          "next start retries).",
+                          "counter");
+        for (const auto result : {"fresh", "completed", "failed"})
+            metrics_.counter("yuzu_server_rbac_backfill_total", {{"result", result}});
+        // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the
+        // existing shared-pool signals (yuzu_pg_acquire_wait_seconds,
+        // yuzu_pg_pool_in_use — both already cover every RbacStore acquire, since
+        // RbacStore shares pg_pool_ with every other store): the acquire-wait
+        // histogram only measures the ACQUIRE, so it reads fast even in the
+        // measured table-lock scenario where the acquire succeeds and the QUERY
+        // itself blocks on PgPool's injected lock_timeout — this histogram wraps
+        // check_permission() end-to-end (acquire + query + cache lookup) and is
+        // the only place that scenario's true cost is visible. Zero-seeded (a
+        // fresh gauge/histogram already reads 0/empty on first touch) so both
+        // exist on an idle server before the first authz check ever runs.
+        metrics_.describe(
+            "yuzu_server_rbac_authz_check_seconds",
+            "End-to-end latency of RbacStore::check_permission (acquire + query + "
+            "cache lookup, all outcomes including cache hits and breaker-denied "
+            "fast paths) — NOT the same as yuzu_pg_acquire_wait_seconds, which "
+            "reads fast even when the acquire succeeds but the query itself "
+            "blocks (e.g. cancelled by PgPool's injected lock_timeout).",
+            "histogram");
+        // Gate 3 (architect + sre, 2 independent reporters): this histogram
+        // exists specifically to characterize the measured lock-contention
+        // tail (~18.5s, worst case ~40s analytically, #3016) — the default
+        // buckets cap at 10s, which would collapse that entire tail into a
+        // single +Inf bucket. Extended buckets, birthed ONCE here (#1686
+        // precedent, same as yuzu_pg_acquire_wait_seconds above) so the hot
+        // path's cached-pointer lookup in RbacStore::set_metrics() never has
+        // to allocate a bucket vector.
+        metrics_.histogram("yuzu_server_rbac_authz_check_seconds",
+                           yuzu::Histogram::seconds_buckets_60s());
+        metrics_.describe(
+            "yuzu_server_rbac_breaker_open",
+            "1 when the authz-hot-path fail-fast breaker is open (2 consecutive "
+            "pool-acquire-timeout or query-error failures — #2703 Gate 7 item 1 "
+            "commit B), 0 when closed. While open, every authz check on this "
+            "replica is denied WITHOUT touching the pool except one probe per "
+            "kRbacGenerationRefreshMs. Per-process, per-replica — not fleet-wide.",
+            "gauge");
+        metrics_.gauge("yuzu_server_rbac_breaker_open");
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
@@ -3939,10 +4020,35 @@ public:
             }
         }
 
-        // Initialize Phase 3: Security & RBAC stores
-        {
-            auto rbac_db = cfg_.db_dir() / "rbac.db";
-            rbac_store_ = std::make_unique<RbacStore>(rbac_db);
+        // Initialize Phase 3: Security & RBAC stores (PostgreSQL, ADR-0041).
+        // The authorization substrate — construction fail-closed (ADR-0007): a
+        // failed open/migration refuses boot rather than serve with authz off.
+        // `migrate_from_sqlite` runs the MANDATORY one-time legacy-`rbac.db`
+        // backfill (ADR-0009/0041) — a failure there is ALSO fatal (never serve
+        // on top of a partially-migrated authorization config; losing a grant or
+        // the enabled flag is a fleet-wide authorization change nobody authored).
+        if (pg_pool_ && !startup_failed_) {
+            rbac_store_ = std::make_unique<RbacStore>(*pg_pool_);
+            if (!rbac_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: RbacStore (authorization substrate) "
+                              "migration/open failed — fail-closed (ADR-0007/0041)");
+                startup_failed_ = true;
+            } else {
+                rbac_store_->set_metrics(&metrics_);
+                auto rbac_db = cfg_.db_dir() / "rbac.db";
+                if (!rbac_store_->migrate_from_sqlite(rbac_db)) {
+                    spdlog::error("[PG] Refusing to start: RbacStore legacy-SQLite backfill from {} "
+                                  "failed (see prior log lines) — the authorization substrate is "
+                                  "authoritative and must not serve partially-migrated grants or a "
+                                  "lost rbac_enabled flag (mandatory backfill, ADR-0009/0041)",
+                                  rbac_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("RbacStore initialized (schema rbac_store; legacy backfill source "
+                                 "{})",
+                                 rbac_db.string());
+                }
+            }
         }
 
         // Engine-principal namespace collision-scan preflight (design doc
@@ -6074,6 +6180,52 @@ public:
 
         stop_requested_.store(true, std::memory_order_release);
 
+        // #2703 Gate 7 merge-slice item 2: stop admitting/serving new HTTP
+        // work as early as reasonably possible — moved up from the old
+        // position after the entire thread-join cascade below, which left
+        // the server fully live and EVERY route (except /readyz, which
+        // already checks draining_ above) admitted and FULLY PROCESSED for
+        // the whole cascade's duration, including racing new work against
+        // stores this same function tears down a few lines later. The 30s
+        // execution-drain window above already gives a load balancer a
+        // /readyz-503 grace period before this point, so closing the
+        // listening socket here does not shorten that signal.
+        //
+        // begin_closing() BEFORE web_server_->stop(): flips the shutdown
+        // signal the /events, /api/v1/events, and dashboard-executions-
+        // drawer SSE providers already re-check every <=3s tick
+        // (StreamBudget::closing()), so an idle held-open stream on one of
+        // those three surfaces closes within one tick instead of pinning
+        // its httplib worker until the client disconnects. Flipped here
+        // (not at the draining_.store(true) point above) so an EventSource
+        // client doesn't see its connection torn down mid-drain and start
+        // auto-reconnect churn for the whole 30s window — it only happens
+        // once the socket is genuinely about to stop accepting anyway.
+        //
+        // NOT wired into the MCP GET/streamed-POST surfaces: McpStreamPump's
+        // teardown is driven by session_alive_/session-registry
+        // revalidation, a materially different mechanism (see
+        // StreamBudget::closing()'s doc comment) — an open MCP stream still
+        // relies on the bounded web-thread join below as its backstop.
+        // Tracked as a named follow-up (#2371 comment, 2026-08-11), not
+        // silently left uncovered.
+        if (stream_budget_)
+            stream_budget_->begin_closing();
+
+        // Stop cert reloader before web server (it holds a pointer to
+        // web_server_) — moved up alongside web_server_->stop() for the
+        // same early-admission-stop reason.
+        if (cert_reloader_) {
+            cert_reloader_->stop();
+            cert_reloader_.reset();
+        }
+        if (redirect_server_) {
+            redirect_server_->stop();
+        }
+        if (web_server_) {
+            web_server_->stop();
+        }
+
         // Signal AuthDB's provisional-MFA reaper to stop up front (it is owned
         // inside AuthDB, not a ServerImpl member thread, so it is not in the
         // joins below). This is signal-only — the join happens at
@@ -6162,23 +6314,67 @@ public:
         // reap_expired() is ticked from the result-set maintenance thread below,
         // which is joined before result_set_store_/guaranteed_state_store_ reset.
 
-        // Stop cert reloader before web server (it holds a pointer to web_server_)
-        if (cert_reloader_) {
-            cert_reloader_->stop();
-            cert_reloader_.reset();
-        }
-
-        if (redirect_server_) {
-            redirect_server_->stop();
-        }
+        // cert_reloader_/redirect_server_/web_server_ were already stopped
+        // early, above (#2703 Gate 7 item 2) — just the joins remain here.
+        // redirect_thread_ gets a bare join: the redirect server serves only
+        // 301s, never a held-open response, so unlike web_thread_ it has no
+        // plausible hang scenario and does not need the bounded treatment
+        // below.
         if (redirect_thread_.joinable()) {
             redirect_thread_.join();
         }
-        if (web_server_) {
-            web_server_->stop();
-        }
+
+        // #2703 Gate 7 merge-slice item 2 (operator-adjudicated: 15s
+        // shutdown grace bound). std::thread has no timed join, so
+        // web_thread_'s body signals web_thread_done_ right after
+        // web_server_->listen() returns (already closed above) and this
+        // waits on that signal instead of a bare join(). On the fast path —
+        // the common case once the close-signal above has drained every
+        // /events / /api/v1/events / dashboard-drawer stream — this returns
+        // within one keep-alive tick, well under the bound.
+        //
+        // Escalation is a deliberate std::_Exit, NOT the nvd_sync
+        // leak-and-continue precedent a few lines above: nvd_sync's leak
+        // works because releasing nvd_sync_ keeps everything the wedged
+        // thread references alive, and nothing ELSE in this function
+        // touches it again. A wedged HTTP worker captures `this` and half
+        // of ServerImpl's stores — continuing teardown (every
+        // reset()/destructor below) past a thread that might still be
+        // running a handler against those same stores is a use-after-free
+        // farm, not a leak. `_Exit` skips the remaining teardown below
+        // (including offload_target_store_->flush_all(), the RESTART-1 fix)
+        // exactly the same way a supervisor SIGKILL would — strictly no
+        // worse, and it only fires when the close-signal above did NOT
+        // reach every stream: an open MCP GET/streamed-POST connection (the
+        // one surface item 2 does not close-signal — see
+        // StreamBudget::closing()'s doc comment) or a genuinely wedged
+        // handler.
         if (web_thread_.joinable()) {
-            web_thread_.join();
+            std::unique_lock<std::mutex> lk(web_thread_done_mtx_);
+            const bool finished = web_thread_done_cv_.wait_for(
+                lk, std::chrono::seconds(15), [this] { return web_thread_done_; });
+            lk.unlock();
+            if (finished) {
+                web_thread_.join();
+            } else {
+                // `stop()` is called synchronously and directly from the SIGTERM/SIGINT
+                // OS signal handler (`on_signal()`, main.cpp) — NOT deferred to a normal
+                // thread context. spdlog::critical()/flush() allocate and take internal
+                // locks, which is undefined behaviour inside a signal handler (the same
+                // class #73 fixed for the single log line at the top of on_signal(), but
+                // never eliminated from the rest of the synchronously-invoked stop() call
+                // graph — tracked as a systemic follow-up). Use only the async-signal-safe
+                // primitive already established there: a raw write() of a fixed message.
+                const char msg[] =
+                    "ServerImpl::stop: web thread did not finish within the 15s shutdown "
+                    "grace bound (#2703 Gate 7 item 2) - force-exiting.\n";
+#ifdef _WIN32
+                _write(2, msg, sizeof(msg) - 1);
+#else
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+                std::_Exit(1);
+            }
         }
 
         // Phase 8.3 #255 — drain offload batch buffers BEFORE the store is
@@ -6395,6 +6591,16 @@ public:
         if (gateway_service_)
             gateway_service_->set_guaranteed_state_store(nullptr);
         guaranteed_state_store_.reset();
+        // RbacStore (authorization substrate, ADR-0041) borrows pg_pool_ — drop
+        // before the pool. Every HTTP/gRPC/MCP handler holding the raw pointer is
+        // quiesced by the drains above; the ManagementGroupStore's
+        // set_rbac_enabled_probe captures `this` and reads rbac_store_.get() only
+        // at request time, so after the drains a now-null pointer is never
+        // dereferenced, and rbac_enforcement_in_effect(nullptr) fails CLOSED
+        // regardless. (Its declaration precedes mgmt_group_store_ so pure
+        // destruction order is also safe — this proactive reset keeps stop()'s
+        // destruct-before-pool discipline explicit.)
+        rbac_store_.reset();
         // Auth substrate (ADR-0006/0010) — destruct-before-pool, and in
         // dependency order. AuthDB owns a background reaper thread
         // (cleanup_provisional_mfa) that leases pg_pool_ via
@@ -7538,6 +7744,22 @@ private:
         if (!rbac_enforcement_in_effect(rbac_store_.get()))
             return true; // loaded & explicitly disabled → legacy-open
         return rbac_store_ && rbac_store_->check_scoped_permission(username, "Response", "Read",
+                                                                   agent_id, mgmt_group_store_.get());
+    }
+
+    /// Same shape as `response_agent_in_scope`, bound to ("Inventory","Read"): the
+    /// per-device Inventory-scope predicate for GET /api/v1/inventory/software (REST)
+    /// and query_installed_software (MCP). Was two byte-identical inline lambdas
+    /// gating on the raw `!is_rbac_enabled()` accessor instead of
+    /// `rbac_enforcement_in_effect` — that accessor can read stale-false while RBAC is
+    /// durably enabled elsewhere (a degraded generation-refresh cache, ADR-0041), which
+    /// would silently disclose the whole fleet's software inventory to a confined
+    /// operator (governance re-review, #2703). Hoisted to one definition so the REST
+    /// and MCP surfaces cannot drift the way #2500's dispatch-targeting defect did.
+    bool inventory_agent_in_scope(const std::string& username, const std::string& agent_id) const {
+        if (!rbac_enforcement_in_effect(rbac_store_.get()))
+            return true; // loaded & explicitly disabled → legacy-open
+        return rbac_store_ && rbac_store_->check_scoped_permission(username, "Inventory", "Read",
                                                                    agent_id, mgmt_group_store_.get());
     }
 
@@ -9114,6 +9336,11 @@ private:
             bool inventory_ok = inventory_store_ && inventory_store_->is_open();
             // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
             bool approval_ok = approval_manager_ && approval_manager_->is_open();
+            // RbacStore (authorization substrate, ADR-0041) — now born-on-PG and
+            // load-bearing for every RBAC/authz check. It was in /readyz but not
+            // here; a degraded rbac_store fails authz reads CLOSED (denies), so a
+            // "healthy" report over a dead authz store would be misleading.
+            bool rbac_ok = rbac_store_ && rbac_store_->is_open();
             // #2636: ResultSetStore was wired into /readyz but missing here — same
             // readyz-vs-healthz drift class the InventoryStore row above documents.
             // Fixed alongside the ADR-0038 GuaranteedStateStore migration since both
@@ -9131,7 +9358,7 @@ private:
                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok && result_set_ok && mgmt_group_ok;
+                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -9155,6 +9382,7 @@ private:
                   {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
                   {"device_inventory_store", device_inventory_ok ? "ok" : "error"},
                   {"inventory_store", inventory_ok ? "ok" : "error"},
+                  {"rbac_store", rbac_ok ? "ok" : "error"},
                   {"result_set_store", result_set_ok ? "ok" : "error"},
                   {"management_group_store", mgmt_group_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
@@ -10189,8 +10417,9 @@ private:
             // of releasing early at post-routing.
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
-                    return detail::sse_content_provider(sink_state, offset, sink);
+                [sink_state, budget = stream_budget_.get()](size_t offset,
+                                                            httplib::DataSink& sink) -> bool {
+                    return detail::sse_content_provider(sink_state, offset, sink, budget);
                 },
                 detail::adopt_quota_slot_into_stream(
                     [sink_state, bus, lease](bool success) noexcept {
@@ -13512,10 +13741,18 @@ private:
         // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
         // off); else the caller's management-group members. The global-read branch is
         // load-bearing — a bare get_visible_agents would blank an admin in no group.
+        //
+        // #2703 Gate 7: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled())
+        // — the latter can read stale-false while RBAC is durably enabled elsewhere (a
+        // degraded generation-refresh cache), which would silently disclose the whole
+        // fleet to a confined operator. Mirrors get_visible_agents_json's identical
+        // fix immediately above.
         auto visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
-                if (!rbac_store_->check_permission(username, "Infrastructure", "Read")) {
+            if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
+                bool global_read = rbac_store_ && rbac_store_->is_open() &&
+                                   rbac_store_->check_permission(username, "Infrastructure", "Read");
+                if (!global_read) {
                     // ADR-0042: get_visible_agents nullopt means the mgmt-store
                     // DEGRADED — return an EMPTY confined set (fail-closed: sees
                     // nothing), NOT nullopt here (which means "sees all fleet").
@@ -15926,10 +16163,7 @@ private:
             // param defaults to {} = no filter (unscoped fleet read).
             software_inventory_store_.get(),
             [this](const std::string& username, const std::string& agent_id) -> bool {
-                if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
-                    return true;
-                return rbac_store_->check_scoped_permission(username, "Inventory", "Read", agent_id,
-                                                            mgmt_group_store_.get());
+                return inventory_agent_in_scope(username, agent_id);
             },
             // #1634: per-agent Response-scope predicate for the fan-out response
             // readers (GET /api/v1/executions/{id}/visualization). Routes through the
@@ -16127,10 +16361,7 @@ private:
                 // isolation). MUST be wired here; the param defaults to {} = no filter.
                 software_inventory_store_.get(),
                 [this](const std::string& username, const std::string& agent_id) -> bool {
-                    if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
-                        return true;
-                    return rbac_store_->check_scoped_permission(username, "Inventory", "Read",
-                                                                agent_id, mgmt_group_store_.get());
+                    return inventory_agent_in_scope(username, agent_id);
                 },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
@@ -16286,6 +16517,15 @@ private:
                 spdlog::info("Web UI available at http://{}:{}/", cfg_.web_address, listen_port);
             }
             web_server_->listen(cfg_.web_address, listen_port);
+            // #2703 Gate 7 item 2: listen() returned (every worker drained back
+            // into the pool and the pool itself joined — see httplib's
+            // ThreadPool::shutdown()), so this thread is about to exit. Signal
+            // stop()'s bounded wait rather than making it guess.
+            {
+                std::lock_guard<std::mutex> lk(web_thread_done_mtx_);
+                web_thread_done_ = true;
+            }
+            web_thread_done_cv_.notify_all();
         });
     }
 
@@ -16487,6 +16727,15 @@ private:
     std::unique_ptr<grpc::Server> mgmt_server_;
     std::unique_ptr<httplib::Server> web_server_;
     std::thread web_thread_;
+    // #2703 Gate 7 merge-slice item 2: signalled by web_thread_'s body right
+    // after web_server_->listen() returns, so stop() can bound how long it
+    // waits before joining rather than blocking on web_thread_.join()
+    // indefinitely (std::thread has no timed join). A std::thread must still
+    // be join()'d somewhere or its destructor calls std::terminate — this
+    // pairs with a wait_for(15s) in stop(), never a bare wait().
+    std::mutex web_thread_done_mtx_;
+    std::condition_variable web_thread_done_cv_;
+    bool web_thread_done_{false};
 
     // HTTPS redirect server
     std::unique_ptr<httplib::Server> redirect_server_;

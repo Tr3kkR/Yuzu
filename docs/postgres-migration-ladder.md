@@ -51,7 +51,7 @@ hole — `security-guardian` gates each.
 
 | Store | Schema | Provisional posture | Notes |
 |---|---|---|---|
-| `RbacStore` | `rbac_store` | authoritative | authz; security-critical. |
+| `RbacStore` | `rbac_store` | authoritative | **In flight — ADR-0041** (Wave 2.1). authz substrate; highest blast radius. Reads FAIL CLOSED (deny-on-degrade, never open — closes the corrupt-rbac.db fail-open). Perm cache made cross-replica-coherent via a durable `rbac_meta.write_generation` token. MANDATORY backfill (grants/roles/groups are irreducible operator intent) with CRITICAL `rbac_enabled` flag preservation — losing it silently reverts the fleet to RBAC-off (fail-open). |
 | `ManagementGroupStore` | `management_group_store` | authoritative | **In flight — ADR-0042** (Wave 2.2). Confinement hierarchy feeding RbacStore `authorize_list_read` (ADR-0017). Confinement-feeding reads made degrade-distinguishable (nullopt→DenyAll) — the DENY-set read is fail-OPEN if it silently degrades to empty. Recursive-CTE ancestors/descendants w/ cycle guard. MANDATORY backfill (confinement scope = irreducible operator intent). Coordinated with RbacStore #2703. |
 | `PolicyStore` | `policy_store` | authoritative | compliance evaluation. |
 | `BaselineStore` | `baseline_store` | authoritative | Guardian deployable unit; uses `SqliteTxn`/`SqliteStmt`. |

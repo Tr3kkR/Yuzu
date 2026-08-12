@@ -17,9 +17,9 @@
  * (mirrors test_rest_api_tokens.cpp) — no httplib::Server, no acceptor
  * thread, TSan-safe (#438).
  *
- * PG-gated: EnginePrincipalStore is a born-on-Postgres store (ADR-0006).
- * Skips when YUZU_TEST_POSTGRES_DSN is unset, fails when set but broken
- * (test_helpers.hpp skip-vs-fail contract).
+ * PG-gated: EnginePrincipalStore AND RbacStore are both born-on-Postgres
+ * stores (ADR-0006). Skips when YUZU_TEST_POSTGRES_DSN is unset, fails when
+ * set but broken (test_helpers.hpp skip-vs-fail contract).
  */
 
 #include "engine_principal_store.hpp"
@@ -79,6 +79,11 @@ public:
     [[nodiscard]] EnginePrincipalStore* get() const noexcept { return store_.get(); }
     EnginePrincipalStore* operator->() const noexcept { return store_.get(); }
 
+    // RbacStore coexists in this SAME database (own `rbac_store` schema) —
+    // RestEngineRolesHarness shares this pool rather than standing up a
+    // second PG database per test.
+    [[nodiscard]] yuzu::server::pg::PgPool& pool() noexcept { return *pool_; }
+
 private:
     std::optional<yuzu::test::PostgresTestDb> db_;
     std::optional<yuzu::server::pg::PgPool> pool_;
@@ -88,9 +93,12 @@ private:
 struct RestEngineRolesHarness {
     yuzu::server::test::TestRouteSink sink;
 
-    yuzu::test::TempDbFile rbac_db_file{"yuzu_test_rest_engine_roles_rbac-"};
-    RbacStore rbac_store{rbac_db_file.path};
+    // engine_store declared first: its constructor is where the
+    // YUZU_TEST_POSTGRES_DSN SKIP actually fires (mirrors ModelHarness in
+    // test_access_review_model.cpp), and rbac_store below is constructed
+    // from engine_store's pool, so engine_store must exist first.
     EnginePrincipalStorePg engine_store;
+    std::unique_ptr<RbacStore> rbac_store;
 
     std::string session_user{"admin"};
     auth::Role session_role{auth::Role::admin};
@@ -113,7 +121,8 @@ struct RestEngineRolesHarness {
     RestApiV1 api;
 
     RestEngineRolesHarness() {
-        REQUIRE(rbac_store.is_open());
+        rbac_store = std::make_unique<RbacStore>(engine_store.pool());
+        REQUIRE(rbac_store->is_open());
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
@@ -143,7 +152,7 @@ struct RestEngineRolesHarness {
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
-                            &rbac_store,
+                            rbac_store.get(),
                             /*mgmt_store=*/nullptr,
                             /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr,
@@ -198,16 +207,16 @@ TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: assign creates a reso
           "fleet-wide grant (the loop the reviewer flagged)",
           "[pg][rest][engine_principal][rbac]") {
     RestEngineRolesHarness h;
-    REQUIRE(h.rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(h.rbac_store->create_role({.name = "EngineReader", .description = "d"}).has_value());
     REQUIRE(
-        h.rbac_store.set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
+        h.rbac_store->set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
     REQUIRE(h.engine_store
                ->create("Vuln Sync", "alice", "cloud IAM parity", "internal", "admin",
                         "engine:vuln")
                .has_value());
 
     // Before assignment: the resolver has nothing to resolve.
-    CHECK_FALSE(h.rbac_store.check_permission("engine:vuln", "Inventory", "Read"));
+    CHECK_FALSE(h.rbac_store->check_permission("engine:vuln", "Inventory", "Read"));
 
     auto res = h.assign("vuln", R"({"role":"EngineReader"})");
     REQUIRE(res);
@@ -217,7 +226,7 @@ TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: assign creates a reso
     // The end-to-end proof: RbacStore::check_permission on "engine:vuln" now
     // resolves true through the resolution-side UNION arm — production
     // route -> RbacStore::assign_role -> collect_roles_locked engine arm.
-    CHECK(h.rbac_store.check_permission("engine:vuln", "Inventory", "Read"));
+    CHECK(h.rbac_store->check_permission("engine:vuln", "Inventory", "Read"));
 
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].action == "engine_principal.role.assigned");
@@ -240,21 +249,21 @@ TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: assign creates a reso
 TEST_CASE("REST DELETE /api/v1/engine-principals/{id}/roles/{role}: unassign removes the grant",
           "[pg][rest][engine_principal][rbac]") {
     RestEngineRolesHarness h;
-    REQUIRE(h.rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(h.rbac_store->create_role({.name = "EngineReader", .description = "d"}).has_value());
     REQUIRE(
-        h.rbac_store.set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
+        h.rbac_store->set_permission({"EngineReader", "Inventory", "Read", "allow"}).has_value());
     REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
                .has_value());
 
     REQUIRE(h.assign("vuln", R"({"role":"EngineReader"})")->status == 201);
-    REQUIRE(h.rbac_store.check_permission("engine:vuln", "Inventory", "Read"));
+    REQUIRE(h.rbac_store->check_permission("engine:vuln", "Inventory", "Read"));
 
     auto res = h.unassign("vuln", "EngineReader");
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->body.find("\"unassigned\":true") != std::string::npos);
 
-    CHECK_FALSE(h.rbac_store.check_permission("engine:vuln", "Inventory", "Read"));
+    CHECK_FALSE(h.rbac_store->check_permission("engine:vuln", "Inventory", "Read"));
 
     bool found_unassign_audit = false;
     for (const auto& e : h.audit_log)
@@ -292,7 +301,7 @@ TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: admin/system role ass
     }
 
     // None of the rejected grants ever landed.
-    CHECK(h.rbac_store.get_principal_roles("engine", "engine:vuln").empty());
+    CHECK(h.rbac_store->get_principal_roles("engine", "engine:vuln").empty());
 }
 
 TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: unknown role name rejected 400",
@@ -304,26 +313,26 @@ TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: unknown role name rej
     auto res = h.assign("vuln", R"({"role":"NoSuchRole"})");
     REQUIRE(res);
     CHECK(res->status == 400);
-    CHECK(h.rbac_store.get_principal_roles("engine", "engine:vuln").empty());
+    CHECK(h.rbac_store->get_principal_roles("engine", "engine:vuln").empty());
 }
 
 TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: assigning to a nonexistent engine "
           "principal returns 404",
           "[pg][rest][engine_principal][rbac]") {
     RestEngineRolesHarness h;
-    REQUIRE(h.rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(h.rbac_store->create_role({.name = "EngineReader", .description = "d"}).has_value());
 
     auto res = h.assign("no-such-principal", R"({"role":"EngineReader"})");
     REQUIRE(res);
     CHECK(res->status == 404);
-    CHECK(h.rbac_store.get_principal_roles("engine", "engine:no-such-principal").empty());
+    CHECK(h.rbac_store->get_principal_roles("engine", "engine:no-such-principal").empty());
 }
 
 TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: assigning to a revoked engine "
           "principal returns 404 (terminal, not a transient outage)",
           "[pg][rest][engine_principal][rbac]") {
     RestEngineRolesHarness h;
-    REQUIRE(h.rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(h.rbac_store->create_role({.name = "EngineReader", .description = "d"}).has_value());
     REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
                .has_value());
     auto revoked = h.engine_store->revoke("engine:vuln");
@@ -339,7 +348,7 @@ TEST_CASE("REST /api/v1/engine-principals/{id}/roles: unauthenticated session ca
           "(auth_fn gate runs before the store write)",
           "[pg][rest][engine_principal][rbac]") {
     RestEngineRolesHarness h;
-    REQUIRE(h.rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(h.rbac_store->create_role({.name = "EngineReader", .description = "d"}).has_value());
     REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
                .has_value());
     h.auth_enabled = false;
@@ -350,7 +359,7 @@ TEST_CASE("REST /api/v1/engine-principals/{id}/roles: unauthenticated session ca
     // std::nullopt and the handler returns without ever calling assign_role —
     // no grant lands, no audit row fires, regardless of the exact status code
     // the (mocked) auth_fn chose to set.
-    CHECK(h.rbac_store.get_principal_roles("engine", "engine:vuln").empty());
+    CHECK(h.rbac_store->get_principal_roles("engine", "engine:vuln").empty());
     CHECK(h.audit_log.empty());
 }
 
@@ -358,7 +367,7 @@ TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: a non-admin/engine se
           "Security:Write is denied",
           "[pg][rest][engine_principal][rbac]") {
     RestEngineRolesHarness h;
-    REQUIRE(h.rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(h.rbac_store->create_role({.name = "EngineReader", .description = "d"}).has_value());
     REQUIRE(h.engine_store->create("Vuln Sync", "alice", "j", "internal", "admin", "engine:vuln")
                .has_value());
 
@@ -371,7 +380,7 @@ TEST_CASE("REST POST /api/v1/engine-principals/{id}/roles: a non-admin/engine se
     auto res = h.assign("vuln", R"({"role":"EngineReader"})");
     REQUIRE(res);
     CHECK(res->status == 403);
-    CHECK(h.rbac_store.get_principal_roles("engine", "engine:vuln").empty());
+    CHECK(h.rbac_store->get_principal_roles("engine", "engine:vuln").empty());
     CHECK(h.audit_log.empty()); // the route's own audit never fires — perm_fn gated first
 }
 
