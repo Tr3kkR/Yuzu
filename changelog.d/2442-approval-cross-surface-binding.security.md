@@ -9,9 +9,10 @@
   invocation with no way to tell. Two of the three mint paths already record their surface; the recall now
   refuses any ticket whose **recorded** surface is something other than MCP. The refusal is
   deliberately indistinguishable from an ordinary spent-ticket response, so the recall cannot be
-  used to probe which surface minted a ticket. A ticket with no recorded surface stays redeemable — the
-  MCP mint is itself undeclared until its own follow-up lands, so that exemption is what keeps the
-  gate working; it closes when the MCP mint declares itself.
+  used to probe which surface minted a ticket. A ticket with no recorded surface stays redeemable at
+  the time of this release — the MCP mint is itself undeclared until its own follow-up lands, so
+  that exemption is what keeps the gate working; a later release closes it once the MCP mint
+  declares itself (see the "MCP mint now declares its own surface" entry).
 
 - **Breaking — an approval granted but not yet redeemed when you upgrade is refused, and must be
   re-requested.** Rows predating the new column record no surface, and rather than assume one they
@@ -23,10 +24,12 @@
   affected — a schedule redeems by matching its own schedule id rather than through the MCP recall,
   so the origin check never sees one. The affected population does not grow after the upgrade.
 
-- **This binds the surface, not the submitter.** The recall still does not compare who obtained the
-  approval against who presents it, so a valid `approval_id` remains redeemable by any principal
-  that also passes the tier gate and the tool's own RBAC. Treat an `approval_id` as a secret. Both
-  halves are tracked: #2442 stays open for the submitter binding, #1803 for the read exposure.
+- **This binds the surface, not the submitter — at the time of this release.** The recall did not
+  yet compare who obtained the approval against who presents it, so a valid `approval_id` was
+  redeemable by any principal that also passed the tier gate and the tool's own RBAC. A later
+  release closes the submitter half too (see the "MCP approval recall is now bound to its
+  submitter" entry). Treat an `approval_id` as a secret regardless — #1803, the read-exposure half
+  (`GET /api/approvals` disclosure), remains open independent of either fix.
 
 - **A stored origin this build does not recognise is now refused rather than treated as
   undeclared.** "No declared origin" is the value that *grants*, so folding an unknown string into

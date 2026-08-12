@@ -6,11 +6,12 @@
   ordinary store contention — and store contention is influenceable from the same
   authenticated MCP session. The refusal is still fail-closed (nothing is redeemed either
   way), but the site is now distinguishable: a new
-  `yuzu_mcp_approval_masked_denials_total{tool}` counter and an ` (origin unverified)` /
+  `yuzu_mcp_approval_masked_denials_total{tool}` counter and an ` (origin/submitter unverified)` /
   ` (lookup)` audit-detail suffix mark a refusal where the origin
   comparison could not run, and `ApprovalManager` logs a warning at the fault site itself so
   every `consume_ticket` caller gets the signal, not only the MCP recall. The ticket remains
-  approved and redeemable once the fault clears.
+  approved and redeemable once the fault clears. (The suffix also covers a later release's
+  submitter comparison, added to the same read — see the submitter-binding entry.)
 - **An approval store that is open but failing permanently (corruption, not-a-database,
   read-only, disk full) no longer tells the caller to retry forever.** The MCP recall's
   store-fault response previously discriminated permanent from transient failures solely by

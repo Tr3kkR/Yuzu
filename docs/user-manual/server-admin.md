@@ -363,15 +363,17 @@ outstanding across the upgrade still fires. If nothing is awaiting an MCP recall
 there is nothing to do.
 
 **Rolling BACK across this release re-opens the check, and rolling forward does not close it
-again.** The back-fill runs once, as a schema migration. An older server started against an
-already-migrated database does not re-run it and does not refuse to start; approvals it mints while
-you are rolled back record no minting surface, which is the value that stays redeemable. Rolling
-forward will not revisit them, because the migration has already run. Treat a roll-back as a window
-in which the cross-surface check is not in force for newly minted approvals, and let those
-approvals expire rather than relying on them being re-checked. Expiry bounds the window, but note it
-runs from two different points: a pending approval expires 7 days after submission, and an approved
-but unredeemed one 7 days after its review — so an approval minted during a roll-back can remain
-redeemable for up to around a fortnight from the mint, not one week.
+again — but as of this same release, it does not stay open either.** The back-fill runs once, as a
+schema migration. An older server started against an already-migrated database does not re-run it
+and does not refuse to start; approvals it mints while you are rolled back record no minting
+surface at all (the column is never set). Rolling forward will not revisit those rows, because the
+migration has already run — but the MCP mint in this same release always declares its own surface
+(see the "MCP mint now declares its own surface" entry below), so a row with no recorded surface is
+no longer the value that grants: it is refused at recall exactly like a declared foreign surface,
+not exempted. There is no window in which a rollback-minted ticket is redeemable once you are back
+on a current server. Treat a roll-back as a window during which such tickets simply won't work
+later — mint fresh ones after rolling forward rather than relying on anything minted during the
+roll-back.
 
 **What happens.** This release records which surface minted each approval, and rows that predate the
 column carry no surface at all. Rather than assume one they may not have come from, the upgrade

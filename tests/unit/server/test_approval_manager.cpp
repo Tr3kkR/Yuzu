@@ -381,6 +381,13 @@ TEST_CASE("ApprovalManager: consume_ticket without a principal fails closed",
 
 TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the original consumer",
           "[approval_manager][approval]") {
+    // Replay by the SAME submitter, deliberately (#2442 submitter binding,
+    // added after this test was written): a replay by a DIFFERENT principal
+    // would now be refused by the binding check as kForeignSubmitter, BEFORE
+    // ever reaching the CAS this test exists to pin — so using a different
+    // principal here would silently stop testing replay protection at all
+    // (the CAS's already-consumed guard could be deleted and this test would
+    // still pass, refused for the wrong reason).
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
@@ -390,8 +397,9 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
     REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
 
-    auto replay = mgr.consume_ticket(*id, "operator2", {});
-    CHECK(!replay.has_value());
+    auto replay = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!replay.has_value());
+    CHECK(replay.error().kind == ConsumeFailure::kNotConsumable);
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
     CHECK(row->consumed_by == "operator1"); // the losing recall never overwrites

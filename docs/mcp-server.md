@@ -85,8 +85,10 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > the ticket's own submitter (#2442) — a Viewer who merely read the ticket id
 > off `GET /api/approvals` cannot redeem it. (e) and (f) are enforced only at
 > this consume step, not at the pending-poll lookup above, and their refusal
-> reads identically to an ordinary replay or a wrong tool/arguments — see
-> -32003 below for why. A successful consume lets the call through to the
+> reads identically to an ordinary replay — see -32003 below for why. (A
+> wrong-tool/arguments mismatch is a DIFFERENT, earlier refusal — a distinct
+> message, at (b)/(c) above, not this one; it is not part of the anti-oracle
+> group.) A successful consume lets the call through to the
 > handler. A recall against a still-**pending**
 > ticket returns the same `kApprovalRequired` envelope (keep polling
 > `status_url`); a rejected/expired/mismatched/consumed ticket returns

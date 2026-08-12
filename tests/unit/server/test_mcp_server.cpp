@@ -8236,11 +8236,11 @@ TEST_CASE("MCP approval recall refuses a ticket presented by a different princip
     // cannot see. The scenario this closes: operator2 read operator1's
     // approved ticket id off GET /api/approvals (Approval:Read, seeded to
     // Viewer) and also holds delete_tag's own RBAC permission.
-    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_2442_mcp_tag_"}};
     yuzu::server::TagStore tags(tagdb.path);
     tags.set_tag("agent-1", "role", "web", "server");
 
-    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_2442_mcp_appr_"}};
     sqlite3* raw = nullptr;
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
     yuzu::server::ApprovalManager appr(raw);

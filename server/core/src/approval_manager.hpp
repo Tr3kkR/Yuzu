@@ -147,14 +147,21 @@ enum class ConsumeFailure {
     kForeignSubmitter, ///< recalled by a principal other than the ticket's submitter (#2442)
 };
 
-/// The one refusal message for every "this ticket cannot be redeemed" outcome.
-/// kForeignOrigin and kForeignSubmitter deliberately share it with
-/// kNotConsumable: the KIND separates a forgery attempt (wrong surface, or
-/// wrong principal) from a replay for the log, but the MESSAGE must not, or
-/// the recall becomes an oracle for which SURFACE minted a ticket or WHO
-/// submitted it. (Not for which definition ids exist: a mismatched id is
-/// refused earlier, and with a different message, before this is reached.)
-/// One home so the copies cannot drift apart.
+/// The one refusal message this STORE returns for every "this ticket cannot
+/// be redeemed" outcome. kForeignOrigin and kForeignSubmitter deliberately
+/// share it with kNotConsumable: the KIND separates a forgery attempt (wrong
+/// surface, or wrong principal) from a replay for the log, but the MESSAGE
+/// must not, or the recall becomes an oracle for which SURFACE minted a
+/// ticket or WHO submitted it. (Not for which definition ids exist: a
+/// mismatched id is refused earlier, and with a different message, before
+/// this is reached.)
+///
+/// NOT one home end-to-end: the MCP recall (`mcp_server.cpp`) does not
+/// consume this constant — it independently hardcodes its own client-facing
+/// string ("approval already used (one-time ticket)"), worded differently
+/// but semantically the same refusal. The two are kept in sync by test
+/// assertions at each layer, not by sharing a symbol. If a future consumer
+/// of `ConsumeError` wants the store's own wording, this is it.
 /// Stable audit token, one per failure kind. The AUDIT trail is server-side and
 /// is never returned to the caller, so the anti-oracle reasoning below does NOT
 /// reach it: suppressing the distinction there would destroy the only evidence
