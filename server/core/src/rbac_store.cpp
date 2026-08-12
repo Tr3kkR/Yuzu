@@ -1363,18 +1363,42 @@ void RbacStore::maybe_refresh_generation() const {
                 generation_valid_ = false;
             }
         } else {
-            // The refresh genuinely landed — this is the ONLY place (besides
-            // boot and a local write) that earns a last_successful_refresh_ms_
-            // update.
-            last_successful_refresh_ms_ = now_ms();
-            if (durable_enabled)
+            // fjarvis (PR #2703 re-review, MEDIUM, residual in the F2 fix):
+            // last_successful_refresh_ms_ used to bump here whenever
+            // write_generation alone was read, regardless of whether
+            // rbac_enabled was ALSO confirmed this round -- durable_enabled
+            // is nullopt both when the value was non-canonical (counted via
+            // saw_non_canonical_enabled below) AND when the row was simply
+            // absent from the result set (never counted at all, since the
+            // per-row loop above only sets saw_non_canonical_enabled inside
+            // its `k == "rbac_enabled"` branch). Either way, the freshness
+            // clock this store's OWN staleness check relies on
+            // (generation_view_stale_locked(), consulted by both perm_cache_
+            // trust and rbac_enabled_view_degraded()) was advancing on a
+            // round that never actually confirmed rbac_enabled -- a replica
+            // cached at rbac_enabled_=false could then keep
+            // rbac_enforcement_in_effect() returning false (legacy-open)
+            // indefinitely instead of degrading after kRbacStaleServeBoundMs,
+            // the asymmetric-with-write_generation direction that matters.
+            // Only advance the freshness clock, and adopt the enabled value,
+            // when BOTH rows were confirmed this round.
+            const bool row_absent = !durable_enabled && !saw_non_canonical_enabled;
+            if (row_absent)
+                fire_non_canonical_degrade = true; // same degrade class: rbac_enabled unconfirmed
+            if (durable_enabled) {
+                last_successful_refresh_ms_ = now_ms();
                 rbac_enabled_.store(*durable_enabled, std::memory_order_relaxed);
+            }
             // Adopt the durable generation only when it moves FORWARD (Gate 3
             // cpp-safety): the SELECT above ran lock-free, so a concurrent
             // local apply_local_generation may have advanced cached_generation_
             // past what we read — never regress it (that would wrongly clear a
             // just-populated cache and re-anchor to a stale value). Generations
-            // are monotonic, so `>` is the correct adopt test.
+            // are monotonic, so `>` is the correct adopt test. This half is
+            // independent of rbac_enabled's own confirmation above — a
+            // successfully-read write_generation still anchors perm_cache_
+            // validity even on a round where rbac_enabled specifically
+            // couldn't be confirmed.
             if (!generation_valid_ || *durable_gen > cached_generation_) {
                 perm_cache_.clear();
                 cached_generation_ = *durable_gen;
@@ -3530,41 +3554,56 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
         // this backfill's existing transaction — no window where the row
         // is gone but the marker isn't there yet to suppress the reseed.
         //
-        // Delete any PG role_permissions row whose role AND securable_type
-        // were BOTH known to legacy (so legacy could have had an opinion
-        // about it) but whose exact (role,type,op) triple is absent from
-        // legacy's own role_permissions — i.e. explicitly revoked, not
-        // merely never-seeded. Scoping to legacy's own catalogue is what
-        // protects a securable a LATER seed_defaults() adds (e.g.
-        // EnginePrincipal, #2376): its type is never in legacy's
-        // securable_types, so the role/type filter excludes it and the
-        // newly-seeded grant survives untouched. An empty
-        // legacy_role_names/legacy_type_names (a pre-securable_types-table
-        // legacy schema) makes both `= ANY` filters match nothing —
-        // degrades to "touch nothing" rather than guessing. Comparison
-        // values are sanitize_pg_text()'d identically to the INSERT above
-        // so a legacy string with invalid UTF-8/embedded NUL matches its
-        // own already-stored (equally sanitized) row instead of spuriously
-        // mismatching and revoking a row legacy still has.
-        // INVARIANT (security-guardian, #2703): this scoping is safe only
-        // because every default grant added to an EXISTING (role,
-        // securable_type) pair since the legacy schema was frozen has, so
-        // far, ridden a brand-new securable_type (EnginePrincipal, #2376).
-        // A future default grant added to an EXISTING role+type pair before
-        // a cutover would be revoked by this same logic, since legacy would
-        // know about both the role and the type but not (yet) have the new
-        // grant. That failure direction is a lockout (access denial), not
-        // an escalation, so it stays safe — but revisit this scoping if
-        // that pattern ever changes.
+        // Delete any PG role_permissions row whose role, securable_type, AND
+        // operation were ALL known to legacy (so legacy could have had an
+        // opinion about it) but whose exact (role,type,op) triple is absent
+        // from legacy's own role_permissions — i.e. explicitly revoked, not
+        // merely never-seeded. Scoping to legacy's own catalogues (all
+        // three: roles, securable_types, AND operations) is what protects a
+        // securable/operation a LATER seed_defaults() adds — a brand-new
+        // securable_type (EnginePrincipal, #2376) is never in legacy's
+        // securable_types; a brand-new OPERATION on an EXISTING role+type
+        // pair (ApiToken:Rotate, P2 #11 — fjarvis re-review, blocking C1,
+        // reproduced against live Postgres: the original two-dimension
+        // scoping deleted and PERMANENTLY suppressed exactly this grant on
+        // every upgrade from a legacy catalogue that predates Rotate) is
+        // never in legacy's operations. Either filter excludes the row and
+        // the newly-seeded grant survives untouched. An empty
+        // legacy_role_names/legacy_type_names/legacy_op_names (a
+        // pre-securable_types/operations-table legacy schema) makes every
+        // `= ANY` filter match nothing — degrades to "touch nothing" rather
+        // than guessing. Comparison values are sanitize_pg_text()'d
+        // identically to the INSERT above so a legacy string with invalid
+        // UTF-8/embedded NUL matches its own already-stored (equally
+        // sanitized) row instead of spuriously mismatching and revoking a
+        // row legacy still has.
+        //
+        // fjarvis (PR #2703 re-review, blocking C1, reproduced against live
+        // Postgres): the invariant above was falsified by this same PR's own
+        // dev merge — ApiToken:Rotate (P2 #11) is a new OPERATION on the
+        // pre-existing (Administrator, ApiToken) / (ApiTokenManager,
+        // ApiToken) pairs, so every upgrade from a legacy catalogue that
+        // predates Rotate had it silently deleted and permanently
+        // suppressed via revoked_seed_defaults, logged as an "operator-
+        // revoked default" it never was. Fixed by adding legacy's own
+        // operations catalogue as a third filter dimension — an operation
+        // legacy never knew about is one legacy could not have had an
+        // opinion about, the same reasoning already applied to role and
+        // type. A genuine operator revocation of an operation legacy DID
+        // know about is still caught (that row is present in legacy_op_names
+        // but absent from perm_ops for this role+type+op triple).
         {
-            std::vector<std::string> legacy_role_names, legacy_type_names, perm_roles, perm_types,
-                perm_ops;
+            std::vector<std::string> legacy_role_names, legacy_type_names, legacy_op_names,
+                perm_roles, perm_types, perm_ops;
             legacy_role_names.reserve(roles.size());
             for (const auto& r : roles)
                 legacy_role_names.push_back(sanitize_pg_text(r.name));
             legacy_type_names.reserve(types.size());
             for (const auto& t : types)
                 legacy_type_names.push_back(sanitize_pg_text(t.name));
+            legacy_op_names.reserve(ops.size());
+            for (const auto& o : ops)
+                legacy_op_names.push_back(sanitize_pg_text(o.first));
             perm_roles.reserve(perms.size());
             perm_types.reserve(perms.size());
             perm_ops.reserve(perms.size());
@@ -3594,6 +3633,7 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                 "  DELETE FROM rbac_store.role_permissions rp "
                 "  WHERE rp.role_name = ANY($1::text[]) "
                 "  AND rp.securable_type = ANY($2::text[]) "
+                "  AND rp.operation = ANY($6::text[]) "
                 "  AND NOT EXISTS ("
                 "    SELECT 1 FROM unnest($3::text[], $4::text[], $5::text[]) "
                 "      AS legacy(role_name, securable_type, operation) "
@@ -3610,7 +3650,8 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                                          pg::to_text_array(to_views(legacy_type_names)),
                                          pg::to_text_array(to_views(perm_roles)),
                                          pg::to_text_array(to_views(perm_types)),
-                                         pg::to_text_array(to_views(perm_ops))});
+                                         pg::to_text_array(to_views(perm_ops)),
+                                         pg::to_text_array(to_views(legacy_op_names))});
             if (revoked.status() != PGRES_COMMAND_OK) {
                 spdlog::error(
                     "RbacStore: migrate_from_sqlite: revoked-permission cleanup failed: {}",

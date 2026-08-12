@@ -2326,13 +2326,21 @@ TEST_CASE("RbacStore: backfill removes a seeded default permission the operator 
         // between open and close must not leak the handle.
         SqliteDb db;
         REQUIRE(sqlite3_open(legacy.path.string().c_str(), db.addr()) == SQLITE_OK);
-        // Legacy KNOWS about role "Viewer" and securable_type "AuditLog"
-        // (both existed pre-upgrade) — this is exactly what scopes the
-        // delete. Deliberately NO ('Viewer','AuditLog','Read') row: the
-        // operator called remove_permission() to revoke it before upgrading.
+        // Legacy KNOWS about role "Viewer", securable_type "AuditLog", AND
+        // operation "Read" (all three existed pre-upgrade -- fjarvis
+        // re-review, blocking C1: the operations catalogue row is what
+        // scopes the delete to an operation legacy could actually have had
+        // an opinion about, the same reasoning already applied to role and
+        // type; omitting it here made this fixture indistinguishable from
+        // "legacy never heard of Read at all", under which C1's fix
+        // correctly does NOT delete -- masking the very revocation this
+        // test exists to prove). Deliberately NO ('Viewer','AuditLog','Read')
+        // row in role_permissions: the operator called remove_permission()
+        // to revoke it before upgrading.
         REQUIRE(sqlite3_exec(db.get(),
                              "INSERT INTO roles VALUES ('Viewer', 'seeded', 1, 0);"
-                             "INSERT INTO securable_types VALUES ('AuditLog', '', 1);",
+                             "INSERT INTO securable_types VALUES ('AuditLog', '', 1);"
+                             "INSERT INTO operations VALUES ('Read', '', 1);",
                              nullptr, nullptr, nullptr) == SQLITE_OK);
     }
     REQUIRE(store.migrate_from_sqlite(legacy.path));
@@ -2368,6 +2376,70 @@ TEST_CASE("RbacStore: backfill removes a seeded default permission the operator 
     // that table is what makes this assertion hold.
     RbacStore reopened{rbac_pool_fx_};
     CHECK_FALSE(reopened.check_role_has_permission("Viewer", "AuditLog", "Read"));
+}
+
+// fjarvis (PR #2703 re-review, blocking C1, reproduced against live
+// Postgres) — the mirror image of the F1 test above, on the third
+// dimension. F1 proves a brand-new securable TYPE (EnginePrincipal) added
+// after the legacy schema was frozen survives the revoked-permission
+// cleanup untouched. This proves the identical property for a brand-new
+// OPERATION (Rotate) added to a PRE-EXISTING role+type pair -- exactly the
+// shape this PR's own dev merge (ApiToken:Rotate, P2 #11) introduced, and
+// exactly the shape the two-dimension (role, type) scoping could not tell
+// apart from a genuine operator revocation: legacy knows about
+// Administrator/ApiTokenManager and ApiToken, but (being older than the
+// Rotate operation) never had a role_permissions row granting Rotate to
+// either -- indistinguishable from "explicitly revoked" without the
+// operation dimension. A genuine revocation of an operation legacy DID
+// know about (Read, here) is still caught in the SAME backfill, proving
+// the fix doesn't just widen to "never revoke anything".
+TEST_CASE("RbacStore: backfill preserves a newly-added default operation on a pre-existing "
+          "role+type pair, and still catches a genuine revocation of a known operation "
+          "(fjarvis re-review, blocking C1)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_c1_rotate-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), db.addr()) == SQLITE_OK);
+        // Legacy KNOWS about Administrator/ApiTokenManager and ApiToken, and
+        // KNOWS about "Read" (but never Rotate -- this legacy catalogue
+        // pre-dates that operation entirely, matching every real deployment
+        // upgrading from a release before P2 #11). Deliberately no
+        // ('*','ApiToken','Rotate') row anywhere -- legacy never had an
+        // opinion on an operation it didn't know existed. Also revokes
+        // Administrator's Read on ApiToken explicitly, to prove a genuine
+        // revocation of a KNOWN operation still works in the same pass.
+        REQUIRE(sqlite3_exec(db.get(),
+                             "INSERT INTO roles VALUES ('Administrator', 'seeded', 1, 0);"
+                             "INSERT INTO roles VALUES ('ApiTokenManager', 'seeded', 1, 0);"
+                             "INSERT INTO securable_types VALUES ('ApiToken', '', 1);"
+                             "INSERT INTO operations VALUES ('Read', '', 1);"
+                             "INSERT INTO operations VALUES ('Write', '', 1);"
+                             "INSERT INTO role_permissions VALUES "
+                             "('ApiTokenManager', 'ApiToken', 'Read', 'allow');"
+                             "INSERT INTO role_permissions VALUES "
+                             "('ApiTokenManager', 'ApiToken', 'Write', 'allow');",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    // THE FIX: Rotate on both roles survives -- legacy never knew the
+    // operation existed, so it's excluded from the revoked-permission scan
+    // entirely, exactly like a brand-new securable type would be.
+    CHECK(store.check_role_has_permission("Administrator", "ApiToken", "Rotate"));
+    CHECK(store.check_role_has_permission("ApiTokenManager", "ApiToken", "Rotate"));
+    // Genuine revocation still caught: legacy knew about Read on this exact
+    // role+type but has no row granting it to Administrator.
+    CHECK_FALSE(store.check_role_has_permission("Administrator", "ApiToken", "Read"));
+    // And survives a reseed, same as the F1 test -- recorded in
+    // revoked_seed_defaults, not just a one-time DELETE.
+    RbacStore reopened{rbac_pool_fx_};
+    CHECK(reopened.check_role_has_permission("Administrator", "ApiToken", "Rotate"));
+    CHECK(reopened.check_role_has_permission("ApiTokenManager", "ApiToken", "Rotate"));
+    CHECK_FALSE(reopened.check_role_has_permission("Administrator", "ApiToken", "Read"));
 }
 
 // fjarvis F2 (#2703, HIGH), schema-level layer: `rbac_meta.value` for
@@ -2419,4 +2491,76 @@ TEST_CASE("RbacStore: refuses to start on a non-canonical rbac_enabled value alr
     // the hand-set value before load_enabled_flag() reads it.
     RbacStore reopened{rbac_pool_fx_};
     CHECK_FALSE(reopened.is_open());
+}
+
+// fjarvis (PR #2703 re-review, MEDIUM, residual in the F2 fix) — a DIFFERENT
+// moment than the two tests above: not initial boot (load_enabled_flag()),
+// but a later REFRESH (maybe_refresh_generation()) that finds
+// write_generation readable but rbac_enabled's row entirely ABSENT (as
+// opposed to present-but-non-canonical, already counted). Pre-fix this had
+// no counter, no log, AND kept advancing last_successful_refresh_ms_ as if
+// the round had fully succeeded -- the generation view reported itself
+// "fresh" indefinitely even though rbac_enabled specifically was never
+// re-confirmed. The dangerous direction: a replica cached at
+// rbac_enabled_=false would keep rbac_enforcement_in_effect() returning
+// false (legacy-open) forever instead of degrading after
+// kRbacStaleServeBoundMs.
+TEST_CASE("RbacStore: a refresh finding rbac_enabled's row absent (write_generation still "
+          "readable) degrades the view past the bound instead of reporting fresh forever "
+          "(fjarvis re-review, MEDIUM)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    REQUIRE_FALSE(replica_a.is_rbac_enabled()); // fresh install default
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 4}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics);
+
+    // Delete rbac_enabled's row directly -- write_generation stays readable,
+    // isolating exactly the asymmetry this fix closes (not a general
+    // refresh failure, which the existing !durable_gen path already
+    // handles correctly).
+    {
+        auto lease = pool_b.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "DELETE FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled'",
+                                std::vector<std::string>{})
+                    .ok());
+    }
+
+    // Clear the 1s stampede gate so the next check genuinely attempts a
+    // refresh rather than serving the gated fast path, then trigger one.
+    // Construction already counted as a genuine completed refresh, so
+    // replica_b is not degraded yet at this point.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    REQUIRE_FALSE(replica_b.rbac_enabled_view_degraded());
+    (void)replica_b.is_rbac_enabled(); // triggers maybe_refresh_generation()
+
+    // THE FIX: the absent row is now counted (pre-fix: silently uncounted).
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "rbac_enabled_non_canonical"}})
+              .value() == 1.0);
+
+    // Push wall time past kRbacStaleServeBoundMs (5000ms) from that SAME
+    // refresh attempt, with the row still absent throughout -- no
+    // subsequent round can ever confirm rbac_enabled either. Each call
+    // below re-triggers maybe_refresh_generation() (past its own 1s gate),
+    // finding the same absent row every time.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    (void)replica_b.is_rbac_enabled();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    (void)replica_b.is_rbac_enabled();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    (void)replica_b.is_rbac_enabled();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // THE FIX: the view is now degraded -- pre-fix, last_successful_refresh_ms_
+    // kept advancing on every one of the calls above despite rbac_enabled
+    // never being confirmed, so this would have stayed false forever.
+    CHECK(replica_b.rbac_enabled_view_degraded());
+    CHECK(rbac_enforcement_in_effect(&replica_b));
 }
