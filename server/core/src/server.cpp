@@ -9753,6 +9753,16 @@ private:
         if (directory_sync_) {
             settings_routes_->set_access_review_directory_sync(directory_sync_.get());
         }
+        // ADR-2001 §§1,3: the dashboard user DELETE deprovision seam
+        // resolves the SCIM slug -> linked-OIDC principal set through
+        // scim_store_ (born-on-PG, constructed unconditionally in the ctor
+        // above alongside api_token_store_) before revoking credentials.
+        // Nullable/deferred-wiring, same posture as the setters above — a
+        // null store degrades the resolver to the slug-only set rather than
+        // failing closed (see deprovision_revoke.hpp's doc comment).
+        if (scim_store_) {
+            settings_routes_->set_scim_store(scim_store_.get());
+        }
         settings_routes_->register_routes(
             *web_server_,
             [this](const httplib::Request& req, httplib::Response& res) {
@@ -15235,9 +15245,22 @@ private:
                 startup_failed_ = true;
             }
             scim_routes_ = std::make_unique<ScimRoutes>();
+            // ADR-2001 §3: token_store threads ApiTokenStore into the
+            // deprovision seams so PATCH/PUT active:false, DELETE, and
+            // create-with-active:false revoke API tokens credentials-FIRST
+            // across the resolved slug + linked-OIDC principal set.
+            // ADR-2001 D1: analytics_store is the codebase's actual
+            // severity channel (AnalyticsEvent::severity via
+            // AnalyticsEventStore, the same mechanism AuthRoutes::
+            // emit_event uses) — threaded so the role-refused-with-link
+            // signal can be raised at Severity::kCritical; AuditEvent
+            // itself carries no severity field. Nullable/deferred like the
+            // other optional stores above — analytics_store_ may be null
+            // when --analytics-db is unset.
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
                                           audit_store_.get(), cfg_.scim_admin_group,
-                                          engine_principal_store_.get());
+                                          engine_principal_store_.get(),
+                                          api_token_store_.get(), analytics_store_.get());
         }
 
         // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set
