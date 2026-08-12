@@ -10,7 +10,7 @@
   ` (lookup)` audit-detail suffix mark a refusal where the origin
   comparison could not run, and `ApprovalManager` logs a warning at the fault site itself so
   every `consume_ticket` caller gets the signal, not only the MCP recall. The ticket remains
-  approved and redeemable once the fault clears. (The suffix also covers a later release's
+  approved and redeemable once the fault clears. (The suffix also covers this same release's
   submitter comparison, added to the same read — see the submitter-binding entry.)
 - **An approval store that is open but failing permanently (corruption, not-a-database,
   read-only, disk full) no longer tells the caller to retry forever.** The MCP recall's
