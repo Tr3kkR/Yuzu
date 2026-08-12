@@ -714,6 +714,17 @@ int main(int argc, char* argv[]) {
     app.add_flag("--oidc-skip-tls-verify", cfg.oidc_skip_tls_verify,
                  "Disable TLS certificate verification for OIDC endpoints (INSECURE, dev only)")
         ->envname("YUZU_OIDC_SKIP_TLS_VERIFY");
+    // ADR-2001 §1 — selects which validated ID token claim is used as the
+    // SCIM-externalId join key at login. "sub" (default) matches Okta's
+    // typical externalId; "oid" matches Entra (whose externalId rides the
+    // `oid` claim, not `sub`). Boot rejects anything outside the allow-list
+    // fail-closed (CLI::IsMember below), never a silent fallback.
+    app.add_option("--oidc-scim-link-claim", cfg.oidc_scim_link_claim,
+                   "ID token claim used as the SCIM externalId join key at OIDC login "
+                   "(default: sub). Entra deployments typically need \"oid\".")
+        ->default_val("sub")
+        ->check(CLI::IsMember({"sub", "oid"}))
+        ->envname("YUZU_OIDC_SCIM_LINK_CLAIM");
 
     // SAML 2.0 SSO options (not supported on Windows — fail-closed)
     app.add_option("--saml-idp-entity-id", cfg.saml_idp_entity_id,
