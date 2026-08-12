@@ -18,6 +18,7 @@
 #include "mcp_policy.hpp"
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
+#include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
 #include "principal_class.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — the unified A4 denial wrapper (#1470)
 
@@ -2433,9 +2434,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // must never collide onto — or silently migrate onto — the same
         // principal, which #1832's RBAC reconcile would otherwise make
         // destructive (one user's login deleting the other's group
-        // memberships). Mirrors AuthManager::create_oidc_session's
-        // construction exactly.
-        const std::string username = "oidc:" + claims.iss + "#" + claims.sub;
+        // memberships). ADR-2001 §5 — built through the single shared
+        // helper, which is also what AuthManager::create_oidc_session uses,
+        // so the two mint sites cannot drift apart.
+        const std::string username = oidc::oidc_principal_id(claims.iss, claims.sub);
         auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
 
         // #1832 — reconcile IdP group memberships into the RBAC store BEFORE

@@ -73,6 +73,14 @@ struct ScimResource {
     int64_t etag_version{1}; ///< Bumped on every mutation; usable as a SCIM ETag.
 };
 
+/// One `(iss, sub)` OIDC identity linked to a SCIM resource (ADR-2001 §2,
+/// `identity_links` table). The owning `scim_id` is the query input for
+/// `links_for_scim_id` and is deliberately not repeated on this struct.
+struct LinkedIdentity {
+    std::string iss;
+    std::string sub;
+};
+
 /// A single SCIM Group resource (slice 2, #2021): the IdP-facing group `id`/
 /// `externalId`/`displayName` — membership itself lives in the separate
 /// `scim_group_members` join table, not on this struct.
@@ -145,6 +153,19 @@ public:
     /// Empty `external_id` always returns `nullopt` (an empty externalId is
     /// not a meaningful lookup key).
     std::optional<ScimResource> find_by_external_id(const std::string& external_id) const;
+
+    /// ADR-2001 §2 mis-link guard (codex-sol plan-review BLOCK): forms a
+    /// result ONLY when exactly one ACTIVE resource matches `external_id`.
+    /// Returns `nullopt` on zero matches (normal — no such resource) AND on
+    /// more than one match (an externalId ambiguity — the caller MUST treat
+    /// this as "no link formed" plus a loud signal, never pick one
+    /// arbitrarily). Empty `external_id` always returns `nullopt`, matching
+    /// `find_by_external_id`. Belt-and-braces alongside the partial-unique
+    /// index on `scim_resources.external_id` (migration v3): this check is
+    /// the layer that still holds even if the index is ever bypassed or
+    /// absent. Does NOT change `find_by_external_id`'s existing contract —
+    /// other callers keep using that one.
+    std::optional<ScimResource> find_unique_active_by_external_id(const std::string& external_id) const;
 
     /// 1-based `start_index` per the SCIM list-response convention (RFC 7644
     /// §3.4.2 `startIndex`). `total_out` receives the total resource count
@@ -268,6 +289,60 @@ public:
     /// rejects, and the same argument this PR makes for MFA.
     std::optional<std::vector<std::string>>
     list_group_display_names_for_user(const std::string& user_scim_id) const;
+
+    // ── Identity linkage (ADR-2001) ──────────────────────────────────────
+    //
+    // `identity_links` durably records the (iss, sub) OIDC identity that a
+    // successful OIDC login resolved to a SCIM resource under a configured
+    // `--oidc-scim-link-claim`. No route/orchestration logic here — that is
+    // a later ADR-2001 task; this store owns the table only (INV-31-3, one
+    // owning store).
+
+    /// Idempotent upsert keyed `(iss, sub)` (the table's UNIQUE constraint —
+    /// one link per OIDC identity). Re-linking the same `(iss, sub)` updates
+    /// `scim_id` and bumps `linked_at` to now; calling twice with identical
+    /// arguments is a no-op-equivalent (same row, refreshed timestamp).
+    /// Returns false on CSPRNG/db failure or an empty `iss`/`sub`/`scim_id`.
+    /// ADR-2001 §2: the write is deliberately fail-OPEN from the login
+    /// path's point of view — the CALLER (a later task) must not fail a
+    /// login because this returned false; the missing link is instead
+    /// caught by the D2 detector (`observation_matches`).
+    bool upsert_link(const std::string& iss, const std::string& sub, const std::string& scim_id);
+
+    /// Every OIDC identity currently linked to `scim_id` — the deprovision
+    /// seam's lookup direction (by `scim_id`, which the table's `(iss,sub)`
+    /// key does not serve; hence the secondary index). `nullopt` when the
+    /// store could not answer (mirrors `list_group_member_user_scim_ids`):
+    /// a deprovision path folding this into "nothing to revoke" on a
+    /// transient blip is exactly the CC6.8 gap ADR-2001 exists to close, so
+    /// callers MUST fail closed on `nullopt` rather than treat it as "no
+    /// linked identities". An engaged-but-empty vector means the scim_id
+    /// genuinely has no linked OIDC identity yet.
+    std::optional<std::vector<LinkedIdentity>>
+    links_for_scim_id(const std::string& scim_id) const;
+
+    // ── OIDC login observations (ADR-2001 D2 detector) ───────────────────
+    //
+    // Records every OIDC login's attempted link-claim value — regardless of
+    // whether it matched a SCIM resource — so a later deprovision can
+    // surface a should-have-matched candidate under a misconfigured
+    // `--oidc-scim-link-claim` (a real, actionable "your link claim is
+    // wrong for this IdP" signal instead of a silent gap).
+
+    /// Idempotent upsert keyed `(iss, sub)` (one observation per identity,
+    /// refreshed on every login). Returns false on db failure or an empty
+    /// `iss`/`sub`/`claim_name`.
+    bool record_login_observation(const std::string& iss, const std::string& sub,
+                                  const std::string& claim_name, const std::string& claim_value);
+
+    /// True if any recorded login observation carries this exact
+    /// `claim_value` — the D2 "did any login present a candidate that
+    /// should have matched" signal. This is a best-effort detection signal,
+    /// not an authorization decision (ADR-2001 D2), so a store-unusable
+    /// read collapses to `false` rather than a tri-state failure — treating
+    /// "cannot tell" as "no candidate seen" is the safe direction for a
+    /// signal that only ever ADDS a human-facing hint, never gates access.
+    bool observation_matches(const std::string& claim_value) const;
 
 private:
     pg::PgPool& pool_;
