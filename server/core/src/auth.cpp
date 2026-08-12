@@ -2,6 +2,8 @@
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/metrics.hpp>
 
+#include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -1049,7 +1051,10 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     // share — keying on it let two same-named users collide onto one
     // principal, which #1832's RBAC reconcile then makes destructive
     // (one user's login can delete the other's group memberships).
-    const std::string stable_username = "oidc:" + iss + "#" + oidc_sub;
+    // ADR-2001 §5 — built through the single shared helper (never hand-built
+    // here) so a future deprovision-time resolver reconstructing this same
+    // string cannot silently drift from the mint site.
+    const std::string stable_username = yuzu::server::oidc::oidc_principal_id(iss, oidc_sub);
     const std::string resolved_display = display_name.empty() ? email : display_name;
 
     auto token = generate_session_token();

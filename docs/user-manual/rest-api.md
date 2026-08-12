@@ -7624,6 +7624,7 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` — rename onto an existing `displayName` / fails `500` |
 | `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed) |
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
+| `scim.user.deprovision_role_refused_with_link` | `failure` | ADR-2001 D1: a role-refused deprovision (`deprovision_role_ok` 404 — the slug's role is not `user`) for a slug with ≥1 active linked OIDC identity, whose tokens are therefore NOT auto-revoked. Always written alongside `yuzu_scim_deprovision_role_refused_with_active_link_total` — see `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
 
 #### Metrics
 
@@ -7633,8 +7634,16 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 `yuzu_scim_role_change_failures_total` (a role change that was decided but
 failed to durably apply — pairs with `scim.user.role_changed` `failure`
 rows).
+
+**ADR-2001 (SCIM↔OIDC identity linkage, CC6.8):**
+`yuzu_scim_deprovision_role_refused_with_active_link_total` (D1 — a
+deprovision was refused for a slug with an active linked federated identity
+whose tokens were not auto-revoked; a human must terminate them manually)
+and `yuzu_scim_deprovision_unlinked_total` (D2 — a deprovision found a
+login observation that should have matched the slug's `externalId` but no
+link had formed, almost always a misconfigured `--oidc-scim-link-claim`).
 Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
-Metrics.
+Metrics and "SCIM ↔ OIDC identity linkage for deprovision" § New metrics.
 
 ---
 

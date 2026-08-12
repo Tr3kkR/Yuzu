@@ -74,6 +74,63 @@ const std::vector<pg::PgMigration>& migrations() {
          "  user_scim_id  TEXT NOT NULL,"
          "  PRIMARY KEY (group_scim_id, user_scim_id));"
          "CREATE INDEX scim_group_members_user_idx ON scim_group_members (user_scim_id);"},
+        // v3 (ADR-2001, Task 1 foundation): the identity-linkage tables +
+        // the scim_resources.external_id ambiguity fix. All three DDL
+        // changes below run as ONE migration transaction (the runner's
+        // exec_ok wraps the whole multi-statement string), so the partial-
+        // unique index failing rolls the two new tables back with it —
+        // there is no "tables created but store still opens with an
+        // unenforced uniqueness assumption" outcome.
+        {3,
+         // identity_links — durable (iss, sub) -> scim_id link recorded at
+         // OIDC login (ADR-2001 §2). UNIQUE (iss, sub): one link per OIDC
+         // identity. Secondary index on scim_id: deprovision looks up BY
+         // scim_id, which the (iss,sub) key does not serve.
+         "CREATE TABLE identity_links ("
+         "  iss        TEXT NOT NULL,"
+         "  sub        TEXT NOT NULL,"
+         "  scim_id    TEXT NOT NULL,"
+         "  linked_at  BIGINT NOT NULL,"
+         "  UNIQUE (iss, sub));"
+         "CREATE INDEX identity_links_scim_id_idx ON identity_links (scim_id);"
+
+         // oidc_login_observations — every OIDC login's attempted
+         // candidate claim value(s), regardless of match (ADR-2001 D2
+         // detector). UNIQUE (iss, sub, claim_name): one observation PER
+         // CANDIDATE CLAIM per identity, upserted on each login. Deliberately
+         // NOT (iss, sub) alone (governance Gate 7 BLOCKING fix): the
+         // headline D2 misconfiguration is an operator running with
+         // `--oidc-scim-link-claim=sub` while the SCIM externalId is
+         // actually the Entra `oid` — under a (iss, sub)-unique table only
+         // the CONFIGURED claim's value survives the upsert, so
+         // `observation_matches(external_id)` (keyed on the oid value) never
+         // matches and D2 never fires for the exact misconfiguration it
+         // exists to catch. Recording one row per candidate claim (sub AND
+         // oid, when both are present) means the oid candidate is on record
+         // even though link FORMATION never used it.
+         "CREATE TABLE oidc_login_observations ("
+         "  iss          TEXT NOT NULL,"
+         "  sub          TEXT NOT NULL,"
+         "  claim_name   TEXT NOT NULL,"
+         "  claim_value  TEXT NOT NULL,"
+         "  seen_at      BIGINT NOT NULL,"
+         "  UNIQUE (iss, sub, claim_name));"
+
+         // scim_resources.external_id ambiguity fix (codex-sol plan-review
+         // BLOCK): external_id was indexed but never UNIQUE, so a
+         // pre-existing duplicate could let link formation mis-link an
+         // OIDC identity to the wrong SCIM user. A plain (non-CONCURRENT —
+         // this runs inside the migration's transaction, and
+         // CREATE INDEX CONCURRENTLY cannot run in one, see
+         // pg_migration_runner.hpp) partial unique index means Postgres
+         // itself detects any pre-existing duplicate non-empty external_id
+         // and raises a unique_violation, which fails this whole migration
+         // (and, per the comment above, the two new tables with it) —
+         // construction then reports !is_open(), fail-closed, matching
+         // this store's ADR-0012 posture. No separate detect-and-refuse
+         // code path needed: the index creation IS the detector.
+         "CREATE UNIQUE INDEX scim_resources_external_id_uniq ON scim_resources (external_id) "
+         "WHERE external_id IS NOT NULL;"},
     };
     return kMigrations;
 }
@@ -328,6 +385,27 @@ std::optional<ScimResource> ScimStore::get_by_username(const std::string& userna
     return read_resource(res.get(), 0);
 }
 
+std::optional<std::optional<ScimResource>>
+ScimStore::get_by_username_checked(const std::string& username) const {
+    if (!open_)
+        return std::nullopt; // store unusable — never conflate with "not found"
+    if (username.empty())
+        return std::optional<ScimResource>{}; // nothing asked for — a definitive non-match
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt; // lease timeout — store error, not "not found"
+
+    std::string sql =
+        std::string("SELECT ") + kResourceCols + " FROM scim_store.scim_resources WHERE username = $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{username});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt; // query failed — store error, not "not found"
+    if (PQntuples(res.get()) == 0)
+        return std::optional<ScimResource>{}; // store answered: genuinely no such row
+    return std::optional<ScimResource>{read_resource(res.get(), 0)};
+}
+
 std::optional<ScimResource> ScimStore::find_by_external_id(const std::string& external_id) const {
     if (!open_ || external_id.empty())
         return std::nullopt;
@@ -341,6 +419,29 @@ std::optional<ScimResource> ScimStore::find_by_external_id(const std::string& ex
     pg::PgResult res =
         pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{external_id});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::nullopt;
+    return read_resource(res.get(), 0);
+}
+
+std::optional<ScimResource>
+ScimStore::find_unique_active_by_external_id(const std::string& external_id) const {
+    if (!open_ || external_id.empty())
+        return std::nullopt;
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+
+    // Deliberately NO `LIMIT 1` — the exactly-one-match guarantee is the
+    // point of this method (ADR-2001 §2 mis-link guard). Any number of
+    // rows other than exactly 1 must fall through to `nullopt` below,
+    // including 2+: an ambiguous external_id is "no link", never an
+    // arbitrary pick.
+    std::string sql = std::string("SELECT ") + kResourceCols +
+                      " FROM scim_store.scim_resources WHERE external_id = $1 AND active = TRUE";
+    pg::PgResult res =
+        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{external_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
         return std::nullopt;
     return read_resource(res.get(), 0);
 }
@@ -777,6 +878,93 @@ ScimStore::list_group_display_names_for_user(const std::string& user_scim_id) co
     for (int i = 0; i < rows; ++i)
         results.push_back(col(res.get(), i, 0));
     return results;
+}
+
+// ── Identity linkage (ADR-2001) ─────────────────────────────────────────
+
+bool ScimStore::upsert_link(const std::string& iss, const std::string& sub,
+                            const std::string& scim_id) {
+    if (!open_ || iss.empty() || sub.empty() || scim_id.empty())
+        return false;
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO scim_store.identity_links (iss, sub, scim_id, linked_at) "
+        "VALUES ($1, $2, $3, extract(epoch FROM now())::bigint) "
+        "ON CONFLICT (iss, sub) DO UPDATE "
+        "SET scim_id = EXCLUDED.scim_id, linked_at = EXCLUDED.linked_at",
+        std::vector<std::string>{iss, sub, scim_id});
+    return res.status() == PGRES_COMMAND_OK;
+}
+
+std::optional<std::vector<LinkedIdentity>>
+ScimStore::links_for_scim_id(const std::string& scim_id) const {
+    if (!open_)
+        return std::nullopt; // store unusable — never "no linked identities"
+    if (scim_id.empty())
+        return std::vector<LinkedIdentity>{}; // no scim_id asked for → genuinely nothing
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT iss, sub FROM scim_store.identity_links WHERE scim_id = $1 "
+        "ORDER BY iss ASC, sub ASC",
+        std::vector<std::string>{scim_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt;
+
+    const int rows = PQntuples(res.get());
+    std::vector<LinkedIdentity> results;
+    results.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i)
+        results.push_back(LinkedIdentity{.iss = col(res.get(), i, 0), .sub = col(res.get(), i, 1)});
+    return results;
+}
+
+// ── OIDC login observations (ADR-2001 D2 detector) ──────────────────────
+
+bool ScimStore::record_login_observation(const std::string& iss, const std::string& sub,
+                                         const std::string& claim_name,
+                                         const std::string& claim_value) {
+    if (!open_ || iss.empty() || sub.empty() || claim_name.empty())
+        return false;
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO scim_store.oidc_login_observations "
+        "(iss, sub, claim_name, claim_value, seen_at) "
+        "VALUES ($1, $2, $3, $4, extract(epoch FROM now())::bigint) "
+        "ON CONFLICT (iss, sub, claim_name) DO UPDATE "
+        "SET claim_value = EXCLUDED.claim_value, "
+        "    seen_at = EXCLUDED.seen_at",
+        std::vector<std::string>{iss, sub, claim_name, claim_value});
+    return res.status() == PGRES_COMMAND_OK;
+}
+
+bool ScimStore::observation_matches(const std::string& claim_value) const {
+    if (!open_ || claim_value.empty())
+        return false;
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return false; // cannot tell — safe direction for a signal-only read
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT 1 FROM scim_store.oidc_login_observations WHERE claim_value = $1 LIMIT 1",
+        std::vector<std::string>{claim_value});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
 }
 
 } // namespace yuzu::server

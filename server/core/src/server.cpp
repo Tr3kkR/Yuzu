@@ -2070,6 +2070,48 @@ public:
                           "group-membership recompute - a sustained non-zero rate means role "
                           "changes are silently not taking effect",
                           "counter");
+        // ADR-2001 D1/D2 (governance Gate 7 BLOCKING fix, #3): describe()'d
+        // unconditionally here rather than left to lazily create at first
+        // increment (scim_routes.cpp) — a purely-lazy metric is absent from
+        // /metrics until the first incident, which is exactly the wrong
+        // moment for an alert rule to discover the series does not exist
+        // yet. Mirrors every other SCIM counter in this block.
+        metrics_.describe("yuzu_scim_deprovision_role_refused_with_active_link_total",
+                          "Total SCIM deprovisions refused (#2021's role-refusal fork) for a "
+                          "slug that has at least one active linked OIDC identity — the "
+                          "termination did NOT complete: the federated identity's tokens were "
+                          "NOT auto-revoked and a human must terminate them manually",
+                          "counter");
+        metrics_.describe("yuzu_scim_deprovision_unlinked_total",
+                          "ADR-2001 D2 tripwire: a deprovision resolved NO linked OIDC identity "
+                          "for a slug, but a recorded login-observation claim value matches that "
+                          "slug's externalId — the user DID authenticate via OIDC but the "
+                          "identity link never formed, almost certainly a misconfigured "
+                          "--oidc-scim-link-claim (a deprovision that revoked nothing for a "
+                          "federated user who exists)",
+                          "counter");
+        // ADR-2001 §2 (governance Gate 7 SHOULD fix, #6): a ScimStore outage
+        // during a login window previously only spdlog::warn'd on a failed
+        // upsert_link/record_login_observation, leaving un-linked
+        // identities invisible until the next login (or never, if the
+        // write keeps failing). Bumped by link_oidc_login_to_scim on either
+        // failure.
+        metrics_.describe("yuzu_scim_oidc_link_write_failures_total",
+                          "Total ADR-2001 identity-link/login-observation writes that failed "
+                          "during OIDC login (ScimStore outage) — the login itself always "
+                          "succeeds (fail-OPEN by design), but a sustained non-zero rate means "
+                          "identity links and/or D2 login observations are silently not being "
+                          "recorded",
+                          "counter");
+        // describe() only registers HELP/TYPE metadata; the series is absent
+        // from /metrics until first .increment(). Instantiate each bare
+        // counter at 0 now so absent()-style alert rules on the CC6.8
+        // tripwires stay meaningful from boot (Gate 8 re-review fix; mirrors
+        // the NVD/quota/access-review pre-seed precedent above and
+        // docs/observability-conventions.md).
+        metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
+        metrics_.counter("yuzu_scim_deprovision_unlinked_total");
+        metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -2642,6 +2684,7 @@ public:
             oidc_cfg.redirect_uri = cfg_.oidc_redirect_uri;
             oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
             oidc_cfg.skip_tls_verify = cfg_.oidc_skip_tls_verify;
+            oidc_cfg.scim_link_claim = cfg_.oidc_scim_link_claim;
             if (cfg_.oidc_skip_tls_verify)
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
@@ -3134,9 +3177,23 @@ public:
         if (pg_pool_ && !startup_failed_) {
             scim_store_ = std::make_unique<ScimStore>(*pg_pool_);
             if (!scim_store_->is_open()) {
-                spdlog::error("[PG] Refusing to start: SCIM store migration/open failed "
-                              "(database reachable but the scim_store schema could not be "
-                              "created/opened)");
+                // Governance Gate 7 SHOULD fix (#7): name the likely cause —
+                // migration v3's partial-unique index on external_id
+                // (scim_resources_external_id_uniq) fails to CREATE, and so
+                // the whole migration (and this store's boot) fails closed,
+                // when a pre-existing deployment already has a duplicate
+                // non-empty external_id across two scim_resources rows.
+                // `docs/user-manual/*` (docs-writer's ADR-2001 runbook)
+                // documents the operator remediation for the diagnostic
+                // query below.
+                spdlog::error(
+                    "[PG] Refusing to start: SCIM store migration/open failed (database "
+                    "reachable but the scim_store schema could not be created/opened). Most "
+                    "likely cause: migration v3's partial-unique index on scim_resources."
+                    "external_id rejected a PRE-EXISTING DUPLICATE non-empty external_id "
+                    "across two rows. Diagnose with: SELECT external_id, COUNT(*) FROM "
+                    "scim_store.scim_resources WHERE external_id IS NOT NULL GROUP BY "
+                    "external_id HAVING COUNT(*) > 1;");
                 startup_failed_ = true;
             }
         }
@@ -5085,6 +5142,10 @@ public:
         // checked here) makes AuthRoutes::synthesize_token_session fail closed
         // for every engine-kind token rather than dereference a dangling store.
         auth_routes_->set_engine_principal_store(engine_principal_store_.get());
+        // ADR-2001 §2/D2 — link formation + login observation at the OIDC
+        // login site are fail-OPEN by design, so a null scim_store_ (no PG
+        // configured) is a safe no-op rather than a login-time failure.
+        auth_routes_->set_scim_store(scim_store_.get());
 
         start_web_server();
 
@@ -10381,6 +10442,16 @@ private:
         }
         if (directory_sync_) {
             settings_routes_->set_access_review_directory_sync(directory_sync_.get());
+        }
+        // ADR-2001 §§1,3: the dashboard user DELETE deprovision seam
+        // resolves the SCIM slug -> linked-OIDC principal set through
+        // scim_store_ (born-on-PG, constructed unconditionally in the ctor
+        // above alongside api_token_store_) before revoking credentials.
+        // Nullable/deferred-wiring, same posture as the setters above — a
+        // null store degrades the resolver to the slug-only set rather than
+        // failing closed (see deprovision_revoke.hpp's doc comment).
+        if (scim_store_) {
+            settings_routes_->set_scim_store(scim_store_.get());
         }
         settings_routes_->register_routes(
             *web_server_,
@@ -15873,9 +15944,22 @@ private:
                 startup_failed_ = true;
             }
             scim_routes_ = std::make_unique<ScimRoutes>();
+            // ADR-2001 §3: token_store threads ApiTokenStore into the
+            // deprovision seams so PATCH/PUT active:false, DELETE, and
+            // create-with-active:false revoke API tokens credentials-FIRST
+            // across the resolved slug + linked-OIDC principal set.
+            // ADR-2001 D1: analytics_store is the codebase's actual
+            // severity channel (AnalyticsEvent::severity via
+            // AnalyticsEventStore, the same mechanism AuthRoutes::
+            // emit_event uses) — threaded so the role-refused-with-link
+            // signal can be raised at Severity::kCritical; AuditEvent
+            // itself carries no severity field. Nullable/deferred like the
+            // other optional stores above — analytics_store_ may be null
+            // when --analytics-db is unset.
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
                                           audit_store_.get(), cfg_.scim_admin_group,
-                                          engine_principal_store_.get());
+                                          engine_principal_store_.get(),
+                                          api_token_store_.get(), analytics_store_.get());
         }
 
         // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set

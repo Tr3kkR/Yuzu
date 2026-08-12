@@ -1504,6 +1504,167 @@ own eventual Postgres cutover. That cutover has now happened for both stores
 in lockstep — the exception is retired, not carried forward. See
 `docs/postgres-migration-ladder.md`'s auth/SCIM row for the shipped record.
 
+### SCIM ↔ OIDC identity linkage for deprovision (ADR-2001, CC6.8)
+
+`docs/adr/2001-scim-oidc-identity-linkage.md` (Accepted). Closes a gap in the
+CC6.8 termination control above: a SCIM-provisioned user and their OIDC login
+identity are **two disjoint `auth.users` rows** (SCIM provisions
+`username=<slug>`; OIDC login always mints `username="oidc:" + iss + "#" +
+sub` and never adopts the slug), and every API/MCP token a federated user
+holds is minted on the **`oidc:` principal**, never the slug. Deprovisioning
+the slug alone (the pre-ADR-2001 behavior) therefore revoked **zero** of a
+federated user's tokens while reporting a clean success — the exact
+silent-under-revocation gap this ADR closes. **PR1+PR2 of the ADR's delivery
+plan are shipped** (link formation, the revoke seam, D1, D2); **PR3
+(deny-at-login on a deprovisioned linked identity, ADR §4) has NOT shipped**
+— an already-issued session token is not blocked from *re-authenticating*
+via OIDC until this lands (it just gets revoked again on the next
+deprovision pass, since the link persists).
+
+**Join key: `--oidc-scim-link-claim`.** Configures which validated ID-token
+claim is compared against a SCIM resource's `externalId` to form the link at
+login. Default `sub`; boot rejects any value outside the allow-list `{sub,
+oid}` fail-closed (`main.cpp`, `CLI::IsMember`) — never a silent fallback to
+an unvalidated claim. This is an **operator decision per IdP**, not a
+universal default:
+
+| IdP | Typical `externalId` source | Correct `--oidc-scim-link-claim` |
+|---|---|---|
+| Okta | The OIDC `sub` claim | `sub` (default — no flag needed) |
+| Microsoft Entra ID | The AAD object id, which rides the ID token as the `oid` claim, **not** `sub` | `oid` (`--oidc-scim-link-claim=oid`) |
+
+Getting this wrong is not silent: it is exactly the condition the D2
+detector (below) exists to surface. An IdP whose SCIM `externalId` shares no
+value with any OIDC claim Yuzu validates **cannot** have its federated
+tokens revoked by SCIM at all — there is no join key available for any
+`--oidc-scim-link-claim` setting to select; this is a fundamental limitation
+of the design (single trusted-issuer join on IdP-asserted claims only, ADR
+constraint 3), not a configuration mistake, and it too is surfaced via D2
+rather than failing silently.
+
+**Link formation (login-time, fail-open).** On a successful OIDC login,
+Yuzu compares the configured claim's value against `scim_resources
+.external_id`. A link is recorded (in `ScimStore`'s dedicated
+`identity_links` table, keyed `(iss, sub)` unique, secondary-indexed on
+`scim_id`) **only when exactly one active SCIM resource matches** —
+zero matches is normal (no link, nothing to do); more than one match is
+treated as **no link**, not an arbitrary pick (`ScimStore::
+find_unique_active_by_external_id`; the mis-link-prevention guard, ADR §2).
+The link write itself is fail-open — a write failure never fails the login,
+because a missing link is caught by the D2 detector below. Independently of
+whether a link formed, **every OIDC login also records a durable
+observation** of the claim value it presented (`ScimStore::
+record_login_observation`) — this is what makes D2 possible at all.
+
+**Deprovision-time revoke.** SCIM `active:false` (PATCH/PUT), SCIM `DELETE`,
+and the dashboard's `DELETE /api/settings/users/{username}` all resolve the
+full principal set — the slug **plus every `oidc:<iss>#<sub>` identity
+currently linked to it** — and revoke API tokens (`ApiTokenStore::
+revoke_for_principal`) and sessions for **each** principal in that set,
+**before** the account is marked inactive/deleted. On any revoke that fails
+to persist, the caller does **not** report a clean success: SCIM returns
+`500` (so the IdP retries) and the audit result is `partial`; the dashboard
+delete likewise refuses to proceed to `remove_user`. This mirrors `/me`'s
+own `api_tokens_revoked=N`/`sessions_revoked=N` detail-string pattern.
+Implementation: `deprovision_revoke.{hpp,cpp}` (the shared
+resolver/orchestrator, deliberately **not** a reuse of `session_revoke_fn`,
+which carries unrelated `caller=self|admin` metric semantics) and
+`oidc_principal.hpp` (the single `oidc_principal_id(iss, sub)` builder every
+call site uses — a hand-built format would silently miss every token for a
+principal built the "wrong" way).
+
+**The ~60s residual, stated honestly.** A previously-issued API/MCP token
+may keep *validating* for up to `ApiTokenStore`'s in-memory validate-cache
+TTL (~60s) after the underlying `revoke_for_principal` call has already
+persisted — the revoke is durable, but a concurrent request racing the
+cache eviction can still see the old cached "valid" answer for that window.
+Add the (irreducible) IdP→SCIM propagation lag on top. **Cookie sessions are
+revoked immediately** (in-memory, no cache layer). The honest guarantee is
+**"revoked within ~60s of the deprovision reaching Yuzu,"** not instant —
+do not describe this as instantaneous revocation.
+
+**D1 — a SCIM slug elevated to admin outside SCIM (the #2021 guard
+interaction).** `deprovision_role_ok` still refuses (404, per the
+provenance/role guard above) to deprovision a slug whose current role is not
+`user` — including when that elevation happened via Groups→role mapping or
+a manual dashboard promotion. Post-linkage, that refusal now has a new
+consequence: the linked federated identity's tokens are **not**
+auto-revoked either (auto-revoking on the IdP's unilateral say-so would
+reopen exactly what #2021 defends against — a compromised or racing IdP
+tearing down an admin). ADR-2001 D1 keeps the refusal, but makes it loud
+whenever a linked identity actually exists to be missed: a human must
+terminate the federated identity manually (revoke its tokens from the
+dashboard, or demote-then-redeprovision). **What actually fires, precisely
+(this is a real divergence from the ADR's `kCritical` shorthand worth
+naming explicitly — see below):**
+
+1. An `AuditStore` row, action `scim.user.deprovision_role_refused_with_link`,
+   **`result="failure"`** — always, and no different in kind from any other
+   audit row on this surface. `AuditEvent` has **no severity column**; a
+   D1 audit row cannot itself be "critical" any more than a break-glass-login
+   audit row can (same pattern there).
+2. The Prometheus counter `yuzu_scim_deprovision_role_refused_with_active_link_total`
+   — always, unconditionally, alongside the audit row.
+3. A `Severity::kCritical` `AnalyticsEvent` (`emit_scim_critical_event`,
+   `scim_routes.cpp`) — **only when `AnalyticsEventStore` is wired**, i.e.
+   only when analytics event collection is enabled (`--no-analytics` is
+   opt-*out*, so this is on by default unless explicitly disabled, but it is
+   a product-analytics pipeline, not a dedicated security-alert channel, and
+   a deployment that disables analytics loses this signal entirely).
+
+**Operator guidance: alert on (1)+(2), the metric and the `result="failure"`
+audit row — that is the primary, always-on D1 signal regardless of the
+analytics-collection setting.** The `kCritical` analytics event is
+enrichment on top for a deployment that has analytics wired, not the
+detection mechanism itself. Do not build a detection rule that assumes an
+audit row can itself carry a severity level — filter on `action=
+"scim.user.deprovision_role_refused_with_link"` (or the metric), not on any
+notion of a "critical audit."
+
+**D2 — the fail-loud detector for a mismatched/misconfigured link claim.**
+Every OIDC login records **both** the `sub` and `oid` candidate claim
+values it observed, not only the value of the claim `--oidc-scim-link-claim`
+is currently configured to use. When a deprovision resolves a principal set
+of size 1 (slug only — no linked identity) but a recorded login observation
+shows the slug's `externalId` matches **either** candidate value at some
+prior OIDC login, that is a real signal: the user **did** authenticate via
+OIDC, but the link never formed — almost always a misconfigured
+`--oidc-scim-link-claim` (or, per the worked-examples table above, an IdP
+whose `externalId` has no matching OIDC claim at all). Recording both
+candidates (rather than only the configured one) is what makes D2 able to
+catch the specific, common failure mode where the *wrong* claim is
+configured — e.g. an Entra deployment left on the default `sub` whose
+`externalId` actually matches `oid` — instead of a case where the
+configured-but-wrong claim's value happens never to have been observed at
+all. This bumps `yuzu_scim_deprovision_unlinked_total`
+(`ScimRoutes::maybe_flag_d2_unlinked`). **A non-zero rate here means some
+federated population's tokens are NOT being revoked by SCIM deprovision
+today** — investigate the flag value before trusting the CC6.8 claim for
+that population. D2 is a detection signal conditioned on a login-then-
+deprovision pair actually occurring in the observed window, not a
+standing guarantee — a zero rate means "nothing detected yet," not
+"every federated user is provably linked."
+
+### New audit actions (ADR-2001)
+
+| Action | Result | When |
+|---|---|---|
+| `scim.user.deprovision_role_refused_with_link` | `failure` | D1: a role-refused deprovision (`deprovision_role_ok` 404) for a slug with ≥1 active linked OIDC identity that was NOT auto-revoked |
+
+The existing `scim.user.deactivated`/`.deleted` rows (see Audit actions
+above) now also carry `api_tokens_revoked=N sessions_revoked=N
+principals=N` in `detail` on success, and `partial` is now a possible
+`result` for those two actions specifically (a non-persisted credential
+revoke — see "Deprovision-time revoke" above), in addition to the existing
+`success`/`failure`.
+
+### New metrics (ADR-2001)
+
+| Metric | Meaning | Operator action on non-zero |
+|---|---|---|
+| `yuzu_scim_deprovision_role_refused_with_active_link_total` | D1: a deprovision was refused (role != `user`) for a slug with an active linked federated identity — that identity's tokens were NOT auto-revoked | A human must terminate the linked federated identity's credentials manually (revoke its tokens, or demote the account then let the next deprovision proceed normally). Alert on this alongside the existing `yuzu_scim_provenance_denied_total`. |
+| `yuzu_scim_deprovision_unlinked_total` | D2: a deprovision found a login observation matching the slug's `externalId` but resolved no formed link — almost certainly a misconfigured `--oidc-scim-link-claim`, or an IdP whose `externalId` has no corresponding OIDC claim (see the worked-examples table) | Re-check `--oidc-scim-link-claim` against your IdP (Okta: `sub`; Entra: `oid`). If neither matches, this population's federated tokens are not reachable by SCIM revoke by design — treat their manual revocation as a required step of the offboarding runbook until a shared claim exists. |
+
 ### Residual risks / deferred (next slice)
 
 - **Crash-window non-atomicity in the two-store deactivate/reactivate
@@ -1537,6 +1698,27 @@ in lockstep — the exception is retired, not carried forward. See
   `mfa_totp_secret` envelope-encryption (shipped, see MFA/TOTP above) is a
   genuinely different case because TOTP verification needs the *plaintext*
   secret back, not just a compare.
+- **ADR-2001 deny-at-login backstop (§4/PR3) has NOT shipped — including a
+  genuine login-vs-deprovision TOCTOU, not only the simpler "re-login after
+  deprovision" case.** Two related but distinct gaps stay open until PR3
+  lands: (1) a federated identity whose linked SCIM slug is **already**
+  deprovisioned is not yet refused at OIDC login — re-authenticating mints a
+  fresh session/tokens (correctly revoked again by the *next* deprovision
+  pass, since the link persists, but live in the meantime); (2) a login that
+  races an **in-flight** deprovision of the same slug — authenticating and
+  forming/refreshing the identity link between that deprovision's principal-
+  set resolution and its account-deactivation write — can walk away with a
+  fresh session/tokens the in-flight pass never saw and therefore never
+  revoked at all, not merely "revoked on the next pass." Both close together
+  once login is refused for a deprovisioned linked slug, because a refused
+  login can never mint a credential for either race to win. Until then, do
+  not describe CC6.8 as fully closed for the federated population without
+  naming this window — see "Known residuals" in
+  `docs/adr/2001-scim-oidc-identity-linkage.md`. **ADR-2001 is also
+  fundamentally unable to revoke a federated population whose IdP SCIM
+  `externalId` shares no value with any OIDC claim Yuzu validates** — no
+  `--oidc-scim-link-claim` setting helps in that case; see the "SCIM ↔ OIDC
+  identity linkage" subsection above for the D2 metric that surfaces this.
 
 Implementation: `server/core/include/yuzu/server/scim_store.hpp` +
 `server/core/src/scim_store.cpp` (storage layer), `server/core/include/yuzu/

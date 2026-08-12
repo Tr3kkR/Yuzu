@@ -9,6 +9,7 @@
 #include "config_secret_keys.hpp" // is_exactly_redaction_placeholder in the OIDC handler
 #include "dex_alert_router.hpp" // F1: parse_routed_types / routed_types_to_json
 #include "dex_blast_radius.hpp" // F1: BlastRadiusConfig defaults for the threshold form
+#include "deprovision_revoke.hpp" // ADR-2001 §§1,3: dashboard user DELETE revoke seam
 #include "dex_routes.hpp"       // F1: dex_signal_groups / dex_signal_label
 #include "directory_sync.hpp"   // access-review read-model optional email enrichment
 #include "http_route_sink.hpp"
@@ -20,6 +21,7 @@
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/server/scim_store.hpp> // ScimStore::is_open (deprovision resolver, ADR-2001)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -3958,6 +3960,14 @@ void SettingsRoutes::register_routes(
             oidc_cfg.redirect_uri = redirect_uri;
             oidc_cfg.admin_group_id = admin_group;
             oidc_cfg.skip_tls_verify = skip_tls;
+            // ADR-2001 §1 gap (Task 2 follow-up): this hot-reload path builds its
+            // own local OidcConfig and previously left scim_link_claim at its
+            // struct default ("sub"), silently reverting an operator's
+            // `--oidc-scim-link-claim oid` (Entra) to `sub` the moment they saved
+            // ANY OIDC setting via this form — until the next process restart
+            // re-read the flag. Mirrors server.cpp's boot-time wiring
+            // (`oidc_cfg.scim_link_claim = cfg_.oidc_scim_link_claim;`).
+            oidc_cfg.scim_link_claim = cfg_->oidc_scim_link_claim;
             if (skip_tls)
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
@@ -4392,12 +4402,111 @@ void SettingsRoutes::register_routes(
                 return;
             }
         }
+        // ADR-2001 §§1,3 — credentials-FIRST revoke across the resolved
+        // principal set (the deleted username + every OIDC identity linked
+        // to it via SCIM, if any) BEFORE the account is removed. Mirrors
+        // the SCIM deprovision seams' ordering and fail-closed posture:
+        // `resolve_deprovision_principals_for_username` fails closed
+        // (nullopt) only on a genuine link-lookup failure for a KNOWN SCIM
+        // user — never on "not a SCIM user"/"SCIM store unwired", which
+        // degrade to the slug-only set (see its doc comment).
+        std::string revoke_detail;
+        if (api_token_store_) {
+            auto principals = resolve_deprovision_principals_for_username(scim_store_, username);
+            if (!principals.has_value()) {
+                spdlog::error("DELETE /api/settings/users: identity-link resolution failed for "
+                             "'{}' — refusing to delete (a store blip must not read as \"no "
+                             "linked identities to revoke\")",
+                             username);
+                audit_fn_(req, "user.delete", "failure", "User", username,
+                         "identity_link_resolution_failed");
+                res.status = 500;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Failed to resolve linked identities — try )"
+                    R"(again","level":"error"}})");
+                res.set_content(render_users_fragment(session->username),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            if (!api_token_store_->is_open()) {
+                spdlog::error("DELETE /api/settings/users: ApiTokenStore unavailable — "
+                             "refusing to delete '{}' without being able to revoke its "
+                             "credentials",
+                             username);
+                audit_fn_(req, "user.delete", "failure", "User", username,
+                         "api_token_store_unavailable");
+                res.status = 503;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Credential store unavailable — try )"
+                    R"(again","level":"error"}})");
+                res.set_content(render_users_fragment(session->username),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            auto revoke_result =
+                revoke_deprovision_credentials(*api_token_store_, *auth_mgr_, *principals);
+            revoke_detail =
+                "api_tokens_revoked=" + std::to_string(revoke_result.api_tokens_revoked) +
+                " sessions_revoked=" + std::to_string(revoke_result.sessions_revoked) +
+                " principals=" + std::to_string(principals->size()) +
+                // Governance Gate 7 SHOULD fix (UP-5): enumerate the actual
+                // principal strings, not just the count — mirrors the SCIM
+                // seam's `revoke_linked_credentials_or_fail`.
+                enumerate_principals_for_audit(*principals);
+            if (!revoke_result.api_tokens_persisted) {
+                revoke_detail += " api_tokens_db_error=true";
+                spdlog::error("DELETE /api/settings/users: revoke_for_principal did not "
+                             "persist for one or more principals linked to '{}' — refusing to "
+                             "report a clean delete (ADR-2001 §3 fail-closed)",
+                             username);
+                audit_fn_(req, "user.delete", "partial", "User", username, revoke_detail);
+                res.status = 500;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Failed to revoke API tokens for one or more )"
+                    R"(linked identities — try again","level":"error"}})");
+                res.set_content(render_users_fragment(session->username),
+                                "text/html; charset=utf-8");
+                return;
+            }
+        } else {
+            // Governance Gate 7 BLOCKING fix (UP-7): FAIL CLOSED here —
+            // mirror the SCIM seam's `revoke_linked_credentials_or_fail`
+            // (scim_routes.cpp), which 503s + audits
+            // "api_token_store_unavailable" rather than skip-and-proceed
+            // when its token_store is null/not open. A null ApiTokenStore
+            // means credentials CANNOT be revoked, and proceeding to
+            // `remove_user` below anyway would silently leave every linked
+            // principal's API tokens live — exactly the CC6.8 gap ADR-2001
+            // exists to close. server.cpp constructs ApiTokenStore
+            // unconditionally whenever pg_pool_ is set and fails the whole
+            // boot otherwise, so a live server NEVER reaches this handler
+            // with a null store — this branch is test-harness-only
+            // (SettingsRoutesHarness/SettingsOwnerDeleteHarness, which
+            // predate ADR-2001) and every wired-store outcome is covered by
+            // SettingsAdr2001Harness's PG-backed tests.
+            spdlog::error("DELETE /api/settings/users: no ApiTokenStore wired — refusing to "
+                         "delete '{}' without being able to revoke its credentials (ADR-2001)",
+                         username);
+            audit_fn_(req, "user.delete", "failure", "User", username,
+                     "api_token_store_unavailable");
+            res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Credential store unavailable — try )"
+                R"(again","level":"error"}})");
+            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            return;
+        }
+
         if (auth_mgr_->remove_user(username)) {
             if (!auth_mgr_->save_config()) {
                 spdlog::error("Failed to save config after user removal");
             }
             spdlog::info("User '{}' removed", username);
-            audit_fn_(req, "user.delete", "success", "User", username, "");
+            audit_fn_(req, "user.delete", "success", "User", username, revoke_detail);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
         } else {
