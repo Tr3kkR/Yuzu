@@ -867,6 +867,17 @@ public:
                           "shape. Needs a genuinely broken platform mutex, so any nonzero value is "
                           "a signal about the host, not a rate to tune. Alert on > 0",
                           "counter");
+        metrics_.describe("yuzu_mcp_stream_poison_close_failures_total",
+                          "A poison-path close (poison_terminal()'s own close, or "
+                          "attach_and_replay's retry of a stale sink on a poisoned session) "
+                          "failed and was contained. The poison flag itself is always durable "
+                          "regardless - this counts only whether the CLIENT was actually told, "
+                          "so a nonzero value means some client may have kept heart-beating on a "
+                          "stream the server had already given up on until its next attach "
+                          "retried the close. Needs a genuinely broken platform mutex (the "
+                          "sink's own mutex acquisition), so any nonzero value is a signal about "
+                          "the host, not a rate to tune. Alert on > 0 (#2531)",
+                          "counter");
         metrics_.gauge("yuzu_mcp_sessions_active").set(0);
         metrics_.counter("yuzu_mcp_sessions_opened_total");
         metrics_.gauge("yuzu_mcp_streams_active").set(0);
@@ -890,6 +901,7 @@ public:
         metrics_.counter("yuzu_mcp_stream_final_unpinned_total");
         metrics_.counter("yuzu_mcp_stream_pin_displaced_total");
         metrics_.counter("yuzu_mcp_stream_final_credit_failed_total");
+        metrics_.counter("yuzu_mcp_stream_poison_close_failures_total");
         // Pre-seed the CLOSED reason label sets to 0 so absent() alerting is
         // meaningful on a healthy/idle server (observability-conventions; the
         // reason literals mirror the bridge's reject/degrade taxonomies).
