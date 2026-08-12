@@ -1255,7 +1255,7 @@ tests:
   # This alert's expr is scoped to exclude them by name; these cases prove
   # that scoping, both directions.
 
-  # CASE 25 -- the two observe-only reasons alone must not page
+  # CASE 47 -- the two observe-only reasons alone must not page
   # YuzuRbacReadDegraded ("callers being denied fleet-wide" would be false).
   - interval: 1m
     name: rbac read degraded - observe-only reasons do not page fleet-wide-denial
@@ -1269,7 +1269,7 @@ tests:
         eval_time: 15m
         exp_samples: []
 
-  # CASE 26 -- a genuine denial reason (query_error) still pages, unaffected
+  # CASE 48 -- a genuine denial reason (query_error) still pages, unaffected
   # by the exclusion added alongside the two observe-only reasons.
   - interval: 1m
     name: rbac read degraded - a genuine denial reason still pages
