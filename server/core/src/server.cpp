@@ -4639,12 +4639,35 @@ public:
             }
         }
 
-        // Phase 7: Device Discovery (Issue 7.18)
-        {
-            auto discovery_db = cfg_.db_dir() / "discovery.db";
-            discovery_store_ = std::make_unique<DiscoveryStore>(discovery_db);
-            if (discovery_store_ && discovery_store_->is_open()) {
-                spdlog::info("DiscoveryStore initialized at {}", discovery_db.string());
+        // Phase 7: Device Discovery (Issue 7.18). Migrated Postgres store
+        // (ADR-0006/0009, schema `discovery_store`) — construction fail-CLOSED
+        // per ADR-0012 §1: a reachable database whose schema can't
+        // migrate/open is a fatal startup error, never a serve-degraded
+        // state. `migrate_from_sqlite` runs the one-time, idempotent legacy-
+        // `discovery.db` backfill (ADR-0009) — the operator-set `managed`
+        // flag is real state, not expendable telemetry, so backfill is
+        // MANDATORY and a failure is ALSO fatal (never serve on top of
+        // partially-migrated discovery data).
+        if (pg_pool_ && !startup_failed_) {
+            discovery_store_ = std::make_unique<DiscoveryStore>(*pg_pool_);
+            if (!discovery_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: discovery store migration/open failed "
+                              "(database reachable but the discovery_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                discovery_store_->set_metrics(&metrics_);
+                auto discovery_db = cfg_.db_dir() / "discovery.db";
+                if (!discovery_store_->migrate_from_sqlite(discovery_db)) {
+                    spdlog::error("[PG] Refusing to start: discovery legacy-SQLite backfill "
+                                  "failed (see prior log lines) — discovery_store is "
+                                  "AUTHORITATIVE and must not serve partially-migrated data. "
+                                  "Operator remediation: repair {} or move it aside to skip the "
+                                  "backfill (discovered devices in it, including the operator-set "
+                                  "managed flag, will NOT carry over)",
+                                  discovery_db.string());
+                    startup_failed_ = true;
+                }
             }
         }
     }
@@ -9624,6 +9647,13 @@ private:
                 {"scim_store", !cfg_.scim_enable ||
                                    (scim_store_ && scim_store_->is_open() &&
                                     scim_store_->has_token())},
+                // Wave 2 migrated Postgres store (ADR-0006/0009, schema
+                // `discovery_store`). AUTHORITATIVE per ADR-0012 §1 — the
+                // operator-set `managed` flag is real state; a not-open
+                // post-boot state would make POST /api/discovery/scan and
+                // GET /api/discovery/results silently 503 per-request
+                // unnoticed rather than being visible at /readyz.
+                {"discovery_store", discovery_store_ && discovery_store_->is_open()},
             };
 
             std::string failed_list;

@@ -727,8 +727,17 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                 }
                 auto subnet = req.get_param_value("subnet");
                 auto devices = discovery_store->list_devices(subnet);
+                if (!devices) {
+                    // Authoritative store (ADR-0012 §1): a query/pool failure
+                    // must surface, never render as an empty fleet.
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"discovery read degraded"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& d : devices) {
+                for (const auto& d : *devices) {
                     arr.push_back({{"id", d.id},
                                    {"ip_address", d.ip_address},
                                    {"mac_address", d.mac_address},
@@ -742,7 +751,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                 }
                 res.set_content(
                     nlohmann::json({{"devices", arr},
-                                    {"total", static_cast<int64_t>(devices.size())}})
+                                    {"total", static_cast<int64_t>(devices->size())}})
                         .dump(),
                     "application/json");
             });
