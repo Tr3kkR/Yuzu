@@ -668,7 +668,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                                                    httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Write"))
                      return;
-                 if (!discovery_store) {
+                 if (!discovery_store || !discovery_store->is_open()) {
                      res.status = 503;
                      res.set_content(
                          R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
@@ -718,7 +718,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
             [perm_fn, discovery_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                if (!discovery_store) {
+                if (!discovery_store || !discovery_store->is_open()) {
                     res.status = 503;
                     res.set_content(
                         R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",

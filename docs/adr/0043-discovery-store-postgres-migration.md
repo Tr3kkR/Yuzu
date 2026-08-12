@@ -71,10 +71,24 @@ table. The marker (`backfill_complete`) and a SHA-256 fingerprint of the migrate
 "genuine fresh install" from "a sibling replica holds the real file," so a sourceless stamp is a
 promotable sentinel, never a terminal fact. A later boot that still holds its own legacy file
 verifies its fingerprint against the stored one before trusting the marker, refusing (fail-closed)
-on a mismatch or an unreadable file. Row-count reconciliation after the insert transaction is a
+on a mismatch or an unreadable file. A 0-byte legacy file is refused rather than treated as a fresh
+install: SQLite opens it as a valid empty database, indistinguishable downstream from the
+legitimate no-`discovered_devices`-table case, but a genuine fresh install never has a file at this
+path at all (the old store only ever created one on first open) — so a 0-byte file is always a
+truncated real database, and silently taking the "nothing to lose" path on it would mask data loss
+as a clean boot.
+
+Reconciliation after the insert transaction is two-layered. Row-count reconciliation alone is a
 weak backstop (it can only catch an out-of-band concurrent delete between commit and count, not a
 partial insert — the per-statement status check inside the transaction already aborts the whole
-transaction on any INSERT failure).
+transaction on any INSERT failure) and, critically, cannot see a same-IP row that already existed
+in Postgres: a legacy row that loses its `ON CONFLICT DO NOTHING` slot to a pre-existing row (e.g.
+a fileless sibling replica that already stamped its own sourceless marker and started serving live
+scans before this replica's backfill reached that IP) is invisible to a count that still balances.
+A second, content-aware pass re-reads every conflict-skipped row this replica's legacy snapshot
+recorded as `managed=true` and refuses the marker if the row already in Postgres does not also
+carry `managed=true` — the one field a silent conflict-skip can actually lose that the operator
+would notice.
 
 ### Lifecycle
 

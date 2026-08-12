@@ -1276,7 +1276,7 @@ public:
         for (const auto result : {"completed", "fresh", "failed"})
             metrics_.counter("yuzu_server_mgmt_group_backfill_total", {{"result", result}});
         // DiscoveryStore observability (ADR-0043). The read-degrade counter is
-        // the fail-open signal: a non-zero rate means list_devices could not
+        // the fail-closed signal: a non-zero rate means list_devices could not
         // answer (store_not_open/pool_acquire_timeout/query_error) — /readyz
         // stays green under pure pool saturation, so this is the read-path
         // degrade signal for the discovered-device inventory.

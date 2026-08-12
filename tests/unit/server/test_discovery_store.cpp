@@ -506,3 +506,72 @@ TEST_CASE("DiscoveryStore: backfill of a legacy db with no discovered_devices ta
     CHECK(scalar(db.dsn(), "SELECT value FROM discovery_store.discovery_meta WHERE key = "
                           "'backfill_source_fingerprint'") == "sourceless");
 }
+
+// A 0-byte file is a valid, empty SQLite database — indistinguishable
+// downstream from the legitimate no-discovered_devices-table case unless
+// caught explicitly. Unlike that case, a 0-byte file is never a fresh
+// install (the old store only ever creates a file on first open), so it
+// must refuse rather than silently take the "nothing to lose" path and
+// mask a truncated real database as a clean fresh boot.
+TEST_CASE("DiscoveryStore: backfill refuses a 0-byte legacy file (never a fresh install)",
+          "[pg][discovery][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DiscoveryStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::test::TempDbFile legacy{"yuzu_test_discovery_truncated_"};
+    std::filesystem::remove(legacy.path);
+    { std::ofstream f(legacy.path, std::ios::binary); } // create with zero bytes written
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM discovery_store.discovery_meta WHERE key = "
+                          "'backfill_complete'") == "0");
+    CHECK(std::filesystem::exists(legacy.path)); // left in place for the operator
+}
+
+// Content-aware reconciliation (row-count reconciliation alone cannot see
+// this): a device already present in Postgres — standing in for a
+// concurrent writer, e.g. a fileless sibling replica that already stamped
+// its own sourceless marker and started serving live scans — steals the
+// ON CONFLICT DO NOTHING slot for an IP this replica's legacy file records
+// as managed=true. The backfill must refuse rather than stamp a marker
+// that silently dropped the operator-set managed flag behind a row count
+// that still balances.
+TEST_CASE("DiscoveryStore: backfill refuses when a conflict-skipped row lost a legacy "
+          "managed=true flag",
+          "[pg][discovery][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DiscoveryStore store{pool};
+    REQUIRE(store.is_open());
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(),
+            "INSERT INTO discovery_store.discovered_devices "
+            "(ip_address, mac_address, hostname, managed, agent_id, discovered_by, "
+            "discovered_at, last_seen, subnet) VALUES "
+            "('192.168.5.50', 'aa:bb:cc:00:00:01', 'live-host', false, '', 'live-scan', "
+            "5000, 5000, '10.0.0.0/24')")};
+        REQUIRE(r.ok());
+    }
+
+    yuzu::test::TempDbFile legacy{"yuzu_test_discovery_race_"};
+    std::filesystem::remove(legacy.path);
+    auto managed = make_device("192.168.5.50");
+    managed.managed = true;
+    managed.discovered_at = 1000;
+    make_legacy_discovery_db(legacy.path, {managed});
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
+    // Refused, not silently accepted: the legacy file survives, no marker
+    // is stamped, and the row already in Postgres keeps its managed=false —
+    // never silently promoted OR silently trusted as the full migration.
+    CHECK(std::filesystem::exists(legacy.path));
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM discovery_store.discovery_meta WHERE key = "
+                          "'backfill_complete'") == "0");
+    CHECK(scalar(db.dsn(), "SELECT managed FROM discovery_store.discovered_devices WHERE "
+                          "ip_address = '192.168.5.50'") == "f");
+}
