@@ -79,6 +79,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Custom Properties](#custom-properties)
   - [Webhooks](#webhooks)
   - [Offload Targets](#offload-targets)
+  - [Network Discovery](#network-discovery)
   - [Workflows](#workflows)
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
@@ -3755,6 +3756,68 @@ Recent delivery attempts for a target (default 50, override via `?limit=N`). Eac
 **Cleartext HTTP warning.** When `url` is `http://` (not `https://`), the entire JSON payload — including potentially sensitive instruction response data (file paths, registry values, software inventory, security findings) — is transmitted in cleartext. Production deployments containing customer endpoint data should use `https://` only. The store accepts `http://` for development convenience and to maintain parity with the webhook precedent.
 
 **Operator trust model.** Any principal with `Infrastructure:Write` can register an offload target pointing at any URL the server can resolve, including RFC1918 / loopback / link-local destinations. There is no URL allowlist or network-egress mitigation in this revision; the trust model is "Infrastructure:Write operators are trusted to choose where data goes." For multi-tenant managed deployments this is a known limitation tracked as a roadmap follow-up.
+
+---
+
+### Network Discovery
+
+Network-discovered devices (Issue 7.18) — raw scan results agents report before an operator promotes a device to a managed agent. Backed by `discovery_store` on the shared PostgreSQL substrate (ADR-0043). Not to be confused with [Discovery (A2)](#discovery-a2) above, which is the unrelated agentic self-discovery family (`/api/v1/discover/*`).
+
+#### `POST /api/discovery/scan`
+
+Store discovery scan results. Requires `Infrastructure:Write`. Upserts one row per device by `ip_address` — `mac_address`/`last_seen`/`subnet` always refresh on a re-scan; `hostname` refreshes only when the new value is non-empty; a re-scan never touches an existing row's `managed`/`agent_id`/`discovered_at`/`discovered_by`.
+
+**Request:**
+
+```json
+{
+  "subnet": "10.0.0.0/24",
+  "discovered_by": "agent-scanner-01",
+  "devices": [
+    {"ip_address": "10.0.0.5", "mac_address": "aa:bb:cc:dd:ee:ff", "hostname": "workstation-05"}
+  ]
+}
+```
+
+`devices[].ip_address` is required per entry; an entry with an empty `ip_address` is silently skipped and not counted.
+
+**Response (200):**
+
+```json
+{"status": "ok", "devices_stored": 1}
+```
+
+**Note:** this endpoint always returns `200` and audits `discovery.scan` as `"success"` even when individual device upserts fail (e.g. under a degraded Postgres pool) — `devices_stored` may be lower than `devices.length` with no other signal in the response body. Watch `yuzu_server_discovery_read_degrade_total` (a proxy for backend health) if you need to distinguish "no devices matched" from "the store was degraded during this scan". Pre-existing behavior, tracked as a follow-up.
+
+#### `GET /api/discovery/results`
+
+List discovered devices. Requires `Infrastructure:Read`. Optional `?subnet=` query param filters to one subnet; omitted returns every discovered device, newest-`last_seen`-first.
+
+**Response (200):**
+
+```json
+{
+  "devices": [
+    {
+      "id": 1,
+      "ip_address": "10.0.0.5",
+      "mac_address": "aa:bb:cc:dd:ee:ff",
+      "hostname": "workstation-05",
+      "managed": false,
+      "agent_id": "",
+      "discovered_by": "agent-scanner-01",
+      "discovered_at": 1714501234,
+      "last_seen": 1714501234,
+      "subnet": "10.0.0.0/24"
+    }
+  ],
+  "total": 1
+}
+```
+
+**Response (503, degraded read):** `{"error":{"code":503,"message":"discovery read degraded"},"meta":{"api_version":"v1"}}`. `discovery_store` is an authoritative store (ADR-0012 §1) — a query/pool failure surfaces as `503`, never as a silently-empty device list. See `yuzu_server_discovery_read_degrade_total{reason}` (`store_not_open`/`pool_acquire_timeout`/`query_error`).
+
+`mark_managed` and `clear_results` exist on the underlying store but have **no REST route today** — dead surface, noted in ADR-0043's Follow-ups.
 
 ---
 
