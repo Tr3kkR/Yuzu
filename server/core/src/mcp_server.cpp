@@ -3868,16 +3868,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         // The kind stays in the audit trail, which is genuinely
                         // server-side.
                         count_denial("yuzu_mcp_approval_refused_total", nullptr);
-                        // #2786 arm 1: when the ORIGIN check's own read is what
-                        // faulted, the comparison never ran, so a foreign-origin
-                        // ticket is exactly as likely to be behind this refusal
-                        // as an innocent one — the forgery signal would
-                        // otherwise be lost to a plain "store_error". The
-                        // masked counter (no reason label, same anti-oracle
-                        // rationale below) and the audit suffix are the
-                        // caller-visible half of that signal; ApprovalManager's
-                        // own warn log is the caller-independent half.
-                        if (consumed.error().origin_check_unevaluated)
+                        // #2786 arm 1: when the origin+submitter BINDING check's
+                        // own read is what faulted, neither comparison ran, so a
+                        // foreign-origin or foreign-submitter ticket is exactly as
+                        // likely to be behind this refusal as an innocent one —
+                        // the forgery signal would otherwise be lost to a plain
+                        // "store_error". The masked counter (no reason label,
+                        // same anti-oracle rationale below) and the audit suffix
+                        // are the caller-visible half of that signal;
+                        // ApprovalManager's own warn log is the
+                        // caller-independent half.
+                        if (consumed.error().binding_check_unevaluated)
                             count_denial("yuzu_mcp_approval_masked_denials_total", nullptr);
                         // Unlike the masked/refused counters above, kPrecondition is
                         // NOT one of the kinds the anti-oracle argument covers (see
@@ -3906,8 +3907,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                            ? (": " + consumed.error().message +
                                               " (ticket not consumed)")
                                            : "") +
-                                      (consumed.error().origin_check_unevaluated
-                                           ? " (origin unverified)"
+                                      (consumed.error().binding_check_unevaluated
+                                           ? " (origin/submitter unverified)"
                                            : ""));
 
                         // CLIENT message stays uniform for the two that must not

@@ -138,21 +138,24 @@ enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
     kStoreError,    ///< store unavailable, missing argument, or a SQLite failure —
-                    ///< see ConsumeError::extended_errcode/origin_check_unevaluated
+                    ///< see ConsumeError::extended_errcode/binding_check_unevaluated
     kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442)
+    kForeignSubmitter, ///< recalled by a principal other than the ticket's submitter (#2442)
 };
 
 /// The one refusal message for every "this ticket cannot be redeemed" outcome.
-/// kForeignOrigin deliberately shares it with kNotConsumable: the KIND separates
-/// a forgery attempt from a replay for the log, but the MESSAGE must not, or the
-/// recall becomes an oracle for which SURFACE minted a ticket. (Not for which
-/// definition ids exist: a mismatched id is refused earlier, and with a
-/// different message, before this is reached.) One home so the copies cannot drift apart.
+/// kForeignOrigin and kForeignSubmitter deliberately share it with
+/// kNotConsumable: the KIND separates a forgery attempt (wrong surface, or
+/// wrong principal) from a replay for the log, but the MESSAGE must not, or
+/// the recall becomes an oracle for which SURFACE minted a ticket or WHO
+/// submitted it. (Not for which definition ids exist: a mismatched id is
+/// refused earlier, and with a different message, before this is reached.)
+/// One home so the copies cannot drift apart.
 /// Stable audit token, one per failure kind. The AUDIT trail is server-side and
 /// is never returned to the caller, so the anti-oracle reasoning below does NOT
 /// reach it: suppressing the distinction there would destroy the only evidence
-/// a cross-surface redemption attempt was refused, which is the thing #2442
-/// exists to produce.
+/// a cross-surface or cross-submitter redemption attempt was refused, which is
+/// the thing #2442 exists to produce.
 ///
 /// Closed set. Adding a `ConsumeFailure` without a token here fails the build on
 /// GCC and Clang — `-Wswitch` is promoted to an error locally because
@@ -187,6 +190,8 @@ enum class ConsumeFailure {
         return "store_error";
     case ConsumeFailure::kForeignOrigin:
         return "foreign_origin";
+    case ConsumeFailure::kForeignSubmitter:
+        return "foreign_submitter";
     }
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic pop
@@ -229,18 +234,19 @@ struct ConsumeError {
     /// `consume_ticket`'s guard-clause comment for why this is harmless
     /// today — the sole production caller never triggers them).
     int extended_errcode = 0;
-    /// True ONLY when the #2442 cross-surface origin check's own read
-    /// (`get_checked` inside `consume_ticket`) is the thing that faulted —
-    /// so the origin comparison never ran and a foreign-origin ticket could
-    /// be hiding behind this refusal exactly as easily as an innocent one.
-    /// #2786 arm 1: without this, a store fault at that specific read
-    /// reports as a plain `kStoreError` and the forgery-detection signal is
-    /// lost for the duration of the fault. False for every other
-    /// `kStoreError` producer (the store-not-open guard, the missing-id/
-    /// missing-principal guards, the CAS itself, the precondition recheck
-    /// read, a throwing precondition) — those never reached the origin
-    /// check, so there is nothing masked to flag.
-    bool origin_check_unevaluated = false;
+    /// True ONLY when the #2442 cross-surface/cross-submitter binding check's
+    /// own read (`get_checked` inside `consume_ticket`) is the thing that
+    /// faulted — so NEITHER the origin nor the submitter comparison ran, and
+    /// a foreign-origin or foreign-submitter ticket could be hiding behind
+    /// this refusal exactly as easily as an innocent one. #2786 arm 1:
+    /// without this, a store fault at that specific read reports as a plain
+    /// `kStoreError` and the forgery-detection signal is lost for the
+    /// duration of the fault. False for every other `kStoreError` producer
+    /// (the store-not-open guard, the missing-id/missing-principal guards,
+    /// the CAS itself, the precondition recheck read, a throwing
+    /// precondition) — those never reached the binding check, so there is
+    /// nothing masked to flag.
+    bool binding_check_unevaluated = false;
 };
 
 /// A cheap, read-only recheck of the state a ticket's effect depends on,
@@ -357,10 +363,12 @@ public:
     /// human-approved one-time capability on a no-op and forcing a fresh
     /// approval round.
     ///
-    /// Order: match the row → reject a non-consumable one → evaluate
-    /// `precondition` → CAS. A precondition denial returns
-    /// ConsumeFailure::kPrecondition and leaves the row untouched, so the same
-    /// ticket is still recallable once the operator resolves the drift.
+    /// Order: argument guards → #2442 origin+submitter binding check → match
+    /// the row → reject a non-consumable one → evaluate `precondition` → CAS.
+    /// A precondition denial returns ConsumeFailure::kPrecondition and leaves
+    /// the row untouched, so the same ticket is still recallable once the
+    /// operator resolves the drift; the binding check has the same
+    /// untouched-on-refusal property.
     ///
     /// `precondition` runs WITHOUT `mtx_` held, deliberately: it inspects state
     /// OUTSIDE this store (rotation status, device state — never authority; see

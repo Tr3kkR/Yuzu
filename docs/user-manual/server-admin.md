@@ -407,6 +407,23 @@ that is still outstanding when you upgrade.
 does not grow after the upgrade — every ticket minted by the new server declares its surface
 at mint time, so nothing outstanding from this point on can hit this case.
 
+### vNEXT — MCP approval recall is now bound to its submitter (#2442) (not breaking)
+
+**What changes.** An approval ticket's `approval_id` is a bearer capability — presenting it is
+what authorizes the recall — and an id can be **disclosed** to a third party: `GET
+/api/approvals` returns the full id to any principal holding `Approval:Read`, seeded to the
+`Viewer` role. Until this release, a Viewer who also held the target tool's own RBAC permission
+could take another operator's approved ticket id from that listing and redeem it themselves. The
+MCP recall now refuses a ticket whose recorded submitter does not match the recalling principal,
+the same way it already refuses one minted on a foreign surface — same client message, a distinct
+audit token (`refused: foreign_submitter`) for the log.
+
+**Who this affects.** Nobody's legitimate flow: the one production redemption path (the MCP
+recall) has only ever redeemed a ticket as the same principal that minted it — this closes an
+attack a Viewer-plus-tool-RBAC principal could otherwise carry out, not a capability any operator
+relied on. Nothing to do at upgrade; there is no outstanding-ticket population this affects,
+because a legitimately-outstanding ticket was always going to be recalled by its own submitter.
+
 ### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
 
 **Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No

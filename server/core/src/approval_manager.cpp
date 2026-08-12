@@ -690,19 +690,23 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         return std::unexpected(
             ConsumeError{ConsumeFailure::kStoreError, "consumed_by is required"});
 
-    // #2442 CROSS-SURFACE BINDING. Approvals are one shared store with three
-    // mint paths, and this recall matches a ticket on its definition id and
-    // scope expression — neither of which names the minting surface. So an
+    // #2442 CROSS-SURFACE + CROSS-SUBMITTER BINDING. Approvals are one shared
+    // store with three mint paths, and this recall matches a ticket on its
+    // definition id and scope expression — neither of which names the
+    // minting surface, and neither of which is bound to who redeems it. So an
     // approval raised through the REST instruction gate, where both fields are
     // caller-influenced, could line up with an MCP tool's canonical arguments
-    // and be redeemed against it. What that buys is the HUMAN APPROVAL itself:
-    // the reviewer sees a ticket id, a submitter and a scope expression, and
-    // nothing that names the SURFACE it was raised on. (The tool is named:
-    // `definition_id` is on the row, and must be exactly `mcp.<tool>` for the
-    // confusion to work at all — that is the premise of the reserved prefix.)
+    // and be redeemed against it; and separately, an id disclosed to any
+    // `Approval:Read` holder (e.g. `GET /api/approvals`) could be redeemed by
+    // a principal other than the one it was granted to. What both buy is the
+    // HUMAN APPROVAL itself: the reviewer sees a ticket id, a submitter and a
+    // scope expression, and nothing that names the SURFACE it was raised on
+    // or BINDS who may present it. (The tool is named: `definition_id` is on
+    // the row, and must be exactly `mcp.<tool>` for the surface confusion to
+    // work at all — that is the premise of the reserved prefix.)
     //
     // get_checked, not get: a FAILED read must not decode as "no declared
-    // origin", which is the value that grants.
+    // origin" or "no submitter", either of which is a value that grants.
     //
     // Runs BEFORE the precondition block because that block is conditional —
     // a caller supplying no precondition must not skip this.
@@ -716,26 +720,41 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     // `sqlite3_set_authorizer` that lets the 1st SELECT through and denies
     // the 2nd. A future read added between the caller's lookup and this one
     // (on the same connection) would shift that test onto the wrong read
-    // without it failing loudly — update the countdown if you add one.
+    // without it failing loudly — update the countdown if you add one. The
+    // submitter check below extends this SAME read rather than adding a 3rd
+    // SELECT, for exactly that reason.
     {
         auto row = get_checked(id); // takes mtx_ itself — must be outside any lock
         if (!row) {
-            // #2786 arm 1: this read failing means the origin comparison below
-            // never runs, so a foreign-origin ticket is exactly as likely to be
-            // sitting behind this refusal as an innocent one — the forgery
-            // signal is masked for the duration of the fault. Flag it and log
-            // it here, at the store, so every consume_ticket caller (today only
-            // the MCP recall) gets the signal without duplicating this check.
-            spdlog::warn("ApprovalManager: origin check for ticket {} could not be evaluated "
+            // #2786 arm 1: this read failing means neither the origin nor the
+            // submitter comparison below runs, so a foreign-origin OR
+            // foreign-submitter ticket is exactly as likely to be sitting
+            // behind this refusal as an innocent one — the forgery signal is
+            // masked for the duration of the fault. Flag it and log it here,
+            // at the store, so every consume_ticket caller (today only the
+            // MCP recall) gets the signal without duplicating this check.
+            spdlog::warn("ApprovalManager: binding check for ticket {} could not be evaluated "
                         "(store fault: {}); refusing closed",
                         redact_id(id), row.error().message);
             return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error().message,
                                                 row.error().extended_errcode,
-                                                /*origin_check_unevaluated=*/true});
+                                                /*binding_check_unevaluated=*/true});
         }
         if (*row && declares_non_mcp_surface((*row)->origin))
             return std::unexpected(
                 ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage});
+        // #2442 submitter binding: an approval id disclosed to a third party
+        // (e.g. via `GET /api/approvals`, gated on `Approval:Read` — seeded to
+        // Viewer) must not be redeemable by anyone but the principal it was
+        // granted to. Same posture as the origin check: refused with the
+        // uniform message, distinct KIND for the audit trail only, so the
+        // recall cannot be used to probe whether a ticket exists versus who
+        // owns it. Checked in the SAME block, after the origin check, so a
+        // foreign-origin ticket is always reported as that (the more specific
+        // fact) rather than as foreign-submitter when both are true.
+        if (*row && (*row)->submitted_by != consumed_by)
+            return std::unexpected(
+                ConsumeError{ConsumeFailure::kForeignSubmitter, kNotConsumableMessage});
     }
 
     // Pre-consume recheck (#2443). Skipped entirely when no precondition was

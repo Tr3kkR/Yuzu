@@ -8852,7 +8852,7 @@ TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreig
               .value() == 1.0);
     REQUIRE(!ts.audit_details.empty());
     CHECK(ts.audit_details.back() ==
-          "approval_id=" + approval_id + " refused: store_error (origin unverified)");
+          "approval_id=" + approval_id + " refused: store_error (origin/submitter unverified)");
 
     REQUIRE(sqlite3_set_authorizer(conn.h, nullptr, nullptr) == SQLITE_OK);
 
