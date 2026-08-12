@@ -71,18 +71,23 @@ table. The marker (`backfill_complete`) and a SHA-256 fingerprint of the migrate
 "genuine fresh install" from "a sibling replica holds the real file," so a sourceless stamp is a
 promotable sentinel, never a terminal fact. A later boot that still holds its own legacy file
 verifies its fingerprint against the stored one before trusting the marker, refusing (fail-closed)
-on a mismatch or an unreadable file. A 0-byte legacy file is refused rather than treated as a fresh
-install ONLY on the first-ever migration for this fleet (no marker yet) — the same case an empty
-file mimics: SQLite opens it as a valid empty database, indistinguishable downstream from the
-legitimate no-`discovered_devices`-table case, but a genuine fresh install never has a file at this
-path at all on a first migration (the old store only ever created one on first open), so a 0-byte
-file there is always a truncated real database and silently taking the "nothing to lose" path on it
-would mask data loss as a clean boot. Once a real migration has already completed for this fleet
-(marker present), a 0-byte file reappearing on this replica (e.g. a backup restore or container
-rebuild leaving an empty placeholder) is NOT re-checked — the pre-existing "this replica's own file
-has nothing to lose" skip already covers it safely, since the real content is durably in Postgres
-regardless of which replica migrated it; gating it there too would refuse to boot forever for no
-safety benefit.
+on a mismatch or an unreadable file. A 0-byte legacy file is checked in BOTH branches, but not the
+same way, because "nothing to lose" is only actually true under different conditions in each:
+
+- **First-ever migration for this fleet** (no marker yet): a genuine fresh install never has a file
+  at this path at all (the old store only ever created one on first open), so a 0-byte file here —
+  which SQLite opens as a valid empty database, indistinguishable downstream from the legitimate
+  no-`discovered_devices`-table case — is always a truncated real database. Refused unconditionally.
+- **A real migration has already completed for this fleet** (marker present, stored fingerprint
+  real): a 0-byte file reappearing on this replica (e.g. a backup restore or container rebuild
+  leaving an empty placeholder) is safe — the real content, wherever it came from, is already
+  durable in Postgres — so the pre-existing "this replica's own file has nothing to lose" skip
+  applies and boot is NOT refused.
+- **The marker is present but stamped SOURCELESS** (no real migration has EVER completed for this
+  fleet) AND this replica's own file is 0 bytes: still refused. This is the same ambiguity as the
+  first case — a 0-byte file cannot be distinguished from "this replica's real content was
+  truncated before this boot ever read it" — reachable here because a sourceless marker means
+  nobody has migrated real content yet, so this replica's file is the only candidate for it.
 
 Both new-in-this-fold refusals (the managed/agent_id reconciliation below, and the 0-byte guard)
 trade a narrow new fail-closed-boot/availability risk for closing a silent-data-loss hole — the same

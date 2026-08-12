@@ -31,6 +31,7 @@
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "sqlite_raii.hpp"
+#include "utf8_sanitize.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -645,4 +646,85 @@ TEST_CASE("DiscoveryStore: backfill refuses when a conflict-skipped row lost a l
     // overwritten OR silently trusted as the full migration.
     CHECK(scalar(db.dsn(), "SELECT agent_id FROM discovery_store.discovered_devices WHERE "
                           "ip_address = '192.168.5.60'") == "agent-live-B");
+}
+
+// Step 4b's conflict-skip re-read must compare against the SANITIZED
+// agent_id (what step 4 actually inserted), not the raw legacy value — a
+// crash-resume re-run conflict-skipping against THIS replica's own
+// previously-inserted row for a legacy agent_id containing invalid UTF-8
+// must NOT false-refuse just because sanitize_pg_text is not the identity
+// transform for that value.
+TEST_CASE("DiscoveryStore: crash-resume reconciliation compares sanitized agent_id, not raw",
+          "[pg][discovery][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DiscoveryStore store{pool};
+    REQUIRE(store.is_open());
+
+    // No embedded NUL (the legacy-db fixture binds via a NUL-terminated
+    // c_str(), which would truncate one) — an invalid UTF-8 continuation
+    // byte is enough to make sanitize_utf8_strict non-identity.
+    const std::string dirty_agent_id = "agent-\xC3\x28-legacy";
+    const std::string sanitized = yuzu::server::sanitize_utf8_strict(dirty_agent_id);
+    REQUIRE(sanitized != dirty_agent_id); // sanity: the transform is actually non-identity here
+
+    // Pre-seed the row THIS replica's own step-4 insert would have produced
+    // on a prior run of the SAME legacy content that crashed after commit
+    // but before the marker was stamped.
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const char* param = sanitized.c_str();
+        PgResult r{PQexecParams(
+            conn.get(),
+            "INSERT INTO discovery_store.discovered_devices "
+            "(ip_address, mac_address, hostname, managed, agent_id, discovered_by, "
+            "discovered_at, last_seen, subnet) VALUES "
+            "('192.168.9.90', 'aa:bb:cc:00:00:03', 'h', true, $1, 'legacy-agent', 1000, 1000, "
+            "'10.0.0.0/24')",
+            1, nullptr, &param, nullptr, nullptr, 0)};
+        REQUIRE(r.ok());
+    }
+
+    yuzu::test::TempDbFile legacy{"yuzu_test_discovery_resume_"};
+    std::filesystem::remove(legacy.path);
+    auto managed = make_device("192.168.9.90");
+    managed.managed = true;
+    managed.agent_id = dirty_agent_id;
+    managed.discovered_at = 1000;
+    make_legacy_discovery_db(legacy.path, {managed});
+
+    CHECK(store.migrate_from_sqlite(legacy.path)); // must succeed, not false-refuse
+}
+
+// The marker_present branch's "nothing to lose" skip has its own 0-byte
+// hazard, distinct from the first-migration guard above: a sourceless
+// marker means NO replica has ever completed a real migration for this
+// fleet, so if THIS replica's own file is 0 bytes, it is the only
+// candidate for content that existed and was truncated before this boot
+// ever read it — indistinguishable from a genuine no-table file, and must
+// refuse rather than silently confirm "nothing to lose" a second time.
+TEST_CASE("DiscoveryStore: backfill refuses a 0-byte legacy file under a sourceless marker "
+          "(no replica has ever migrated real content)",
+          "[pg][discovery][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+
+    // "Replica A" — fileless, stamps the shared marker sourceless.
+    {
+        DiscoveryStore store_a{pool};
+        REQUIRE(store_a.is_open());
+        REQUIRE(store_a.migrate_from_sqlite("/nonexistent-yuzu-test/discovery-a.db"));
+    }
+
+    // "Replica B" — its own legacy file existed with real content but is 0
+    // bytes by the time this boot reads it (e.g. truncated mid-write).
+    DiscoveryStore store_b{pool};
+    REQUIRE(store_b.is_open());
+    yuzu::test::TempDbFile legacy{"yuzu_test_discovery_truncated_sourceless_"};
+    std::filesystem::remove(legacy.path);
+    { std::ofstream f(legacy.path, std::ios::binary); } // 0 bytes
+
+    CHECK_FALSE(store_b.migrate_from_sqlite(legacy.path));
+    CHECK(std::filesystem::exists(legacy.path)); // untouched, left for the operator
 }

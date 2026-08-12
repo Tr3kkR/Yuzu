@@ -638,6 +638,33 @@ bool DiscoveryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
             return false;
         }
         if (*verify_fp == kSourcelessFingerprint) {
+            // "Nothing to lose" is only actually true when SOME replica has
+            // already completed a REAL migration for this fleet (stored
+            // fingerprint is real) — the content, wherever it came from, is
+            // already durable in Postgres. When the stored fingerprint is
+            // ALSO sourceless, no real migration has ever happened for this
+            // fleet, and this replica's own file being 0 bytes right now is
+            // indistinguishable from "this replica's real content was
+            // truncated before this boot ever read it" — the same UP-3
+            // hazard, reachable here because SQLite reports a 0-byte file
+            // identically to a genuine no-discovered_devices-table file.
+            // Refuse rather than silently launder a truncation into a
+            // second "fresh, nothing to lose" verdict.
+            if (stored_fingerprint && *stored_fingerprint == kSourcelessFingerprint) {
+                std::error_code size_ec;
+                const auto sz = std::filesystem::file_size(legacy_db_path, size_ec);
+                if (!size_ec && sz == 0) {
+                    spdlog::error(
+                        "DiscoveryStore: migrate_from_sqlite: backfill_complete is already set "
+                        "sourceless (no real migration has ever completed for this fleet), and "
+                        "this replica's own legacy db {} is 0 bytes — this is NOT evidence of "
+                        "nothing to lose, it is a truncated real database indistinguishable from "
+                        "one. Refusing (fail-closed): restore from backup before retrying.",
+                        legacy_db_path.string());
+                    backfill_metric("failed");
+                    return false;
+                }
+            }
             spdlog::debug("DiscoveryStore: migrate_from_sqlite already completed; this "
                          "replica's own legacy db has no discovered_devices table (nothing to "
                          "lose), skipping");
@@ -686,14 +713,16 @@ bool DiscoveryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
 
     // This replica is the one performing the FIRST-EVER migration (no
     // marker yet) — a 0-byte legacy file here is checked ONLY on this path,
-    // not when marker_present (above): once some replica has already
-    // completed a real migration, a 0-byte file on THIS replica is
-    // unambiguously safe either way (never had content, or had content that
-    // is already durable in Postgres from whoever migrated it), and the
-    // marker_present branch's existing "nothing to lose" skip already
-    // handles it correctly — gating it here too would refuse to boot
-    // forever on a stray empty placeholder left by e.g. a backup restore
-    // or container rebuild, for no safety benefit.
+    // not when marker_present (above): the marker_present branch has its
+    // OWN 0-byte check (see the stored_fingerprint == kSourcelessFingerprint
+    // guard above), scoped to fire only when no real migration has EVER
+    // completed for this fleet — the one case a 0-byte file there is still
+    // ambiguous. When a real migration HAS already completed (stored
+    // fingerprint is real), a 0-byte file on this replica is safe: the
+    // content, wherever it came from, is already durable in Postgres, and
+    // the existing "nothing to lose" skip handles it correctly without
+    // refusing to boot forever on a stray empty placeholder left by e.g. a
+    // backup restore or container rebuild.
     if (legacy_exists) {
         std::error_code size_ec;
         const auto legacy_size = std::filesystem::file_size(legacy_db_path, size_ec);
@@ -872,7 +901,12 @@ bool DiscoveryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
         const std::string agent_id_val = text_col(r.get(), 0, 1);
         const bool managed_matches =
             (legacy_row.managed != 0) == (managed_val == "t" || managed_val == "true");
-        const bool agent_id_matches = legacy_row.agent_id == agent_id_val;
+        // Compare against the SANITIZED value, matching what step 4 actually
+        // inserted (sanitize_pg_text(d.agent_id)) — comparing the raw legacy
+        // value here would false-refuse on the crash-resume path for any
+        // agent_id containing invalid UTF-8/NUL, which sanitize_pg_text
+        // transforms non-identically on this replica's OWN prior row.
+        const bool agent_id_matches = sanitize_pg_text(legacy_row.agent_id) == agent_id_val;
         if (!managed_matches || !agent_id_matches) {
             spdlog::error(
                 "DiscoveryStore: migrate_from_sqlite: reconciliation FAILED — legacy device {} "
