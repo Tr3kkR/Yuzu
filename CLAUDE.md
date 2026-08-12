@@ -185,6 +185,9 @@ agents/plugins/   49 plugins
 server/core/      Server daemon (sessions, auth, dashboard, REST API, policy engine)
 gateway/          Erlang/OTP gateway (standalone rebar3 project)
 sdk/              Public SDK — stable C ABI (plugin.h) + C++23 wrapper
+common/include/   Shared header-only include root between server/core and agents/ (#2549) —
+                  pure decision code only: no I/O, no store/wire types, no server-trust-
+                  boundary authority
 proto/            Protobuf definitions (source of truth for wire protocol)
 tests/unit/       Catch2 unit tests
 docs/             Architecture docs, conventions, roadmap, capability map

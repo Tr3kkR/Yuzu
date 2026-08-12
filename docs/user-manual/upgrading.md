@@ -391,17 +391,22 @@ collision check above). At boot, the server now scans for any pre-existing
 it finds one — silently coexisting with (or being shadowed by) a real engine
 principal is not an acceptable outcome, so this fails closed rather than
 booting into an ambiguous state (decision log #3). Before upgrading, run
-against both stores. Note they live on different substrates: local users are in
-Postgres (`auth.users`), while local RBAC groups are still SQLite (`rbac.db`):
+against both stores.
+
+> **Superseded by the RbacStore → PostgreSQL migration (ADR-0041):** the
+> per-node `sqlite3 rbac.db` query below is a HISTORICAL artifact from the era
+> when local RBAC groups were SQLite. RBAC config is now a **single shared
+> PostgreSQL** `rbac_store` schema, so run **one** `psql` query, **not**
+> per-node `sqlite3`. Both queries below target Postgres:
 
 ```bash
 # Local users — Postgres.
 psql "$YUZU_POSTGRES_DSN" -c \
   "SELECT username FROM auth.users WHERE username LIKE 'engine:%';"
 
-# Local RBAC groups — SQLite, per-node. Run on every node.
-sqlite3 /var/lib/yuzu/rbac.db \
-  "SELECT name FROM groups WHERE source = 'local' AND name LIKE 'engine:%';"
+# Local RBAC groups — PostgreSQL (shared; one query, not per-node — ADR-0041).
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT name FROM rbac_store.groups WHERE source = 'local' AND name LIKE 'engine:%';"
 ```
 
 If either query returns rows, rename or remove those users/groups **before**
@@ -570,6 +575,204 @@ response row is still stored and still renders, defanged, rather than being
 dropped (governance #1593). Retention moved from an hourly background thread
 to a clock-guarded, capped reap on the maintenance tick (no operator-visible
 behaviour change beyond the same 90-day default).
+
+## RBAC store moves to PostgreSQL — config preserved by mandatory backfill (RbacStore → Postgres, ADR-0041)
+
+`RbacStore` — the authorization substrate holding **role definitions,
+role→permission grants, principal→role assignments, RBAC groups + membership,
+and the global `rbac_enabled` flag** — moves from the SQLite `rbac.db` file to
+the server's PostgreSQL substrate in this release (ADR-0041, Wave 2.1), schema
+`rbac_store`. **Unlike the AuthDB/ScimStore cutover below, this is NOT a
+fresh-start reset — your RBAC configuration is preserved by a mandatory
+backfill.** No new flag or environment variable is added (it reuses the shared
+server `PgPool`).
+
+**What happens on first PG boot:**
+
+- A one-time, idempotent, **fail-closed** backfill copies every role, grant,
+  group, and membership out of the legacy `rbac.db` into `rbac_store`. Operator
+  edits to seeded permissions are preserved — including a revoked built-in
+  default (`remove_permission`), which is **deleted** (matching legacy
+  exactly) rather than silently restored. The revocation itself is recorded
+  separately as reseed-suppression bookkeeping, so the deleted row cannot be
+  silently re-seeded on the very next restart, without ever becoming a real
+  authorization fact (never a `deny` row an unrelated role could be vetoed
+  by). This is the same mechanism `remove_permission()` itself uses for a
+  revocation made after upgrading. The
+  backfill reconciles counts (roles + grants + groups + members) and **refuses
+  the completion marker on any shortfall** — if it cannot complete, the server
+  **fails the boot closed** and retries on the next start (it never boots on a
+  partial authorization config).
+- **CRITICAL — the `rbac_enabled` flag is preserved and read-back-verified.** It
+  is migrated first, so an operator who had RBAC **enabled** stays enabled after
+  upgrade. (Losing this flag would silently boot the fleet RBAC-**off**, making
+  every confined operator fleet-wide-authorized — the migration is engineered
+  specifically to prevent that.) An unreadable **or non-canonical** durable
+  flag also refuses boot — a value other than exactly `true`/`false` is
+  rejected both by a schema-level constraint on write and by a strict parse on
+  every read, rather than being silently treated as `false`. That schema-level
+  constraint is itself a migration, so on the (unexpected) case of a
+  non-canonical value already sitting in the row from before this upgrade — a
+  hand-edit or a bug on an old release — the migration's own `ALTER TABLE ...
+  ADD CONSTRAINT` fails validation and the server refuses to boot with a raw
+  Postgres `23514 check_violation` rather than the app's own message. Recovery:
+  connect directly and correct the row (`UPDATE rbac_store.rbac_meta SET value
+  = 'false' WHERE key = 'rbac_enabled'`, or `'true'` if RBAC was genuinely
+  enabled) before restarting.
+- The legacy `rbac.db` file is **moved aside** only after the backfill is
+  verified — but a once-failed move-aside can leave it in place, and in that
+  case it **is** read again: every subsequent boot that still finds it
+  fingerprints its content (a SHA-256 content hash, stamped alongside the
+  completion marker) and re-verifies it against what was actually migrated,
+  refusing to boot rather than silently trust a marker this replica's own
+  file was never proven part of. This closes a multi-replica anti-pattern
+  (a fileless replica could otherwise foreclose migration for a sibling
+  genuinely holding the real file) but means an operator on a mixed-fleet
+  first boot or a retained legacy file may see one of a few distinct
+  refusals — `docs/ops-runbooks/rbac-store-backfill-recovery.md` covers each
+  and how to tell them apart. **On a multi-replica upgrade, boot the replica
+  holding the real, authoritative `rbac.db` first** — this lets the actual
+  migration land before any fileless/stale sibling replica boots and stamps a
+  sourceless marker, avoiding the refusals above entirely rather than having
+  to recover from one. A verified-match boot also retries the
+  move-aside automatically, so a once-failed rename does not need manual
+  cleanup once the underlying problem (e.g. a permissions issue) is fixed.
+  Keep the moved-aside copy until you have confirmed RBAC behaves as
+  expected, then remove it.
+
+**What to expect / do:**
+
+- **Widened startup budget on large RBAC datasets.** A fleet with many custom
+  roles / grants / groups will see a longer first-boot while the backfill
+  runs; this is one-time. Budget for it in the maintenance window and avoid
+  killing the server mid-backfill if you can help it — it is **not** resumable
+  (unlike AuditStore's larger, cursor-resumed migration): a killed boot is
+  data-safe (nothing is left half-migrated), but the next boot restarts the
+  whole backfill from scratch rather than continuing where it left off, so an
+  interruption costs you the full window again.
+- **Routine (not just one-time) boot-time cost, every deployment.** Every
+  server boot's `seed_defaults()` reseed now coordinates its built-in-default
+  grants against any concurrent revoke via a cluster-wide advisory lock
+  (closes a rare Postgres race where a revoked permission could otherwise be
+  silently resurrected mid-boot). This adds a small, ordinarily negligible
+  amount of boot time on every restart, not just first boot — but if you
+  bulk-restart or scale out MANY replicas of the same RBAC-on-Postgres
+  deployment **simultaneously**, their reseed passes serialize against each
+  other and against any in-flight legacy backfill, which can add up at large
+  replica counts. Prefer a rolling (not all-at-once) restart/redeploy
+  strategy for this reason, as you likely already do for other reasons.
+- **Reads now FAIL CLOSED (deny-on-degrade).** A degraded or unreachable
+  `rbac_store` (pool-acquire timeout, query error) now **denies** authorization
+  rather than falling through to an allow — this **closes** the prior
+  "corrupt `rbac.db` fails open" behavior. Watch the new
+  `yuzu_server_rbac_read_degrade_total` metric and the `YuzuRbacReadDegraded`
+  alert after upgrade; a degrade denies authz fleet-wide.
+- **Multi-replica staleness caveat.** If you run multiple server replicas, a
+  role/permission/enabled-flag change on one replica is typically visible on
+  the others within a **~1 s** window under normal conditions (a durable
+  generation token, refreshed at most once per second) — this is a target the
+  refresh loop aims for, not a hard guarantee: a replica whose refresh is
+  genuinely slow (pool saturation, a Postgres blip) can observe staleness
+  beyond the window, now counted via a `stale_beyond_accepted_bound` degrade
+  rather than silently assumed. A revoke is therefore not strictly
+  instantaneous cross-replica — well inside the fleet's existing
+  revocation-latency envelope (heartbeat + session/token TTLs measured in
+  minutes), and an accepted residual risk (`LISTEN/NOTIFY` is the named
+  follow-up).
+- **Bounded stale-serve, then fail-fast deny, under backend degradation —
+  two independent mechanisms.** An already-cached authorization decision
+  keeps answering from cache for up to a **~5 s** bound past the last
+  confirmed-good refresh, regardless of anything else failing (bounded
+  staleness for continuity) — a brief blip does not deny cached decisions
+  immediately. Separately, a fail-fast breaker governs *pool access, not
+  cache validity*: once it sees **2 consecutive** pool-acquire/query
+  failures, any check that is not already a cache hit denies immediately
+  rather than blocking on the acquire budget first, and it stops touching
+  the pool for a ~1 s cooldown between recovery probes. **"How fast" depends
+  on the degradation mode:** pool exhaustion (no connection available) trips
+  the breaker in well under a second (2 × the 250 ms acquire budget); a
+  query blocked on a PostgreSQL-side lock (e.g. a migration touching
+  `rbac_meta`) instead inherits `PgPool`'s `lock_timeout` (10 s default) per
+  attempt — measured ~18.5 s for 2 such attempts against a live held lock
+  (#3016). Both converge on the same fail-closed deny, just not at the same
+  speed. Net effect on a sustained outage: previously-seen decisions keep
+  answering for up to ~5 s regardless of breaker state; new/uncached
+  decisions deny once the breaker trips, at whichever of the two speeds
+  above applies; once the 5 s bound elapses, every check denies until the
+  backend recovers. **Not just a sustained outage — flapping (repeated
+  short degrade/recover cycles, the shape a managed-Postgres failover or a
+  brief network partition actually produces) is arguably the worse case for
+  this mechanism, not a milder one:** the breaker's closed-state failure
+  streak resets to 0 on a single success, so each recovery — even one that
+  lasts only as long as the next probe — reopens the breaker back to FULL
+  concurrency rather than easing back in; a Postgres backend that is
+  flapping rather than cleanly down can therefore see repeated full-
+  concurrency retry bursts instead of a single clean trip-and-stay-open
+  (tracked for a half-open concurrency cap, see #3016). **Blast radius while
+  open is bounded by the shared connection pool, not the breaker itself:**
+  every authz check on this replica denies while the breaker is open —
+  including checks against securable types that have nothing to do with
+  whatever degraded — because the breaker gates pool ACCESS, shared across
+  every `RbacStore` caller on the process, not per-query health. **No
+  operator action is needed for recovery** — the breaker self-heals: once a
+  probe succeeds (the next attempt after its ~1 s cooldown), it closes
+  again automatically and normal service resumes. Watch
+  `yuzu_server_rbac_breaker_open` (gauge) and
+  `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade.
+- **If you alert on the raw `generation_refresh_failed` reason label,
+  re-baseline after upgrade.** This release splits what was previously a
+  single reason into two: `generation_refresh_failed` (still denying —
+  unchanged meaning) and the new `generation_refresh_failed_within_bound`
+  (a refresh failure that landed inside the bounded ~5 s stale-serve window
+  above and denied nobody). A custom alert or dashboard built against the
+  pre-upgrade single-reason series may see its rate drop after upgrade —
+  that is the intended effect of the split, not a sign the underlying
+  condition stopped occurring. The shipped `YuzuRbacReadDegraded` alert
+  already accounts for this (see `docs/prometheus/yuzu-alerts.yml`); a
+  custom query built directly against `yuzu_server_rbac_read_degrade_total`
+  should be reviewed against the reason list in `metrics.md` before relying
+  on it post-upgrade.
+- **Shutdown grace bounds now stack; raise your orchestrator's termination
+  grace period, but understand what that does and does not buy you.** A
+  graceful `SIGTERM` walks several independently-bounded waits in sequence —
+  up to 30 s draining in-flight executions, up to 5 s waiting on the
+  NVD-sync background thread, up to 15 s waiting on the HTTP listener thread
+  (#2703 Gate 7 item 2), and up to 5 s on the gRPC shutdown deadline — which
+  can stack to **~55 s** in the worst case if more than one is genuinely
+  wedged. Kubernetes' default `terminationGracePeriodSeconds` is **30**, so
+  a pod with slow-draining work in more than one of those stages can be
+  `SIGKILL`ed mid-sequence before the server finishes its own bounded
+  teardown. If you run under Kubernetes (or any orchestrator with a similar
+  default), raise the grace period to comfortably exceed ~55 s rather than
+  relying on the platform default. **Two things a longer grace period does
+  NOT fix:** (1) the 30 s drain window re-queries `execution_tracker_` for
+  `running` executions on each of its one-second iterations — so it also
+  picks up work that starts mid-drain, not just what was already running
+  when `SIGTERM` arrived — but it never stops the HTTP listener from
+  ACCEPTING new requests during that window, so a request that lands late in
+  the drain is not bounded by the ~55 s figure at all; raising the grace
+  period does not close this gap, because the gap is about admission, not
+  about how long the drain itself waits. (2) if the 15 s HTTP-listener bound IS exceeded, the server
+  force-exits (`std::_Exit(1)`) on its OWN internal schedule, independent of
+  whatever grace period the orchestrator was configured with — a longer
+  external grace period only prevents the orchestrator from `SIGKILL`ing
+  the process BEFORE that internal bound fires; it cannot prevent or delay
+  the force-exit itself, and the force-exit skips
+  `offload_target_store_->flush_all()` and any other still-pending teardown
+  the same way a `SIGKILL` would. If the 15 s HTTP-listener bound is
+  exceeded, the diagnostic line is written directly to **stderr** (not
+  through the configured logger) before the process force-exits — an
+  async-signal-safety requirement, since `stop()` runs synchronously inside
+  the SIGTERM handler (see #3007). If you rely on the log file or a
+  structured log sink rather than captured stderr, this one line will not
+  appear there; check container/service stderr capture for it instead.
+- Confirm on first boot: the backfill completion log line, no `RbacStore`
+  open/migrate errors, and that RBAC is still enabled if you had enabled it
+  (Settings → RBAC, or check that confined operators still see only their
+  scoped fleet).
+
+See `docs/auth-architecture.md` § "RbacStore — the authorization substrate" and
+[ADR-0041](../adr/0041-rbac-store-postgres-migration.md) for the full design.
 
 ## ⚠️ Breaking: local accounts + MFA enrolments reset (AuthDB/ScimStore → Postgres, ADR-0006)
 

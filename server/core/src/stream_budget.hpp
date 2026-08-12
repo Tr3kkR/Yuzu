@@ -17,6 +17,7 @@
 /// with) — small enough that a separate TU adds no value, and directly
 /// unit-testable.
 
+#include <atomic>
 #include <cstddef>
 #include <mutex>
 #include <string>
@@ -333,6 +334,21 @@ public:
 
     Config config() const { return cfg_; }
 
+    /// #2703 Gate 7 merge-slice item 2: server shutdown's close-signal for
+    /// every held-open stream that shares this budget. Every SSE content
+    /// provider on the simpler surfaces (`/events`, `/api/v1/events`, the
+    /// dashboard executions drawer) already re-checks its wait predicate at
+    /// least every 3s (the keep-alive tick) — adding this to that SAME
+    /// predicate closes an idle stream within one tick, with no new
+    /// cv-plumbing. NOT wired into the MCP GET/streamed-POST surfaces
+    /// (`McpStreamPump`'s teardown is driven by `session_alive_`/session-
+    /// registry revalidation, a materially different mechanism) — an open
+    /// MCP stream still relies on the bounded web-thread join + escalation
+    /// in `ServerImpl::stop()` as its backstop. Tracked as a named follow-up
+    /// (#2371 comment, 2026-08-11), not silently left uncovered.
+    void begin_closing() { closing_.store(true, std::memory_order_release); }
+    bool closing() const { return closing_.load(std::memory_order_acquire); }
+
 private:
     /// CONTAINED AT THE SOURCE, and it has to be here rather than at any call site:
     /// this is reached from ~Lease -> an httplib content-provider releaser ->
@@ -372,6 +388,7 @@ private:
     Config cfg_;
     std::size_t total_ = 0;
     std::unordered_map<Key, std::size_t, KeyHash> per_principal_;
+    std::atomic<bool> closing_{false};
 };
 
 }  // namespace yuzu::server::detail

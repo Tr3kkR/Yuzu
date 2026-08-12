@@ -33,7 +33,8 @@ PgPool::PgPool(Options opts)
     : conninfo_(std::move(opts.conninfo)), size_(opts.size > 0 ? opts.size : 1),
       connect_timeout_s_(opts.connect_timeout_s), statement_timeout_ms_(opts.statement_timeout_ms),
       lock_timeout_ms_(opts.lock_timeout_ms), keepalives_idle_s_(opts.keepalives_idle_s),
-      observer_(std::move(opts.observer)), backoff_base_(opts.connect_backoff_base),
+      tcp_user_timeout_ms_(opts.tcp_user_timeout_ms), observer_(std::move(opts.observer)),
+      backoff_base_(opts.connect_backoff_base),
       backoff_cap_(opts.connect_backoff_cap) {
     // Parse up front so a malformed conninfo is caught here, once, with a
     // sanitized error — NOT at first acquire with libpq's parse error, which
@@ -62,6 +63,9 @@ PgPool::PgPool(Options opts)
     conninfo_has_options_ = conninfo_sets(parsed, "options") ||
                             (env_options != nullptr && env_options[0] != '\0');
     conninfo_has_keepalives_ = conninfo_sets(parsed, "keepalives");
+    // No dedicated PG* env var exists for tcp_user_timeout (unlike
+    // connect_timeout/options above) — conninfo is the only source to check.
+    conninfo_has_tcp_user_timeout_ = conninfo_sets(parsed, "tcp_user_timeout");
     PQconninfoFree(parsed);
     valid_ = true;
 }
@@ -236,12 +240,16 @@ PGconn* PgPool::connect_one() {
     //    host would otherwise wedge the acquiring thread;
     //  - keepalives/keepalives_idle: surface a silently reaped connection as a
     //    failed statement rather than an indefinite hang;
+    //  - tcp_user_timeout: bounds how long UNACKED data may sit on a
+    //    genuinely dark network path, independent of the keepalive cycle
+    //    (see the Options doc comment for why this differs from keepalives);
     //  - options (-c statement_timeout / -c lock_timeout): bound a wedged
     //    query and the migration-runner advisory-lock wait server-side.
     // All locals below must outlive the PQconnectdbParams call (they do — the
     // call happens before this function returns).
     const std::string timeout = std::to_string(connect_timeout_s_);
     const std::string keepalives_idle = std::to_string(keepalives_idle_s_);
+    const std::string tcp_user_timeout = std::to_string(tcp_user_timeout_ms_);
     std::string options;
     if (!conninfo_has_options_) {
         if (statement_timeout_ms_ > 0)
@@ -266,6 +274,10 @@ PGconn* PgPool::connect_one() {
         vals.push_back("1");
         keys.push_back("keepalives_idle");
         vals.push_back(keepalives_idle.c_str());
+    }
+    if (!conninfo_has_tcp_user_timeout_ && tcp_user_timeout_ms_ > 0) {
+        keys.push_back("tcp_user_timeout");
+        vals.push_back(tcp_user_timeout.c_str());
     }
     if (!conninfo_has_options_ && !options.empty()) {
         keys.push_back("options");
