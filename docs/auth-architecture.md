@@ -2639,9 +2639,11 @@ legacy `rbac.db` (seed defaults first, then backfill operator rows via `ON CONFL
 operator edits to seeded permissions are preserved via `DO UPDATE`). A
 built-in default permission the operator explicitly revoked (`remove_permission`)
 before upgrading is **deleted** — matching legacy exactly, a plain absent row
-— scoped to (role, securable_type) pairs legacy's own catalogue actually
-knew about, so a securable a later `seed_defaults()` adds (e.g.
-`EnginePrincipal`, #2376) is untouched (fjarvis #2703 F1). The revocation is
+— scoped to (role, securable_type, operation) triples legacy's own catalogue
+actually knew about, so a securable a later `seed_defaults()` adds (e.g.
+`EnginePrincipal`, #2376) or an operation added to an existing role+type pair
+(e.g. `ApiToken:Rotate` — fjarvis #2703 re-review, C1) is untouched (fjarvis
+#2703 F1). The revocation is
 recorded SEPARATELY, as pure reseed-suppression bookkeeping in a dedicated
 `revoked_seed_defaults` table — consulted ONLY by `seed_defaults()`'s grant
 helper, never by any authorization-decision code path — so `seed_defaults()`'s

@@ -106,8 +106,10 @@ dataset), reconciled, **fail-CLOSED** backfill from the legacy `rbac.db` (the AD
 fingerprint pattern, right-sized for a small non-resumable dataset — governance re-review, #2703),
 seeding defaults first then backfilling operator rows via `ON CONFLICT DO NOTHING`. A built-in
 default the operator explicitly revoked before upgrading is **deleted** post-seed — matching legacy
-exactly, a plain absent row — scoped to (role, securable_type) pairs the legacy catalogue actually
-knew about; a securable a later seed adds (e.g. `EnginePrincipal`, #2376) is untouched. The
+exactly, a plain absent row — scoped to (role, securable_type, operation) triples the legacy
+catalogue actually knew about; a securable a later seed adds (e.g. `EnginePrincipal`, #2376) or an
+operation added to an existing role+type pair (e.g. `ApiToken:Rotate` — #2703 re-review, C1) is
+untouched. The
 revocation is recorded SEPARATELY, as pure reseed-suppression bookkeeping in a dedicated
 `revoked_seed_defaults` table consulted ONLY by the seed step's own grant helper — never by any
 authorization-decision code path — so the idempotent every-boot reseed cannot silently resurrect it

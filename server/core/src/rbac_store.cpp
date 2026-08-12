@@ -1328,7 +1328,11 @@ void RbacStore::maybe_refresh_generation() const {
     // serialization point — every concurrent check_permission() call (even
     // a cache HIT) needs it too. That same reasoning applies to these two
     // sibling branches; only the STATE MUTATIONS stay under the lock, and
-    // which degrade(s) to fire is decided as plain bools first.
+    // which degrade(s) to fire is decided as plain bools first — except the
+    // row-absent case below, which sets this same flag from INSIDE the
+    // lock's durable_gen-confirmed branch, deliberately: it must only fire
+    // when durable_gen was ALSO confirmed this round (see the fjarvis
+    // MEDIUM comment there), a condition not yet known at this point.
     bool fire_non_canonical_degrade = saw_non_canonical_enabled;
     bool fire_refresh_failed_degrade = false;
     bool refresh_failed_cache_dropped = false;
@@ -1409,8 +1413,9 @@ void RbacStore::maybe_refresh_generation() const {
     if (fire_non_canonical_degrade) {
         static DegradeSampler sampler;
         if (note_read_degrade(metrics_, kReasonNonCanonicalFlag, sampler))
-            spdlog::warn("RbacStore: durable rbac_enabled refresh read a non-canonical value — "
-                         "leaving the cached enabled-state unchanged (never coercing to false)");
+            spdlog::warn("RbacStore: durable rbac_enabled refresh could not confirm this round "
+                         "(row read as non-canonical, or absent entirely) — leaving the cached "
+                         "enabled-state unchanged (never coercing to false)");
     }
     if (fire_refresh_failed_degrade) {
         // Count the degrade so on-call can see that the cross-replica
@@ -3592,6 +3597,25 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
         // type. A genuine operator revocation of an operation legacy DID
         // know about is still caught (that row is present in legacy_op_names
         // but absent from perm_ops for this role+type+op triple).
+        //
+        // INVARIANT (security-guardian, #2703 re-review): this generalizes
+        // the original two-dimension gap rather than closing the risk
+        // class it warned about. A brand-new TRIPLE — a default grant whose
+        // role, securable_type, AND operation are each individually already
+        // known to legacy, but never before as this exact combination (e.g.
+        // a role gaining a grant for an operation legacy only ever saw
+        // associated with a DIFFERENT role) — is still indistinguishable
+        // from a genuine operator revocation under this filter, for the
+        // same structural reason the original two-dimension case was:
+        // legacy has an opinion about all three catalogues individually but
+        // holds no row for the triple. As before, the failure direction is
+        // a lockout (access denial), not an escalation — but it is
+        // narrowed, not eliminated. Revisit this scoping if a future
+        // default grant ever ships onto a triple whose role, type, and
+        // operation legacy could each plausibly have known but never in
+        // that combination (ApiToken:Rotate was the type+operation
+        // instance of this; role+operation and role+type instances remain
+        // theoretically possible).
         {
             std::vector<std::string> legacy_role_names, legacy_type_names, legacy_op_names,
                 perm_roles, perm_types, perm_ops;
