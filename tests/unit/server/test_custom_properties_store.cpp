@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1050,11 +1051,9 @@ TEST_CASE("CustomPropertiesStore: migrate_from_sqlite refuses on this replica's 
     REQUIRE(replica_b.is_open());
     TempSqliteFile legacy("yuzu_test_customprops_holdercorrupt_");
     {
-        FILE* f = std::fopen(legacy.path.string().c_str(), "wb");
-        REQUIRE(f != nullptr);
-        const char junk[] = "not a sqlite database";
-        std::fwrite(junk, 1, sizeof(junk), f);
-        std::fclose(f);
+        std::ofstream f(legacy.path, std::ios::binary);
+        REQUIRE(f.is_open());
+        f << "not a sqlite database";
     }
 
     // A corrupt/unreadable file while the marker is set must fail closed —
@@ -1062,4 +1061,84 @@ TEST_CASE("CustomPropertiesStore: migrate_from_sqlite refuses on this replica's 
     // local file that might hold real, never-migrated data.
     CHECK_FALSE(replica_b.migrate_from_sqlite(legacy.path));
     CHECK(std::filesystem::exists(legacy.path));
+}
+
+// governance Gate 8 (security-guardian, MEDIUM): the 4 holder-side tests
+// above are all SEQUENTIAL — replica A's migrate_from_sqlite fully commits
+// (marker present) before replica B's ever runs, so replica B always takes
+// the pre-existing `marker_present` verify branch and never re-enters
+// stamp_complete itself. None of them would fail if stamp_complete's SQL
+// were reverted to the pre-fix plain `ON CONFLICT DO NOTHING`. A genuine
+// concurrent-collision repro needs two real racing callers, which (mirrors
+// RbacStore's own documented limitation, test_rbac_store.cpp) the public
+// API's own step-2 idempotency check makes impossible to force
+// deterministically without a test-only pause hook. Verify the upsert's SQL
+// semantics directly against Postgres instead — a COPY of stamp_complete's
+// fingerprint query, not a call into stamp_complete itself (a private
+// lambda with no external call site). DISCLOSED LIMITATION: this copy is
+// NOT auto-synced — if stamp_complete's fingerprint UPSERT in
+// custom_properties_store.cpp ever changes, this copy must be updated to
+// match or this test silently stops covering the real code.
+TEST_CASE("CustomPropertiesStore: backfill_source_fingerprint upsert promotes sourceless, "
+          "protects a real value, and accepts a matching value",
+          "[pg][custom_props][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    CustomPropertiesStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.migrate_from_sqlite("/nonexistent/path/custom-properties.db")); // seeds 'sourceless'
+
+    const auto stamp = [&](const std::string& value) -> int {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "INSERT INTO custom_properties_store.custom_properties_meta (key, value) VALUES "
+            "('backfill_source_fingerprint', $1) ON CONFLICT (key) DO UPDATE SET "
+            "value = EXCLUDED.value WHERE custom_properties_store.custom_properties_meta.value = "
+            "'sourceless' OR custom_properties_store.custom_properties_meta.value = "
+            "EXCLUDED.value RETURNING value",
+            std::vector<std::string>{value});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+    const auto stored_value = [&]() -> std::string {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "SELECT value FROM custom_properties_store.custom_properties_meta WHERE key = "
+            "'backfill_source_fingerprint'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(r.get()) == 1);
+        return PQgetvalue(r.get(), 0, 0);
+    };
+    REQUIRE(stored_value() == "sourceless");
+
+    // A real fingerprint promotes a stored sourceless placeholder — 1 row.
+    CHECK(stamp("v1:real_A") == 1);
+    CHECK(stored_value() == "v1:real_A");
+
+    // A DIFFERENT real fingerprint may not overwrite the now-real value — 0
+    // rows, and the stored value is untouched. This is the exact case the
+    // security-guardian HIGH finding closed: pre-fix (plain ON CONFLICT DO
+    // NOTHING), this same call would have silently no-opped without ever
+    // reporting that a different value already won.
+    CHECK(stamp("v1:real_B") == 0);
+    CHECK(stored_value() == "v1:real_A");
+
+    // The SAME real fingerprint writing again (two replicas sharing storage,
+    // both migrating identical content, one loses only the INSERT race, not
+    // the content race) counts as success, not a lost race — 1 row.
+    CHECK(stamp("v1:real_A") == 1);
+    CHECK(stored_value() == "v1:real_A");
+
+    // A sourceless writer never overwrites an established real value — 0
+    // rows (non-error for the sourceless caller per stamp_complete's own
+    // exemption, exercised at the migrate_from_sqlite level in the tests
+    // above).
+    CHECK(stamp("sourceless") == 0);
+    CHECK(stored_value() == "v1:real_A");
 }

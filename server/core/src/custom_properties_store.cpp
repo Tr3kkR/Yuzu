@@ -744,20 +744,26 @@ std::optional<std::string> fingerprint_legacy_snapshot(const LegacySnapshot& sna
 // error is a legitimate zero-row legacy database.
 //
 // The properties and schemas SELECTs run inside one deferred transaction
-// (BEGIN...COMMIT/ROLLBACK), not as two independent statements on the bare
-// connection: without it, a legacy file that is STILL being written by
-// another process between the two loops (e.g. a stale pre-migration binary
-// still pointed at custom-properties.db) could interleave a commit between
-// them, producing a torn cross-table read that then gets fingerprinted and
-// stamped complete as if it were consistent — silently discarding whichever
-// half of the interleaved write lands after the read completes. `BEGIN`
-// (not `BEGIN IMMEDIATE`) is sufficient here: this connection is
-// SQLITE_OPEN_READONLY, so a deferred transaction still fixes one consistent
-// snapshot for the whole read, and there is nothing for this connection to
-// write that a reserved lock would need to protect.
+// (BEGIN, then RAII-guarded via SqliteTxn — governance Gate 8 cpp-safety:
+// an earlier revision of this function used a raw sqlite3_exec COMMIT/
+// ROLLBACK pair instead of the repo's own SqliteTxn wrapper, so an exception
+// thrown mid-loop, e.g. bad_alloc from a string copy/push_back, skipped the
+// final exec entirely — the exact "new manual cleanup where an RAII wrapper
+// already exists" shape sqlite_raii.hpp's header comment names as its own
+// motivating case). Without a shared transaction at all, a legacy file that
+// is STILL being written by another process between the two loops (e.g. a
+// stale pre-migration binary still pointed at custom-properties.db) could
+// interleave a commit between them, producing a torn cross-table read that
+// then gets fingerprinted and stamped complete as if it were consistent —
+// silently discarding whichever half of the interleaved write lands after
+// the read completes. `BEGIN` (not `BEGIN IMMEDIATE`) is sufficient here:
+// this connection is SQLITE_OPEN_READONLY, so a deferred transaction still
+// fixes one consistent snapshot for the whole read, and there is nothing
+// for this connection to write that a reserved lock would need to protect.
 std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* db) {
     if (sqlite3_exec(db, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK)
         return std::nullopt;
+    SqliteTxn txn(db);
     LegacySnapshot snap;
     bool ok = true;
     {
@@ -802,9 +808,19 @@ std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* db) {
         }
     }
     // A read-only transaction commits or rolls back identically (no writes to
-    // preserve or discard) — ROLLBACK on the failure path just releases the
-    // snapshot promptly rather than leaving it open until the connection closes.
-    sqlite3_exec(db, ok ? "COMMIT" : "ROLLBACK", nullptr, nullptr, nullptr);
+    // preserve or discard). SqliteTxn's destructor rolls back on ANY path
+    // that doesn't reach a successful commit() — including an exception
+    // unwinding through this function — so the !ok path below deliberately
+    // does NOT call commit(), letting the guard's destructor roll back when
+    // this scope exits (whether via the normal `return std::nullopt` or an
+    // exception). A COMMIT failure on a read-only transaction is not
+    // expected in practice but is checked rather than ignored (commit() is
+    // [[nodiscard]]): the guard still rolls back on scope exit either way,
+    // so this is a fail-closed read either path — logged, not fatal, since
+    // the caller already treats `ok` as the sole success signal.
+    if (ok && txn.commit() != SQLITE_OK)
+        spdlog::warn("CustomPropertiesStore: read_legacy_snapshot: COMMIT failed: {}",
+                     sqlite3_errmsg(db));
     if (!ok)
         return std::nullopt;
     return snap;

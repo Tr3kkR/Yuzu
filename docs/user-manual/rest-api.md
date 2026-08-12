@@ -3519,10 +3519,14 @@ Set or update a custom property value on an agent. If a property schema exists f
 
 **Note on database degrade:** unlike `GET /api/agents/:id/properties` above, a transient
 database failure during this write currently surfaces as this same `400` (`"database error"` /
-`"database write failed"`) rather than a distinguishable `503` — not yet type-widened. This
-predates the Postgres migration (the SQLite original had the identical collapse-to-generic-error
-shape on a write failure); it is called out here because a Postgres pool/query failure is a more
-routine occurrence than a local SQLite file error ever was.
+`"database write failed"`) rather than a distinguishable `503` — not yet type-widened. Most of
+this predates the Postgres migration (the SQLite original had the identical
+collapse-to-generic-error shape on an INSERT failure); it is called out here because a Postgres
+pool/query failure is a more routine occurrence than a local SQLite file error ever was. One
+sub-case is new in this release: a transient failure on the schema-validation lookup itself
+(rather than the property write) used to be silently treated as "no schema, accept any value" by
+the SQLite original — that fail-open is now closed, and this sub-case also surfaces as `400`
+(`"database error"`), correctly rejecting the write rather than accepting it unvalidated.
 
 ---
 

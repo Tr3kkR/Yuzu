@@ -31,15 +31,21 @@ is genuine) or confirm it's safe to discard, then retry.
 
 ### "HOLDER-SIDE VERIFICATION FAILED ... a DIFFERENT recorded source fingerprint"
 
-A different replica's `custom-properties.db` was migrated, and this
-replica's own file was never part of it. **This should be rare for this
-store specifically**: unlike `rbac.db`, `custom-properties.db` is ordinarily
-a single server's local operator-authored asset-tagging data, not something
-expected to diverge legitimately across replicas of the same logical
-deployment — if you're seeing this, it usually means either (a) two
-independently-seeded pre-cutover servers are being merged into one Postgres
-deployment for the first time, or (b) an operator edited custom properties
-on more than one replica before the cutover completed.
+This ONE log message covers two distinct situations — read the quoted
+`fingerprint '{stored}'` value in the log line before acting, since the
+right recovery differs between them:
+
+**If the quoted stored fingerprint is a real hash (`v1:<64 hex chars>`), not
+the literal word `sourceless`:** a different replica's real
+`custom-properties.db` was migrated, and this replica's own file was never
+part of it. **This should be rare for this store specifically**: unlike
+`rbac.db`, `custom-properties.db` is ordinarily a single server's local
+operator-authored asset-tagging data, not something expected to diverge
+legitimately across replicas of the same logical deployment — if you're
+seeing this, it usually means either (a) two independently-seeded
+pre-cutover servers are being merged into one Postgres deployment for the
+first time, or (b) an operator edited custom properties on more than one
+replica before the cutover completed.
 
 To make this rare rather than routine, boot the replica holding the real,
 authoritative `custom-properties.db` FIRST on any fresh multi-replica
@@ -58,6 +64,25 @@ correct properties via `PUT /api/agents/:id/properties/:key` /
 `POST /api/property-schemas` is often simpler than a DB-level reconciliation,
 since this store's data is small and operator-editable through the normal
 API).
+
+**If the quoted stored fingerprint is the literal word `sourceless`:** a
+fileless sibling replica booted first and stamped the shared marker before
+ANY replica had migrated real data — nothing has actually been backfilled
+into Postgres yet. This replica's file holds real content and is refused
+anyway, because the marker being present at all means this is not a fresh
+install this replica can just proceed with. There is no "move aside the
+other replica's file" step here — there is no other file, nothing was ever
+migrated. **To recover:** confirm no operator activity has touched custom
+properties through the REST API on any replica since the sourceless stamp
+(there is nothing to reconcile against yet, unlike `RbacStore`'s equivalent
+case, since this store's backfill makes no live-state-mutation between the
+marker stamp and now); if clean, engage engineering to clear the
+`backfill_complete` and `backfill_source_fingerprint` rows from
+`custom_properties_store.custom_properties_meta` and restart this replica —
+it will then find the marker absent and complete a normal migration. To
+avoid this: boot the replica holding the real `custom-properties.db` FIRST
+on any fresh multi-replica rollout, same guidance as the real-fingerprint
+case above.
 
 ## Note: no "abandon by hand" procedure
 

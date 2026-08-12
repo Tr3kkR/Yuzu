@@ -1069,11 +1069,13 @@ performs a **mandatory one-time backfill** on first Postgres boot:
   or silently overwriting the winner's data — see
   `docs/ops-runbooks/custom-properties-store-backfill-recovery.md` for the
   recovery procedure.
-- **Widened startup budget.** First boot takes longer than usual while the
-  backfill runs; the server's startup readiness budget is widened to
-  accommodate it. A large `custom-properties.db` (many agents/properties)
-  will extend this further — do not treat a slower-than-normal first boot as
-  a hang.
+- **Budget for a longer first boot.** First boot takes longer than usual while
+  the backfill runs; a large `custom-properties.db` (many agents/properties)
+  extends this further. **Widen your own orchestrator's startup budget
+  accordingly** (Kubernetes `startupProbe` failure/period budget, or the
+  Docker Compose healthcheck `start_period`) so it does not kill the server
+  mid-backfill and restart it into the same long boot repeatedly — do not
+  treat a slower-than-normal first boot as a hang.
 
 **Operator-visible behaviour change (fail-closed reads).** After cutover, a
 `props.<key>`-feeding read that degrades (store not open, pool-acquire

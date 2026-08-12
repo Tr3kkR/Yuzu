@@ -6603,11 +6603,20 @@ public:
         // pool, matching every other migrated store's belt-and-braces
         // discipline (declaration order alone is a coincidence, not a
         // contract — a future caller wired here mid-`stop()` must not find a
-        // still-live store past this point). No background thread and no
-        // other consumer holds a raw pointer to unwire first: its only
-        // callers are `AgentRegistry::evaluate_scope` (via a borrowed
-        // pointer passed per-call, never stored) and the REST handlers,
-        // both quiesced by the drains above.
+        // still-live store past this point). No OTHER consumer stores a raw
+        // pointer beyond its call duration: `AgentRegistry::evaluate_scope`
+        // takes it as a borrowed per-call argument, never stored, and every
+        // REST handler is quiesced by the drains above. `PolicyEvaluator`
+        // DOES hold a raw `custom_properties_store` pointer
+        // (`PolicyEvaluator::Deps`, wired near this store's construction) on
+        // its background `policy_eval_thread_` — that thread is already
+        // joined earlier in this same `stop()` (see `policy_eval_thread_
+        // .join()` above), before this reset runs, so it is not a live
+        // consumer at this point either; it is called out explicitly here
+        // (governance Gate 8 cpp-safety) because an earlier revision of this
+        // comment claimed "no background thread holds a raw pointer,"
+        // which was inaccurate — the thread exists, it is simply already
+        // joined by the time execution reaches this line.
         custom_properties_store_.reset();
         // ResultSetStore borrows pg_pool_ — drop before the pool. The maintenance
         // thread that leased it is already joined above; every HTTP/gRPC handler
