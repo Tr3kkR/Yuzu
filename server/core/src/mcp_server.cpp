@@ -11,6 +11,7 @@
 #include "mcp_stream_bridge.hpp" // progress bridge core (2f PR 3a)
 #include "mcp_transport.hpp"     // Streamable HTTP transport pre-checks (2f)
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (streamed POST, 3b)
+#include "reserved_definition_id.hpp" // kMcpDefinitionPrefix (#2442 — the ONE reserved-namespace rule)
 #include "rotation_confirm_state.hpp" // classify_confirm_state (#2443 confirm_engine_rotation precondition)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric (shared REST/MCP metric symbol)
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
@@ -3425,7 +3426,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
 
-                    const std::string definition_id = "mcp." + tool_name;
+                    const std::string definition_id = std::string(kMcpDefinitionPrefix) + tool_name;
                     const std::string canon = canonical_args(args);
                     const std::string supplied_id = param_str(args, "approval_id");
                     // M2 (PR #1796): device-targeted tools prefix the pending
@@ -3589,8 +3590,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
-                        auto submitted =
-                            approval_manager->submit(definition_id, session->username, canon);
+                        auto submitted = approval_manager->submit(
+                            definition_id, session->username, canon,
+                            /*schedule_id=*/"", ApprovalOrigin::kMcp);
                         if (!submitted) {
                             mcp_audit("failure", "approval submit failed: " + submitted.error());
                             res.set_content(
@@ -3866,16 +3868,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         // The kind stays in the audit trail, which is genuinely
                         // server-side.
                         count_denial("yuzu_mcp_approval_refused_total", nullptr);
-                        // #2786 arm 1: when the ORIGIN check's own read is what
-                        // faulted, the comparison never ran, so a foreign-origin
-                        // ticket is exactly as likely to be behind this refusal
-                        // as an innocent one — the forgery signal would
-                        // otherwise be lost to a plain "store_error". The
-                        // masked counter (no reason label, same anti-oracle
-                        // rationale below) and the audit suffix are the
-                        // caller-visible half of that signal; ApprovalManager's
-                        // own warn log is the caller-independent half.
-                        if (consumed.error().origin_check_unevaluated)
+                        // #2786 arm 1: when the origin+submitter BINDING check's
+                        // own read is what faulted, neither comparison ran, so a
+                        // foreign-origin or foreign-submitter ticket is exactly as
+                        // likely to be behind this refusal as an innocent one —
+                        // the forgery signal would otherwise be lost to a plain
+                        // "store_error". The masked counter (no reason label,
+                        // same anti-oracle rationale below) and the audit suffix
+                        // are the caller-visible half of that signal;
+                        // ApprovalManager's own warn log is the
+                        // caller-independent half.
+                        if (consumed.error().binding_check_unevaluated)
                             count_denial("yuzu_mcp_approval_masked_denials_total", nullptr);
                         // Unlike the masked/refused counters above, kPrecondition is
                         // NOT one of the kinds the anti-oracle argument covers (see
@@ -3904,14 +3907,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                            ? (": " + consumed.error().message +
                                               " (ticket not consumed)")
                                            : "") +
-                                      (consumed.error().origin_check_unevaluated
-                                           ? " (origin unverified)"
+                                      (consumed.error().binding_check_unevaluated
+                                           ? " (origin/submitter unverified)"
                                            : ""));
 
-                        // CLIENT message stays uniform for the two that must not
-                        // be distinguishable: a foreign-origin refusal reads
-                        // exactly like an ordinary replay, or the recall becomes
-                        // a probe for which surface minted a ticket.
+                        // CLIENT message stays uniform for the three that must
+                        // not be distinguishable: a foreign-origin or
+                        // foreign-submitter refusal reads exactly like an
+                        // ordinary replay, or the recall becomes a probe for
+                        // which surface minted a ticket or who it belongs to.
                         //
                         // kStoreError is NOT one of those. It leaves the ticket
                         // UNTOUCHED, so telling the caller it was "already used"

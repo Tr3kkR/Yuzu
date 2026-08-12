@@ -8253,6 +8253,83 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
     sqlite3_close(raw);
 }
 
+TEST_CASE("MCP approval recall refuses a ticket presented by a different principal "
+          "than its submitter",
+          "[mcp][integration][tag][approval][security]") {
+    // End-to-end sibling to the store-level submitter-binding tests
+    // (test_approval_manager.cpp): mints and recalls through the REAL MCP
+    // handler, not directly against ApprovalManager, so this pins the
+    // client-facing envelope and the audit string the store-level tests
+    // cannot see. The scenario this closes: operator2 read operator1's
+    // approved ticket id off GET /api/approvals (Approval:Read, seeded to
+    // Viewer) and also holds delete_tag's own RBAC permission.
+    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_2442_mcp_tag_"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_2442_mcp_appr_"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("operator");
+
+    // 1. Mint as operator1 — mock_username is read at call time, so this test
+    //    can swap principals between calls on the SAME server instance.
+    ts.mock_username = "operator1";
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":260,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+    REQUIRE(appr.get(approval_id)->submitted_by == "operator1");
+    REQUIRE(appr.get(approval_id)->origin == ApprovalOrigin::kMcp); // the real mint declares it
+
+    // 2. Recall as operator2 — same tool, same arguments, foreign principal.
+    ts.mock_username = "operator2";
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":261,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // Same client-facing shape as an ordinary replay or a foreign-origin
+    // refusal — the anti-oracle constraint (kNotConsumableMessage) applies
+    // identically to this kind.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"] == "approval already used (one-time ticket)");
+    CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
+    // Not masked — the binding-check read succeeded, it just refused.
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 0.0);
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back() == "approval_id=" + approval_id + " refused: foreign_submitter");
+
+    // Untouched — the rightful submitter can still redeem it.
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+    CHECK(tags.get_tag("agent-1", "role") == "web"); // not deleted
+
+    ts.mock_username = "operator1";
+    auto res2 = ts.call(recall);
+    auto payload2 = write_tool_payload(res2);
+    CHECK(payload2["deleted"] == true);
+    CHECK(tags.get_tag("agent-1", "role").empty()); // the rightful submitter DID delete it
+    sqlite3_close(raw);
+}
+
 TEST_CASE("MCP delete_tag with a mismatched-args approval_id is rejected",
           "[mcp][integration][tag][approval]") {
     yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
@@ -8765,10 +8842,11 @@ TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too,
     REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
     CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
     CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
-    // Negative control: this fault hit only the CAS, AFTER the origin check
-    // already passed (the MCP mint's ticket is kUnspecified, which grants) —
-    // the masked-denial counter must stay at zero, not fire on every
-    // store-error kind indiscriminately.
+    // Negative control: this fault hit only the CAS, AFTER the binding check
+    // already passed (the MCP mint declares ApprovalOrigin::kMcp, and this
+    // recall's own principal is the ticket's submitter) — the masked-denial
+    // counter must stay at zero, not fire on every store-error kind
+    // indiscriminately.
     CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
               .value() == 0.0);
     REQUIRE(!ts.audit_details.empty());
@@ -8879,7 +8957,7 @@ TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreig
               .value() == 1.0);
     REQUIRE(!ts.audit_details.empty());
     CHECK(ts.audit_details.back() ==
-          "approval_id=" + approval_id + " refused: store_error (origin unverified)");
+          "approval_id=" + approval_id + " refused: store_error (origin/submitter unverified)");
 
     REQUIRE(sqlite3_set_authorizer(conn.h, nullptr, nullptr) == SQLITE_OK);
 
@@ -9119,7 +9197,8 @@ TEST_CASE("MCP 2405: approved ticket bound to schema-invalid args is rejected an
 
     // Seed the pre-#2405 state directly: a ticket already minted for
     // schema-invalid args (missing `key`) and approved by an admin.
-    auto seeded = h.appr->submit("mcp.delete_tag", "test-user", R"({"agent_id":"agent-1"})");
+    auto seeded = h.appr->submit("mcp.delete_tag", "test-user", R"({"agent_id":"agent-1"})", "",
+                                 yuzu::server::ApprovalOrigin::kMcp);
     REQUIRE(seeded);
     REQUIRE(h.appr->approve(*seeded, "reviewer-bob", ""));
 
@@ -10070,7 +10149,8 @@ TEST_CASE("MCP approve_request approves a pending request as a second principal"
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
     yuzu::server::ApprovalManager appr(raw);
     appr.create_tables();
-    auto submitted = appr.submit("some.definition", "alice", "{}");
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
     REQUIRE(submitted);
 
     McpTestServer ts;
@@ -10098,7 +10178,8 @@ TEST_CASE("MCP reject_request rejects a pending request", "[mcp][integration][ap
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
     yuzu::server::ApprovalManager appr(raw);
     appr.create_tables();
-    auto submitted = appr.submit("some.definition", "alice", "{}");
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
     REQUIRE(submitted);
 
     McpTestServer ts;

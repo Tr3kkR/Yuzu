@@ -6016,10 +6016,10 @@ uniqueness against existing definitions.
 Body is `{"error": "<reason>"}`.
 
 The `mcp.` definition-id prefix is **reserved** (#2442): it names MCP approval
-tickets, and the MCP recall matches a ticket on its definition id and scope
-expression without binding the submitter, so a definition authored under that
-prefix could line up with an MCP tool's canonical arguments. Every authoring
-route that accepts an explicit id refuses it — this one, `POST
+tickets, and a definition authored under that prefix could line up with an MCP
+tool's canonical arguments (`docs/mcp-server.md` documents the recall's full
+match, which also binds origin and submitter). Every authoring route that
+accepts an explicit id refuses it — this one, `POST
 /api/instructions/yaml`, and `POST /api/instructions/import` — and boot-time
 auto-import skips such a definition. Product-pack install is unaffected: it
 never carries a declared id through, so the store always assigns one.

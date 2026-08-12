@@ -78,8 +78,18 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > (`definition_id`), (c) for these exact arguments (canonical-args match,
 > `approval_id` excluded from the comparison), and (d) not yet consumed, then
 > **atomically consumes it** (one-time; a replay of a consumed ticket, or a
-> concurrent second recall, is rejected — the mutating op runs at most once) and
-> lets the call through to the handler. A recall against a still-**pending**
+> concurrent second recall, is rejected — the mutating op runs at most once).
+> The consume step additionally requires (e) the ticket was minted by the MCP
+> surface itself, not a REST/schedule mint that happens to share this tool's
+> `definition_id` and arguments (#2442), and (f) the recalling principal is
+> the ticket's own submitter (#2442) — a Viewer who merely read the ticket id
+> off `GET /api/approvals` cannot redeem it. (e) and (f) are enforced only at
+> this consume step, not at the pending-poll lookup above, and their refusal
+> reads identically to an ordinary replay — see -32003 below for why. (A
+> wrong-tool/arguments mismatch is a DIFFERENT, earlier refusal — a distinct
+> message, at (b)/(c) above, not this one; it is not part of the anti-oracle
+> group.) A successful consume lets the call through to the
+> handler. A recall against a still-**pending**
 > ticket returns the same `kApprovalRequired` envelope (keep polling
 > `status_url`); a rejected/expired/mismatched/consumed ticket returns
 > `kPermissionDenied` (-32003). `confirm_engine_rotation`'s recall additionally
