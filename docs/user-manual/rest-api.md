@@ -5579,21 +5579,25 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 
 Fleet-wide status rollup. `errored_rules` is real (#2298 item 6d): the count of
 distinct rule_ids with at least one agent currently reporting state `errored` in
-the `guardian_agent_rule_status` census — the source of truth also behind the
-dashboard's Unhealthy Guards card, not the (reaped, 30-day) event log. `compliant_rules`
-and `drifted_rules` stay `0` deliberately — full status ingest (`action=="status"`)
-lands in a later rung.
+the `guardian_agent_rule_status` census, intersected against the live rule catalogue
+(a census row for a since-deleted rule is excluded) — the source of truth also
+behind the dashboard's Unhealthy Guards card, not the (reaped, 30-day) event log.
+`compliant_rules` and `drifted_rules` stay `0` deliberately — full status ingest
+(`action=="status"`) lands in a later rung. A **service-scoped API token is denied
+(`403`) outright**: this route aggregates across every agent's census, and a token
+scoped to one service must not read the fleet-wide count.
 
-- **Permission:** `GuaranteedState:Read`
+- **Permission:** `GuaranteedState:Read` (non-service-scoped only — see above)
 - **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
 - **5xx:** `503` if the Guaranteed State store is unavailable or degraded — never a silent `0`.
 
 #### `GET /api/v1/guaranteed-state/status/{agent_id}`
 
-Per-agent status. `errored_rules` is the same census derivation as the fleet route,
-scoped to this agent; `total_rules` is the count of rules with any census entry for
-this agent (not the fleet catalogue size). `compliant_rules`/`drifted_rules` stay `0`
-for the same reason as the fleet route. Per-device behavioral read: scoped the same
+Per-agent status. `errored_rules` is the same census derivation as the fleet route
+(also intersected against the live rule catalogue), scoped to this agent; `total_rules`
+is the count of rules with any census entry for this agent (not the fleet catalogue
+size). `compliant_rules`/`drifted_rules` stay `0` for the same reason as the fleet
+route. Per-device behavioral read: scoped the same
 way as `GET /guaranteed-state/device-compliance` (a global grant passes fleet-wide,
 otherwise the caller must hold Read via a management group the device is in), and
 audited as `guardian.device.view` — **fail-closed**: `503` + `Sec-Audit-Failed: true`
