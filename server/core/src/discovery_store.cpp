@@ -405,8 +405,12 @@ DiscoveryStore::list_devices(const std::string& subnet_filter) {
         res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
     } else {
         sql += "WHERE subnet = $1 ORDER BY last_seen DESC";
+        // sanitize_pg_text: match the same transform applied on write, so a
+        // filter value containing invalid UTF-8/NUL still matches the
+        // sanitized bytes actually stored (rather than silently no-op-ing to
+        // "no rows found" against the caller's untransformed original).
         res = pg::exec_params(lease.get(), sql.c_str(),
-                              std::vector<std::string>{subnet_filter});
+                              std::vector<std::string>{sanitize_pg_text(subnet_filter)});
     }
     if (res.status() != PGRES_TUPLES_OK) {
         if (note_read_degrade(metrics_, kReasonQueryError, sampler))
@@ -435,8 +439,8 @@ DiscoveryStore::get_device(const std::string& ip_address) {
 
     std::string sql = std::string("SELECT ") + kDeviceCols +
                       " FROM discovery_store.discovered_devices WHERE ip_address = $1 LIMIT 1";
-    pg::PgResult res =
-        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{ip_address});
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(),
+                                       std::vector<std::string>{sanitize_pg_text(ip_address)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(std::string("get_device failed: ") + PQerrorMessage(lease.get()));
     if (PQntuples(res.get()) == 0)
@@ -459,7 +463,7 @@ DiscoveryStore::mark_managed(const std::string& ip_address, const std::string& a
         lease.get(),
         "UPDATE discovery_store.discovered_devices SET managed = TRUE, agent_id = $1 "
         "WHERE ip_address = $2 RETURNING id",
-        std::vector<std::string>{sanitize_pg_text(agent_id), ip_address});
+        std::vector<std::string>{sanitize_pg_text(agent_id), sanitize_pg_text(ip_address)});
     if (res.status() != PGRES_TUPLES_OK)
         return std::unexpected(std::string("mark_managed failed: ") +
                                PQerrorMessage(lease.get()));
@@ -483,7 +487,7 @@ std::expected<void, std::string> DiscoveryStore::clear_results(const std::string
     } else {
         res = pg::exec_params(lease.get(),
                               "DELETE FROM discovery_store.discovered_devices WHERE subnet = $1",
-                              std::vector<std::string>{subnet});
+                              std::vector<std::string>{sanitize_pg_text(subnet)});
     }
     if (res.status() != PGRES_COMMAND_OK)
         return std::unexpected(std::string("clear_results failed: ") +

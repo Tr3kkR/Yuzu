@@ -62,7 +62,7 @@ hole — `security-guardian` gates each.
 | `QuarantineStore` | `quarantine_store` | authoritative | Guardian quarantine. |
 | `DeploymentStore` | `deployment_store` | authoritative | |
 | `SoftwareDeploymentStore` | `software_deployment_store` | authoritative | |
-| `DiscoveryStore` | `discovery_store` | authoritative | |
+| `DiscoveryStore` | `discovery_store` | authoritative | **In flight — ADR-0043.** Network-discovered devices (Issue 7.18), single table, no FKs, no secrets. MANDATORY fingerprint-verified backfill (RbacStore/#2703 sourceless-fingerprint shape, ADR-0040/0041 pattern) — the operator-set `managed` flag is irreducible operator intent. `list_devices`/`get_device` type-distinguishable (`nullopt`/`unexpected` on degrade); `GET /api/discovery/results` 503s rather than rendering an empty device list on a degraded read. |
 | `AnalyticsEventStore` | `analytics_event_store` | authoritative? | high-volume; may suit a TTL/ephemeral posture. |
 | `NotificationStore` | `notification_store` | authoritative | |
 | `LicenseStore` | `license_store` | authoritative | |

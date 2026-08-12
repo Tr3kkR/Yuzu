@@ -17,18 +17,20 @@
  *    legacy file; migrates legacy rows and is idempotent on re-run; refuses
  *    (fail-closed) on a corrupt legacy file.
  *
- * Born-on-Postgres store (ADR-0012 §1, authoritative/fail-hard). PG-gated:
- * skips when YUZU_TEST_POSTGRES_DSN is unset, fails when set but broken
- * (test_helpers.hpp skip-vs-fail contract). Store-behaviour cases use the
- * pre-migrated PgTestTemplate variant (docs/postgres-store-playbook.md step
- * 7); the fail-closed construction case uses plain YUZU_REQUIRE_PG_DB, per
- * the plain-migration-test carve-out documented on that macro.
+ * Migrated Postgres store (ADR-0043, authoritative/fail-hard per ADR-0012
+ * §1). PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset, fails when set
+ * but broken (test_helpers.hpp skip-vs-fail contract). Store-behaviour cases
+ * use the pre-migrated PgTestTemplate variant
+ * (docs/postgres-store-playbook.md step 7); the fail-closed construction
+ * case uses plain YUZU_REQUIRE_PG_DB, per the plain-migration-test carve-out
+ * documented on that macro.
  */
 
 #include "discovery_store.hpp"
 
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "sqlite_raii.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -300,35 +302,33 @@ namespace {
 
 void make_legacy_discovery_db(const std::filesystem::path& path,
                               const std::vector<DiscoveredDevice>& devices) {
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open_v2(path.string().c_str(), &db,
+    yuzu::server::SqliteDb db;
+    REQUIRE(sqlite3_open_v2(path.string().c_str(), db.addr(),
                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
     const char* ddl =
         "CREATE TABLE discovered_devices (id INTEGER PRIMARY KEY AUTOINCREMENT, "
         "ip_address TEXT NOT NULL UNIQUE, mac_address TEXT, hostname TEXT, managed INTEGER, "
         "agent_id TEXT, discovered_by TEXT, discovered_at INTEGER, last_seen INTEGER, "
         "subnet TEXT);";
-    REQUIRE(sqlite3_exec(db, ddl, nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(db.get(), ddl, nullptr, nullptr, nullptr) == SQLITE_OK);
     for (const auto& d : devices) {
-        sqlite3_stmt* s = nullptr;
-        REQUIRE(sqlite3_prepare_v2(db,
+        yuzu::server::SqliteStmt s;
+        REQUIRE(sqlite3_prepare_v2(db.get(),
                                    "INSERT INTO discovered_devices (ip_address, mac_address, "
                                    "hostname, managed, agent_id, discovered_by, discovered_at, "
                                    "last_seen, subnet) VALUES (?,?,?,?,?,?,?,?,?)",
-                                   -1, &s, nullptr) == SQLITE_OK);
-        sqlite3_bind_text(s, 1, d.ip_address.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s, 2, d.mac_address.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s, 3, d.hostname.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int(s, 4, d.managed ? 1 : 0);
-        sqlite3_bind_text(s, 5, d.agent_id.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(s, 6, d.discovered_by.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(s, 7, d.discovered_at);
-        sqlite3_bind_int64(s, 8, d.last_seen);
-        sqlite3_bind_text(s, 9, d.subnet.c_str(), -1, SQLITE_TRANSIENT);
-        REQUIRE(sqlite3_step(s) == SQLITE_DONE);
-        sqlite3_finalize(s);
+                                   -1, s.addr(), nullptr) == SQLITE_OK);
+        sqlite3_bind_text(s.get(), 1, d.ip_address.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s.get(), 2, d.mac_address.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s.get(), 3, d.hostname.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(s.get(), 4, d.managed ? 1 : 0);
+        sqlite3_bind_text(s.get(), 5, d.agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(s.get(), 6, d.discovered_by.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(s.get(), 7, d.discovered_at);
+        sqlite3_bind_int64(s.get(), 8, d.last_seen);
+        sqlite3_bind_text(s.get(), 9, d.subnet.c_str(), -1, SQLITE_TRANSIENT);
+        REQUIRE(sqlite3_step(s.get()) == SQLITE_DONE);
     }
-    sqlite3_close(db);
 }
 
 std::string scalar(const std::string& dsn, const std::string& sql) {
@@ -423,12 +423,11 @@ TEST_CASE("DiscoveryStore: backfill of a legacy db with no discovered_devices ta
     yuzu::test::TempDbFile legacy{"yuzu_test_discovery_empty_"};
     std::filesystem::remove(legacy.path);
     {
-        sqlite3* db_raw = nullptr;
-        REQUIRE(sqlite3_open_v2(legacy.path.string().c_str(), &db_raw,
+        yuzu::server::SqliteDb legacy_db;
+        REQUIRE(sqlite3_open_v2(legacy.path.string().c_str(), legacy_db.addr(),
                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(db_raw, "CREATE TABLE unrelated (x INTEGER)", nullptr, nullptr,
-                             nullptr) == SQLITE_OK);
-        sqlite3_close(db_raw);
+        REQUIRE(sqlite3_exec(legacy_db.get(), "CREATE TABLE unrelated (x INTEGER)", nullptr,
+                             nullptr, nullptr) == SQLITE_OK);
     }
 
     REQUIRE(store.migrate_from_sqlite(legacy.path));
