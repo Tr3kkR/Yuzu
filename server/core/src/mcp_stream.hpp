@@ -521,6 +521,13 @@ public:
     /// `times=2` means two throws and then normal service, not a permanently armed seam.
     void inject_unpin_fault_for_test(UnpinFault fault, int times = 1);
 
+    /// The NEXT `times` close attempts on the poison path throw, modelling close_sink's one
+    /// throw site (the sink's own mutex acquisition) - the fault close_sink itself has no
+    /// seam for. Shared by BOTH poison-path close sites: poison_terminal()'s original close
+    /// and attach_and_replay's poison-branch retry, so `times=2` covers one throw at each.
+    /// One-shot per attempt, consumed under mu_ before the close runs. TEST SEAM ONLY (#2531).
+    void inject_poison_close_fault_for_test(int times = 1);
+
     /// Set a short human-readable log prefix (e.g. the session id) included in publish()'s
     /// rare WARN lines so an operator can attribute a dropped/anomalous frame to a session.
     ///
@@ -614,7 +621,13 @@ public:
     /// flag so every FUTURE attach fast-fails (AttachStatus::kPoisoned → 410 + remediation)
     /// rather than a client re-attaching and heart-beating forever for a terminal that will
     /// never arrive, and closes any currently-live sink with kInternalError. Idempotent.
-    void poison_terminal();
+    ///
+    /// The flag write is unconditional and durable; the close is best-effort. Its one throw
+    /// site (close_sink's sink mutex acquisition, modelling a broken platform mutex) is
+    /// contained and counted rather than escaping - a client left heart-beating on a failed
+    /// close is not silent, and gets a second close attempt the next time it attaches
+    /// (attach_and_replay's poison branch retries against any still-live stale sink) (#2531).
+    void poison_terminal() noexcept;
 
     std::size_t pinned_count() const;  ///< eviction-exempt frames currently held (observability/tests)
 
@@ -651,6 +664,20 @@ private:
     /// is_pinned() both funnel through it). Scans the fixed pin array - O(pin count).
     bool is_pinned_locked(std::uint64_t id) const;
 
+    /// True (and consumes one) iff a poison-close fault is armed. Assumes mu_ is held -
+    /// the counter is a plain int, not an atomic, because both callers already hold mu_ at
+    /// the point they need to decide. Test seam only (#2531).
+    bool take_poison_close_fault_locked();
+
+    /// The shared contained-close for the poison path: poison_terminal()'s own close and
+    /// attach_and_replay's poison-branch retry both funnel here, so the containment, the
+    /// counter and the log line cannot drift between the two call sites (#2531). Never
+    /// called while mu_ is held - close_sink's lock order (sink->sse->mu, taken outside
+    /// mu_) forbids it, same as close(). `inject_fault` is pre-decided by the caller under
+    /// mu_ (see take_poison_close_fault_locked) since the seam counter is not atomic.
+    void poison_close_contained(const std::shared_ptr<McpStreamSink>& sink,
+                                bool inject_fault) noexcept;
+
     mutable std::mutex mu_;
     std::deque<McpStreamEvent> ring_;
     std::size_t ring_cap_;
@@ -663,6 +690,7 @@ private:
     UnpinFault unpin_fault_ = UnpinFault::kNone;       ///< test seam; guarded by mu_
     int unpin_fault_remaining_ = 0;                    ///< unpins left that consume it
     int publish_fault_remaining_ = 0;  ///< publishes left that consume publish_fault_; guarded by mu_
+    int poison_close_fault_remaining_ = 0;  ///< test seam; guarded by mu_ (#2531)
     // Write-once at mint before the stream is shared (set_log_context contract); read
     // unlocked in publish()'s WARN paths. Never mutated after the stream goes live.
     std::string log_context_;

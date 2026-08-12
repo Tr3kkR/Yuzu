@@ -65,7 +65,7 @@
 
 // STL -> third-party -> project (docs/cpp-conventions.md) — this project
 // header sits last, below the libpq-fe.h third-party include above.
-#include "audit_retention_rules.hpp" // Facts/Anomaly/classify — this store's rotation sweep
+#include <yuzu/audit_retention_rules.hpp> // Facts/Anomaly/classify — this store's rotation sweep
                                      // REUSES the shared pure decision function rather than
                                      // forking a second copy, the same way
                                      // result_set_store.cpp/guaranteed_state_store.cpp/

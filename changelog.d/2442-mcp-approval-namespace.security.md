@@ -19,8 +19,11 @@
   editor is stricter and refuses it on every save. Rename such a definition before upgrading — see
   the upgrade note in `docs/user-manual/server-admin.md` for a query that finds them.
 
-  The minting surface is recorded with each approval; the MCP mint itself is unlabelled
-  until its own follow-up lands, and an unlabelled ticket stays redeemable — that exemption is what
-  keeps the MCP gate working. Rows predating the column are NOT left unlabelled: unlabelled is the
-  value that grants, so they are back-filled to a sentinel that claims no surface and fails closed.
-  The column is read at redemption — see the cross-surface binding entry.
+  The minting surface is recorded with each approval. Left alone, an unlabelled MCP mint would
+  stay redeemable — that exemption is what would otherwise be needed to keep the MCP gate
+  working — but this same release closes it: the MCP mint declares its own surface explicitly
+  (see the "MCP mint now declares its own surface" entry), so no unlabelled ticket exists going
+  forward. Rows predating the column are NOT left unlabelled: unlabelled is the value that would
+  grant, so they are back-filled to a sentinel that claims no surface and fails closed. The
+  column is read at redemption — see the
+  cross-surface binding entry.

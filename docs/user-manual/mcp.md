@@ -1279,28 +1279,30 @@ expired, or mismatched ticket returns `-32003` (below).
 permission check (the token creator lacks the required RBAC permission for the
 securable type), **or** an approval-ticket recall supplied an `approval_id` that
 is no longer usable — already consumed (one-time ticket / replay), rejected,
-expired, for a different tool/arguments than the current call (#289), **or**
-minted through a different Yuzu surface than the one recalling it (#2442).
+expired, for a different tool/arguments than the current call (#289), minted
+through a different Yuzu surface than the one recalling it (#2442), **or**
+presented by a principal other than the one who submitted it (#2442).
 
-The last of those is deliberately indistinguishable from a replay in this
-response: reporting it separately would turn the recall into a probe for which
-surface minted a ticket. Server-side it is distinguishable — the audit row
-records `refused: foreign_origin`. The `yuzu_mcp_approval_refused_total` counter
-does **not** break the refusals down by reason: a store failure is already
-exposed via the response code (`-32603` vs `-32003`), and what stays withheld
-is the split *within* a `-32003` denial — foreign-origin vs an ordinary
-replay — which is exactly what this response refuses to make, and `/metrics`
-is not a stronger reader than the caller — so alert on the refusal rate and
-read the audit trail for the kind.
+The last two of those are deliberately indistinguishable from a replay in this
+response: reporting either separately would turn the recall into a probe for
+which surface minted a ticket, or for whether a given ticket id exists and who
+owns it. Server-side they are distinguishable — the audit row records
+`refused: foreign_origin` or `refused: foreign_submitter`. The
+`yuzu_mcp_approval_refused_total` counter does **not** break the refusals down
+by reason: a store failure is already exposed via the response code (`-32603`
+vs `-32003`), and what stays withheld is the split *within* a `-32003` denial —
+foreign-origin/foreign-submitter vs an ordinary replay — which is exactly what
+this response refuses to make, and `/metrics` is not a stronger reader than the
+caller — so alert on the refusal rate and read the audit trail for the kind.
 
 If a store fault happens to coincide with this exact check — the recall's
-lookup step, or the consume step's own cross-surface origin comparison — a
-foreign-origin ticket cannot be told apart from an innocent one for the
-duration of the fault, and the refusal comes back as `-32603` (below), not
-this `-32003`. `yuzu_mcp_approval_masked_denials_total` counts those refusals
-specifically, and the audit row carries a `(lookup)` or `(origin unverified)`
-suffix, so the event is not silently indistinguishable from ordinary store
-contention.
+lookup step, or the consume step's own origin+submitter binding comparison — a
+foreign-origin or foreign-submitter ticket cannot be told apart from an
+innocent one for the duration of the fault, and the refusal comes back as
+`-32603` (below), not this `-32003`. `yuzu_mcp_approval_masked_denials_total`
+counts those refusals specifically, and the audit row carries a `(lookup)` or
+`(origin/submitter unverified)` suffix, so the event is not silently
+indistinguishable from ordinary store contention.
 
 **Fix**: For an RBAC denial — grant the permission to the token creator's
 principal, or use an account with the required permissions. For a ticket recall —
