@@ -1834,9 +1834,22 @@ std::string McpStreamBridge::build_real_final(const BridgeRecord& rec,
     return success_response(rec.jsonrpc_id, base.dump());
 }
 
+// A future throw source added here would std::terminate at this boundary rather than
+// silently vanish - teardown_claimed is itself noexcept (so a throw there was ALREADY
+// a terminate), and project_record's caller has no ladder-level catch at all (a throw
+// would previously escape to run_projector's per-record catch and be swallowed
+// silently, mis-settling that record). Binding this to McpStreamState's noexcept-ness
+// makes that guarantee a compile-time fact instead of a comment nobody re-checks: if
+// either call below becomes throwing again, this line fails to compile rather than
+// quietly reopening kPublishThrew's dead-enum problem (#2531/#2523).
+static_assert(noexcept(std::declval<McpStreamState&>().publish_final(
+                  std::string_view{}, std::string_view{})) &&
+             noexcept(std::declval<McpStreamState&>().poison_terminal()),
+             "publish_terminal_ladder assumes both calls are noexcept");
+
 McpStreamBridge::LadderResult
 McpStreamBridge::publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
-                                         std::string&& frame) {
+                                         std::string&& frame) noexcept {
     auto fid = rec->stream->publish_final("message", frame);
     if (fid != 0) {
         return {fid, TerminalRung::kPrimary};
@@ -2410,12 +2423,13 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     // every publishing case there is no live listener to race, and for kNone there
     // is nothing to publish.
     TerminalRung rung = TerminalRung::kNotAttempted;
-    bool ladder_reached = false;
     switch (decision) {
-        case TeardownFinal::kSynthesizeUnavailable:
+        case TeardownFinal::kSynthesizeUnavailable: {
             // Pressure victim that genuinely NEVER saw a terminal (verified at claim
             // under Channel::mu): pin a machine-readable terminal-unavailable so a
             // later resume still finds truth in the ring.
+            std::string frame;
+            bool built = false;
             try {
                 if (terminal_build_fault_.load(std::memory_order_acquire) > 0 &&
                     terminal_build_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
@@ -2430,46 +2444,47 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
                                         "execution_id (get_execution_status / "
                                         "query_responses)") +
                     "}";
-                std::string frame =
-                    error_response(rec->jsonrpc_id, kMcpTerminalUnavailable,
-                                   "streamed result forced-expired under memory pressure", data);
-                ladder_reached = true;
+                frame = error_response(rec->jsonrpc_id, kMcpTerminalUnavailable,
+                                       "streamed result forced-expired under memory pressure",
+                                       data);
+                built = true;
+            } catch (...) {  // NOLINT(bugprone-empty-catch)
+            }
+            if (built) {
+                // The ladder itself is noexcept (#2531/#2523) - nothing left to catch.
                 rung = publish_terminal_ladder(rec, std::move(frame)).rung;
-            } catch (...) {
-                // Distinguish "never reached the ladder" (frame build threw) from
-                // "the ladder itself threw": the audit must not claim a frame could
-                // not be BUILT when it was built and the publish threw.
-                rung = ladder_reached ? TerminalRung::kPublishThrew : TerminalRung::kNotAttempted;
+            } else {
+                // rung stays kNotAttempted: the frame was never built, so the ladder
+                // was never called.
                 if (metrics_ != nullptr) {
                     obs_guard([&] { metrics_->counter(kMetricTerminalPublishFailures).increment(); });
                 }
             }
             break;
-        case TeardownFinal::kFallbackFinal:
+        }
+        case TeardownFinal::kFallbackFinal: {
             // Terminal existed but its payload aged out of the bus buffer: publish
             // the prebuilt SUCCESS-shaped final, NEVER -32014.
+            std::string frame;
+            bool built = false;
             try {
                 if (terminal_build_fault_.load(std::memory_order_acquire) > 0 &&
                     terminal_build_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
                     throw std::bad_alloc{};  // models the fallback_final copy failing
                 }
-                // Copy FIRST, then flag. The ladder takes an rvalue reference
-                // precisely so this copy cannot hide at the call boundary: done
-                // there it would allocate AFTER ladder_reached was set, making a
-                // copy OOM audit as "publishing threw" when the ladder was never
-                // entered. No test can distinguish those two orderings (the fault
-                // seam cannot sit at the copy point in both), so the signature
-                // enforces it instead.
-                std::string frame = rec->fallback_final;
-                ladder_reached = true;
+                frame = rec->fallback_final;
+                built = true;
+            } catch (...) {  // NOLINT(bugprone-empty-catch)
+            }
+            if (built) {
                 rung = publish_terminal_ladder(rec, std::move(frame)).rung;
-            } catch (...) {
-                rung = ladder_reached ? TerminalRung::kPublishThrew : TerminalRung::kNotAttempted;
+            } else {
                 if (metrics_ != nullptr) {
                     obs_guard([&] { metrics_->counter(kMetricTerminalPublishFailures).increment(); });
                 }
             }
             break;
+        }
         case TeardownFinal::kNone:
             break;  // real final already pinned, or nothing to publish
     }
@@ -2508,9 +2523,9 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // The detail must not assert a delivery that did not happen. There are three
         // teardown_claimed call sites; the pin-ack / session-death / arming-reap one
         // passes kNone literally and publishes nothing, and the two pressure sites
-        // pass a decision that still delivers nothing on kPoisoned / kPublishThrew /
-        // kNotAttempted - so "the terminal was published" is only true when the ladder
-        // actually committed. The disposition below is derived, not assumed.
+        // pass a decision that still delivers nothing on kPoisoned / kNotAttempted -
+        // so "the terminal was published" is only true when the ladder actually
+        // committed. The disposition below is derived, not assumed.
         audit_contained(audit_action, exec_id,
                         "teardown incomplete: bus unsubscribe failed; the record, its streamed "
                         "charge and its bus subscription are all retained for shutdown",
@@ -2832,18 +2847,6 @@ const char* McpStreamBridge::disposition_phrase(TeardownFinal decision,
         case TerminalRung::kPoisoned:
             return "the terminal publish POISONED the session - every later attach 410s and "
                    "the client must re-initialize; recover the result by execution_id";
-        case TerminalRung::kPublishThrew:
-            // Deliberately does NOT claim the stream escaped poisoning. publish_final
-            // is noexcept, so the only way the ladder throws is poison_terminal() (#2531),
-            // which sets its sticky flag under mu_ and THEN calls close_sink outside
-            // it - so a throw here means the session very likely IS poisoned, with the
-            // flag already set. The previous wording asserted the opposite. This arm
-            // is reachable but has no fault seam (nothing can make close_sink throw
-            // from a test), so it is stated conservatively rather than pinned.
-            return "the terminal was built but publishing threw; nothing was confirmed "
-                   "published and the session's poison state is indeterminate (a throw at this "
-                   "point almost certainly means it WAS poisoned - see #2531; the wording stays "
-                   "conservative only because nothing can pin it) - recover by execution_id";
         case TerminalRung::kNotAttempted:
             break;
     }

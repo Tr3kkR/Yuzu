@@ -1006,16 +1006,20 @@ private:
     /// cannot answer this - a nonzero id from the retry looks identical to one from
     /// the primary frame - and teardown's audit must not claim the caller's frame
     /// was delivered when the fallback was (#2506 F4).
-    /// kNotAttempted is NOT a ladder result - it means the ladder was never
-    /// reached (the frame or the by-value fallback copy threw first). It is a
-    /// distinct state on purpose: kPoisoned asserts poison_terminal() ran, and an
-    /// audit row must never claim a session was poisoned when it was not.
-    /// kNotAttempted / kPublishThrew are NOT ladder results - they mean the ladder
-    /// was never reached (the frame or the fallback copy threw first) or that it
-    /// threw part-way. Both are distinct from kPoisoned, which asserts
-    /// poison_terminal() actually ran: an audit row must never claim a session was
-    /// poisoned when it was not.
-    enum class TerminalRung { kNotAttempted, kPublishThrew, kPrimary, kFallback, kPoisoned };
+    /// kNotAttempted is NOT a ladder result - it means the ladder was never reached
+    /// (the caller's own frame-build failed before the ladder was ever called; see
+    /// the callers' `built` guard). It is a distinct state on purpose: kPoisoned
+    /// asserts poison_terminal() ran, and an audit row must never claim a session
+    /// was poisoned when it was not.
+    ///
+    /// There used to be a third non-ladder state, kPublishThrew, for a throw
+    /// escaping the ladder itself - retired once publish_terminal_ladder became
+    /// noexcept (#2531 made poison_terminal() noexcept, which was the ladder's
+    /// only remaining throw source; #2523 closed the enum value it left
+    /// permanently untestable). See the static_assert at publish_terminal_ladder's
+    /// definition, which is what makes this enum's shape a compile-time fact
+    /// rather than a comment someone has to remember to update.
+    enum class TerminalRung { kNotAttempted, kPrimary, kFallback, kPoisoned };
     struct LadderResult {
         std::uint64_t id = 0;  ///< committed event id; 0 ⇔ kPoisoned
         /// NOT kPoisoned: a defaulted result must not assert a poisoning either.
@@ -1031,8 +1035,13 @@ private:
     /// never entered. Callers must therefore own the frame first and move it in -
     /// the mistake is now a compile error rather than a mislabelled audit row that
     /// no test can distinguish (#2487 Gate 8).
+    ///
+    /// noexcept (#2531/#2523): both calls inside are noexcept, so a caller no
+    /// longer needs its own try/catch around this call - only around building
+    /// `frame` beforehand. See the static_assert at the definition, which binds
+    /// this to McpStreamState's noexcept-ness at compile time.
     LadderResult publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
-                                         std::string&& frame);
+                                         std::string&& frame) noexcept;
 
     /// Claimed-kDone teardown: unsubscribe, publish the decided terminal frame
     /// (kSynthesizeUnavailable = -32014 for a never-terminal victim; kFallbackFinal
