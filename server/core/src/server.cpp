@@ -2091,6 +2091,15 @@ public:
                           "identity links and/or D2 login observations are silently not being "
                           "recorded",
                           "counter");
+        // describe() only registers HELP/TYPE metadata; the series is absent
+        // from /metrics until first .increment(). Instantiate each bare
+        // counter at 0 now so absent()-style alert rules on the CC6.8
+        // tripwires stay meaningful from boot (Gate 8 re-review fix; mirrors
+        // the NVD/quota/access-review pre-seed precedent above and
+        // docs/observability-conventions.md).
+        metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
+        metrics_.counter("yuzu_scim_deprovision_unlinked_total");
+        metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
