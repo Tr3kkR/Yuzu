@@ -1,0 +1,186 @@
+# ADR-0043: CustomPropertiesStore → PostgreSQL (Wave 2)
+
+- **Status:** Accepted
+- **Date:** 2026-08-12
+- **Deciders:** pg workstream (one of four parallel Wave 2 easy-store migrations, alongside
+  `NotificationStore`/`DiscoveryStore`/`DeploymentStore`)
+- **Parents:** ADR-0006/0007/0008(+Correction), ADR-0009, ADR-0012, ADR-0036 (typed-read
+  program policy)
+
+## Context
+
+`CustomPropertiesStore` (`custom-properties.db` today, `server/core/src/custom_properties_store.{hpp,cpp}`,
+~465 LOC pre-migration) holds typed, operator-authored per-agent metadata — free-form key/value
+properties (`custom_properties`, PK `(agent_id, key)`) plus optional per-key type/validation
+policy (`custom_property_schemas`, PK `key`). Properties are usable in scope expressions via
+`props.<key>` (`AgentRegistry::evaluate_scope`, `docs/asset-tagging-guide.md`), which makes this
+store's read path feed dispatch/targeting decisions, not just dashboard display.
+
+Picked as one of the "4 easiest of the 12 not-yet-migrated Wave 2 stores" (file size, table count,
+zero FK coupling to any other store — verified by grep, no `FOREIGN KEY`/`REFERENCES` in the
+original `.cpp`). The store has existing test coverage (`test_custom_properties_store.cpp`,
+550 lines pre-migration) to port/extend.
+
+**Why this is not purely routine, despite the "easy" bucket:** the same class of fail-open the
+`ResultSetStore` migration (ADR-0036) closed for `from_result_set:<id>` scope atoms was latent
+here too. `AgentRegistry::evaluate_scope`'s `props.<key>` resolver called
+`props_store->get_value(id, prop_key)` per agent inside the fleet loop, collapsing "no such
+property" and "the read failed" to the same empty string. Under `NOT props.<key>` (or `!=`), an
+empty resolution is a match — so a transient Postgres blip under the pooled connection this
+migration introduces would silently invert to "every agent matches," a fleet-wide dispatch
+fail-open reachable without any code the operator wrote being wrong. This ADR's scope therefore
+extends to `AgentRegistry::evaluate_scope`'s `props.<key>` resolution, not only the store itself.
+
+## Decision
+
+Migrate to PostgreSQL schema **`custom_properties_store`** (ADR-0008), construction fail-closed
+(ADR-0007/0012 §1), on the shared server `PgPool`. `sqlite3_changes()` → `RETURNING` (#1033).
+
+### Posture: authoritative (ADR-0012 §1)
+
+Device custom properties and their schemas are irreducible operator-authored asset-tagging data,
+not expendable telemetry — confirmed per the kickoff doc's explicit prompt to re-derive posture
+from the code rather than trust the ladder doc's provisional entry. Every read whose result can
+feed a `props.<key>` scope/dispatch decision (`get_properties`, `get_property`, `get_value`,
+`get_property_map`, and the new bulk `get_values_for_keys`) returns
+`std::expected<T, CustomPropertiesReadError>` — `kDegraded` on a store/pool/query failure, never
+collapsed into the empty/not-found success shape (ADR-0036 program policy). Non-scope-feeding
+reads (`list_schemas`, `get_schema` — admin-surface display only) stay plain-optional/container,
+matching the `ResultSetStore`/`ManagementGroupStore` precedent of scoping the typed-read widening
+to exactly the reads that can feed a decision.
+
+### Schema
+
+Two independent tables, column-for-column with the SQLite original (`updated_at` becomes
+`BIGINT`), plus a new `custom_properties_meta` (key/value) for the backfill's idempotency marker
+and source fingerprint — the same bookkeeping-table shape `RbacStore`/`ManagementGroupStore` use,
+not a data table:
+
+```sql
+CREATE TABLE custom_properties (
+    agent_id    TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    type        TEXT NOT NULL DEFAULT 'string',
+    updated_at  BIGINT NOT NULL,
+    PRIMARY KEY (agent_id, key)
+);
+CREATE INDEX custom_props_agent_idx ON custom_properties (agent_id);
+
+CREATE TABLE custom_property_schemas (
+    key               TEXT PRIMARY KEY,
+    display_name      TEXT NOT NULL DEFAULT '',
+    type              TEXT NOT NULL DEFAULT 'string',
+    description       TEXT NOT NULL DEFAULT '',
+    validation_regex  TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE custom_properties_meta (
+    key    TEXT PRIMARY KEY,
+    value  TEXT NOT NULL
+);
+```
+
+### Cross-table validation stays application-layer, not a Postgres FK/CHECK
+
+The kickoff doc flagged this as a decision to make explicitly rather than default silently:
+`set_property`'s `validate_against_schema` reads `custom_property_schemas` for the given key and
+enforces type/regex before the write — ported as application-layer logic on the same lease as the
+write (ADR-0012 §2(c): one logical operation, not two acquires), unchanged from the SQLite
+original's behavior. **No FK added**, for two reasons: (1) a schema is optional per-key *policy*,
+not a fixed enum a property's `type` column must reference — most keys never get a schema row at
+all, which a FK from `type` cannot express; (2) `delete_schema` must not cascade or block on
+existing property rows (the SQLite original's `DELETE FROM custom_property_schemas` never touched
+`custom_properties`, and preserving that — "delete schema removes validation, existing values
+untouched" — is itself asserted by a ported test). A real FK would either forbid this delete or
+silently orphan/cascade in a way the original behavior never had.
+
+### Secrets: none
+
+Property values are free-form operator-set text (max 1024 bytes). No dedicated secret column, no
+schema commitment to structured secret material. An operator *could* paste a credential-shaped
+string into a property value, but that is true of any free-text field in the product (a tag
+value, a management-group description) and is not, on its own, grounds for `SecretCodec` —
+ADR-0010's secrets seam targets columns the *store* commits to holding secret material, not free
+text an operator could theoretically misuse. Stated explicitly per the kickoff doc's prompt, not
+silently assumed.
+
+### `props.<key>` scope-DSL fail-open — closed at the resolver, not just the store
+
+`AgentRegistry::evaluate_scope` (`agent_registry.cpp`) already preloads `from_result_set:<id>`
+membership once, before the per-agent loop, aborting (`nullopt`) on a degraded preload — the fix
+`ResultSetStore`'s migration (ADR-0036) added for the identical fail-open shape. `props.<key>`
+resolution is now given the same treatment:
+
+- A new `collect_props_keys` walks the parsed scope AST (mirroring `collect_result_set_ids`) to
+  find every `props.<key>` atom referenced.
+- A new `CustomPropertiesStore::get_values_for_keys(keys)` bulk-preloads
+  `agent_id -> (key -> value)` for exactly those keys in ONE query (`WHERE key = ANY($1::text[])`
+  via `pg::to_text_array`), never a per-agent round-trip — the same reasoning that motivated the
+  `from_result_set:` preload (N sequential blocking Postgres calls held under
+  `AgentRegistry::mu_` is both a fail-open surface and a lock-hold-during-network-I/O violation of
+  ADR-0012 §2(b)).
+- A `kDegraded` preload result **aborts the whole scope evaluation** (`nullopt`), exactly like a
+  `member_set_owned` degrade — never silently resolves every `props.<key>` atom to `""` (no
+  match), which inverts to "matches every agent" under `NOT`/`!=`.
+- A scope with no `props.<key>` atom is unaffected — the preload is a no-op, and every existing
+  `evaluate_scope` call site already collapses `nullopt` via `.value_or(std::vector<std::string>{})`
+  (the same `H1`-established pattern used for the `from_result_set:` fix), so no call site needed
+  a signature or behavior change beyond this.
+
+### Backfill (ADR-0009) — mandatory
+
+Custom properties and schemas are operator-authored asset-tagging data that cannot be
+re-derived — mandatory, one-time, idempotent, fail-closed `migrate_from_sqlite()`. Follows the
+`RbacStore` post-#2703 reference shape (`docs/postgres-store-playbook.md` "Local source absence
+never creates terminal migration state on its own"): a SHA-256 content fingerprint of the legacy
+`custom-properties.db` is stamped alongside the completion marker in the SAME transaction, so a
+later boot that still holds a local legacy file verifies the marker was actually derived from
+THIS file's content before trusting it (never a bare "marker present → skip") — closing the
+holder-side gap `ManagementGroupStore`'s backfill has not yet ported.
+
+**Sized down from `RbacStore`'s full state machine**, deliberately: this store has no
+revoke-vs-reseed conflict (nothing else writes `custom_properties`/`custom_property_schemas`
+before first boot completes) and no data whose loss is *worse* than re-running the backfill, so
+the fingerprint's own race (two replicas racing the SAME shared legacy file) is resolved with a
+plain `ON CONFLICT DO NOTHING` rather than `RbacStore`'s monotonic-promotion `DO UPDATE ... WHERE`
+— whichever replica's fingerprint wins reflects the same shared file content either writer would
+have derived, so there is nothing to promote and no partial-write risk to reconcile. Rows are
+inserted per-row inside one transaction, `ON CONFLICT DO NOTHING` (config data is small; the
+~27-store playbook's array-batching guidance targets high-volume ingest, not reference-sized
+tables). Legacy file moved aside after a verified backfill (one-release rollback window).
+
+## Considered and rejected
+
+- **A real FK from `custom_properties.type` to a schema-type enum**: rejected — see "Cross-table
+  validation stays application-layer" above; the data model has no fixed-enum relationship to
+  express, and a FK would change `delete_schema`'s observable behavior.
+- **`RbacStore`'s full monotonic-promotion backfill state machine**: rejected as over-scoped for
+  this store's data — no revoke path, no "different real fingerprint already won" reconciliation
+  need. Sized down per the reasoning above; ported the holder-side verification (the part that
+  *is* load-bearing) without the promotion machinery (the part that isn't needed here).
+- **Leaving `props.<key>` resolution as a per-agent store call**: rejected — reproduces the exact
+  `ResultSetStore`/ADR-0036 fail-open one hop later, and holds `AgentRegistry::mu_` across N
+  sequential blocking Postgres round-trips.
+
+## Consequences
+
+- `props.<key>` scope resolution now aborts (denies the dispatch/arm, the safe direction) rather
+  than silently matching the whole fleet on a Postgres blip — closes a fail-open this migration
+  would otherwise have introduced by moving a previously-synchronous SQLite read onto a pooled
+  connection with real failure modes.
+- `AgentRegistry::evaluate_scope` gains one new bulk preload query per scope evaluation that
+  references `props.<key>`, symmetric with the existing `from_result_set:` preload; no call site
+  needed a signature change.
+- Tests → `YUZU_REQUIRE_PG_DB_TPL`-equivalent (`PgTestTemplate` + a file-owned pool,
+  TRUNCATE-reset per test, the `test_product_registry_store.cpp` pattern) for CRUD/schema/bulk
+  coverage; backfill / fresh-database tests use plain `YUZU_REQUIRE_PG_DB` against their own
+  per-test database.
+
+## Follow-ups
+
+- `ManagementGroupStore`'s backfill has not yet ported the holder-side fingerprint-verification
+  gap this store's backfill was built with from the start (tracked separately per the playbook's
+  existing note — not new to this ADR).
+- Wave 2 continues with the other three parallel easy-store migrations
+  (`NotificationStore`/`DiscoveryStore`/`DeploymentStore`); no ordering dependency on this one.

@@ -1123,6 +1123,24 @@ static void collect_result_set_ids(const yuzu::scope::Expression& expr,
     }
 }
 
+// Collect every props.<key> reference in a scope expression, mirroring
+// collect_result_set_ids above — same reason: the resolver preloads all
+// referenced property keys ONCE, before the agent loop, rather than a
+// per-agent CustomPropertiesStore query while holding mu_ (same shape
+// review finding F fixed for from_result_set:).
+static void collect_props_keys(const yuzu::scope::Expression& expr,
+                               std::vector<std::string>& out) {
+    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
+        if (cond->attribute.starts_with("props."))
+            out.push_back(cond->attribute.substr(6));
+    } else if (const auto* comb =
+                   std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
+        if (*comb)
+            for (const auto& child : (*comb)->children)
+                collect_props_keys(child, out);
+    }
+}
+
 std::optional<std::vector<std::string>>
 AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                               const CustomPropertiesStore* props_store, ResultSetStore* rs_store,
@@ -1190,6 +1208,42 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
         }
     }
 
+    // Preload every props.<key> value the expression references, ONE bulk
+    // query across all agents rather than a per-agent CustomPropertiesStore
+    // round-trip inside the loop below (which would also mean N sequential
+    // blocking Postgres calls held under mu_, the exact anti-pattern the
+    // from_result_set: preload above was already rewritten to avoid).
+    //
+    // ADR-0036 fail-closed contract, same shape as the from_result_set:
+    // preload: a store/pool/query error here ABORTS the whole evaluation
+    // (nullopt) rather than resolving every props.<key> atom to "" (no
+    // match) for every agent — under a NOT combinator or `!=`, that silent
+    // empty INVERTS to "matches every agent", the identical fleet-wide
+    // fail-open ADR-0036 closed for from_result_set:. A caller passing no
+    // props_store (a scope with no props.<key> atom, or a call site that
+    // doesn't wire one) is unaffected — the preload only runs when the
+    // expression actually references props.<key>.
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> props_values;
+    {
+        std::vector<std::string> prop_keys;
+        collect_props_keys(expr, prop_keys);
+        if (!prop_keys.empty()) {
+            if (props_store == nullptr) {
+                spdlog::error("AgentRegistry::evaluate_scope: scope references props.<key> but no "
+                              "CustomPropertiesStore is wired to resolve it — aborting scope "
+                              "evaluation");
+                return std::nullopt;
+            }
+            auto preload = props_store->get_values_for_keys(prop_keys);
+            if (!preload) {
+                spdlog::error("AgentRegistry::evaluate_scope: get_values_for_keys degraded — "
+                              "aborting scope evaluation");
+                return std::nullopt;
+            }
+            props_values = std::move(*preload);
+        }
+    }
+
     std::vector<std::string> matched;
     std::lock_guard lock(mu_);
     for (const auto& [id, session] : agents_) {
@@ -1225,11 +1279,18 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
                 if (tag_store)
                     return tag_store->get_tag(id, tag_key);
             }
-            // props:X lookups (custom properties, Phase 7.6)
+            // props.X lookups (custom properties, Phase 7.6) — served from the
+            // bulk preload above, never a per-agent store query (see the
+            // preload block's comment for the fail-closed contract).
             if (key.starts_with("props.")) {
                 auto prop_key = key.substr(6);
-                if (props_store)
-                    return props_store->get_value(id, prop_key);
+                auto agent_it = props_values.find(id);
+                if (agent_it != props_values.end()) {
+                    auto prop_it = agent_it->second.find(prop_key);
+                    if (prop_it != agent_it->second.end())
+                        return prop_it->second;
+                }
+                return {};
             }
             return {};
         };

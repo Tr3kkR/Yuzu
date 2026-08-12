@@ -4376,9 +4376,36 @@ public:
                 apply_runtime_config_overrides();
             }
         }
-        {
-            auto props_db = cfg_.db_dir() / "custom-properties.db";
-            custom_properties_store_ = std::make_unique<CustomPropertiesStore>(props_db);
+        // Migrated Postgres store (ADR-0006/ADR-0043, schema
+        // `custom_properties_store`) — construction fail-CLOSED per ADR-0012
+        // §1 (same template as ManagementGroupStore above): a reachable
+        // database whose schema can't migrate/open is a fatal startup error,
+        // never a serve-degraded asset-tagging substrate. `migrate_from_sqlite`
+        // runs the one-time, idempotent legacy-`custom-properties.db` backfill
+        // (ADR-0009) — AUTHORITATIVE operator-authored data means a backfill
+        // failure is ALSO fatal (never serve on top of partially-migrated
+        // custom properties/schemas).
+        if (pg_pool_ && !startup_failed_) {
+            custom_properties_store_ = std::make_unique<CustomPropertiesStore>(*pg_pool_);
+            if (!custom_properties_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: custom-properties store migration/open "
+                              "failed (database reachable but the custom_properties_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                custom_properties_store_->set_metrics(&metrics_);
+                auto props_db = cfg_.db_dir() / "custom-properties.db";
+                if (!custom_properties_store_->migrate_from_sqlite(props_db)) {
+                    spdlog::error("[PG] Refusing to start: custom-properties legacy-SQLite "
+                                  "backfill failed (see prior log lines) — custom_properties_store "
+                                  "is the AUTHORITATIVE asset-tagging substrate and must not serve "
+                                  "partially-migrated data. Operator remediation: repair {} or move "
+                                  "it aside to skip the backfill (custom properties/schemas in it "
+                                  "will NOT carry over)",
+                                  props_db.string());
+                    startup_failed_ = true;
+                }
+            }
         }
 
         // Phase 7: Workflow Engine
@@ -9923,8 +9950,15 @@ private:
 
             auto agent_id = req.matches[1].str();
             auto props = custom_properties_store_->get_properties(agent_id);
+            if (!props) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"custom properties store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& p : props) {
+            for (const auto& p : *props) {
                 arr.push_back({{"key", p.key},
                                {"value", p.value},
                                {"type", p.type},

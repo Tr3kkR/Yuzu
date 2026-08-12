@@ -3456,6 +3456,11 @@ List all custom properties for a specific agent.
 
 **Permission:** `Infrastructure:Read`
 
+**Error (503) -- store degraded:** `custom_properties_store` is a migrated Postgres store
+(authoritative posture); a transient database read failure returns `503` rather than an
+empty/partial property list, so automation never mistakes a degraded read for "this agent has no
+properties."
+
 **Response:**
 
 ```json

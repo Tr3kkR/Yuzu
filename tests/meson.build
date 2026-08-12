@@ -592,6 +592,7 @@ if build_server
       'unit/server/test_compliance_eval.cpp',
       'unit/server/test_cel_eval.cpp',
       'unit/server/test_custom_properties_store.cpp',
+      'unit/server/test_props_scope_authz.cpp',
       'unit/server/test_notification_store.cpp',
       'unit/server/test_webhook_store.cpp',
       'unit/server/test_migration_runner.cpp',
