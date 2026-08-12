@@ -21,23 +21,24 @@ namespace yuzu::server {
 /// surface makes the namespaces separable, and gives audit a clean per-surface
 /// split.
 enum class ApprovalOrigin {
-    /// A mint that predates this enum, or one that has not declared itself:
-    /// today ONLY the MCP gate. It is left undeclared deliberately, not for want
-    /// of an opportunity — `kUnspecified` is the value that GRANTS at
-    /// redemption, so it is the only correct choice for the one surface the
-    /// binding must not refuse. Kept honest rather than mislabelled: a ticket
-    /// recorded `instruction` when MCP minted it would be false evidence.
-    /// Declaring `kMcp` here is a behaviour change, not a relabelling — it makes
-    /// `kUnspecified` non-granting and every undeclared row unredeemable — so it
-    /// belongs with that change, not with this one.
+    /// A mint that has not declared its surface, or a row minted before
+    /// `submit()`'s `origin` parameter existed or before it was made
+    /// non-defaulted. REFUSED at redemption (declares_non_mcp_surface),
+    /// same as kUnrecognised — since #2442's closing half, the MCP gate
+    /// (the one surface that historically relied on this value granting)
+    /// declares `kMcp` explicitly, so nothing in the tree writes
+    /// `kUnspecified` any more and there is no longer a correct reason for a
+    /// new caller to produce it. Kept as a distinct decode target from
+    /// kUnrecognised (see `to_string`'s comment) rather than merged into it,
+    /// so "declared nothing" and "predates the column" stay separable causes
+    /// even though both refuse today.
     kUnspecified,
     /// The interactive REST/dashboard instruction-approval gate
     /// (workflow_routes.cpp).
     kInstruction,
     /// A scheduled-fire submission (schedule_runner.cpp).
     kSchedule,
-    /// The MCP approval-ticket gate (mcp_server.cpp). Not yet passed by that
-    /// caller — see kUnspecified.
+    /// The MCP approval-ticket gate (mcp_server.cpp).
     kMcp,
     /// A stored value this build does not know — a row written by a newer
     /// binary, or a corrupted column. DISTINCT from kUnspecified because
@@ -47,19 +48,21 @@ enum class ApprovalOrigin {
     kUnrecognised,
 };
 
-/// True when `origin` names a surface that is NOT the MCP recall — including
-/// kUnrecognised, which fails closed. False for kMcp and for kUnspecified, the
-/// undeclared case that stays redeemable until the MCP mint declares itself.
+/// True when `origin` names a surface that is NOT the MCP recall, or names no
+/// surface at all — kUnrecognised and kUnspecified both fail closed. False
+/// ONLY for kMcp, the one surface this binding must not refuse.
 bool declares_non_mcp_surface(ApprovalOrigin origin);
 
 /// Column text for `origin`. `kUnspecified` stores the empty string.
 ///
 /// A row that predates the column does NOT read back as `kUnspecified`, and the
-/// difference is the whole point: migration v7 rewrites every `''` row to a
-/// sentinel that decodes to `kUnrecognised` and is REFUSED at redemption, while
-/// a caller that simply stayed silent writes `''` and is GRANTED. "No declared
-/// origin" and "declared nothing because the column did not exist yet" are
-/// deliberately not the same value.
+/// difference still matters even though both are refused at redemption today
+/// (#2442's closing half): migration v7 rewrites every `''` row it finds to a
+/// sentinel that decodes to `kUnrecognised`, while a caller that stays silent
+/// writes `''` and decodes to `kUnspecified`. "No declared origin" and
+/// "declared nothing because the column did not exist yet" are deliberately
+/// not the same value — collapsing them would make a future, more permissive
+/// treatment of one silently apply to the other.
 const char* to_string(ApprovalOrigin origin);
 ApprovalOrigin approval_origin_from_string(std::string_view text);
 
@@ -274,13 +277,17 @@ public:
     /// which refuses a ticket whose recorded surface is not MCP — see the
     /// rationale in `submit()`'s body for why the check moved.
     ///
-    /// Pick the value deliberately. `kUnspecified` is what GRANTS at
-    /// redemption, and it is the correct choice only for the MCP mint, which
-    /// cannot yet declare `kMcp`.
+    /// No default (#2442's closing half — was `= ApprovalOrigin::kUnspecified`
+    /// until the MCP mint could declare `kMcp`; it does now). Every caller
+    /// states its surface explicitly, so a future caller cannot silently
+    /// regain the pre-fix behaviour by forgetting the argument — and forgetting
+    /// it is now a compile error rather than a silent `kUnspecified`, which
+    /// itself refuses at redemption today, not grants (see
+    /// `declares_non_mcp_surface`).
     std::expected<std::string, std::string>
     submit(const std::string& definition_id, const std::string& submitted_by,
-           const std::string& scope_expression, const std::string& schedule_id = "",
-           ApprovalOrigin origin = ApprovalOrigin::kUnspecified);
+           const std::string& scope_expression, const std::string& schedule_id,
+           ApprovalOrigin origin);
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 

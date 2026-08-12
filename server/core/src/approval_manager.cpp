@@ -48,11 +48,15 @@ std::string col_text(sqlite3_stmt* stmt, int col) {
 
 } // namespace
 
-// Guarded the same way as `consume_denial_reason`, and this is the one that
-// needed it more: a missing arm here falls through to `return ""`, which
-// `approval_origin_from_string` decodes as kUnspecified — the value that GRANTS
-// at redemption. So the failure direction of an unhandled enumerator is
-// fail-OPEN, where the denial-reason table's is merely a wrong log token. See
+// Guarded the same way as `consume_denial_reason`. A missing arm here falls
+// through to `return ""`, which `approval_origin_from_string` decodes as
+// kUnspecified — refused at redemption since #2442's closing half
+// (declares_non_mcp_surface). That makes an unhandled enumerator fail CLOSED
+// today, which was not always true: before the MCP mint declared kMcp,
+// kUnspecified was the value that granted, and a missing arm here was
+// fail-open. Kept guarded regardless — this function's return value is a
+// stored column, not just a redemption input, and a silently-wrong write is
+// its own defect independent of which way redemption currently reads it. See
 // that function's header comment for why the MSVC arm is ordered as it is and
 // why it is best-effort.
 const char* to_string(ApprovalOrigin origin) {
@@ -92,13 +96,22 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
         return ApprovalOrigin::kSchedule;
     if (text == "mcp")
         return ApprovalOrigin::kMcp;
-    // Empty is an UNDECLARED MINT — today only the MCP gate — and it is
-    // redeemable. It is NOT the pre-column row: migration v7 rewrote every ''
-    // it found to the sentinel, so a row that predates the column decodes
-    // below as kUnrecognised and is refused. Anything ELSE is a value this build does not
-    // know, and it must NOT fold into that case — kUnspecified is what grants
-    // (#2442), so folding would make a row written by a newer binary redeemable
-    // here. Decode it as its own value and let the predicate refuse it.
+    // Empty is an UNDECLARED MINT. Since #2442's closing half, no production
+    // caller writes it any more — the MCP mint now declares kMcp, and
+    // `submit()`'s `origin` parameter is no longer defaulted — so this arm now
+    // exists for two things only: a row minted before this change, and a
+    // caller that regresses the non-default (which the compiler stops, but a
+    // stored row predating the fix is real data, not a hypothetical). Both are
+    // REFUSED at redemption, same as kUnrecognised (declares_non_mcp_surface).
+    // It is NOT the pre-column row: migration v7 rewrote every '' it found to
+    // the sentinel, so a row that predates the column decodes below as
+    // kUnrecognised, not kUnspecified — kept apart so the two refusal causes
+    // ("declared nothing" vs. "predates the column entirely") stay
+    // distinguishable in code even though redemption treats them alike today.
+    // Anything ELSE is a value this build does not know, and it must NOT fold
+    // into either declared case — decode it as its own value (kUnrecognised)
+    // and let the predicate refuse it on that basis, not by accident of
+    // string-matching.
     if (text.empty())
         return ApprovalOrigin::kUnspecified;
     return ApprovalOrigin::kUnrecognised;
@@ -121,6 +134,13 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
 // here while still erroring in `to_string`. The trailing return living OUTSIDE
 // the switch is what keeps the guard armed, and that is the whole reason it is
 // out there rather than in a default arm.
+//
+// kUnspecified moved from the grant side to the refuse side here (#2442,
+// closing half): the MCP mint now declares ApprovalOrigin::kMcp explicitly
+// (mcp_server.cpp), so kUnspecified is no longer "the MCP gate, undeclared" —
+// it is now indistinguishable from a row this build cannot attribute to any
+// surface, which is exactly the kUnrecognised case one arm below. Grouping
+// them is deliberate, not an oversight.
 bool declares_non_mcp_surface(ApprovalOrigin origin) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
@@ -134,9 +154,9 @@ bool declares_non_mcp_surface(ApprovalOrigin origin) {
     case ApprovalOrigin::kInstruction:
     case ApprovalOrigin::kSchedule:
     case ApprovalOrigin::kUnrecognised:
+    case ApprovalOrigin::kUnspecified:
         return true;
     case ApprovalOrigin::kMcp:
-    case ApprovalOrigin::kUnspecified:
         return false;
     }
 #if defined(__GNUC__) || defined(__clang__)

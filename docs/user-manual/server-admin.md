@@ -387,6 +387,26 @@ upgrade time, it does not grow afterwards, and approvals expire after 7 days reg
 server side the refusal is distinguishable: the audit row records `refused: foreign_origin`, not the
 uniform client message.
 
+### vNEXT — the MCP mint now declares its own surface; undeclared tickets stop redeeming (#2442) (breaking)
+
+**Who this affects.** Any deployment holding an **MCP** approval that was granted but not yet
+redeemed at the moment of upgrade — the same population as the entry above, widened. The
+previous release closed the check for a ticket a REST or scheduled mint declared as its own
+surface; an MCP-minted ticket was still exempt, because the MCP gate could not yet declare
+`kMcp` itself. This release removes that exemption: the MCP mint now stamps every new ticket
+`kMcp` explicitly, and an undeclared ticket (the value an omitted `origin` argument used to
+produce) is refused at recall exactly like a declared foreign surface.
+
+**What happens.** Same mechanics as the entry above, same client message
+(`approval already used (one-time ticket)`), same audit distinction (`refused: foreign_origin`).
+The only difference is which population is now caught: any MCP ticket minted by a
+pre-upgrade server — every one of them, since none could declare `kMcp` before this release —
+that is still outstanding when you upgrade.
+
+**Recover** the same way: call the tool again without `approval_id`. The affected population
+does not grow after the upgrade — every ticket minted by the new server declares its surface
+at mint time, so nothing outstanding from this point on can hit this case.
+
 ### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
 
 **Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No

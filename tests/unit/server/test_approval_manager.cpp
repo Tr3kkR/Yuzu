@@ -55,7 +55,8 @@ TEST_CASE("ApprovalManager: submit creates pending approval", "[approval_manager
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit("def-001", "operator1", "ostype = 'windows'");
+    auto result =
+        mgr.submit("def-001", "operator1", "ostype = 'windows'", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
     CHECK(!result->empty());
 }
@@ -65,7 +66,8 @@ TEST_CASE("ApprovalManager: submitted approval has pending status", "[approval_m
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit("def-001", "operator1", "ostype = 'windows'");
+    auto result =
+        mgr.submit("def-001", "operator1", "ostype = 'windows'", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
 
     // Verify via query
@@ -86,9 +88,9 @@ TEST_CASE("ApprovalManager: submit multiple approvals", "[approval_manager]") {
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    mgr.submit("def-001", "operator1", "scope-1");
-    mgr.submit("def-002", "operator2", "scope-2");
-    mgr.submit("def-003", "operator1", "scope-3");
+    mgr.submit("def-001", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    mgr.submit("def-002", "operator2", "scope-2", "", ApprovalOrigin::kInstruction);
+    mgr.submit("def-003", "operator1", "scope-3", "", ApprovalOrigin::kInstruction);
 
     auto all = mgr.query();
     REQUIRE(all.size() == 3);
@@ -101,9 +103,9 @@ TEST_CASE("ApprovalManager: query by status — pending", "[approval_manager]") 
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    mgr.submit("def-1", "operator1", "scope-1");
-    mgr.submit("def-2", "operator1", "scope-2");
-    auto r3 = mgr.submit("def-3", "operator1", "scope-3");
+    mgr.submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    mgr.submit("def-2", "operator1", "scope-2", "", ApprovalOrigin::kInstruction);
+    auto r3 = mgr.submit("def-3", "operator1", "scope-3", "", ApprovalOrigin::kInstruction);
     REQUIRE(r3.has_value());
     mgr.approve(*r3, "admin1", "approved");
 
@@ -118,8 +120,8 @@ TEST_CASE("ApprovalManager: query by status — approved", "[approval_manager]")
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto r1 = mgr.submit("def-1", "operator1", "scope-1");
-    mgr.submit("def-2", "operator1", "scope-2");
+    auto r1 = mgr.submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    mgr.submit("def-2", "operator1", "scope-2", "", ApprovalOrigin::kInstruction);
     REQUIRE(r1.has_value());
     mgr.approve(*r1, "admin1", "looks good");
 
@@ -148,9 +150,9 @@ TEST_CASE("ApprovalManager: query by submitted_by", "[approval_manager]") {
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    mgr.submit("def-1", "operator1", "scope-1");
-    mgr.submit("def-2", "operator2", "scope-2");
-    mgr.submit("def-3", "operator1", "scope-3");
+    mgr.submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    mgr.submit("def-2", "operator2", "scope-2", "", ApprovalOrigin::kInstruction);
+    mgr.submit("def-3", "operator1", "scope-3", "", ApprovalOrigin::kInstruction);
 
     ApprovalQuery q;
     q.submitted_by = "operator1";
@@ -173,9 +175,9 @@ TEST_CASE("ApprovalManager: pending_count increments and decrements", "[approval
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    mgr.submit("def-1", "operator1", "scope-1");
-    mgr.submit("def-2", "operator1", "scope-2");
-    mgr.submit("def-3", "operator1", "scope-3");
+    mgr.submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    mgr.submit("def-2", "operator1", "scope-2", "", ApprovalOrigin::kInstruction);
+    mgr.submit("def-3", "operator1", "scope-3", "", ApprovalOrigin::kInstruction);
     CHECK(mgr.pending_count() == 3);
 
     // Approve one
@@ -194,7 +196,7 @@ TEST_CASE("ApprovalManager: approve sets status, reviewer, timestamp", "[approva
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit("def-001", "operator1", "scope");
+    auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
 
     auto approve_result = mgr.approve(*result, "admin_user", "Approved for deployment");
@@ -215,7 +217,7 @@ TEST_CASE("ApprovalManager: approve with empty comment", "[approval_manager]") {
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit("def-001", "operator1", "scope");
+    auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
 
     auto approve_result = mgr.approve(*result, "admin_user", "");
@@ -229,7 +231,7 @@ TEST_CASE("ApprovalManager: reject sets status, reviewer, comment", "[approval_m
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit("def-001", "operator1", "scope");
+    auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
 
     auto reject_result = mgr.reject(*result, "admin_user", "Too risky");
@@ -252,7 +254,7 @@ TEST_CASE("ApprovalManager: self-approval prevented", "[approval_manager]") {
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit("def-1", "operator1", "scope");
+    auto result = mgr.submit("def-1", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
 
     // Same user cannot approve their own request
@@ -270,7 +272,7 @@ TEST_CASE("ApprovalManager: cannot approve already approved", "[approval_manager
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit("def-001", "operator1", "scope");
+    auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
     mgr.approve(*result, "admin1", "ok");
 
@@ -283,7 +285,7 @@ TEST_CASE("ApprovalManager: cannot reject already approved", "[approval_manager]
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit("def-001", "operator1", "scope");
+    auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
     mgr.approve(*result, "admin1", "ok");
 
@@ -296,7 +298,7 @@ TEST_CASE("ApprovalManager: cannot approve already rejected", "[approval_manager
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit("def-001", "operator1", "scope");
+    auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
     mgr.reject(*result, "admin1", "denied");
 
@@ -309,7 +311,7 @@ TEST_CASE("ApprovalManager: cannot reject already rejected", "[approval_manager]
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto result = mgr.submit("def-001", "operator1", "scope");
+    auto result = mgr.submit("def-001", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(result.has_value());
     mgr.reject(*result, "admin1", "denied");
 
@@ -345,7 +347,8 @@ TEST_CASE("ApprovalManager: consume_ticket stamps consumed_by with the recalling
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}");
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}", "",
+                         ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
 
@@ -364,7 +367,7 @@ TEST_CASE("ApprovalManager: consume_ticket without a principal fails closed",
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
@@ -382,7 +385,7 @@ TEST_CASE("ApprovalManager: consume_ticket replay is rejected and keeps the orig
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}");
+    auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
     REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
@@ -451,29 +454,35 @@ TEST_CASE("ApprovalManager: a declared origin is recorded on the ticket",
     CHECK(mgr.query({.submitted_by = "operator1"}).at(0).origin == ApprovalOrigin::kInstruction);
 }
 
-TEST_CASE("ApprovalManager: an undeclared mint records no origin and keeps the mcp. prefix",
-          "[approval_manager][approval]") {
+TEST_CASE("ApprovalManager: an undeclared submit still records kUnspecified, and it is "
+          "refused at redemption",
+          "[approval_manager][approval][security]") {
+    // Formerly the TETHER on the kUnspecified exemption ("an undeclared mint
+    // records no origin and keeps the mcp. prefix"), back when the MCP gate
+    // itself minted through this same undeclared path and the test asserted
+    // that grant. #2442's closing half removed that exemption: the MCP mint
+    // now declares ApprovalOrigin::kMcp explicitly (mcp_server.cpp), so no
+    // production caller reaches this path any more. What remains worth
+    // pinning is the DEFENSIVE property for a future caller that regresses —
+    // omitting `origin` is now a compile error (no default), so this can only
+    // happen via an explicit kUnspecified, and that must still decode and
+    // still refuse, exactly like kUnrecognised.
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    // The MCP gate still mints without declaring (mcp_server.cpp is frozen for
-    // a parallel rebase). It must keep working, and must NOT be recorded as a
-    // surface it did not come from.
-    //
-    // This case is also the TETHER on the exemption, which is the weakest part
-    // of the design and is meant to be temporary: an undeclared mint is the
-    // one remaining way to reach the reserved namespace, so a future caller
-    // that forgot to declare an origin would reach it too. Nothing relies on
-    // that today — the MCP gate is the only undeclared caller in the tree.
-    // When the MCP mint declares kMcp, the exemption should go and THIS TEST
-    // should fail; that failure is the prompt to delete it deliberately, not a
-    // regression to paper over.
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}");
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}", "",
+                         ApprovalOrigin::kUnspecified);
     REQUIRE(id.has_value());
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
-    CHECK(row->origin == ApprovalOrigin::kUnspecified);
+    CHECK(row->origin == ApprovalOrigin::kUnspecified); // still recorded honestly, not folded
+
+    REQUIRE(mgr.approve(*id, "admin1", "").has_value());
+    auto denied = mgr.consume_ticket(*id, "operator1", {});
+    REQUIRE(!denied.has_value());
+    CHECK(denied.error().kind == ConsumeFailure::kForeignOrigin); // refused, not granted
+    CHECK(mgr.get(*id)->consumed_at == 0);
 }
 
 TEST_CASE("ApprovalManager: origin round-trips through its column text",
@@ -490,9 +499,12 @@ TEST_CASE("ApprovalManager: origin round-trips through its column text",
     // the pre-column row: v7 rewrote those to the sentinel. Anything
     // unrecognised is NOT the same thing and must not decode as it.
     CHECK(approval_origin_from_string("") == ApprovalOrigin::kUnspecified);
-    // NOT kUnspecified: that is the value that GRANTS redemption, so folding an
-    // unknown string into it would make a row written by a newer binary
-    // redeemable here. See the kUnrecognised case below.
+    // NOT kUnspecified: both refuse at redemption today, but they are
+    // different FACTS ("declared nothing" vs. "this build cannot attribute
+    // it to any surface"), and folding an unknown string into kUnspecified
+    // would erase that distinction in the stored evidence even though it
+    // would not currently change whether the ticket redeems. See the
+    // kUnrecognised case below.
     CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnrecognised);
     CHECK(approval_origin_from_string("nonsense") == ApprovalOrigin::kUnrecognised);
 }
@@ -535,10 +547,14 @@ TEST_CASE("ApprovalManager: a pre-column row is back-filled to a fail-closed sen
     REQUIRE(row.has_value());
     CHECK(row->definition_id == "inventory.audit");
     // NOT back-filled to 'instruction': the row is evidence, and its surface is
-    // genuinely unknown. NOT left at '' either — that is the GRANTING case, so
-    // every pre-v5 row would have stayed cross-surface redeemable, which is the
-    // defect #2442 exists to close. The sentinel claims no surface and fails
-    // closed.
+    // genuinely unknown. NOT left at '' either: at the time this migration was
+    // written, '' (kUnspecified) was the GRANTING value, so every pre-v5 row
+    // would have stayed cross-surface redeemable — the defect #2442 exists to
+    // close. kUnspecified stopped granting once the MCP mint declared kMcp
+    // (#2442's closing half), but the sentinel is kept distinct from it
+    // regardless: "predates the column" and "declared nothing" are different
+    // facts even now that both refuse. The sentinel claims no surface and
+    // fails closed.
     CHECK(row->origin == ApprovalOrigin::kUnrecognised);
     CHECK(declares_non_mcp_surface(row->origin));
 }
@@ -586,7 +602,8 @@ TEST_CASE("ApprovalManager: a failing pre-consume recheck denies WITHOUT consumi
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.confirm_engine_rotation", "operator1", "{\"token_id\":\"t1\"}");
+    auto id = mgr.submit("mcp.confirm_engine_rotation", "operator1", "{\"token_id\":\"t1\"}", "",
+                         ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
 
@@ -611,7 +628,7 @@ TEST_CASE("ApprovalManager: a ticket denied by the recheck is still consumable a
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.confirm_engine_rotation", "operator1", "{}");
+    auto id = mgr.submit("mcp.confirm_engine_rotation", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
@@ -638,7 +655,8 @@ TEST_CASE("ApprovalManager: the pre-consume recheck sees the matched ticket's ow
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}");
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{\"agent_id\":\"a1\"}", "",
+                         ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
 
@@ -663,7 +681,7 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
     REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
@@ -679,7 +697,8 @@ TEST_CASE("ApprovalManager: a non-consumable ticket is declined without running 
     CHECK(!ran); // the recheck may be costly or emit audit — spent tickets skip it
 
     // Same for a pending (never-approved) ticket and for an absent id.
-    auto pending = mgr.submit("mcp.delete_tag", "operator1", "{\"n\":1}");
+    auto pending =
+        mgr.submit("mcp.delete_tag", "operator1", "{\"n\":1}", "", ApprovalOrigin::kMcp);
     REQUIRE(pending.has_value());
     ran = false; // reset per sub-case so a regression names WHICH one regressed
     auto on_pending = mgr.consume_ticket(*pending, "operator1",
@@ -707,7 +726,7 @@ TEST_CASE("ApprovalManager: an empty precondition consumes exactly like the two-
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
@@ -723,7 +742,7 @@ TEST_CASE("ApprovalManager: a missing principal fails closed on the recheck over
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
@@ -747,7 +766,7 @@ TEST_CASE("ApprovalManager: the CAS still wins when the row is consumed during t
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
@@ -775,7 +794,7 @@ TEST_CASE("ApprovalManager: a throwing recheck denies without consuming and does
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
@@ -810,7 +829,7 @@ TEST_CASE("ApprovalManager: a store failure during the recheck is not reported a
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
@@ -921,7 +940,7 @@ TEST_CASE("ApprovalManager: the recheck may read the store without deadlocking",
     auto fx = std::make_shared<Fixture>();
     fx->mgr.create_tables();
 
-    auto id = fx->mgr.submit("mcp.delete_tag", "operator1", "{}");
+    auto id = fx->mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(fx->mgr.approve(*id, "admin1", "").has_value());
 
@@ -984,11 +1003,12 @@ TEST_CASE("ApprovalManager: stale pending approvals expire on the next submit",
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto stale = mgr.submit("def-old", "operator1", "scope");
+    auto stale = mgr.submit("def-old", "operator1", "scope", "", ApprovalOrigin::kInstruction);
     REQUIRE(stale.has_value());
     backdate(tdb.db, *stale, "submitted_at", k8Days);
 
-    REQUIRE(mgr.submit("def-new", "operator1", "scope").has_value()); // triggers the sweep
+    REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value()); // triggers the sweep
 
     auto row = mgr.get(*stale);
     REQUIRE(row.has_value());
@@ -1001,12 +1021,13 @@ TEST_CASE("ApprovalManager: approved-but-unconsumed tickets expire 7 days after 
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}");
+    auto id = mgr.submit("mcp.quarantine_device", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "ok").has_value());
     backdate(tdb.db, *id, "reviewed_at", k8Days);
 
-    REQUIRE(mgr.submit("def-new", "operator1", "scope").has_value()); // triggers the sweep
+    REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value()); // triggers the sweep
 
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
@@ -1023,13 +1044,14 @@ TEST_CASE("ApprovalManager: consumed tickets are history, never expired",
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}");
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
     REQUIRE(mgr.consume_ticket(*id, "operator1", {}).has_value());
     backdate(tdb.db, *id, "reviewed_at", k8Days);
 
-    REQUIRE(mgr.submit("def-new", "operator1", "scope").has_value()); // triggers the sweep
+    REQUIRE(mgr.submit("def-new", "operator1", "scope", "", ApprovalOrigin::kInstruction)
+                .has_value()); // triggers the sweep
 
     auto row = mgr.get(*id);
     REQUIRE(row.has_value());
@@ -1124,12 +1146,12 @@ TEST_CASE("ApprovalManager: an MCP-minted ticket under the reserved prefix still
     CHECK(mgr.consume_ticket(*declared, "operator1", {}).has_value());
     CHECK(mgr.get(*declared)->consumed_at != 0);
 
-    // And the undeclared mint — which is what the frozen MCP gate actually does
-    // today — must also still redeem, or the guard breaks the live MCP flow.
-    auto undeclared = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
-    REQUIRE(undeclared.has_value());
-    REQUIRE(mgr.approve(*undeclared, "admin1", "").has_value());
-    CHECK(mgr.consume_ticket(*undeclared, "operator1", {}).has_value());
+    // The undeclared mint used to be what the frozen MCP gate actually did,
+    // and had to still redeem or the guard broke the live MCP flow. #2442's
+    // closing half removed that carve-out (mcp_server.cpp now always declares
+    // kMcp), so an undeclared submit is no longer a live production path —
+    // see "an undeclared submit still records kUnspecified, and it is refused
+    // at redemption" above for the negative coverage that replaced this.
 }
 
 TEST_CASE("ApprovalManager: an ordinary non-MCP ticket is refused at redemption too",
@@ -1159,7 +1181,7 @@ TEST_CASE("ApprovalManager: an empty precondition consumes with no precondition 
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kUnspecified);
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
@@ -1233,9 +1255,13 @@ TEST_CASE("ApprovalManager: a store failure is not reported as spent in the mess
 
 TEST_CASE("ApprovalManager: an unrecognised origin column value is refused, not exempted",
           "[approval_manager][approval][security]") {
-    // The decode used to fold anything unknown into kUnspecified. #2442 made
-    // kUnspecified the value that GRANTS redemption, so that fold would have made
-    // the composite fail OPEN even though the predicate fails closed.
+    // The decode used to fold anything unknown into kUnspecified. At the time
+    // #2442 first shipped, kUnspecified was the value that GRANTED redemption,
+    // so that fold would have made the composite fail OPEN even though the
+    // predicate fails closed. kUnspecified stopped granting once the MCP mint
+    // declared kMcp explicitly (#2442's closing half) — kept apart from
+    // kUnrecognised regardless, since folding still erases a real evidentiary
+    // distinction even though both refuse today.
     CHECK(approval_origin_from_string("") == ApprovalOrigin::kUnspecified);
     CHECK(approval_origin_from_string("mcp") == ApprovalOrigin::kMcp);
     CHECK(approval_origin_from_string("MCP") == ApprovalOrigin::kUnrecognised); // case-sensitive
@@ -1285,14 +1311,14 @@ TEST_CASE("ApprovalManager: find_pending skips a ticket the recall would refuse"
 
 TEST_CASE("ApprovalManager: find_pending walks past a foreign ticket to a usable one",
           "[approval_manager][approval][security]") {
-    // The filter must WALK, not just reject the newest. An older undeclared
+    // The filter must WALK, not just reject the newest. An older MCP-origin
     // ticket under the same key is a perfectly good dedup hit; skipping it
     // mints a duplicate and re-opens the flooding this dedup exists to bound.
     TestDb tdb;
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto usable = mgr.submit("mcp.delete_tag", "operator1", "{}"); // undeclared = MCP mint today
+    auto usable = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(usable.has_value());
     backdate(tdb.db, *usable, "submitted_at", 60); // older, so the foreign one sorts first
 
@@ -1303,7 +1329,7 @@ TEST_CASE("ApprovalManager: find_pending walks past a foreign ticket to a usable
     auto found = mgr.find_pending("mcp.delete_tag", "operator1", "{}");
     REQUIRE(found.has_value());
     CHECK(found->id == *usable); // NOT the newer foreign one
-    CHECK(found->origin == ApprovalOrigin::kUnspecified);
+    CHECK(found->origin == ApprovalOrigin::kMcp);
 }
 
 TEST_CASE("ApprovalManager: migration v7 reaches a store already at v5",
@@ -1502,7 +1528,7 @@ TEST_CASE("ApprovalManager: a CAS-step fault after a passing origin check does N
     ApprovalManager mgr(tdb.db);
     mgr.create_tables();
 
-    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}"); // kUnspecified — grants
+    auto id = mgr.submit("mcp.delete_tag", "operator1", "{}", "", ApprovalOrigin::kMcp);
     REQUIRE(id.has_value());
     REQUIRE(mgr.approve(*id, "admin1", "").has_value());
 
