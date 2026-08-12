@@ -90,8 +90,9 @@ constexpr const char* kMetricPinReleaseFailed = "yuzu_mcp_bridge_pin_release_fai
 constexpr const char* kMetricPinReleaseRaced = "yuzu_mcp_bridge_pin_release_raced_total";
 // Produced ONLY by the bridge's publish_final -> fallback -> poison ladder
 // (below); named in the yuzu_mcp_stream_* family because it describes stream-
-// terminal delivery, not because mcp_stream.cpp increments it (poison_terminal()
-// increments nothing; publish_guarded uses the generic publish-failure counter).
+// terminal delivery, not because mcp_stream.cpp increments it - poison_terminal()
+// increments its OWN family instead (yuzu_mcp_stream_poison_close_failures_total,
+// #2531), which counts a close failure, not a publish-ladder failure.
 constexpr const char* kMetricTerminalPublishFailures =
     "yuzu_mcp_stream_terminal_publish_failures_total";
 
@@ -171,14 +172,59 @@ void McpStreamBridge::shutdown() {
             records_.clear();
             streamed_unpinned_.clear();
         }
+        std::size_t poisoned_unresolved = 0;
         for (const auto& rec : reaped) {
+            bool should_poison = false;
             {
                 // Settle charge bookkeeping for consistency (the ledger map is
                 // already gone; the flag must not read as "held" to a late observer).
                 std::lock_guard<std::mutex> lk(rec->mu);
                 rec->streamed_charge_held = false;
+                // A pressure-visitor claim (torn_down set under Channel::mu) can be
+                // abandoned mid-teardown: the claim commits inside the bus visitor,
+                // WITHOUT bridge_mu_, so shutdown() can start meanwhile - the
+                // CALLER (sweep's pressure-relief loop, not teardown_claimed
+                // itself) re-checks shutdown_started_ right after and returns
+                // before teardown_claimed is ever invoked, so this walk is the
+                // only reclaimer left. It still never PUBLISHES against
+                // a torn-down record - that would race a possibly-still-running
+                // teardown_claimed and break the exactly-once arbitration
+                // teardown_claimed's own comment describes - but it CAN poison one
+                // whose terminal was never resolved (teardown_terminal_handled
+                // false), so a client still connected learns its stream is gone
+                // instead of heart-beating past process exit (#2517). A concurrent
+                // sweep() mid-teardown_claimed (not joined here, only the projector
+                // is) can race this and cause a spurious poison of a record that
+                // actually published - harmless: poisoning is idempotent and the
+                // client's remediation is the same fetch-by-execution_id either way.
+                should_poison = rec->torn_down && !rec->teardown_terminal_handled &&
+                                !rec->terminal_projected.load(std::memory_order_acquire) &&
+                                !rec->final_written;
+            }
+            if (should_poison) {
+                rec->stream->poison_terminal();  // noexcept (#2531); idempotent
+                ++poisoned_unresolved;
             }
             flush_record_obs(*rec);
+        }
+        if (poisoned_unresolved > 0) {
+            // ONE aggregate row, not one per record: a closed campaign of shutdown
+            // reaps is not evidence-silent (#2489 comp-S1), but per-record teardown
+            // evidence is exactly what the abandoned records never got and cannot
+            // get now (publishing against them here would be the arbitration
+            // violation the poison-only design above avoids). No metric: the
+            // process is exiting and the series would never be scraped - this
+            // audit row is the durable evidence.
+            audit_contained("mcp.bridge.shutdown_reap", /*execution_id=*/"", /*stage=*/"",
+                            "poisoned " + std::to_string(poisoned_unresolved) +
+                                " claimed-but-unpublished record(s) at shutdown; every "
+                                "result remains fetchable by execution_id");
+            try {
+                spdlog::info("MCP bridge shutdown: poisoned {} claimed-but-unpublished "
+                            "record(s); every result remains fetchable by execution_id",
+                            poisoned_unresolved);
+            } catch (...) {  // NOLINT(bugprone-empty-catch) - nothing left we could safely do
+            }
         }
         flush_core_obs();
         publish_records_gauge(0);
@@ -1833,9 +1879,22 @@ std::string McpStreamBridge::build_real_final(const BridgeRecord& rec,
     return success_response(rec.jsonrpc_id, base.dump());
 }
 
+// A future throw source added here would std::terminate at this boundary rather than
+// silently vanish - teardown_claimed is itself noexcept (so a throw there was ALREADY
+// a terminate), and project_record's caller has no ladder-level catch at all (a throw
+// would previously escape to run_projector's per-record catch and be swallowed
+// silently, mis-settling that record). Binding this to McpStreamState's noexcept-ness
+// makes that guarantee a compile-time fact instead of a comment nobody re-checks: if
+// either call below becomes throwing again, this line fails to compile rather than
+// quietly reopening kPublishThrew's dead-enum problem (#2531/#2523).
+static_assert(noexcept(std::declval<McpStreamState&>().publish_final(
+                  std::string_view{}, std::string_view{})) &&
+             noexcept(std::declval<McpStreamState&>().poison_terminal()),
+             "publish_terminal_ladder assumes both calls are noexcept");
+
 McpStreamBridge::LadderResult
 McpStreamBridge::publish_terminal_ladder(const std::shared_ptr<BridgeRecord>& rec,
-                                         std::string&& frame) {
+                                         std::string&& frame) noexcept {
     auto fid = rec->stream->publish_final("message", frame);
     if (fid != 0) {
         return {fid, TerminalRung::kPrimary};
@@ -2409,12 +2468,13 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     // every publishing case there is no live listener to race, and for kNone there
     // is nothing to publish.
     TerminalRung rung = TerminalRung::kNotAttempted;
-    bool ladder_reached = false;
     switch (decision) {
-        case TeardownFinal::kSynthesizeUnavailable:
+        case TeardownFinal::kSynthesizeUnavailable: {
             // Pressure victim that genuinely NEVER saw a terminal (verified at claim
             // under Channel::mu): pin a machine-readable terminal-unavailable so a
             // later resume still finds truth in the ring.
+            std::string frame;
+            bool built = false;
             try {
                 if (terminal_build_fault_.load(std::memory_order_acquire) > 0 &&
                     terminal_build_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
@@ -2429,48 +2489,60 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
                                         "execution_id (get_execution_status / "
                                         "query_responses)") +
                     "}";
-                std::string frame =
-                    error_response(rec->jsonrpc_id, kMcpTerminalUnavailable,
-                                   "streamed result forced-expired under memory pressure", data);
-                ladder_reached = true;
+                frame = error_response(rec->jsonrpc_id, kMcpTerminalUnavailable,
+                                       "streamed result forced-expired under memory pressure",
+                                       data);
+                built = true;
+            } catch (...) {  // NOLINT(bugprone-empty-catch)
+            }
+            if (built) {
+                // The ladder itself is noexcept (#2531/#2523) - nothing left to catch.
                 rung = publish_terminal_ladder(rec, std::move(frame)).rung;
-            } catch (...) {
-                // Distinguish "never reached the ladder" (frame build threw) from
-                // "the ladder itself threw": the audit must not claim a frame could
-                // not be BUILT when it was built and the publish threw.
-                rung = ladder_reached ? TerminalRung::kPublishThrew : TerminalRung::kNotAttempted;
+            } else {
+                // rung stays kNotAttempted: the frame was never built, so the ladder
+                // was never called.
                 if (metrics_ != nullptr) {
                     obs_guard([&] { metrics_->counter(kMetricTerminalPublishFailures).increment(); });
                 }
             }
             break;
-        case TeardownFinal::kFallbackFinal:
+        }
+        case TeardownFinal::kFallbackFinal: {
             // Terminal existed but its payload aged out of the bus buffer: publish
             // the prebuilt SUCCESS-shaped final, NEVER -32014.
+            std::string frame;
+            bool built = false;
             try {
                 if (terminal_build_fault_.load(std::memory_order_acquire) > 0 &&
                     terminal_build_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
                     throw std::bad_alloc{};  // models the fallback_final copy failing
                 }
-                // Copy FIRST, then flag. The ladder takes an rvalue reference
-                // precisely so this copy cannot hide at the call boundary: done
-                // there it would allocate AFTER ladder_reached was set, making a
-                // copy OOM audit as "publishing threw" when the ladder was never
-                // entered. No test can distinguish those two orderings (the fault
-                // seam cannot sit at the copy point in both), so the signature
-                // enforces it instead.
-                std::string frame = rec->fallback_final;
-                ladder_reached = true;
+                frame = rec->fallback_final;
+                built = true;
+            } catch (...) {  // NOLINT(bugprone-empty-catch)
+            }
+            if (built) {
                 rung = publish_terminal_ladder(rec, std::move(frame)).rung;
-            } catch (...) {
-                rung = ladder_reached ? TerminalRung::kPublishThrew : TerminalRung::kNotAttempted;
+            } else {
                 if (metrics_ != nullptr) {
                     obs_guard([&] { metrics_->counter(kMetricTerminalPublishFailures).increment(); });
                 }
             }
             break;
+        }
         case TeardownFinal::kNone:
             break;  // real final already pinned, or nothing to publish
+    }
+
+    // Record whether Step 1 resolved this record's terminal disposition, so
+    // shutdown()'s walk can tell "nothing was ever owed / the ladder ran" apart
+    // from "the frame build failed and nothing happened" - the latter is the one
+    // state shutdown must poison rather than silently abandon (#2517). Set here,
+    // under the record lock, regardless of what Steps 2-4 below do next.
+    {
+        std::lock_guard<std::mutex> rlk(rec->mu);
+        rec->teardown_terminal_handled =
+            decision == TeardownFinal::kNone || rung != TerminalRung::kNotAttempted;
     }
 
     // Derived ONCE and passed to every audit site below, bail or not. See
@@ -2507,9 +2579,9 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // The detail must not assert a delivery that did not happen. There are three
         // teardown_claimed call sites; the pin-ack / session-death / arming-reap one
         // passes kNone literally and publishes nothing, and the two pressure sites
-        // pass a decision that still delivers nothing on kPoisoned / kPublishThrew /
-        // kNotAttempted - so "the terminal was published" is only true when the ladder
-        // actually committed. The disposition below is derived, not assumed.
+        // pass a decision that still delivers nothing on kPoisoned / kNotAttempted -
+        // so "the terminal was published" is only true when the ladder actually
+        // committed. The disposition below is derived, not assumed.
         audit_contained(audit_action, exec_id,
                         "teardown incomplete: bus unsubscribe failed; the record, its streamed "
                         "charge and its bus subscription are all retained for shutdown",
@@ -2831,18 +2903,6 @@ const char* McpStreamBridge::disposition_phrase(TeardownFinal decision,
         case TerminalRung::kPoisoned:
             return "the terminal publish POISONED the session - every later attach 410s and "
                    "the client must re-initialize; recover the result by execution_id";
-        case TerminalRung::kPublishThrew:
-            // Deliberately does NOT claim the stream escaped poisoning. publish_final
-            // is noexcept, so the only way the ladder throws is poison_terminal() (#2531),
-            // which sets its sticky flag under mu_ and THEN calls close_sink outside
-            // it - so a throw here means the session very likely IS poisoned, with the
-            // flag already set. The previous wording asserted the opposite. This arm
-            // is reachable but has no fault seam (nothing can make close_sink throw
-            // from a test), so it is stated conservatively rather than pinned.
-            return "the terminal was built but publishing threw; nothing was confirmed "
-                   "published and the session's poison state is indeterminate (a throw at this "
-                   "point almost certainly means it WAS poisoned - see #2531; the wording stays "
-                   "conservative only because nothing can pin it) - recover by execution_id";
         case TerminalRung::kNotAttempted:
             break;
     }
@@ -2954,12 +3014,13 @@ void McpStreamBridge::inject_projection_fallback_fault_for_test(int times) {
     projection_fallback_fault_.store(times, std::memory_order_release);
 }
 
-void McpStreamBridge::inject_teardown_step_fault_for_test(TeardownStage stage, int times) {
+bool McpStreamBridge::inject_teardown_step_fault_for_test(TeardownStage stage, int times) {
     const auto idx = static_cast<std::size_t>(stage);
     if (idx >= kTeardownStageCount) {
-        return;  // public method: an out-of-range cast must not become an OOB write
+        return false;  // public method: an out-of-range cast must not become an OOB write
     }
     teardown_step_fault_[idx].store(times, std::memory_order_release);
+    return true;
 }
 
 void McpStreamBridge::inject_terminal_build_fault_for_test(int times) {
