@@ -171,6 +171,40 @@ void setup_rbac_store_pg_lifecycle_template(const std::string& dsn) {
 yuzu::test::PgTestTemplate rbac_store_lifecycle_template{"rbacstore_lc",
                                                          &setup_rbac_store_pg_lifecycle_template};
 
+// #2964: PostgreSQL's OWN clock, queried directly. Since the clock-guarded
+// rotation sweep (`ApiTokenStore::sweep_expired_rotations`) reads PG's own
+// `now()` for its eligibility decision rather than trusting the `now`
+// argument a caller passes, a sweep test can no longer "time-travel" a
+// pair's overlap window into the past by simply passing a large future
+// `now` to `sweep_expired_rotations` itself — mirrors
+// `AuditStore::cleanup_once`'s identical divergence (`test_audit_store.cpp`
+// carries the same helper). Tests below force a predecessor's
+// `overlap_expires_at` directly, relative to a `pg_now(dsn)` reading, rather
+// than relying on wall-clock elapse.
+std::int64_t pg_now(const std::string& dsn) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult r{PQexec(conn.get(), "SELECT EXTRACT(EPOCH FROM now())::bigint")};
+    REQUIRE(r.ok());
+    return std::stoll(PQgetvalue(r.get(), 0, 0));
+}
+
+// Force an EXISTING predecessor row's overlap window to a specific instant
+// (typically already-elapsed relative to `pg_now`) via a direct UPDATE —
+// simulates "the window has now elapsed" without an actual wall-clock wait,
+// which a PG-authoritative eligibility decision cannot otherwise fast-
+// forward through in a test. Direct-SQL precedent: `wire_manual_rotation_
+// pair` (test_api_token_store.cpp).
+void force_overlap_expires_at(const std::string& dsn, const std::string& token_id,
+                              std::int64_t overlap_expires_at) {
+    pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult r = pg::exec_params(
+        conn.get(), "UPDATE api_token_store.api_tokens SET overlap_expires_at = $1 WHERE token_id = $2",
+        std::vector<std::string>{std::to_string(overlap_expires_at), token_id});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
 struct AuditCall {
     std::string action;
     std::string result;
@@ -1321,6 +1355,32 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: auto-revokes an elapsed "
         [&](const std::string& id) { return engine_store->get_for_auth(id).status; });
 
     const auto now = now_epoch();
+
+    // #2964: settle the clock-guard bootstrap marker on an empty table
+    // BEFORE minting anything (mirrors `AuditStore`'s own `anchor_guard` —
+    // nothing eligible yet, so the pass short-circuits to `Anomaly::None`
+    // without ever declining — `ApiTokenStorePgShared` TRUNCATEs
+    // `rotation_retention_meta` alongside `api_tokens` between fixtures, so
+    // every test on this shared bundle starts unanchored), and seed a
+    // harmless HUMAN companion pair whose overlap window stays comfortably
+    // in the future — without it, THIS test's own single in-flight pair
+    // elapsing is indistinguishable from a genuine would-wipe clock jump
+    // (the guard's own probe: "would this pass expire EVERY eligible row,
+    // with none left surviving?").
+    {
+        auto anchor = tokens->sweep_expired_rotations(now);
+        REQUIRE(anchor.outcome == ApiTokenStore::SweepOutcome::Ok);
+        REQUIRE(anchor.revoked.empty());
+        REQUIRE(tokens->create_token("survivor-pred", "sweep-test-survivor", now + 90 * 24 * 3600)
+                   .has_value());
+        const std::string survivor_pred_id =
+            tokens->list_active_for_principal("sweep-test-survivor")[0].token_id;
+        auto survivor_rotated = tokens->rotate_token(survivor_pred_id, 24 * 3600, now,
+                                                      "sweep-test-survivor", "", "");
+        REQUIRE(survivor_rotated.has_value());
+        REQUIRE(tokens->validate_token(*survivor_rotated).has_value());
+    }
+
     // rotate_engine_credential's 0-active arm rejects outright ("mint one
     // first") — the identity alone (engine_store->create above) is not a
     // credential. Mint the first one directly, the same shape the REST
@@ -1356,19 +1416,27 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: auto-revokes an elapsed "
     // exercising the auto-revoke path it is named for.
     REQUIRE(tokens->validate_token(*rotated).has_value());
 
-    // BEFORE the window elapses: a sweep at `now` (or shortly after, still
-    // < overlap_expires_at) finds nothing to do — idempotent, no early revoke.
+    // BEFORE the window elapses: a sweep finds nothing to do — idempotent,
+    // no early revoke. `overlap_expires_at` (`now + 24h`, set at mint above)
+    // is genuinely in the future relative to PostgreSQL's own clock, which
+    // is what the sweep's eligibility decision reads (#2964) — no synthetic
+    // future `now` argument can fast-forward past it.
     auto too_early = tokens->sweep_expired_rotations(now + 10);
-    CHECK(too_early.empty());
+    REQUIRE(too_early.outcome == ApiTokenStore::SweepOutcome::Ok);
+    CHECK(too_early.revoked.empty());
     auto predecessor_before = tokens->get_token(predecessor_id).value();
     REQUIRE(predecessor_before.has_value());
     CHECK_FALSE(predecessor_before->revoked);
 
-    // AFTER the window elapses: the predecessor is revoked...
+    // AFTER the window elapses: force the predecessor's overlap window into
+    // the past relative to PostgreSQL's own clock (a real wall-clock wait
+    // is not available to a test) — the predecessor is revoked...
+    force_overlap_expires_at(tokens.dsn(), predecessor_id, pg_now(tokens.dsn()) - 1);
     const auto after_window = now + 24 * 3600 + 1;
     auto swept = tokens->sweep_expired_rotations(after_window);
-    REQUIRE(swept.size() == 1);
-    CHECK(swept[0].token_id == predecessor_id);
+    REQUIRE(swept.outcome == ApiTokenStore::SweepOutcome::Ok);
+    REQUIRE(swept.revoked.size() == 1);
+    CHECK(swept.revoked[0].token_id == predecessor_id);
 
     auto predecessor_row = tokens->get_token(predecessor_id).value();
     REQUIRE(predecessor_row.has_value());
@@ -1392,7 +1460,8 @@ TEST_CASE("ApiTokenStore::sweep_expired_rotations: auto-revokes an elapsed "
     // Idempotent: re-running the sweep at the same (or a later) instant
     // finds nothing left to revoke.
     auto second_sweep = tokens->sweep_expired_rotations(after_window + 100);
-    CHECK(second_sweep.empty());
+    CHECK(second_sweep.outcome == ApiTokenStore::SweepOutcome::Ok);
+    CHECK(second_sweep.revoked.empty());
 
     (void)rotation_group;
 }
@@ -1419,20 +1488,24 @@ TEST_CASE("ApiTokenStore::list_rotations_nearing_expiry_unused: flags an unused 
     REQUIRE(rotated.has_value());
     const std::string raw_successor = *rotated;
 
+    // #2964 fix round finding 7: no longer takes a caller `now` (reads
+    // PostgreSQL's own clock internally) — `now` above is real wall-clock
+    // time, so this is equivalent.
+    //
     // Far from the window end: not yet in the warn set.
-    auto too_early = tokens->list_rotations_nearing_expiry_unused(now, 3600);
-    CHECK(too_early.empty());
+    auto too_early = tokens->list_rotations_nearing_expiry_unused(3600);
+    CHECK(too_early.pairs.empty());
 
     // Within the warn lead time, successor unused: flagged.
-    auto nearing = tokens->list_rotations_nearing_expiry_unused(now, 24 * 3600 + 10);
-    REQUIRE(nearing.size() == 1);
-    CHECK(nearing[0].predecessor.principal_id == "engine:sweepwarn");
-    CHECK(nearing[0].successor.last_used_at == 0);
+    auto nearing = tokens->list_rotations_nearing_expiry_unused(24 * 3600 + 10);
+    REQUIRE(nearing.pairs.size() == 1);
+    CHECK(nearing.pairs[0].predecessor.principal_id == "engine:sweepwarn");
+    CHECK(nearing.pairs[0].successor.last_used_at == 0);
 
     // Once the successor is presented (validate_token bumps last_used_at),
     // it drops out of the "unused" set.
     auto validated = tokens->validate_token(raw_successor);
     REQUIRE(validated.has_value());
-    auto nearing_after_use = tokens->list_rotations_nearing_expiry_unused(now, 24 * 3600 + 10);
-    CHECK(nearing_after_use.empty());
+    auto nearing_after_use = tokens->list_rotations_nearing_expiry_unused(24 * 3600 + 10);
+    CHECK(nearing_after_use.pairs.empty());
 }

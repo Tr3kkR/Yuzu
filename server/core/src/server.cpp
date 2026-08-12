@@ -21,6 +21,11 @@
 #include "store_errors.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "audit_retention_rules.hpp" // audit_retention::Anomaly — the rotation sweep's
+                                     // SweepResult::decline_anomaly type (the human-readable
+                                     // decline REASON only — the metric split below routes on
+                                     // the raw SweepResult::no_anchor fact instead, #2964 round
+                                     // 3 review finding 2; see that field's own doc comment)
 #include "rotation_sweep_naming.hpp"
 #include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
@@ -2194,6 +2199,158 @@ public:
                           "principal_kind",
                           "counter");
         metrics_.counter("yuzu_rotation_sweep_capped_total");
+        // The sweep's clock guard DECLINED a tick (a big-step/bad-state
+        // verdict) — both credentials in every affected pair stay active
+        // rather than being auto-revoked on an unverified reading. A
+        // decline must never be indistinguishable from "nothing was
+        // eligible this tick" (both leave zero rows revoked) — this
+        // counter, plus the caller's own actionable log line, are what make
+        // the two distinguishable. Same shared, un-split-by-principal_kind
+        // scope as its sweep_failures/capped siblings above — the decline
+        // is a tick-level clock-guard verdict, not attributable to one
+        // kind's rows.
+        //
+        // `big-step` (`Step`) is NOT a clock-anomaly-only signal at this
+        // store's 3'600s threshold (`kRotationSweepBigStepSecs`, its own
+        // doc comment in `api_token_store.hpp`) — an hour of `Failed` ticks
+        // (a maintenance window, a DB failover, a dev instance left off
+        // overnight) crosses it just as a clock jump would, with no clock
+        // fault involved. `describe()` below states both causes; do not
+        // narrow this text to "clock anomaly" alone.
+        //
+        // Deliberately EXCLUDES the no-durable-anchor decline (routed-concern
+        // policy floor) — see `yuzu_rotation_sweep_bootstrap_declines_total`
+        // below for why that one is a SEPARATE series, never folded into
+        // this one.
+        metrics_.describe("yuzu_rotation_sweep_declined_total",
+                          "Cumulative rotation-sweep ticks the clock guard declined (big-step / "
+                          "bad-state - this store does not adopt the would-wipe half of the "
+                          "routed-concern probe, see api_token_store.cpp's DELIBERATE "
+                          "NON-ADOPTION comment). A big-step decline is NOT necessarily a clock "
+                          "fault: at this store's 3600s threshold it is most often a planned or "
+                          "unplanned multi-tick outage (maintenance window, DB failover, an "
+                          "instance left off overnight) with a perfectly correct clock - check "
+                          "both before assuming the clock moved. Shared across BOTH "
+                          "engine-credential and human API-token rotation pairs, not split by "
+                          "principal_kind. Excludes bootstrap declines (no durable anchor yet) - "
+                          "see yuzu_rotation_sweep_bootstrap_declines_total",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_declined_total");
+        // #2964 fix round finding 4 (routed-concern POLICY FLOOR: a bootstrap
+        // decline "counts to its own ..._retention_bootstrap_declines_total,
+        // never the clock-anomaly series, because it asserts only that
+        // nothing can yet be ruled out and must not fire an alert that says
+        // the clock moved"). Sharing the counter above would fire that
+        // alert's "the clock moved" claim on every server carrying a rotation
+        // backlog through the first sweep tick after an upgrade — the exact
+        // false-positive #2579/audit_store's own bootstrap counter exists to
+        // avoid, mirrored here. `SweepResult::no_anchor` (`api_token_
+        // store.hpp`) is what this counter is derived from — the raw fact,
+        // not `decline_anomaly`'s classified precedence winner (#2964 round
+        // 3 review finding 2; see that field's own doc comment).
+        metrics_.describe("yuzu_rotation_sweep_bootstrap_declines_total",
+                          "Cumulative rotation-sweep ticks declined because no pass on this "
+                          "database has yet reached a verdict (NOT a clock anomaly - a weaker "
+                          "claim that asserts only that nothing can yet be ruled out) - the "
+                          "human-owned/engine-owned-shared twin of "
+                          "yuzu_server_audit_retention_bootstrap_declines_total",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_bootstrap_declines_total");
+        // #2964 fix round finding 5: the sweep's single caller is ONE
+        // dedicated thread on a sequential 60s loop (`engine_rotation_sweep_
+        // thread_` below) — it cannot self-collide on the store-wide session
+        // lock. In a SINGLE-replica deployment — the default — that means a
+        // `SkippedLock` can only mean a SECOND writer is holding the SAME
+        // Postgres session lock: a zombie process from a previous
+        // deployment, a botched blue-green cutover overlap, or an
+        // unauthorised second server instance pointed at the same DSN.
+        // Operator-facing rule: should read ZERO in a single-replica
+        // deployment; investigate if it does not. Multi-replica is the ONLY
+        // topology where contention here is genuinely routine (N replicas
+        // legitimately racing for one cluster-wide lock every tick) — see
+        // the sweep thread's own consecutive-skip escalation below, which
+        // makes the single-replica fault case visible without making this
+        // counter's own description dishonest for the multi-replica case.
+        metrics_.describe("yuzu_rotation_sweep_lock_skipped_total",
+                          "Cumulative rotation-sweep ticks this replica skipped because another "
+                          "writer already held the store-wide sweep lock. In a single-replica "
+                          "deployment (the default) this can ONLY mean a second writer holding "
+                          "the same session lock (zombie process / botched blue-green cutover / "
+                          "unauthorised second instance on the same DSN) - should read zero; "
+                          "investigate if not. Routine leader-election contention ONLY in a "
+                          "multi-replica deployment",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_lock_skipped_total");
+        // #2964 fix round finding 5: the durable, cluster-wide anchor every
+        // rotation-sweep replica's clock guard shares
+        // (`rotation_retention_meta.last_pass_now`) — unlike a process-local
+        // liveness gauge, every replica's reading of THIS gauge agrees,
+        // regardless of which replica actually held the store-wide sweep
+        // lock that tick. Staleness relative to the 60s tick cadence
+        // (`engine_rotation_sweep_thread_` below) is the sweep's liveness
+        // signal. `_timestamp_seconds` suffix per Prometheus naming
+        // convention for a Unix-timestamp-valued gauge (the older sibling
+        // `yuzu_server_audit_retention_last_pass_unixtime` predates this
+        // convention being applied here and is not renamed retroactively —
+        // renaming an already-shipped series breaks existing alerts/
+        // dashboards; this is a NEW series, so it gets the correct suffix
+        // from the start).
+        metrics_.describe("yuzu_rotation_sweep_last_pass_timestamp_seconds",
+                          "Unix time PostgreSQL's own clock read the last time the rotation-sweep "
+                          "clock guard reached a verdict (accepted or declined) - the durable, "
+                          "cluster-wide anchor every replica's guard shares, not a per-replica "
+                          "reading. 0 if no pass has ever reached a verdict on this database",
+                          "gauge");
+        // #2964 fix round (governance chaos-injection finding): describe()
+        // alone does not publish a gauge family either — MetricsRegistry::
+        // serialize() only walks families that exist in gauges_/counters_,
+        // and gauges_[name] is only populated by an actual gauge() call
+        // (mirrors the identical counter()-after-describe() pre-seed pattern
+        // the three sweep counters above use, and the same reason: without
+        // this the series is ABSENT from /metrics, not present-at-0, until
+        // the health-recompute-thread scrape loop below first finds
+        // `rotation_sweep_last_pass_now()` engaged — which itself never
+        // happens until a pass reaches a verdict). Left un-published, the
+        // `YuzuRotationSweepNotRunning` alert's `and gauge > 0` guard reads
+        // as "no data" rather than "0", which happens to still not page —
+        // but only by accident of that guard's own shape, not because the
+        // series is actually present the way the audit-retention sibling
+        // gauge is (seeded from its durable anchor at startup, #2854). Pre-
+        // seeding here closes that gap the same way for both gauges.
+        metrics_.gauge("yuzu_rotation_sweep_last_pass_timestamp_seconds");
+        // #2964 fix round finding 6 (chaos-injection, escalated from "tidy-up"
+        // to "highest-value part of the patch"): an `Ok` tick can select N
+        // eligible predecessors and have SOME OR ALL of their per-pair revoke
+        // transactions fail to acquire a connection (ordinary pool
+        // contention under a small pool — reproduced with a size-2 pool, 5
+        // eligible pairs, and one unrelated consumer holding a lease; the
+        // sweep's own store-wide session-lock connection plus each per-pair
+        // `with_txn_for` need TWO connections concurrently). Before
+        // `SweepResult::failed_pairs` existed this was silently
+        // indistinguishable from an idle tick: the tick still reaches a
+        // verdict (so the last-pass gauge above stays fresh) and no counter
+        // moves — "every signal reads healthy" while revocations are
+        // silently lost. Deliberately a SEPARATE series from
+        // `yuzu_engine_principal_rotation_sweep_failures_total` (which means
+        // "the whole tick did not run to completion") rather than folded
+        // into it — an operator alerting on that counter must be able to
+        // tell "the tick failed outright" from "the tick succeeded but lost
+        // some revocations", which a shared series cannot express. Value is
+        // the COUNT of predecessors affected this tick (not a 0/1 tick
+        // flag), so `increase()` over a window gives the actual scale of
+        // lost revocations, not just "did it happen".
+        metrics_.describe("yuzu_rotation_sweep_lost_revocations_total",
+                          "Cumulative predecessors an accepted rotation-sweep tick selected for "
+                          "auto-revoke but whose per-pair revoke transaction genuinely FAILED "
+                          "(pool/lock/query fault, not the benign already-resolved idempotent "
+                          "no-op) - distinct from a whole-tick failure "
+                          "(yuzu_engine_principal_rotation_sweep_failures_total); shared across "
+                          "BOTH engine-credential and human API-token rotation pairs, not split "
+                          "by principal_kind. Each affected predecessor remains eligible and is "
+                          "retried on the next tick, so this is a lagging-tick signal, not "
+                          "evidence of a permanently stranded credential",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_lost_revocations_total");
         // #2404: confirm-rotation endpoint outcomes, so a 409-conflict or
         // 503-transient retry storm on confirm is alertable instead of
         // invisible (yuzu_http_requests_total has no per-route label). SCOPE
@@ -5340,6 +5497,19 @@ public:
                     metrics_.gauge("yuzu_server_audit_retention_last_pass_unixtime")
                         .set(static_cast<double>(audit_store_->last_pass_unixtime()));
                 }
+                // #2964 fix round finding 5: the rotation sweep's own
+                // cluster-wide liveness anchor. A DB round trip, unlike the
+                // atomic accessors above, so guarded and best-effort — a
+                // transient lease/query failure just leaves the gauge at its
+                // previous value for this tick rather than fabricating a
+                // reading (see `rotation_sweep_last_pass_now()`'s own doc
+                // comment).
+                if (api_token_store_ && api_token_store_->is_open()) {
+                    if (auto last = api_token_store_->rotation_sweep_last_pass_now()) {
+                        metrics_.gauge("yuzu_rotation_sweep_last_pass_timestamp_seconds")
+                            .set(static_cast<double>(*last));
+                    }
+                }
                 // PR 5b — ExecutionEventBus observability. Same scrape-as-
                 // gauge pattern used for AuditStore + GuaranteedStateStore
                 // counters above; the bus exposes the counters via lock-
@@ -5614,6 +5784,39 @@ public:
                 // shortest lead time that is never a false "already gone"
                 // read against the shortest window an operator can even set.
                 constexpr std::int64_t kSuccessorUnusedWarnLeadSecs = 24 * 3600;
+                // #2964 fix round finding 5: this thread is the sweep's
+                // SINGLE caller — one dedicated thread on a sequential 60s
+                // loop — so it cannot self-collide on the store-wide session
+                // lock. In a single-replica deployment (the default) a
+                // `SkippedLock` can therefore ONLY mean a SECOND writer is
+                // holding the SAME Postgres session lock: a zombie process
+                // from a previous deployment, a botched blue-green cutover
+                // overlap, or an unauthorised second server instance pointed
+                // at the same DSN — never routine contention, which exists
+                // only in a multi-replica deployment (N replicas legitimately
+                // racing for one cluster-wide lock every tick; see the
+                // counter's own describe() text above for the split).
+                // Three consecutive ticks (3 minutes at the 60s cadence) is
+                // enough to rule out a one-tick race at boot (two replicas
+                // starting within the same tick window) while still
+                // escalating promptly; any non-SkippedLock outcome resets
+                // the counter.
+                constexpr std::size_t kConsecutiveSkippedLockWarnThreshold = 3;
+                std::size_t consecutive_lock_skipped = 0;
+                // #2964 round 3 review (finding 6): the warn below used to
+                // fire on EVERY tick once the streak crossed the threshold
+                // (the guard only reset the streak, never a separate "next
+                // warn at" mark) — ~1440 lines/day per non-winning replica
+                // in a multi-replica deployment, where a losing replica's
+                // own `describe()`-documented topology makes this routine.
+                // `rotation_warn_dedup.hpp`'s own header cites that exact
+                // ~1440/day shape as the thing every cadence in THIS file
+                // exists to avoid. Warn once on the CROSSING tick, then only
+                // again on a WIDENING interval (doubling each time) — an
+                // operator still gets escalating visibility on a streak that
+                // keeps growing, without a log line every 60 seconds
+                // forever. Reset alongside `consecutive_lock_skipped`.
+                std::size_t next_skipped_lock_warn_at = kConsecutiveSkippedLockWarnThreshold;
 
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     for (int i = 0; i < 60 && !stop_requested_.load(std::memory_order_acquire);
@@ -5638,29 +5841,148 @@ public:
                                          .count();
 
                     // Half 1: auto-revoke elapsed predecessors + clear the
-                    // surviving successor's rotation state. A failed tick (pool
-                    // contention / query error) is reported via the out-param —
-                    // the store swallows it (returns empty) rather than throwing,
-                    // so without this the sweep-failures alert would stay at zero
-                    // while rotated-out credentials silently outlive their window.
-                    bool sweep_tick_failed = false;
-                    bool sweep_tick_capped = false;
-                    auto revoked = api_token_store_->sweep_expired_rotations(
-                        now, &sweep_tick_failed, &sweep_tick_capped);
-                    if (sweep_tick_failed) {
-                        spdlog::warn("Rotation sweep tick could not run (pool "
-                                     "contention / query failure) — predecessor auto-revoke deferred "
-                                     "to the next tick");
+                    // surviving successor's rotation state — now the FULL
+                    // seven-part clock-guarded-retention shape (#2964), not
+                    // only the unconditional cap it shipped with. The typed
+                    // outcome replaces the old two-bool contract: `Failed`
+                    // (pool/query fault — a missed tick, deferred to the
+                    // next one), `SkippedLock` (another replica holds the
+                    // lock this tick), `Declined` (the clock guard declined
+                    // the whole pass — MUST be visible as its own thing,
+                    // never indistinguishable from "nothing was eligible"),
+                    // `Ok` (ran to completion, possibly with zero
+                    // revocations).
+                    auto sweep = api_token_store_->sweep_expired_rotations(now);
+                    if (sweep.outcome != ApiTokenStore::SweepOutcome::SkippedLock) {
+                        consecutive_lock_skipped = 0;
+                        next_skipped_lock_warn_at = kConsecutiveSkippedLockWarnThreshold;
+                    }
+                    switch (sweep.outcome) {
+                    case ApiTokenStore::SweepOutcome::Failed:
+                        // #2964 fix round (governance chaos-injection
+                        // finding): `sweep.fail_reason` names the ACTUAL
+                        // stage + libpq error text — before this field
+                        // existed every Failed tick logged this same generic
+                        // "pool contention / query failure" line regardless
+                        // of cause, which is actively misleading for a
+                        // permanent schema defect (e.g. a missing
+                        // `rotation_retention_meta` table) that will repeat
+                        // identically forever and is neither pool
+                        // contention nor an ordinary query failure.
+                        spdlog::warn("Rotation sweep tick could not run — predecessor auto-revoke "
+                                     "deferred to the next tick: {}",
+                                     sweep.fail_reason.empty() ? "(no reason captured)"
+                                                                : sweep.fail_reason);
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
                             .increment();
+                        break;
+                    case ApiTokenStore::SweepOutcome::SkippedLock:
+                        metrics_.counter("yuzu_rotation_sweep_lock_skipped_total").increment();
+                        // #2964 fix round finding 5: a single-replica
+                        // deployment should read zero here (see the
+                        // constant's own doc comment above), so escalate to
+                        // a warn log once the streak crosses the threshold —
+                        // the counter alone is sufficient for a multi-replica
+                        // deployment (routine there), but silent-forever is
+                        // wrong for the single-replica default.
+                        //
+                        // #2964 round 3 review (finding 6): warn on the
+                        // CROSSING tick only, then again on a WIDENING
+                        // interval (`next_skipped_lock_warn_at` doubles each
+                        // time it fires) — never on every tick past the
+                        // threshold, which was measured to be ~1440
+                        // lines/day per non-winning replica in a
+                        // multi-replica deployment (routine topology there;
+                        // see `describe()` above and this file's own
+                        // consecutive-skip comment).
+                        ++consecutive_lock_skipped;
+                        if (consecutive_lock_skipped >= next_skipped_lock_warn_at) {
+                            spdlog::warn(
+                                "Rotation sweep has been unable to acquire its store-wide sweep "
+                                "lock for {} consecutive ticks — routine only on a multi-replica "
+                                "deployment (another replica is sweeping); on a single-replica "
+                                "deployment this can only mean a second writer holds the same "
+                                "session lock (zombie process / botched blue-green cutover / "
+                                "unauthorised second instance on the same DSN) — investigate",
+                                consecutive_lock_skipped);
+                            next_skipped_lock_warn_at *= 2;
+                        }
+                        break;
+                    case ApiTokenStore::SweepOutcome::Declined:
+                        // Actionable: the store's own `decline_reason`
+                        // already names WHICH anomaly and what it costs
+                        // (both credentials in every affected pair stay
+                        // active past their overlap window until the next
+                        // tick clears the anomaly).
+                        spdlog::warn("Rotation sweep tick declined by its clock guard: {}",
+                                     sweep.decline_reason);
+                        // #2964 fix round finding 4 (routed-concern POLICY
+                        // FLOOR): a bootstrap decline (no durable anchor yet)
+                        // counts to its OWN series, never the clock-anomaly
+                        // one — see yuzu_rotation_sweep_bootstrap_declines_
+                        // total's own describe() text for why sharing the
+                        // counter would be a false "the clock moved" claim.
+                        //
+                        // #2964 round 3 review (finding 2): routes on
+                        // `sweep.no_anchor` — the RAW fact — never on
+                        // `sweep.decline_anomaly == NoAnchor`. `classify`'s
+                        // precedence (`BadState > Step > Wipe > NoAnchor`,
+                        // `audit_retention_rules.hpp`) means a bootstrap tick
+                        // that ALSO observes another anomaly classifies as
+                        // that other anomaly even though `no_anchor` is still
+                        // true — switching on the collapsed enum here would
+                        // have miscounted that tick to the clock-anomaly
+                        // series, exactly the false "the clock moved" claim
+                        // this split exists to avoid. See
+                        // `SweepResult::no_anchor`'s own doc comment.
+                        if (sweep.no_anchor) {
+                            metrics_.counter("yuzu_rotation_sweep_bootstrap_declines_total")
+                                .increment();
+                        } else {
+                            metrics_.counter("yuzu_rotation_sweep_declined_total").increment();
+                        }
+                        break;
+                    case ApiTokenStore::SweepOutcome::Ok:
+                        // UP-6: the per-tick cap already logged the eligible/
+                        // processed counts inside the store — the counter
+                        // here is the alertable signal that a drain is in
+                        // progress.
+                        if (sweep.capped) {
+                            metrics_.counter("yuzu_rotation_sweep_capped_total").increment();
+                        }
+                        // #2964 fix round finding 6: an `Ok` tick that
+                        // selected candidates and had some/all of their
+                        // per-pair revoke transactions genuinely FAIL (not
+                        // the benign idempotent no-op — typically ordinary
+                        // pool contention: the sweep's own held session-lock
+                        // connection plus each per-pair `with_txn_for` need
+                        // TWO connections concurrently) used to be
+                        // byte-identical to an idle tick — zero revoked, no
+                        // counter, no log, and the tick still reaches a
+                        // verdict so the last-pass liveness gauge stays
+                        // fresh throughout. `sweep.failed_pairs` — a typed
+                        // `SweepResult` field, not merely a log line — is
+                        // what makes this DISTINGUISHABLE TO THE CALLER
+                        // (this switch, but also any future caller that
+                        // reads `SweepResult` directly, e.g. a test or an
+                        // MCP diagnostic tool); the counter below is this
+                        // caller's own alertable rendering of it, deliberately
+                        // a SEPARATE series from the whole-tick failures
+                        // counter (see its own describe() text for why) and
+                        // incremented by the actual COUNT lost, not just once.
+                        if (sweep.failed_pairs > 0) {
+                            spdlog::warn("Rotation sweep tick completed but {} of its per-pair "
+                                         "revoke transactions failed (pool/lock/query fault, not "
+                                         "the benign already-resolved case) — those predecessors "
+                                         "were not revoked this tick; they remain eligible and "
+                                         "will be retried on the next tick",
+                                         sweep.failed_pairs);
+                            metrics_.counter("yuzu_rotation_sweep_lost_revocations_total")
+                                .increment(static_cast<double>(sweep.failed_pairs));
+                        }
+                        break;
                     }
-                    // UP-6: the per-tick cap already logged the eligible/
-                    // processed counts inside the store — the counter here is
-                    // the alertable signal that a drain is in progress.
-                    if (sweep_tick_capped) {
-                        metrics_.counter("yuzu_rotation_sweep_capped_total").increment();
-                    }
-                    for (const auto& predecessor : revoked) {
+                    for (const auto& predecessor : sweep.revoked) {
                         // P2 #11: route to the engine or human family/audit
                         // action by THIS row's own principal_kind — never
                         // assume every swept row is engine-owned.
@@ -5692,22 +6014,41 @@ public:
                     // event="security"; see the design doc §7 / the
                     // metrics_.describe comment above), kept on its own
                     // channel from any theft-detection alert.
+                    //
+                    // #2964 fix round finding 7: this half no longer takes
+                    // the process-clock `now` — it reads PostgreSQL's own
+                    // clock internally and returns that reading as
+                    // `nearing.pg_now`, which `elapsed` below MUST be
+                    // derived from. Before this fix, this half's own query
+                    // and this half's own `elapsed` comparison used TWO
+                    // different clocks (this store-side PG read vs this
+                    // thread's process clock), so under exactly the skew
+                    // this whole guard exists to survive, `elapsed` could
+                    // read true for a pair `sweep_expired_rotations` — using
+                    // its OWN, separate PG clock read — does not (yet)
+                    // consider elapsed at all, asserting a state that had
+                    // not actually happened and able to flap between states
+                    // on successive ticks as the two clocks drift apart and
+                    // back.
                     auto nearing = api_token_store_->list_rotations_nearing_expiry_unused(
-                        now, kSuccessorUnusedWarnLeadSecs);
+                        kSuccessorUnusedWarnLeadSecs);
                     std::unordered_set<std::string> still_nearing;
-                    for (const auto& pair : nearing) {
+                    for (const auto& pair : nearing.pairs) {
                         still_nearing.insert(pair.successor.rotation_group);
                         // UP-5: `list_rotations_nearing_expiry_unused` now
                         // also returns a pair whose predecessor window has
                         // ALREADY elapsed — sweep_expired_rotations
-                        // deliberately declines to auto-revoke it while the
-                        // successor stays unused, so this is the only
-                        // remaining signal for it. The signals do NOT share a
-                        // cadence — `RotationWarnDedup` owns which fire on this
-                        // tick, and its header states why (an un-throttled
-                        // audit row on an indefinitely-stuck pair is ~1440/day
-                        // into the SOC 2 evidence store).
-                        const bool elapsed = pair.predecessor.overlap_expires_at <= now;
+                        // deliberately WITHHOLDS auto-revoke on it while the
+                        // successor stays unused (not the SAME "declined" as
+                        // `SweepOutcome::Declined`'s clock-guard verdict
+                        // above — see `rotation_warn_dedup.hpp`'s own note),
+                        // so this is the only remaining signal for it. The
+                        // signals do NOT share a cadence — `RotationWarnDedup`
+                        // owns which fire on this tick, and its header states
+                        // why (an un-throttled audit row on an indefinitely-
+                        // stuck pair is ~1440/day into the SOC 2 evidence
+                        // store).
+                        const bool elapsed = pair.predecessor.overlap_expires_at <= nearing.pg_now;
                         const auto signals =
                             warn_dedup.observe(pair.successor.rotation_group, elapsed);
 
@@ -5715,7 +6056,7 @@ public:
                             spdlog::warn(
                                 "Rotation predecessor {} (principal {}) is past its overlap "
                                 "window but the successor has never been used — auto-revoke "
-                                "was declined to avoid leaving zero usable credentials; both "
+                                "was withheld to avoid leaving zero usable credentials; both "
                                 "stay active until an operator confirms or revokes explicitly",
                                 pair.predecessor.token_id, pair.predecessor.principal_id);
                         }
