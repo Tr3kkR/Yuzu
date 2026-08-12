@@ -685,6 +685,17 @@ std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* legacy) {
     // fingerprint (canonicalize_legacy_snapshot, below) derive from THIS
     // returned snapshot, so neither can see different content than what was
     // actually decided here.
+    // cpp-safety (#2703 Gate 8, scoped re-review): on a genuinely pre-#339
+    // legacy file (no schema_meta table), current_version()'s internal
+    // ensure_meta_table() logs an spdlog::error ("attempt to write a
+    // readonly database") for what is, at THIS call site, an EXPECTED and
+    // correctly-handled fallback (see the -1 handling immediately below) --
+    // not a real infrastructure fault. That ERROR line is shared
+    // MigrationRunner behavior (server/core/src/migration_runner.cpp), not
+    // specific to this call site, so it's left as-is rather than touched
+    // for every other caller; noted here so an on-call engineer correlating
+    // logs for a direct-from-a-very-old-release upgrade knows this
+    // particular ERROR line is benign in this one context.
     const int legacy_version = MigrationRunner::current_version(legacy, kStoreName);
     // -1 means the version read itself failed -- no schema_meta table at all
     // (a file that predates MigrationRunner's adoption in this store, #339,
@@ -3402,11 +3413,17 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
     // one transaction, ON CONFLICT DO NOTHING (idempotent + crash-resumable by
     // re-run). securable_types/operations are backfilled too (defensive:
     // keeps role_permissions FKs satisfiable even for a hypothetical custom
-    // type). Legacy is already migration-cleaned, so v3/v4 cleanups are not
-    // replayed. Reconciliation counts below are the snapshot's own row counts
-    // — a genuinely partial read already failed closed at step 3b (read_all's
-    // rc == SQLITE_DONE contract), so re-counting via a second query would be
-    // redundant, not an independent check.
+    // type). Doomgoose (PR #2703 review, blocking item 2) disproved the
+    // premise this comment used to assert ("legacy is already migration-
+    // cleaned, so v3/v4 cleanups are not replayed") -- nothing ever enforced
+    // that. v3/v4's predicates ARE now replayed, just earlier in the
+    // pipeline than this point: read_legacy_snapshot() (called at step 3b,
+    // feeding `roles`/`perms`/`groups`/`members` below) applies them inline
+    // against the legacy file's own schema_meta version before returning.
+    // Reconciliation counts below are the snapshot's own (already-filtered)
+    // row counts — a genuinely partial read already failed closed at step 3b
+    // (read_all's rc == SQLITE_DONE contract), so re-counting via a second
+    // query would be redundant, not an independent check.
     struct TableCounts {
         std::int64_t roles{0}, perms{0}, principals{0}, groups{0}, members{0};
     };
@@ -3676,7 +3693,13 @@ bool RbacStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path)
                 }
                 continue;
             }
-            const char* sqlstate_p = PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE);
+            // Explicit ins.get() guard for exact parity with the
+            // InventoryStore precedent this mirrors (inventory_store.cpp)
+            // -- PQresultErrorField/PQresultErrorMessage already null-check
+            // internally (verified against vendored libpq's fe-exec.c), so
+            // this is belt-and-suspenders, not a functional fix.
+            const char* sqlstate_p =
+                ins.get() ? PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE) : nullptr;
             const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
             const bool row_data_error =
                 sqlstate.size() == 5 && (sqlstate.starts_with("22") || sqlstate.starts_with("23") ||
