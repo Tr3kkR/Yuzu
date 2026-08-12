@@ -1131,6 +1131,96 @@ TEST_CASE("REST gs.status: returns store rule_count rollup", "[pg][rest][guarant
     CHECK_FALSE(j["data"].contains("compliant"));
     CHECK_FALSE(j["data"].contains("drifted"));
     CHECK_FALSE(j["data"].contains("errored"));
+    // No census rows yet — the M1 census-derived count (#2298 item 6d) is honestly 0,
+    // not a placeholder 0.
+    CHECK(j["data"]["errored_rules"].get<int>() == 0);
+}
+
+TEST_CASE("REST gs.status: errored_rules is real, census-derived and DISTINCT-rule counted",
+          "[pg][rest][guaranteed_state][status]") {
+    // #2298 item 6d. Two agents share one errored rule (counted ONCE — distinct
+    // rule_ids, not devices/rows); a second rule is errored on only one agent; a
+    // third rule is compliant and must not contribute. compliant_rules/drifted_rules
+    // stay the documented placeholder 0.
+    RestGsHarness h;
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-2", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("e3", "WS-1", "r2", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("e4", "WS-1", "r3", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["errored_rules"].get<int>() == 2); // r1 (once) + r2
+    CHECK(j["data"]["compliant_rules"].get<int>() == 0);
+    CHECK(j["data"]["drifted_rules"].get<int>() == 0);
+}
+
+// ── #2298 item 6d: per-agent status route (previously untested at REST level) ──
+
+TEST_CASE("REST gs.status/{agent_id}: errored_rules is real, scoped to this agent's census",
+          "[pg][rest][guaranteed_state][status]") {
+    RestGsHarness h;
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-1", "r2", "guard.compliant", "2026-06-20T10:00:00Z");
+    // A different agent's errored rule must NOT leak into WS-1's count.
+    h.seed_status("e3", "WS-2", "r3", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status/WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["agent_id"].get<std::string>() == "WS-1");
+    // total_rules = census rows for THIS agent (r1 + r2), not the fleet catalogue.
+    CHECK(j["data"]["total_rules"].get<int>() == 2);
+    CHECK(j["data"]["errored_rules"].get<int>() == 1);
+    CHECK(j["data"]["compliant_rules"].get<int>() == 0);
+    CHECK(j["data"]["drifted_rules"].get<int>() == 0);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    // Audited as guardian.device.view — same verb as GET /guaranteed-state/device-
+    // compliance and GET /dex/devices/{id}, so a works-council evidence review finds
+    // one verb per read pattern, not a fork.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guardian.device.view");
+    CHECK(h.audit_log[0].result == "success");
+    CHECK(h.audit_log[0].target_id == "WS-1");
+}
+
+TEST_CASE("REST gs.status/{agent_id}: per-device scope denies an out-of-scope caller",
+          "[pg][rest][guaranteed_state][status]") {
+    // World-A / ADR-0017: this route now serves real per-agent data, so it must be
+    // confined the same way GET /guaranteed-state/device-compliance is — a bare
+    // global perm_fn would be exactly the confinement gap that concern forbids.
+    RestGsHarness h;
+    h.deny_scoped_agent = "WS-9";
+    h.seed_status("e1", "WS-9", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status/WS-9");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // The route scoped by the right device before denying.
+    CHECK(h.last_scoped_agent_id == "WS-9");
+    // No data leaked in a denial.
+    CHECK(res->body.find("errored_rules") == std::string::npos);
+}
+
+TEST_CASE("REST gs.status/{agent_id}: audit persistence failure -> 503, no data served, "
+          "Sec-Audit-Failed",
+          "[pg][rest][guaranteed_state][status][audit]") {
+    RestGsHarness h;
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.audit_succeeds = false; // the audit row cannot persist (DB locked/full/corrupt)
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status/WS-1");
+    REQUIRE(res);
+    // FAIL-CLOSED: per-device Guardian state must not be served when the evidence row
+    // is known to have been lost (SOC 2 CC7.2 / works-council) — same posture as GET
+    // /guaranteed-state/device-compliance and GET /dex/devices/{id}.
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    CHECK(res->body.find("errored_rules") == std::string::npos);
 }
 
 TEST_CASE("REST gs.alerts: empty list placeholder", "[pg][rest][guaranteed_state][alerts]") {

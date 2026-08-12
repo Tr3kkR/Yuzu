@@ -954,10 +954,10 @@ const std::string& openapi_spec() {
       "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Two gated shapes behind one route. An agent-scoped query (non-empty agent_id, max 256 chars, no control characters) requires per-device-scoped GuaranteedState:Read (management-group aware; a service-scoped token is confined to its own service's agents) and returns that device's individual-identifying behavioural signal history. A fleet-wide query (no agent_id) requires global GuaranteedState:Read AND denies a service-scoped token outright (403) — the fleet fan-out returns every reporting agent's agent_id + detail_json, which the bare service-token role check alone would not confine. BOTH shapes emit a dex.device.view audit (target_type Agent for the per-device shape, GuaranteedState for the fleet shape) and FAIL CLOSED — 503 + Sec-Audit-Failed: true (retryable, A4 envelope with retry_after_ms) — if that audit row cannot persist, parity with GET /api/v1/dex/devices/{id}. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit/offset, or agent_id too long / contains a control character"}, "403": {"description": "A service-scoped token queried the fleet-wide (no agent_id) shape, or an agent-scoped query named a device outside the caller's scope"}, "503": {"description": "Audit row could not persist — behavioural data withheld on both the agent-scoped and fleet-wide shapes; carries Sec-Audit-Failed: true and is retryable (A4 envelope).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/guaranteed-state/status": {
-      "get": {"summary": "Fleet Guaranteed State status rollup", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. PR 2 returns a placeholder with zero compliant/drifted/errored counts; real fleet aggregation lands in Guardian PR 4.", "responses": {"200": {"description": "Status rollup", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}}}
+      "get": {"summary": "Fleet Guaranteed State status rollup", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. errored_rules is REAL (#2298 item 6d), derived from the guardian_agent_rule_status census: the count of distinct rule_ids with at least one agent reporting state=errored, fleet-wide. compliant_rules/drifted_rules stay 0 — full status ingest lands in a later rung. 503 if the guaranteed-state store is unavailable or degraded (never a silent 0).", "responses": {"200": {"description": "Status rollup", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}, "503": {"description": "Guaranteed-state store unavailable or degraded (A4 envelope) — never rendered as a silent 0", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/guaranteed-state/status/{agent_id}": {
-      "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
+      "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in) — same World-A confinement shape as GET /guaranteed-state/device-compliance. errored_rules is REAL (#2298 item 6d), derived from this agent's guardian_agent_rule_status census rows; total_rules is the count of rules with ANY census entry for this agent, not the fleet catalogue size. compliant_rules/drifted_rules stay 0 — full status ingest lands in a later rung. Audited as guardian.device.view; FAILS CLOSED (503 + Sec-Audit-Failed) if the audit row cannot persist, parity with GET /dex/devices/{id} and GET /guaranteed-state/device-compliance.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}, "503": {"description": "Either the route is misconfigured (scoped-permission fn/store unwired) OR the guardian.device.view audit row could not persist (FAIL-CLOSED, CC7.2) OR the guaranteed-state store is degraded (A4 envelope)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the read was refused because the audit row could not persist (CC7.2 fail-closed); retry after the audit subsystem recovers."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/guaranteed-state/device-compliance": {
       "get": {"summary": "Name-anchored, device-applicable Guardian compliance", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Looks up the Baseline by NAME (a stable constant such as 'ServiceNow Compliance', not a churning baseline_id) and returns the Guards ACTUALLY APPLICABLE to this device, each with the device's last reported (Observe-mode) verdict. One Baseline carries a SUPERSET of Guards, each scoped via scope_expr so the push arms a different subset per machine; the denominator here is the deployed_snapshot intersected with the Guards this device has reported, so an out-of-scope Guard is absent and each machine shows only its own applicable Guards. total_guards is that applicable count, not the snapshot size. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). updated_at carries staleness. Audited as guardian.device.view (success/not_found); a behavioral-PII read, so it FAILS CLOSED (503 + Sec-Audit-Failed) if the audit row cannot persist — parity with GET /dex/devices/{id}. Honest in-scope-but-unreported 'pending' (per-device scope_expr evaluation) is a deferred upgrade.", "parameters": [{"name": "baseline", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Baseline NAME (unique). URL-encode spaces, e.g. ServiceNow%20Compliance."}, {"name": "agent_id", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device applicable baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateDeviceComplianceStatus"}}}}, "400": {"description": "Missing baseline/agent_id, over-length query parameter, or a parameter containing control characters (bytes < 0x20) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline name not found (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Either the route is misconfigured (stores / scoped-permission fn unwired — non-transient, do not retry) OR the guardian.device.view audit row could not persist so the read is refused without durable evidence (FAIL-CLOSED, CC7.2 — transient: Sec-Audit-Failed: true + retry_after_ms, retry after the audit subsystem recovers). A4 envelope.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the read was refused because the audit row could not persist (CC7.2 fail-closed); retry after the audit subsystem recovers."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
@@ -10666,44 +10666,149 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    // GET /status, /status/:agent_id, /alerts — placeholders that respond
-    // with empty rollups for PR 2. Real fleet aggregation arrives in PR 4
-    // (status) and PR 11 (alerts). Returning empty structures now keeps
-    // dashboard fragments and audit tooling exercisable against the API.
-    // Field names match the agent-side proto `GuaranteedStateStatus`
-    // (compliant_rules / drifted_rules / errored_rules) so REST and proto
-    // schemas do not diverge when PR 4 wires real aggregation.
+    // GET /status — fleet Guaranteed State rollup (#2298 gate 3, item 6d). errored_rules
+    // is now REAL, derived from the guardian_agent_rule_status CENSUS table — the single
+    // source of truth for current per-(agent,rule) state (guardian_routes.cpp's
+    // rollup_by_rule invariant) — never the event log, which is reaped at 30 days and
+    // would silently lose a quiet-but-still-errored rule. compliant_rules/drifted_rules
+    // stay placeholder 0 deliberately: this rung is minimal by design (#2298 D3) and
+    // full status ingest (action=="status") lands separately at a later rung.
+    //
+    // Count = DISTINCT rule_ids with >=1 census row in state "errored", fleet-wide. Two
+    // deliberate deltas from the dashboard's guards_errored card (guardian_routes.cpp):
+    // no intersection against the live rule catalogue (a census row for a since-deleted
+    // rule is impossible — rows are deleted with the rule, guaranteed_state_store.cpp)
+    // and no offline-agent fold to "unknown". Documented in the note field, not silently
+    // reproduced-then-diverging.
     sink.Get(
         "/api/v1/guaranteed-state/status",
         [perm_fn, guaranteed_state_store](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "GuaranteedState", "Read"))
                 return;
-            const auto rules = guaranteed_state_store ? guaranteed_state_store->rule_count() : 0;
-            res.set_content(ok_json(JObj()
-                                        .add("total_rules", static_cast<int64_t>(rules))
-                                        .add("compliant_rules", 0)
-                                        .add("drifted_rules", 0)
-                                        .add("errored_rules", 0)
-                                        .add("note", "fleet aggregation lands in Guardian PR 4")
-                                        .str()),
-                            "application/json");
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!guaranteed_state_store) {
+                spdlog::error("guaranteed-state.status: store null — registration-order "
+                              "defect; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            const auto rules = guaranteed_state_store->rule_count();
+            // ADR-0038 catastrophic-read: a degrade must render 503, never a silent "0
+            // errored" that would misreport the fleet as compliant.
+            auto statuses_result = guaranteed_state_store->agent_rule_statuses();
+            if (!statuses_result) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
+                                "application/json");
+                spdlog::warn("guaranteed-state.status store degraded (503) cid={}", cid);
+                return;
+            }
+            std::unordered_set<std::string> errored_rule_ids;
+            for (const auto& st : *statuses_result)
+                if (st.state == "errored")
+                    errored_rule_ids.insert(st.rule_id);
+            res.set_content(
+                ok_json(JObj()
+                            .add("total_rules", static_cast<int64_t>(rules))
+                            .add("compliant_rules", 0)
+                            .add("drifted_rules", 0)
+                            .add("errored_rules", static_cast<int64_t>(errored_rule_ids.size()))
+                            .add("note", "errored_rules is real (M1 census-derived, #2298 "
+                                        "item 6d); compliant_rules/drifted_rules land with "
+                                        "full status ingest in a later rung")
+                            .str()),
+                "application/json");
         });
 
-    sink.Get(R"(/api/v1/guaranteed-state/status/([A-Za-z0-9._\-]+))",
-             [perm_fn](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
-                     return;
-                 auto agent_id = req.matches[1].str();
-                 res.set_content(ok_json(JObj()
-                                             .add("agent_id", agent_id)
-                                             .add("total_rules", 0)
-                                             .add("compliant_rules", 0)
-                                             .add("drifted_rules", 0)
-                                             .add("errored_rules", 0)
-                                             .add("note", "per-agent status lands in Guardian PR 4")
-                                             .str()),
-                                 "application/json");
-             });
+    // GET /status/{agent_id} — per-agent Guaranteed State rollup (#2298 gate 3, item 6d).
+    // errored_rules is the SAME census derivation as the fleet route above, scoped to
+    // this one agent's rows. Per-device behavioral read: adopts the same scoped_perm_fn
+    // + guardian.device.view audit shape as GET /guaranteed-state/device-compliance
+    // (World-A / ADR-0017 routed concern) — wiring real per-agent data behind only the
+    // bare global perm_fn would be exactly the confinement gap that concern forbids.
+    // total_rules here means "rules with ANY census entry for this agent" (the same
+    // store call, no extra query) — NOT the fleet catalogue size, and NOT a
+    // baseline-scoped "applicable rules" count (that needs baseline+scope evaluation,
+    // the same tradeoff device-compliance's own header comment documents; out of this
+    // rung's minimal scope).
+    sink.Get(
+        R"(/api/v1/guaranteed-state/status/([A-Za-z0-9._\-]+))",
+        [scoped_perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+                                                            httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            auto agent_id = req.matches[1].str();
+            if (!scoped_perm_fn) {
+                spdlog::error("guaranteed-state.status.agent: scoped_perm_fn unwired — "
+                              "misconfigured call site; failing closed; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                return;
+            if (!guaranteed_state_store) {
+                spdlog::error("guaranteed-state.status.agent: store null — "
+                              "registration-order defect; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto statuses_result = guaranteed_state_store->agent_rule_statuses_for_agent(agent_id);
+            // Behavioral-PII access audit — FAIL-CLOSED via the shared #1647 kernel,
+            // same shape as GET /guaranteed-state/device-compliance. `result` records
+            // success/failure (this route has no "not found" branch of its own — an
+            // unrecognised agent_id simply has zero census rows, which is a legitimate
+            // empty result, not an error).
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "guardian.device.view",
+                    statuses_result ? "success" : "failure", "Agent", agent_id,
+                    "per-agent Guaranteed State status via REST")) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
+                                               "device data without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                spdlog::warn("guaranteed-state.status.agent audit fail-closed (503) cid={} "
+                             "agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+            if (!statuses_result) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
+                                "application/json");
+                spdlog::warn("guaranteed-state.status.agent store degraded (503) cid={} "
+                             "agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+            int64_t errored = 0;
+            for (const auto& st : *statuses_result)
+                if (st.state == "errored")
+                    ++errored;
+            res.set_content(
+                ok_json(JObj()
+                            .add("agent_id", agent_id)
+                            .add("total_rules", static_cast<int64_t>(statuses_result->size()))
+                            .add("compliant_rules", 0)
+                            .add("drifted_rules", 0)
+                            .add("errored_rules", errored)
+                            .add("note", "errored_rules is real (M1 census-derived, #2298 "
+                                        "item 6d); compliant_rules/drifted_rules land with "
+                                        "full status ingest in a later rung")
+                            .str()),
+                "application/json");
+        });
 
     // ── Name-anchored, device-applicable Guardian compliance (ServiceNow CI) ──
     //
