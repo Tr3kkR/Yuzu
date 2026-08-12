@@ -181,9 +181,12 @@ void McpStreamBridge::shutdown() {
                 std::lock_guard<std::mutex> lk(rec->mu);
                 rec->streamed_charge_held = false;
                 // A pressure-visitor claim (torn_down set under Channel::mu) can be
-                // abandoned mid-teardown: teardown_claimed re-checks
-                // shutdown_started_ and returns before Step 1 ever runs, so this
-                // walk is the only reclaimer left. It still never PUBLISHES against
+                // abandoned mid-teardown: the claim commits inside the bus visitor,
+                // WITHOUT bridge_mu_, so shutdown() can start meanwhile - the
+                // CALLER (sweep's pressure-relief loop, not teardown_claimed
+                // itself) re-checks shutdown_started_ right after and returns
+                // before teardown_claimed is ever invoked, so this walk is the
+                // only reclaimer left. It still never PUBLISHES against
                 // a torn-down record - that would race a possibly-still-running
                 // teardown_claimed and break the exactly-once arbitration
                 // teardown_claimed's own comment describes - but it CAN poison one
