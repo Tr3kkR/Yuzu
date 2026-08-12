@@ -5577,17 +5577,31 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 
 #### `GET /api/v1/guaranteed-state/status`
 
-Fleet-wide status rollup. Returns placeholder counts today; full fleet aggregation lands in Guardian PR 4.
+Fleet-wide status rollup. `errored_rules` is real (#2298 item 6d): the count of
+distinct rule_ids with at least one agent currently reporting state `errored` in
+the `guardian_agent_rule_status` census — the source of truth also behind the
+dashboard's Unhealthy Guards card, not the (reaped, 30-day) event log. `compliant_rules`
+and `drifted_rules` stay `0` deliberately — full status ingest (`action=="status"`)
+lands in a later rung.
 
 - **Permission:** `GuaranteedState:Read`
 - **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
+- **5xx:** `503` if the Guaranteed State store is unavailable or degraded — never a silent `0`.
 
 #### `GET /api/v1/guaranteed-state/status/{agent_id}`
 
-Per-agent status. Returns placeholder counts today; per-agent aggregation lands in Guardian PR 4.
+Per-agent status. `errored_rules` is the same census derivation as the fleet route,
+scoped to this agent; `total_rules` is the count of rules with any census entry for
+this agent (not the fleet catalogue size). `compliant_rules`/`drifted_rules` stay `0`
+for the same reason as the fleet route. Per-device behavioral read: scoped the same
+way as `GET /guaranteed-state/device-compliance` (a global grant passes fleet-wide,
+otherwise the caller must hold Read via a management group the device is in), and
+audited as `guardian.device.view` — **fail-closed**: `503` + `Sec-Audit-Failed: true`
+if the audit row cannot persist.
 
-- **Permission:** `GuaranteedState:Read`
+- **Permission:** `GuaranteedState:Read`, per-device scoped
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
+- **5xx:** `503` on an unwired scope gate/store, an audit-persistence failure, or a degraded store — never a silent `0`.
 
 #### `GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`
 
