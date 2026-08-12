@@ -587,28 +587,6 @@ bool DiscoveryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
         backfill_metric("failed");
         return false;
     }
-    if (legacy_exists) {
-        std::error_code size_ec;
-        const auto legacy_size = std::filesystem::file_size(legacy_db_path, size_ec);
-        // SQLite treats a 0-byte file as a valid, empty database, indistinguishable
-        // downstream from the legitimate no-discovered_devices-table case. A genuine
-        // fresh install never has a file here at all (the old store only creates one
-        // on first open) — a 0-byte file at this path is always a truncated real db,
-        // never a fresh install, and must not silently take the "nothing to lose" path.
-        if (!size_ec && legacy_size == 0) {
-            spdlog::error(
-                "DiscoveryStore: migrate_from_sqlite: legacy db {} exists but is 0 bytes — "
-                "this is NOT a fresh install (a fresh install has no file here at all), it "
-                "is a truncated/corrupted real database. Refusing (fail-closed): either the "
-                "legacy store was created but never used (safe to delete this empty file "
-                "manually and retry) or a real file was truncated (restore from backup "
-                "before retrying).",
-                legacy_db_path.string());
-            backfill_metric("failed");
-            return false;
-        }
-    }
-
     // 2. Idempotency marker (short-lived lease released before any legacy I/O).
     bool marker_present = false;
     std::optional<std::string> stored_fingerprint;
@@ -706,6 +684,39 @@ bool DiscoveryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
         return true;
     }
 
+    // This replica is the one performing the FIRST-EVER migration (no
+    // marker yet) — a 0-byte legacy file here is checked ONLY on this path,
+    // not when marker_present (above): once some replica has already
+    // completed a real migration, a 0-byte file on THIS replica is
+    // unambiguously safe either way (never had content, or had content that
+    // is already durable in Postgres from whoever migrated it), and the
+    // marker_present branch's existing "nothing to lose" skip already
+    // handles it correctly — gating it here too would refuse to boot
+    // forever on a stray empty placeholder left by e.g. a backup restore
+    // or container rebuild, for no safety benefit.
+    if (legacy_exists) {
+        std::error_code size_ec;
+        const auto legacy_size = std::filesystem::file_size(legacy_db_path, size_ec);
+        // SQLite treats a 0-byte file as a valid, empty database, indistinguishable
+        // downstream from the legitimate no-discovered_devices-table case. A genuine
+        // fresh install never has a file here at all (the old store only creates one
+        // on first open) — a 0-byte file at this path, on a first-ever migration, is
+        // always a truncated real db, never a fresh install, and must not silently
+        // take the "nothing to lose" path.
+        if (!size_ec && legacy_size == 0) {
+            spdlog::error(
+                "DiscoveryStore: migrate_from_sqlite: legacy db {} exists but is 0 bytes — "
+                "this is NOT a fresh install (a fresh install has no file here at all), it "
+                "is a truncated/corrupted real database. Refusing (fail-closed): either the "
+                "legacy store was created but never used (safe to delete this empty file "
+                "manually and retry) or a real file was truncated (restore from backup "
+                "before retrying).",
+                legacy_db_path.string());
+            backfill_metric("failed");
+            return false;
+        }
+    }
+
     if (!legacy_exists) {
         // Fresh install. Fingerprint is the sourceless sentinel, not
         // skipped: a later process that DOES hold a legacy file must be
@@ -782,15 +793,23 @@ bool DiscoveryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
     const std::int64_t legacy_count = static_cast<std::int64_t>(snap.size());
 
     // 4. Insert every row in one transaction. ON CONFLICT DO NOTHING →
-    // idempotent + crash-resumable by re-run. A conflict-skipped row whose
-    // legacy `managed` was true is recorded for step 4b: a concurrent
-    // sibling replica (e.g. a fileless one that already finished its own
-    // sourceless backfill and started serving live scans) can steal the
-    // conflict slot with managed=false, and row-count reconciliation alone
-    // would never notice — the count still balances.
-    std::vector<std::string> managed_at_risk_ips;
+    // idempotent + crash-resumable by re-run. A conflict-skipped row that
+    // legacy recorded as managed and/or with a non-empty agent_id — the two
+    // fields `mark_managed` always writes together as one atomic operator
+    // action (never independently derivable from a re-scan) — is recorded
+    // for step 4b: a concurrent sibling replica (e.g. a fileless one that
+    // already finished its own sourceless backfill and started serving live
+    // scans) can steal the conflict slot with a different value for either,
+    // and row-count reconciliation alone would never notice — the count
+    // still balances. discovered_at/discovered_by are deliberately NOT
+    // checked here: upsert_device's own ON CONFLICT already treats
+    // whichever write lands first as authoritative for those two, an
+    // accepted property of every ordinary re-scan, not something this
+    // backfill needs to defend more strictly than live traffic already does.
+    std::vector<std::size_t> at_risk_indices;
     const bool insert_ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
-        for (const auto& d : snap) {
+        for (std::size_t i = 0; i < snap.size(); ++i) {
+            const auto& d = snap[i];
             pg::PgResult r = pg::exec_params(
                 c,
                 "INSERT INTO discovery_store.discovered_devices "
@@ -813,8 +832,8 @@ bool DiscoveryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                 return false;
             }
             const bool row_inserted = std::string(PQcmdTuples(r.get())) != "0";
-            if (!row_inserted && d.managed != 0)
-                managed_at_risk_ips.push_back(sanitize_pg_text(d.ip_address));
+            if (!row_inserted && (d.managed != 0 || !d.agent_id.empty()))
+                at_risk_indices.push_back(i);
         }
         return true;
     });
@@ -823,13 +842,15 @@ bool DiscoveryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
         return false;
     }
 
-    // 4b. Content-aware reconciliation for the one field row-count
+    // 4b. Content-aware reconciliation for the two fields row-count
     // reconciliation (step 5) cannot see: re-read every conflict-skipped
-    // row that legacy recorded as managed=true and refuse the marker if a
-    // racing writer's row won the conflict slot with managed=false —
-    // silently losing an operator-set managed flag must never be masked by
-    // a row count that still balances.
-    for (const auto& ip : managed_at_risk_ips) {
+    // row that legacy recorded as managed and/or agent_id-assigned, and
+    // refuse the marker if a racing writer's row won the conflict slot with
+    // a DIFFERENT value for either — silently losing or corrupting the
+    // operator's managed-device assignment must never be masked by a row
+    // count that still balances.
+    for (const auto idx : at_risk_indices) {
+        const auto& legacy_row = snap[idx];
         auto lease = pool_.acquire();
         if (!lease) {
             backfill_metric("failed");
@@ -837,24 +858,31 @@ bool DiscoveryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
         }
         pg::PgResult r = pg::exec_params(
             lease.get(),
-            "SELECT managed FROM discovery_store.discovered_devices WHERE ip_address = $1",
-            std::vector<std::string>{ip});
+            "SELECT managed, agent_id FROM discovery_store.discovered_devices WHERE ip_address "
+            "= $1",
+            std::vector<std::string>{sanitize_pg_text(legacy_row.ip_address)});
         if (r.status() != PGRES_TUPLES_OK || PQntuples(r.get()) != 1) {
             spdlog::error("DiscoveryStore: migrate_from_sqlite: reconciliation FAILED — could "
-                         "not re-read conflict-skipped managed row for {}",
-                         ip);
+                         "not re-read conflict-skipped row for {}",
+                         legacy_row.ip_address);
             backfill_metric("failed");
             return false;
         }
         const std::string managed_val = text_col(r.get(), 0, 0);
-        if (managed_val != "t" && managed_val != "true") {
+        const std::string agent_id_val = text_col(r.get(), 0, 1);
+        const bool managed_matches =
+            (legacy_row.managed != 0) == (managed_val == "t" || managed_val == "true");
+        const bool agent_id_matches = legacy_row.agent_id == agent_id_val;
+        if (!managed_matches || !agent_id_matches) {
             spdlog::error(
                 "DiscoveryStore: migrate_from_sqlite: reconciliation FAILED — legacy device {} "
-                "was recorded managed=true but a same-IP row already present in PostgreSQL (ON "
-                "CONFLICT DO NOTHING skip) has managed={}; a concurrent writer (likely a "
-                "sibling replica's live scan) raced this backfill. Refusing marker to avoid "
-                "silently losing the operator-set managed flag.",
-                ip, managed_val);
+                "was recorded managed={}/agent_id='{}' but a same-IP row already present in "
+                "PostgreSQL (ON CONFLICT DO NOTHING skip) has managed={}/agent_id='{}'; a "
+                "concurrent writer (likely a sibling replica's live scan or its own mark_managed "
+                "call) raced this backfill. Refusing marker to avoid silently losing or "
+                "misattributing the operator's managed-device assignment.",
+                legacy_row.ip_address, legacy_row.managed != 0, legacy_row.agent_id, managed_val,
+                agent_id_val);
             backfill_metric("failed");
             return false;
         }

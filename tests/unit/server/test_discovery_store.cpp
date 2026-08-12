@@ -530,6 +530,33 @@ TEST_CASE("DiscoveryStore: backfill refuses a 0-byte legacy file (never a fresh 
     CHECK(std::filesystem::exists(legacy.path)); // left in place for the operator
 }
 
+// The 0-byte guard is scoped to the FIRST-EVER migration only (no marker
+// yet). Once a real migration has already completed for this fleet, a
+// stray 0-byte placeholder later reappearing at the legacy path (e.g. a
+// backup restore or container rebuild) must NOT block every future boot —
+// the pre-existing "this replica's own file has nothing to lose" skip
+// already covers it safely, since the real content is durably in Postgres
+// regardless of which replica migrated it.
+TEST_CASE("DiscoveryStore: a 0-byte legacy file does not block boot once backfill already "
+          "completed",
+          "[pg][discovery][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DiscoveryStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::test::TempDbFile legacy{"yuzu_test_discovery_poststray_"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_discovery_db(legacy.path, {make_device("192.168.7.70")});
+    REQUIRE(store.migrate_from_sqlite(legacy.path)); // real migration completes, marker stamped
+    CHECK_FALSE(std::filesystem::exists(legacy.path)); // moved aside
+
+    // A stray 0-byte file reappears at the same canonical path afterward.
+    { std::ofstream f(legacy.path, std::ios::binary); }
+
+    CHECK(store.migrate_from_sqlite(legacy.path)); // must NOT refuse boot
+}
+
 // Content-aware reconciliation (row-count reconciliation alone cannot see
 // this): a device already present in Postgres — standing in for a
 // concurrent writer, e.g. a fileless sibling replica that already stamped
@@ -574,4 +601,48 @@ TEST_CASE("DiscoveryStore: backfill refuses when a conflict-skipped row lost a l
                           "'backfill_complete'") == "0");
     CHECK(scalar(db.dsn(), "SELECT managed FROM discovery_store.discovered_devices WHERE "
                           "ip_address = '192.168.5.50'") == "f");
+}
+
+// Same mechanism, but `managed` matches on both sides while `agent_id`
+// diverges: mark_managed always writes managed+agent_id together as one
+// atomic operator action (never independently re-derivable), so a
+// conflict-skip that preserves managed=true but silently keeps the WRONG
+// agent_id is a managed-device misattribution, not a mere flag loss, and
+// must be caught even though a managed-only check would miss it.
+TEST_CASE("DiscoveryStore: backfill refuses when a conflict-skipped row lost a legacy "
+          "agent_id assignment (managed matches, agent_id diverges)",
+          "[pg][discovery][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, discovery_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DiscoveryStore store{pool};
+    REQUIRE(store.is_open());
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult r{PQexec(conn.get(),
+            "INSERT INTO discovery_store.discovered_devices "
+            "(ip_address, mac_address, hostname, managed, agent_id, discovered_by, "
+            "discovered_at, last_seen, subnet) VALUES "
+            "('192.168.5.60', 'aa:bb:cc:00:00:02', 'live-host', true, 'agent-live-B', "
+            "'live-scan', 5000, 5000, '10.0.0.0/24')")};
+        REQUIRE(r.ok());
+    }
+
+    yuzu::test::TempDbFile legacy{"yuzu_test_discovery_agentid_race_"};
+    std::filesystem::remove(legacy.path);
+    auto managed = make_device("192.168.5.60");
+    managed.managed = true;
+    managed.agent_id = "agent-legacy-A";
+    managed.discovered_at = 1000;
+    make_legacy_discovery_db(legacy.path, {managed});
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
+    CHECK(std::filesystem::exists(legacy.path));
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM discovery_store.discovery_meta WHERE key = "
+                          "'backfill_complete'") == "0");
+    // The row already in Postgres keeps its own agent_id — never silently
+    // overwritten OR silently trusted as the full migration.
+    CHECK(scalar(db.dsn(), "SELECT agent_id FROM discovery_store.discovered_devices WHERE "
+                          "ip_address = '192.168.5.60'") == "agent-live-B");
 }

@@ -72,11 +72,25 @@ table. The marker (`backfill_complete`) and a SHA-256 fingerprint of the migrate
 promotable sentinel, never a terminal fact. A later boot that still holds its own legacy file
 verifies its fingerprint against the stored one before trusting the marker, refusing (fail-closed)
 on a mismatch or an unreadable file. A 0-byte legacy file is refused rather than treated as a fresh
-install: SQLite opens it as a valid empty database, indistinguishable downstream from the
+install ONLY on the first-ever migration for this fleet (no marker yet) — the same case an empty
+file mimics: SQLite opens it as a valid empty database, indistinguishable downstream from the
 legitimate no-`discovered_devices`-table case, but a genuine fresh install never has a file at this
-path at all (the old store only ever created one on first open) — so a 0-byte file is always a
-truncated real database, and silently taking the "nothing to lose" path on it would mask data loss
-as a clean boot.
+path at all on a first migration (the old store only ever created one on first open), so a 0-byte
+file there is always a truncated real database and silently taking the "nothing to lose" path on it
+would mask data loss as a clean boot. Once a real migration has already completed for this fleet
+(marker present), a 0-byte file reappearing on this replica (e.g. a backup restore or container
+rebuild leaving an empty placeholder) is NOT re-checked — the pre-existing "this replica's own file
+has nothing to lose" skip already covers it safely, since the real content is durably in Postgres
+regardless of which replica migrated it; gating it there too would refuse to boot forever for no
+safety benefit.
+
+Both new-in-this-fold refusals (the managed/agent_id reconciliation below, and the 0-byte guard)
+trade a narrow new fail-closed-boot/availability risk for closing a silent-data-loss hole — the same
+tradeoff already accepted for RbacStore/AuditStore/ManagementGroupStore's mandatory backfills. The
+managed/agent_id case is reachable only by an actor already holding `Infrastructure:Write`
+(Administrator/ITServiceOwner) during the narrow multi-replica migration window, with foreknowledge
+of legacy managed IPs — not an anytime-equivalent-damage actor, since `managed` is protected from
+live-scan overwrite post-migration (`upsert_device`'s `ON CONFLICT` never touches it).
 
 Reconciliation after the insert transaction is two-layered. Row-count reconciliation alone is a
 weak backstop (it can only catch an out-of-band concurrent delete between commit and count, not a
@@ -86,9 +100,12 @@ in Postgres: a legacy row that loses its `ON CONFLICT DO NOTHING` slot to a pre-
 a fileless sibling replica that already stamped its own sourceless marker and started serving live
 scans before this replica's backfill reached that IP) is invisible to a count that still balances.
 A second, content-aware pass re-reads every conflict-skipped row this replica's legacy snapshot
-recorded as `managed=true` and refuses the marker if the row already in Postgres does not also
-carry `managed=true` — the one field a silent conflict-skip can actually lose that the operator
-would notice.
+recorded as `managed=true` and/or with a non-empty `agent_id` — the two fields `mark_managed`
+always writes together as one atomic operator action — and refuses the marker if the row already
+in Postgres does not carry the SAME value for both. `discovered_at`/`discovered_by` are
+deliberately excluded from this check: `upsert_device`'s own `ON CONFLICT` clause already treats
+whichever write lands first as authoritative for those two on every ordinary re-scan, so the
+backfill does not need to hold them to a stricter standard than live traffic already does.
 
 ### Lifecycle
 
