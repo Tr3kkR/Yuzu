@@ -1056,6 +1056,22 @@ Postgres boot:
   VERIFICATION FAILED" log line, do not force-boot around it: this indicates two
   replicas each hold `discovery.db` files with genuinely different content, and an
   operator needs to decide which is authoritative before either can proceed.
+- **A 0-byte `discovery.db` is refused, not treated as a fresh install.** SQLite
+  opens a 0-byte file as a valid empty database, which looks identical to "this
+  legacy store was created but never used" — but a genuine fresh install never has
+  a `discovery.db` file at all. If you see a log line saying this is "NOT a fresh
+  install... a truncated/corrupted real database", either delete the empty file and
+  retry (if the legacy store genuinely was never used) or restore `discovery.db`
+  from backup before retrying (if it held real data that got truncated).
+- **A conflict during backfill can also refuse the boot, not just a fingerprint
+  mismatch.** On a multi-replica deployment, if a live scan lands a row for an IP
+  before this replica's own backfill reaches it, and that legacy row was
+  `managed=true` or had an `agent_id` assigned, the backfill verifies the row
+  already in Postgres carries the same values before trusting the migration —
+  refusing (with a "reconciliation FAILED" log line naming the IP) rather than
+  silently dropping or misattributing an operator's managed-device assignment.
+  This is expected during a multi-replica cutover window; it resolves itself once
+  every replica has completed its own backfill.
 - **Legacy file moved aside after a verified backfill.** Once the backfill is
   confirmed complete, `discovery.db` is renamed to
   `discovery.db.migrated-<epoch>` (the server never reads it again). Keep the
