@@ -26,8 +26,8 @@ TWO SCENARIOS, because one rule cannot answer both restart-liveness questions.
 `anchored` seeds the stamp series at a constant non-zero unix time (a database
 that has run before, whose reaper died) and gates `YuzuAuditRetentionNotRunning`.
 `fresh` seeds it flat `0` (a database that has never run one) and gates
-`YuzuAuditRetentionNeverRan`. `YuzuAuditRetentionNeverRan` does not exist until
-rung D lands; a scenario whose alert is absent from the rules file is reported
+`YuzuAuditRetentionNeverRan` (shipped by rung D; during rungs B/C it did not
+exist yet). A scenario whose alert is absent from the rules file is reported
 as `alert_present: false` with EVERY sampled cadence uncovered by definition,
 not an abort - see the comment on `extract()`.
 
@@ -131,22 +131,25 @@ SCENARIO_ALERTS = {
 
 # TIMEOUT BUDGET WARNING (Gate 4 consistency-auditor + Gate 6 sre, both
 # independently, same review wave). `full_sweep()` skips `measure()` entirely
-# for any scenario whose alert isn't in the rules file yet - today that's
-# `fresh`, so only 3 real (scenario, interval) pairs run. The moment a rung D
-# PR adds `YuzuAuditRetentionNeverRan` to `docs/prometheus/yuzu-alerts.yml`,
-# `fresh` becomes real too and this doubles to 6 pairs - roughly doubling
-# step 2's worst-case ceiling in `docs-lint.yml`'s `prometheus-rules` job
-# (see that file's own timeout-minutes comment for the current arithmetic).
-# RE-DERIVE both `docs-lint.yml`'s `timeout-minutes` and
-# `tests/meson.build`'s `'audit retention alert coverage manifest'` `timeout:`
-# in the SAME PR that ships a second scenario's alert - don't leave the old
-# numbers sized for 3 pairs while 6 now run.
+# for any scenario whose alert isn't in the rules file - with both alerts
+# shipped (#2854 rung D), all 6 (scenario, interval) pairs run for real, and
+# `docs-lint.yml`'s `timeout-minutes` plus `tests/meson.build`'s
+# `'audit retention alert coverage manifest'` `timeout:` are sized to that
+# worst case (see each one's own arithmetic comment). Adding a THIRD scenario
+# grows it to 9 pairs: RE-DERIVE both budgets in the SAME PR that adds it -
+# rung B shipped with budgets sized to typical runtime instead of worst-case
+# ceilings and rung D inherited the re-derivation; don't repeat that.
 
 DEFAULT_INTERVALS_S = (30, 60, 300)
 DEFAULT_LOW, DEFAULT_HIGH, DEFAULT_STEP = 30, 240, 5
 DEFAULT_MANIFEST = REPO_ROOT / "tests" / "prometheus" / "blind_band_manifest.json"
 
-SETTLE_MIN = 3 * 60 + 20   # past the [3h] window plus the 15m `for:`
+# The binding constraint is YuzuAuditRetentionNeverRan's fire time: its
+# condition is true from the first sample, so it fires at its `for: 3h` plus
+# one evaluation interval (<= 185m at the widest 300s interval); 200m leaves
+# >= 15m of margin at every interval. It also sits past
+# YuzuAuditRetentionNotRunning's [3h] window plus 15m `for:`.
+SETTLE_MIN = 3 * 60 + 20
 
 
 def rules_text(ref: str | None) -> str:
@@ -174,11 +177,11 @@ def extract(text: str, alert: str) -> tuple[dict, bool]:
     """The named alert's rule(s), and whether it exists in the file at all.
 
     DOES NOT sys.exit on absence, unlike the pre-rung-B version. `fresh`'s
-    alertname (`YuzuAuditRetentionNeverRan`) does not exist until rung D lands,
-    and rung B ships first by design (Sol's land-order review: the manifest
+    alertname (`YuzuAuditRetentionNeverRan`) did not exist until rung D landed,
+    and rung B shipped first by design (Sol's land-order review: the manifest
     and gate mechanics need independent review before the redesign changes
-    what they gate) - so "alert not in the rules file yet" is an ordinary,
-    expected state for this scenario during rung B/C, not a script bug. A
+    what they gate) - so "alert not in the rules file yet" was an ordinary,
+    expected state for this scenario during rungs B/C, not a script bug. A
     future reader who "fixes" this back to fail-fast breaks every `fresh`
     manifest entry the moment this rung merges.
     """
@@ -210,8 +213,8 @@ def case(cadence: int, interval_s: int, scenario: str, alert: str) -> dict:
 
     THE ASSERTION WRAPS IN `count(...)` rather than naming `ALERTS{}`'s full
     label set. That set is whatever the rule's own `labels:` block plus its
-    expression's inherited series labels produce, and differs between today's
-    rule, rung C's new rule and rung D's redesign - hardcoding it would make
+    expression's inherited series labels produce, and differs between the
+    rules this script has measured across its life - hardcoding it would make
     this generator brittle to a relabel that has nothing to do with coverage.
     `count(ALERTS{alertname=..., alertstate="firing"})` aggregates to a single
     anonymous sample (`exp_samples: [{"labels": "{}", "value": 1}]`) when
@@ -367,17 +370,19 @@ def measure(mode: str, native_argv: list[str] | None, tmp_root: Path,
     junit_host = d / "out" / "result.xml"
 
     # 30s/90s, not 60s/300s. `full_sweep` makes one of these pairs PER
-    # (scenario, interval) - 3 today, more as scenarios gain shipped alerts -
-    # sequentially, so a per-call ceiling compounds into the JOB's ceiling,
-    # not just this call's. Measured warm total for all 3 pairs: ~16s: 90s
-    # already gives >10x headroom per call. Sized this way after build-ci's
-    # Gate 3 review measured that the ORIGINAL 60s/300s pair, summed across 3
-    # sequential calls (1080s), exceeded the 900s `prometheus-rules` job
-    # budget outright if promtool ever genuinely wedges - the exact
-    # opaque-job-timeout failure mode #2553 was fixed to avoid, reopened here
-    # by generous-looking per-call timeouts nobody had summed. Worst case now
-    # 3 x (30+90) = 360s, comfortably inside the budget alongside
-    # pull_with_retry's own documented ~195s ladder.
+    # (scenario, interval) - 6 with both alerts shipped (#2854 rung D), more
+    # as scenarios are added - sequentially, so a per-call ceiling compounds
+    # into the JOB's ceiling, not just this call's. 90s already gives >10x
+    # headroom per call (measured warm total for a full 3-pair run: ~16s).
+    # Sized this way after build-ci's Gate 3 review measured that the
+    # ORIGINAL 60s/300s pair, summed across sequential calls, exceeded the
+    # then-900s `prometheus-rules` job budget outright if promtool ever
+    # genuinely wedged - the exact opaque-job-timeout failure mode #2553 was
+    # fixed to avoid, reopened here by generous-looking per-call timeouts
+    # nobody had summed. Worst case now 6 x (30+90) = 720s, inside the
+    # budgets that enclose it alongside pull_with_retry's ~195s ladder - the
+    # full arithmetic lives in docs-lint.yml's timeout-minutes comment;
+    # re-derive there first when this loop grows.
     try:
         check_p = subprocess.run(base + ["check", "rules", rules_path],
                                  capture_output=True, text=True, timeout=30)
@@ -454,7 +459,8 @@ def full_sweep(mode: str, native_argv: list[str] | None, rules_ref: str | None,
         for interval_s in intervals:
             if not found:
                 # Selected-but-absent: fully uncovered by definition, not an
-                # abort and not a docker call - `fresh` before rung D lands.
+                # abort and not a docker call - `fresh`'s state during rungs
+                # B/C, and any future scenario that ships ahead of its alert.
                 by_interval[str(interval_s)] = list(cadences)
             else:
                 by_interval[str(interval_s)] = measure(
@@ -473,10 +479,14 @@ def build_manifest(uncovered: dict, low: int, high: int, step: int,
     return {
         "note": (
             "Reflects TODAY'S rules file, measured with the inverted "
-            "must-be-firing assertion. This is expected to be much wider than "
-            "the historical 164-195 blind band, because the inversion sees the "
-            "auto-resolve duty-cycle hole for the first time too - a long list "
-            "here is the redesign's (#2854 rung D) target, not an instrument bug."
+            "must-be-firing assertion: a listed cadence is one where the "
+            "scenario's alert did NOT stay continuously firing. Empty lists "
+            "are the #2854 rung D redesign's shipped state - the stamp-based "
+            "grace closed both the historical 164-195 minute blind band and "
+            "the ~90-minute-up intermittent auto-resolve gap the inversion "
+            "measured (each documented in this file's git history). A cadence "
+            "appearing here again is a regression to re-reason, not a number "
+            "to commit."
         ),
         "promtool_image": PROMTOOL_IMAGE,
         "grid": {"settle_minutes": SETTLE_MIN, "low": low, "high": high, "step": step},
@@ -520,11 +530,12 @@ def compare(committed: dict, measured: dict, scenarios: list[str],
 
 def provenance_mismatches(committed: dict, measured: dict) -> list[str]:
     """Catches a manifest whose cadence sets still happen to match but whose
-    PROVENANCE has drifted - the image pin bumped, or `--low/--high/--step`/
-    `--intervals` changed - so the recorded grid no longer describes how the
-    committed cadence sets were actually measured. Separate from `compare()`
-    so its existing (scenario, interval, unexpected, stale) contract - and the
-    selftest pinning it - stays untouched by this addition."""
+    PROVENANCE has drifted - the image pin bumped, `--low/--high/--step`/
+    `--intervals` changed, or a scenario's recorded `alert`/`alert_present`
+    no longer matches what was measured (#2949) - so the record no longer
+    describes how the committed cadence sets were actually produced. Separate
+    from `compare()` so its existing (scenario, interval, unexpected, stale)
+    contract - and the selftest pinning it - stays untouched by this addition."""
     reasons = []
     if committed.get("promtool_image") != measured["promtool_image"]:
         reasons.append(f"promtool_image: committed={committed.get('promtool_image')!r} "
@@ -535,6 +546,22 @@ def provenance_mismatches(committed: dict, measured: dict) -> list[str]:
     if committed.get("intervals_s") != measured["intervals_s"]:
         reasons.append(f"intervals_s: committed={committed.get('intervals_s')!r} "
                        f"measured={measured['intervals_s']!r}")
+    # #2949: `alert` and `alert_present` are written per scenario (full_sweep)
+    # but were read by nothing, so an alertname rename - or a shipped alert
+    # whose measurement never replaced the absent-by-definition placeholder -
+    # passed --check as long as the cadence sets matched. A scenario missing
+    # from the committed manifest entirely is compare()'s missing-key finding,
+    # deliberately not repeated here.
+    c_uncovered = committed.get("uncovered", {})
+    for scenario, m_entry in measured.get("uncovered", {}).items():
+        c_entry = c_uncovered.get(scenario)
+        if c_entry is None:
+            continue
+        for field in ("alert", "alert_present"):
+            if c_entry.get(field) != m_entry.get(field):
+                reasons.append(
+                    f"{scenario}.{field}: committed={c_entry.get(field)!r} "
+                    f"measured={m_entry.get(field)!r}")
     return reasons
 
 
@@ -643,6 +670,27 @@ def selftest() -> int:
           len(provenance_mismatches(base, {**base, "grid": {"low": 25}})), 1)
     check("provenance_mismatches() catches an intervals_s change",
           len(provenance_mismatches(base, {**base, "intervals_s": [30, 60]})), 1)
+
+    # #2949: the per-scenario alert NAME and alert_present FLAG are provenance
+    # too. Cadence sets can match while either drifts - an alertname rename, or
+    # the rung-D absent->present flip where `fresh` goes from
+    # all-uncovered-by-definition to a real measurement - and a comparator that
+    # only diffs cadence sets waves both through.
+    def scen(alert="A", present=True):
+        return {**base,
+                "uncovered": {"anchored": {"alert": alert, "alert_present": present,
+                                           "by_interval": {"30": []}}}}
+    check("provenance_mismatches() finds nothing when scenario fields match",
+          provenance_mismatches(scen(), scen()), [])
+    check("provenance_mismatches() catches alertname drift",
+          len(provenance_mismatches(scen(alert="A"), scen(alert="B"))), 1)
+    check("provenance_mismatches() catches an absent->present alert_present flip",
+          len(provenance_mismatches(scen(present=False), scen(present=True))), 1)
+    check("provenance_mismatches() catches a present->absent alert_present flip",
+          len(provenance_mismatches(scen(present=True), scen(present=False))), 1)
+    check("provenance_mismatches() leaves a committed-side missing scenario "
+          "to compare()'s missing-key finding",
+          provenance_mismatches({**base, "uncovered": {}}, scen()), [])
 
     # resolve_scope(): the three CLI-validation branches, previously reachable
     # only by hand-running main() with a specific flag combination.

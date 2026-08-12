@@ -917,12 +917,16 @@ test('prometheus harness selftest',
 # YUZU_TEST_ENABLE_PROMTOOL_DOCKER and none carries a 3.x native promtool, so
 # the realistic local/CI-matrix outcome is SKIP (77); the authoritative run is
 # the docs-lint.yml `prometheus-rules` job, which does set the opt-in.
-# Timeout matches the workflow step's own budget for the same work.
+# Timeout sized to the sweep's own worst-case ceiling, not typical runtime:
+# with both scenarios' alerts shipped (#2854 rung D) all 6 (scenario,
+# interval) measure() calls run for real -- pull ladder ~195s plus 6 x
+# (30s check + 90s test) = ~915s -- so 1200 keeps a real margin over that.
+# A third sweep scenario adds another ~360s: re-derive, don't inherit.
 test('audit retention alert coverage manifest',
   _python3_test,
   args: [files('prometheus/blind_band_sweep.py'), '--check'],
   suite: 'docs',
-  timeout: 900,
+  timeout: 1200,
 )
 
 # Pure-logic selftest for the sweep (cycles_for, the seconds-resolution grid,

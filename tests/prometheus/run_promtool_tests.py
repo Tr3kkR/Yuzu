@@ -324,11 +324,19 @@ def count_assertions(doc: dict) -> CaseFacts:
     return CaseFacts(cases=len(tests), assertions=assertions, caseless=caseless)
 
 
-# The canary mutation. `unless` is what makes the young-server grace an
-# EXCLUSION; `and` inverts it, so every case asserting the alert FIRES must go
-# red. Measured against this suite (#2553 pass 13, quality-engineer's M3).
-CANARY_FROM = "unless ("
-CANARY_TO = "and ("
+# The canary mutation. `unless` is what makes YuzuAuditRetentionNotRunning's
+# never-ran grace an EXCLUSION; `and` inverts it so the rule can fire ONLY on a
+# never-anchored database, and every case asserting it FIRES on an anchored one
+# must go red. Measured against this suite (#2553 pass 13, quality-engineer's
+# M3; re-measured for the #2854 rung D expression). ANCHORED TO THE EXPR'S
+# 10-SPACE INDENT deliberately: a bare "unless (" also appears in prose
+# comments (the rung D history block, the rising-edge note), where the old
+# form would mutate prose and report the wrong failure - a comment line cannot
+# consist of exactly this indented fragment. The rules file carries a matching
+# "CANARY ANCHOR" marker comment above the rule; change either side only with
+# the other.
+CANARY_FROM = "\n          unless (\n"
+CANARY_TO = "\n          and (\n"
 
 
 def build_canary_tree(dest: Path) -> None:
@@ -342,12 +350,18 @@ def build_canary_tree(dest: Path) -> None:
         (dest / rel).parent.mkdir(parents=True, exist_ok=True)
     shutil.copy(REPO_ROOT / TESTS, dest / TESTS)
     text = (REPO_ROOT / RULES).read_text(encoding="utf-8")
-    if CANARY_FROM not in text:
+    # Exactly-one, not merely present (#2854 rung D governance UP-16): with
+    # `replace(..., 1)` a SECOND match added above the intended rule would be
+    # the one mutated - its own cases might redden, and the real target's
+    # grace would go unguarded while the canary reports success. Presence
+    # alone cannot see that; the count can.
+    n = text.count(CANARY_FROM)
+    if n != 1:
         sys.exit(
-            f"FAIL: canary anchor {CANARY_FROM!r} is no longer in {RULES}, so the "
-            f"canary would pass without proving anything - silently inert, which "
-            f"is the exact failure it exists to catch. Choose a new anchor whose "
-            f"removal MUST redden this suite, and update CANARY_FROM/CANARY_TO."
+            f"FAIL: canary anchor {CANARY_FROM!r} matches {n} times in {RULES} "
+            f"(need exactly 1), so the canary would mutate the wrong site or "
+            f"nothing - silently inert, which is the exact failure it exists to "
+            f"catch. Re-anchor CANARY_FROM/CANARY_TO to the intended rule."
         )
     (dest / RULES).write_text(text.replace(CANARY_FROM, CANARY_TO, 1),
                               encoding="utf-8")
@@ -537,13 +551,13 @@ def pull_with_retry() -> bool:
     # added to prevent (#2553, Gate 5). Worst case is now 2x90 + 15 = 195s here,
     # ~30s for the daemon probe and 2x120s for the two promtool runs: ~465s.
     # That is comfortable against meson's 600s, which starts at script launch.
-    # `timeout-minutes` on the `prometheus-rules` job is now 20 (1200s), not
-    # 10 - #2854 rung B added a second promtool-driven step
+    # `timeout-minutes` on the `prometheus-rules` job is now 30 (1800s) -
+    # #2854 rung B added a second promtool-driven step
     # (`blind_band_sweep.py --check`) to the SAME job, sharing this budget
-    # rather than getting its own. Sized to the WORST-CASE SUM of both steps'
-    # own documented ceilings (~465-495s here, ~555s for the second step
-    # after its own Gate 3 review found and fixed an under-sized per-call
-    # timeout - see `docs-lint.yml`'s comment on this job for the full
+    # rather than getting its own, and rung D doubled that step's real
+    # (scenario, interval) measurements to 6. Sized to the WORST-CASE SUM of
+    # both steps' own documented ceilings (~465-495s here, ~915s for the
+    # second step - see `docs-lint.yml`'s comment on this job for the full
     # arithmetic), not to either step's typical measured runtime - sizing to
     # typical runtime is exactly what let the second step ship with a
     # per-call ceiling the shared budget could not actually survive if

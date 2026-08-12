@@ -499,19 +499,24 @@ public:
     ///     the correction condition are recorded here, once, so they don't
     ///     drift across sites (#2854 fold round 4).
     ///
-    /// KNOWN LIMITATION, not fixed here, deferred to the rung-D rule
-    /// redesign (#2854): neither `0` nor `INT64_MIN` is actually RESERVED.
+    /// KNOWN LIMITATION, still open after the rung-D rule redesign
+    /// (#2854): neither `0` nor `INT64_MIN` is actually RESERVED.
     /// `cleanup_once` has no lower bound on the caller-supplied clock it
     /// stamps here (only `now > kMaxPlausibleNow` is rejected), so a caller
     /// passing exactly `0` or exactly `INT64_MIN` would be stamped as a
     /// live reading, indistinguishable from "never ran" or the anomaly
     /// sentinel respectively. In practice `run_cleanup`'s only real caller
     /// passes `std::chrono::system_clock::now()`, which cannot plausibly
-    /// produce either value — this is a theoretical collision on the
-    /// current code, not a reachable one — but the redesigned rule family
-    /// this gauge feeds should reserve these values explicitly (or widen
-    /// its own documented meaning to cover "live but unusable") rather than
-    /// inherit an assumption this comment cannot actually guarantee.
+    /// produce either value — a theoretical collision, not a reachable one.
+    /// The rung-D rules CHOSE their reading of the unreserved values rather
+    /// than reserving them: `0` anywhere in a window is treated as
+    /// "possibly never ran" and `INT64_MIN` as "unknown, cannot disprove
+    /// never-ran" (see the comment blocks above the two liveness rules in
+    /// docs/prometheus/yuzu-alerts.yml). A stamped value of exactly `0`
+    /// would therefore re-enter the never-ran grace — the collision cost is
+    /// a mis-ROUTED page (NeverRan instead of NotRunning), never silence.
+    /// Reserving the values server-side remains the durable fix if a caller
+    /// beyond run_cleanup ever appears.
     std::int64_t last_pass_unixtime() const noexcept {
         return last_pass_unixtime_.load(std::memory_order_relaxed);
     }

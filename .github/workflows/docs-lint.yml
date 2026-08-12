@@ -112,30 +112,25 @@ jobs:
   prometheus-rules:
     name: Prometheus alert rules
     runs-on: ubuntu-24.04
-    # 10 -> 20 for #2854 rung B: a second promtool step (the coverage-manifest
-    # check below) now shares this job's budget, and the budget must fit the
-    # WORST-CASE SUM of both steps' own documented ceilings, not their typical
-    # runtime - the same methodology run_promtool_tests.py's pull_with_retry()
-    # uses for its own ladder ("THE LADDER MUST FIT INSIDE THE TIMEOUTS THAT
-    # ENCLOSE IT"). Step 1's own comment states ~465-495s worst case (pull
-    # ladder + two 120s promtool calls). Step 2's worst case, after Gate 3
-    # review found and fixed an under-sized-timeout defect (see
-    # blind_band_sweep.py's measure()): its own pull_with_retry ladder
-    # (~195s, same shared function) plus 3 sequential (scenario, interval)
-    # measure() calls at 30s+90s each = ~360s, totalling ~555s. Sum: ~1050s
-    # (17.5 min). 20 minutes (1200s) leaves ~150s margin over that sum rather
-    # than sizing the budget to the ~30s TYPICAL combined runtime measured
-    # locally, which is what the original 10->15 bump did and is exactly the
-    # gap that let step 2 ship with a per-call ceiling the job budget could
-    # not actually survive.
-    #
-    # THIS MARGIN IS TEMPORARY. Step 2 only makes 3 (scenario, interval)
-    # `measure()` calls today because its `fresh` scenario's alert
-    # (`YuzuAuditRetentionNeverRan`) doesn't exist yet - see the timeout
-    # warning next to `SCENARIO_ALERTS` in `blind_band_sweep.py`. The rung
-    # that ships it doubles step 2 to 6 calls (~915s alone) and must
-    # re-derive this number, not inherit it.
-    timeout-minutes: 20
+    # 20 -> 30 for #2854 rung D: `YuzuAuditRetentionNeverRan` now exists, so
+    # step 2's `fresh` scenario measures for real and its 3 (scenario,
+    # interval) `measure()` calls double to 6. The budget fits the WORST-CASE
+    # SUM of both steps' own documented ceilings, not their typical runtime -
+    # the same methodology run_promtool_tests.py's pull_with_retry() uses for
+    # its own ladder ("THE LADDER MUST FIT INSIDE THE TIMEOUTS THAT ENCLOSE
+    # IT"). Step 1's own comment states ~465-495s worst case (pull ladder +
+    # two 120s promtool calls). Step 2: its own pull_with_retry ladder (~195s,
+    # same shared function) plus 6 sequential measure() calls at 30s+90s each
+    # = ~720s, totalling ~915s. Sum: ~1410s (23.5 min). 25 minutes would leave
+    # only ~90s over that sum - thinner than the ~150s margin the rung B
+    # 10->20 derivation deliberately kept - so 30 minutes (1800s). Sizing to
+    # the ~1-minute TYPICAL combined runtime measured locally is what the
+    # original 10->15 bump did, and is exactly the gap that let step 2 ship
+    # with a per-call ceiling the job budget could not actually survive. A
+    # THIRD sweep scenario grows step 2 by another ~360s: re-derive this
+    # number in that PR, don't inherit it (see the warning next to
+    # `SCENARIO_ALERTS` in `blind_band_sweep.py`).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

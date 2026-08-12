@@ -393,7 +393,8 @@ conditions and the triage differs. The current rule set is
 | `YuzuServerRestartLoop` | The server has restarted more than 3 times in the last 3 hours --- a process-health signal, not itself an audit-store fault, but a common CAUSE of the retention alerts below. | [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuserverrestartloop). |
 | `YuzuAuditRetentionClockAnomaly` | A pass declined. Nothing was deleted. | Read on. |
 | `YuzuAuditRetentionFailing` | The pass is **erroring**, not declining. | `yuzu_server_audit_cleanup_failed_total` in the metric table below. |
-| `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and the audit store grows without bound. | Triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionnotrunning) --- **start there**: it opens with the routine, self-clearing causes (a Prometheus restart false-pages for ~45 minutes) before the real diagnosis, and it states the cadence band where this rule cannot fire at all (measured: [`prometheus/blind-band-measurement.md`](../prometheus/blind-band-measurement.md)). Then `yuzu_server_audit_retention_passes_total` in the metric table below. |
+| `YuzuAuditRetentionNotRunning` | The reaper is not running on a database that has run before --- retention is unenforced and the audit store grows without bound. Fires at every restart cadence and stays firing while the reaper is dead (the #2854 rung D redesign closed the old grace's blind band; coverage is machine-checked against [`prometheus/blind-band-measurement.md`](../prometheus/blind-band-measurement.md)'s committed manifest on every PR). | Triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionnotrunning) --- **start there**: it opens with the routine, self-clearing causes (a Prometheus restart false-pages for ~45 minutes) before the real diagnosis. Then `yuzu_server_audit_retention_passes_total` in the metric table below. |
+| `YuzuAuditRetentionNeverRan` | NO retention pass has EVER run against this database --- not "not recently": the seeded stamp still reads 0 after three hours. Almost always a store that failed to open at boot, or a fresh install crash-looping before its first pass. | [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionneverran). |
 | `YuzuAuditRetentionMetricMissing` | The liveness metric is not being scraped **at all**, so `YuzuAuditRetentionNotRunning` cannot fire for anyone. **Check `up` for the Yuzu target first** — if it is down, or the target has left service discovery, this is an outage rather than just a monitoring gap, and on a single-server Prometheus this may be the only rule firing. | The three-state triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionmetricmissing) — start there; then `yuzu_server_audit_retention_passes_total` in the metric table below. |
 | `YuzuAuditRetentionStateNotPersisting` | The durable clock reading cannot be written, so detection will not survive a restart. | `yuzu_server_audit_retention_persist_failed_total` in the metric table below. |
 | `YuzuAuditRetentionCapBinding` | Expiry is outrunning the drain. | [Capacity](#capacity). |
@@ -625,12 +626,15 @@ Five correction rounds here produced only transcription errors between the code
 and prose paraphrases of it; the paraphrases have been removed rather than
 sharpened.
 
-Seven metrics report on the retention guard. All but
-`yuzu_server_audit_rows_deleted_total` and
-`yuzu_server_audit_retention_last_pass_unixtime` ship with an alert rule in
-`docs/prometheus/yuzu-alerts.yml`; those two are read alongside the others
-(is the backlog moving? when did the reaper last run?) rather than alerted on
-directly. Do not collapse the first two:
+Eight metrics report on the retention guard. All but
+`yuzu_server_audit_rows_deleted_total` ship with an alert rule in
+`docs/prometheus/yuzu-alerts.yml` — since #2854 rung D that includes
+`yuzu_server_audit_retention_last_pass_unixtime`, which is an operand of BOTH
+liveness rules (`YuzuAuditRetentionNotRunning`'s grace and the whole of
+`YuzuAuditRetentionNeverRan`), so a relabel rule dropping it changes what
+pages (see the rules file's "WHAT WOULD BREAK THE ASSUMPTION" block).
+`rows_deleted_total` is read alongside the others (is the backlog moving?)
+rather than alerted on directly. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|
