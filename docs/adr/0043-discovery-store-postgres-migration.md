@@ -116,7 +116,7 @@ backfill does not need to hold them to a stricter standard than live traffic alr
 
 Construction moves inside `server.cpp`'s `if (pg_pool_ && !startup_failed_)` guard; a failed
 migration or backfill sets `startup_failed_` (fail-closed boot, never serve on top of
-partially-migrated discovery data). Added to the `/readyz` check list.
+partially-migrated discovery data). Added to both the `/healthz` and `/readyz` check lists.
 
 ## Considered and rejected
 

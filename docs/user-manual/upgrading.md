@@ -1040,7 +1040,8 @@ Postgres boot:
 
 - **What is preserved:** every discovered device — IP/MAC/hostname, the `managed`
   flag and its associated `agent_id`, and first-seen (`discovered_at`/`discovered_by`)
-  provenance — carries over exactly.
+  provenance — carries over (any field containing invalid UTF-8 or an embedded NUL
+  is scrubbed to U+FFFD on write, matching every other field in this store).
 - **Fail-closed boot on backfill failure.** If the backfill cannot complete —
   Postgres write error, an unreadable legacy DB, or a fingerprint mismatch (below) —
   the server **refuses to boot** rather than come up with an empty or partial
@@ -1064,14 +1065,20 @@ Postgres boot:
   retry (if the legacy store genuinely was never used) or restore `discovery.db`
   from backup before retrying (if it held real data that got truncated).
 - **A conflict during backfill can also refuse the boot, not just a fingerprint
-  mismatch.** On a multi-replica deployment, if a live scan lands a row for an IP
-  before this replica's own backfill reaches it, and that legacy row was
-  `managed=true` or had an `agent_id` assigned, the backfill verifies the row
-  already in Postgres carries the same values before trusting the migration —
-  refusing (with a "reconciliation FAILED" log line naming the IP) rather than
-  silently dropping or misattributing an operator's managed-device assignment.
-  This is expected during a multi-replica cutover window; it resolves itself once
-  every replica has completed its own backfill.
+  mismatch.** On a multi-replica deployment, if a live scan (or a `mark_managed`
+  call through a sibling replica) lands a row for an IP before this replica's own
+  backfill reaches it, and that legacy row was `managed=true` or had an
+  `agent_id` assigned, the backfill verifies the row already in Postgres carries
+  the same values before trusting the migration — refusing (with a
+  "reconciliation FAILED" log line naming the IP) rather than silently dropping
+  or misattributing an operator's managed-device assignment. **This does NOT
+  resolve itself on its own** — the legacy data is frozen and a retry
+  conflict-skips against the same mismatched row every time, so this replica
+  restart-loops until an operator manually reconciles: check
+  `discovery_store.discovered_devices` for the named IP to see which value is
+  actually correct, then either accept the value already in Postgres (delete the
+  legacy file and let this replica take the sourceless-skip path) or correct the
+  row via `mark_managed` before retrying.
 - **Legacy file moved aside after a verified backfill.** Once the backfill is
   confirmed complete, `discovery.db` is renamed to
   `discovery.db.migrated-<epoch>` (the server never reads it again). Keep the

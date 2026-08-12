@@ -659,7 +659,9 @@ bool DiscoveryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                         "sourceless (no real migration has ever completed for this fleet), and "
                         "this replica's own legacy db {} is 0 bytes — this is NOT evidence of "
                         "nothing to lose, it is a truncated real database indistinguishable from "
-                        "one. Refusing (fail-closed): restore from backup before retrying.",
+                        "one. Refusing (fail-closed): either the legacy store was created but "
+                        "never used (safe to delete this empty file manually and retry) or a real "
+                        "file was truncated (restore from backup before retrying).",
                         legacy_db_path.string());
                     backfill_metric("failed");
                     return false;
@@ -915,8 +917,8 @@ bool DiscoveryStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_
                 "concurrent writer (likely a sibling replica's live scan or its own mark_managed "
                 "call) raced this backfill. Refusing marker to avoid silently losing or "
                 "misattributing the operator's managed-device assignment.",
-                legacy_row.ip_address, legacy_row.managed != 0, legacy_row.agent_id, managed_val,
-                agent_id_val);
+                sanitize_pg_text(legacy_row.ip_address), legacy_row.managed != 0,
+                sanitize_pg_text(legacy_row.agent_id), managed_val, agent_id_val);
             backfill_metric("failed");
             return false;
         }

@@ -2270,13 +2270,16 @@ groups:
         # observable from outside is the ABSENCE of a success outcome — a server
         # that refused to boot publishes no discovery-backfill series at all.
         #
-        # THIS RULE DEPENDS ON THE PRE-SEED. `DiscoveryStore::set_metrics`
-        # (wired at server.cpp construction) initialises the whole `result` set
-        # to 0, which is what makes "series absent" mean "no server is serving"
-        # rather than "no server has this metric registered yet". Without the
-        # seed, the ordinary restart of an already-migrated server (which
-        # returns at the marker check without reaching an outcome this tick)
-        # exports nothing and this rule pages on every routine restart.
+        # THIS RULE DEPENDS ON THE PRE-SEED. Unlike AuditStore (whose
+        # set_metrics() owns its own pre-seed), DiscoveryStore::set_metrics()
+        # is a bare pointer assignment — the seed lives in server.cpp's metrics
+        # registration block (the `describe()`/zero-loop right after
+        # DiscoveryStore construction), which initialises the whole `result`
+        # set to 0. That is what makes "series absent" mean "no server is
+        # serving" rather than "no server has this metric registered yet".
+        # Without the seed, the ordinary restart of an already-migrated server
+        # (which returns at the marker check without reaching an outcome this
+        # tick) exports nothing and this rule pages on every routine restart.
         #
         # LIMITS: fires only when NO scraped server reports a completed/fresh
         # backfill, so in a multi-replica deployment one wedged replica among

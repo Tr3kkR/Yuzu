@@ -3787,7 +3787,7 @@ Store discovery scan results. Requires `Infrastructure:Write`. Upserts one row p
 {"status": "ok", "devices_stored": 1}
 ```
 
-**Note:** this endpoint always returns `200` and audits `discovery.scan` as `"success"` even when individual device upserts fail (e.g. under a degraded Postgres pool) — `devices_stored` may be lower than `devices.length` with no other signal in the response body. Watch `yuzu_server_discovery_read_degrade_total` (a proxy for backend health) if you need to distinguish "no devices matched" from "the store was degraded during this scan". Pre-existing behavior, tracked as a follow-up.
+**Note:** this endpoint always returns `200` and audits `discovery.scan` as `"success"` even when individual device upserts fail (e.g. under a degraded Postgres pool) — `devices_stored` may be lower than `devices.length` with no other signal in the response body. `yuzu_server_discovery_read_degrade_total` does **not** cover this path — it is populated only by `GET /api/discovery/results`. There is currently no scan-path-specific degrade signal; `devices_stored < devices.length` in the response body is the only per-request evidence, and the shared `yuzu_pg_*` connection-pool metrics are the closest backend-health proxy. Pre-existing behavior, tracked as a follow-up.
 
 #### `GET /api/discovery/results`
 
