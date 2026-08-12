@@ -62,6 +62,7 @@
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
+#include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
 #include "instruction_store.hpp"
 #include "instruction_yaml.hpp"
@@ -1804,6 +1805,16 @@ public:
                           detail::kGuardianJournalReportingHelp, "gauge");
         metrics_.describe(detail::kGuardianJournalTagRejectedGauge,
                           detail::kGuardianJournalTagRejectedHelp, "gauge");
+        // Guardian M1 health-stream fleet rollup (#2298 gate 3, item 6d). Registered
+        // from the SAME table AgentHealthStore::recompute_metrics clears and publishes
+        // from (guardian_health_fleet_tags.hpp), same reason as the journal block
+        // above: a new signal cannot ship with a gauge but no HELP.
+        for (const auto& m : detail::kGuardianHealthMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        metrics_.describe(detail::kGuardianHealthReportingGauge,
+                          detail::kGuardianHealthReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianHealthTagRejectedGauge,
+                          detail::kGuardianHealthTagRejectedHelp, "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
