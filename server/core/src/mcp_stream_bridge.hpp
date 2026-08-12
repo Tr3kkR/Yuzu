@@ -682,8 +682,10 @@ public:
     /// live listener), release_charge leaks a per-session admission slot while the
     /// record is still erased, and erase leaks the record after the other two
     /// settled. A persistent fault keeps the state observable, which is what
-    /// distinguishes "the fault fired" from a silent no-op (#2487).
-    void inject_teardown_step_fault_for_test(TeardownStage stage, int times = 1);
+    /// distinguishes "the fault fired" from a silent no-op (#2487). Returns false and
+    /// arms nothing on an out-of-range `stage` cast (#2523) - a mistyped stage must
+    /// fail the test loudly rather than pass vacuously against an unfaulted teardown.
+    [[nodiscard]] bool inject_teardown_step_fault_for_test(TeardownStage stage, int times = 1);
     /// The NEXT `times` ~ClaimGuard record-lock acquisitions throw, modelling the
     /// mutex failure this file's fault model already treats as real. Drives the
     /// #2528 DEGRADED SETTLE: the claim must still be released (else the record is

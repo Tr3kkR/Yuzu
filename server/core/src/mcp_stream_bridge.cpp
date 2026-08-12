@@ -2954,12 +2954,13 @@ void McpStreamBridge::inject_projection_fallback_fault_for_test(int times) {
     projection_fallback_fault_.store(times, std::memory_order_release);
 }
 
-void McpStreamBridge::inject_teardown_step_fault_for_test(TeardownStage stage, int times) {
+bool McpStreamBridge::inject_teardown_step_fault_for_test(TeardownStage stage, int times) {
     const auto idx = static_cast<std::size_t>(stage);
     if (idx >= kTeardownStageCount) {
-        return;  // public method: an out-of-range cast must not become an OOB write
+        return false;  // public method: an out-of-range cast must not become an OOB write
     }
     teardown_step_fault_[idx].store(times, std::memory_order_release);
+    return true;
 }
 
 void McpStreamBridge::inject_terminal_build_fault_for_test(int times) {

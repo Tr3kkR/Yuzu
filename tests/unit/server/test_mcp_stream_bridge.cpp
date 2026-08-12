@@ -1521,8 +1521,8 @@ TEST_CASE("bridge teardown - a failed unsubscribe retains the record, never orph
     REQUIRE(fx.bus.subscriber_count("exec-2487") == 1);
 
     fx.clock_s->store(1801);  // session death: the pass-2 teardown this exercises
-    fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe,
-                                                  1000);  // persistent
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe,
+                                                            1000));  // persistent
     REQUIRE_NOTHROW(fx.bridge->sweep());  // the whole point - no escape to the thread
 
     // SELF-VALIDATING: with the fault reduced to a no-op the record is torn down and
@@ -1556,7 +1556,7 @@ TEST_CASE("bridge teardown - a failed unsubscribe retains the record, never orph
     // The claim is one-way ON PURPOSE (re-opening it is a change to the exactly-once
     // teardown protocol, not a containment fix), so healing the fault does NOT make a
     // later sweep retry. This is the honest bound the metric exists to surface.
-    fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 0);
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 0));
     fx.bridge->sweep();
     CHECK(fx.bridge->record_count() == 1);
     CHECK(fx.bus.subscriber_count("exec-2487") == 1);
@@ -1618,7 +1618,7 @@ TEST_CASE("bridge subscribe() is an exactly-once state-checked transition (#2487
         auto s = fx.make_session();
         REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
         offset->store(101);  // past the reaper threshold, still pre-subscribe
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
         fx.bridge->sweep();  // claims the orphan, then fails to erase it
         REQUIRE(fx.bridge->record_count() == 1);  // claimed, torn_down, still resolvable
 
@@ -1704,7 +1704,8 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         Fx fx;
         auto s = fx.make_session();
         park_one(fx, s);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge,
+                                                                1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
         // Distinct from the unsubscribe stage: teardown CONTINUES past this failure.
         CHECK(fx.bridge->record_count() == 0);
@@ -1726,7 +1727,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         Fx fx;
         auto s = fx.make_session();
         park_one(fx, s);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
         CHECK(fx.bridge->record_count() == 1);              // retained
         CHECK(fx.bus.subscriber_count("exec-stage") == 0);  // but already unsubscribed
@@ -1746,7 +1747,8 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         park_pair(fx, s, "pub");
 
         // The synthesis publishes normally; only the charge release fails.
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge,
+                                                                1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
@@ -1769,7 +1771,8 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
 
         // Both publish rungs fail -> poison; and the charge release fails too.
         s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge,
+                                                                1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
@@ -1785,7 +1788,8 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         auto s = fx.make_session();
         park_pair(fx, s, "up");
         s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe,
+                                                                1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
@@ -1804,7 +1808,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         park_pair(fx, s, "ep");
 
         s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
@@ -1822,8 +1826,9 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         Fx fx;
         auto s = fx.make_session();
         park_one(fx, s);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge,
+                                                                1000));
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
         CHECK(fx.bridge->record_count() == 1);
         CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total",
@@ -1839,6 +1844,29 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         CHECK(row.detail.find("charge was not released") != std::string::npos);
         CHECK(row.detail.find("were settled") == std::string::npos);
     }
+}
+
+TEST_CASE("bridge teardown fault injector fails loudly on an out-of-range stage (#2523)",
+          "[mcp][bridge][2f]") {
+    // A mistyped stage used to no-op silently, so the test that armed it passed
+    // vacuously against an unfaulted teardown. It must now be loud at the call site
+    // instead of vacuously green at the assertion site.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-oob"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    fx.clock_s->store(1801);  // session death drives the pass-2 teardown
+
+    CHECK_FALSE(fx.bridge->inject_teardown_step_fault_for_test(
+        static_cast<Bridge::TeardownStage>(3), 1000));
+
+    // Nothing armed: the teardown this drives proceeds unfaulted.
+    REQUIRE_NOTHROW(fx.bridge->sweep());
+    CHECK(fx.bridge->record_count() == 0);
+    CHECK(fx.bus.subscriber_count("exec-oob") == 0);
 }
 
 TEST_CASE("bridge pressure - the decided terminal is published even if teardown then fails "
@@ -1865,7 +1893,7 @@ TEST_CASE("bridge pressure - the decided terminal is published even if teardown 
     fx.bus.publish("exec-drop-b", "execution-completed", kCompleted, /*is_terminal=*/true);
     REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
 
-    fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1000);
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1000));
     REQUIRE_NOTHROW(fx.bridge->sweep());
 
     // The victim's terminal reached the ring despite the teardown failing after it.
