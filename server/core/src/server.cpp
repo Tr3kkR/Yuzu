@@ -4630,12 +4630,39 @@ public:
             }
         }
 
-        // Phase 7: Deployment Jobs (Issue 7.7)
-        {
-            auto deploy_db = cfg_.db_dir() / "deployment-jobs.db";
-            deployment_store_ = std::make_unique<DeploymentStore>(deploy_db);
-            if (deployment_store_ && deployment_store_->is_open()) {
-                spdlog::info("DeploymentStore initialized at {}", deploy_db.string());
+        // Phase 7: Deployment Jobs (Issue 7.7). Migrated Postgres store
+        // (ADR-0006/ADR-0043, schema `deployment_store`) — construction
+        // fail-CLOSED per ADR-0012 §1 (same template as ResultSetStore
+        // above): a reachable database whose schema can't migrate/open is a
+        // fatal startup error, never a serve-degraded state.
+        // `migrate_from_sqlite` runs the one-time, idempotent legacy-
+        // `deployment-jobs.db` backfill (ADR-0009) — AUTHORITATIVE posture
+        // means a backfill failure is ALSO fatal (never serve on top of a
+        // partially-migrated schema). NOT `DeploymentRunStore` (the `/auto`
+        // Deploy stage's own, unrelated PG store) — see deployment_store.hpp's
+        // file header for the naming trap.
+        if (pg_pool_ && !startup_failed_) {
+            deployment_store_ = std::make_unique<DeploymentStore>(*pg_pool_);
+            if (!deployment_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: deployment store migration/open failed "
+                              "(database reachable but the deployment_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto deploy_db = cfg_.db_dir() / "deployment-jobs.db";
+                if (!deployment_store_->migrate_from_sqlite(deploy_db)) {
+                    spdlog::error("[PG] Refusing to start: deployment-jobs legacy-SQLite "
+                                  "backfill failed (see prior log lines) — deployment_store is "
+                                  "authoritative and must not serve partially-migrated data. "
+                                  "Operator remediation: repair {} or move it aside to skip the "
+                                  "backfill (jobs in it will NOT carry over)",
+                                  deploy_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("DeploymentStore initialized (schema deployment_store; legacy "
+                                 "backfill source {})",
+                                 deploy_db.string());
+                }
             }
         }
 
@@ -9351,6 +9378,11 @@ private:
             // rows above document. A degraded confinement store fails RbacStore's
             // list gate closed, so surface it.
             bool mgmt_group_ok = mgmt_group_store_ && mgmt_group_store_->is_open();
+            // Migrated Postgres store (ADR-0043, gov sre finding, hardening
+            // round) — parity with every other migrated authoritative store's
+            // readyz/healthz wiring; construction is already fail-closed, this
+            // is belt-and-braces against a runtime is_open() flip.
+            bool deployment_ok = deployment_store_ && deployment_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -9358,7 +9390,7 @@ private:
                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok;
+                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && deployment_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -9384,7 +9416,8 @@ private:
                   {"inventory_store", inventory_ok ? "ok" : "error"},
                   {"rbac_store", rbac_ok ? "ok" : "error"},
                   {"result_set_store", result_set_ok ? "ok" : "error"},
-                  {"management_group_store", mgmt_group_ok ? "ok" : "error"}}},
+                  {"management_group_store", mgmt_group_ok ? "ok" : "error"},
+                  {"deployment_store", deployment_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -9605,6 +9638,13 @@ private:
                 // (startup_failed_) per ADR-0012 §1, but the readyz entry stays
                 // as belt-and-braces against a runtime is_open() flip.
                 {"result_set_store", result_set_store_ && result_set_store_->is_open()},
+                // Migrated Postgres store (ADR-0043, gov sre finding, hardening
+                // round). Load-bearing for all 4 /api/deployment-jobs routes;
+                // construction is already fail-closed (startup_failed_), but the
+                // readyz entry stays for parity with every OTHER migrated
+                // authoritative store on this ladder (all of which are wired in
+                // here) as belt-and-braces against a runtime is_open() flip.
+                {"deployment_store", deployment_store_ && deployment_store_->is_open()},
                 // PKI PR2: ca.db is load-bearing only when the install is on
                 // built-in default certs (PR3+ make it load-bearing for mTLS
                 // issuance/revocation). When the operator brought their own certs
@@ -17096,7 +17136,9 @@ private:
     std::unique_ptr<DirectorySync> directory_sync_;
     std::unique_ptr<PatchManager> patch_manager_;
 
-    // Phase 7: Deployment Jobs (Issue 7.7) & Discovery (Issue 7.18)
+    // Phase 7: Deployment Jobs (Issue 7.7) & Discovery (Issue 7.18).
+    // DeploymentStore is now Postgres (ADR-0043) — declared after pg_pool_
+    // (above) so it destructs before the pool; Discovery stays SQLite.
     std::unique_ptr<DeploymentStore> deployment_store_;
     std::unique_ptr<DiscoveryStore> discovery_store_;
 
