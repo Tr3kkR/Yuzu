@@ -24,10 +24,11 @@
 #include "engine_principal_store.hpp"
 #include "oidc_provider.hpp"
 #include "rbac_store.hpp"
-#include "sqlite_raii.hpp"
+#include "test_rbac_store_pg_helper.hpp" // PG-backed RbacStore (ADR-0041)
 
 #include "../test_helpers.hpp"
 
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -36,11 +37,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <httplib.h>
-#include <sqlite3.h>
 
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -73,11 +74,15 @@ yuzu::test::PgTestTemplate authz_floor_audit_tpl{"authzflooraudit", [](const std
 /// resolve_session's cookie branch never touches it — mirrors
 /// test_auth_routes_hardened.cpp's HardenedHarness).
 struct FloorFixture {
-    yuzu::test::TempDbFile rbac_db_file{"yuzu_test_authz_floor_rbac_"};
+    // RbacStore is a PG store (ADR-0041); the bundle SKIPs the TEST_CASE when
+    // YUZU_TEST_POSTGRES_DSN is unset — declared first so that SKIP fires
+    // before any other member construction. Every FloorFixture-constructing
+    // TEST_CASE carries the `[pg]` tag.
+    yuzu::test::RbacStorePg rbac_bundle;
+    RbacStore& rbac_store = *rbac_bundle;
     Config cfg{};
     yuzu::MetricsRegistry metrics;
     auth::AuthManager auth_mgr{};
-    RbacStore rbac_store{rbac_db_file.path};
     std::optional<yuzu::test::PostgresTestDb> audit_db;
     std::optional<yuzu::server::pg::PgPool> audit_pool;
     std::unique_ptr<AuditStore> audit_store;
@@ -87,18 +92,6 @@ struct FloorFixture {
 
     FloorFixture() {
         REQUIRE(rbac_store.is_open());
-        // Gate 3 quality-engineer (merge-fix retroactive review): unlike
-        // HardenedHarness, this fixture has no earlier-constructed PG member
-        // to inherit a SKIP from (rbac_store above is SQLite-only) — needs
-        // its own explicit guard, matching ModelHarness's shape
-        // (test_access_review_model.cpp) exactly. Without this, every
-        // FloorFixture-constructing TEST_CASE hard-FAILs rather than skips
-        // when YUZU_TEST_POSTGRES_DSN is unset, breaking the standard
-        // skip-vs-fail contract for local dev runs with no Postgres up (not
-        // CI-visible — ensure-postgres.sh guarantees a DSN there).
-        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
-            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
-        }
         audit_db.emplace(authz_floor_audit_tpl);
         INFO("[FloorFixture] audit db status (blank == ok): " << audit_db->error());
         REQUIRE(audit_db->available());
@@ -197,9 +190,9 @@ TEST_CASE("topology_floor_applies: exactly the three documented pairs are floore
 // This closes that by asserting against the STORE's own registry rather than
 // another copy of the same literals.
 TEST_CASE("kTopologyFloor: every floored securable is a real, seeded securable type",
-          "[authz][floor]") {
-    yuzu::test::TempDbFile rbac_db_file{"yuzu_test_authz_floor_catalogue_"};
-    RbacStore store{rbac_db_file.path};
+          "[authz][floor][pg]") {
+    yuzu::test::RbacStorePg rbac_bundle;
+    RbacStore& store = *rbac_bundle;
     REQUIRE(store.is_open());
 
     const auto types = store.list_securable_types();
@@ -405,58 +398,49 @@ TEST_CASE("RbacStore::seed_defaults: EnginePrincipal is seeded with Administrato
 // engine-principal routes would 403 for Administrator and Viewer alike.
 TEST_CASE("RbacStore: an EXISTING pre-#2376 database gains EnginePrincipal on the next boot, "
           "with no migration — the no-migration decision's actual claim",
-          "[authz][floor]") {
-    yuzu::test::TempDbFile rbac_db_file{"yuzu_test_authz_floor_upgrade_"};
-
-    // Boot once so the file exists and is fully seeded/migrated, then strip the
-    // securable back out to simulate a database created before #2376.
-    {
-        RbacStore store{rbac_db_file.path};
-        REQUIRE(store.is_open());
-        auto types = store.list_securable_types();
-        REQUIRE(std::find(types.begin(), types.end(), "EnginePrincipal") != types.end());
-    }
+          "[authz][floor][pg]") {
+    // The pre-migrated, pre-seeded clone IS "boot once so the file exists and
+    // is fully seeded/migrated" — the template's own setup already performed
+    // that boot; every clone inherits its state.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::rbac_store_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    REQUIRE(pool.valid());
 
     // Strip the securable back out, and confirm the strip actually took — all
     // through raw SQL with NO RbacStore open, because merely constructing one
     // re-seeds and would restore the rows. An earlier draft of this test put a
     // store construction between the strip and the assertion; that made the
     // "upgrade boot" the third open and the test passed for the wrong reason.
+    // Child-first delete order: role_permissions references securable_types.
     {
-        // RAII throughout: every REQUIRE below throws on failure, and a raw
-        // sqlite3*/sqlite3_stmt* pair would unwind past its own close/finalize —
-        // leaking the connection exactly when an assertion catches the regression
-        // this test exists to catch. `SqliteHandleOwner` closes with
-        // `sqlite3_close_v2`, so a still-outstanding statement defers the close
-        // rather than leaking the handle outright.
-        yuzu::test::SqliteHandleOwner<sqlite3> raw;
-        // `.string()`, NOT `.c_str()`: TempDbFile::path is a std::filesystem::path,
-        // whose value_type is `char` on POSIX but `wchar_t` on Windows — so
-        // `.c_str()` yields `const wchar_t*` there and does not convert to
-        // sqlite3_open's `const char*` (MSVC C2664). Every other test in the repo
-        // passes ":memory:" to sqlite3_open, so this is the first site to hit it.
-        // The std::string must outlive the call, hence the named local.
-        const std::string rbac_db_path = rbac_db_file.path.string();
-        REQUIRE(sqlite3_open(rbac_db_path.c_str(), &raw.db) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(raw.db,
-                             "DELETE FROM role_permissions WHERE securable_type='EnginePrincipal';"
-                             "DELETE FROM securable_types WHERE name='EnginePrincipal';",
-                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto* c = lease.get();
+        REQUIRE(yuzu::server::pg::exec_params(c,
+                                              "DELETE FROM rbac_store.role_permissions "
+                                              "WHERE securable_type = $1",
+                                              std::vector<std::string>{"EnginePrincipal"})
+                    .ok());
+        REQUIRE(yuzu::server::pg::exec_params(c,
+                                              "DELETE FROM rbac_store.securable_types "
+                                              "WHERE name = $1",
+                                              std::vector<std::string>{"EnginePrincipal"})
+                    .ok());
 
         auto count_of = [&](const char* sql) {
-            yuzu::server::SqliteStmt s;
-            REQUIRE(sqlite3_prepare_v2(raw.db, sql, -1, s.addr(), nullptr) == SQLITE_OK);
-            REQUIRE(sqlite3_step(s.get()) == SQLITE_ROW);
-            return sqlite3_column_int(s.get(), 0);
+            yuzu::server::pg::PgResult r =
+                yuzu::server::pg::exec_params(c, sql, std::vector<std::string>{"EnginePrincipal"});
+            REQUIRE(r.ok());
+            return std::atoi(PQgetvalue(r.get(), 0, 0));
         };
-        REQUIRE(count_of("SELECT COUNT(*) FROM securable_types WHERE name='EnginePrincipal';") == 0);
-        REQUIRE(count_of(
-                    "SELECT COUNT(*) FROM role_permissions WHERE securable_type='EnginePrincipal';")
+        REQUIRE(count_of("SELECT COUNT(*) FROM rbac_store.securable_types WHERE name = $1") == 0);
+        REQUIRE(count_of("SELECT COUNT(*) FROM rbac_store.role_permissions "
+                        "WHERE securable_type = $1")
                 == 0);
     }
 
     // The upgrade boot — the FIRST store construction since the strip.
-    RbacStore upgraded{rbac_db_file.path};
+    RbacStore upgraded{pool};
     REQUIRE(upgraded.is_open());
 
     auto types = upgraded.list_securable_types();
@@ -506,8 +490,10 @@ TEST_CASE("require_permission: an engine principal is still denied Read on every
 
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    auto rbac_db = yuzu::test::TempDbFile{"yuzu_test_authz_floor_engine_rbac_"};
-    RbacStore rbac_store{rbac_db.path};
+    // RbacStore migrates+seeds its own `rbac_store` schema beside the
+    // engine-principal/api-token schemas already open on this same fresh DB —
+    // no second database needed.
+    RbacStore rbac_store{pool};
     REQUIRE(rbac_store.is_open());
     REQUIRE_FALSE(rbac_store.is_rbac_enabled()); // default-off — the hazard scenario
 

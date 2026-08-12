@@ -39,12 +39,13 @@
  *  - `to_csv`: header + RFC 4180 escaping (comma/quote/newline), plus CWE-1236
  *    formula-injection neutralization (leading `=`/`+`/`-`/`@`/tab/CR).
  *
- * `RbacStore` (SQLite) needs no PG gate. `AuthDB` and `EnginePrincipalStore`
- * are BOTH born-on-Postgres stores (ADR-0006) — every case that constructs
+ * `RbacStore` is now ALSO a born-on-Postgres store (ADR-0006), alongside
+ * `AuthDB` and `EnginePrincipalStore` — every case that constructs
  * `ModelHarness` (or the standalone R1 fixture) carries `[pg]` and skips
  * cleanly without `YUZU_TEST_POSTGRES_DSN` (via `yuzu::test::AuthDbPg`'s own
- * SKIP, which now fires before the EnginePrincipalStore SKIP ever would) —
- * the `to_csv` cases do not depend on either store and always run.
+ * SKIP, which now fires before the RbacStore/EnginePrincipalStore SKIPs ever
+ * would) — the `to_csv` cases do not depend on any of the three stores and
+ * always run.
  */
 
 #include "access_review_model.hpp"
@@ -93,31 +94,58 @@ void setup_access_review_model_eps_tpl(const std::string& dsn) {
 yuzu::test::PgTestTemplate access_review_model_eps_tpl{"accrevmodel",
                                                         &setup_access_review_model_eps_tpl};
 
-/// Shared fixture: a born-on-PG AuthDB + a (SQLite) RbacStore, plus a
-/// PG-backed EnginePrincipalStore. SKIPs (Catch2 SKIP from inside AuthDbPg's
-/// constructor, mirroring EnginePrincipalStorePg in
+// Pre-migrated template for RbacStore (own `rbac_store` schema) — kept as a
+// SEPARATE database/template from the EnginePrincipalStore one above,
+// deliberately NOT shared. The R1 fixture below drops the
+// EnginePrincipalStore database out from under an already-open store to
+// force a mid-enumeration read failure, while the users+groups reads (the
+// groups read goes through RbacStore) must keep succeeding — sharing one PG
+// database between the two stores would break that read too and defeat the
+// whole point of R1. ModelHarness uses the same independent-database shape
+// for consistency with the R1 fixture.
+void setup_access_review_model_rbac_tpl(const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    RbacStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error(
+            "access_review model template: rbac store failed to migrate/seed");
+}
+
+yuzu::test::PgTestTemplate access_review_model_rbac_tpl{"accrevrbac",
+                                                         &setup_access_review_model_rbac_tpl};
+
+/// Shared fixture: a born-on-PG AuthDB, plus PG-backed RbacStore and
+/// EnginePrincipalStore (each on its own independent database — see the
+/// setup functions above for why they're kept separate). SKIPs (Catch2 SKIP
+/// from inside AuthDbPg's constructor, mirroring EnginePrincipalStorePg in
 /// test_rest_engine_principal_roles.cpp) when YUZU_TEST_POSTGRES_DSN is
 /// unset.
 struct ModelHarness {
     yuzu::test::AuthDbPg auth_db;
 
-    yuzu::test::TempDbFile rbac_file{"yuzu_test_access_review_model_rbac-"};
-    RbacStore rbac{rbac_file.path};
+    std::optional<yuzu::test::PostgresTestDb> rbac_db;
+    std::optional<PgPool> rbac_pool;
+    std::unique_ptr<RbacStore> rbac;
 
     std::optional<yuzu::test::PostgresTestDb> engine_db;
     std::optional<PgPool> engine_pool;
     std::unique_ptr<EnginePrincipalStore> engines;
 
     ModelHarness() {
-        REQUIRE(rbac.is_open());
-
         // Redundant with AuthDbPg's own SKIP above (both gate on the same
         // env var) — kept as a defence-in-depth guard directly on this
-        // fixture's own PG dependency (EnginePrincipalStore), matching the
-        // original shape.
+        // fixture's own PG dependencies (RbacStore + EnginePrincipalStore),
+        // matching the original shape.
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
+        rbac_db.emplace(access_review_model_rbac_tpl);
+        REQUIRE(rbac_db->available());
+        rbac_pool.emplace(PgPool::Options{.conninfo = rbac_db->dsn(), .size = 4});
+        REQUIRE(rbac_pool->valid());
+        rbac = std::make_unique<RbacStore>(*rbac_pool);
+        REQUIRE(rbac->is_open());
+
         engine_db.emplace(access_review_model_eps_tpl);
         REQUIRE(engine_db->available());
         engine_pool.emplace(PgPool::Options{.conninfo = engine_db->dsn(), .size = 4});
@@ -147,22 +175,22 @@ TEST_CASE("build_access_review: union of GRANTED user/group/active-engine/revoke
           "type dropped — and a grant-less roster member produces NO row (UP-1)",
           "[access_review][model][pg]") {
     ModelHarness h;
-    REQUIRE(h.rbac.create_role({.name = "UnionRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "UnionRole", .description = "d"}).has_value());
 
     h.add_user("alice");
-    REQUIRE(h.rbac.assign_role({"user", "alice", "UnionRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "alice", "UnionRole"}).has_value());
 
-    REQUIRE(h.rbac.create_group({.name = "eng", .description = "d", .source = "local"})
+    REQUIRE(h.rbac->create_group({.name = "eng", .description = "d", .source = "local"})
                .has_value());
-    REQUIRE(h.rbac.assign_role({"group", "eng", "UnionRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"group", "eng", "UnionRole"}).has_value());
 
     REQUIRE(h.engines->create("Active Svc", "alice", "j", "internal", "admin", "engine:active")
                .has_value());
-    REQUIRE(h.rbac.assign_role({"engine", "engine:active", "UnionRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"engine", "engine:active", "UnionRole"}).has_value());
 
     REQUIRE(h.engines->create("Revoked Svc", "alice", "j", "external", "admin", "engine:revoked")
                .has_value());
-    REQUIRE(h.rbac.assign_role({"engine", "engine:revoked", "UnionRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"engine", "engine:revoked", "UnionRole"}).has_value());
     auto revoke_res = h.engines->revoke("engine:revoked");
     REQUIRE(revoke_res.has_value());
     CHECK(*revoke_res == true);
@@ -171,7 +199,7 @@ TEST_CASE("build_access_review: union of GRANTED user/group/active-engine/revoke
     // answers "who currently has access", not "who exists".
     h.add_user("carol-no-grants");
 
-    auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
+    auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
     REQUIRE(result.has_value());
     const auto& rows = *result;
 
@@ -211,23 +239,23 @@ TEST_CASE("build_access_review: R2 — a group's permission count comes from the
           "[access_review][model][pg]") {
     ModelHarness h;
 
-    REQUIRE(h.rbac.create_role({.name = "GroupRole", .description = "d"}).has_value());
-    REQUIRE(h.rbac.set_permission({"GroupRole", "Tag", "Read", "allow"}).has_value());
-    REQUIRE(h.rbac.set_permission({"GroupRole", "Inventory", "Read", "allow"}).has_value());
-    REQUIRE(h.rbac.create_group({.name = "g1", .description = "d", .source = "local"})
+    REQUIRE(h.rbac->create_role({.name = "GroupRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->set_permission({"GroupRole", "Tag", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac->set_permission({"GroupRole", "Inventory", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac->create_group({.name = "g1", .description = "d", .source = "local"})
                .has_value());
-    REQUIRE(h.rbac.assign_role({"group", "g1", "GroupRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"group", "g1", "GroupRole"}).has_value());
 
     // A USER literally named "g1", carrying a DIFFERENT role grant. If the
     // model ever called something like get_effective_permissions("g1") for
     // the group row (the exact anti-pattern R2's doc comment forbids), this
     // user's UserRole grant would leak onto the group's row.
     h.add_user("g1");
-    REQUIRE(h.rbac.create_role({.name = "UserRole", .description = "d"}).has_value());
-    REQUIRE(h.rbac.set_permission({"UserRole", "Security", "Write", "allow"}).has_value());
-    REQUIRE(h.rbac.assign_role({"user", "g1", "UserRole"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "UserRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->set_permission({"UserRole", "Security", "Write", "allow"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "g1", "UserRole"}).has_value());
 
-    auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
+    auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
     REQUIRE(result.has_value());
 
     const auto* group_row = h.find(*result, "group", "g1");
@@ -249,13 +277,13 @@ TEST_CASE("build_access_review: an engine principal's effective_permission_count
           "[access_review][model][pg]") {
     ModelHarness h;
     h.add_user("owner1");
-    REQUIRE(h.rbac.create_role({.name = "EngineRole", .description = "d"}).has_value());
-    REQUIRE(h.rbac.set_permission({"EngineRole", "Execution", "Execute", "allow"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "EngineRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->set_permission({"EngineRole", "Execution", "Execute", "allow"}).has_value());
     REQUIRE(h.engines->create("Svc", "owner1", "j", "internal", "admin", "engine:perm")
                .has_value());
-    REQUIRE(h.rbac.assign_role({"engine", "engine:perm", "EngineRole"}).has_value());
+    REQUIRE(h.rbac->assign_role({"engine", "engine:perm", "EngineRole"}).has_value());
 
-    auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
+    auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
     REQUIRE(result.has_value());
     const auto* row = h.find(*result, "engine", "engine:perm");
     REQUIRE(row != nullptr);
@@ -269,27 +297,27 @@ TEST_CASE("build_access_review: a user row carries DIRECT grants only — group 
           "access produces no row at all (UP-1)",
           "[access_review][model][pg]") {
     ModelHarness h;
-    REQUIRE(h.rbac.create_group({.name = "grp-inherit", .description = "d", .source = "local"})
+    REQUIRE(h.rbac->create_group({.name = "grp-inherit", .description = "d", .source = "local"})
                .has_value());
-    REQUIRE(h.rbac.create_role({.name = "GroupOnlyRole", .description = "d"}).has_value());
-    REQUIRE(h.rbac.set_permission({"GroupOnlyRole", "Tag", "Read", "allow"}).has_value());
-    REQUIRE(h.rbac.assign_role({"group", "grp-inherit", "GroupOnlyRole"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "GroupOnlyRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->set_permission({"GroupOnlyRole", "Tag", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac->assign_role({"group", "grp-inherit", "GroupOnlyRole"}).has_value());
 
     // bob: group member, NO direct grant of his own.
     h.add_user("bob");
-    REQUIRE(h.rbac.add_group_member("grp-inherit", "bob").has_value());
+    REQUIRE(h.rbac->add_group_member("grp-inherit", "bob").has_value());
 
     // dana: ALSO a group member, but additionally holds a DIRECT grant of a
     // DIFFERENT role — proves the group's GroupOnlyRole does not leak onto
     // her own row's roles/count even though she does get a row (via her own
     // direct grant).
     h.add_user("dana");
-    REQUIRE(h.rbac.add_group_member("grp-inherit", "dana").has_value());
-    REQUIRE(h.rbac.create_role({.name = "DirectRole", .description = "d"}).has_value());
-    REQUIRE(h.rbac.set_permission({"DirectRole", "Security", "Write", "allow"}).has_value());
-    REQUIRE(h.rbac.assign_role({"user", "dana", "DirectRole"}).has_value());
+    REQUIRE(h.rbac->add_group_member("grp-inherit", "dana").has_value());
+    REQUIRE(h.rbac->create_role({.name = "DirectRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->set_permission({"DirectRole", "Security", "Write", "allow"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "dana", "DirectRole"}).has_value());
 
-    auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
+    auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
     REQUIRE(result.has_value());
 
     // UP-1: bob holds ZERO direct grants — group membership is not a
@@ -328,14 +356,14 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
           "as an orphan row, never silently dropped",
           "[access_review][model][pg]") {
     ModelHarness h;
-    REQUIRE(h.rbac.create_role({.name = "OrphanRole", .description = "d"}).has_value());
-    REQUIRE(h.rbac.set_permission({"OrphanRole", "Tag", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "OrphanRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->set_permission({"OrphanRole", "Tag", "Read", "allow"}).has_value());
 
     SECTION("orphan user — an OIDC/SSO principal never materialized into the users roster") {
         const std::string orphan_id = "oidc:https://idp.example.com#deleted-abc";
-        REQUIRE(h.rbac.assign_role({"user", orphan_id, "OrphanRole"}).has_value());
+        REQUIRE(h.rbac->assign_role({"user", orphan_id, "OrphanRole"}).has_value());
 
-        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         const auto* row = h.find(*result, "user", orphan_id);
@@ -360,12 +388,12 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
         // CC6.2 evidence than an orphan: a KNOWN account with RESIDUAL access,
         // not an unrostered principal. It must NOT collapse into orphan/unknown.
         h.add_user("evicted-eve");
-        REQUIRE(h.rbac.assign_role({"user", "evicted-eve", "OrphanRole"}).has_value());
+        REQUIRE(h.rbac->assign_role({"user", "evicted-eve", "OrphanRole"}).has_value());
         // Soft-delete via remove_user (is_active=0); the RBAC grant lives in a
         // separate store and survives, reproducing the disabled-but-granted case.
         REQUIRE(h.auth_db->remove_user("evicted-eve").has_value());
 
-        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         const auto* row = h.find(*result, "user", "evicted-eve");
@@ -382,9 +410,9 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
     }
 
     SECTION("orphan group — a grant against a group name no longer in the groups roster") {
-        REQUIRE(h.rbac.assign_role({"group", "deleted-group", "OrphanRole"}).has_value());
+        REQUIRE(h.rbac->assign_role({"group", "deleted-group", "OrphanRole"}).has_value());
 
-        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         const auto* row = h.find(*result, "group", "deleted-group");
@@ -396,9 +424,9 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
 
     SECTION("orphan engine — a grant against an engine principal_id no longer in the engine "
             "roster") {
-        REQUIRE(h.rbac.assign_role({"engine", "engine:deleted", "OrphanRole"}).has_value());
+        REQUIRE(h.rbac->assign_role({"engine", "engine:deleted", "OrphanRole"}).has_value());
 
-        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         const auto* row = h.find(*result, "engine", "engine:deleted");
@@ -410,11 +438,11 @@ TEST_CASE("build_access_review: UP-1 — a grant whose principal matches no rost
 
     SECTION("a NORMAL rostered grant coexists and enriches correctly alongside an orphan") {
         h.add_user("alice");
-        REQUIRE(h.rbac.assign_role({"user", "alice", "OrphanRole"}).has_value());
+        REQUIRE(h.rbac->assign_role({"user", "alice", "OrphanRole"}).has_value());
         const std::string orphan_id = "oidc:https://idp.example.com#deleted-xyz";
-        REQUIRE(h.rbac.assign_role({"user", orphan_id, "OrphanRole"}).has_value());
+        REQUIRE(h.rbac->assign_role({"user", orphan_id, "OrphanRole"}).has_value());
 
-        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         // The rostered grant enriches normally — NOT flagged as an orphan.
@@ -444,15 +472,15 @@ TEST_CASE("build_access_review: disabled-user edges — zero grants still yields
           "disabled + active grant coexist with distinct lifecycle_state",
           "[access_review][model][pg]") {
     ModelHarness h;
-    REQUIRE(h.rbac.create_role({.name = "DisabledEdgeRole", .description = "d"}).has_value());
-    REQUIRE(h.rbac.set_permission({"DisabledEdgeRole", "Tag", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac->create_role({.name = "DisabledEdgeRole", .description = "d"}).has_value());
+    REQUIRE(h.rbac->set_permission({"DisabledEdgeRole", "Tag", "Read", "allow"}).has_value());
 
     SECTION("a disabled user with ZERO grants produces NO row — the 'who has access' invariant "
             "holds even for a disabled account") {
         h.add_user("disabled-no-grants");
         REQUIRE(h.auth_db->remove_user("disabled-no-grants").has_value());
 
-        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         CHECK(h.find(*result, "user", "disabled-no-grants") == nullptr);
@@ -461,14 +489,14 @@ TEST_CASE("build_access_review: disabled-user edges — zero grants still yields
     SECTION("a disabled user and an active user with grants in the SAME result — lifecycle "
             "differs, proving they don't share a buggy code path") {
         h.add_user("disabled-with-grant");
-        REQUIRE(h.rbac.assign_role({"user", "disabled-with-grant", "DisabledEdgeRole"})
+        REQUIRE(h.rbac->assign_role({"user", "disabled-with-grant", "DisabledEdgeRole"})
                     .has_value());
         REQUIRE(h.auth_db->remove_user("disabled-with-grant").has_value());
 
         h.add_user("active-with-grant");
-        REQUIRE(h.rbac.assign_role({"user", "active-with-grant", "DisabledEdgeRole"}).has_value());
+        REQUIRE(h.rbac->assign_role({"user", "active-with-grant", "DisabledEdgeRole"}).has_value());
 
-        auto result = build_access_review(h.auth_db.get(), &h.rbac, h.engines.get(), nullptr, nullptr);
+        auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
         REQUIRE(result.has_value());
 
         const auto* disabled_row = h.find(*result, "user", "disabled-with-grant");
@@ -504,8 +532,17 @@ TEST_CASE("build_access_review: R1 — a genuine read failure MID-enumeration re
     yuzu::test::AuthDbPg auth_db;
     REQUIRE(auth_db->upsert_user("alice", "hash", "salt", Role::user).has_value());
 
-    yuzu::test::TempDbFile rbac_file{"yuzu_test_access_review_r1_rbac-"};
-    RbacStore rbac{rbac_file.path};
+    // RbacStore needs an INDEPENDENT database from `engine_db` below — R1
+    // forces the mid-enumeration failure by dropping `engine_db` out from
+    // under the already-`is_open()==true` `engines` store while the
+    // users+groups reads (the groups read goes through `rbac`) must keep
+    // succeeding first. Sharing engine_db's pool here would break both
+    // reads at once and defeat the whole point of this test.
+    yuzu::test::PostgresTestDb rbac_db{access_review_model_rbac_tpl};
+    REQUIRE(rbac_db.available());
+    PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    RbacStore rbac{rbac_pool};
     REQUIRE(rbac.is_open());
     REQUIRE(rbac.create_group({.name = "eng", .description = "d", .source = "local"})
                .has_value());
