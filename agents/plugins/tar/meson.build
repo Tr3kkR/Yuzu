@@ -67,7 +67,8 @@ shared_library(
   name_prefix: '',
   # ../../shared: win_str.hpp (#1681, tar_module_etw)
   # ../../core/src: dex_linux_proc.hpp — reused pure /proc parsers (tar_perf, tar_proc_perf)
-  include_directories: include_directories('../../shared', '../../core/src'),
+  # ../../../common/include: yuzu/audit_retention_rules.hpp (#2549 shared clock-guard core)
+  include_directories: include_directories('../../shared', '../../core/src', '../../../common/include'),
   cpp_args: tar_cpp_args,
   dependencies: tar_deps,
   install: true,

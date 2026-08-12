@@ -38,7 +38,7 @@
 ///    streams the legacy `audit.db` in bounded, id-resumable batches and boot
 ///    FAILS CLOSED on backfill failure.
 
-#include "audit_retention_rules.hpp"
+#include <yuzu/audit_retention_rules.hpp>
 
 #include <atomic>
 #include <cstddef>
