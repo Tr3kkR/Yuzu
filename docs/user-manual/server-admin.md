@@ -1020,6 +1020,47 @@ same DSN. If you run single-replica, treat any sustained non-zero
 `yuzu_rotation_sweep_lock_skipped_total` as a fault to investigate, not
 background noise; see `docs/ops-runbooks/rotation-sweep-clock-guard.md`.
 
+### vNEXT — Guardian status routes gain real data, new denial/failure modes (#2298 item 6d) (breaking)
+
+**What changed.** `GET /api/v1/guaranteed-state/status` and
+`/status/{agent_id}` previously returned a hardcoded placeholder
+(`errored_rules: 0`, always `200`). `errored_rules` is now real, derived
+from the same per-agent compliance census (`guardian_agent_rule_status`)
+the dashboard's Unhealthy Guards card reads, intersected against the live
+rule catalogue. `compliant_rules`/`drifted_rules` remain placeholder `0`
+pending full status ingest, tracked separately.
+
+**What a client sees.**
+
+- **`403`** on the fleet route (`/status`, no `{agent_id}`) — new. A
+  service-scoped API token is now refused outright rather than admitted to
+  a fleet-wide aggregate outside its own scope: this route aggregates
+  across every agent's census, and the underlying permission check does
+  not apply a service-scoped token's own service-tag confinement (it only
+  checks a role grant), so admitting it here would have let a token scoped
+  to one service read a fleet-wide count.
+- **`503`** on the per-agent route (`/status/{agent_id}`) — new failure
+  mode. This route now performs a **behavioral-PII access audit**
+  (`guardian.device.view`, same verb as `GET
+  /guaranteed-state/device-compliance` and `GET /dex/devices/{id}`) before
+  serving per-device data, and fails **closed**
+  (`503` + `Sec-Audit-Failed: true`) if that audit row cannot persist —
+  the audit subsystem being unavailable is not itself new, but this route
+  could not previously return `503` for it because it served no real
+  per-device data before.
+- **`503`** on either route if the Guaranteed State store degrades — new;
+  previously the route degraded silently to `0` on any store fault.
+
+**Who this affects.** Any integration polling either route that (a) uses a
+service-scoped API token against the fleet route — that call now needs
+either a non-service-scoped credential or a per-agent call against
+`/status/{agent_id}` instead; or (b) treats every response as `200` — both
+routes can now return `403`/`503` and a client that does not already retry
+on `5xx` (standard practice for every other Guaranteed State route) should
+add that handling. No change for a global-permission, non-service-scoped
+caller on the happy path beyond `errored_rules` becoming a real, changing
+number instead of a constant `0`.
+
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 
 The `antivirus` plugin's macOS leg previously hardcoded `av|XProtect|active`
