@@ -1831,9 +1831,16 @@ TEST_CASE("McpStreamState: a poison-time close failure AND its attach retry fail
     CHECK_NOTHROW(retry = state->attach_and_replay(0, nullptr, "bob"));
     CHECK(retry.status == mcp::McpStreamState::AttachStatus::kPoisoned);
     // The retry ALSO failed and was ALSO contained - two failures, still no escape, and
-    // alice's sink is still open (a third attach would get a third clean shot).
+    // alice's sink is still open - the seam is now exhausted, so a THIRD attach
+    // gets a clean shot and actually closes it.
     CHECK(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 2.0);
     CHECK_FALSE(attached.sink->sse->closed.load());
+
+    CHECK(state->attach_and_replay(0, nullptr, "carol").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+    CHECK(attached.sink->sse->closed.load());
+    // No third failure - the seam was armed for exactly 2.
+    CHECK(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 2.0);
 }
 
 TEST_CASE("McpStreamState: a pre-commit publish_final failure writes no pin and consumes no id",

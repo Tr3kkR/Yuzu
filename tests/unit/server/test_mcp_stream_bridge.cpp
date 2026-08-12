@@ -1475,13 +1475,22 @@ TEST_CASE("bridge pressure - a sweep claim racing shutdown reaps once, no double
     fx.bridge->shutdown();
     sweeper.get();
     CHECK(fx.bridge->record_count() == 0);
-    // Mutually exclusive per record: teardown_claimed either resolves the terminal
-    // itself (forced_expire, from the sweep completing Step 1) or never reaches Step 1
-    // at all (shutdown's walk finds teardown_terminal_handled still false and reaps
-    // it instead, #2517) - never both, regardless of which side of the race won.
+    // Each family is individually bounded to at most one row: this is ONE record,
+    // so at most one teardown_claimed call can ever run for it (forced_expire), and
+    // shutdown() runs its whole cleanup exactly once, so its aggregate row fires at
+    // most once regardless of how many records it poisoned (shutdown_reap). NOT
+    // asserted as mutually exclusive: shutdown()'s own comment above (see the
+    // should_poison computation) documents the accepted overlap - a concurrent
+    // sweep() mid-teardown_claimed, past its own shutdown_started_ recheck but not
+    // yet through Step 1, can have shutdown's walk poison the same record before
+    // teardown_claimed's Step 1 sets teardown_terminal_handled, so BOTH rows can
+    // fire for one record in that narrow window. Harmless per that comment
+    // (poisoning is idempotent, the audit rows are individually accurate), but a
+    // real interleaving this test's threading can produce - not eliminated here.
     const std::size_t forced = fx.audit_count("mcp.bridge.forced_expire");
     const std::size_t reaped = fx.audit_count("mcp.bridge.shutdown_reap");
-    CHECK(forced + reaped <= 1);
+    CHECK(forced <= 1);
+    CHECK(reaped <= 1);
 
     auto attached = s.stream->attach_and_replay(0, nullptr, "alice");
     if (reaped == 1) {
@@ -1540,7 +1549,7 @@ TEST_CASE("bridge shutdown poisons a claimed-but-terminal-unresolved record and 
         for (const auto& row : fx.audits) {
             if (row.action == "mcp.bridge.shutdown_reap") {
                 saw_reap = true;
-                CHECK(row.detail.find("1") != std::string::npos);
+                CHECK(row.detail.find("poisoned 1 claimed") != std::string::npos);
                 CHECK(row.detail.find("execution_id") != std::string::npos);
                 CHECK(row.result == "success");
             }
