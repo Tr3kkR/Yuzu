@@ -1768,6 +1768,74 @@ TEST_CASE("McpStreamState: poison_terminal fails every future attach with kPoiso
           mcp::McpStreamState::AttachStatus::kPoisoned);
 }
 
+TEST_CASE("McpStreamState: a poison-time close failure is contained and counted, not thrown "
+          "(#2531)",
+          "[mcp][stream]") {
+    // Live registry so the real counter path runs, not the nullptr short-circuit.
+    yuzu::MetricsRegistry reg;
+    auto state = std::make_shared<mcp::McpStreamState>(mcp::kMcpRingCapDefault, &reg);
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->inject_poison_close_fault_for_test(1);
+    CHECK_NOTHROW(state->poison_terminal());
+    CHECK(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 1.0);
+    // The close itself failed, so alice's sink is left heart-beating rather than closed -
+    // exactly the silent-loss shape #2531 exists to close. Checked BEFORE any further
+    // attach, because an attach on a poisoned session is ITSELF a retry attempt (see the
+    // next test) and would close it.
+    CHECK_FALSE(attached.sink->sse->closed.load());
+
+    // The flag is durable regardless of what happened to the close - every future attach
+    // still fast-fails.
+    CHECK(state->attach_and_replay(0, nullptr, "bob").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+}
+
+TEST_CASE("McpStreamState: a later attach retries and closes a sink the poison-time close "
+          "missed (#2531)",
+          "[mcp][stream]") {
+    yuzu::MetricsRegistry reg;
+    auto state = std::make_shared<mcp::McpStreamState>(mcp::kMcpRingCapDefault, &reg);
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->inject_poison_close_fault_for_test(1); // one-shot: only the poison-time close fails
+    state->poison_terminal();
+    REQUIRE(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 1.0);
+    REQUIRE_FALSE(attached.sink->sse->closed.load()); // missed, per the previous test
+
+    // Poisoning is sticky and idempotent, so THIS attach's retry gets a clean shot at the
+    // same stale sink - the seam is exhausted, so the retry succeeds.
+    CHECK(state->attach_and_replay(0, nullptr, "bob").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+    CHECK(attached.sink->sse->closed.load());
+    // No second failure counted - the retry succeeded.
+    CHECK(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 1.0);
+}
+
+TEST_CASE("McpStreamState: a poison-time close failure AND its attach retry failure are both "
+          "contained (#2531)",
+          "[mcp][stream]") {
+    yuzu::MetricsRegistry reg;
+    auto state = std::make_shared<mcp::McpStreamState>(mcp::kMcpRingCapDefault, &reg);
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->inject_poison_close_fault_for_test(2); // covers both the poison close AND the retry
+    CHECK_NOTHROW(state->poison_terminal());
+    CHECK(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 1.0);
+    CHECK_FALSE(attached.sink->sse->closed.load());
+
+    mcp::McpStreamState::AttachResult retry;
+    CHECK_NOTHROW(retry = state->attach_and_replay(0, nullptr, "bob"));
+    CHECK(retry.status == mcp::McpStreamState::AttachStatus::kPoisoned);
+    // The retry ALSO failed and was ALSO contained - two failures, still no escape, and
+    // alice's sink is still open (a third attach would get a third clean shot).
+    CHECK(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 2.0);
+    CHECK_FALSE(attached.sink->sse->closed.load());
+}
+
 TEST_CASE("McpStreamState: a pre-commit publish_final failure writes no pin and consumes no id",
           "[mcp][stream]") {
     mcp::McpStreamState state;

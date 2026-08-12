@@ -90,8 +90,9 @@ constexpr const char* kMetricPinReleaseFailed = "yuzu_mcp_bridge_pin_release_fai
 constexpr const char* kMetricPinReleaseRaced = "yuzu_mcp_bridge_pin_release_raced_total";
 // Produced ONLY by the bridge's publish_final -> fallback -> poison ladder
 // (below); named in the yuzu_mcp_stream_* family because it describes stream-
-// terminal delivery, not because mcp_stream.cpp increments it (poison_terminal()
-// increments nothing; publish_guarded uses the generic publish-failure counter).
+// terminal delivery, not because mcp_stream.cpp increments it - poison_terminal()
+// increments its OWN family instead (yuzu_mcp_stream_poison_close_failures_total,
+// #2531), which counts a close failure, not a publish-ladder failure.
 constexpr const char* kMetricTerminalPublishFailures =
     "yuzu_mcp_stream_terminal_publish_failures_total";
 

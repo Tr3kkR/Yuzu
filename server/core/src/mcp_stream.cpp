@@ -89,6 +89,14 @@ constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total
 /// increment site) - a credit step that fails to run without throwing is a
 /// distinct failure shape this counter says nothing about.
 constexpr const char* kMetricFinalCreditFailed = "yuzu_mcp_stream_final_credit_failed_total";
+/// A poison-path close (poison_terminal()'s own close, or attach_and_replay's retry of a
+/// stale sink on a poisoned session) failed and was contained. The poison flag itself is
+/// always durable regardless - this counts only whether the CLIENT was actually told, so
+/// a nonzero value means some client may have kept heart-beating on a stream the server
+/// had already given up on until its next attach retried the close. Needs a genuinely
+/// broken platform mutex (close_sink's one throw site), so any nonzero value is a signal
+/// about the host, not a rate to tune. Alert on > 0 (#2531).
+constexpr const char* kMetricPoisonCloseFailures = "yuzu_mcp_stream_poison_close_failures_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
     if (metrics != nullptr) {
@@ -109,6 +117,12 @@ void count_stream_close(yuzu::MetricsRegistry* metrics, McpStreamClose reason) {
 void count_final_credit_failed(yuzu::MetricsRegistry* metrics) {
     if (metrics != nullptr) {
         metrics->counter(kMetricFinalCreditFailed).increment();
+    }
+}
+
+void count_poison_close_failed(yuzu::MetricsRegistry* metrics) {
+    if (metrics != nullptr) {
+        metrics->counter(kMetricPoisonCloseFailures).increment();
     }
 }
 
@@ -597,7 +611,7 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
     std::shared_ptr<McpStreamSink> superseded;
     sse_bus::StreamBudget::Lease new_lease;
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::unique_lock<std::mutex> lk(mu_);
 
         // 0. Poison. A terminal frame could not be delivered (publish_final failed twice),
         //    so this stream will never carry its final - fail every attach fast with a 410
@@ -606,6 +620,14 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
         //    regardless of cursor.
         if (terminal_poisoned_) {
             out.status = AttachStatus::kPoisoned;
+            std::shared_ptr<McpStreamSink> stale_live = live_;
+            const bool inject_fault = take_poison_close_fault_locked();
+            lk.unlock();  // lock order: close_sink takes sink->sse->mu, never under mu_
+            // Poisoning is sticky and idempotent: retry the close poison_terminal()
+            // attempted, in case IT was contained (#2531) - a stale live client would
+            // otherwise never learn its stream is gone until its own timeout, however
+            // long that is.
+            poison_close_contained(stale_live, inject_fault);
             return out;
         }
 
@@ -848,6 +870,11 @@ void McpStreamState::inject_unpin_fault_for_test(UnpinFault fault, int times) {
     unpin_fault_remaining_ = fault == UnpinFault::kNone ? 0 : times;
 }
 
+void McpStreamState::inject_poison_close_fault_for_test(int times) {
+    std::lock_guard<std::mutex> lk(mu_);
+    poison_close_fault_remaining_ = times;
+}
+
 bool McpStreamState::unpin(std::uint64_t id) {
     if (id == 0) {
         return false;
@@ -894,17 +921,49 @@ std::size_t McpStreamState::pinned_count() const {
     return n;
 }
 
-void McpStreamState::poison_terminal() {
+bool McpStreamState::take_poison_close_fault_locked() {
+    if (poison_close_fault_remaining_ > 0) {
+        --poison_close_fault_remaining_;
+        return true;
+    }
+    return false;
+}
+
+void McpStreamState::poison_close_contained(const std::shared_ptr<McpStreamSink>& sink,
+                                            bool inject_fault) noexcept {
+    // BEST-EFFORT: close_sink's one throw site is the sink's own mutex acquisition (a
+    // genuinely broken platform mutex). The poison flag is already durable regardless of
+    // what happens here, so a close failure must not escape - it is counted, logged, and
+    // left for the next attach's retry rather than silently heart-beating forever (#2531).
+    try {
+        if (inject_fault) {
+            throw std::runtime_error("injected poison-close fault (test seam)");
+        }
+        close_sink(sink, McpStreamClose::kInternalError);
+    } catch (...) {
+        try {
+            count_poison_close_failed(metrics_);
+            spdlog::warn("MCP stream poison [{}]: close of a live/stale sink failed and was "
+                         "contained; the client may keep heart-beating until its next attach",
+                         log_context_);
+        } catch (...) {  // NOLINT(bugprone-empty-catch) — nothing left we could safely do
+        }
+    }
+}
+
+void McpStreamState::poison_terminal() noexcept {
     std::shared_ptr<McpStreamSink> live;
+    bool inject_fault = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
         terminal_poisoned_ = true; // sticky - every future attach_and_replay 410s
         live = live_;
+        inject_fault = take_poison_close_fault_locked();
     }
     // Close any currently-live GET sink honestly rather than leave it heart-beating for a
     // terminal that will never come. Outside mu_ (lock order), like close(). Idempotent:
     // a second poison_terminal() just re-sets the flag and re-closes an already-closed sink.
-    close_sink(live, McpStreamClose::kInternalError);
+    poison_close_contained(live, inject_fault);
 }
 
 std::uint64_t McpStreamState::current_generation() const {
