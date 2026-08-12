@@ -102,12 +102,42 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   successful return, original or replay, is independently audited under
   `engine_principal.credential.reveal`.
 - If the consuming module updates the secret and you never call `confirm`
-  (next step), a **60-second background sweep** auto-revokes the predecessor
-  once the overlap window elapses on its own — **unless the successor was
-  never presented at all**, in which case the sweep deliberately leaves BOTH
-  credentials active rather than revoke your only working credential out
-  from under you (a dropped rotate response, or simply never picking up the
-  new secret, must not end in zero usable credentials). The sweep separately
+  (next step), a **60-second background sweep** enforces predecessor
+  auto-revoke on your behalf, with this SLA: **a predecessor is revoked
+  within one 60-second tick of its overlap window elapsing; on the first
+  occurrence of a given clock-guard anomaly the tick declines instead and
+  revocation defers to the next tick (roughly 120 seconds total), after
+  which an identical anomaly drains normally on the following tick; every
+  decline is counted and logged — a fresh deployment's first-ever bootstrap
+  decline (no durable clock reading yet) increments
+  `yuzu_rotation_sweep_bootstrap_declines_total`, any other decline (an
+  implausible reading, or a big step since the last accepted tick)
+  increments `yuzu_rotation_sweep_declined_total`; the two are deliberately
+  separate series (see [metrics.md](metrics.md#rotation-sweep-clock-guard-metrics-2964)).**
+  A big-step decline is **not necessarily a clock fault** — the sweep's
+  3600s big-step threshold is crossed just as readily by a multi-tick gap
+  with a perfectly correct clock (a maintenance window, a database
+  failover, an instance left off overnight) as by an actual clock jump.
+  One case is not "eventually" but **never**, by design, until an operator
+  acts: **the successor was never presented at all** — the sweep leaves BOTH
+  credentials active indefinitely rather than revoke your only working
+  credential out from under you (a dropped rotate response, or simply never
+  picking up the new secret, must not end in zero usable credentials). A
+  **sustained clock anomaly is NOT this case**, even though it sounds like
+  it should be: the guard suppresses only a *repeat of the identical*
+  anomaly (the fact-set dedup rule) and drains on the very next tick once it
+  does, so a clock fault that settles on one anomaly shape — even
+  indefinitely — costs at most the one extra declined tick already described
+  above, and revocation then proceeds on schedule against the (still bad)
+  clock reading; do not read this SLA as "credentials are held safe for the
+  duration of a clock incident". The genuinely open-ended never-until-an-
+  operator-acts cases are (a) a clock fault that keeps changing shape tick to
+  tick (each distinct fact set declines fresh, so dedup never gets a repeat
+  to suppress) and (b) a **store-wide-lock fault** — every replica losing the
+  sweep's advisory lock to a wedged holder — neither of which an operator can
+  tell apart from "one declined tick" using this page alone, which is
+  exactly what `docs/ops-runbooks/rotation-sweep-clock-guard.md` and the
+  `YuzuRotationSweepNotRunning` alert exist to surface. The sweep separately
   warns (an operational signal, not a security alert) whenever the
   *successor* looks unused — once as its own window nears expiry, and once
   more on crossing into the elapsed state if it is still unused (that row

@@ -890,6 +890,44 @@ you see this on a rolling upgrade, retry once traffic quiesces (a load
 balancer draining the outgoing replica is usually enough); it is not a data
 integrity concern either way.
 
+### vNEXT — the rotation sweep now carries the full clock-guarded-retention shape (#2964)
+
+**What changed.** `ApiTokenStore::sweep_expired_rotations` — the 60-second
+background sweep that auto-revokes rotation predecessors for *both*
+engine-credential and human API-token overlap pairs — previously issued its
+delete on a bare local wall-clock comparison, capped per tick but with no
+persisted clock anchor and no anomaly detection. It now reads a
+Postgres-authoritative clock, persists a durable anchor in a new
+`rotation_retention_meta` table (schema v4), and classifies every tick
+through the same guard `audit_store`'s retention pass uses — a clock anomaly
+or a not-yet-trustworthy anchor **declines** the tick outright rather than
+revoke on an unverified reading, leaving both credentials in every affected
+pair active for at least one more tick. Detail:
+`docs/user-manual/authentication.md` "Rotating a Token",
+`docs/user-manual/engine-principals.md` "Rotate the credential (overlap-pair
+model)", and `docs/user-manual/metrics.md` "Rotation-sweep clock guard
+metrics".
+
+**HA / multi-replica.** Unlike `audit_store`'s retention pass, this sweep is
+single-writer **by construction**: before it will classify anything, it
+takes a store-wide PostgreSQL **session** advisory lock in its own key
+namespace. This is what makes the per-tick auto-revoke cap (≤200) a
+**cluster-wide** cap rather than a per-replica one that would otherwise let
+an N-replica deployment auto-revoke up to `N x 200` predecessors in one
+tick. A replica that does not win the lock on a given tick records a
+`SkippedLock` outcome and does nothing that tick — expected, routine
+behaviour on a genuinely multi-replica deployment, where roughly
+`(N-1)/N` of ticks land there for any given replica. **On a single-replica
+deployment — the default — this is not "routine leader-election
+contention" at all: one dedicated sweep thread on a sequential 60-second
+loop cannot lose an election against itself, so `SkippedLock` there can only
+mean a *second writer* holding the same session lock** — a zombie process
+left over from a crashed instance, a botched blue-green cutover overlapping
+two live instances briefly, or an unauthorised second server pointed at the
+same DSN. If you run single-replica, treat any sustained non-zero
+`yuzu_rotation_sweep_lock_skipped_total` as a fault to investigate, not
+background noise; see `docs/ops-runbooks/rotation-sweep-clock-guard.md`.
+
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 
 The `antivirus` plugin's macOS leg previously hardcoded `av|XProtect|active`
