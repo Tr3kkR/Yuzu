@@ -53,12 +53,14 @@
 /// **Backfill (ADR-0009): mandatory, one-time, idempotent, fail-closed.**
 /// `migrate_from_sqlite()` follows the `RbacStore` post-#2703 reference shape
 /// (`docs/postgres-store-playbook.md` "Local source absence never creates
-/// terminal migration state on its own") sized down for this store's
-/// no-revoke, no-promotion two-table data: a SHA-256 content fingerprint of
-/// the legacy `custom-properties.db` is stamped alongside the completion
-/// marker in the SAME transaction, so a later boot that still holds a local
-/// legacy file verifies the marker was actually derived from THIS file's
-/// content before trusting it (never a bare "marker present -> skip").
+/// terminal migration state on its own") unmodified: a SHA-256 content
+/// fingerprint of the legacy `custom-properties.db` is stamped alongside the
+/// completion marker in the SAME transaction via a monotonic-promotion
+/// upsert (never a plain `ON CONFLICT DO NOTHING`, which cannot distinguish
+/// two racing replicas with identical legacy content from two with
+/// DIFFERENT real content), so a later boot that still holds a local legacy
+/// file verifies the marker was actually derived from THIS file's content
+/// before trusting it (never a bare "marker present -> skip").
 
 #include <libpq-fe.h> // PGconn — private_ methods below take a live connection; see api_token_store.hpp's rationale for including directly rather than forward-declaring libpq's private `pg_conn` tag.
 
@@ -148,11 +150,15 @@ public:
     [[nodiscard]] std::expected<std::optional<CustomProperty>, CustomPropertiesReadError>
     get_property(const std::string& agent_id, const std::string& key) const;
 
-    /// Property value as a string. `nullopt` == read fine, not found (or
-    /// found with an empty value — indistinguishable, matching the prior
-    /// `get_value` contract). `std::unexpected` == store/pool/query failure.
-    /// THE typed accessor `AgentRegistry::evaluate_scope`'s `props.<key>`
-    /// resolver preload must use — see the header comment above.
+    /// Property value as a string. `nullopt` == read fine, not found. A
+    /// found property with an empty value returns an ENGAGED
+    /// `optional{""}`, distinguishable from `nullopt` (unlike the prior
+    /// plain-`std::string` `get_value` contract, where both cases returned
+    /// the same empty string). `std::unexpected` == store/pool/query
+    /// failure. NOT the accessor `AgentRegistry::evaluate_scope`'s
+    /// `props.<key>` resolver uses — that's the bulk `get_values_for_keys`
+    /// below, which preloads once for the whole agent loop rather than
+    /// per-agent.
     [[nodiscard]] std::expected<std::optional<std::string>, CustomPropertiesReadError>
     get_value(const std::string& agent_id, const std::string& key) const;
 
@@ -191,7 +197,7 @@ public:
     /// failure alike (matches the prior SQLite contract's boolean shape —
     /// deletion is not a scope/dispatch-feeding read, so this is not widened
     /// to a typed error).
-    bool delete_property(const std::string& agent_id, const std::string& key);
+    [[nodiscard]] bool delete_property(const std::string& agent_id, const std::string& key);
 
     /// Delete all properties for an agent. Best-effort (logged on failure).
     void delete_all_properties(const std::string& agent_id);
@@ -228,9 +234,18 @@ private:
 
     /// Validate a value against the schema for a key (if one exists). Runs on
     /// the SAME lease as the caller's write (no separate schema-read lease —
-    /// keeps `set_property` to one logical operation, ADR-0012 §2(c)).
-    std::expected<void, std::string> validate_against_schema(PGconn* conn, const std::string& key,
-                                                              const std::string& value) const;
+    /// keeps `set_property` to one logical operation, ADR-0012 §2(c)), and
+    /// its ONE query is also the caller's sole source for the schema's type
+    /// (a second, separate "what type does this schema have" query would
+    /// read a possibly-different row under READ COMMITTED if a concurrent
+    /// `upsert_schema`/`delete_schema` commits between the two statements —
+    /// governance Gate 4 unhappy-path, this PR). Returns the schema's type
+    /// on success when a schema exists (`nullopt` when none does); a query
+    /// failure is `std::unexpected` — NOT silently treated as "no schema"
+    /// (that conflation was a validation-bypass gap the SQLite original's
+    /// prepare-failure fallthrough carried over unnoticed).
+    std::expected<std::optional<std::string>, std::string>
+    validate_against_schema(PGconn* conn, const std::string& key, const std::string& value) const;
 };
 
 } // namespace yuzu::server

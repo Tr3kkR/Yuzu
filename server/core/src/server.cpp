@@ -6599,6 +6599,16 @@ public:
         if (gateway_service_)
             gateway_service_->set_mgmt_group_store(nullptr);
         mgmt_group_store_.reset();
+        // CustomPropertiesStore borrows pg_pool_ (ADR-0043) — drop before the
+        // pool, matching every other migrated store's belt-and-braces
+        // discipline (declaration order alone is a coincidence, not a
+        // contract — a future caller wired here mid-`stop()` must not find a
+        // still-live store past this point). No background thread and no
+        // other consumer holds a raw pointer to unwire first: its only
+        // callers are `AgentRegistry::evaluate_scope` (via a borrowed
+        // pointer passed per-call, never stored) and the REST handlers,
+        // both quiesced by the drains above.
+        custom_properties_store_.reset();
         // ResultSetStore borrows pg_pool_ — drop before the pool. The maintenance
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.

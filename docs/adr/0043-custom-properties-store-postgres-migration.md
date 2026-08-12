@@ -133,32 +133,67 @@ resolution is now given the same treatment:
 Custom properties and schemas are operator-authored asset-tagging data that cannot be
 re-derived — mandatory, one-time, idempotent, fail-closed `migrate_from_sqlite()`. Follows the
 `RbacStore` post-#2703 reference shape (`docs/postgres-store-playbook.md` "Local source absence
-never creates terminal migration state on its own"): a SHA-256 content fingerprint of the legacy
-`custom-properties.db` is stamped alongside the completion marker in the SAME transaction, so a
-later boot that still holds a local legacy file verifies the marker was actually derived from
-THIS file's content before trusting it (never a bare "marker present → skip") — closing the
-holder-side gap `ManagementGroupStore`'s backfill has not yet ported.
+never creates terminal migration state on its own") **unmodified for the fingerprint stamp
+mechanics**: a SHA-256 content fingerprint of the legacy `custom-properties.db` is stamped
+alongside the completion marker in the SAME transaction via `RbacStore`'s monotonic-promotion
+`DO UPDATE ... WHERE` upsert (never a plain `ON CONFLICT DO NOTHING`), so a later boot that still
+holds a local legacy file verifies the marker was actually derived from THIS file's content
+before trusting it (never a bare "marker present → skip") — closing the holder-side gap
+`ManagementGroupStore`'s backfill has not yet ported.
 
-**Sized down from `RbacStore`'s full state machine**, deliberately: this store has no
-revoke-vs-reseed conflict (nothing else writes `custom_properties`/`custom_property_schemas`
-before first boot completes) and no data whose loss is *worse* than re-running the backfill, so
-the fingerprint's own race (two replicas racing the SAME shared legacy file) is resolved with a
-plain `ON CONFLICT DO NOTHING` rather than `RbacStore`'s monotonic-promotion `DO UPDATE ... WHERE`
-— whichever replica's fingerprint wins reflects the same shared file content either writer would
-have derived, so there is nothing to promote and no partial-write risk to reconcile. Rows are
-inserted per-row inside one transaction, `ON CONFLICT DO NOTHING` (config data is small; the
-~27-store playbook's array-batching guidance targets high-volume ingest, not reference-sized
-tables). Legacy file moved aside after a verified backfill (one-release rollback window).
+**Governance correction (Gate 2 security-guardian, this PR):** an earlier revision of this store
+simplified `stamp_complete` to a plain `ON CONFLICT DO NOTHING` on the theory that "nothing else
+writes `custom_properties`/`custom_property_schemas` before first boot completes" makes any two
+racing writers' fingerprints interchangeable. That reasoning holds only when every racing
+replica's legacy file has *identical* content — it does not hold for two replicas racing first
+boot with *different* real legacy content (a realistic case: independently-seeded pre-cutover
+servers being merged into one Postgres deployment). In that case both replicas' per-row
+`ON CONFLICT DO NOTHING` inserts on the DATA tables also silently interleave — the loser's rows
+land, then loses the marker/fingerprint race, then logs success and moves its own legacy file
+aside, permanently discarding the fact that the resulting table is a mix of both replicas' data
+with no record either operator can recover from. The fix — shipped in this same PR, not deferred
+— is `RbacStore`'s exact `stamp_complete` mechanics: promote (`DO UPDATE ... WHERE value =
+'sourceless' OR value = EXCLUDED.value`) rather than no-op on a fingerprint collision, and treat
+"this call's own fingerprint lost to a DIFFERENT real value" as a hard failure this replica's own
+boot must refuse on (`PQntuples() == 0` on the `RETURNING` read). See
+`docs/ops-runbooks/custom-properties-store-backfill-recovery.md` for the operator-facing recovery
+procedure this produces.
+
+**What IS still sized down from `RbacStore`'s full state machine**, deliberately: this store has
+no revoke-vs-reseed conflict, so it needs none of `RbacStore`'s revoke-coordination locking or
+its `rbac_enabled`-flag read-back-verification step — only the fingerprint-promotion mechanics
+above carry over. Rows are inserted per-row inside one transaction, `ON CONFLICT DO NOTHING`
+(config data is small; the ~27-store playbook's array-batching guidance targets high-volume
+ingest, not reference-sized tables). Legacy file moved aside after a verified backfill
+(one-release rollback window).
+
+### Lifecycle
+
+`stop()` (`server.cpp`) resets `custom_properties_store_` explicitly, before `pg_pool_.reset()`
+— matching every other migrated store's belt-and-braces discipline (declaration order alone
+would also be safe here, since the store has no background thread or other consumer holding a
+borrowed pointer to unwire first, but the explicit reset keeps the destruct-before-pool
+discipline uniform and doesn't rely on a future reader re-deriving why declaration order happens
+to be safe). The store is already in the `/readyz` conjunction (`server.cpp`, unchanged by this
+migration — it predates it as a placeholder `is_open()` check that now reflects the real
+Postgres-backed state). Construction is fail-closed (ADR-0007/0012 §1): a reachable database
+whose schema can't migrate/open, or whose mandatory backfill fails, sets `startup_failed_` and
+the server refuses to serve.
 
 ## Considered and rejected
 
 - **A real FK from `custom_properties.type` to a schema-type enum**: rejected — see "Cross-table
   validation stays application-layer" above; the data model has no fixed-enum relationship to
   express, and a FK would change `delete_schema`'s observable behavior.
-- **`RbacStore`'s full monotonic-promotion backfill state machine**: rejected as over-scoped for
-  this store's data — no revoke path, no "different real fingerprint already won" reconciliation
-  need. Sized down per the reasoning above; ported the holder-side verification (the part that
-  *is* load-bearing) without the promotion machinery (the part that isn't needed here).
+- **A plain `ON CONFLICT DO NOTHING` fingerprint stamp** (this store's own first-draft
+  simplification): rejected after Gate 2 review found it silently drops data on a
+  divergent-legacy-content concurrent first boot — see the governance correction above. The
+  monotonic-promotion upsert is ported from `RbacStore` unmodified; there was no correct way to
+  size this specific mechanic down further.
+- **`RbacStore`'s revoke-coordination locking and `rbac_enabled` read-back-verification**:
+  rejected as genuinely over-scoped for this store — no revoke path exists here, and there is no
+  analogous single security-critical flag to verify. This is the part of `RbacStore`'s machinery
+  that stays out; the fingerprint-promotion mechanics above do not.
 - **Leaving `props.<key>` resolution as a per-agent store call**: rejected — reproduces the exact
   `ResultSetStore`/ADR-0036 fail-open one hop later, and holds `AgentRegistry::mu_` across N
   sequential blocking Postgres round-trips.
@@ -182,5 +217,21 @@ tables). Legacy file moved aside after a verified backfill (one-release rollback
 - `ManagementGroupStore`'s backfill has not yet ported the holder-side fingerprint-verification
   gap this store's backfill was built with from the start (tracked separately per the playbook's
   existing note — not new to this ADR).
+- **Write-path degrade is not type-widened** (governance Gate 6 compliance-officer, this PR):
+  `set_property`/`delete_property`/`list_schemas`/`upsert_schema` collapse a Postgres
+  pool-timeout/query-error into the same generic result a genuine validation-failure/not-found/
+  empty-list case produces (400/404/200-empty respectively) — unlike `get_properties`, which was
+  widened to a distinguishable `503`. This is unchanged, byte-identical behavior from the SQLite
+  original (confirmed via `git show origin/dev:server/core/src/custom_properties_store.cpp`) and
+  the same posture `ManagementGroupStore`/`ResultSetStore` document for their own un-widened
+  writes — not a regression this migration introduces, but the Postgres migration makes a
+  degrade a materially more routine occurrence than a local SQLite file error ever was.
+  Documented in `docs/user-manual/rest-api.md`'s per-route notes; widening to a typed
+  degraded-vs-not-found distinction on the write path is tracked as a follow-up, not fixed here
+  (matches `ResultSetStore`'s own "not yet widened — tracked as a follow-up" framing for the
+  identical class of un-widened write).
+- **Legacy-file removal after the one-release rollback window** (ADR-0009) is an unautomated,
+  repo-wide convention with no per-store tracking issue — not specific to this store; worth one
+  umbrella issue across the ~15-store ladder rather than a per-store follow-up here.
 - Wave 2 continues with the other three parallel easy-store migrations
   (`NotificationStore`/`DiscoveryStore`/`DeploymentStore`); no ordering dependency on this one.

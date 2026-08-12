@@ -1159,6 +1159,28 @@ sum(rate(yuzu_server_mgmt_group_read_degrade_total[5m])) by (reason) > 0
 sum(rate(yuzu_server_mgmt_group_backfill_total{result="failed"}[15m])) > 0
 ```
 
+## Custom properties metrics (ADR-0043)
+
+The `CustomPropertiesStore` — operator-authored per-agent metadata (schema
+`custom_properties_store`) usable in scope expressions via `props.<key>` — is a migrated
+PostgreSQL store (authoritative posture).
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_custom_properties_read_degrade_total{reason}` | counter | A `props.<key>` scope-feeding read (the bulk `get_values_for_keys` preload `AgentRegistry::evaluate_scope` uses, or a direct property read) degraded instead of returning a result. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection available in time — correlates with `yuzu_pg_acquire_*` saturation), `query_error` (the query failed). **A non-zero rate means a `props.<key>`-scoped dispatch/policy/push rule is aborting scope evaluation** — every caller collapses that abort to "zero targets matched," so this is NOT the same as "operators removed the properties." |
+| `yuzu_server_custom_properties_backfill_total{result}` | counter | Outcome of the one-time SQLite→Postgres backfill at boot (ADR-0043). `result` ∈ `success` (legacy `custom-properties.db` found and backfilled, then moved aside), `fresh` (no legacy DB — a clean install, nothing to migrate), `failed` (backfill could not complete — write error, unreadable legacy file, or a holder-side fingerprint-verification refusal on a multi-replica boot with divergent legacy content; the server **fails closed at boot** and retries on next start). Emitted once per boot; a `failed` sample is the signal that the server refused to come up. |
+
+**Useful PromQL queries:**
+
+```promql
+# props.<key> scope reads degrading → scoped dispatch/policy/push rules may be
+# silently matching nobody. (Shipped as the YuzuCustomPropertiesReadDegraded alert.)
+sum(rate(yuzu_server_custom_properties_read_degrade_total[5m])) by (reason) > 0
+
+# One-time custom-properties backfill failed → server refused to boot (ADR-0043).
+sum(rate(yuzu_server_custom_properties_backfill_total{result="failed"}[15m])) > 0
+```
+
 ## RBAC store metrics (authorization substrate, ADR-0041)
 
 The `RbacStore` — the PostgreSQL authorization substrate (schema `rbac_store`)

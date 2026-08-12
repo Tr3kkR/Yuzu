@@ -21,6 +21,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <system_error>
 
 namespace yuzu::server {
@@ -99,8 +100,8 @@ bool note_read_degrade(yuzu::MetricsRegistry* metrics, const char* reason, Degra
 // hot get_value degrade mask a cold get_properties one from ever logging).
 DegradeSampler g_props_sampler;
 DegradeSampler g_prop_sampler;
-DegradeSampler g_value_sampler;
 DegradeSampler g_map_sampler;
+DegradeSampler g_values_for_keys_sampler;
 
 // Unqualified DDL: the runner sets search_path to `custom_properties_store`
 // for the migration transaction; runtime statements below schema-qualify
@@ -119,6 +120,12 @@ const std::vector<pg::PgMigration>& migrations() {
                 PRIMARY KEY (agent_id, key)
             );
             CREATE INDEX custom_props_agent_idx ON custom_properties (agent_id);
+            -- Supports get_values_for_keys' WHERE key = ANY($1::text[]) —
+            -- the props.<key> scope-DSL bulk preload, a hot path (every
+            -- evaluate_scope call referencing props.<key>, including the
+            -- background policy-evaluator tick). Without this index that
+            -- query sequential-scans the whole table (gov Gate 6 sre).
+            CREATE INDEX custom_props_key_idx ON custom_properties (key);
 
             CREATE TABLE custom_property_schemas (
                 key               TEXT PRIMARY KEY,
@@ -176,7 +183,7 @@ bool CustomPropertiesStore::validate_value(const std::string& value) {
     return value.size() <= 1024;
 }
 
-std::expected<void, std::string>
+std::expected<std::optional<std::string>, std::string>
 CustomPropertiesStore::validate_against_schema(PGconn* conn, const std::string& key,
                                                const std::string& value) const {
     pg::PgResult res = pg::exec_params(
@@ -184,14 +191,25 @@ CustomPropertiesStore::validate_against_schema(PGconn* conn, const std::string& 
         "SELECT type, validation_regex FROM custom_properties_store.custom_property_schemas "
         "WHERE key = $1",
         std::vector<std::string>{key});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
-        return {}; // no schema (or a query error — same "no validation" fallback as SQLite original)
+    if (res.status() != PGRES_TUPLES_OK) {
+        // A genuine query failure, NOT "no schema" — the SQLite original
+        // conflated the two (a prepare failure silently fell through to "no
+        // validation"), which is a validation bypass now that this runs
+        // against a real network connection with real failure modes instead
+        // of a local file read. Surface it as a write failure so the whole
+        // with_txn_for callback aborts (the same "database write failed"
+        // shape the INSERT already produces on its own failure) rather than
+        // silently accepting an unvalidated write.
+        return std::unexpected("database error");
+    }
+    if (PQntuples(res.get()) == 0)
+        return std::optional<std::string>{std::nullopt}; // genuinely no schema for this key
 
     const std::string schema_type = text_col(res.get(), 0, 0);
     const std::string validation_regex = text_col(res.get(), 0, 1);
 
     if (schema_type.empty())
-        return {};
+        return std::optional<std::string>{std::nullopt};
 
     if (schema_type == "int") {
         try {
@@ -215,7 +233,7 @@ CustomPropertiesStore::validate_against_schema(PGconn* conn, const std::string& 
         }
     }
 
-    return {};
+    return std::optional<std::string>{schema_type};
 }
 
 // ── Property CRUD ────────────────────────────────────────────────────────────
@@ -345,13 +363,13 @@ CustomPropertiesStore::get_values_for_keys(const std::vector<std::string>& keys)
     if (keys.empty())
         return result;
     if (!open_) {
-        if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_map_sampler))
+        if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_values_for_keys_sampler))
             spdlog::warn("CustomPropertiesStore::get_values_for_keys: store not open");
         return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
-        if (note_read_degrade(metrics_, kReasonPoolTimeout, g_map_sampler))
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, g_values_for_keys_sampler))
             spdlog::warn("CustomPropertiesStore::get_values_for_keys: no connection in time ({})",
                         pool_.last_error());
         return std::unexpected(CustomPropertiesReadError::kDegraded);
@@ -363,7 +381,7 @@ CustomPropertiesStore::get_values_for_keys(const std::vector<std::string>& keys)
         "WHERE key = ANY($1::text[])",
         std::vector<std::string>{pg::to_text_array(key_views)});
     if (res.status() != PGRES_TUPLES_OK) {
-        if (note_read_degrade(metrics_, kReasonQueryError, g_map_sampler))
+        if (note_read_degrade(metrics_, kReasonQueryError, g_values_for_keys_sampler))
             spdlog::warn("CustomPropertiesStore::get_values_for_keys: query failed: {}",
                         PQerrorMessage(lease.get()));
         return std::unexpected(CustomPropertiesReadError::kDegraded);
@@ -400,13 +418,14 @@ CustomPropertiesStore::set_property(const std::string& agent_id, const std::stri
             schema_error = schema_result.error();
             return false;
         }
-        // Use schema type if available, otherwise the caller-provided type
-        // (matches SQLite original's effective-type resolution).
-        pg::PgResult st = pg::exec_params(
-            c, "SELECT type FROM custom_properties_store.custom_property_schemas WHERE key = $1",
-            std::vector<std::string>{key});
-        if (st.status() == PGRES_TUPLES_OK && PQntuples(st.get()) > 0)
-            effective_type = text_col(st.get(), 0, 0);
+        // Use the schema's type if validate_against_schema found one,
+        // otherwise the caller-provided type (matches SQLite original's
+        // effective-type resolution) — read from the SAME query
+        // validate_against_schema already ran, never a second SELECT (see
+        // its header doc comment for why a second query would be a fresh
+        // READ COMMITTED snapshot, not a guarantee of the same row).
+        if (*schema_result)
+            effective_type = **schema_result;
 
         pg::PgResult res = pg::exec_params(
             c,
@@ -602,16 +621,24 @@ bool CustomPropertiesStore::delete_schema(const std::string& key) {
 //
 // Mirrors RbacStore::migrate_from_sqlite's post-#2703 reference shape
 // (docs/postgres-store-playbook.md "Local source absence never creates
-// terminal migration state on its own"), sized down: this store's two
-// independent tables carry no revoke-vs-reseed conflict and no promotable
-// "sourceless" writer race worth its own state machine — the fingerprint IS
-// the sourceless sentinel (an empty-tables legacy DB and a missing legacy
-// file fingerprint identically), so a plain first-writer-wins ON CONFLICT DO
-// NOTHING on the marker is sufficient (unlike RbacStore, nothing here can
-// legitimately "promote" a sourceless stamp — every real fingerprint that
-// loses the race left no partial writes behind it worth reconciling, because
-// the only writes this backfill makes are its own idempotent upserts on
-// tables no other writer touches before first boot completes).
+// terminal migration state on its own"), including its stamp_complete
+// monotonic-promotion fingerprint write (governance Gate 2 security-guardian,
+// this PR: an earlier revision of this file simplified stamp_complete to a
+// plain ON CONFLICT DO NOTHING on the theory that "nothing else writes these
+// tables pre-first-boot" makes any two racing writers' fingerprints
+// interchangeable — that reasoning holds ONLY when every racing replica's
+// legacy file has IDENTICAL content. Two replicas racing first boot with
+// DIFFERENT real legacy content (a realistic case: independently-seeded
+// pre-cutover servers) would both silently "win" a per-row ON CONFLICT DO
+// NOTHING on the DATA tables too — the loser's own INSERTs land, then lose
+// the marker/fingerprint race, then log success and move its own legacy file
+// aside, permanently discarding the fact that its rows are a MIX of both
+// replicas' data with no record either replica's operator can recover from).
+// The fix: promote (DO UPDATE ... WHERE) rather than no-op on a fingerprint
+// collision, and treat "this call's own fingerprint lost to a DIFFERENT real
+// value" as a hard failure this replica's own boot must refuse on — see
+// stamp_complete below for the exact mechanics, which are RbacStore's
+// unmodified.
 
 namespace {
 
@@ -715,45 +742,71 @@ std::optional<std::string> fingerprint_legacy_snapshot(const LegacySnapshot& sna
 
 // nullopt == a genuine read error (fail-closed); an empty snapshot with no
 // error is a legitimate zero-row legacy database.
+//
+// The properties and schemas SELECTs run inside one deferred transaction
+// (BEGIN...COMMIT/ROLLBACK), not as two independent statements on the bare
+// connection: without it, a legacy file that is STILL being written by
+// another process between the two loops (e.g. a stale pre-migration binary
+// still pointed at custom-properties.db) could interleave a commit between
+// them, producing a torn cross-table read that then gets fingerprinted and
+// stamped complete as if it were consistent — silently discarding whichever
+// half of the interleaved write lands after the read completes. `BEGIN`
+// (not `BEGIN IMMEDIATE`) is sufficient here: this connection is
+// SQLITE_OPEN_READONLY, so a deferred transaction still fixes one consistent
+// snapshot for the whole read, and there is nothing for this connection to
+// write that a reserved lock would need to protect.
 std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* db) {
+    if (sqlite3_exec(db, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK)
+        return std::nullopt;
     LegacySnapshot snap;
+    bool ok = true;
     {
         SqliteStmt s;
         if (sqlite3_prepare_v2(db, "SELECT agent_id, key, value, type, updated_at FROM custom_properties",
-                               -1, s.addr(), nullptr) != SQLITE_OK)
-            return std::nullopt;
-        int rc;
-        while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-            LProperty p;
-            p.agent_id = legacy_text(s.get(), 0);
-            p.key = legacy_text(s.get(), 1);
-            p.value = legacy_text(s.get(), 2);
-            p.type = legacy_text(s.get(), 3);
-            p.updated_at = sqlite3_column_int64(s.get(), 4);
-            snap.properties.push_back(std::move(p));
+                               -1, s.addr(), nullptr) != SQLITE_OK) {
+            ok = false;
+        } else {
+            int rc;
+            while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+                LProperty p;
+                p.agent_id = legacy_text(s.get(), 0);
+                p.key = legacy_text(s.get(), 1);
+                p.value = legacy_text(s.get(), 2);
+                p.type = legacy_text(s.get(), 3);
+                p.updated_at = sqlite3_column_int64(s.get(), 4);
+                snap.properties.push_back(std::move(p));
+            }
+            if (rc != SQLITE_DONE)
+                ok = false;
         }
-        if (rc != SQLITE_DONE)
-            return std::nullopt;
     }
-    {
+    if (ok) {
         SqliteStmt s;
         if (sqlite3_prepare_v2(
                 db, "SELECT key, display_name, type, description, validation_regex FROM custom_property_schemas",
-                -1, s.addr(), nullptr) != SQLITE_OK)
-            return std::nullopt;
-        int rc;
-        while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
-            LSchema sc;
-            sc.key = legacy_text(s.get(), 0);
-            sc.display_name = legacy_text(s.get(), 1);
-            sc.type = legacy_text(s.get(), 2);
-            sc.description = legacy_text(s.get(), 3);
-            sc.validation_regex = legacy_text(s.get(), 4);
-            snap.schemas.push_back(std::move(sc));
+                -1, s.addr(), nullptr) != SQLITE_OK) {
+            ok = false;
+        } else {
+            int rc;
+            while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+                LSchema sc;
+                sc.key = legacy_text(s.get(), 0);
+                sc.display_name = legacy_text(s.get(), 1);
+                sc.type = legacy_text(s.get(), 2);
+                sc.description = legacy_text(s.get(), 3);
+                sc.validation_regex = legacy_text(s.get(), 4);
+                snap.schemas.push_back(std::move(sc));
+            }
+            if (rc != SQLITE_DONE)
+                ok = false;
         }
-        if (rc != SQLITE_DONE)
-            return std::nullopt;
     }
+    // A read-only transaction commits or rolls back identically (no writes to
+    // preserve or discard) — ROLLBACK on the failure path just releases the
+    // snapshot promptly rather than leaving it open until the connection closes.
+    sqlite3_exec(db, ok ? "COMMIT" : "ROLLBACK", nullptr, nullptr, nullptr);
+    if (!ok)
+        return std::nullopt;
     return snap;
 }
 
@@ -803,6 +856,19 @@ bool CustomPropertiesStore::migrate_from_sqlite(const std::filesystem::path& leg
     // the SAME transaction — the anti-pattern the playbook's "Local source
     // absence never creates terminal migration state on its own" note
     // guards against.
+    //
+    // governance (Gate 2 security-guardian, this PR): the fingerprint write
+    // is a MONOTONIC PROMOTION, not a plain first-writer-wins race, ported
+    // unmodified from RbacStore::migrate_from_sqlite (rbac_store.cpp,
+    // #2703) — "sourceless" carries no evidence worth protecting, so a real
+    // fingerprint may promote a stored "sourceless" value; a stored REAL
+    // value is never overwritten by anyone; a writer whose value already
+    // equals what's stored counts as success, not a lost race. RETURNING +
+    // PQntuples() (not PQcmdTuples on a DO NOTHING) is the correct read of
+    // "did this call's value end up as the stored one": 1 row means it did
+    // (fresh insert, promotion, or already-equal); 0 rows means a DIFFERENT
+    // real value already won and this call's write was rejected by the
+    // WHERE clause.
     const auto stamp_complete = [&](std::string_view source_fingerprint) -> bool {
         return pool_.with_txn_for(kBackfillTxnTimeout, [source_fingerprint](PGconn* c) -> bool {
             pg::PgResult mk = pg::exec_params(
@@ -818,7 +884,10 @@ bool CustomPropertiesStore::migrate_from_sqlite(const std::filesystem::path& leg
             pg::PgResult fp = pg::exec_params(
                 c,
                 "INSERT INTO custom_properties_store.custom_properties_meta (key, value) VALUES "
-                "('backfill_source_fingerprint', $1) ON CONFLICT (key) DO NOTHING RETURNING value",
+                "('backfill_source_fingerprint', $1) ON CONFLICT (key) DO UPDATE SET "
+                "value = EXCLUDED.value WHERE custom_properties_store.custom_properties_meta.value "
+                "= 'sourceless' OR custom_properties_store.custom_properties_meta.value = "
+                "EXCLUDED.value RETURNING value",
                 std::vector<std::string>{std::string(source_fingerprint)});
             if (fp.status() != PGRES_TUPLES_OK) {
                 spdlog::error(
@@ -826,12 +895,30 @@ bool CustomPropertiesStore::migrate_from_sqlite(const std::filesystem::path& leg
                     PQerrorMessage(c));
                 return false;
             }
-            // A DO NOTHING lost race is fine here (unlike RbacStore): nothing
-            // else writes custom_properties/custom_property_schemas before
-            // first boot completes, so whichever replica's fingerprint won
-            // reflects the same shared legacy file content this replica
-            // would have derived — see the header comment above for the
-            // full reasoning this simplification relies on.
+            if (PQntuples(fp.get()) == 0 && source_fingerprint != kSourcelessFingerprint) {
+                // This replica's own steps already committed real writes to
+                // Postgres before losing this race — they are not rolled
+                // back, and a retry does NOT recover cleanly. The next boot
+                // will find the marker present with a DIFFERENT real
+                // fingerprint and permanently refuse (HOLDER-SIDE
+                // VERIFICATION FAILED) until an operator reconciles which
+                // replica's config is authoritative — see the runbook.
+                spdlog::error(
+                    "CustomPropertiesStore: migrate_from_sqlite: lost the race to record this "
+                    "backfill's own source fingerprint — a DIFFERENT real fingerprint already "
+                    "stamped backfill_source_fingerprint between this pass's marker-absent check "
+                    "and this commit. This replica's own migration steps already committed to "
+                    "Postgres; a retry will find the marker present, fail holder-side fingerprint "
+                    "verification against the winning replica's value, and require manual "
+                    "reconciliation — see docs/ops-runbooks/custom-properties-store-backfill-"
+                    "recovery.md.");
+                return false;
+            }
+            // A sourceless stamp losing this same race is NOT an error
+            // (matches RbacStore/AuditStore's stamp_complete): whichever
+            // writer's "sourceless" value won is the same value this call
+            // would have written, so there is nothing this replica's boot
+            // needs to refuse over.
             return true;
         });
     };
@@ -871,7 +958,12 @@ bool CustomPropertiesStore::migrate_from_sqlite(const std::filesystem::path& leg
     }
 
     // 2. Idempotency marker (short-lived lease, released before any legacy
-    // file I/O — ADR-0012 §2(b)).
+    // file I/O — ADR-0012 §2(b)). Unbounded acquire() here matches
+    // RbacStore's/ManagementGroupStore's own backfill marker lookups
+    // (rbac_store.cpp, management_group_store.cpp): this runs once at boot,
+    // single-threaded, before serving begins, not on a runtime request path
+    // — the ADR-0012 §2(a) exception for construction-time acquires applies
+    // equally to this one-shot pre-serve step.
     bool marker_present = false;
     std::optional<std::string> stored_fingerprint;
     {
@@ -1024,12 +1116,12 @@ bool CustomPropertiesStore::migrate_from_sqlite(const std::filesystem::path& leg
         return false;
     }
 
-    // 5. Bulk-insert schemas first (properties don't FK to them in Postgres,
-    // but ordering matches the original table-creation order and keeps the
-    // migration legible). ON CONFLICT DO NOTHING per row (unnest arrays kept
-    // to a bounded batch size for simplicity — this store's config data is
-    // small; the ~27-store playbook doesn't mandate batching for reference-
-    // sized tables the way it does for high-volume ingest).
+    // 5. Insert schemas first (properties don't FK to them in Postgres, but
+    // ordering matches the original table-creation order and keeps the
+    // migration legible). One statement per row, ON CONFLICT DO NOTHING — no
+    // unnest/array batching: this store's config data is small, and the
+    // ~27-store playbook doesn't mandate batching for reference-sized tables
+    // the way it does for high-volume ingest.
     const bool ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
         for (const auto& s : snap.schemas) {
             pg::PgResult r = pg::exec_params(
@@ -1037,8 +1129,9 @@ bool CustomPropertiesStore::migrate_from_sqlite(const std::filesystem::path& leg
                 "INSERT INTO custom_properties_store.custom_property_schemas "
                 "(key, display_name, type, description, validation_regex) "
                 "VALUES ($1, $2, $3, $4, $5) ON CONFLICT (key) DO NOTHING",
-                std::vector<std::string>{s.key, sanitize_pg_text(s.display_name), s.type,
-                                         sanitize_pg_text(s.description), s.validation_regex});
+                std::vector<std::string>{sanitize_pg_text(s.key), sanitize_pg_text(s.display_name),
+                                         sanitize_pg_text(s.type), sanitize_pg_text(s.description),
+                                         sanitize_pg_text(s.validation_regex)});
             if (r.status() != PGRES_COMMAND_OK) {
                 spdlog::error("CustomPropertiesStore: migrate_from_sqlite: schema insert failed "
                               "for key='{}': {}",
@@ -1052,7 +1145,8 @@ bool CustomPropertiesStore::migrate_from_sqlite(const std::filesystem::path& leg
                 "INSERT INTO custom_properties_store.custom_properties "
                 "(agent_id, key, value, type, updated_at) VALUES ($1, $2, $3, $4, $5::bigint) "
                 "ON CONFLICT (agent_id, key) DO NOTHING",
-                std::vector<std::string>{p.agent_id, p.key, sanitize_pg_text(p.value), p.type,
+                std::vector<std::string>{sanitize_pg_text(p.agent_id), sanitize_pg_text(p.key),
+                                         sanitize_pg_text(p.value), sanitize_pg_text(p.type),
                                          std::to_string(p.updated_at)});
             if (r.status() != PGRES_COMMAND_OK) {
                 spdlog::error("CustomPropertiesStore: migrate_from_sqlite: property insert failed "

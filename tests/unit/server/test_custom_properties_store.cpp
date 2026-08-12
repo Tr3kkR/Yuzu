@@ -15,6 +15,7 @@
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "sqlite_raii.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -36,6 +37,9 @@ using yuzu::server::CustomProperty;
 using yuzu::server::CustomPropertiesReadError;
 using yuzu::server::CustomPropertiesStore;
 using yuzu::server::CustomPropertySchema;
+using yuzu::server::SqliteDb;
+using yuzu::server::SqliteErrMsg;
+using yuzu::server::SqliteStmt;
 using yuzu::server::pg::PgPool;
 namespace pg = yuzu::server::pg;
 
@@ -433,7 +437,7 @@ TEST_CASE("CustomPropertiesStore: same key different agents", "[pg][custom_props
     CHECK(require_ok(store.get_value("agent-3", "role")) == "cache");
 
     // Delete from agent-2 only
-    store.delete_property("agent-2", "role");
+    CHECK(store.delete_property("agent-2", "role"));
     CHECK(require_ok(store.get_value("agent-1", "role")) == "web");
     CHECK_FALSE(require_ok(store.get_value("agent-2", "role")).has_value());
     CHECK(require_ok(store.get_value("agent-3", "role")) == "cache");
@@ -801,11 +805,11 @@ TEST_CASE("CustomPropertiesStore: backfill copies properties and schemas from le
 
     TempSqliteFile legacy("yuzu_test_customprops_backfill_");
     {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open(legacy.path.string().c_str(), &raw) == SQLITE_OK);
-        REQUIRE(raw != nullptr);
-        char* err = nullptr;
-        REQUIRE(sqlite3_exec(raw,
+        SqliteDb raw;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), raw.addr()) == SQLITE_OK);
+        REQUIRE(raw.get() != nullptr);
+        SqliteErrMsg err;
+        REQUIRE(sqlite3_exec(raw.get(),
                              "CREATE TABLE custom_properties (agent_id TEXT NOT NULL, key TEXT "
                              "NOT NULL, value TEXT NOT NULL, type TEXT NOT NULL DEFAULT "
                              "'string', updated_at INTEGER NOT NULL, PRIMARY KEY (agent_id, "
@@ -819,8 +823,7 @@ TEST_CASE("CustomPropertiesStore: backfill copies properties and schemas from le
                              "'db', 'string', 1700000001);"
                              "INSERT INTO custom_property_schemas VALUES ('env', 'Environment', "
                              "'string', 'Deployment env', '^(dev|staging|production)$');",
-                             nullptr, nullptr, &err) == SQLITE_OK);
-        sqlite3_close(raw);
+                             nullptr, nullptr, err.addr()) == SQLITE_OK);
     }
 
     REQUIRE(store.migrate_from_sqlite(legacy.path));
@@ -882,18 +885,181 @@ TEST_CASE("CustomPropertiesStore: backfill with legacy db missing custom_propert
 
     TempSqliteFile legacy("yuzu_test_customprops_notable_");
     {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open(legacy.path.string().c_str(), &raw) == SQLITE_OK);
+        SqliteDb raw;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), raw.addr()) == SQLITE_OK);
         // A valid, empty SQLite db with no custom_properties table (e.g. a
         // stray file, or a DB some other subsystem created).
-        char* err = nullptr;
-        REQUIRE(sqlite3_exec(raw, "CREATE TABLE unrelated (x INTEGER);", nullptr, nullptr,
-                             &err) == SQLITE_OK);
-        sqlite3_close(raw);
+        SqliteErrMsg err;
+        REQUIRE(sqlite3_exec(raw.get(), "CREATE TABLE unrelated (x INTEGER);", nullptr, nullptr,
+                             err.addr()) == SQLITE_OK);
     }
 
     CHECK(store.migrate_from_sqlite(legacy.path));
     auto props = store.get_properties("any-agent");
     REQUIRE(props.has_value());
     CHECK(props->empty());
+}
+
+// ============================================================================
+// Backfill: holder-side fingerprint verification (marker already set, this
+// replica still holds a legacy file) — the novel logic this store's backfill
+// was specifically built to add over the SQLite original, per ADR-0043 and
+// the RbacStore post-#2703 reference shape it ports unmodified. Governance
+// Gate 3 quality-engineer flagged these branches as having zero coverage.
+// ============================================================================
+
+namespace {
+
+void write_legacy_props_db(const std::filesystem::path& path, const std::string& agent_id,
+                           const std::string& key, const std::string& value) {
+    SqliteDb raw;
+    REQUIRE(sqlite3_open(path.string().c_str(), raw.addr()) == SQLITE_OK);
+    SqliteErrMsg err;
+    REQUIRE(sqlite3_exec(raw.get(),
+                         "CREATE TABLE custom_properties (agent_id TEXT NOT NULL, key TEXT NOT "
+                         "NULL, value TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'string', "
+                         "updated_at INTEGER NOT NULL, PRIMARY KEY (agent_id, key));"
+                         "CREATE TABLE custom_property_schemas (key TEXT PRIMARY KEY, "
+                         "display_name TEXT, type TEXT NOT NULL DEFAULT 'string', description "
+                         "TEXT, validation_regex TEXT);",
+                         nullptr, nullptr, err.addr()) == SQLITE_OK);
+    SqliteStmt stmt;
+    REQUIRE(sqlite3_prepare_v2(raw.get(),
+                               "INSERT INTO custom_properties (agent_id, key, value, type, "
+                               "updated_at) VALUES (?, ?, ?, 'string', 1700000000)",
+                               -1, stmt.addr(), nullptr) == SQLITE_OK);
+    sqlite3_bind_text(stmt.get(), 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, key.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, value.c_str(), -1, SQLITE_TRANSIENT);
+    REQUIRE(sqlite3_step(stmt.get()) == SQLITE_DONE);
+}
+
+} // namespace
+
+TEST_CASE("CustomPropertiesStore: migrate_from_sqlite verifies a matching fingerprint when "
+          "this replica's own already-migrated legacy file is still present",
+          "[pg][custom_props][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    CustomPropertiesStore store{pool};
+    REQUIRE(store.is_open());
+
+    TempSqliteFile legacy("yuzu_test_customprops_fpmatch_");
+    write_legacy_props_db(legacy.path, "agent-1", "env", "prod");
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+    CHECK_FALSE(std::filesystem::exists(legacy.path)); // moved aside as usual
+
+    // Recreate a file with IDENTICAL logical content at the same path —
+    // simulating a failed move-aside on a real restart (the RbacStore
+    // reference case, test_rbac_store.cpp).
+    write_legacy_props_db(legacy.path, "agent-1", "env", "prod");
+    CustomPropertiesStore reopened{pool};
+    REQUIRE(reopened.is_open());
+    CHECK(reopened.migrate_from_sqlite(legacy.path));
+
+    // Verified, not re-migrated: no duplicate/conflicting row, and the
+    // matched-fingerprint branch retries move_legacy_aside — machine-check
+    // that it actually ran, not just that migrate_from_sqlite returned true.
+    auto prop = reopened.get_property("agent-1", "env");
+    REQUIRE(prop.has_value());
+    REQUIRE(prop->has_value());
+    CHECK((*prop)->value == "prod");
+    CHECK_FALSE(std::filesystem::exists(legacy.path));
+}
+
+TEST_CASE("CustomPropertiesStore: migrate_from_sqlite refuses a sourceless sibling's marker on "
+          "a later boot even though this replica genuinely holds the legacy file",
+          "[pg][custom_props][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    // "Replica A" — no local legacy file, stamps the shared marker with the
+    // sourceless sentinel fingerprint.
+    CustomPropertiesStore replica_a{pool};
+    REQUIRE(replica_a.is_open());
+    CHECK(replica_a.migrate_from_sqlite("/nonexistent/path/custom-properties.db"));
+
+    // "Replica B" — same shared Postgres, but this one genuinely holds a
+    // legacy file with real, non-empty operator content, and boots AFTER
+    // the marker was already stamped sourceless.
+    CustomPropertiesStore replica_b{pool};
+    REQUIRE(replica_b.is_open());
+    TempSqliteFile legacy("yuzu_test_customprops_sourcelessrace_");
+    write_legacy_props_db(legacy.path, "agent-1", "env", "prod");
+
+    // Refused, not silently accepted OR silently re-migrated — the file must
+    // survive untouched, and no operator data it holds must land in PG.
+    CHECK_FALSE(replica_b.migrate_from_sqlite(legacy.path));
+    CHECK(std::filesystem::exists(legacy.path));
+    auto prop = replica_b.get_property("agent-1", "env");
+    REQUIRE(prop.has_value());
+    CHECK_FALSE(prop->has_value());
+}
+
+TEST_CASE("CustomPropertiesStore: migrate_from_sqlite HOLDER-SIDE VERIFICATION FAILED on a "
+          "different replica's real fingerprint",
+          "[pg][custom_props][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    // "Replica A" migrates its own real content and stamps the shared marker.
+    CustomPropertiesStore replica_a{pool};
+    REQUIRE(replica_a.is_open());
+    TempSqliteFile legacy_a("yuzu_test_customprops_holderA_");
+    write_legacy_props_db(legacy_a.path, "agent-a", "env", "staging");
+    REQUIRE(replica_a.migrate_from_sqlite(legacy_a.path));
+
+    // "Replica B" boots later, holding a DIFFERENT real legacy file (its own,
+    // divergent content) — must refuse rather than silently accept the
+    // marker or clobber the already-migrated data.
+    CustomPropertiesStore replica_b{pool};
+    REQUIRE(replica_b.is_open());
+    TempSqliteFile legacy_b("yuzu_test_customprops_holderB_");
+    write_legacy_props_db(legacy_b.path, "agent-b", "role", "db");
+
+    CHECK_FALSE(replica_b.migrate_from_sqlite(legacy_b.path));
+    // Replica B's file must NOT have been consumed/moved.
+    CHECK(std::filesystem::exists(legacy_b.path));
+    // Replica B's data must NOT have landed in Postgres.
+    auto prop_b = replica_b.get_property("agent-b", "role");
+    REQUIRE(prop_b.has_value());
+    CHECK_FALSE(prop_b->has_value());
+    // Replica A's data is untouched (the promotion upsert never overwrites a
+    // stored real value with a different real value).
+    auto prop_a = replica_b.get_property("agent-a", "env");
+    REQUIRE(prop_a.has_value());
+    REQUIRE(prop_a->has_value());
+    CHECK((*prop_a)->value == "staging");
+}
+
+TEST_CASE("CustomPropertiesStore: migrate_from_sqlite refuses on this replica's own legacy "
+          "file being unreadable while the marker is already set",
+          "[pg][custom_props][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    CustomPropertiesStore replica_a{pool};
+    REQUIRE(replica_a.is_open());
+    REQUIRE(replica_a.migrate_from_sqlite("/nonexistent/path/custom-properties.db"));
+
+    CustomPropertiesStore replica_b{pool};
+    REQUIRE(replica_b.is_open());
+    TempSqliteFile legacy("yuzu_test_customprops_holdercorrupt_");
+    {
+        FILE* f = std::fopen(legacy.path.string().c_str(), "wb");
+        REQUIRE(f != nullptr);
+        const char junk[] = "not a sqlite database";
+        std::fwrite(junk, 1, sizeof(junk), f);
+        std::fclose(f);
+    }
+
+    // A corrupt/unreadable file while the marker is set must fail closed —
+    // never silently trust the (sourceless) marker over an unverifiable
+    // local file that might hold real, never-migrated data.
+    CHECK_FALSE(replica_b.migrate_from_sqlite(legacy.path));
+    CHECK(std::filesystem::exists(legacy.path));
 }
