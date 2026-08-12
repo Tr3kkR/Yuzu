@@ -407,6 +407,7 @@ yuzu_server_core_lib = static_library(
     'src/result_sets_ui.cpp',
     'src/rbac_store.cpp',
     'src/oidc_provider.cpp',
+    'src/oidc_scim_link.cpp',
     'src/saml_provider.cpp',
     'src/error_codes.cpp',
     'src/result_envelope.cpp',

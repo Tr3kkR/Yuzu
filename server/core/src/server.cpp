@@ -2392,6 +2392,7 @@ public:
             oidc_cfg.redirect_uri = cfg_.oidc_redirect_uri;
             oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
             oidc_cfg.skip_tls_verify = cfg_.oidc_skip_tls_verify;
+            oidc_cfg.scim_link_claim = cfg_.oidc_scim_link_claim;
             if (cfg_.oidc_skip_tls_verify)
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
@@ -4783,6 +4784,10 @@ public:
         // checked here) makes AuthRoutes::synthesize_token_session fail closed
         // for every engine-kind token rather than dereference a dangling store.
         auth_routes_->set_engine_principal_store(engine_principal_store_.get());
+        // ADR-2001 §2/D2 — link formation + login observation at the OIDC
+        // login site are fail-OPEN by design, so a null scim_store_ (no PG
+        // configured) is a safe no-op rather than a login-time failure.
+        auth_routes_->set_scim_store(scim_store_.get());
 
         start_web_server();
 
