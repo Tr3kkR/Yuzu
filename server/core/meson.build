@@ -556,7 +556,7 @@ yuzu_server_core_lib = static_library(
     'src/kek_routes.cpp',
     'src/security_headers.cpp',
   )],
-  include_directories: ['include'],
+  include_directories: ['include', '../../common/include'],
   cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
@@ -566,7 +566,7 @@ yuzu_server_core_lib = static_library(
 
 yuzu_server_core_dep = declare_dependency(
   link_with: yuzu_server_core_lib,
-  include_directories: include_directories('include'),
+  include_directories: [include_directories('include'), include_directories('../../common/include')],
   # CPPHTTPLIB_OPENSSL_SUPPORT gates real data members on httplib::ClientImpl/
   # SSLClient (header-only, inline definitions) — every consumer TU must define
   # it identically to yuzu_server_core_lib's own cpp_args, or the linker folds

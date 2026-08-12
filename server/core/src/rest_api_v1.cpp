@@ -10790,18 +10790,21 @@ void RestApiV1::register_routes(
         // in principal_quota_gate.hpp).
         res.set_chunked_content_provider(
             "text/event-stream",
-            [sink_state, exec_id_for_capture, metrics_registry](size_t /*offset*/,
-                                                                httplib::DataSink& s) -> bool {
+            [sink_state, exec_id_for_capture, metrics_registry, stream_budget](
+                size_t /*offset*/, httplib::DataSink& s) -> bool {
                 std::unique_lock<std::mutex> lk(sink_state->mu);
                 // Wait condition includes pre_emit so the provider wakes
                 // immediately if the handler stashed a synthetic (the
                 // handler-thread path may pre-attach a pre_emit before
-                // the first publish notify lands).
+                // the first publish notify lands). #2703 Gate 7 item 2:
+                // also includes the shutdown close-signal — see
+                // StreamBudget::closing()'s doc comment.
                 sink_state->cv.wait_for(lk, std::chrono::seconds(3), [&] {
                     return !sink_state->queue.empty() || sink_state->closed.load() ||
-                           sink_state->pre_emit.has_value();
+                           sink_state->pre_emit.has_value() ||
+                           (stream_budget && stream_budget->closing());
                 });
-                if (sink_state->closed.load())
+                if (sink_state->closed.load() || (stream_budget && stream_budget->closing()))
                     return false;
 
                 // Pre-emit synthetic — drained FIRST and out-of-band of

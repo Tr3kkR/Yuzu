@@ -19,6 +19,8 @@
 
 #include <httplib.h>
 
+#include "stream_budget.hpp"
+
 namespace yuzu::server::detail {
 
 // -- SSE Event ----------------------------------------------------------------
@@ -195,16 +197,23 @@ inline std::string format_sse(const SseEvent& ev) {
 
 // -- SSE content provider callback --------------------------------------------
 
+// `budget` is nullable (matches the existing metrics_-pointer convention in
+// this file) — a null budget means "no shutdown close-signal available",
+// never a crash. #2703 Gate 7 merge-slice item 2: checking `budget->closing()`
+// in the SAME predicate the provider already re-evaluates at least every 3s
+// (the keep-alive tick) closes an idle stream within one tick on server
+// shutdown, with no new cv-plumbing.
 inline bool sse_content_provider(const std::shared_ptr<SseSinkState>& state, size_t /*offset*/,
-                                 httplib::DataSink& sink) {
+                                 httplib::DataSink& sink, const StreamBudget* budget = nullptr) {
     std::unique_lock<std::mutex> lk(state->mu);
     // Keep the interval well under httplib's Keep-Alive timeout (5s)
     // to prevent the browser from closing the SSE connection due to
     // inactivity.
-    state->cv.wait_for(lk, std::chrono::seconds(3),
-                       [&state] { return !state->queue.empty() || state->closed.load(); });
+    state->cv.wait_for(lk, std::chrono::seconds(3), [&state, budget] {
+        return !state->queue.empty() || state->closed.load() || (budget && budget->closing());
+    });
 
-    if (state->closed.load()) {
+    if (state->closed.load() || (budget && budget->closing())) {
         return false;
     }
 

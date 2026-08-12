@@ -183,8 +183,19 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   boot that still finds it) and refuse to serve on a mismatch, rather than silently reporting
   success over a trail nobody streamed. `ManagementGroupStore` and `ResultSetStore` share the
   first-generation `if (!legacy_exists) → mark complete` shape this closes; porting the
-  holder-side check to them is tracked, not yet done (#2697 deferred this ladder-wide — the fix
-  landed for AuditStore only, as the mandatory-evidence case).
+  holder-side check to them is tracked, not yet done. `RbacStore` independently discovered and
+  fixed the identical shape (#2703, git-blamed to its original migration commit, not caught by
+  that migration's own governance pass or two rounds of external review — only surfaced by a
+  wider-scope adversarial review) — it is now a SECOND reference implementation, right-sized for
+  a small, non-resumable, single-transaction legacy dataset rather than `AuditStore`'s larger
+  resumable-streaming one. **Trap a future port hits if it works from this paragraph's prose
+  instead of the actual code:** `AuditStore::stamp_complete` has two exemptions this description
+  doesn't spell out and `RbacStore`'s own first port missed both — (1) a **sourceless** writer
+  losing the trust-anchor race is NOT an error (it has no evidence worth protecting, so whichever
+  writer's `"sourceless"` value won is fine); (2) a **real** writer's content that fingerprints as
+  having nothing to protect (an empty/schema-less local file) should trust the marker rather than
+  refuse. Port the REFERENCE CODE (`audit_store.cpp`'s `stamp_complete`, or `rbac_store.cpp`'s
+  post-#2703 version) and diff your port against it line by line — not this summary.
 - **Long-lived migration branches accumulate test-file drift against the pre-migration API —
   budget for it on every `dev`-merge, not just the first.** Any test file that constructs the
   store via its old constructor fails to compile once the branch merges current `origin/dev` —
@@ -220,7 +231,19 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   #2697) is the worked example: checking only statement status let a real backfill that lost this
   exact race report success while a different writer's value sat at the trust anchor — the same
   silent-discard shape as the `sqlite3_changes()` pitfall above, just on `ON CONFLICT DO NOTHING`
-  rather than a mutate-then-count.
+  rather than a mutate-then-count. **When "first writer wins" is too strict** — some values carry
+  no evidence worth protecting (a sourceless placeholder) or two writers can legitimately agree
+  (identical content from a shared volume) — plain `DO NOTHING` can't express that; use `DO
+  UPDATE ... WHERE <promotable-condition> RETURNING <col>` instead, and read success via
+  `PQntuples() == 1` (the WHERE matched: fresh insert, a promotion, or an already-equal value),
+  never `PQcmdTuples()` on a `DO UPDATE` (it reports rows affected by the WHOLE statement,
+  conflating "this row was promoted" with "this row already held my value" — both fine, but
+  neither is a `DO NOTHING`'s simple insert/no-op binary). `RbacStore::stamp_complete` (#2703) is
+  the worked example: a real fingerprint may promote a stored `"sourceless"` value; a stored real
+  value is never overwritten by anyone; a writer whose value already equals what's stored counts
+  as success rather than a spurious lost-race failure. Verify the exact upsert against a live
+  Postgres instance before shipping it — `ON CONFLICT ... DO UPDATE ... WHERE` semantics are easy
+  to get subtly wrong by reasoning alone.
 - A plaintext secret column. Use `SecretCodec` / verify-only hash.
 - A new server **SQLite** store (ADR-0006 forbids it without an exception ADR).
 - A `CREATE INDEX CONCURRENTLY` / `VACUUM` / `ALTER TYPE ADD VALUE` smuggled into a
@@ -260,6 +283,50 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   already-available `pool.with_txn` + `pg::PgTxn` RAII guard before a second review round caught
   it. `SoftwareLicensingStore::count_stale_agents` is the clean reference implementation of the
   correct shape.
+- A hard `DELETE` to revoke a row that an unconditional reseed pass (a `seed_defaults()`-style
+  step re-run on every construction, `ON CONFLICT DO NOTHING`) can silently reinsert. A deleted
+  row leaves nothing for the reseed's conflict target to match, so the very next restart
+  resurrects the seeded default — the operator's revocation is undone on ordinary
+  restart/redeploy, no attacker required. `RbacStore::remove_permission` (#2703, fjarvis) is the
+  reference case, and it took THREE rounds to land correctly — the wrong two are as instructive as
+  the right one. Round 1 (bare `DELETE`) had exactly this bug. Round 2 upserted an explicit `deny`
+  row instead, on the theory that "the authorization outcome is identical either way (no matching
+  allow → deny)" — **false when the row's table feeds anything beyond a single positive/negative
+  check.** `RbacStore`'s reader applies "deny overrides everything, across ALL of a principal's
+  held roles" (a pre-existing invariant, not new), so a real deny row from the revoked role vetoed
+  an allow the SAME principal held via a DIFFERENT role — an authorization change nobody
+  authorized, on both the global check and a management-group-scoped visibility read. Round 3
+  (shipped): DELETE the row (so the read path sees exactly what the operator authored — absence,
+  same as if the grant never existed) and record the revocation SEPARATELY, in a dedicated
+  bookkeeping table (`revoked_seed_defaults`) consulted ONLY by the reseed step's own grant
+  helper — never by anything that makes an authorization decision. **The general rule: don't
+  represent "suppress the next reseed" as a fact your read path can see.** A tombstone using the
+  same effect/value the read path already interprets is only safe if that value is neutral
+  everywhere it can be read — verify this for every reader (a scoped/confinement path is easy to
+  miss when the store also has a "global" check), not just the one you're staring at. When in
+  doubt, a separate table costs one migration and guarantees it structurally.
+
+  Round 3 shipped a FOURTH bug on top, chaos-tested and closed the same week: `INSERT ... SELECT
+  ... WHERE NOT EXISTS (marker) ... ON CONFLICT DO NOTHING` — a reseed step checking the
+  bookkeeping table above before granting — is **not safe against a concurrent writer of that
+  bookkeeping table** without an explicit lock. A statement's READ COMMITTED snapshot is fixed
+  ONCE, at that statement's start, before any of its own function calls run. If the reseed's
+  snapshot is taken before a concurrent revoke's marker-insert commits, but the reseed's `INSERT`
+  then blocks on the `ON CONFLICT` arbiter waiting for that SAME revoke's uncommitted `DELETE` of
+  the conflicting row, Postgres — once the revoke commits — only re-checks the CONFLICT TARGET
+  (now gone); it does NOT re-evaluate the `WHERE NOT EXISTS` subquery, which is still reading the
+  pre-revoke snapshot. The reseed's already-computed row lands anyway: the marker AND the
+  resurrected row both end up present, permanently — nothing ever re-syncs the data table against
+  the bookkeeping table. Verified empirically (two real connections, one held open uncommitted,
+  the other genuinely blocked and measured). **The lock must be its own statement, in an explicit
+  transaction, strictly BEFORE the statement that checks-and-mutates** — a `pg_advisory_xact_lock`
+  embedded via a CTE in the SAME statement as the check does NOT work, for the identical
+  fixed-snapshot reason: blocking mid-statement never refreshes that statement's snapshot. Fix
+  shape: `BEGIN; SELECT pg_advisory_xact_lock(...); <check-and-mutate>; COMMIT;` in every writer of
+  both the data table and the bookkeeping table, all keyed to the same lock (a fixed/coarse key is
+  fine — this class of write is never a hot path). `RbacStore`'s three writers
+  (`seed_defaults()`'s grant, `remove_permission`, the backfill's revoke block) are the reference
+  case (`kRevokeCoordLockSql`).
 
 ## Non-transactional migrations (the deferred kind)
 

@@ -363,15 +363,17 @@ outstanding across the upgrade still fires. If nothing is awaiting an MCP recall
 there is nothing to do.
 
 **Rolling BACK across this release re-opens the check, and rolling forward does not close it
-again.** The back-fill runs once, as a schema migration. An older server started against an
-already-migrated database does not re-run it and does not refuse to start; approvals it mints while
-you are rolled back record no minting surface, which is the value that stays redeemable. Rolling
-forward will not revisit them, because the migration has already run. Treat a roll-back as a window
-in which the cross-surface check is not in force for newly minted approvals, and let those
-approvals expire rather than relying on them being re-checked. Expiry bounds the window, but note it
-runs from two different points: a pending approval expires 7 days after submission, and an approved
-but unredeemed one 7 days after its review — so an approval minted during a roll-back can remain
-redeemable for up to around a fortnight from the mint, not one week.
+again — but as of this same release, it does not stay open either.** The back-fill runs once, as a
+schema migration. An older server started against an already-migrated database does not re-run it
+and does not refuse to start; approvals it mints while you are rolled back record no minting
+surface at all (the column is never set). Rolling forward will not revisit those rows, because the
+migration has already run — but the MCP mint in this same release always declares its own surface
+(see the "MCP mint now declares its own surface" entry below), so a row with no recorded surface is
+no longer the value that grants: it is refused at recall exactly like a declared foreign surface,
+not exempted. There is no window in which a rollback-minted ticket is redeemable once you are back
+on a current server. Treat a roll-back as a window during which such tickets simply won't work
+later — mint fresh ones after rolling forward rather than relying on anything minted during the
+roll-back.
 
 **What happens.** This release records which surface minted each approval, and rows that predate the
 column carry no surface at all. Rather than assume one they may not have come from, the upgrade
@@ -387,6 +389,49 @@ upgrade time, it does not grow afterwards, and approvals expire after 7 days reg
 server side the refusal is distinguishable: the audit row records `refused: foreign_origin`, not the
 uniform client message.
 
+### vNEXT — the MCP mint now declares its own surface; undeclared tickets stop redeeming (#2442) (breaking)
+
+**Who this affects.** Any deployment holding an **MCP** approval that was granted but not yet
+redeemed at the moment of upgrade — the same population as the entry above, widened. The
+previous release closed the check for a ticket a REST or scheduled mint declared as its own
+surface; an MCP-minted ticket was still exempt, because the MCP gate could not yet declare
+`kMcp` itself. This release removes that exemption: the MCP mint now stamps every new ticket
+`kMcp` explicitly, and an undeclared ticket (the value an omitted `origin` argument used to
+produce) is refused at recall exactly like a declared foreign surface.
+
+**What happens.** Same mechanics as the entry above, same client message
+(`approval already used (one-time ticket)`), same audit distinction (`refused: foreign_origin`).
+The only difference is which population is now caught: any MCP ticket minted by a
+pre-upgrade server — every one of them, since none could declare `kMcp` before this release —
+that is still outstanding when you upgrade.
+
+**Recover** the same way: call the tool again without `approval_id`. The affected population
+does not grow after the upgrade — every ticket minted by the new server declares its surface
+at mint time, so nothing outstanding from this point on can hit this case.
+
+### vNEXT — MCP approval recall is now bound to its submitter (#2442) (intentional compatibility break, no supported flow affected)
+
+**What changes.** An approval ticket's `approval_id` is a bearer capability — presenting it is
+what authorizes the recall — and an id can be **disclosed** to a third party: `GET
+/api/approvals` returns the full id to any principal holding `Approval:Read`, seeded to the
+`Viewer` role. Until this release, a Viewer who also held the target tool's own RBAC permission
+could take another operator's approved ticket id from that listing and redeem it themselves. The
+MCP recall now refuses a ticket whose recorded submitter does not match the recalling principal,
+the same way it already refuses one minted on a foreign surface — same client message, a distinct
+audit token (`refused: foreign_submitter`) for the log.
+
+**Who this affects.** No supported flow: the one production redemption path in this codebase
+(the MCP recall) has only ever redeemed a ticket as the same principal that minted it, verified
+by an exhaustive sweep of every mint and consume call site in the tree, and the non-binding was
+documented as this issue's own hazard, never as an intended capability. What this cannot rule
+out is an external integration that relied on the old behavior to hand an `approval_id` between
+two different authenticated principals deliberately — nothing in this codebase does that, but an
+operator's own tooling might have. If something in your deployment presented a ticket as a
+different principal than the one that minted it, that now fails; there is no supported
+replacement for it today (see #2442 if you need one). Nothing to do at upgrade for the ordinary
+case: there is no outstanding-ticket population affected by this specific change, because a
+legitimately-outstanding ticket was always going to be recalled by its own submitter.
+
 ### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
 
 **Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No
@@ -394,12 +439,15 @@ shipped or bundled content uses that prefix, so a deployment running only Yuzu-s
 needs no action *for this item* — but the outstanding-approval entry above applies regardless of
 what content you run.
 
-**Why.** `mcp.<tool>` names an MCP approval ticket. The MCP recall matches a ticket on its
-definition id and scope expression and does not bind the submitter, so a definition authored
-under that prefix could line up with an MCP tool's canonical arguments — a ticket raised on one
-surface being redeemable on another. Consuming it still required the schema check, the tier
-gate, per-handler RBAC and a human approval, so this closes a namespace confusion rather than an
-open escalation.
+**Why.** `mcp.<tool>` names an MCP approval ticket. At the time this shipped, the MCP recall
+matched a ticket on its definition id and scope expression alone, so a definition authored under
+that prefix could line up with an MCP tool's canonical arguments — a ticket raised on one surface
+being redeemable on another. (Two later releases closed the redemption side of this directly, by
+binding the recall to the ticket's recorded origin and separately to its submitter — see the two
+entries above. This prefix reservation is the narrower, mint-time-adjacent half: it stops a
+definition from being authored under `mcp.` at all.) Consuming a confused ticket still required
+the schema check, the tier gate, per-handler RBAC and a human approval, so this closes a
+namespace confusion rather than an open escalation.
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
 authoring route that accepts an explicit id — `POST /api/instructions`, `POST
@@ -889,6 +937,44 @@ with a clear log line rather than serving degraded or hanging the table. If
 you see this on a rolling upgrade, retry once traffic quiesces (a load
 balancer draining the outgoing replica is usually enough); it is not a data
 integrity concern either way.
+
+### vNEXT — the rotation sweep now carries the full clock-guarded-retention shape (#2964)
+
+**What changed.** `ApiTokenStore::sweep_expired_rotations` — the 60-second
+background sweep that auto-revokes rotation predecessors for *both*
+engine-credential and human API-token overlap pairs — previously issued its
+delete on a bare local wall-clock comparison, capped per tick but with no
+persisted clock anchor and no anomaly detection. It now reads a
+Postgres-authoritative clock, persists a durable anchor in a new
+`rotation_retention_meta` table (schema v4), and classifies every tick
+through the same guard `audit_store`'s retention pass uses — a clock anomaly
+or a not-yet-trustworthy anchor **declines** the tick outright rather than
+revoke on an unverified reading, leaving both credentials in every affected
+pair active for at least one more tick. Detail:
+`docs/user-manual/authentication.md` "Rotating a Token",
+`docs/user-manual/engine-principals.md` "Rotate the credential (overlap-pair
+model)", and `docs/user-manual/metrics.md` "Rotation-sweep clock guard
+metrics".
+
+**HA / multi-replica.** Unlike `audit_store`'s retention pass, this sweep is
+single-writer **by construction**: before it will classify anything, it
+takes a store-wide PostgreSQL **session** advisory lock in its own key
+namespace. This is what makes the per-tick auto-revoke cap (≤200) a
+**cluster-wide** cap rather than a per-replica one that would otherwise let
+an N-replica deployment auto-revoke up to `N x 200` predecessors in one
+tick. A replica that does not win the lock on a given tick records a
+`SkippedLock` outcome and does nothing that tick — expected, routine
+behaviour on a genuinely multi-replica deployment, where roughly
+`(N-1)/N` of ticks land there for any given replica. **On a single-replica
+deployment — the default — this is not "routine leader-election
+contention" at all: one dedicated sweep thread on a sequential 60-second
+loop cannot lose an election against itself, so `SkippedLock` there can only
+mean a *second writer* holding the same session lock** — a zombie process
+left over from a crashed instance, a botched blue-green cutover overlapping
+two live instances briefly, or an unauthorised second server pointed at the
+same DSN. If you run single-replica, treat any sustained non-zero
+`yuzu_rotation_sweep_lock_skipped_total` as a fault to investigate, not
+background noise; see `docs/ops-runbooks/rotation-sweep-clock-guard.md`.
 
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 

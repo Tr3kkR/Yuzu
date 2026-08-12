@@ -575,8 +575,9 @@ current membership. Mirrors the break-glass metric/audit treatment above.
   source; a miswired call passing `"local"` would mass-delete every local
   group membership fleet-wide.
 - **Fail-closed on the login.** An over-cap assertion or a reconcile-store
-  failure (e.g. a locked/corrupt `rbac.db`) denies the login outright before a
-  session is minted — a heavily-loaded or unhealthy `rbac.db` degrades
+  failure (e.g. an unreachable/degraded PostgreSQL `rbac_store` — pool-acquire
+  timeout or query error, ADR-0041) denies the login outright before a
+  session is minted — a heavily-loaded or unhealthy `rbac_store` degrades
   availability (SSO logins fail) rather than integrity (a session with
   stale/unreconciled roles). The break-glass/local-password escape hatch
   (`/login`, hardened-mode) is unaffected — it never calls `/auth/callback`
@@ -706,7 +707,9 @@ unchanged; if that value is later rendered into HTML, the render layer's
 own escaping (`html_escape`) is what neutralises it. See the docstring on
 `detail::sanitize_detail_value` in `auth_routes.hpp` for the full contract.
 
-**Migration.** `RbacStore` schema v3 deletes every `group_members` row
+**Migration.** `RbacStore` **legacy SQLite** schema v3 (distinct from the PG
+schema's own v3, ADR-0041 — different migration sequences, same file)
+deletes every `group_members` row
 belonging to an IdP-sourced group (`groups.source != 'local'`) on
 upgrade — those rows were keyed on the OLD display-name principal and
 would otherwise be BOTH orphaned (never re-referenced by the new
@@ -879,8 +882,9 @@ sweep described at the top of this bullet, for every `auth_source`.
 Implementation: `Session::username`/`display_name`
 (`auth.hpp`), `AuthManager::create_oidc_session` (`auth.cpp`), the
 stable-id construction and per-audit-row `display=`/`email=` detail
-attachment in `auth_routes.cpp` `/auth/callback`, `RbacStore` migration
-v3 (`rbac_store.cpp`). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
+attachment in `auth_routes.cpp` `/auth/callback`, `RbacStore` legacy SQLite
+migration v3 (`rbac_store.cpp`; distinct from the PG schema's own v3,
+ADR-0041). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
 
 ## SAML 2.0 SP
 
@@ -1802,8 +1806,9 @@ existing deployment picks up the `EnginePrincipal` securable and its grants
 on the next boot with no migration required — the same mechanism that
 introduced `AccessReview` and `SoftwareLicensing`. A migration is needed
 only when a change cannot be expressed as an idempotent additive re-seed
-(`rbac_store.cpp`'s v4 migration *deletes* rows, which is why it needed
-one).
+(`rbac_store.cpp`'s legacy SQLite v4 migration *deletes* rows, which is why
+it needed one — distinct from the PG schema's own migration sequence,
+ADR-0041, currently at v3).
 
 ## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 
@@ -1901,8 +1906,10 @@ resulting latency bounds.
   to the legacy pre-RBAC path or the MCP-tier/service-scoped resolution used
   for human and agent sessions. An engine session's authority is resolved
   **exclusively** against `RbacStore`:
-  - `rbac_store_` null/unopened → **`503`** (cannot evaluate authority;
-    retryable, never a silent allow).
+  - `rbac_store_` unavailable — null/unopened, or a runtime degrade of the
+    PostgreSQL `rbac_store` substrate (pool-acquire timeout / query error,
+    ADR-0041) — → **`503`** (cannot evaluate authority; retryable, never a
+    silent allow — the deny-on-degrade contract).
   - RBAC disabled, or no matching `(principal="engine:<slug>", role, scope)`
     grant → **`403`**.
   - A matching grant → allowed.
@@ -1923,9 +1930,10 @@ resulting latency bounds.
 - **Reserved-namespace fail-closed guards.** `find_local_groups_with_prefix`
   returns `std::nullopt` (not an engaged-empty optional) when the RBAC store
   can't be read, and the `server.cpp` boot-time `engine:`-collision preflight
-  requires `rbac_store_->is_open()` before trusting a clean scan — a corrupt
-  `rbac.db` now fails the boot closed rather than booting "clean" past a
-  reserved-namespace collision it could not actually see. `upsert_sso_identity`
+  requires `rbac_store_->is_open()` before trusting a clean scan — a degraded
+  or unreachable `rbac_store` (PostgreSQL substrate, ADR-0041) now fails the
+  boot closed rather than booting "clean" past a reserved-namespace collision
+  it could not actually see. `upsert_sso_identity`
   separately rejects any `engine:`-prefixed write at the SSO identity-sync
   surface (design §3.3), sharing the `kEngineReservedPrefix` constant with the
   store's own create-path guard.
@@ -2661,3 +2669,229 @@ MFA fail-closed on secret-read failure, cleanup cadence, snapshot-and-release
 publishing) live in `.claude/agents/authdb.md` — the AuthDB review agent
 loads them on any change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` /
 `auth.{hpp,cpp}`.
+
+## RbacStore — the authorization substrate (Postgres, ADR-0041 — SQLite `rbac.db` retired)
+
+`RbacStore` (`server/core/src/rbac_store.{hpp,cpp}`) is the **authorization
+substrate**: role definitions, role→permission grants, principal→role
+assignments, RBAC groups + membership, and the global `rbac_enabled` flag.
+`require_permission` / `require_scoped_permission` / `authorize_list_read`
+(World-A confinement, ADR-0017) / the engine-principal default-deny path
+(ADR-0031) all resolve through it. It moved from the SQLite `rbac.db` file to
+the server's PostgreSQL substrate in the ADR-0041 (Wave 2.1) migration, schema
+**`rbac_store`**, born-on-Postgres on the shared server `PgPool` with
+fail-closed construction (`!is_open()` → the server refuses to start,
+ADR-0007/0012 §1). It is the **highest-blast-radius store** on the migration
+ladder — a defect here is a fleet-wide authorization failure — and reuses the
+shared pool, so it adds **no new flag or environment variable**.
+
+**Reads FAIL CLOSED — deny-on-degrade (the load-bearing invariant).** Every
+authz read keeps its `bool`/deny-on-error contract: a store-not-open,
+pool-acquire timeout, or query error returns **deny** (`false` for the
+`check_permission` / `check_scoped_permission` / `holds_permission_via_any_group`
+/ `check_role_has_permission` bool checks; the empty/most-restrictive result for
+the list/scope reads), NEVER allow. Where a caller needs to distinguish "denied"
+from "store degraded" for a 403-vs-503 decision (e.g. `authorize_list_read`),
+that is exposed via a **separate** tri-state / `std::expected` accessor — the
+plain `bool` path stays deny-on-error so no existing chokepoint can regress to
+fail-open. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
+under SQLite a corrupt/unreadable RBAC store could fall through to an engaged
+allow at some call sites; the PostgreSQL `rbac_store` now denies on any degrade.
+
+**Cross-replica coherence — durable generation token.** Each replica keeps its
+in-process permission cache (`perm_cache_`) but validates it against a **durable
+`rbac_meta.write_generation` counter** bumped in the same transaction as every
+mutation (`assign_role`, `unassign_role`, `set_permission`, role/group changes,
+`set_rbac_enabled`). A read refreshes its cached view of the durable generation
+at most once per `kRbacGenerationRefreshMs` (1000 ms — one cheap indexed
+single-row `SELECT`, not a permission re-query) and clears `perm_cache_` on a
+change; a local mutation bumps the counter and clears its own cache immediately.
+This bounds cross-replica staleness to the refresh interval under normal
+conditions: a revoke on replica A is typically visible on replica B within
+~1 s. **That bound is a target the refresh loop aims for, not a hard
+guarantee**: the interval-gating timestamp is claimed BEFORE the query runs
+(deliberately, to prevent a refresh stampede), so a concurrent reader that
+lands while a refresh is genuinely slow (pool saturation, a Postgres blip)
+can observe staleness beyond the interval. That condition is now measured,
+not silently assumed: a durable-completion timestamp tracks only actual
+refresh successes (separately from the stampede-gating timestamp), and a
+reader who misses the gate while already past the bound counts a
+`stale_beyond_accepted_bound` degrade (fjarvis #2703 F3) — the read still
+proceeds from the existing cache; nothing is denied. **Updated 2026-08-11
+(#2703 Gate 7 merge-slice, ADR-0041 "Update" section — supersedes the
+original "assume changed" text below it):** a failed generation refresh no
+longer clears the cache immediately. Trust is extended for a bounded **~5 s**
+window (`kRbacStaleServeBoundMs`) past the last confirmed-good refresh — a
+deliberate bounded-staleness-for-continuity tradeoff, layered underneath the
+~1 s propagation target above. Only once that 5 s bound is exceeded is the
+failure treated as "assume changed" (cache cleared) and counted as a
+`generation_refresh_failed` degrade. A separate fail-fast circuit breaker
+(2 consecutive pool-acquire/query failures) independently bounds how long an
+**uncached** check can block on a doomed pool — it denies such checks
+immediately once open, but it does not itself clear the cache or shorten the
+5 s bound; a cache hit is served regardless of breaker state. **The bound is
+tight only for pool-acquisition failure** (no connection available within
+the 250ms acquire budget — well under a second for 2 consecutive attempts).
+A query that acquires a connection and then blocks on a PostgreSQL-side lock
+inherits `PgPool`'s `lock_timeout` (10s default) instead — measured ~18.5s
+for 2 such attempts against a live held `ACCESS EXCLUSIVE` lock on
+`rbac_meta` (#3016); both modes still converge on a fail-closed deny, just
+not at the same speed. See
+`docs/enterprise-readiness-soc2-first-customer.md`'s "Availability posture
+under PostgreSQL degradation" note for the full mechanism and its CAIQ
+characterization. **The `rbac_enabled` flag propagates on the same durable
+path.** The ~1 s bounded stale-allow window is an **accepted, gate-recorded
+residual risk** (well inside the fleet's minutes-scale revocation-latency
+envelope); `LISTEN/NOTIFY` (window → 0) is the named follow-up. **The 5 s
+stale-serve bound above covers this flag's cached view too, not just
+`perm_cache_`:** `rbac_enforcement_in_effect()` — the fail-closed accessor
+every confinement-critical caller MUST use instead of the raw
+`is_rbac_enabled()` — consults `rbac_enabled_view_degraded()`, which is
+gated by the same `kRbacStaleServeBoundMs` window as the permission cache.
+A refresh failure inside the bound therefore keeps trusting the
+last-known-good `rbac_enabled` state exactly as it keeps trusting cached
+permission verdicts; only past the bound does the view count as degraded
+and `rbac_enforcement_in_effect()` fail closed (treats degraded the same as
+enabled) regardless of what the raw flag last read.
+
+**Terminology note:** every "the bound" reference in this paragraph and the
+ones above it means `kRbacStaleServeBoundMs` (~5 s, the trust/staleness
+bound governing when cached state stops being trusted) — a DIFFERENT
+constant from `kRbacGenerationRefreshMs` (~1 s, the propagation-target
+interval discussed earlier in this section, which only governs how often a
+refresh may even be attempted and carries no trust semantics of its own).
+
+**Addendum (2026-08-11, same day, pre-merge, never shipped, G11-CPPEXPERT-B2):**
+"a failed generation refresh" above describes only a refresh attempt that
+*ran to completion* and then failed. Gate 8 re-review found the fix missed a
+second trigger the same 5 s bound needs to cover just as strictly: a refresh
+attempt stuck in flight and never completing at all — e.g. blocked on the
+`ACCESS EXCLUSIVE`-class lock contention discussed above, for up to the full
+~10 s `lock_timeout`. Every concurrent caller during that stall either takes
+the gated fast-return path (no state touched) or is itself blocked inside its
+own query, so the completed-failure code path that degrades the cache never
+ran — trust could be extended for the whole stuck-in-flight duration, not
+just the intended 5 s. Fixed same-day: the staleness check now measures
+elapsed time directly rather than depending on a refresh attempt's own
+completion, at all three sites that decide whether cached state is still
+trustworthy (now one shared chokepoint, `generation_view_stale_locked()`).
+Never shipped; no SOC 2 assessment period or deployed fleet carried the gap.
+
+**Fail-closed BOOT on the `rbac_enabled` flag.** The `rbac_enabled` flag is
+durable in `rbac_meta`. An unreadable OR non-canonical flag at boot **refuses
+to start** — the server never serves RBAC-**off** on a fleet that had enabled
+it (which would silently make every confined operator fleet-wide-authorized:
+a catastrophic fail-open). "Non-canonical" means any value other than the
+exact strings `"true"`/`"false"` (fjarvis #2703 F2) — a query error or a
+missing row was always fail-closed, but a *readable* value that wasn't
+exactly one of those two strings previously coerced silently to `false`. A
+schema-level `CHECK` constraint on `rbac_meta.value` for this key rejects a
+non-canonical write outright as defense in depth; the application-level
+strict parse is what refuses to boot if a bad value ever lands regardless.
+
+**Mandatory backfill (ADR-0009/0041).** Unlike the AuthDB fresh-start cutover,
+RBAC state is irreducible operator-authored config that **cannot be
+re-derived** — custom roles, every principal→role grant, groups, and
+membership — so the migration performs a one-time, single-shot, idempotent
+(retried from scratch on interruption — not a cursor-resumed stream, unlike
+AuditStore's larger dataset), reconciled, **fail-CLOSED** backfill from the
+legacy `rbac.db` (seed defaults first, then backfill operator rows via `ON CONFLICT DO NOTHING`;
+operator edits to seeded permissions are preserved via `DO UPDATE`). A
+built-in default permission the operator explicitly revoked (`remove_permission`)
+before upgrading is **deleted** — matching legacy exactly, a plain absent row
+— scoped to (role, securable_type, operation) triples legacy's own catalogue
+actually knew about, so a securable a later `seed_defaults()` adds (e.g.
+`EnginePrincipal`, #2376) or an operation added to an existing role+type pair
+(e.g. `ApiToken:Rotate` — fjarvis #2703 re-review, C1) is untouched (fjarvis
+#2703 F1). The revocation is
+recorded SEPARATELY, as pure reseed-suppression bookkeeping in a dedicated
+`revoked_seed_defaults` table — consulted ONLY by `seed_defaults()`'s grant
+helper, never by any authorization-decision code path — so `seed_defaults()`'s
+unconditional every-boot reseed cannot silently resurrect the revoked default
+without ever making it a real authorization fact again. This mirrors
+`remove_permission()`'s own permanent mechanism for the identical hazard
+beyond the one-time cutover. THREE earlier versions of this fix each
+reintroduced a hazard, all caught by governance before merge (none ever
+pushed to `origin`): a plain `DELETE` with no marker resurrects on the very
+next restart (verified empirically — a second `RbacStore` construction
+against the same database brought the revoked permission back); an
+`effect='deny'` tombstone avoids that but is a REAL authorization fact —
+`check_permission()` / `check_scoped_permission()` / `authorize_list_read()`
+all apply "deny overrides everything, across ALL of a principal's held
+roles" (pre-existing, identical in the legacy store), so the tombstone
+silently changed the authorization OUTCOME for any principal holding a
+second role that independently grants the same permission — on both the
+global and the management-group-scoped read paths (verified empirically
+both ways); the DELETE+marker design that fixes both has its own
+concurrency hazard (**CHAOS-1**) — `seed_defaults()`'s `grant()` fixes its
+READ COMMITTED snapshot at statement start, so if a concurrent revoke's
+marker-insert commits WHILE `grant()` is blocked on the `ON CONFLICT`
+arbiter waiting for that same revoke's uncommitted `DELETE`, Postgres only
+re-checks the conflict target after unblocking — never the `WHERE NOT
+EXISTS` subquery — and `grant()`'s already-computed row lands anyway,
+resurrecting the permission with the marker present but ineffective. Most
+likely during a fleet-wide rolling restart (many replicas' `seed_defaults()`
+calls racing another replica's one-time backfill). Closed with a
+`pg_advisory_xact_lock`, acquired in its own statement strictly BEFORE the
+check-and-mutate statement, in an explicit transaction, in all three writers
+(`grant()`, `remove_permission()`, the backfill's own revoke step) —
+verified empirically with two real Postgres connections, and safe for any
+replica boot ordering. Reconciliation counts roles + grants + groups +
+members and refuses the completion marker on any shortfall (fail-closed →
+refuse boot, retry next start). **The `rbac_enabled` flag is migrated first
+and read-back-verified** before the store is considered open (losing it is
+the single most dangerous outcome); a flag-backfill failure fails the whole
+backfill closed. The legacy `rbac.db` is moved aside only after a verified
+backfill.
+
+**Cross-replica marker fingerprinting (governance re-review, #2703).** The
+shared Postgres `backfill_complete` marker alone cannot distinguish
+"genuinely no legacy data anywhere" from "a fileless replica happened to
+check first" — stamping it from local absence alone let a fileless replica
+permanently foreclose migration for a sibling genuinely holding the real
+`rbac.db` (matches the anti-pattern `docs/postgres-store-playbook.md`
+documents for `AuditStore`, #2697). The fix: a SHA-256 content fingerprint
+of the legacy file (length-prefixed, injective encoding over every migrated
+row — not a delimiter join, which cannot safely disambiguate unconstrained
+operator free-text) is stamped alongside the marker, in the same
+transaction, derived from the exact rows actually migrated (no second file
+read — the trust anchor and the migrated data come from one shared
+in-memory snapshot). Any later replica that still holds a local legacy file
+re-derives its own fingerprint and verifies it against the stored value
+before trusting an existing marker: a genuine match skips (safe); anything
+else fails closed, with a distinct diagnostic for each of a stored
+`"sourceless"` value (no real migration has happened yet, but this later
+boot cannot bound what live post-cutover mutations — e.g. IdP group
+reconciliation — a fresh auto-migration might clobber), a genuinely
+different real fingerprint, and an absent fingerprint from a marker that
+predates this mechanism. None of the fail-closed cases auto-retry; a
+genuine prior migration under live operator changes since cannot be told
+apart from a different replica's completion this file was never part of.
+Promotion of a stored `"sourceless"` value to a real fingerprint happens
+only at STAMP TIME, inside a replica's own migration (a monotonic upsert in
+`stamp_complete`) — by then that replica's writes are already durably
+committed, so correcting the trust anchor cannot clobber anything; a later
+boot's mismatch is a materially different, unbounded situation and always
+refuses. Operator-facing failure modes and recovery:
+`docs/ops-runbooks/rbac-store-backfill-recovery.md`.
+
+**Metrics.** `yuzu_server_rbac_read_degrade_total{reason}` — three
+DENYING reasons (`pool_acquire_timeout` / `query_error` /
+`generation_refresh_failed`): a degrade denies authz fleet-wide, so a
+non-zero rate on one of these is a fleet-wide authorization-availability
+event, and the `YuzuRbacReadDegraded` alert pages on exactly this subset.
+Two OBSERVE-ONLY reasons share the same metric but deny nothing — the read
+still proceeds — and are deliberately excluded from that alert:
+`rbac_enabled_non_canonical` (a periodic refresh saw a non-canonical value;
+the cached enabled-state is left unchanged rather than coerced) and
+`stale_beyond_accepted_bound` (see the cross-replica coherence paragraph
+above). Also `yuzu_server_rbac_backfill_total{result}` (result ∈ `fresh` /
+`completed` / `failed`). See `docs/user-manual/metrics.md` and the
+`YuzuRbacReadDegraded` alert in `docs/prometheus/yuzu-alerts.yml`.
+
+**Read split for reviewers.** The plain `bool` authz checks fail closed
+(deny-on-error) so no chokepoint can regress to fail-open; the tri-state
+`_checked` / `std::expected` accessors are the ONLY place a caller may learn
+"degraded" (503) as distinct from "denied" (403). A new read must land on the
+correct side of this split — see ADR-0041 and
+`docs/adr/0017-management-group-confinement-list-reads.md`.

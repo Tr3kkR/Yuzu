@@ -56,7 +56,6 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <memory>
 #include <set>
@@ -639,6 +638,22 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 #include <memory>
 #include <stdexcept>
 #include <vector>
+
+namespace {
+// Pre-migrated template for RbacStore (PG port). Shares the "rbacstore" key
+// with test_rbac_store.cpp's own template (identical setup, replay-verified
+// — docs/postgres-store-playbook.md step 7). Every TEST_CASE below just
+// needs an OPEN RbacStore to satisfy the #1717 fail-closed guard, not RBAC
+// behavior itself.
+yuzu::test::PgTestTemplate mcp_rbac_tpl{"rbacstore", [](const std::string& dsn) {
+                                            yuzu::server::pg::PgPool pool{
+                                                {.conninfo = dsn, .size = 1}};
+                                            yuzu::server::RbacStore store{pool};
+                                            if (!store.is_open())
+                                                throw std::runtime_error(
+                                                    "rbac template: store failed to migrate/seed");
+                                        }};
+} // namespace
 
 namespace {
 
@@ -2856,8 +2871,12 @@ TEST_CASE("MCP Integration: discover_routes matches the OpenAPI-derived catalog"
     CHECK(got.value("source", "") == "openapi");
 }
 
-TEST_CASE("MCP Integration: discover_permissions wired vs unwired", "[mcp][integration][discovery]") {
-    yuzu::server::RbacStore rbac(":memory:");
+TEST_CASE("MCP Integration: discover_permissions wired vs unwired",
+          "[mcp][integration][discovery][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool};
     REQUIRE(rbac.is_open());
 
     McpTestServer ts;
@@ -2894,10 +2913,11 @@ TEST_CASE("MCP Integration: discover_permissions wired vs unwired", "[mcp][integ
     // Infrastructure:Read gate, and the taxonomy must still be served — the split
     // exists so A2 discovery of the permission MODEL survives.
     {
-        yuzu::server::RbacStore rbac_denied(":memory:");
-        REQUIRE(rbac_denied.is_open());
+        // The denial comes from perm_override_for_test below, not from a
+        // special store state — the outer PG-backed `rbac` (already open and
+        // seeded) is reused rather than opening a second store.
         McpTestServer ts_denied;
-        ts_denied.rbac_store_for_test = &rbac_denied;
+        ts_denied.rbac_store_for_test = &rbac;
         ts_denied.perm_override_for_test = [](const std::string& securable,
                                               const std::string& operation) {
             return !(securable == "UserManagement" && operation == "Read");
@@ -7610,12 +7630,15 @@ yuzu::server::AgentLicenseRow sle_pii_row() {
 } // namespace
 
 TEST_CASE("MCP query_software_licenses: scope gate unwired → fail closed (never legacy-open)",
-          "[mcp][sle]") {
+          "[mcp][sle][pg]") {
     // No scoped_perm_fn wired (default empty). The twin must REFUSE, not fall through
     // to a global/legacy-open read of per-agent licence facts — parity with the REST
     // drill's sle_gate_usable fail-closed posture.
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ the #1717 guard passes (it targets a
-    REQUIRE(rbac.is_open());                  // CORRUPT db; see the dedicated fail-close test)
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ the #1717 guard passes (it targets a
+    REQUIRE(rbac.is_open());                 // CORRUPT db; see the dedicated fail-close test)
     McpTestServer ts; // no scoped gate, no store
     ts.rbac_store_for_test = &rbac;
     ts.start();
@@ -7652,24 +7675,18 @@ TEST_CASE("MCP query_software_licenses: authorization subsystem unavailable → 
 }
 
 TEST_CASE("MCP query_software_licenses: corrupt rbac.db (non-null, closed) → #1717 fail closed",
-          "[mcp][sle]") {
+          "[mcp][sle][pg]") {
     // The OTHER arm of the #1717 guard (`rbac_store && rbac_store->is_open()`):
     // the sibling test above leaves the store null; this one hands the twin a
-    // NON-NULL store whose backing file is garbage bytes, so sqlite3_open_v2
-    // succeeds but the schema migration hits SQLITE_NOTADB and RbacStore
-    // closes db_ — the literal #1717 corrupt-but-openable scenario. Both arms
-    // collapse into one boolean today, so only this case would catch a future
-    // null-prefix refactor (`if (rbac_store && ...)`) breaking the corrupt
-    // arm (#2104).
-    yuzu::test::TempDbFile db{"yuzu_test_mcp_rbac_corrupt-"};
-    {
-        // NON-empty garbage: SQLite treats a zero-byte file as a valid fresh
-        // database, which would open cleanly and defeat the test.
-        std::ofstream f(db.path, std::ios::binary | std::ios::trunc);
-        REQUIRE(f.is_open());
-        f << "not a valid sqlite database";
-    }
-    yuzu::server::RbacStore broken(db.path);
+    // NON-NULL store whose backing substrate never connects, so is_open()
+    // stays false — the PG analogue of the #1717 corrupt-but-openable
+    // scenario (an unroutable DSN leaves migration never having run). Both
+    // arms collapse into one boolean today, so only this case would catch a
+    // future null-prefix refactor (`if (rbac_store && ...)`) breaking the
+    // unusable-but-non-null arm (#2104).
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore broken{bad_pool};
     REQUIRE_FALSE(broken.is_open());
 
     McpTestServer ts;
@@ -7691,8 +7708,11 @@ TEST_CASE("MCP query_software_licenses: corrupt rbac.db (non-null, closed) → #
     CHECK(saw_failure);
 }
 
-TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[mcp][sle]") {
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[mcp][sle][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -7710,12 +7730,15 @@ TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[
 }
 
 TEST_CASE("MCP query_software_licenses: out-of-scope agent is 403'd by the scoped gate",
-          "[mcp][sle]") {
+          "[mcp][sle][pg]") {
     // The per-device confinement (ADR-0017): a group-scoped operator reading an agent
     // OUTSIDE their management group is 403'd by the same scoped gate the REST drill
     // takes — the licence facts are never served, and no store read is attempted.
     std::vector<std::string> calls;
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -7742,10 +7765,14 @@ TEST_CASE("MCP query_software_licenses: out-of-scope agent is 403'd by the scope
     CHECK(res->body.find("store unavailable") == std::string::npos);
 }
 
-TEST_CASE("MCP query_software_licenses: store unavailable → A4 internal error", "[mcp][sle]") {
+TEST_CASE("MCP query_software_licenses: store unavailable → A4 internal error",
+          "[mcp][sle][pg]") {
     // Scope gate PASSES (in-scope agent) but no store is configured on this deployment.
     // The twin must return the A4 error envelope, never success+empty.
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -7782,7 +7809,7 @@ TEST_CASE("MCP query_software_licenses: success shape + user_ref/user_scope OMIT
     REQUIRE(store.is_open());
     REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
 
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    yuzu::server::RbacStore rbac{pool}; // open ⇒ #1717 guard passes (shares the SLE pool)
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -7843,7 +7870,7 @@ TEST_CASE("MCP query_software_licenses: a degraded store errors, never success+[
         REQUIRE(drop.status() == PGRES_COMMAND_OK);
     }
 
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    yuzu::server::RbacStore rbac{pool}; // open ⇒ #1717 guard passes (shares the SLE pool)
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -7885,7 +7912,7 @@ TEST_CASE("MCP query_software_licenses: dropped audit row surfaces audit_persist
     REQUIRE(store.is_open());
     REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
 
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    yuzu::server::RbacStore rbac{pool}; // open ⇒ #1717 guard passes (shares the SLE pool)
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -7930,7 +7957,7 @@ TEST_CASE("MCP query_software_licenses: throwing audit_fn is caught → audit_pe
     REQUIRE(store.is_open());
     REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
 
-    yuzu::server::RbacStore rbac(":memory:");
+    yuzu::server::RbacStore rbac{pool}; // shares the SLE pool
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -8223,6 +8250,83 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
     auto body3 = nlohmann::json::parse(res3->body);
     REQUIRE(body3.contains("error"));
     CHECK(body3["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP approval recall refuses a ticket presented by a different principal "
+          "than its submitter",
+          "[mcp][integration][tag][approval][security]") {
+    // End-to-end sibling to the store-level submitter-binding tests
+    // (test_approval_manager.cpp): mints and recalls through the REAL MCP
+    // handler, not directly against ApprovalManager, so this pins the
+    // client-facing envelope and the audit string the store-level tests
+    // cannot see. The scenario this closes: operator2 read operator1's
+    // approved ticket id off GET /api/approvals (Approval:Read, seeded to
+    // Viewer) and also holds delete_tag's own RBAC permission.
+    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_2442_mcp_tag_"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_2442_mcp_appr_"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("operator");
+
+    // 1. Mint as operator1 — mock_username is read at call time, so this test
+    //    can swap principals between calls on the SAME server instance.
+    ts.mock_username = "operator1";
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":260,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+    REQUIRE(appr.get(approval_id)->submitted_by == "operator1");
+    REQUIRE(appr.get(approval_id)->origin == ApprovalOrigin::kMcp); // the real mint declares it
+
+    // 2. Recall as operator2 — same tool, same arguments, foreign principal.
+    ts.mock_username = "operator2";
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":261,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // Same client-facing shape as an ordinary replay or a foreign-origin
+    // refusal — the anti-oracle constraint (kNotConsumableMessage) applies
+    // identically to this kind.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"] == "approval already used (one-time ticket)");
+    CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
+    // Not masked — the binding-check read succeeded, it just refused.
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 0.0);
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back() == "approval_id=" + approval_id + " refused: foreign_submitter");
+
+    // Untouched — the rightful submitter can still redeem it.
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+    CHECK(tags.get_tag("agent-1", "role") == "web"); // not deleted
+
+    ts.mock_username = "operator1";
+    auto res2 = ts.call(recall);
+    auto payload2 = write_tool_payload(res2);
+    CHECK(payload2["deleted"] == true);
+    CHECK(tags.get_tag("agent-1", "role").empty()); // the rightful submitter DID delete it
     sqlite3_close(raw);
 }
 
@@ -8738,10 +8842,11 @@ TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too,
     REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
     CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
     CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
-    // Negative control: this fault hit only the CAS, AFTER the origin check
-    // already passed (the MCP mint's ticket is kUnspecified, which grants) —
-    // the masked-denial counter must stay at zero, not fire on every
-    // store-error kind indiscriminately.
+    // Negative control: this fault hit only the CAS, AFTER the binding check
+    // already passed (the MCP mint declares ApprovalOrigin::kMcp, and this
+    // recall's own principal is the ticket's submitter) — the masked-denial
+    // counter must stay at zero, not fire on every store-error kind
+    // indiscriminately.
     CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
               .value() == 0.0);
     REQUIRE(!ts.audit_details.empty());
@@ -8852,7 +8957,7 @@ TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreig
               .value() == 1.0);
     REQUIRE(!ts.audit_details.empty());
     CHECK(ts.audit_details.back() ==
-          "approval_id=" + approval_id + " refused: store_error (origin unverified)");
+          "approval_id=" + approval_id + " refused: store_error (origin/submitter unverified)");
 
     REQUIRE(sqlite3_set_authorizer(conn.h, nullptr, nullptr) == SQLITE_OK);
 
@@ -9092,7 +9197,8 @@ TEST_CASE("MCP 2405: approved ticket bound to schema-invalid args is rejected an
 
     // Seed the pre-#2405 state directly: a ticket already minted for
     // schema-invalid args (missing `key`) and approved by an admin.
-    auto seeded = h.appr->submit("mcp.delete_tag", "test-user", R"({"agent_id":"agent-1"})");
+    auto seeded = h.appr->submit("mcp.delete_tag", "test-user", R"({"agent_id":"agent-1"})", "",
+                                 yuzu::server::ApprovalOrigin::kMcp);
     REQUIRE(seeded);
     REQUIRE(h.appr->approve(*seeded, "reviewer-bob", ""));
 
@@ -10043,7 +10149,8 @@ TEST_CASE("MCP approve_request approves a pending request as a second principal"
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
     yuzu::server::ApprovalManager appr(raw);
     appr.create_tables();
-    auto submitted = appr.submit("some.definition", "alice", "{}");
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
     REQUIRE(submitted);
 
     McpTestServer ts;
@@ -10071,7 +10178,8 @@ TEST_CASE("MCP reject_request rejects a pending request", "[mcp][integration][ap
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
     yuzu::server::ApprovalManager appr(raw);
     appr.create_tables();
-    auto submitted = appr.submit("some.definition", "alice", "{}");
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
     REQUIRE(submitted);
 
     McpTestServer ts;

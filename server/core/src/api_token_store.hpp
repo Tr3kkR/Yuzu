@@ -63,11 +63,81 @@
 // site instead of one `#include`.
 #include <libpq-fe.h>
 
+// STL -> third-party -> project (docs/cpp-conventions.md) — this project
+// header sits last, below the libpq-fe.h third-party include above.
+#include <yuzu/audit_retention_rules.hpp> // Facts/Anomaly/classify — this store's rotation sweep
+                                     // REUSES the shared pure decision function rather than
+                                     // forking a second copy, the same way
+                                     // result_set_store.cpp/guaranteed_state_store.cpp/
+                                     // response_store.cpp already do (each contributes its own
+                                     // probe SQL/meta table/dedup serialisation around the SAME
+                                     // Facts/classify pair; the truth table itself needs no
+                                     // per-store retest — test_audit_retention_rules.cpp already
+                                     // pins it exhaustively and it has no store-specific
+                                     // behaviour). This is the routed clock-guarded-retention
+                                     // concern's own "Reference impl for the DECISION rule" note
+                                     // (`audit_retention_rules.hpp::classify` +
+                                     // `AuditStore::cleanup_once`) — not tied to one of its
+                                     // seven numbered parts.
+
 namespace yuzu::server::pg {
 class PgPool;
 }
 
 namespace yuzu::server {
+
+// Part 7 (clock-guarded-retention routed concern): ABSOLUTE elapsed-step
+// threshold for the T12 rotation sweep's clock guard (#2964), never scaled
+// to a retention window (this store has none to scale against — only a 60s
+// tick cadence, `server.cpp`).
+//
+// A bare copy of `audit_store`'s constant (86'400, one day) fails the
+// routed concern's own "copy the SHAPE, never the numbers" rule:
+// `audit_store` re-anchors far less often than every 60s, so a one-day
+// floor on a 60-second cadence would silently tolerate a forward jump of
+// just under 24 hours — precisely the sub-86400 hole this store's
+// (now-removed) would-wipe probe was being asked to cover instead (see the
+// DELIBERATE NON-ADOPTION comment in the .cpp). The value below is instead
+// derived from THIS store's own re-anchor cadence: 60 consecutive missed
+// re-anchors at the 60s tick cadence (`server.cpp`'s sweep-thread loop
+// period) is itself remarkable — either the sweep has gone genuinely unable
+// to reach a verdict for an hour straight (a real outage) or the clock
+// moved by more than an hour, and either warrants a decline+report rather
+// than a silent drain. An ordinary transient blip (one failed pool
+// acquire, one skipped-lock tick) is one to a handful of ticks, nowhere
+// near this floor, so this does not fire on routine contention.
+//
+// DOMINANT TRIGGER: at the 86'400 floor a planned no-verdict gap (a
+// maintenance window, a DB failover, a dev instance left off overnight)
+// was rare enough to ignore; at this 3'600 floor it is the MOST COMMON
+// `Step` trigger — an hour of `Failed` ticks reaches this threshold on its
+// own, no clock fault required. Every operator-facing surface for this
+// guard (`describe()` below, the user-manual/metrics/alert-runbook docs)
+// must present "clock fault" as ONE possible cause of `Step`, never the
+// only one.
+//
+// RESIDUAL: a forward jump strictly UNDER this floor is undetected by
+// every detector in this store's fact set and can retire predecessors up
+// to just under an hour early. This is a DELIBERATE, bounded gap, not an
+// oversight — UP-5 (the per-pair re-assertion under the row lock) proves
+// the successor was actually presented before any predecessor in the pair
+// is touched, and `kOverlapCeilSecs` (10 years) means no legitimate
+// overlap window is anywhere near this floor's scale, so the earliest a
+// sub-floor jump can cut a window short is still bounded by that window's
+// own length, never by an unbounded amount.
+//
+// MULTIPLIER: "60 ticks" is a CHOSEN point for this store, not a derived
+// one — the routed concern requires the number be argued from THIS
+// store's own substrate (done above), not that the multiplier itself be
+// self-evident. Sibling guards choose their own multiples of their own
+// cadences for the same reason (e.g. `audit_store.hpp`'s
+// `kAuditMinBigStepSec`, 7 days against a re-anchor cadence far coarser
+// than this store's 60s) — copy the SHAPE (derive from this store's own
+// cadence), never a sibling's chosen multiplier.
+//
+// Namespace-scope (not a class member) so a test can reference it without
+// duplicating the magic number.
+inline constexpr std::int64_t kRotationSweepBigStepSecs = 60 * 60; // 60 ticks x 60s/tick = 1h
 
 // Forward-declared rather than pulling in engine_principal_store.hpp here —
 // a scoped enum's underlying type defaults to `int`, so an opaque
@@ -524,14 +594,208 @@ public:
         ApiToken successor;
     };
 
-    /// T12 sweep, half 1 — auto-revoke (design doc §7 bullet 3): revokes
-    /// every predecessor whose overlap window has elapsed
-    /// (`overlap_expires_at > 0 AND overlap_expires_at <= now`, not yet
-    /// revoked) and clears the SURVIVING successor's rotation state
+    /// Outcome of one `sweep_expired_rotations` call — a TYPED result (#2964),
+    /// never the pair of bools this replaced. The two bools could not distinguish "the clock
+    /// guard declined the whole pass" from "nothing happened to be
+    /// eligible" (both left `tick_failed=false` and an empty vector), and
+    /// could not distinguish "another replica is sweeping this tick"
+    /// (routine leader-election contention, never worth a warning) from a
+    /// genuine fault.
+    enum class SweepOutcome {
+        Failed,      ///< Pool/query/txn failure — this tick did not run to completion.
+        SkippedLock, ///< Another replica holds the store-wide sweep lock this tick.
+        Declined,    ///< The clock guard declined the pass — see `decline_reason`.
+        Ok,          ///< The pass ran to completion (possibly zero eligible).
+    };
+
+    /// Return value of `sweep_expired_rotations` — see `SweepOutcome` above
+    /// and the method's own doc comment for what each field means per
+    /// outcome.
+    struct SweepResult {
+        SweepOutcome outcome = SweepOutcome::Failed;
+        /// Predecessors actually revoked this call (`principal_id`/
+        /// `token_id` populated, `token_hash` masked same as every other
+        /// read here). Only ever non-empty when `outcome == Ok`.
+        std::vector<ApiToken> revoked;
+        /// True when more eligible predecessors existed than
+        /// `kMaxAutoRevokesPerTick` allowed this tick and the remainder was
+        /// deferred to later ticks. Only meaningful when `outcome == Ok`
+        /// (a `Declined`/`SkippedLock`/`Failed` pass processes nothing, so
+        /// this stays `false` on all three).
+        bool capped = false;
+        /// Actionable text for the caller's log line / audit row. Populated
+        /// (never blank) iff `outcome == Declined`.
+        std::string decline_reason;
+        /// GOVERNANCE CHAOS-INJECTION FINDING (#2964 fix round): a stage tag
+        /// plus the underlying libpq error text (or a fixed diagnostic for a
+        /// pre-connection failure — store not open, pool exhausted) for
+        /// `outcome == Failed`. Before this field existed, EVERY internal
+        /// failure inside the classification transaction — including a
+        /// genuinely permanent schema defect, e.g. a missing
+        /// `rotation_retention_meta` table from a botched migration-number
+        /// reconciliation (#3013) — surfaced identically as the caller's own
+        /// generic "pool contention / query failure" text, which is neither
+        /// accurate nor actionable for that case: an operator staring at
+        /// that message cannot tell a transient blip from a permanent defect
+        /// that will repeat every tick forever. Populated (never blank) iff
+        /// `outcome == Failed`; empty for every other outcome.
+        std::string fail_reason;
+        /// The classified anomaly behind a `Declined` outcome
+        /// (`audit_retention::Anomaly::None` for every other outcome) —
+        /// lets the caller choose a human-readable decline REASON without
+        /// re-parsing `decline_reason`.
+        ///
+        /// #2964 round 3 review (finding 2): do NOT route a metric on this
+        /// field alone. `classify`'s precedence is `BadState > Step > Wipe >
+        /// NoAnchor` (`audit_retention_rules.hpp`), so a bootstrap tick that
+        /// ALSO observes another anomaly classifies as that other anomaly,
+        /// not `NoAnchor` — even though `facts.no_anchor` is still true and
+        /// the routed-concern policy floor ("a bootstrap decline counts to
+        /// its own series, never the clock-anomaly one, because it asserts
+        /// only that nothing can yet be ruled out") still applies. Use
+        /// `no_anchor` below for that routing decision instead; this field
+        /// is for the human-readable reason only.
+        audit_retention::Anomaly decline_anomaly = audit_retention::Anomaly::None;
+        /// The RAW `Facts::no_anchor` bit behind a `Declined` outcome
+        /// (`false` for every other outcome) — the routing key for the
+        /// bootstrap-vs-clock-anomaly metric split (see `decline_anomaly`'s
+        /// own doc comment for why the collapsed enum is the wrong thing to
+        /// switch on for this). Correct even when another anomaly outranks
+        /// `NoAnchor` in `decline_anomaly`, because this is the fact itself,
+        /// never the classified precedence winner.
+        bool no_anchor = false;
+        /// Count of predecessors whose per-pair revoke transaction genuinely
+        /// FAILED (pool acquire / lock / query / execution fault, at ANY
+        /// point in that transaction's lifecycle — INCLUDING a COMMIT that
+        /// fails after the transaction's own work already succeeded, #2964
+        /// round 3 review finding 6) rather than resolving as the expected
+        /// idempotent no-op (already revoked, or resolved out from under the
+        /// sweep by a concurrent manual revoke/confirm under the same
+        /// principal-scoped lock). Only meaningful when `outcome == Ok`.
+        /// Before this field existed a tick that selected N candidates and
+        /// failed EVERY per-pair transaction returned `{Ok, revoked={},
+        /// capped=false}` — byte-identical to a genuinely idle tick —
+        /// because the loop's success branch had no `else`; this is what
+        /// lets the caller tell the two apart, PROVIDED the counting
+        /// condition covers every way a per-pair transaction can fail — the
+        /// round-2 shape counted only an in-lambda failure and silently
+        /// dropped a pair whose COMMIT failed after the lambda itself
+        /// reported success, which is the specific gap round 3 closed (see
+        /// the counting site in `sweep_expired_rotations`'s own comment).
+        /// This conflation was PRE-EXISTING (the two-bool `SweepResult` this
+        /// type replaced had the same gap).
+        ///
+        /// GOVERNANCE CHAOS-INJECTION FINDING (#2964 fix round): this is not
+        /// a rare/exceptional path — it is ORDINARY pool contention.
+        /// Reproduced against live Postgres with a size-2 pool, 5 eligible
+        /// pairs, and one unrelated caller holding a single lease: the sweep
+        /// pins one connection for its store-wide session lock, each per-pair
+        /// `pool_.with_txn_for` call needs a SECOND connection, and with only
+        /// one free, every per-pair call timed out — `outcome=Ok
+        /// revoked={} capped=false`, all 5 predecessors still live, with
+        /// neither the accepted-pass verdict nor the last-pass liveness
+        /// gauge showing anything wrong. `--postgres-pool-size 1` makes it
+        /// unconditional. This field, being a TYPED `SweepResult` member
+        /// rather than only a log line, is what makes a tick that lost
+        /// revocations distinguishable BY THE CALLER — server.cpp's own
+        /// rendering of it is `yuzu_rotation_sweep_lost_revocations_total`
+        /// (see that metric's own describe() text), but any caller reading
+        /// `SweepResult` directly (a test, a future diagnostic surface) can
+        /// act on this field without needing that counter to exist.
+        std::size_t failed_pairs = 0;
+    };
+
+    /// T12 sweep, half 1 — auto-revoke (design doc §7 bullet 3), now the
+    /// FULL clock-guarded-retention shape (routed concern, all seven parts;
+    /// #2964) rather than only the unconditional cap (part 5) it shipped
+    /// with. Revokes every ELIGIBLE predecessor whose overlap window has
+    /// elapsed (`overlap_expires_at > 0 AND overlap_expires_at <=` <em>
+    /// PostgreSQL's own clock</em> — see below — not yet revoked, live
+    /// successor that has itself been presented at least once) and clears
+    /// the SURVIVING successor's rotation state
     /// (`rotation_group`/`supersedes_token_id`/`overlap_expires_at` ->
     /// defaults — "revocation during overlap ... resolves the rotation
-    /// state", §7) so a fresh rotation may begin. `now` is caller-supplied,
-    /// same contract as `rotate_engine_credential`.
+    /// state", §7) so a fresh rotation may begin.
+    ///
+    /// `now` is CALLER-supplied but is NOT what drives the eligibility
+    /// decision — part 2 of the routed concern: the decision reads
+    /// PostgreSQL's own clock (`SELECT EXTRACT(EPOCH FROM now())::bigint`,
+    /// read once per call, inside the classification transaction below),
+    /// the same reasoning `AuditStore::cleanup_once` documents (N server
+    /// replicas would otherwise compare against N independently-drifting
+    /// process clocks). `now`'s ONLY remaining role is the cheap
+    /// pre-transaction implausibility check (an upper-bound sanity floor
+    /// shared with every other clock-guarded store in this codebase) — it
+    /// reaches no arithmetic and stamps no liveness signal of its own. (The
+    /// sweep's actual liveness signal is `rotation_sweep_last_pass_now()`,
+    /// which reads PostgreSQL's own persisted `last_pass_now` directly — see
+    /// that accessor's doc comment for why a caller-clock reading would not
+    /// do.) Pass any plausible reading, e.g. the caller's own
+    /// `std::chrono::system_clock::now()`.
+    ///
+    /// LOCKING SHAPE (the part a simpler design gets wrong): a NEW
+    /// store-wide SESSION advisory lock (`hashtextextended
+    /// ('api_token_store:rotation_sweep', 0)`, its own key namespace — never
+    /// `hashtext(principal_id)`, the per-PRINCIPAL key `rotate_engine_
+    /// credential`/`confirm_rotation`/the per-row revoke below all use),
+    /// acquired with a bounded TRY on one leased connection and held for
+    /// the WHOLE call. Holding it: the clock read, the durable meta
+    /// read/write, the eligibility probes, and — if the pass is accepted —
+    /// a SELECT of at most 201 eligible candidates (201, not 200: enough to
+    /// tell "more than the cap" from "exactly the cap") all run as ONE
+    /// transaction on that connection. The (at most 200) actual revokes
+    /// then run as up to 200 SEPARATE per-pair transactions — the existing
+    /// per-principal-locked shape below, UNCHANGED — never folded into the
+    /// classification transaction: ~600 statements holding locks against a
+    /// 2s pool-acquire budget and a 30s statement timeout would block
+    /// interactive rotation for the whole batch's duration, for the sake of
+    /// one commit fate shared by 200 UNRELATED rotations. Lock order is
+    /// fixed — global sweep lock -> per-principal lock -> mutation — and
+    /// the global lock is NEVER acquired from inside a per-principal
+    /// transaction. Released via `pg::PgSessionAdvisoryLockGuard`
+    /// (`pg/pg_session_advisory_lock.hpp`) — the same reusable release
+    /// protocol `KekOpLockGuard` uses — before the connection returns to the
+    /// pool: a leaked session lock on a pooled connection wedges every
+    /// future sweep permanently (a session lock persists until explicitly
+    /// unlocked or the connection closes — unlike the per-PRINCIPAL
+    /// `pg_advisory_xact_lock` this same file's rotate/confirm/per-row-revoke
+    /// paths take, which is transaction-scoped and self-releases at
+    /// COMMIT/ROLLBACK).
+    ///
+    /// POOL-SIZE FLOOR: the session-lock connection above is held for the
+    /// WHOLE call, spanning the up-to-200 per-pair `pool_.with_txn_for` calls
+    /// that follow it — each of those acquires its OWN, second connection
+    /// from the SAME pool while the first is still leased. A pool configured
+    /// with fewer than 2 connections can therefore never make progress on
+    /// this sweep: every per-pair `with_txn_for` call would time out
+    /// acquiring its connection against the one already pinned by the
+    /// session lock (`pg_pool.hpp`'s own nested-`with_txn`-on-a-size-1-pool
+    /// warning is the same hazard from the other direction). Not a
+    /// hypothetical regression risk in practice today (production pool 16,
+    /// test fixtures 4) — recorded here because the pre-#2964 design held
+    /// only a transaction-scoped per-principal lock released before this
+    /// per-pair loop began, so it needed just 1 connection; #2964
+    /// deliberately widened that to a store-wide SESSION lock held across
+    /// the whole call (the paragraph above), and that widening is what
+    /// raises the floor to 2. This is the correct trade, not an oversight —
+    /// see the LOCKING SHAPE paragraph for why the lock must be session- and
+    /// whole-call-scoped rather than released before the per-pair revokes.
+    ///
+    /// The eligibility PROBE measures the ELIGIBLE set only — pairs this
+    /// sweep could actually revoke — never every syntactically-elapsed
+    /// predecessor. A pair whose successor has never been presented
+    /// (`last_used_at == 0`, UP-5) is PERMANENTLY ineligible (see below) and
+    /// plays no part in this probe's outcome, since such a pair never
+    /// becomes eligible no matter how much time passes. This store does NOT
+    /// adopt the clock-guarded-retention routed concern's part 1 would-wipe
+    /// half (`Facts::would_wipe` is hardcoded `false`) — see the DELIBERATE
+    /// NON-ADOPTION comment in the .cpp, near where `kMinWipeProbePopulation`
+    /// used to live, for the measured reason: a would-wipe predicate whose
+    /// true positive (a genuine clock jump) and single most common false
+    /// positive (an ordinary drain tick) are the same observable outcome
+    /// swallows a later genuine anomaly through fact-set dedup regardless of
+    /// any population floor, and this store's per-pair UP-5 re-assertion
+    /// already bounds the harm of accepting that mis-fit.
     ///
     /// Never revokes a predecessor whose successor has NEVER been presented
     /// (`last_used_at == 0`, read fresh under THIS row's own locked
@@ -546,13 +810,25 @@ public:
     /// solely by `rotation_warn_dedup.hpp` — the log line repeats per tick,
     /// the audit row and metric fire once per pair per state.
     ///
-    /// Bounded per tick at `kMaxAutoRevokesPerTick` (a defensible cap, not a
-    /// tuned one — see the constant's own comment) — the routed
-    /// clock-guarded-retention concern requires every accepted bulk
-    /// wall-clock mutation pass to cap unconditionally, even though the
-    /// full seven-part guard shape (persisted anchor, anomaly detection) is
-    /// out of scope here. A single forward clock step degrades to a bounded
-    /// multi-tick drain instead of a fleet-wide cutover in one tick.
+    /// Bounded per tick at `kMaxAutoRevokesPerTick` — cap every accepted
+    /// pass UNCONDITIONALLY (routed concern part 5): the cap is the
+    /// guarantee, the anomaly detectors above are best-effort. A single
+    /// forward clock step degrades to a bounded multi-tick drain instead of
+    /// a fleet-wide cutover in one tick.
+    ///
+    /// A MISSING durable anchor (no pass on this database has ever reached
+    /// a verdict) DECLINES rather than proceeding (routed concern part 6,
+    /// the `AuditStore` answer, not `ResultSetStore`'s) — both credentials
+    /// in an affected pair stay active, which is already the supported,
+    /// warned-about UP-5 state, so this never locks anyone out. The cost is
+    /// real, not free: for a pair whose successor HAS been used, the
+    /// predecessor stays valid past its promised overlap window for at
+    /// least one more sweep tick (60s, `server.cpp`), extending exposure to
+    /// a possibly-compromised credential. Accepted because clock-driven
+    /// revocation of a live credential on an unverified reading is worse,
+    /// and because fact-set dedup (never a latch bool) means the decline is
+    /// not permanent — an identical repeat on the next tick drains, paced
+    /// by the cap.
     ///
     /// Idempotent: re-running finds nothing to revoke once every eligible
     /// predecessor is already revoked (the per-row UPDATE is itself
@@ -569,41 +845,72 @@ public:
     /// `pg_advisory_xact_lock` `rotate_engine_credential`/`confirm_rotation`
     /// take, so this sweep can't race a concurrent manual rotate/confirm
     /// for the same principal (never a revoked predecessor left with a
-    /// successor still mid-rotation). Returns the predecessors actually
-    /// revoked this call (`principal_id`/`token_id` populated,
-    /// `token_hash` masked same as every other read here) — design doc §7
-    /// "every step audits", so the caller can emit one audit row per
-    /// revoked credential rather than a single aggregate line. Empty on an
-    /// unreachable store (fail-closed: a missed tick simply delays the
-    /// revoke to the next tick, it never extends the window itself, which
-    /// is stamped in the row and evaluated fresh every call).
-    /// `tick_failed` (optional out-param): set to `true` when the tick could
-    /// not run to completion — the pool lease timed out, or the predecessor
-    /// scan query failed — so the caller can bump
-    /// `yuzu_engine_principal_rotation_sweep_failures_total`. Since this sweep
-    /// is the SOLE enforcement of predecessor auto-revoke (`validate_token`
-    /// never checks `overlap_expires_at`), a silently-swallowed failed tick
-    /// would let rotated-out credentials outlive their window with the alert at
-    /// zero. Left `false` on a clean tick (including one that revoked nothing).
-    /// `tick_capped` (optional out-param): set to `true` when this tick found
-    /// MORE eligible predecessors than `kMaxAutoRevokesPerTick` and processed
-    /// only the cap's worth — the caller logs + counts this so an in-progress
-    /// drain is visible rather than silently taking several ticks. Left
-    /// `false` when every eligible predecessor fit in this tick.
-    std::vector<ApiToken> sweep_expired_rotations(int64_t now, bool* tick_failed = nullptr,
-                                                  bool* tick_capped = nullptr);
+    /// successor still mid-rotation).
+    ///
+    /// A `SkippedLock` outcome (another replica is sweeping) is routine
+    /// leader-election contention — the caller MUST NOT warn/audit on it
+    /// every tick, only count it. A `Declined` outcome MUST be visible as
+    /// something happened — never indistinguishable from "nothing expired"
+    /// — via a dedicated metric plus an actionable log/audit event.
+    [[nodiscard]] SweepResult sweep_expired_rotations(int64_t now);
+
+    /// Best-effort, cluster-wide read of the sweep's own durable liveness
+    /// anchor (`rotation_retention_meta.last_pass_now` — the same value
+    /// `sweep_expired_rotations`'s classification transaction re-anchors on
+    /// EVERY pass it reaches a verdict on, accepted or declined). Unlike a
+    /// process-local liveness gauge (which would only ever move on the
+    /// replica that happens to win the store-wide sweep lock — every other
+    /// replica sees `SkippedLock` and never touches it), this reads the ONE
+    /// shared row every replica's clock guard writes, so every replica's
+    /// gauge reports the identical cluster-wide last-verdict instant
+    /// regardless of which replica actually held the lock that tick. This
+    /// is part 2 of the routed concern (compare against PostgreSQL's OWN
+    /// clock, not N independently-drifting replica clocks) plus its
+    /// unnumbered SINGLE-WRITER clause ("on a Postgres store the reading and
+    /// the dedup state must become SHARED rows under an ... advisory lock,
+    /// because process-local state paces at N x cap across replicas"),
+    /// applied to this sweep's own observability: a store-wide session lock
+    /// serialises the sweep, so `SkippedLock` on N-1 replicas is routine and
+    /// staleness must be judged against the ONE shared anchor, never a
+    /// per-replica one.
+    /// `nullopt` on a lease/query failure or when no pass has ever reached a
+    /// verdict (fresh install) — the caller must not fabricate a reading.
+    [[nodiscard]] std::optional<int64_t> rotation_sweep_last_pass_now() const;
+
+    /// Result of `list_rotations_nearing_expiry_unused` below.
+    struct NearingExpiryResult {
+        std::vector<RotationPair> pairs;
+        /// PostgreSQL's own clock reading (`SELECT EXTRACT(EPOCH FROM
+        /// now())::bigint`) THIS call used to decide `pairs`' lead-time
+        /// window. The caller MUST derive any "has this pair's overlap
+        /// window already elapsed" judgement from THIS value, never its own
+        /// process clock — finding 7 of the #2964 fix round: the two halves
+        /// of the T12 sweep used to compare against two DIFFERENT clocks
+        /// (this half's own query vs the caller's process clock in
+        /// `server.cpp`), so under exactly the skew this whole guard exists
+        /// to survive, the caller could log/audit an "auto-revoke declined,
+        /// past its overlap window" state for a pair `sweep_expired_
+        /// rotations` does not (yet) consider elapsed at all. 0 when
+        /// `pairs` is empty because the read failed (lease/query error) —
+        /// in that case `pairs` is also empty, so there is nothing to
+        /// derive `elapsed` for.
+        int64_t pg_now = 0;
+    };
 
     /// T12 sweep, half 2 (operational-health signal, design doc §7 bullet 2)
     /// — read-only. Returns every in-flight rotation pair whose predecessor
-    /// overlap window ends within `warn_within_secs` of `now` — INCLUDING one
-    /// that has already elapsed — AND whose successor has never been
-    /// presented (`last_used_at == 0`). Before the never-used-successor
-    /// carve-out in `sweep_expired_rotations` above, an already-elapsed
-    /// window was exclusively that function's job and never appeared here;
-    /// now that `sweep_expired_rotations` deliberately leaves such a pair
-    /// alone, this half is the ONLY thing that keeps surfacing it, so it
-    /// must keep matching past `now` too (no upper-bound-only pairs are lost
-    /// to the old `> now` floor). The caller (server.cpp's maintenance loop)
+    /// overlap window ends within `warn_within_secs` of PostgreSQL's OWN
+    /// current time (`NearingExpiryResult::pg_now`, read once per call — see
+    /// that struct's doc comment for why this half no longer takes a
+    /// caller-supplied `now`) — INCLUDING one that has already elapsed —
+    /// AND whose successor has never been presented (`last_used_at == 0`).
+    /// Before the never-used-successor carve-out in `sweep_expired_
+    /// rotations` above, an already-elapsed window was exclusively that
+    /// function's job and never appeared here; now that
+    /// `sweep_expired_rotations` deliberately leaves such a pair alone, this
+    /// half is the ONLY thing that keeps surfacing it, so it must keep
+    /// matching past `pg_now` too (no upper-bound-only pairs are lost to the
+    /// old `> now` floor). The caller (server.cpp's maintenance loop)
     /// turns each returned pair into an `engine_principal.rotation.
     /// successor_unused` audit row plus a bounded `reason="successor_unused"`
     /// Prometheus counter — deliberately NOT `event="security"` (this is an
@@ -628,8 +935,7 @@ public:
     /// Best-effort, mirrors `list_all`: a lease/query failure logs at warn
     /// and returns an empty vector rather than propagating — this is a
     /// maintenance-loop read, not an authorization chokepoint.
-    std::vector<RotationPair> list_rotations_nearing_expiry_unused(int64_t now,
-                                                                    int64_t warn_within_secs) const;
+    NearingExpiryResult list_rotations_nearing_expiry_unused(int64_t warn_within_secs) const;
 
     /// Revoke every non-revoked token belonging to a principal. Used by the
     /// session-revocation REST surface so "Sign out everywhere" actually

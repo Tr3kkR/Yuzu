@@ -21,6 +21,11 @@
 #include "store_errors.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include <yuzu/audit_retention_rules.hpp> // audit_retention::Anomaly — the rotation sweep's
+                                     // SweepResult::decline_anomaly type (the human-readable
+                                     // decline REASON only — the metric split below routes on
+                                     // the raw SweepResult::no_anchor fact instead, #2964 round
+                                     // 3 review finding 2; see that field's own doc comment)
 #include "rotation_sweep_naming.hpp"
 #include "rotation_warn_dedup.hpp"
 #include "approval_manager.hpp"
@@ -205,6 +210,7 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <charconv>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <deque>
@@ -226,6 +232,12 @@ template <typename Req> auto yuzu_req_get_file(const Req& req, const std::string
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#ifdef _WIN32
+#include <io.h> // _write — async-signal-safe stderr write, stop()'s escalation log (#2703 Gate 7 item 2)
+#else
+#include <unistd.h> // ::write — same
+#endif
 
 // Defined in dashboard_ui.cpp (separate TU to isolate MSVC raw-string issues).
 extern const char* const kDashboardIndexHtml;
@@ -1146,6 +1158,80 @@ public:
                           "transaction hold time per ingest, by source and phase "
                           "(full = full-payload replace; hash_only = hash-skip compare)",
                           "histogram");
+        // RbacStore observability (ADR-0041). Described + zero-seeded up front so
+        // the HELP/TYPE lines and closed dims exist on an idle server — critical
+        // here because a degrade means fleet-wide authz DENY (a PG blip denies
+        // every authorized request), so absent-series alerting must work before
+        // the first degrade ever fires (Gate 6 sre BLOCKING / Gate 4 consistency).
+        metrics_.describe("yuzu_server_rbac_read_degrade_total",
+                          "Authorization reads/refreshes that hit a degraded store, by reason "
+                          "(pool_acquire_timeout/query_error = a check denied fail-closed rather "
+                          "than returning data; generation_refresh_failed = the cross-replica "
+                          "generation/enabled-flag refresh failed PAST the bounded ~5s stale-serve "
+                          "window and the perm cache was dropped — denying; "
+                          "generation_refresh_failed_within_bound/rbac_enabled_non_canonical/"
+                          "stale_beyond_accepted_bound are OBSERVE-ONLY — the store still served "
+                          "its existing decision from cache, this counts a data-quality or "
+                          "staleness condition rather than a denied check — see the alert's "
+                          "reason filter before assuming any nonzero rate here pages). "
+                          "A sustained non-zero rate in the denying reasons is a fleet-wide authz "
+                          "availability event, not mass access-denial — alert on it. "
+                          "A circuit-breaker-open denial (#2703 Gate 7 item 1 commit B) is recorded "
+                          "under pool_acquire_timeout, not a distinct reason — it is one of that "
+                          "reason's own two contributing failure modes (see "
+                          "yuzu_server_rbac_breaker_open for whether the pool is actually being "
+                          "touched right now).",
+                          "counter");
+        for (const auto reason : {"pool_acquire_timeout", "query_error",
+                                  "generation_refresh_failed", "generation_refresh_failed_within_bound",
+                                  "rbac_enabled_non_canonical", "stale_beyond_accepted_bound"})
+            metrics_.counter("yuzu_server_rbac_read_degrade_total", {{"reason", reason}});
+        metrics_.describe("yuzu_server_rbac_backfill_total",
+                          "One-time legacy rbac.db → rbac_store PostgreSQL backfill outcome on "
+                          "first PG boot, by result (fresh = no legacy DB, marked complete; "
+                          "completed = migrated + reconciled; failed = fail-closed, boot refused, "
+                          "next start retries).",
+                          "counter");
+        for (const auto result : {"fresh", "completed", "failed"})
+            metrics_.counter("yuzu_server_rbac_backfill_total", {{"result", result}});
+        // #2703 Gate 7 merge-slice item 1 commit C. Neither metric duplicates the
+        // existing shared-pool signals (yuzu_pg_acquire_wait_seconds,
+        // yuzu_pg_pool_in_use — both already cover every RbacStore acquire, since
+        // RbacStore shares pg_pool_ with every other store): the acquire-wait
+        // histogram only measures the ACQUIRE, so it reads fast even in the
+        // measured table-lock scenario where the acquire succeeds and the QUERY
+        // itself blocks on PgPool's injected lock_timeout — this histogram wraps
+        // check_permission() end-to-end (acquire + query + cache lookup) and is
+        // the only place that scenario's true cost is visible. Zero-seeded (a
+        // fresh gauge/histogram already reads 0/empty on first touch) so both
+        // exist on an idle server before the first authz check ever runs.
+        metrics_.describe(
+            "yuzu_server_rbac_authz_check_seconds",
+            "End-to-end latency of RbacStore::check_permission (acquire + query + "
+            "cache lookup, all outcomes including cache hits and breaker-denied "
+            "fast paths) — NOT the same as yuzu_pg_acquire_wait_seconds, which "
+            "reads fast even when the acquire succeeds but the query itself "
+            "blocks (e.g. cancelled by PgPool's injected lock_timeout).",
+            "histogram");
+        // Gate 3 (architect + sre, 2 independent reporters): this histogram
+        // exists specifically to characterize the measured lock-contention
+        // tail (~18.5s, worst case ~40s analytically, #3016) — the default
+        // buckets cap at 10s, which would collapse that entire tail into a
+        // single +Inf bucket. Extended buckets, birthed ONCE here (#1686
+        // precedent, same as yuzu_pg_acquire_wait_seconds above) so the hot
+        // path's cached-pointer lookup in RbacStore::set_metrics() never has
+        // to allocate a bucket vector.
+        metrics_.histogram("yuzu_server_rbac_authz_check_seconds",
+                           yuzu::Histogram::seconds_buckets_60s());
+        metrics_.describe(
+            "yuzu_server_rbac_breaker_open",
+            "1 when the authz-hot-path fail-fast breaker is open (2 consecutive "
+            "pool-acquire-timeout or query-error failures — #2703 Gate 7 item 1 "
+            "commit B), 0 when closed. While open, every authz check on this "
+            "replica is denied WITHOUT touching the pool except one probe per "
+            "kRbacGenerationRefreshMs. Per-process, per-replica — not fleet-wide.",
+            "gauge");
+        metrics_.gauge("yuzu_server_rbac_breaker_open");
         metrics_.describe("yuzu_inventory_read_degrade_total",
                           "Authoritative inventory reads that returned a degrade (no data) rather "
                           "than a result, by reason "
@@ -2113,6 +2199,158 @@ public:
                           "principal_kind",
                           "counter");
         metrics_.counter("yuzu_rotation_sweep_capped_total");
+        // The sweep's clock guard DECLINED a tick (a big-step/bad-state
+        // verdict) — both credentials in every affected pair stay active
+        // rather than being auto-revoked on an unverified reading. A
+        // decline must never be indistinguishable from "nothing was
+        // eligible this tick" (both leave zero rows revoked) — this
+        // counter, plus the caller's own actionable log line, are what make
+        // the two distinguishable. Same shared, un-split-by-principal_kind
+        // scope as its sweep_failures/capped siblings above — the decline
+        // is a tick-level clock-guard verdict, not attributable to one
+        // kind's rows.
+        //
+        // `big-step` (`Step`) is NOT a clock-anomaly-only signal at this
+        // store's 3'600s threshold (`kRotationSweepBigStepSecs`, its own
+        // doc comment in `api_token_store.hpp`) — an hour of `Failed` ticks
+        // (a maintenance window, a DB failover, a dev instance left off
+        // overnight) crosses it just as a clock jump would, with no clock
+        // fault involved. `describe()` below states both causes; do not
+        // narrow this text to "clock anomaly" alone.
+        //
+        // Deliberately EXCLUDES the no-durable-anchor decline (routed-concern
+        // policy floor) — see `yuzu_rotation_sweep_bootstrap_declines_total`
+        // below for why that one is a SEPARATE series, never folded into
+        // this one.
+        metrics_.describe("yuzu_rotation_sweep_declined_total",
+                          "Cumulative rotation-sweep ticks the clock guard declined (big-step / "
+                          "bad-state - this store does not adopt the would-wipe half of the "
+                          "routed-concern probe, see api_token_store.cpp's DELIBERATE "
+                          "NON-ADOPTION comment). A big-step decline is NOT necessarily a clock "
+                          "fault: at this store's 3600s threshold it is most often a planned or "
+                          "unplanned multi-tick outage (maintenance window, DB failover, an "
+                          "instance left off overnight) with a perfectly correct clock - check "
+                          "both before assuming the clock moved. Shared across BOTH "
+                          "engine-credential and human API-token rotation pairs, not split by "
+                          "principal_kind. Excludes bootstrap declines (no durable anchor yet) - "
+                          "see yuzu_rotation_sweep_bootstrap_declines_total",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_declined_total");
+        // #2964 fix round finding 4 (routed-concern POLICY FLOOR: a bootstrap
+        // decline "counts to its own ..._retention_bootstrap_declines_total,
+        // never the clock-anomaly series, because it asserts only that
+        // nothing can yet be ruled out and must not fire an alert that says
+        // the clock moved"). Sharing the counter above would fire that
+        // alert's "the clock moved" claim on every server carrying a rotation
+        // backlog through the first sweep tick after an upgrade — the exact
+        // false-positive #2579/audit_store's own bootstrap counter exists to
+        // avoid, mirrored here. `SweepResult::no_anchor` (`api_token_
+        // store.hpp`) is what this counter is derived from — the raw fact,
+        // not `decline_anomaly`'s classified precedence winner (#2964 round
+        // 3 review finding 2; see that field's own doc comment).
+        metrics_.describe("yuzu_rotation_sweep_bootstrap_declines_total",
+                          "Cumulative rotation-sweep ticks declined because no pass on this "
+                          "database has yet reached a verdict (NOT a clock anomaly - a weaker "
+                          "claim that asserts only that nothing can yet be ruled out) - the "
+                          "human-owned/engine-owned-shared twin of "
+                          "yuzu_server_audit_retention_bootstrap_declines_total",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_bootstrap_declines_total");
+        // #2964 fix round finding 5: the sweep's single caller is ONE
+        // dedicated thread on a sequential 60s loop (`engine_rotation_sweep_
+        // thread_` below) — it cannot self-collide on the store-wide session
+        // lock. In a SINGLE-replica deployment — the default — that means a
+        // `SkippedLock` can only mean a SECOND writer is holding the SAME
+        // Postgres session lock: a zombie process from a previous
+        // deployment, a botched blue-green cutover overlap, or an
+        // unauthorised second server instance pointed at the same DSN.
+        // Operator-facing rule: should read ZERO in a single-replica
+        // deployment; investigate if it does not. Multi-replica is the ONLY
+        // topology where contention here is genuinely routine (N replicas
+        // legitimately racing for one cluster-wide lock every tick) — see
+        // the sweep thread's own consecutive-skip escalation below, which
+        // makes the single-replica fault case visible without making this
+        // counter's own description dishonest for the multi-replica case.
+        metrics_.describe("yuzu_rotation_sweep_lock_skipped_total",
+                          "Cumulative rotation-sweep ticks this replica skipped because another "
+                          "writer already held the store-wide sweep lock. In a single-replica "
+                          "deployment (the default) this can ONLY mean a second writer holding "
+                          "the same session lock (zombie process / botched blue-green cutover / "
+                          "unauthorised second instance on the same DSN) - should read zero; "
+                          "investigate if not. Routine leader-election contention ONLY in a "
+                          "multi-replica deployment",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_lock_skipped_total");
+        // #2964 fix round finding 5: the durable, cluster-wide anchor every
+        // rotation-sweep replica's clock guard shares
+        // (`rotation_retention_meta.last_pass_now`) — unlike a process-local
+        // liveness gauge, every replica's reading of THIS gauge agrees,
+        // regardless of which replica actually held the store-wide sweep
+        // lock that tick. Staleness relative to the 60s tick cadence
+        // (`engine_rotation_sweep_thread_` below) is the sweep's liveness
+        // signal. `_timestamp_seconds` suffix per Prometheus naming
+        // convention for a Unix-timestamp-valued gauge (the older sibling
+        // `yuzu_server_audit_retention_last_pass_unixtime` predates this
+        // convention being applied here and is not renamed retroactively —
+        // renaming an already-shipped series breaks existing alerts/
+        // dashboards; this is a NEW series, so it gets the correct suffix
+        // from the start).
+        metrics_.describe("yuzu_rotation_sweep_last_pass_timestamp_seconds",
+                          "Unix time PostgreSQL's own clock read the last time the rotation-sweep "
+                          "clock guard reached a verdict (accepted or declined) - the durable, "
+                          "cluster-wide anchor every replica's guard shares, not a per-replica "
+                          "reading. 0 if no pass has ever reached a verdict on this database",
+                          "gauge");
+        // #2964 fix round (governance chaos-injection finding): describe()
+        // alone does not publish a gauge family either — MetricsRegistry::
+        // serialize() only walks families that exist in gauges_/counters_,
+        // and gauges_[name] is only populated by an actual gauge() call
+        // (mirrors the identical counter()-after-describe() pre-seed pattern
+        // the three sweep counters above use, and the same reason: without
+        // this the series is ABSENT from /metrics, not present-at-0, until
+        // the health-recompute-thread scrape loop below first finds
+        // `rotation_sweep_last_pass_now()` engaged — which itself never
+        // happens until a pass reaches a verdict). Left un-published, the
+        // `YuzuRotationSweepNotRunning` alert's `and gauge > 0` guard reads
+        // as "no data" rather than "0", which happens to still not page —
+        // but only by accident of that guard's own shape, not because the
+        // series is actually present the way the audit-retention sibling
+        // gauge is (seeded from its durable anchor at startup, #2854). Pre-
+        // seeding here closes that gap the same way for both gauges.
+        metrics_.gauge("yuzu_rotation_sweep_last_pass_timestamp_seconds");
+        // #2964 fix round finding 6 (chaos-injection, escalated from "tidy-up"
+        // to "highest-value part of the patch"): an `Ok` tick can select N
+        // eligible predecessors and have SOME OR ALL of their per-pair revoke
+        // transactions fail to acquire a connection (ordinary pool
+        // contention under a small pool — reproduced with a size-2 pool, 5
+        // eligible pairs, and one unrelated consumer holding a lease; the
+        // sweep's own store-wide session-lock connection plus each per-pair
+        // `with_txn_for` need TWO connections concurrently). Before
+        // `SweepResult::failed_pairs` existed this was silently
+        // indistinguishable from an idle tick: the tick still reaches a
+        // verdict (so the last-pass gauge above stays fresh) and no counter
+        // moves — "every signal reads healthy" while revocations are
+        // silently lost. Deliberately a SEPARATE series from
+        // `yuzu_engine_principal_rotation_sweep_failures_total` (which means
+        // "the whole tick did not run to completion") rather than folded
+        // into it — an operator alerting on that counter must be able to
+        // tell "the tick failed outright" from "the tick succeeded but lost
+        // some revocations", which a shared series cannot express. Value is
+        // the COUNT of predecessors affected this tick (not a 0/1 tick
+        // flag), so `increase()` over a window gives the actual scale of
+        // lost revocations, not just "did it happen".
+        metrics_.describe("yuzu_rotation_sweep_lost_revocations_total",
+                          "Cumulative predecessors an accepted rotation-sweep tick selected for "
+                          "auto-revoke but whose per-pair revoke transaction genuinely FAILED "
+                          "(pool/lock/query fault, not the benign already-resolved idempotent "
+                          "no-op) - distinct from a whole-tick failure "
+                          "(yuzu_engine_principal_rotation_sweep_failures_total); shared across "
+                          "BOTH engine-credential and human API-token rotation pairs, not split "
+                          "by principal_kind. Each affected predecessor remains eligible and is "
+                          "retried on the next tick, so this is a lagging-tick signal, not "
+                          "evidence of a permanently stranded credential",
+                          "counter");
+        metrics_.counter("yuzu_rotation_sweep_lost_revocations_total");
         // #2404: confirm-rotation endpoint outcomes, so a 409-conflict or
         // 503-transient retry storm on confirm is alertable instead of
         // invisible (yuzu_http_requests_total has no per-route label). SCOPE
@@ -3783,10 +4021,35 @@ public:
             }
         }
 
-        // Initialize Phase 3: Security & RBAC stores
-        {
-            auto rbac_db = cfg_.db_dir() / "rbac.db";
-            rbac_store_ = std::make_unique<RbacStore>(rbac_db);
+        // Initialize Phase 3: Security & RBAC stores (PostgreSQL, ADR-0041).
+        // The authorization substrate — construction fail-closed (ADR-0007): a
+        // failed open/migration refuses boot rather than serve with authz off.
+        // `migrate_from_sqlite` runs the MANDATORY one-time legacy-`rbac.db`
+        // backfill (ADR-0009/0041) — a failure there is ALSO fatal (never serve
+        // on top of a partially-migrated authorization config; losing a grant or
+        // the enabled flag is a fleet-wide authorization change nobody authored).
+        if (pg_pool_ && !startup_failed_) {
+            rbac_store_ = std::make_unique<RbacStore>(*pg_pool_);
+            if (!rbac_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: RbacStore (authorization substrate) "
+                              "migration/open failed — fail-closed (ADR-0007/0041)");
+                startup_failed_ = true;
+            } else {
+                rbac_store_->set_metrics(&metrics_);
+                auto rbac_db = cfg_.db_dir() / "rbac.db";
+                if (!rbac_store_->migrate_from_sqlite(rbac_db)) {
+                    spdlog::error("[PG] Refusing to start: RbacStore legacy-SQLite backfill from {} "
+                                  "failed (see prior log lines) — the authorization substrate is "
+                                  "authoritative and must not serve partially-migrated grants or a "
+                                  "lost rbac_enabled flag (mandatory backfill, ADR-0009/0041)",
+                                  rbac_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("RbacStore initialized (schema rbac_store; legacy backfill source "
+                                 "{})",
+                                 rbac_db.string());
+                }
+            }
         }
 
         // Engine-principal namespace collision-scan preflight (design doc
@@ -5239,6 +5502,19 @@ public:
                     metrics_.gauge("yuzu_server_audit_retention_last_pass_unixtime")
                         .set(static_cast<double>(audit_store_->last_pass_unixtime()));
                 }
+                // #2964 fix round finding 5: the rotation sweep's own
+                // cluster-wide liveness anchor. A DB round trip, unlike the
+                // atomic accessors above, so guarded and best-effort — a
+                // transient lease/query failure just leaves the gauge at its
+                // previous value for this tick rather than fabricating a
+                // reading (see `rotation_sweep_last_pass_now()`'s own doc
+                // comment).
+                if (api_token_store_ && api_token_store_->is_open()) {
+                    if (auto last = api_token_store_->rotation_sweep_last_pass_now()) {
+                        metrics_.gauge("yuzu_rotation_sweep_last_pass_timestamp_seconds")
+                            .set(static_cast<double>(*last));
+                    }
+                }
                 // PR 5b — ExecutionEventBus observability. Same scrape-as-
                 // gauge pattern used for AuditStore + GuaranteedStateStore
                 // counters above; the bus exposes the counters via lock-
@@ -5513,6 +5789,39 @@ public:
                 // shortest lead time that is never a false "already gone"
                 // read against the shortest window an operator can even set.
                 constexpr std::int64_t kSuccessorUnusedWarnLeadSecs = 24 * 3600;
+                // #2964 fix round finding 5: this thread is the sweep's
+                // SINGLE caller — one dedicated thread on a sequential 60s
+                // loop — so it cannot self-collide on the store-wide session
+                // lock. In a single-replica deployment (the default) a
+                // `SkippedLock` can therefore ONLY mean a SECOND writer is
+                // holding the SAME Postgres session lock: a zombie process
+                // from a previous deployment, a botched blue-green cutover
+                // overlap, or an unauthorised second server instance pointed
+                // at the same DSN — never routine contention, which exists
+                // only in a multi-replica deployment (N replicas legitimately
+                // racing for one cluster-wide lock every tick; see the
+                // counter's own describe() text above for the split).
+                // Three consecutive ticks (3 minutes at the 60s cadence) is
+                // enough to rule out a one-tick race at boot (two replicas
+                // starting within the same tick window) while still
+                // escalating promptly; any non-SkippedLock outcome resets
+                // the counter.
+                constexpr std::size_t kConsecutiveSkippedLockWarnThreshold = 3;
+                std::size_t consecutive_lock_skipped = 0;
+                // #2964 round 3 review (finding 6): the warn below used to
+                // fire on EVERY tick once the streak crossed the threshold
+                // (the guard only reset the streak, never a separate "next
+                // warn at" mark) — ~1440 lines/day per non-winning replica
+                // in a multi-replica deployment, where a losing replica's
+                // own `describe()`-documented topology makes this routine.
+                // `rotation_warn_dedup.hpp`'s own header cites that exact
+                // ~1440/day shape as the thing every cadence in THIS file
+                // exists to avoid. Warn once on the CROSSING tick, then only
+                // again on a WIDENING interval (doubling each time) — an
+                // operator still gets escalating visibility on a streak that
+                // keeps growing, without a log line every 60 seconds
+                // forever. Reset alongside `consecutive_lock_skipped`.
+                std::size_t next_skipped_lock_warn_at = kConsecutiveSkippedLockWarnThreshold;
 
                 while (!stop_requested_.load(std::memory_order_acquire)) {
                     for (int i = 0; i < 60 && !stop_requested_.load(std::memory_order_acquire);
@@ -5537,29 +5846,148 @@ public:
                                          .count();
 
                     // Half 1: auto-revoke elapsed predecessors + clear the
-                    // surviving successor's rotation state. A failed tick (pool
-                    // contention / query error) is reported via the out-param —
-                    // the store swallows it (returns empty) rather than throwing,
-                    // so without this the sweep-failures alert would stay at zero
-                    // while rotated-out credentials silently outlive their window.
-                    bool sweep_tick_failed = false;
-                    bool sweep_tick_capped = false;
-                    auto revoked = api_token_store_->sweep_expired_rotations(
-                        now, &sweep_tick_failed, &sweep_tick_capped);
-                    if (sweep_tick_failed) {
-                        spdlog::warn("Rotation sweep tick could not run (pool "
-                                     "contention / query failure) — predecessor auto-revoke deferred "
-                                     "to the next tick");
+                    // surviving successor's rotation state — now the FULL
+                    // seven-part clock-guarded-retention shape (#2964), not
+                    // only the unconditional cap it shipped with. The typed
+                    // outcome replaces the old two-bool contract: `Failed`
+                    // (pool/query fault — a missed tick, deferred to the
+                    // next one), `SkippedLock` (another replica holds the
+                    // lock this tick), `Declined` (the clock guard declined
+                    // the whole pass — MUST be visible as its own thing,
+                    // never indistinguishable from "nothing was eligible"),
+                    // `Ok` (ran to completion, possibly with zero
+                    // revocations).
+                    auto sweep = api_token_store_->sweep_expired_rotations(now);
+                    if (sweep.outcome != ApiTokenStore::SweepOutcome::SkippedLock) {
+                        consecutive_lock_skipped = 0;
+                        next_skipped_lock_warn_at = kConsecutiveSkippedLockWarnThreshold;
+                    }
+                    switch (sweep.outcome) {
+                    case ApiTokenStore::SweepOutcome::Failed:
+                        // #2964 fix round (governance chaos-injection
+                        // finding): `sweep.fail_reason` names the ACTUAL
+                        // stage + libpq error text — before this field
+                        // existed every Failed tick logged this same generic
+                        // "pool contention / query failure" line regardless
+                        // of cause, which is actively misleading for a
+                        // permanent schema defect (e.g. a missing
+                        // `rotation_retention_meta` table) that will repeat
+                        // identically forever and is neither pool
+                        // contention nor an ordinary query failure.
+                        spdlog::warn("Rotation sweep tick could not run — predecessor auto-revoke "
+                                     "deferred to the next tick: {}",
+                                     sweep.fail_reason.empty() ? "(no reason captured)"
+                                                                : sweep.fail_reason);
                         metrics_.counter("yuzu_engine_principal_rotation_sweep_failures_total")
                             .increment();
+                        break;
+                    case ApiTokenStore::SweepOutcome::SkippedLock:
+                        metrics_.counter("yuzu_rotation_sweep_lock_skipped_total").increment();
+                        // #2964 fix round finding 5: a single-replica
+                        // deployment should read zero here (see the
+                        // constant's own doc comment above), so escalate to
+                        // a warn log once the streak crosses the threshold —
+                        // the counter alone is sufficient for a multi-replica
+                        // deployment (routine there), but silent-forever is
+                        // wrong for the single-replica default.
+                        //
+                        // #2964 round 3 review (finding 6): warn on the
+                        // CROSSING tick only, then again on a WIDENING
+                        // interval (`next_skipped_lock_warn_at` doubles each
+                        // time it fires) — never on every tick past the
+                        // threshold, which was measured to be ~1440
+                        // lines/day per non-winning replica in a
+                        // multi-replica deployment (routine topology there;
+                        // see `describe()` above and this file's own
+                        // consecutive-skip comment).
+                        ++consecutive_lock_skipped;
+                        if (consecutive_lock_skipped >= next_skipped_lock_warn_at) {
+                            spdlog::warn(
+                                "Rotation sweep has been unable to acquire its store-wide sweep "
+                                "lock for {} consecutive ticks — routine only on a multi-replica "
+                                "deployment (another replica is sweeping); on a single-replica "
+                                "deployment this can only mean a second writer holds the same "
+                                "session lock (zombie process / botched blue-green cutover / "
+                                "unauthorised second instance on the same DSN) — investigate",
+                                consecutive_lock_skipped);
+                            next_skipped_lock_warn_at *= 2;
+                        }
+                        break;
+                    case ApiTokenStore::SweepOutcome::Declined:
+                        // Actionable: the store's own `decline_reason`
+                        // already names WHICH anomaly and what it costs
+                        // (both credentials in every affected pair stay
+                        // active past their overlap window until the next
+                        // tick clears the anomaly).
+                        spdlog::warn("Rotation sweep tick declined by its clock guard: {}",
+                                     sweep.decline_reason);
+                        // #2964 fix round finding 4 (routed-concern POLICY
+                        // FLOOR): a bootstrap decline (no durable anchor yet)
+                        // counts to its OWN series, never the clock-anomaly
+                        // one — see yuzu_rotation_sweep_bootstrap_declines_
+                        // total's own describe() text for why sharing the
+                        // counter would be a false "the clock moved" claim.
+                        //
+                        // #2964 round 3 review (finding 2): routes on
+                        // `sweep.no_anchor` — the RAW fact — never on
+                        // `sweep.decline_anomaly == NoAnchor`. `classify`'s
+                        // precedence (`BadState > Step > Wipe > NoAnchor`,
+                        // `audit_retention_rules.hpp`) means a bootstrap tick
+                        // that ALSO observes another anomaly classifies as
+                        // that other anomaly even though `no_anchor` is still
+                        // true — switching on the collapsed enum here would
+                        // have miscounted that tick to the clock-anomaly
+                        // series, exactly the false "the clock moved" claim
+                        // this split exists to avoid. See
+                        // `SweepResult::no_anchor`'s own doc comment.
+                        if (sweep.no_anchor) {
+                            metrics_.counter("yuzu_rotation_sweep_bootstrap_declines_total")
+                                .increment();
+                        } else {
+                            metrics_.counter("yuzu_rotation_sweep_declined_total").increment();
+                        }
+                        break;
+                    case ApiTokenStore::SweepOutcome::Ok:
+                        // UP-6: the per-tick cap already logged the eligible/
+                        // processed counts inside the store — the counter
+                        // here is the alertable signal that a drain is in
+                        // progress.
+                        if (sweep.capped) {
+                            metrics_.counter("yuzu_rotation_sweep_capped_total").increment();
+                        }
+                        // #2964 fix round finding 6: an `Ok` tick that
+                        // selected candidates and had some/all of their
+                        // per-pair revoke transactions genuinely FAIL (not
+                        // the benign idempotent no-op — typically ordinary
+                        // pool contention: the sweep's own held session-lock
+                        // connection plus each per-pair `with_txn_for` need
+                        // TWO connections concurrently) used to be
+                        // byte-identical to an idle tick — zero revoked, no
+                        // counter, no log, and the tick still reaches a
+                        // verdict so the last-pass liveness gauge stays
+                        // fresh throughout. `sweep.failed_pairs` — a typed
+                        // `SweepResult` field, not merely a log line — is
+                        // what makes this DISTINGUISHABLE TO THE CALLER
+                        // (this switch, but also any future caller that
+                        // reads `SweepResult` directly, e.g. a test or an
+                        // MCP diagnostic tool); the counter below is this
+                        // caller's own alertable rendering of it, deliberately
+                        // a SEPARATE series from the whole-tick failures
+                        // counter (see its own describe() text for why) and
+                        // incremented by the actual COUNT lost, not just once.
+                        if (sweep.failed_pairs > 0) {
+                            spdlog::warn("Rotation sweep tick completed but {} of its per-pair "
+                                         "revoke transactions failed (pool/lock/query fault, not "
+                                         "the benign already-resolved case) — those predecessors "
+                                         "were not revoked this tick; they remain eligible and "
+                                         "will be retried on the next tick",
+                                         sweep.failed_pairs);
+                            metrics_.counter("yuzu_rotation_sweep_lost_revocations_total")
+                                .increment(static_cast<double>(sweep.failed_pairs));
+                        }
+                        break;
                     }
-                    // UP-6: the per-tick cap already logged the eligible/
-                    // processed counts inside the store — the counter here is
-                    // the alertable signal that a drain is in progress.
-                    if (sweep_tick_capped) {
-                        metrics_.counter("yuzu_rotation_sweep_capped_total").increment();
-                    }
-                    for (const auto& predecessor : revoked) {
+                    for (const auto& predecessor : sweep.revoked) {
                         // P2 #11: route to the engine or human family/audit
                         // action by THIS row's own principal_kind — never
                         // assume every swept row is engine-owned.
@@ -5591,22 +6019,41 @@ public:
                     // event="security"; see the design doc §7 / the
                     // metrics_.describe comment above), kept on its own
                     // channel from any theft-detection alert.
+                    //
+                    // #2964 fix round finding 7: this half no longer takes
+                    // the process-clock `now` — it reads PostgreSQL's own
+                    // clock internally and returns that reading as
+                    // `nearing.pg_now`, which `elapsed` below MUST be
+                    // derived from. Before this fix, this half's own query
+                    // and this half's own `elapsed` comparison used TWO
+                    // different clocks (this store-side PG read vs this
+                    // thread's process clock), so under exactly the skew
+                    // this whole guard exists to survive, `elapsed` could
+                    // read true for a pair `sweep_expired_rotations` — using
+                    // its OWN, separate PG clock read — does not (yet)
+                    // consider elapsed at all, asserting a state that had
+                    // not actually happened and able to flap between states
+                    // on successive ticks as the two clocks drift apart and
+                    // back.
                     auto nearing = api_token_store_->list_rotations_nearing_expiry_unused(
-                        now, kSuccessorUnusedWarnLeadSecs);
+                        kSuccessorUnusedWarnLeadSecs);
                     std::unordered_set<std::string> still_nearing;
-                    for (const auto& pair : nearing) {
+                    for (const auto& pair : nearing.pairs) {
                         still_nearing.insert(pair.successor.rotation_group);
                         // UP-5: `list_rotations_nearing_expiry_unused` now
                         // also returns a pair whose predecessor window has
                         // ALREADY elapsed — sweep_expired_rotations
-                        // deliberately declines to auto-revoke it while the
-                        // successor stays unused, so this is the only
-                        // remaining signal for it. The signals do NOT share a
-                        // cadence — `RotationWarnDedup` owns which fire on this
-                        // tick, and its header states why (an un-throttled
-                        // audit row on an indefinitely-stuck pair is ~1440/day
-                        // into the SOC 2 evidence store).
-                        const bool elapsed = pair.predecessor.overlap_expires_at <= now;
+                        // deliberately WITHHOLDS auto-revoke on it while the
+                        // successor stays unused (not the SAME "declined" as
+                        // `SweepOutcome::Declined`'s clock-guard verdict
+                        // above — see `rotation_warn_dedup.hpp`'s own note),
+                        // so this is the only remaining signal for it. The
+                        // signals do NOT share a cadence — `RotationWarnDedup`
+                        // owns which fire on this tick, and its header states
+                        // why (an un-throttled audit row on an indefinitely-
+                        // stuck pair is ~1440/day into the SOC 2 evidence
+                        // store).
+                        const bool elapsed = pair.predecessor.overlap_expires_at <= nearing.pg_now;
                         const auto signals =
                             warn_dedup.observe(pair.successor.rotation_group, elapsed);
 
@@ -5614,7 +6061,7 @@ public:
                             spdlog::warn(
                                 "Rotation predecessor {} (principal {}) is past its overlap "
                                 "window but the successor has never been used — auto-revoke "
-                                "was declined to avoid leaving zero usable credentials; both "
+                                "was withheld to avoid leaving zero usable credentials; both "
                                 "stay active until an operator confirms or revokes explicitly",
                                 pair.predecessor.token_id, pair.predecessor.principal_id);
                         }
@@ -5738,6 +6185,52 @@ public:
 
         stop_requested_.store(true, std::memory_order_release);
 
+        // #2703 Gate 7 merge-slice item 2: stop admitting/serving new HTTP
+        // work as early as reasonably possible — moved up from the old
+        // position after the entire thread-join cascade below, which left
+        // the server fully live and EVERY route (except /readyz, which
+        // already checks draining_ above) admitted and FULLY PROCESSED for
+        // the whole cascade's duration, including racing new work against
+        // stores this same function tears down a few lines later. The 30s
+        // execution-drain window above already gives a load balancer a
+        // /readyz-503 grace period before this point, so closing the
+        // listening socket here does not shorten that signal.
+        //
+        // begin_closing() BEFORE web_server_->stop(): flips the shutdown
+        // signal the /events, /api/v1/events, and dashboard-executions-
+        // drawer SSE providers already re-check every <=3s tick
+        // (StreamBudget::closing()), so an idle held-open stream on one of
+        // those three surfaces closes within one tick instead of pinning
+        // its httplib worker until the client disconnects. Flipped here
+        // (not at the draining_.store(true) point above) so an EventSource
+        // client doesn't see its connection torn down mid-drain and start
+        // auto-reconnect churn for the whole 30s window — it only happens
+        // once the socket is genuinely about to stop accepting anyway.
+        //
+        // NOT wired into the MCP GET/streamed-POST surfaces: McpStreamPump's
+        // teardown is driven by session_alive_/session-registry
+        // revalidation, a materially different mechanism (see
+        // StreamBudget::closing()'s doc comment) — an open MCP stream still
+        // relies on the bounded web-thread join below as its backstop.
+        // Tracked as a named follow-up (#2371 comment, 2026-08-11), not
+        // silently left uncovered.
+        if (stream_budget_)
+            stream_budget_->begin_closing();
+
+        // Stop cert reloader before web server (it holds a pointer to
+        // web_server_) — moved up alongside web_server_->stop() for the
+        // same early-admission-stop reason.
+        if (cert_reloader_) {
+            cert_reloader_->stop();
+            cert_reloader_.reset();
+        }
+        if (redirect_server_) {
+            redirect_server_->stop();
+        }
+        if (web_server_) {
+            web_server_->stop();
+        }
+
         // Signal AuthDB's provisional-MFA reaper to stop up front (it is owned
         // inside AuthDB, not a ServerImpl member thread, so it is not in the
         // joins below). This is signal-only — the join happens at
@@ -5826,23 +6319,67 @@ public:
         // reap_expired() is ticked from the result-set maintenance thread below,
         // which is joined before result_set_store_/guaranteed_state_store_ reset.
 
-        // Stop cert reloader before web server (it holds a pointer to web_server_)
-        if (cert_reloader_) {
-            cert_reloader_->stop();
-            cert_reloader_.reset();
-        }
-
-        if (redirect_server_) {
-            redirect_server_->stop();
-        }
+        // cert_reloader_/redirect_server_/web_server_ were already stopped
+        // early, above (#2703 Gate 7 item 2) — just the joins remain here.
+        // redirect_thread_ gets a bare join: the redirect server serves only
+        // 301s, never a held-open response, so unlike web_thread_ it has no
+        // plausible hang scenario and does not need the bounded treatment
+        // below.
         if (redirect_thread_.joinable()) {
             redirect_thread_.join();
         }
-        if (web_server_) {
-            web_server_->stop();
-        }
+
+        // #2703 Gate 7 merge-slice item 2 (operator-adjudicated: 15s
+        // shutdown grace bound). std::thread has no timed join, so
+        // web_thread_'s body signals web_thread_done_ right after
+        // web_server_->listen() returns (already closed above) and this
+        // waits on that signal instead of a bare join(). On the fast path —
+        // the common case once the close-signal above has drained every
+        // /events / /api/v1/events / dashboard-drawer stream — this returns
+        // within one keep-alive tick, well under the bound.
+        //
+        // Escalation is a deliberate std::_Exit, NOT the nvd_sync
+        // leak-and-continue precedent a few lines above: nvd_sync's leak
+        // works because releasing nvd_sync_ keeps everything the wedged
+        // thread references alive, and nothing ELSE in this function
+        // touches it again. A wedged HTTP worker captures `this` and half
+        // of ServerImpl's stores — continuing teardown (every
+        // reset()/destructor below) past a thread that might still be
+        // running a handler against those same stores is a use-after-free
+        // farm, not a leak. `_Exit` skips the remaining teardown below
+        // (including offload_target_store_->flush_all(), the RESTART-1 fix)
+        // exactly the same way a supervisor SIGKILL would — strictly no
+        // worse, and it only fires when the close-signal above did NOT
+        // reach every stream: an open MCP GET/streamed-POST connection (the
+        // one surface item 2 does not close-signal — see
+        // StreamBudget::closing()'s doc comment) or a genuinely wedged
+        // handler.
         if (web_thread_.joinable()) {
-            web_thread_.join();
+            std::unique_lock<std::mutex> lk(web_thread_done_mtx_);
+            const bool finished = web_thread_done_cv_.wait_for(
+                lk, std::chrono::seconds(15), [this] { return web_thread_done_; });
+            lk.unlock();
+            if (finished) {
+                web_thread_.join();
+            } else {
+                // `stop()` is called synchronously and directly from the SIGTERM/SIGINT
+                // OS signal handler (`on_signal()`, main.cpp) — NOT deferred to a normal
+                // thread context. spdlog::critical()/flush() allocate and take internal
+                // locks, which is undefined behaviour inside a signal handler (the same
+                // class #73 fixed for the single log line at the top of on_signal(), but
+                // never eliminated from the rest of the synchronously-invoked stop() call
+                // graph — tracked as a systemic follow-up). Use only the async-signal-safe
+                // primitive already established there: a raw write() of a fixed message.
+                const char msg[] =
+                    "ServerImpl::stop: web thread did not finish within the 15s shutdown "
+                    "grace bound (#2703 Gate 7 item 2) - force-exiting.\n";
+#ifdef _WIN32
+                _write(2, msg, sizeof(msg) - 1);
+#else
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+                std::_Exit(1);
+            }
         }
 
         // Phase 8.3 #255 — drain offload batch buffers BEFORE the store is
@@ -6059,6 +6596,16 @@ public:
         if (gateway_service_)
             gateway_service_->set_guaranteed_state_store(nullptr);
         guaranteed_state_store_.reset();
+        // RbacStore (authorization substrate, ADR-0041) borrows pg_pool_ — drop
+        // before the pool. Every HTTP/gRPC/MCP handler holding the raw pointer is
+        // quiesced by the drains above; the ManagementGroupStore's
+        // set_rbac_enabled_probe captures `this` and reads rbac_store_.get() only
+        // at request time, so after the drains a now-null pointer is never
+        // dereferenced, and rbac_enforcement_in_effect(nullptr) fails CLOSED
+        // regardless. (Its declaration precedes mgmt_group_store_ so pure
+        // destruction order is also safe — this proactive reset keeps stop()'s
+        // destruct-before-pool discipline explicit.)
+        rbac_store_.reset();
         // Auth substrate (ADR-0006/0010) — destruct-before-pool, and in
         // dependency order. AuthDB owns a background reaper thread
         // (cleanup_provisional_mfa) that leases pg_pool_ via
@@ -7202,6 +7749,22 @@ private:
         if (!rbac_enforcement_in_effect(rbac_store_.get()))
             return true; // loaded & explicitly disabled → legacy-open
         return rbac_store_ && rbac_store_->check_scoped_permission(username, "Response", "Read",
+                                                                   agent_id, mgmt_group_store_.get());
+    }
+
+    /// Same shape as `response_agent_in_scope`, bound to ("Inventory","Read"): the
+    /// per-device Inventory-scope predicate for GET /api/v1/inventory/software (REST)
+    /// and query_installed_software (MCP). Was two byte-identical inline lambdas
+    /// gating on the raw `!is_rbac_enabled()` accessor instead of
+    /// `rbac_enforcement_in_effect` — that accessor can read stale-false while RBAC is
+    /// durably enabled elsewhere (a degraded generation-refresh cache, ADR-0041), which
+    /// would silently disclose the whole fleet's software inventory to a confined
+    /// operator (governance re-review, #2703). Hoisted to one definition so the REST
+    /// and MCP surfaces cannot drift the way #2500's dispatch-targeting defect did.
+    bool inventory_agent_in_scope(const std::string& username, const std::string& agent_id) const {
+        if (!rbac_enforcement_in_effect(rbac_store_.get()))
+            return true; // loaded & explicitly disabled → legacy-open
+        return rbac_store_ && rbac_store_->check_scoped_permission(username, "Inventory", "Read",
                                                                    agent_id, mgmt_group_store_.get());
     }
 
@@ -8778,6 +9341,11 @@ private:
             bool inventory_ok = inventory_store_ && inventory_store_->is_open();
             // Load-bearing for the MCP write surface + REST approvals (sre-BLOCKING-1).
             bool approval_ok = approval_manager_ && approval_manager_->is_open();
+            // RbacStore (authorization substrate, ADR-0041) — now born-on-PG and
+            // load-bearing for every RBAC/authz check. It was in /readyz but not
+            // here; a degraded rbac_store fails authz reads CLOSED (denies), so a
+            // "healthy" report over a dead authz store would be misleading.
+            bool rbac_ok = rbac_store_ && rbac_store_->is_open();
             // #2636: ResultSetStore was wired into /readyz but missing here — same
             // readyz-vs-healthz drift class the InventoryStore row above documents.
             // Fixed alongside the ADR-0038 GuaranteedStateStore migration since both
@@ -8795,7 +9363,7 @@ private:
                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok && result_set_ok && mgmt_group_ok;
+                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -8819,6 +9387,7 @@ private:
                   {"app_perf_fleet_store", app_perf_fleet_ok ? "ok" : "error"},
                   {"device_inventory_store", device_inventory_ok ? "ok" : "error"},
                   {"inventory_store", inventory_ok ? "ok" : "error"},
+                  {"rbac_store", rbac_ok ? "ok" : "error"},
                   {"result_set_store", result_set_ok ? "ok" : "error"},
                   {"management_group_store", mgmt_group_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
@@ -9863,8 +10432,9 @@ private:
             // of releasing early at post-routing.
             res.set_chunked_content_provider(
                 "text/event-stream",
-                [sink_state](size_t offset, httplib::DataSink& sink) -> bool {
-                    return detail::sse_content_provider(sink_state, offset, sink);
+                [sink_state, budget = stream_budget_.get()](size_t offset,
+                                                            httplib::DataSink& sink) -> bool {
+                    return detail::sse_content_provider(sink_state, offset, sink, budget);
                 },
                 detail::adopt_quota_slot_into_stream(
                     [sink_state, bus, lease](bool success) noexcept {
@@ -13186,10 +13756,18 @@ private:
         // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
         // off); else the caller's management-group members. The global-read branch is
         // load-bearing — a bare get_visible_agents would blank an admin in no group.
+        //
+        // #2703 Gate 7: gate on rbac_enforcement_in_effect (NOT raw is_rbac_enabled())
+        // — the latter can read stale-false while RBAC is durably enabled elsewhere (a
+        // degraded generation-refresh cache), which would silently disclose the whole
+        // fleet to a confined operator. Mirrors get_visible_agents_json's identical
+        // fix immediately above.
         auto visible_set_fn =
             [this](const std::string& username) -> std::optional<std::set<std::string>> {
-            if (rbac_store_ && rbac_store_->is_rbac_enabled() && mgmt_group_store_) {
-                if (!rbac_store_->check_permission(username, "Infrastructure", "Read")) {
+            if (mgmt_group_store_ && rbac_enforcement_in_effect(rbac_store_.get())) {
+                bool global_read = rbac_store_ && rbac_store_->is_open() &&
+                                   rbac_store_->check_permission(username, "Infrastructure", "Read");
+                if (!global_read) {
                     // ADR-0042: get_visible_agents nullopt means the mgmt-store
                     // DEGRADED — return an EMPTY confined set (fail-closed: sees
                     // nothing), NOT nullopt here (which means "sees all fleet").
@@ -15613,10 +16191,7 @@ private:
             // param defaults to {} = no filter (unscoped fleet read).
             software_inventory_store_.get(),
             [this](const std::string& username, const std::string& agent_id) -> bool {
-                if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
-                    return true;
-                return rbac_store_->check_scoped_permission(username, "Inventory", "Read", agent_id,
-                                                            mgmt_group_store_.get());
+                return inventory_agent_in_scope(username, agent_id);
             },
             // #1634: per-agent Response-scope predicate for the fan-out response
             // readers (GET /api/v1/executions/{id}/visualization). Routes through the
@@ -15814,10 +16389,7 @@ private:
                 // isolation). MUST be wired here; the param defaults to {} = no filter.
                 software_inventory_store_.get(),
                 [this](const std::string& username, const std::string& agent_id) -> bool {
-                    if (!rbac_store_ || !rbac_store_->is_rbac_enabled())
-                        return true;
-                    return rbac_store_->check_scoped_permission(username, "Inventory", "Read",
-                                                                agent_id, mgmt_group_store_.get());
+                    return inventory_agent_in_scope(username, agent_id);
                 },
                 // ADR-0011: metrics sink for the MCP-surface bundle orchestrator
                 // (yuzu_bundle_*{surface="mcp"}). REST passes its own registry.
@@ -15973,6 +16545,15 @@ private:
                 spdlog::info("Web UI available at http://{}:{}/", cfg_.web_address, listen_port);
             }
             web_server_->listen(cfg_.web_address, listen_port);
+            // #2703 Gate 7 item 2: listen() returned (every worker drained back
+            // into the pool and the pool itself joined — see httplib's
+            // ThreadPool::shutdown()), so this thread is about to exit. Signal
+            // stop()'s bounded wait rather than making it guess.
+            {
+                std::lock_guard<std::mutex> lk(web_thread_done_mtx_);
+                web_thread_done_ = true;
+            }
+            web_thread_done_cv_.notify_all();
         });
     }
 
@@ -16174,6 +16755,15 @@ private:
     std::unique_ptr<grpc::Server> mgmt_server_;
     std::unique_ptr<httplib::Server> web_server_;
     std::thread web_thread_;
+    // #2703 Gate 7 merge-slice item 2: signalled by web_thread_'s body right
+    // after web_server_->listen() returns, so stop() can bound how long it
+    // waits before joining rather than blocking on web_thread_.join()
+    // indefinitely (std::thread has no timed join). A std::thread must still
+    // be join()'d somewhere or its destructor calls std::terminate — this
+    // pairs with a wait_for(15s) in stop(), never a bare wait().
+    std::mutex web_thread_done_mtx_;
+    std::condition_variable web_thread_done_cv_;
+    bool web_thread_done_{false};
 
     // HTTPS redirect server
     std::unique_ptr<httplib::Server> redirect_server_;

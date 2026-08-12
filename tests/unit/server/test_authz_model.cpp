@@ -31,6 +31,7 @@
 
 #include "../test_helpers.hpp"
 #include "test_mgmt_group_pg_helper.hpp" // PG-backed ManagementGroupStore (ADR-0042)
+#include "test_rbac_store_pg_helper.hpp" // PG-backed RbacStore (ADR-0041)
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -254,12 +255,14 @@ namespace {
 ///
 /// Members: a_p∈P, a_c1∈C1, a_c2∈C2, a_s∈S.
 struct Rig {
-    yuzu::server::RbacStore rbac{":memory:"};
-    /// ADR-0042: ManagementGroupStore is Postgres-only — the SQLite temp-file
-    /// constructor this fixture used is gone. The bundle SKIPs the enclosing
-    /// TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset, so every case that
-    /// constructs a Rig carries the [pg] tag (same contract as
-    /// test_list_read_confinement.cpp, whose fixture pattern this mirrors).
+    /// ADR-0041/ADR-0042: RbacStore and ManagementGroupStore are both
+    /// Postgres-only — the SQLite `":memory:"`/temp-file constructors this
+    /// fixture used are gone. Both bundles SKIP the enclosing TEST_CASE when
+    /// YUZU_TEST_POSTGRES_DSN is unset, so every case that constructs a Rig
+    /// carries the [pg] tag (same contract as test_list_read_confinement.cpp,
+    /// whose fixture pattern this mirrors).
+    yuzu::test::RbacStorePg rbac_bundle;
+    yuzu::server::RbacStore& rbac = *rbac_bundle;
     yuzu::test::ManagementGroupStorePg mgmt_bundle;
     yuzu::server::ManagementGroupStore& mgmt = *mgmt_bundle;
     std::string gP, gC1, gC2, gS;
@@ -457,8 +460,9 @@ TEST_CASE("authz_model composition: no grant anywhere ⇒ empty visible set (fai
 }
 
 TEST_CASE("authz_model composition: null mgmt store ⇒ empty visible set, never unfiltered",
-          "[authz_model][compose][fail-closed]") {
-    yuzu::server::RbacStore rbac{":memory:"};
+          "[authz_model][compose][fail-closed][pg]") {
+    yuzu::test::RbacStorePg rbac_bundle;
+    yuzu::server::RbacStore& rbac = *rbac_bundle;
     rbac.set_rbac_enabled(true);
     REQUIRE(rbac.create_role({"ExecReader2", "", false, 0}).has_value());
     REQUIRE(rbac.set_permission({"ExecReader2", "Execution", "Execute", "allow"}).has_value());

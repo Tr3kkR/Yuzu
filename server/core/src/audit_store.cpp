@@ -1,7 +1,7 @@
 #include "audit_store.hpp"
 #include "config_secret_keys.hpp"
 
-#include "audit_retention_rules.hpp"
+#include <yuzu/audit_retention_rules.hpp>
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
