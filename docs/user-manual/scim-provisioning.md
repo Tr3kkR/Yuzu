@@ -543,4 +543,5 @@ with a **currently-active** account.
   deprovision-ordering decision).
 - `docs/adr/2001-scim-oidc-identity-linkage.md` — the ADR behind
   [SCIM ↔ OIDC identity linkage](#scim--oidc-identity-linkage-federated-token-revocation)
-  above (design rationale, the D1/D2 forks, the deferred deny-at-login PR3).
+  above (design rationale, the D1/D2 forks, and the deny-at-login backstop
+  shipped as PR3).

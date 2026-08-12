@@ -2441,6 +2441,36 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         const std::string username = oidc::oidc_principal_id(claims.iss, claims.sub);
         auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
 
+        // ADR-2001 §4 — deny-at-login backstop, PRIMARY check. Runs before
+        // every mutation below (group reconcile, session mint,
+        // provision_sso_identity, the ADR-2001 §2 link/observation writes,
+        // MFA amr seeding) so a denied login leaves no side effect behind —
+        // a deprovisioned SCIM user must not be able to re-authenticate and
+        // mint a fresh session just by round-tripping the IdP again.
+        // `oidc_login_denied_deprovisioned` is fail-CLOSED: a ScimStore that
+        // cannot answer denies, exactly like a resolved-inactive/orphaned
+        // link. Emits the BYTE-IDENTICAL `sso_failed` redirect the
+        // token-exchange-failure branch above uses — no "deprovisioned"/
+        // oracle wording reaches the browser; the reason (and, when known,
+        // the driving scim_id — server-generated CSPRNG hex, never IdP
+        // input, so no sanitize_detail_value needed) lives only in the
+        // server-side audit row.
+        if (auto decision = oidc::oidc_login_denied_deprovisioned(scim_store_, claims.iss, claims.sub);
+            decision.denied) {
+            spdlog::warn("OIDC login denied for '{}': linked SCIM resource is deprovisioned",
+                        username);
+            std::string deny_detail = "reason=linked_scim_resource_inactive";
+            if (decision.scim_id)
+                deny_detail += ";scim_id=" + *decision.scim_id;
+            audit_log_for_principal(req, "auth.oidc.deprovisioned_denied", "failure", username,
+                                    "user", "User", username, deny_detail);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+            }
+            res.set_redirect("/login?error=sso_failed");
+            return;
+        }
+
         // #1832 — reconcile IdP group memberships into the RBAC store BEFORE
         // minting a session, so a provisioning failure denies the login
         // outright (fail-closed) instead of granting a session under
@@ -2649,6 +2679,43 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             scim_store_, claims.iss, claims.sub, claims.oid, cfg_.oidc_scim_link_claim,
             cfg_.oidc_scim_link_claim == "oid" ? claims.oid : claims.sub,
             auth_mgr_.metrics_registry());
+
+        // ADR-2001 §4 — deny-at-login backstop, POST-MINT RE-CHECK (the
+        // codex-caught check-then-mint race, user-approved). The primary
+        // check above ran before this login's own mint; a concurrent SCIM
+        // deactivate/DELETE could have landed in the window between that
+        // check and `create_oidc_session` above. Re-resolve the SAME
+        // decision via the SAME helper and, if it has now flipped to DENY,
+        // invalidate the session just minted rather than hand it out — this
+        // self-heals the race without holding a cross-store lock over the
+        // mint (which would violate the no-lease-across-sibling-store
+        // discipline, ADR-2001 §3). Runs BEFORE the Set-Cookie header below
+        // so a denied login never reaches the browser with a live cookie.
+        if (auto decision = oidc::oidc_login_denied_deprovisioned(scim_store_, claims.iss, claims.sub);
+            decision.denied) {
+            spdlog::warn("OIDC login denied for '{}' on post-mint re-check: linked SCIM resource "
+                        "is deprovisioned (concurrent deprovision race)",
+                        username);
+            auto revoke_result = auth_mgr_.invalidate_user_sessions(username);
+            std::string recheck_detail =
+                "reason=linked_scim_resource_inactive;post_mint_recheck=true;sessions_invalidated=" +
+                std::to_string(revoke_result.count);
+            if (decision.scim_id)
+                recheck_detail += ";scim_id=" + *decision.scim_id;
+            if (!revoke_result.db_persisted) {
+                // RevokeResult's contract (auth.hpp): a "success" audit row
+                // that hides a DB persistence failure produces fictional
+                // CC6.3/CC6.6 evidence — surface it in the row itself.
+                recheck_detail += ";db_persisted=false";
+            }
+            audit_log_for_principal(req, "auth.oidc.deprovisioned_denied", "failure", username,
+                                    "user", "User", username, recheck_detail);
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+            }
+            res.set_redirect("/login?error=sso_failed");
+            return;
+        }
 
         res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
 

@@ -27,6 +27,7 @@
 /// `oid`, when present and sane) regardless of which one is configured for
 /// LINK FORMATION — see `oidc_scim_link.cpp`'s `is_sane_claim_value`.
 
+#include <optional>
 #include <string>
 
 namespace yuzu {
@@ -75,5 +76,56 @@ void link_oidc_login_to_scim(ScimStore* scim_store, const std::string& iss, cons
                              const std::string& oid, const std::string& link_claim_name,
                              const std::string& link_claim_value,
                              yuzu::MetricsRegistry* metrics = nullptr);
+
+/// ADR-2001 §4 — the deny-at-login backstop's resolve-and-decide result.
+/// `denied` is the single question the login path needs answered; `scim_id`
+/// — when the decision came from an actual linked identity (deactivated or
+/// orphaned) — names which SCIM resource drove a DENY, so the CC6.8 audit
+/// row is self-contained ("denied because resource X was deprovisioned",
+/// not just "denied"). `scim_id` is `nullopt` on every PROCEED outcome, and
+/// also on the store-unavailable DENY (there is no resource to name — the
+/// store could not be asked).
+struct OidcLoginDenyDecision {
+    bool denied{false};
+    std::optional<std::string> scim_id;
+};
+
+/// ADR-2001 §4 — the deny-at-login backstop's resolve-and-decide step.
+/// Resolves `(iss, sub)` via `ScimStore::linked_resource_active` and
+/// collapses its state into the single question the login path needs: MUST
+/// this login be denied, and if so, which SCIM resource drove it? Called
+/// from `/auth/callback` TWICE — once before any mint, once again
+/// immediately after (the codex-caught check-then-mint race) — so both call
+/// sites share exactly one decision function rather than each hand-rolling
+/// the mapping.
+///
+/// `denied == true` iff:
+///  - `scim_store` is present but could not answer
+///    (`linked_resource_active`'s OUTER `nullopt`) — fail-closed, never
+///    treated as "no link"; `scim_id` is `nullopt` (no resource to name);
+///  - the linked resource resolved INACTIVE (engaged, `scim_id` set,
+///    `active` either `nullopt` — an orphaned link whose `scim_resources`
+///    row was hard-deleted — or `false` — deactivated); `scim_id` carries
+///    the linked resource's id in both sub-cases.
+///
+/// `denied == false` (`scim_id` always `nullopt`) iff:
+///  - `scim_store` is null — SCIM/ADR-2001 linkage is not configured at all
+///    (mirrors `link_oidc_login_to_scim`'s null-safety: no store means no
+///    link could ever have formed, so there is nothing to deny against —
+///    this is "feature off", not "store degraded", and must not block
+///    every OIDC login on a deployment that never enabled SCIM);
+///  - no `identity_links` row exists for this identity (engaged,
+///    `scim_id == nullopt`) — an unlinked OIDC identity is not a
+///    deprovisioned SCIM user;
+///  - the linked resource resolved ACTIVE (engaged, `active == true`).
+///
+/// Pure decision function: no audit, no metrics, no redirect — the caller
+/// owns every side effect of a DENY (the byte-identical `sso_failed`
+/// redirect, the `auth.oidc.deprovisioned_denied` audit row carrying
+/// `scim_id`, the `yuzu_auth_oidc_deprovisioned_denied_total` bump, and —
+/// on the post-mint call only — invalidating the session just minted).
+[[nodiscard]] OidcLoginDenyDecision
+oidc_login_denied_deprovisioned(ScimStore* scim_store, const std::string& iss,
+                                const std::string& sub);
 
 } // namespace yuzu::server::oidc

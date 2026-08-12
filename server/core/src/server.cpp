@@ -2103,6 +2103,19 @@ public:
                           "identity links and/or D2 login observations are silently not being "
                           "recorded",
                           "counter");
+        // ADR-2001 §4 — deny-at-login backstop. Bumped by
+        // `oidc_login_denied_deprovisioned`'s two call sites in
+        // auth_routes.cpp's /auth/callback (the primary pre-mint check and
+        // the post-mint re-check for the codex-caught concurrent-deprovision
+        // race) on every DENY — a non-zero rate is the CC6.8 backstop
+        // actually firing, i.e. a deprovisioned federated identity attempted
+        // to re-authenticate.
+        metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_total",
+                          "Total OIDC logins denied at /auth/callback because the identity's "
+                          "linked SCIM resource is deprovisioned (deactivated, or orphaned by a "
+                          "hard-deleted scim_resources row) — the ADR-2001 §4 deny-at-login "
+                          "backstop closing the re-login-mints-fresh-tokens window",
+                          "counter");
         // describe() only registers HELP/TYPE metadata; the series is absent
         // from /metrics until first .increment(). Instantiate each bare
         // counter at 0 now so absent()-style alert rules on the CC6.8
@@ -2112,6 +2125,7 @@ public:
         metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
         metrics_.counter("yuzu_scim_deprovision_unlinked_total");
         metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
+        metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning

@@ -81,4 +81,28 @@ void link_oidc_login_to_scim(ScimStore* scim_store, const std::string& iss, cons
     }
 }
 
+OidcLoginDenyDecision oidc_login_denied_deprovisioned(ScimStore* scim_store, const std::string& iss,
+                                                      const std::string& sub) {
+    // No store configured at all — SCIM/ADR-2001 linkage cannot have formed,
+    // so there is nothing to deny against. This is deliberately DIFFERENT
+    // from a non-null-but-unusable store (below), which fails closed.
+    if (!scim_store)
+        return {.denied = false, .scim_id = std::nullopt};
+
+    auto result = scim_store->linked_resource_active(iss, sub);
+    if (!result)
+        return {.denied = true, .scim_id = std::nullopt}; // store could not answer: deny, no id to name
+
+    if (!result->scim_id)
+        return {.denied = false, .scim_id = std::nullopt}; // no linked identity: proceed
+
+    if (!result->active || !*result->active) {
+        // Orphaned (active == nullopt) or explicitly deactivated (active ==
+        // false) — either way, deny and name the resource that drove it.
+        return {.denied = true, .scim_id = result->scim_id};
+    }
+
+    return {.denied = false, .scim_id = std::nullopt}; // active == true: proceed
+}
+
 } // namespace yuzu::server::oidc

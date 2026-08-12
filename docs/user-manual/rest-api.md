@@ -7597,6 +7597,7 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed) |
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
 | `scim.user.deprovision_role_refused_with_link` | `failure` | ADR-2001 D1: a role-refused deprovision (`deprovision_role_ok` 404 — the slug's role is not `user`) for a slug with ≥1 active linked OIDC identity, whose tokens are therefore NOT auto-revoked. Always written alongside `yuzu_scim_deprovision_role_refused_with_active_link_total` — see `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
+| `auth.oidc.deprovisioned_denied` | `failure` | ADR-2001 §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the store could not answer — fail-closed). Emitted from `GET /auth/callback`, not a `/scim/v2/*` route — listed here because it is part of the same ADR-2001 linkage. `detail` carries `reason=linked_scim_resource_inactive`, `scim_id=<id>` when a resource drove the denial, and — only on the post-mint re-check path (a concurrent deprovision landed after the primary check) — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). Pairs with `yuzu_auth_oidc_deprovisioned_denied_total`. |
 
 #### Metrics
 
@@ -7610,10 +7611,14 @@ rows).
 **ADR-2001 (SCIM↔OIDC identity linkage, CC6.8):**
 `yuzu_scim_deprovision_role_refused_with_active_link_total` (D1 — a
 deprovision was refused for a slug with an active linked federated identity
-whose tokens were not auto-revoked; a human must terminate them manually)
-and `yuzu_scim_deprovision_unlinked_total` (D2 — a deprovision found a
+whose tokens were not auto-revoked; a human must terminate them manually),
+`yuzu_scim_deprovision_unlinked_total` (D2 — a deprovision found a
 login observation that should have matched the slug's `externalId` but no
-link had formed, almost always a misconfigured `--oidc-scim-link-claim`).
+link had formed, almost always a misconfigured `--oidc-scim-link-claim`),
+and `yuzu_auth_oidc_deprovisioned_denied_total` (§4/PR3 — the deny-at-login
+backstop refused an OIDC re-login against a deprovisioned linked identity;
+see the audit action above and `docs/user-manual/metrics.md` "SSO login
+metrics").
 Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
 Metrics and "SCIM ↔ OIDC identity linkage for deprovision" § New metrics.
 
