@@ -1,6 +1,6 @@
 # ADR-2001 — SCIM ↔ OIDC identity linkage for deprovision (SOC 2 CC6.8)
 
-**Status:** Accepted (rev 3, 2026-08-12 — D1/D2/D3 decided; see "Decisions" below)
+**Status:** Accepted (rev 3, 2026-08-12 — D1/D2/D3 decided; see "Decisions" below). **PR1+PR2+PR3 all SHIPPED** — the deny-at-login backstop (§4) has landed; see "Known residuals" for the honest scope of what it closes.
 **Authors:** Fraser Jarvis (@fjarvis)
 **Date:** 2026-08-12
 **Relates to:** ADR-0031 (`0031-engine-principal-store.md`), ADR-0017 (management-group confinement), ADR-0012 (PG store contract), the SCIM v2 provisioning surface, the OIDC stable-principal decision (#1837), and the #2021 SCIM role/provenance guard.
@@ -56,8 +56,10 @@ SCIM `active:false`/`DELETE` and dashboard delete resolve slug → `scim_id` →
 
 **Lock/pool discipline (the real hazard, per architect):** the three stores share one bounded `pg_pool_`. The orchestration lives **above** the stores — it calls each store's public method in sequence and **never holds one store's pool lease while calling another** (a nested second lease from the same pool can exhaust/deadlock it, `api_token_store.hpp:257`). `AuthManager::mu_` stays a leaf, never held across a store/DB/bus call (unchanged house discipline). Acquisition order to hold: resolve links (ScimStore) → revoke tokens (ApiTokenStore) → revoke sessions (AuthManager) → mark inactive (AuthManager) → SCIM mirror (ScimStore), each self-contained.
 
-### 4. Deny-at-login backstop (own PR — see Delivery)
-An OIDC login whose linked SCIM resource is deprovisioned is **denied** — fail-CLOSED — emitting the **identical `?error=sso_failed` redirect** as the existing token-exchange-failure branch (`auth_routes.cpp:2422`), with a server-side `auth.oidc.deprovisioned_denied` audit. This closes the re-login-mints-fresh-tokens window that eager revoke alone leaves. Architecturally decoupled from §3 (different site, opposite failure direction) → separate PR.
+### 4. Deny-at-login backstop (own PR — see Delivery) — SHIPPED (PR3)
+An OIDC login whose linked SCIM resource is deprovisioned is **denied** — fail-CLOSED — emitting the **identical `?error=sso_failed` redirect** as the existing token-exchange-failure branch (`auth_routes.cpp:2422`), with a server-side `auth.oidc.deprovisioned_denied` audit and the `yuzu_auth_oidc_deprovisioned_denied_total` counter. This closes the re-login-mints-fresh-tokens window that eager revoke alone leaves — refusing a login against an **already-completed** deprovision, the dominant case, outright. Architecturally decoupled from §3 (different site, opposite failure direction) → separate PR.
+
+Implemented as `ScimStore::linked_resource_active(iss, sub)`, a single fused `identity_links` ⋈ (LEFT JOIN) `scim_resources` query, so an **orphaned link** — the linked `scim_resources` row hard-DELETEd by a SCIM `DELETE` (`identity_links` is not FK-cascaded) — is denied exactly like an explicitly deactivated one, rather than reading as "no link" (which an INNER join would have produced) and letting the deprovisioned identity re-authenticate. Store-unavailable (the query itself cannot be answered) also denies, fail-closed. The decision is called from two sites in `/auth/callback`: a **primary** check before any session/link mint, and a **post-mint re-check** that invalidates a just-minted session if the identity was deprovisioned concurrently — see "Known residuals" below for exactly what this does and does not close.
 
 ### 5. Single shared principal-string helper (mandatory)
 The `oidc:<iss>#<sub>` string is hand-built at two sites today; the resolver would be a third. A drift in the format silently misses every token — the exact "reported success, revoked nothing" failure. **Require one `oidc_principal_id(iss,sub)` helper**; the resolver returns raw `(iss,sub)` rows and this helper builds every principal string. Do **not** widen `session_revoke_fn` (it carries `caller=self|admin` metric semantics) — add a resolver over the existing per-principal revoke primitive.
@@ -88,16 +90,134 @@ The full analysis of each fork is retained below for the build team.
 
 ## Consequences
 
-- **CC6.8 residual, stated honestly:** after deprovision, a previously-issued API token may keep validating for up to **~60s** (the `ApiTokenStore` validate-cache TTL, `api_token_store.hpp:787`; MCP stream sessions carry the same), plus the irreducible IdP→SCIM lag before deprovision fires. Cookie sessions are erased immediately. Deny-at-login (§4) closes re-login mint. The guarantee is "revoked within ~60s of the deprovision reaching Yuzu, and no new access thereafter," not "instant."
+- **CC6.8 residual, stated honestly:** after deprovision, a previously-issued API token may keep validating for up to **~60s** (the `ApiTokenStore` validate-cache TTL, `api_token_store.hpp:787`; MCP stream sessions carry the same), plus the irreducible IdP→SCIM lag before deprovision fires. Cookie sessions are erased immediately. Deny-at-login (§4, shipped) refuses re-login against an already-completed deprovision outright, and narrows — via a post-mint re-check — but does not by construction eliminate, a login racing an in-flight deprovision (see "Known residuals" for the precise, deliberately-scoped guarantee). The guarantee is "revoked within ~60s of the deprovision reaching Yuzu, and no new access thereafter for a completed deprovision," not "instant" and not an absolute guarantee against every in-flight race.
+- **New availability coupling, stated honestly (PR3 governance fold D1):** the deny-at-login check (§4) is fail-**CLOSED** on a `ScimStore`/Postgres query failure — once `--scim-enable` is set, OIDC login availability is now hard-coupled to `ScimStore`'s live query path. A `ScimStore`/Postgres outage therefore denies **every** OIDC login fleet-wide, including a user who was never SCIM-linked at all, not only an actually-deprovisioned one. This is the correct tradeoff — a login whose deprovision status cannot be checked is treated as unsafe, consistent with the born-on-PG fail-closed posture (ADR-0012 §1) — but it is a real new availability dependency and must be operator-visible, not left implicit in metric-doc prose; see `docs/user-manual/scim-provisioning.md`'s operator runbook for the blast-radius note (password login is unaffected — this coupling is OIDC-only).
 - **Deliverables (new work this ADR authorizes):** `oid` claim parse + `sub`-equivalent validation; `identity_links` table (ScimStore, `(iss,sub)` unique + `scim_id` index, no-prune-by-decision — orphan links from a claim-config change accumulate but only ever cause safe over-revoke); `--oidc-scim-link-claim` flag; the shared `oidc_principal_id` helper; a principal-set resolver; the deprovision reorder; new audit verbs + metrics; plus whichever D1/D2 options are chosen.
 - **INV-31-3 not crossed:** `identity_links` has one owning store (ScimStore), method-mediated — a future engine/core split stays clean.
-- **Delivery (architect recommendation, reconciled with the "A+B together" intent):** three reviewable PRs — **PR1** per-principal revoke at the deprovision seams (`{slug}` only, forward-compatible set-resolver); **PR2** linkage (`oid`, `identity_links`, resolver, D2 detector); **PR3** deny-at-login (D1 handling + §4). The CC6.8 compliance cell may only be updated to "complete for federated users" **after PR2** — PR1 alone must not touch it, or it overstates. If you want a single PR per your earlier call, PR1+PR2 can merge together; PR3 (login-path, fail-closed) is best kept separate for blast-radius.
+- **Delivery (architect recommendation, reconciled with the "A+B together" intent):** three reviewable PRs — **PR1** per-principal revoke at the deprovision seams (`{slug}` only, forward-compatible set-resolver); **PR2** linkage (`oid`, `identity_links`, resolver, D2 detector); **PR3** deny-at-login (D1 handling + §4). **All three have now shipped.** The CC6.8 compliance cell may only be updated to "complete for federated users" **after PR2** — PR1 alone must not touch it, or it overstates. If you want a single PR per your earlier call, PR1+PR2 can merge together; PR3 (login-path, fail-closed) is best kept separate for blast-radius.
 
 ### Known residuals
 
 - **The ~60s validate-cache window** (see Consequences above) — stated honestly, not treated as fixed by this ADR.
 - **A manually-elevated federated admin's tokens are not auto-revoked (D1)** — by design, a human step; see D1 above.
-- **Login-mid-deprovision TOCTOU, open until PR3.** PR1+PR2 (shipped) close the *deprovision-time* revoke gap; they do not close a race between an OIDC login's principal-set resolution and a concurrent deactivation of the same slug. Concretely: a login that authenticates and forms/refreshes an `identity_links` row for `(iss, sub)` **between** a deprovision's `resolve_deprovision_principals` read and its `set_active(..., false)`/delete write can mint a fresh session and API/MCP tokens for that identity that the in-flight deprovision pass never saw and therefore never revoked — a freshly-linked (or freshly re-authenticated) principal can walk away with live credentials from a termination that, from the operator's point of view, just completed successfully. This is exactly the gap §4 (deny-at-login, PR3, not yet shipped) closes: once a login is refused for a deprovisioned linked SCIM slug, the race has nothing left to win — the login itself fails before any new credential is minted. Until PR3 ships, this is a genuine, acknowledged residual, not a theoretical one: **do not describe CC6.8 as fully closed for the federated population without naming this window.** Operationally it is bounded by ordinary IdP-to-Yuzu SCIM propagation latency (typically seconds to low minutes, IdP-dependent), not unbounded.
+- **Login-mid-deprovision TOCTOU — narrowed by PR3, not fully eliminated. This is a deliberate design decision, not an oversight; state the guarantee precisely, never as "the race has nothing left to win."** PR1+PR2 close the *deprovision-time* revoke gap. §4/PR3 (shipped) then refuses a login whose linked SCIM resource is **already** deprovisioned — the dominant case, and it is fully closed: a re-login after a completed deprovision cannot mint a fresh credential, full stop.
+  What PR3 does **not** eliminate outright is the narrower **in-flight-deprovision** race: a login that authenticates and forms/refreshes an `identity_links` row for `(iss, sub)` strictly **between** the primary deny-at-login check and the session mint — concurrently with a deprovision's `set_active(..., false)`/delete write landing in that same window — can still walk away with a session minted before the deprovision was visible to the check that ran. PR3 **self-heals** this window with a **post-mint re-check**: immediately after minting, `oidc_login_denied_deprovisioned` is called again, and if the identity has since flipped to deprovisioned, the just-minted session is invalidated and the login is denied before any cookie reaches the browser (`AuthManager::invalidate_user_sessions`). This closes the window to everything except a **microsecond check-then-mint gap** that remains theoretically possible between the re-check's own read and the response being sent.
+  **That microsecond gap is deliberately not closed by lock-serialization.** Holding a lock across the login's check→mint sequence and the entirety of a concurrent deprovision would require a cross-store lease held over a sibling-store call (`ScimStore` across `AuthManager`'s session mint), which this codebase's store discipline (§3 above; `AuthManager::mu_` and the shared `pg_pool_` leases) treats as a deadlock hazard, not a hardening opportunity — see §3's "never hold one store's pool lease while calling another." **The residual bound differs by credential kind — do not collapse the two.** (a) An **API/MCP token** minted or already held during the race is caught by the existing **~60s `ApiTokenStore` validate-cache window** above: even a freshly-minted token stops validating within that bound once the underlying revoke lands. (b) A **slipped session is not on the same clock.** `AuthManager::validate_session` re-checks only the session's own expiry/idle timeout on every request — it does **not** re-query SCIM-linked deprovision state — so a session that does slip through this race remains valid for up to the **session's own TTL** (the absolute `kSessionDuration`, 8h by default, or the shorter `--session-inactivity-secs` idle timeout when configured), not ~60s. It is cut short early only if a *subsequent* deprovision call happens to land against the same identity — which is not guaranteed: an IdP does not necessarily re-send a deprovision call for a resource it already believes is deactivated. Stating the session residual as "~60s" or as reliably self-healed by a next deprovision pass overstates the guarantee.
+  **The honest guarantee, stated precisely:** re-login against an already-completed deprovision is refused, unconditionally. A login racing an in-flight deprovision is refused in the overwhelming majority of timings and self-heals via the post-mint re-check in the remainder; a vanishingly narrow, deliberately-unclosed microsecond window remains, bounded by the ~60s cache TTL for API/MCP tokens and by the session's own TTL (not ~60s) for a slipped session, not eliminated by construction. **Do not describe this as "the race has nothing left to win" or as fully closing the TOCTOU** — that overclaims what a lock-free, cross-store design can guarantee. Operationally the window is additionally bounded by ordinary IdP-to-Yuzu SCIM propagation latency (typically seconds to low minutes, IdP-dependent), not unbounded.
+  **Forward caveat — single-primary Postgres reads assumed.** The guarantee above is sound only because Yuzu's Postgres deployment is single-primary today: every `linked_resource_active` read lands on the same primary a deprovision write just landed on, so there is no replica-lag window beyond the microsecond check-then-mint gap already described. If read-replica routing is ever introduced for `ScimStore`, a check could read a stale, not-yet-replicated `scim_resources.active` value, and this residual would widen from a microsecond window to ordinary replica lag — revisit deny-at-login's guarantee at that point. Not a current defect; single-primary is the shipped, verified configuration.
+- **Orphaned links (the `scim_resources` row was hard-DELETEd by a SCIM `DELETE`) are handled, not a gap.** `linked_resource_active`'s LEFT JOIN surfaces a deleted-but-still-linked `identity_links` row as `active == nullopt` (an INNER join would instead have silently treated the now-rowless join as "no link" and let the deprovisioned identity re-authenticate). The deny decision then distinguishes two orphaned sub-cases: if an **active resource now exists for the login's externalId** (`find_unique_active_by_external_id`), the identity was DELETE'd and re-`POST`ed under a new `scim_id` — a returning employee — so the login **proceeds** and the imminent `link_oidc_login_to_scim` repoints the stale link; if **no** active resource exists, it is genuinely deprovisioned and is **denied** (like an explicitly deactivated one). This reprovision distinction is scoped to the orphaned branch only — the `external_id` unique index guarantees an explicitly-deactivated (row-present) resource can have no active same-externalId sibling. Denying orphaned links unconditionally (the pre-fix behaviour) would permanently lock out a returning re-provisioned employee.
+
+## SAML ↔ SCIM identity linkage (PR4a addendum, accepted 2026-08-13)
+
+This ADR's title and body above are OIDC-specific by construction (§5's
+`oidc_principal_id`, the `identity_links` table, `--oidc-scim-link-claim`).
+**PR4a extends the same closing argument to SAML**, delivering the SAML
+analogue of PR1+PR2 (link formation + deprovision-time revoke). SAML
+deny-at-login — the analogue of §4/PR3 above — is **PR4b (#3066), NOT shipped
+by this addendum.**
+
+**Why a SAML gap exists at all.** Exactly the same root cause as the OIDC
+case: prior to PR4a, a SAML login minted a session keyed on the raw NameID
+(`AuthManager::create_saml_session`, the "#1837 fast-follow" comment it
+replaced), with no link ever recorded to the SCIM resource that provisioned
+that person. A SCIM deprovision therefore reached zero SAML sessions for a
+federated user's identity while reporting a clean success — the same
+silent-under-revocation shape §"Context" above describes for OIDC tokens,
+here for SAML sessions.
+
+**1. The stable principal: `saml:<entity_id>#<NameID>`, one builder.**
+`saml::saml_principal_id(entity_id, name_id)` (`server/core/src/
+saml_principal.hpp`) is `"saml:" + entity_id + "#" + name_id` — the SAML
+mirror of §5's `oidc_principal_id(iss, sub)`, for the identical reason: a
+NameID is only guaranteed unique *within* one IdP, so a bare NameID is unsafe
+as a durable session/RBAC key the moment more than one IdP (or, before this
+addendum, a future multi-tenant deployment) could assert it. Every
+construction site — the session-mint site (`AuthManager::
+create_saml_session`) and the deprovision-time resolver
+(`deprovision_revoke.cpp`) — routes through this one function; a hand-built
+copy at either site would silently drift and miss sessions on revoke,
+exactly §5's stated failure mode.
+
+**2. Session-key / display-name split.** `create_saml_session`'s `username`
+(the authorization/audit/revoke key) becomes the stable principal;
+`display_name` stays the raw NameID (rendering only). This is the SAML
+mirror of the OIDC session's own username/display split.
+
+**3. The NameID-Format contract (architect codex-sol plan-review BLOCK,
+2026-08-12).** A NameID is a safe join key against a SCIM `externalId`
+**only when it carries a STABLE Format AND its value equals that
+`externalId`** — an assertion's `<NameID Format="...">` attribute is read
+(`SamlAssertion::name_id_format`, from the same XSW-verified node as the
+NameID itself) and gated: a link forms only for
+`urn:oasis:names:tc:SAML:2.0:nameid-format:persistent` or the SAML 1.1
+`urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress`
+(`saml::is_linkable_name_id_format`). `transient` (re-minted per login by
+design), `unspecified`, and a missing Format are all treated conservatively
+as **not linkable** — Yuzu never normalizes a NameID into a linkable shape.
+This is a configuration contract on the operator, stated explicitly: **the
+operator MUST configure their IdP to emit a NameID that is both a stable
+Format and numerically equal to the externalId SCIM provisions that person
+with.** Yuzu's role is to reject an unacceptable Format outright, never to
+coerce one. A stable-Format NameID that simply doesn't match any
+`externalId` — or a deployment left on `transient` — forms no link; the
+login still succeeds (this is not a login-time authorization gate, only a
+linkability gate), but that identity is unlinkable and therefore
+**unrevocable via SCIM deprovision** — the documented residual below.
+
+**4. Single-IdP precondition — stronger than the OIDC case.** §"Hard
+constraints" constraint 5 above requires the OIDC side to reason about
+multiple possible issuers sharing one `externalId` space; SAML does not face
+that question in the same way, because Yuzu already requires exactly one
+pinned IdP cert + one pinned `--saml-idp-entity-id`
+(`SamlProvider::is_enabled()`), and `SamlProvider::validate_response`
+verifies the assertion's signed `<saml:Issuer>` equals that pinned
+`entity_id` before anything downstream ever sees it. One pinned IdP is what
+makes a bare NameID→`externalId` match safe by construction here, without
+needing an `iss`-partitioned `externalId` space the way a future multi-IdP
+OIDC configuration would.
+
+**5. `saml_identity_links` (ScimStore migration v4).** A dedicated table —
+deliberately **not** a generalization of §2's `identity_links` (keeps this
+addendum off PR3's OIDC schema surface) — keyed `(entity_id, name_id)`
+unique, secondary-indexed on `scim_id` (the deprovision lookup direction).
+Link formation reuses the same `find_unique_active_by_external_id`
+exactly-one-active-match rule §2 established for OIDC (zero matches: no link,
+normal; more than one: no link, never an arbitrary pick). The write is
+fail-**open** — a write failure never fails the login, mirroring §2's OIDC
+contract exactly.
+
+**6. Deprovision revokes the SAML session — and any token minted under it.**
+`resolve_deprovision_principals` (§3's resolver) gained a second pass:
+`saml::saml_principal_id(entity_id, name_id)` for every row
+`ScimStore::saml_links_for_scim_id(scim_id)` returns, fail-**closed** on that
+call's own `nullopt` (the identical contract §3 gives the OIDC pass). SAML
+has no *separate* token-mint path — the only session-mint call site keyed on
+a `saml:` principal is `create_saml_session` — but the revoke functions
+(`revoke_for_principal` et al.) are principal-agnostic: any token that was
+minted with a `saml:` principal as its owner (e.g. via the HTMX
+settings-page token-create route, which stamps the calling session's
+username onto the token regardless of that session's auth source) is
+revoked right alongside the session when its `saml:` principal is resolved
+into the revoke set. In practice this means a SAML deprovision's dominant
+observable effect is the session teardown, since the SAML login flow itself
+never mints a token — but it is not the *only* thing revoked for that
+principal.
+
+**7. The residual, stated as honestly as §"Known residuals" states PR3's.**
+PR4b (deny-at-login, #3066) has **not** shipped. A SAML identity whose linked
+SCIM slug is already deprovisioned is **not yet refused at `/saml/acs`** — a
+person who still holds a valid, signed assertion from the IdP can
+re-authenticate after their SCIM deprovision and mint a fresh session. That
+fresh session is correctly revoked again on the *next* deprovision pass (the
+link persists), but it is live in the meantime — precisely the window
+§"Known residuals" describes for OIDC's PR3 gap, now open on the SAML side
+until PR4b lands. Do not describe SAML deprovision as fully closing CC6.8 for
+the federated SAML population without naming this window.
 
 ## Review provenance
 Rev 2 folds: architect B1 (`oid` unbuilt) + B2 (overload infeasible) + lease-nesting/reorder/resolver/index/helper notes; security-guardian F1 (D1), F2 (D2), F3 (single-issuer precondition, constraint 5), F4 (`oid`, constraint 3), F5 (constraint 4 wording), F6 (60s residual), F7 (generic deny redirect). Both reviews called the core reconciliation idea sound; the defects were in the provenance interaction and the fail-loud realizability, now surfaced as D1/D2.
+
+The SAML addendum (PR4a, 2026-08-13) folds one architect (codex-sol) BLOCK
+from its plan review: the NameID-Format gate above (item 3) — an earlier
+draft of the plan treated any NameID as a safe join key, which the BLOCK
+correctly identified as unsafe for `transient` NameIDs.

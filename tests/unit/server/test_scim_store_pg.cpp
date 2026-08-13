@@ -755,6 +755,225 @@ TEST_CASE("ScimStore: oidc_login_observations upsert-on-relogin + observation_ma
     }
 }
 
+// ── ADR-2001 PR4a — SAML identity linkage (migration v4) ────────────────
+//
+// saml_identity_links — the SAML analogue of v3's identity_links. A
+// SEPARATE table from identity_links (never a generalization) — keeps this
+// PR off PR3's scim_store schema surface. No scim_resources.external_id
+// ambiguity guard is re-tested here (that guard, and its migration, are
+// v3's — this table adds no new one; find_unique_active_by_external_id is
+// already covered above).
+
+TEST_CASE("ScimStore: saml_identity_links upsert + saml_links_for_scim_id",
+         "[pg][scim][2001][linkage][saml]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("upsert_saml_link is idempotent and saml_links_for_scim_id returns it") {
+        REQUIRE(store.upsert_saml_link("https://idp.example.com/saml/metadata",
+                                       "alice@example.com", "scim-alice"));
+        REQUIRE(store.upsert_saml_link("https://idp.example.com/saml/metadata",
+                                       "alice@example.com", "scim-alice")); // repeat
+
+        auto links = store.saml_links_for_scim_id("scim-alice");
+        REQUIRE(links.has_value());
+        REQUIRE(links->size() == 1);
+        CHECK((*links)[0].entity_id == "https://idp.example.com/saml/metadata");
+        CHECK((*links)[0].name_id == "alice@example.com");
+    }
+
+    SECTION("multiple (entity_id,name_id) identities can link to the same scim_id") {
+        REQUIRE(store.upsert_saml_link("https://idp-a.example.com/", "a@example.com",
+                                       "scim-bob"));
+        REQUIRE(store.upsert_saml_link("https://idp-b.example.com/", "b@example.com",
+                                       "scim-bob"));
+
+        auto links = store.saml_links_for_scim_id("scim-bob");
+        REQUIRE(links.has_value());
+        REQUIRE(links->size() == 2);
+    }
+
+    SECTION("saml_links_for_scim_id returns an engaged-but-empty vector for an unknown "
+           "scim_id") {
+        auto links = store.saml_links_for_scim_id("no-such-scim-id");
+        REQUIRE(links.has_value());
+        CHECK(links->empty());
+    }
+
+    SECTION("re-linking the same (entity_id,name_id) to a different scim_id moves the link "
+           "(UNIQUE (entity_id,name_id) enforced)") {
+        REQUIRE(store.upsert_saml_link("https://idp.example.com/", "move@example.com",
+                                       "scim-old"));
+        REQUIRE(store.upsert_saml_link("https://idp.example.com/", "move@example.com",
+                                       "scim-new"));
+
+        CHECK(store.saml_links_for_scim_id("scim-old")->empty());
+        auto new_links = store.saml_links_for_scim_id("scim-new");
+        REQUIRE(new_links.has_value());
+        REQUIRE(new_links->size() == 1);
+        CHECK((*new_links)[0].name_id == "move@example.com");
+    }
+
+    SECTION("upsert_saml_link rejects empty entity_id/name_id/scim_id") {
+        CHECK_FALSE(store.upsert_saml_link("", "name", "scim-x"));
+        CHECK_FALSE(store.upsert_saml_link("entity", "", "scim-x"));
+        CHECK_FALSE(store.upsert_saml_link("entity", "name", ""));
+    }
+}
+
+TEST_CASE("ScimStore: saml_identity_links and identity_links (OIDC) are independent tables",
+         "[pg][scim][2001][linkage][saml]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Link the SAME scim_id from both sides — an OIDC link and a SAML link
+    // coexisting on one SCIM resource must not interfere with each other's
+    // read (a shared/generalized table would risk exactly this).
+    REQUIRE(store.upsert_link("https://oidc-idp.example.com/", "sub-1", "scim-both"));
+    REQUIRE(store.upsert_saml_link("https://saml-idp.example.com/", "name@example.com",
+                                   "scim-both"));
+
+    auto oidc_links = store.links_for_scim_id("scim-both");
+    auto saml_links = store.saml_links_for_scim_id("scim-both");
+    REQUIRE(oidc_links.has_value());
+    REQUIRE(saml_links.has_value());
+    REQUIRE(oidc_links->size() == 1);
+    REQUIRE(saml_links->size() == 1);
+    CHECK((*oidc_links)[0].sub == "sub-1");
+    CHECK((*saml_links)[0].name_id == "name@example.com");
+}
+
+// ── ADR-2001 §4 — deny-at-login backstop accessor ───────────────────────
+
+TEST_CASE("ScimStore: linked_resource_active — deny-at-login backstop tri-state + scim_id",
+         "[pg][scim][2001][linkage][deny-at-login]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("active linked resource -> engaged, scim_id set, active=true (PROCEED)") {
+        auto r = store.create_resource("active-user", "ext-active");
+        REQUIRE(r.has_value());
+        REQUIRE(store.upsert_link("https://idp.example.com/", "sub-active", r->scim_id));
+
+        auto result = store.linked_resource_active("https://idp.example.com/", "sub-active");
+        REQUIRE(result.has_value()); // OUTER engaged — store answered
+        REQUIRE(result->scim_id.has_value());
+        CHECK(*result->scim_id == r->scim_id); // the audit-detail id, asserted
+        REQUIRE(result->active.has_value());
+        CHECK(*result->active == true);
+    }
+
+    SECTION("deactivated linked resource (set_active false) -> engaged, scim_id set, "
+           "active=false (DENY)") {
+        auto r = store.create_resource("inactive-user", "ext-inactive");
+        REQUIRE(r.has_value());
+        REQUIRE(store.upsert_link("https://idp.example.com/", "sub-inactive", r->scim_id));
+        REQUIRE(store.set_active(r->scim_id, false));
+
+        auto result = store.linked_resource_active("https://idp.example.com/", "sub-inactive");
+        REQUIRE(result.has_value());
+        REQUIRE(result->scim_id.has_value());
+        CHECK(*result->scim_id == r->scim_id);
+        REQUIRE(result->active.has_value());
+        CHECK(*result->active == false);
+    }
+
+    // The LOAD-BEARING case: the scim_resources row was hard-DELETEd (a
+    // completed SCIM DELETE) but identity_links is not FK-cascaded, so the
+    // link row survives, orphaned. An INNER join would read this as "no
+    // rows" (= no link = PROCEED) — the exact bypass ADR-2001 §4 exists to
+    // close. `scim_id` still names the (now-gone) resource — that's the
+    // audit-detail id a DENY on this path reports.
+    SECTION("orphaned link (scim_resources row hard-deleted) -> engaged, scim_id set, "
+           "active=nullopt (DENY)") {
+        auto r = store.create_resource("deleted-user", "ext-deleted");
+        REQUIRE(r.has_value());
+        REQUIRE(store.upsert_link("https://idp.example.com/", "sub-deleted", r->scim_id));
+        auto del = store.delete_by_scim_id(r->scim_id);
+        REQUIRE(del.has_value());
+        CHECK(*del == true);
+
+        auto result = store.linked_resource_active("https://idp.example.com/", "sub-deleted");
+        REQUIRE(result.has_value());          // store answered
+        REQUIRE(result->scim_id.has_value()); // identity_links row still exists, names the id
+        CHECK(*result->scim_id == r->scim_id);
+        CHECK_FALSE(result->active.has_value()); // NULL sr.active (join miss) -> deny
+    }
+
+    SECTION("no identity_links row at all -> engaged, scim_id=nullopt (PROCEED — unlinked, "
+           "not deprovisioned)") {
+        auto result = store.linked_resource_active("https://idp.example.com/", "sub-never-linked");
+        REQUIRE(result.has_value());           // store answered
+        CHECK_FALSE(result->scim_id.has_value()); // zero rows — genuinely no link
+        CHECK_FALSE(result->active.has_value());
+    }
+
+    SECTION("empty iss/sub -> engaged, scim_id=nullopt (a definitive non-match, not a store "
+           "error)") {
+        auto result_empty_iss = store.linked_resource_active("", "sub-x");
+        REQUIRE(result_empty_iss.has_value());
+        CHECK_FALSE(result_empty_iss->scim_id.has_value());
+
+        auto result_empty_sub = store.linked_resource_active("https://idp.example.com/", "");
+        REQUIRE(result_empty_sub.has_value());
+        CHECK_FALSE(result_empty_sub->scim_id.has_value());
+    }
+}
+
+// Mutation-check (ADR-2001 §4 task spec): pins the LEFT JOIN's load-bearing
+// behaviour directly against the raw SQL. Runs the SAME orphaned-link
+// scenario the section above already denies via the store's real (LEFT
+// JOIN) accessor, then proves an INNER JOIN over the identical data returns
+// ZERO rows — the exact "no rows = read as no link = PROCEED" bypass that
+// would ship if `linked_resource_active`'s JOIN type ever regressed.
+TEST_CASE("ScimStore: linked_resource_active — LEFT JOIN is load-bearing (mutation-checked)",
+         "[pg][scim][2001][linkage][deny-at-login][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto r = store.create_resource("mutcheck-user", "ext-mutcheck");
+    REQUIRE(r.has_value());
+    REQUIRE(store.upsert_link("https://idp.example.com/", "sub-mutcheck", r->scim_id));
+    REQUIRE(store.delete_by_scim_id(r->scim_id).value());
+
+    // Sanity: the store's own (correct, LEFT JOIN) accessor denies, and
+    // still names the (now-gone) resource.
+    auto result = store.linked_resource_active("https://idp.example.com/", "sub-mutcheck");
+    REQUIRE(result.has_value());
+    REQUIRE(result->scim_id.has_value());
+    CHECK(*result->scim_id == r->scim_id);
+    CHECK_FALSE(result->active.has_value());
+
+    // The counterfactual: an INNER JOIN over the SAME orphaned-link data
+    // returns zero rows, which `linked_resource_active`'s "0 rows -> engaged,
+    // scim_id=nullopt -> PROCEED" branch would then read as "genuinely
+    // unlinked" — letting a fully-deprovisioned identity log back in. This
+    // is what an `INNER JOIN` regression in the production query would
+    // produce.
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto inner = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT il.scim_id, sr.active FROM scim_store.identity_links il "
+        "INNER JOIN scim_store.scim_resources sr ON sr.scim_id = il.scim_id "
+        "WHERE il.iss = $1 AND il.sub = $2 LIMIT 1",
+        std::vector<std::string>{"https://idp.example.com/", "sub-mutcheck"});
+    REQUIRE(inner.ok());
+    CHECK(PQntuples(inner.get()) == 0);
+}
+
 // ── Dup-detecting fail-closed migration (v3) ────────────────────────────
 //
 // Mirrors the api_token_store #3013 fail-closed test pattern: pre-seed a

@@ -334,6 +334,8 @@ Yuzu supports SAML 2.0 SP-initiated single sign-on against a single, statically-
 
 > **MFA step-up:** MFA step-up is not supported for SAML sessions in this release. A SAML session hitting any of the 11 step-up-gated endpoints (token mint/revoke, session revoke, Guardian rule write, software deploy, user management) receives a `403` regardless of `--mfa-enforcement` mode. Use `--mfa-enforcement=optional` and rely on your IdP to enforce MFA at login time. Do not use `--mfa-enforcement=required` for SAML deployments — it denies SAML users at all step-up gates.
 
+> **SCIM linkage and force-logout:** if SCIM provisioning is also enabled, a SAML login whose NameID resolves to a SCIM resource forms a durable link, and SCIM deprovisioning that resource revokes the linked SAML session automatically. A SAML session is also individually force-loggable by an admin via `DELETE /api/v1/sessions?username=saml:<entity_id>#<NameID>`. See [SCIM ↔ SAML identity linkage](scim-provisioning.md#scim--saml-identity-linkage-federated-session-revocation) for the NameID-Format contract this depends on.
+
 ### Registering the SP with Your IdP
 
 Before configuring the server, register Yuzu as a Service Provider with your identity provider:

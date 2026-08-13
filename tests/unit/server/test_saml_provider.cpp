@@ -120,6 +120,12 @@ struct SamlTestFixture {
     ///        make_attribute_statement) embedded in the UNSIGNED injected
     ///        assertion — qa-S3, proves group extraction never leaks a value
     ///        from the unverified node.
+    /// @param name_id_format    ADR-2001 PR4a — the NameID Format attribute
+    ///        value. Defaults to the SAML 1.1 emailAddress format (a
+    ///        STABLE/linkable format, matching the codebase's original
+    ///        hardcoded behaviour). Pass an empty string to omit the
+    ///        Format attribute entirely (models an IdP that never sends
+    ///        one — the "missing Format" case).
     std::string make_response(
         const std::string& request_id,
         const std::string& name_id        = "user@example.com",
@@ -131,7 +137,9 @@ struct SamlTestFixture {
         bool use_sha1_algorithms           = false,
         bool use_sha1_digest_only          = false,
         const std::string& attribute_statement_xml = {},
-        const std::string& evil_attribute_statement_xml = {}) const
+        const std::string& evil_attribute_statement_xml = {},
+        const std::string& name_id_format =
+            "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress") const
     {
         const auto& aud = audience.empty()  ? sp_entity_id : audience;
         const auto& rec = recipient.empty() ? sp_acs_url   : recipient;
@@ -195,7 +203,8 @@ struct SamlTestFixture {
               "</ds:Signature>"
               "<saml:Subject>"
                 "<saml:NameID"
-                  " Format=\"urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress\">"
+                  + (name_id_format.empty() ? std::string{} : " Format=\"" + name_id_format + "\"")
+                  + ">"
                   + name_id +
                 "</saml:NameID>"
                 "<saml:SubjectConfirmation"
@@ -1037,6 +1046,97 @@ TEST_CASE("SAML: valid signed assertion is accepted", "[saml]") {
 
     REQUIRE(result.has_value());
     CHECK(result->name_id == "user@example.com");
+}
+
+// ── ADR-2001 PR4a — NameID Format extraction (SamlAssertion::name_id_format) ──
+//
+// Pure extraction coverage: the verifier never rejects on Format — the
+// stable-vs-transient decision is entirely the login-site linking
+// orchestration's (saml_scim_link.hpp, test_saml_scim_link.cpp). These tests
+// pin that the verifier faithfully surfaces whatever Format the verified
+// assertion carried (or an empty string when it carried none).
+
+TEST_CASE("SAML: default NameID Format (SAML 1.1 emailAddress) is extracted verbatim",
+          "[saml][2001]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // fixture's make_response default Format is the SAML 1.1 emailAddress
+    // format — matches the codebase's original hardcoded behaviour.
+    const auto response_b64 = f.make_response(request_id);
+    const auto result       = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->name_id_format == "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress");
+}
+
+TEST_CASE("SAML: NameID Format persistent is extracted verbatim", "[saml][2001]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, {}, {},
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent");
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->name_id_format == "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent");
+}
+
+TEST_CASE("SAML: NameID Format transient is extracted verbatim (still accepted by the "
+          "verifier — the reject-for-linking decision lives at the login-site orchestration)",
+          "[saml][2001]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    const auto response_b64 = f.make_response(
+        request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, {}, {},
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:transient");
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->name_id_format == "urn:oasis:names:tc:SAML:2.0:nameid-format:transient");
+}
+
+TEST_CASE("SAML: a NameID with no Format attribute extracts an empty name_id_format — the "
+          "login still succeeds",
+          "[saml][2001]") {
+    const auto& f  = fixture();
+    auto cfg       = f.make_config();
+    SamlProvider p{cfg};
+
+    const auto authn_result  = p.build_authn_request("relay");
+    const auto request_id    = extract_request_id_from_url(authn_result.url);
+    const auto& cookie_secret = authn_result.cookie_secret;
+    REQUIRE_FALSE(request_id.empty());
+
+    // Empty name_id_format arg → make_response omits the Format attribute
+    // entirely, modelling an IdP that never sends one.
+    const auto response_b64 = f.make_response(request_id, "user@example.com", 3600, {}, {}, false,
+                                              nullptr, false, false, {}, {}, /*name_id_format=*/"");
+    const auto result = p.validate_response(response_b64, cookie_secret);
+
+    REQUIRE(result.has_value());
+    CHECK(result->name_id == "user@example.com");
+    CHECK(result->name_id_format.empty());
 }
 
 TEST_CASE("SAML: tampered assertion body after signing is rejected", "[saml]") {

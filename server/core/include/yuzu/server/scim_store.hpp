@@ -81,6 +81,33 @@ struct LinkedIdentity {
     std::string sub;
 };
 
+/// One SAML NameID identity linked to a SCIM resource (ADR-2001 PR4a,
+/// `saml_identity_links` table — the SAML analogue of `LinkedIdentity`
+/// above). Deliberately a SEPARATE table/struct rather than a generalized
+/// `identity_links`, so this stays off the OIDC linkage surface (PR3). The
+/// owning `scim_id` is the query input for `saml_links_for_scim_id` and is
+/// deliberately not repeated on this struct.
+struct SamlLinkedIdentity {
+    std::string entity_id;
+    std::string name_id;
+};
+
+/// The deny-at-login backstop's resolved state for one `(iss, sub)` (ADR-2001
+/// §4), returned engaged (see `linked_resource_active`'s doc comment for the
+/// full tri-state contract — this struct only carries what an ENGAGED result
+/// means):
+///  - `scim_id == nullopt, active == nullopt`: no `identity_links` row for
+///    this identity — genuinely unlinked.
+///  - `scim_id` set, `active == nullopt`: an orphaned link — the linked
+///    `scim_resources` row was hard-DELETEd (`identity_links` is not
+///    FK-cascaded); `scim_id` still names which resource used to own it.
+///  - `scim_id` set, `active` set: exactly one linked row and its
+///    `scim_resources.active` value.
+struct LinkedResourceState {
+    std::optional<std::string> scim_id;
+    std::optional<bool> active;
+};
+
 /// A single SCIM Group resource (slice 2, #2021): the IdP-facing group `id`/
 /// `externalId`/`displayName` — membership itself lives in the separate
 /// `scim_group_members` join table, not on this struct.
@@ -335,6 +362,75 @@ public:
     /// genuinely has no linked OIDC identity yet.
     std::optional<std::vector<LinkedIdentity>>
     links_for_scim_id(const std::string& scim_id) const;
+
+    // ── SAML identity linkage (ADR-2001 PR4a) ────────────────────────────
+    //
+    // `saml_identity_links` durably records the (entity_id, name_id) SAML
+    // identity that a successful SAML login resolved to a SCIM resource
+    // (`saml_scim_link.cpp`'s login-site orchestration). A SEPARATE table
+    // from `identity_links` (OIDC) — keeps this PR off PR3's scim_store
+    // schema surface. No route/orchestration logic here — this store owns
+    // the table only (INV-31-3, one owning store).
+
+    /// Idempotent upsert keyed `(entity_id, name_id)` (the table's UNIQUE
+    /// constraint — one link per SAML identity). Re-linking the same
+    /// `(entity_id, name_id)` updates `scim_id` and bumps `linked_at` to
+    /// now. Returns false on CSPRNG/db failure or an empty
+    /// `entity_id`/`name_id`/`scim_id`. Mirrors `upsert_link`'s fail-OPEN
+    /// contract from the login path's point of view — the CALLER
+    /// (`saml_scim_link.cpp`) must not fail a login because this returned
+    /// false.
+    bool upsert_saml_link(const std::string& entity_id, const std::string& name_id,
+                          const std::string& scim_id);
+
+    /// Every SAML identity currently linked to `scim_id` — the deprovision
+    /// seam's lookup direction, mirroring `links_for_scim_id` exactly.
+    /// `nullopt` when the store could not answer: a deprovision path
+    /// folding this into "nothing to revoke" on a transient blip is exactly
+    /// the CC6.8 gap ADR-2001 exists to close, so callers MUST fail closed
+    /// on `nullopt` rather than treat it as "no linked identities". An
+    /// engaged-but-empty vector means the scim_id genuinely has no linked
+    /// SAML identity yet.
+    std::optional<std::vector<SamlLinkedIdentity>>
+    saml_links_for_scim_id(const std::string& scim_id) const;
+
+    /// The deny-at-login backstop's sole store read (ADR-2001 §4): resolves
+    /// `(iss, sub)` against `identity_links` FUSED with a LEFT JOIN to
+    /// `scim_resources` in one query (selecting BOTH `il.scim_id` and
+    /// `sr.active`), so an ORPHANED link (the `scim_resources` row was
+    /// hard-DELETEd by a SCIM DELETE — `identity_links` is not
+    /// FK-cascaded) is distinguishable from "no link at all", reads as
+    /// deprovisioned, AND still names which resource used to own it (the
+    /// CC6.8 audit trail needs a self-contained "denied because resource
+    /// X was deprovisioned" row, not just "denied"). An INNER join would
+    /// instead silently treat a fully-deprovisioned user's now-rowless
+    /// link as "no link", letting them re-authenticate — the bypass this
+    /// LEFT join exists to close (codex-caught). `iss` is carried on
+    /// `identity_links` itself, so this lookup is single-issuer-safe by
+    /// construction; do NOT resolve the decision via
+    /// `scim_resources.external_id` instead (ADR-2001 §5's single-issuer
+    /// precondition).
+    ///
+    /// OUTER `optional<LinkedResourceState>` carries the store-availability
+    /// half of the tri-state (mirrors `get_by_username_checked`); the
+    /// ENGAGED value's `scim_id`/`active` fields (see `LinkedResourceState`'s
+    /// doc comment) carry the rest:
+    ///  - OUTER `nullopt`: the store could not answer (closed, lease
+    ///    timeout, or a failed statement) — the caller MUST fail CLOSED
+    ///    (deny the login), never treat this as "no link".
+    ///  - engaged, `scim_id == nullopt` (zero rows): no `identity_links`
+    ///    row exists for this `(iss, sub)` at all — a genuinely unlinked
+    ///    OIDC identity is not a deprovisioned SCIM user, so the caller
+    ///    PROCEEDS.
+    ///  - engaged, `scim_id` set, `active == nullopt`: exactly one linked
+    ///    row, and the joined `scim_resources` row is gone (NULL `active`,
+    ///    the orphaned-link case above) — the caller DENIES.
+    ///  - engaged, `scim_id` set, `active == false`: exactly one linked
+    ///    row, deactivated — the caller DENIES.
+    ///  - engaged, `scim_id` set, `active == true`: exactly one linked row,
+    ///    active — the caller PROCEEDS.
+    std::optional<LinkedResourceState>
+    linked_resource_active(const std::string& iss, const std::string& sub) const;
 
     // ── OIDC login observations (ADR-2001 D2 detector) ───────────────────
     //

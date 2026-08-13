@@ -2103,6 +2103,43 @@ public:
                           "identity links and/or D2 login observations are silently not being "
                           "recorded",
                           "counter");
+        // ADR-2001 PR4a — the SAML analogue of the OIDC counter immediately
+        // above. Bumped by link_saml_login_to_scim on an upsert_saml_link
+        // failure (saml_scim_link.cpp). Same fail-OPEN posture: the SAML
+        // login itself always succeeds; a sustained non-zero rate means
+        // SAML identities are silently not being linked, and therefore
+        // WON'T be revoked on a later deprovision (the exact CC6.8 gap
+        // ADR-2001 exists to close) — same recurring pre-seed lesson as the
+        // block below (a purely-lazy metric is absent from /metrics until
+        // the first incident, which is exactly the wrong moment for an
+        // alert rule to discover the series does not exist yet).
+        metrics_.describe("yuzu_scim_saml_link_write_failures_total",
+                          "Total ADR-2001 PR4a SAML identity-link writes that failed during "
+                          "SAML login (ScimStore outage) — the login itself always succeeds "
+                          "(fail-OPEN by design), but a sustained non-zero rate means SAML "
+                          "identities are silently not being linked and won't be revoked on "
+                          "deprovision",
+                          "counter");
+
+        // ADR-2001 §4 — deny-at-login backstop. Bumped by
+        // `oidc_login_denied_deprovisioned`'s two call sites in
+        // auth_routes.cpp's /auth/callback (the primary pre-mint check and
+        // the post-mint re-check for the codex-caught concurrent-deprovision
+        // race) on every DENY — a non-zero rate is the CC6.8 backstop
+        // actually firing, i.e. a deprovisioned federated identity attempted
+        // to re-authenticate. It also fires on the fail-closed
+        // `scim_store_unavailable` branch (the ScimStore couldn't be asked),
+        // so a non-zero rate is not proof of a real deprovision alone — see
+        // the metric description below and docs/user-manual/metrics.md.
+        metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_total",
+                          "Total OIDC logins denied at /auth/callback because the identity's "
+                          "linked SCIM resource is deprovisioned (deactivated, or orphaned by a "
+                          "hard-deleted scim_resources row) OR because the ScimStore could not "
+                          "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
+                          "closing the re-login-mints-fresh-tokens window; correlate with the "
+                          "audit reason= field to distinguish a real deprovision from a store "
+                          "outage",
+                          "counter");
         // describe() only registers HELP/TYPE metadata; the series is absent
         // from /metrics until first .increment(). Instantiate each bare
         // counter at 0 now so absent()-style alert rules on the CC6.8
@@ -2112,6 +2149,8 @@ public:
         metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
         metrics_.counter("yuzu_scim_deprovision_unlinked_total");
         metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
+        metrics_.counter("yuzu_scim_saml_link_write_failures_total");
+        metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -4726,12 +4765,39 @@ public:
             }
         }
 
-        // Phase 7: Deployment Jobs (Issue 7.7)
-        {
-            auto deploy_db = cfg_.db_dir() / "deployment-jobs.db";
-            deployment_store_ = std::make_unique<DeploymentStore>(deploy_db);
-            if (deployment_store_ && deployment_store_->is_open()) {
-                spdlog::info("DeploymentStore initialized at {}", deploy_db.string());
+        // Phase 7: Deployment Jobs (Issue 7.7). Migrated Postgres store
+        // (ADR-0006/ADR-0043, schema `deployment_store`) — construction
+        // fail-CLOSED per ADR-0012 §1 (same template as ResultSetStore
+        // above): a reachable database whose schema can't migrate/open is a
+        // fatal startup error, never a serve-degraded state.
+        // `migrate_from_sqlite` runs the one-time, idempotent legacy-
+        // `deployment-jobs.db` backfill (ADR-0009) — AUTHORITATIVE posture
+        // means a backfill failure is ALSO fatal (never serve on top of a
+        // partially-migrated schema). NOT `DeploymentRunStore` (the `/auto`
+        // Deploy stage's own, unrelated PG store) — see deployment_store.hpp's
+        // file header for the naming trap.
+        if (pg_pool_ && !startup_failed_) {
+            deployment_store_ = std::make_unique<DeploymentStore>(*pg_pool_);
+            if (!deployment_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: deployment store migration/open failed "
+                              "(database reachable but the deployment_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto deploy_db = cfg_.db_dir() / "deployment-jobs.db";
+                if (!deployment_store_->migrate_from_sqlite(deploy_db)) {
+                    spdlog::error("[PG] Refusing to start: deployment-jobs legacy-SQLite "
+                                  "backfill failed (see prior log lines) — deployment_store is "
+                                  "authoritative and must not serve partially-migrated data. "
+                                  "Operator remediation: repair {} or move it aside to skip the "
+                                  "backfill (jobs in it will NOT carry over)",
+                                  deploy_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("DeploymentStore initialized (schema deployment_store; legacy "
+                                 "backfill source {})",
+                                 deploy_db.string());
+                }
             }
         }
 
@@ -5145,7 +5211,13 @@ public:
         // ADR-2001 §2/D2 — link formation + login observation at the OIDC
         // login site are fail-OPEN by design, so a null scim_store_ (no PG
         // configured) is a safe no-op rather than a login-time failure.
-        auth_routes_->set_scim_store(scim_store_.get());
+        // Gated on cfg_.scim_enable (mirrors the /readyz scim_store exemption
+        // above) — Postgres is the mandatory substrate so scim_store_ is
+        // non-null on every deployment, and without this gate a server
+        // running OIDC SSO with SCIM disabled would deny every OIDC login
+        // during a transient Postgres blip (store-unavailable reads as
+        // fail-closed deny-at-login) even though the feature is off.
+        auth_routes_->set_scim_store(cfg_.scim_enable ? scim_store_.get() : nullptr);
 
         start_web_server();
 
@@ -9470,6 +9542,11 @@ private:
             // rows above document. A degraded confinement store fails RbacStore's
             // list gate closed, so surface it.
             bool mgmt_group_ok = mgmt_group_store_ && mgmt_group_store_->is_open();
+            // Migrated Postgres store (ADR-0043, gov sre finding, hardening
+            // round) — parity with every other migrated authoritative store's
+            // readyz/healthz wiring; construction is already fail-closed, this
+            // is belt-and-braces against a runtime is_open() flip.
+            bool deployment_ok = deployment_store_ && deployment_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -9477,7 +9554,7 @@ private:
                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok;
+                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && deployment_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -9503,7 +9580,8 @@ private:
                   {"inventory_store", inventory_ok ? "ok" : "error"},
                   {"rbac_store", rbac_ok ? "ok" : "error"},
                   {"result_set_store", result_set_ok ? "ok" : "error"},
-                  {"management_group_store", mgmt_group_ok ? "ok" : "error"}}},
+                  {"management_group_store", mgmt_group_ok ? "ok" : "error"},
+                  {"deployment_store", deployment_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -9724,6 +9802,13 @@ private:
                 // (startup_failed_) per ADR-0012 §1, but the readyz entry stays
                 // as belt-and-braces against a runtime is_open() flip.
                 {"result_set_store", result_set_store_ && result_set_store_->is_open()},
+                // Migrated Postgres store (ADR-0043, gov sre finding, hardening
+                // round). Load-bearing for all 4 /api/deployment-jobs routes;
+                // construction is already fail-closed (startup_failed_), but the
+                // readyz entry stays for parity with every OTHER migrated
+                // authoritative store on this ladder (all of which are wired in
+                // here) as belt-and-braces against a runtime is_open() flip.
+                {"deployment_store", deployment_store_ && deployment_store_->is_open()},
                 // PKI PR2: ca.db is load-bearing only when the install is on
                 // built-in default certs (PR3+ make it load-bearing for mTLS
                 // issuance/revocation). When the operator brought their own certs
@@ -17245,7 +17330,9 @@ private:
     std::unique_ptr<DirectorySync> directory_sync_;
     std::unique_ptr<PatchManager> patch_manager_;
 
-    // Phase 7: Deployment Jobs (Issue 7.7) & Discovery (Issue 7.18)
+    // Phase 7: Deployment Jobs (Issue 7.7) & Discovery (Issue 7.18).
+    // DeploymentStore is now Postgres (ADR-0043) — declared after pg_pool_
+    // (above) so it destructs before the pool; Discovery stays SQLite.
     std::unique_ptr<DeploymentStore> deployment_store_;
     std::unique_ptr<DiscoveryStore> discovery_store_;
 

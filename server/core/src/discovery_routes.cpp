@@ -1,6 +1,7 @@
 #include "discovery_routes.hpp"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <chrono>
@@ -8,6 +9,26 @@
 #include <vector>
 
 namespace yuzu::server {
+
+namespace {
+
+// DeploymentStore error classifier — mirrors rest_api_v1.cpp's
+// access_review_error_status (AccessReviewStore's `"not_found: "` idiom),
+// inverted: here the MAJORITY of a route's `unexpected` values are
+// caller-input validation or not-found/wrong-state business errors (400/404
+// territory), so DeploymentStore prefixes the MINORITY — genuine DB/lease
+// failures — with `kDeploymentDbErrorPrefix` rather than the other way
+// around. Any error NOT carrying that prefix is a 400 here (adversarial-
+// review MEDIUM hardening round, 2026-08-12 — the write routes previously
+// collapsed every failure, including genuine outages, to 400). Keys off the
+// SHARED constant (deployment_store.hpp), never a local copy of the literal
+// — a future rename of the prefix in the store must not silently regress
+// every classified 503 back to 400 (gov F3).
+bool is_deployment_db_error(const std::string& err) {
+    return err.starts_with(kDeploymentDbErrorPrefix);
+}
+
+} // namespace
 
 void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                       AuditFn audit_fn, DirectorySync* directory_sync,
@@ -528,8 +549,16 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                     return;
                 }
                 auto jobs = deployment_store->list_jobs();
+                if (!jobs) {
+                    spdlog::error("GET /api/deployment-jobs: {}", jobs.error());
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& j : jobs) {
+                for (const auto& j : *jobs) {
                     arr.push_back({{"id", j.id},
                                    {"target_host", j.target_host},
                                    {"os", j.os},
@@ -568,6 +597,14 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                  auto method = body.value("method", "manual");
                  auto result = deployment_store->create_job(target, os, method);
                  if (!result) {
+                     if (is_deployment_db_error(result.error())) {
+                         spdlog::error("POST /api/deployment-jobs: {}", result.error());
+                         res.status = 503;
+                         res.set_content(
+                             R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                             "application/json");
+                         return;
+                     }
                      res.status = 400;
                      res.set_content(
                          nlohmann::json({{"error", result.error()}}).dump(),
@@ -616,20 +653,28 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                 auto id = req.matches[1].str();
                 auto job = deployment_store->get_job(id);
                 if (!job) {
+                    spdlog::error("GET /api/deployment-jobs/{}: {}", id, job.error());
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                if (!*job) {
                     res.status = 404;
                     res.set_content(R"({"error":"job not found"})", "application/json");
                     return;
                 }
                 res.set_content(
-                    nlohmann::json({{"id", job->id},
-                                    {"target_host", job->target_host},
-                                    {"os", job->os},
-                                    {"method", job->method},
-                                    {"status", job->status},
-                                    {"created_at", job->created_at},
-                                    {"started_at", job->started_at},
-                                    {"completed_at", job->completed_at},
-                                    {"error", job->error}})
+                    nlohmann::json({{"id", (*job)->id},
+                                    {"target_host", (*job)->target_host},
+                                    {"os", (*job)->os},
+                                    {"method", (*job)->method},
+                                    {"status", (*job)->status},
+                                    {"created_at", (*job)->created_at},
+                                    {"started_at", (*job)->started_at},
+                                    {"completed_at", (*job)->completed_at},
+                                    {"error", (*job)->error}})
                         .dump(),
                     "application/json");
             });
@@ -650,6 +695,14 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                    auto id = req.matches[1].str();
                    auto result = deployment_store->cancel_job(id);
                    if (!result) {
+                       if (is_deployment_db_error(result.error())) {
+                           spdlog::error("DELETE /api/deployment-jobs/{}: {}", id, result.error());
+                           res.status = 503;
+                           res.set_content(
+                               R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                               "application/json");
+                           return;
+                       }
                        res.status = 400;
                        res.set_content(
                            nlohmann::json({{"error", result.error()}}).dump(),
