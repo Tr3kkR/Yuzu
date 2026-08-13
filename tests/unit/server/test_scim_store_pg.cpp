@@ -849,6 +849,131 @@ TEST_CASE("ScimStore: saml_identity_links and identity_links (OIDC) are independ
     CHECK((*saml_links)[0].name_id == "name@example.com");
 }
 
+// ── ADR-2001 §4 — deny-at-login backstop accessor ───────────────────────
+
+TEST_CASE("ScimStore: linked_resource_active — deny-at-login backstop tri-state + scim_id",
+         "[pg][scim][2001][linkage][deny-at-login]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("active linked resource -> engaged, scim_id set, active=true (PROCEED)") {
+        auto r = store.create_resource("active-user", "ext-active");
+        REQUIRE(r.has_value());
+        REQUIRE(store.upsert_link("https://idp.example.com/", "sub-active", r->scim_id));
+
+        auto result = store.linked_resource_active("https://idp.example.com/", "sub-active");
+        REQUIRE(result.has_value()); // OUTER engaged — store answered
+        REQUIRE(result->scim_id.has_value());
+        CHECK(*result->scim_id == r->scim_id); // the audit-detail id, asserted
+        REQUIRE(result->active.has_value());
+        CHECK(*result->active == true);
+    }
+
+    SECTION("deactivated linked resource (set_active false) -> engaged, scim_id set, "
+           "active=false (DENY)") {
+        auto r = store.create_resource("inactive-user", "ext-inactive");
+        REQUIRE(r.has_value());
+        REQUIRE(store.upsert_link("https://idp.example.com/", "sub-inactive", r->scim_id));
+        REQUIRE(store.set_active(r->scim_id, false));
+
+        auto result = store.linked_resource_active("https://idp.example.com/", "sub-inactive");
+        REQUIRE(result.has_value());
+        REQUIRE(result->scim_id.has_value());
+        CHECK(*result->scim_id == r->scim_id);
+        REQUIRE(result->active.has_value());
+        CHECK(*result->active == false);
+    }
+
+    // The LOAD-BEARING case: the scim_resources row was hard-DELETEd (a
+    // completed SCIM DELETE) but identity_links is not FK-cascaded, so the
+    // link row survives, orphaned. An INNER join would read this as "no
+    // rows" (= no link = PROCEED) — the exact bypass ADR-2001 §4 exists to
+    // close. `scim_id` still names the (now-gone) resource — that's the
+    // audit-detail id a DENY on this path reports.
+    SECTION("orphaned link (scim_resources row hard-deleted) -> engaged, scim_id set, "
+           "active=nullopt (DENY)") {
+        auto r = store.create_resource("deleted-user", "ext-deleted");
+        REQUIRE(r.has_value());
+        REQUIRE(store.upsert_link("https://idp.example.com/", "sub-deleted", r->scim_id));
+        auto del = store.delete_by_scim_id(r->scim_id);
+        REQUIRE(del.has_value());
+        CHECK(*del == true);
+
+        auto result = store.linked_resource_active("https://idp.example.com/", "sub-deleted");
+        REQUIRE(result.has_value());          // store answered
+        REQUIRE(result->scim_id.has_value()); // identity_links row still exists, names the id
+        CHECK(*result->scim_id == r->scim_id);
+        CHECK_FALSE(result->active.has_value()); // NULL sr.active (join miss) -> deny
+    }
+
+    SECTION("no identity_links row at all -> engaged, scim_id=nullopt (PROCEED — unlinked, "
+           "not deprovisioned)") {
+        auto result = store.linked_resource_active("https://idp.example.com/", "sub-never-linked");
+        REQUIRE(result.has_value());           // store answered
+        CHECK_FALSE(result->scim_id.has_value()); // zero rows — genuinely no link
+        CHECK_FALSE(result->active.has_value());
+    }
+
+    SECTION("empty iss/sub -> engaged, scim_id=nullopt (a definitive non-match, not a store "
+           "error)") {
+        auto result_empty_iss = store.linked_resource_active("", "sub-x");
+        REQUIRE(result_empty_iss.has_value());
+        CHECK_FALSE(result_empty_iss->scim_id.has_value());
+
+        auto result_empty_sub = store.linked_resource_active("https://idp.example.com/", "");
+        REQUIRE(result_empty_sub.has_value());
+        CHECK_FALSE(result_empty_sub->scim_id.has_value());
+    }
+}
+
+// Mutation-check (ADR-2001 §4 task spec): pins the LEFT JOIN's load-bearing
+// behaviour directly against the raw SQL. Runs the SAME orphaned-link
+// scenario the section above already denies via the store's real (LEFT
+// JOIN) accessor, then proves an INNER JOIN over the identical data returns
+// ZERO rows — the exact "no rows = read as no link = PROCEED" bypass that
+// would ship if `linked_resource_active`'s JOIN type ever regressed.
+TEST_CASE("ScimStore: linked_resource_active — LEFT JOIN is load-bearing (mutation-checked)",
+         "[pg][scim][2001][linkage][deny-at-login][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto r = store.create_resource("mutcheck-user", "ext-mutcheck");
+    REQUIRE(r.has_value());
+    REQUIRE(store.upsert_link("https://idp.example.com/", "sub-mutcheck", r->scim_id));
+    REQUIRE(store.delete_by_scim_id(r->scim_id).value());
+
+    // Sanity: the store's own (correct, LEFT JOIN) accessor denies, and
+    // still names the (now-gone) resource.
+    auto result = store.linked_resource_active("https://idp.example.com/", "sub-mutcheck");
+    REQUIRE(result.has_value());
+    REQUIRE(result->scim_id.has_value());
+    CHECK(*result->scim_id == r->scim_id);
+    CHECK_FALSE(result->active.has_value());
+
+    // The counterfactual: an INNER JOIN over the SAME orphaned-link data
+    // returns zero rows, which `linked_resource_active`'s "0 rows -> engaged,
+    // scim_id=nullopt -> PROCEED" branch would then read as "genuinely
+    // unlinked" — letting a fully-deprovisioned identity log back in. This
+    // is what an `INNER JOIN` regression in the production query would
+    // produce.
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    auto inner = yuzu::server::pg::exec_params(
+        lease.get(),
+        "SELECT il.scim_id, sr.active FROM scim_store.identity_links il "
+        "INNER JOIN scim_store.scim_resources sr ON sr.scim_id = il.scim_id "
+        "WHERE il.iss = $1 AND il.sub = $2 LIMIT 1",
+        std::vector<std::string>{"https://idp.example.com/", "sub-mutcheck"});
+    REQUIRE(inner.ok());
+    CHECK(PQntuples(inner.get()) == 0);
+}
+
 // ── Dup-detecting fail-closed migration (v3) ────────────────────────────
 //
 // Mirrors the api_token_store #3013 fail-closed test pattern: pre-seed a

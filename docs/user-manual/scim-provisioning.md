@@ -414,6 +414,26 @@ mutable fields like email are never used), not a bug to work around. Treat
 manual token revocation as a required, explicit offboarding step for that
 IdP until it exposes a shared claim.
 
+### Availability: a ScimStore/Postgres outage denies ALL OIDC logins
+
+Deny-at-login (the check that refuses re-login for an already-deprovisioned
+identity) is fail-**closed**: if `ScimStore` cannot answer — a Postgres
+outage or degradation — the check treats that the same as "deprovisioned"
+and denies the login. This is the correct tradeoff (a login Yuzu cannot
+verify as safe is treated as unsafe), but it is a new availability coupling
+worth knowing about before you flip `--scim-enable` on: **once SCIM linkage
+is enabled, a `ScimStore`/Postgres degradation denies every OIDC login
+fleet-wide** — not just deprovisioned users, but anyone signing in via SSO,
+including a user who was never SCIM-linked at all. **Password login is not
+affected** — this coupling is OIDC-only.
+
+If you see a spike in `yuzu_auth_oidc_deprovisioned_denied_total` that does
+not correspond to actual terminations, correlate it with Postgres health —
+`yuzu_pg_acquire_wait_seconds` and `yuzu_pg_acquire_timeout_total` — before
+assuming it's legitimate deny-at-login activity; a sustained spike with no
+matching offboarding is more likely `ScimStore`/Postgres struggling to
+answer the check than a wave of terminated users trying to log back in.
+
 ### The ~60 second window
 
 A deprovision revokes tokens and sessions **immediately** at the store
@@ -629,4 +649,5 @@ with a **currently-active** account.
 - `docs/adr/2001-scim-oidc-identity-linkage.md` — the ADR behind
   [SCIM ↔ OIDC identity linkage](#scim--oidc-identity-linkage-federated-token-revocation)
   and [SCIM ↔ SAML identity linkage](#scim--saml-identity-linkage-federated-session-revocation)
-  above (design rationale, the D1/D2 forks, the deferred deny-at-login PR3/PR4b).
+  above (design rationale, the D1/D2 forks, the OIDC deny-at-login backstop
+  shipped as PR3, and the SAML deny-at-login deferred to PR4b).

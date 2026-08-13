@@ -92,6 +92,22 @@ struct SamlLinkedIdentity {
     std::string name_id;
 };
 
+/// The deny-at-login backstop's resolved state for one `(iss, sub)` (ADR-2001
+/// §4), returned engaged (see `linked_resource_active`'s doc comment for the
+/// full tri-state contract — this struct only carries what an ENGAGED result
+/// means):
+///  - `scim_id == nullopt, active == nullopt`: no `identity_links` row for
+///    this identity — genuinely unlinked.
+///  - `scim_id` set, `active == nullopt`: an orphaned link — the linked
+///    `scim_resources` row was hard-DELETEd (`identity_links` is not
+///    FK-cascaded); `scim_id` still names which resource used to own it.
+///  - `scim_id` set, `active` set: exactly one linked row and its
+///    `scim_resources.active` value.
+struct LinkedResourceState {
+    std::optional<std::string> scim_id;
+    std::optional<bool> active;
+};
+
 /// A single SCIM Group resource (slice 2, #2021): the IdP-facing group `id`/
 /// `externalId`/`displayName` — membership itself lives in the separate
 /// `scim_group_members` join table, not on this struct.
@@ -377,6 +393,44 @@ public:
     /// SAML identity yet.
     std::optional<std::vector<SamlLinkedIdentity>>
     saml_links_for_scim_id(const std::string& scim_id) const;
+
+    /// The deny-at-login backstop's sole store read (ADR-2001 §4): resolves
+    /// `(iss, sub)` against `identity_links` FUSED with a LEFT JOIN to
+    /// `scim_resources` in one query (selecting BOTH `il.scim_id` and
+    /// `sr.active`), so an ORPHANED link (the `scim_resources` row was
+    /// hard-DELETEd by a SCIM DELETE — `identity_links` is not
+    /// FK-cascaded) is distinguishable from "no link at all", reads as
+    /// deprovisioned, AND still names which resource used to own it (the
+    /// CC6.8 audit trail needs a self-contained "denied because resource
+    /// X was deprovisioned" row, not just "denied"). An INNER join would
+    /// instead silently treat a fully-deprovisioned user's now-rowless
+    /// link as "no link", letting them re-authenticate — the bypass this
+    /// LEFT join exists to close (codex-caught). `iss` is carried on
+    /// `identity_links` itself, so this lookup is single-issuer-safe by
+    /// construction; do NOT resolve the decision via
+    /// `scim_resources.external_id` instead (ADR-2001 §5's single-issuer
+    /// precondition).
+    ///
+    /// OUTER `optional<LinkedResourceState>` carries the store-availability
+    /// half of the tri-state (mirrors `get_by_username_checked`); the
+    /// ENGAGED value's `scim_id`/`active` fields (see `LinkedResourceState`'s
+    /// doc comment) carry the rest:
+    ///  - OUTER `nullopt`: the store could not answer (closed, lease
+    ///    timeout, or a failed statement) — the caller MUST fail CLOSED
+    ///    (deny the login), never treat this as "no link".
+    ///  - engaged, `scim_id == nullopt` (zero rows): no `identity_links`
+    ///    row exists for this `(iss, sub)` at all — a genuinely unlinked
+    ///    OIDC identity is not a deprovisioned SCIM user, so the caller
+    ///    PROCEEDS.
+    ///  - engaged, `scim_id` set, `active == nullopt`: exactly one linked
+    ///    row, and the joined `scim_resources` row is gone (NULL `active`,
+    ///    the orphaned-link case above) — the caller DENIES.
+    ///  - engaged, `scim_id` set, `active == false`: exactly one linked
+    ///    row, deactivated — the caller DENIES.
+    ///  - engaged, `scim_id` set, `active == true`: exactly one linked row,
+    ///    active — the caller PROCEEDS.
+    std::optional<LinkedResourceState>
+    linked_resource_active(const std::string& iss, const std::string& sub) const;
 
     // ── OIDC login observations (ADR-2001 D2 detector) ───────────────────
     //

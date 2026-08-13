@@ -995,6 +995,47 @@ ScimStore::saml_links_for_scim_id(const std::string& scim_id) const {
     return results;
 }
 
+std::optional<LinkedResourceState>
+ScimStore::linked_resource_active(const std::string& iss, const std::string& sub) const {
+    if (!open_)
+        return std::nullopt; // store unusable — caller MUST fail closed
+    if (iss.empty() || sub.empty())
+        return LinkedResourceState{}; // nothing to look up — a definitive non-match, not a store error
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt; // lease timeout — store error, not "no link"
+
+    // LEFT JOIN is load-bearing (see the .hpp doc comment): an INNER join
+    // would collapse an orphaned link (scim_resources row hard-DELETEd,
+    // identity_links not FK-cascaded) into "no rows", which reads as "no
+    // link" and lets a fully-deprovisioned identity re-authenticate.
+    // il.scim_id is carried alongside sr.active so a DENY can name which
+    // resource drove it — a self-contained CC6.8 audit row, not just "denied".
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT il.scim_id, sr.active FROM scim_store.identity_links il "
+        "LEFT JOIN scim_store.scim_resources sr ON sr.scim_id = il.scim_id "
+        "WHERE il.iss = $1 AND il.sub = $2 LIMIT 1",
+        std::vector<std::string>{iss, sub});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt; // query failed — store error, not "no link"
+
+    if (PQntuples(res.get()) == 0)
+        return LinkedResourceState{}; // no identity_links row — genuinely no link
+
+    // Exactly one linked row. il.scim_id is NOT NULL (identity_links schema),
+    // so this is always populated once a row matched. NULL sr.active means
+    // the join found no matching scim_resources row (orphaned link) —
+    // reported as an engaged scim_id with active left nullopt; the caller
+    // treats that identically to an explicit active=false: deny.
+    LinkedResourceState state;
+    state.scim_id = col(res.get(), 0, 0);
+    if (!PQgetisnull(res.get(), 0, 1))
+        state.active = to_bool(PQgetvalue(res.get(), 0, 1));
+    return state;
+}
+
 // ── OIDC login observations (ADR-2001 D2 detector) ──────────────────────
 
 bool ScimStore::record_login_observation(const std::string& iss, const std::string& sub,
