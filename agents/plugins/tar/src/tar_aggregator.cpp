@@ -370,9 +370,15 @@ namespace {
 // still works once a write has landed after the clock moved, and held in memory
 // alone it compares against zero on the first pass of a process -- so an agent
 // that BOOTS with a wrong RTC would never see a step at all, which is the case
-// this guard exists for. The per-table decline latch stays in memory on purpose;
-// re-declining once after a reboot is the safe direction.
+// this guard exists for. The per-table recorded fact set (#2573) stays in
+// memory on purpose; re-declining once after a reboot is the safe direction.
 constexpr std::string_view kRetentionLastPassKey = "retention_guard_last_pass";
+
+// Shared with the audit store's own clock guard (common/include/yuzu/
+// audit_retention_rules.hpp): five bools in, one Anomaly out. See
+// RetentionGuardState::last_reported for the one deliberate divergence
+// (NoAnchor is never recorded here).
+namespace audit_retention = yuzu::server::audit_retention;
 
 // Reported on the `tar status` failure surface when the durable clock reading
 // cannot be written. Deliberately not a table name -- the surface is keyed by
@@ -601,14 +607,15 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
         auto enabled_key = std::format("{}_enabled", src.name);
         if (canonical_source_enabled(
                 db.get_config(enabled_key, src.default_enabled ? "true" : "false")) != "true") {
-            // Clear this source's latches while it is skipped. A latch left SET
-            // across a pause is spent: the first pass after the operator
-            // re-enables the source would delete capped with no decline, no
-            // counter and no warn, even if the anomaly that set it is still
-            // live. Counters are cumulative and deliberately survive.
+            // Clear this source's recorded fact sets while it is skipped. An
+            // entry left recorded across a pause is spent: the first pass
+            // after the operator re-enables the source would delete capped
+            // with no decline, no counter and no warn, even if the anomaly
+            // that recorded it is still live. Counters are cumulative and
+            // deliberately survive.
             std::lock_guard lock(guard.mu);
             for (const auto& g : src.granularities)
-                guard.latched[std::format("{}_{}", src.name, g.suffix)] = false;
+                guard.last_reported.erase(std::format("{}_{}", src.name, g.suffix));
             continue;
         }
         for (const auto& g : src.granularities) {
@@ -666,24 +673,23 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                 db, table_name, std::format("{} BETWEEN {} AND {}", ts_col, cutoff, horizon));
 
             std::lock_guard lock(guard.mu);
-            bool& latched = guard.latched[table_name];
             if (!has_expired || !has_survivor) {
                 // Fail closed: a probe we could not read is not evidence that
                 // deleting is safe. Skip the table this pass, count the failure,
-                // and RE-ARM the guard -- carrying a set latch across a failed
-                // pass would let the next pass that really would wipe the table
-                // delete with no decline and no counter. Same rule the audit
-                // store applies to its own probe failures.
+                // and RE-ARM the guard -- carrying a recorded fact set across a
+                // failed pass would let the next pass that really would wipe the
+                // table delete with no decline and no counter. Same rule the
+                // audit store applies to its own probe failures.
                 ++guard.failures[table_name];
-                latched = false;
+                guard.last_reported.erase(table_name);
                 ++unreadable_tables; // aggregated into ONE warn below
                 continue;
             }
             if (!*has_expired) {
                 // Nothing to delete, so nothing to guard against -- and the
-                // anomaly this table latched for is over. Same rule the accepting
-                // path applies below.
-                latched = false;
+                // anomaly this table's entry covered is over. Same rule the
+                // accepting path applies below.
+                guard.last_reported.erase(table_name);
                 continue;
             }
 
@@ -715,46 +721,69 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             // That is the dead-CMOS endpoint this guard was written for
             // (#2361, Sol adversarial review).
             const bool no_anchor = !prev_pass_now;
-            // The ANOMALY triggers, which spend the one-shot latch.
-            const bool anomaly = would_wipe || big_step || prev_implausible;
-            if ((anomaly || no_anchor) && !latched) {
-                // The bootstrap decline deliberately does NOT latch. The latch
-                // means "this table already declined FOR THE CURRENT ANOMALY",
-                // and a bootstrap is not an anomaly -- just a missing comparison
-                // point. Spending the latch on it let the NEXT pass accept a real
-                // anomaly undeclined: agent upgrade, pass 1 declines and latches,
-                // a dead RTC or a resumed snapshot lands before pass 2, and pass
-                // 2 deletes to the cap with no decline and no counter. That is
-                // the silent deletion the bootstrap rule exists to prevent,
-                // moved one pass later rather than removed (Gate 4 re-review,
-                // UPS-1).
-                if (anomaly)
-                    latched = true;
+
+            const audit_retention::Facts facts{.has_expired = true, // guaranteed above
+                                               .would_wipe = would_wipe,
+                                               .big_step = big_step,
+                                               .prev_unusable = prev_implausible,
+                                               .no_anchor = no_anchor};
+            const audit_retention::Anomaly anomaly = audit_retention::classify(facts);
+            const auto reported = guard.last_reported.find(table_name);
+            const bool already_reported =
+                reported != guard.last_reported.end() && reported->second == facts;
+
+            if (anomaly != audit_retention::Anomaly::None && !already_reported) {
+                // #2573: the dedup key is the WHOLE fact set, not a single bool,
+                // so a DIFFERENT anomaly arriving while one is already recorded
+                // reports again instead of deleting silently (MEASURED: a bool
+                // latch cannot carry anomaly identity).
+                //
+                // NoAnchor is the one exception, and deliberately NOT recorded.
+                // The audit sibling needs no such carve-out because its
+                // bootstrap-settled write commits in the SAME transaction as
+                // the verdict; TAR's anchor persist (further up, `set_config`)
+                // is independent of this map, so if it keeps failing,
+                // `no_anchor` stays true forever -- recording it would make
+                // every later identical pass a suppressed drain, silently
+                // defeating the fail-safe this trigger exists to provide. A
+                // stale non-NoAnchor entry is also cleared here: it cannot
+                // still be valid once the verdict classifies as NoAnchor.
+                if (anomaly != audit_retention::Anomaly::NoAnchor)
+                    guard.last_reported[table_name] = facts;
+                else
+                    guard.last_reported.erase(table_name);
                 ++guard.declines[table_name];
                 ++declined_tables;
-                spdlog::debug("TAR retention: declining {} (wipe={}, bad_state={}, {}s since last "
-                              "pass, threshold {}s)",
-                              table_name, would_wipe, prev_implausible,
+                spdlog::debug("TAR retention: declining {} (wipe={}, bad_state={}, no_anchor={}, "
+                              "{}s since last pass, threshold {}s)",
+                              table_name, would_wipe, prev_implausible, no_anchor,
                               prev_pass_now ? now_epoch - *prev_pass_now : 0, step_threshold);
                 continue;
             }
-            // Hold the latch only while an anomaly is STILL BEING WORKED OFF:
-            // the wipe condition held AND the cap will leave rows behind.
-            // Latching on `would_wipe` alone left the latch set after a pass
-            // that drained the whole backlog (#2361 Gate 8 / Sol).
+            // Accepted: either no anomaly, or a suppressed repeat of the fact
+            // set already recorded for this table -- either way the pass
+            // proceeds, paced by the cap below.
+            //
+            // Keep the entry recorded only while the wipe condition is STILL
+            // BEING WORKED OFF: it held AND the cap will leave rows behind.
+            // Keying purely on `would_wipe` left an entry recorded after a pass
+            // that drained the whole backlog (#2361 Gate 8 / Sol) -- a fresh
+            // identical anomaly arriving before the next 900s tick would then
+            // be indistinguishable from the just-finished one and silently
+            // suppressed.
             //
             // The probe asks whether a (cap+1)th expired row exists: bounded,
             // index-driven, and only for a table already in the wipe condition.
             //
-            // UNREADABLE defaults to "yes", i.e. leave the latch SET, which
+            // UNREADABLE defaults to "yes", i.e. KEEP the entry recorded, which
             // PERMITS the next delete. That is the one default here that leans
             // toward deleting; every other unknown in this guard leans toward
             // preserving. It is safe because it cannot grant permission from
             // nothing -- `would_wipe` implies an anomaly, so reaching here with
-            // it true means the latch was already set -- and cheap to be wrong
-            // about: clearing it would at worst give alternate-pass deletion on
-            // a quiet table, while an active one mints fresh rows via
-            // `run_aggregation` and deletes at full rate regardless.
+            // it true means an entry was already recorded -- and cheap to be
+            // wrong about: clearing it would at worst give alternate-pass
+            // deletion on a quiet table, while an active one mints fresh rows
+            // via `run_aggregation` and deletes at full rate regardless.
             bool cap_will_bind = false;
             if (would_wipe) {
                 const auto more = exists_where(
@@ -763,7 +792,10 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                                 kMaxTarDeletesPerTablePerPass));
                 cap_will_bind = !more || *more;
             }
-            latched = would_wipe && cap_will_bind;
+            if (would_wipe && cap_will_bind)
+                guard.last_reported[table_name] = facts;
+            else
+                guard.last_reported.erase(table_name);
             // Capped, oldest-first. Every warehouse table has `id INTEGER PRIMARY
             // KEY` plus an `idx_{table}_{ts_col}` index (generate_warehouse_ddl),
             // so the subquery is an index scan, not a sort.
@@ -810,11 +842,11 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             ++guard.delete_failures[plans[i].table];
             // Re-arm, exactly as the audit sibling does on its delete-failure
             // path. Nothing was deleted, so the pass learned nothing about the
-            // clock; carrying a set latch forward would let the next pass accept
-            // a real anomaly with no decline and no counter. Only for tables that
-            // HAVE a latch -- row-count tables share this batch but no guard.
-            if (auto it = guard.latched.find(plans[i].table); it != guard.latched.end())
-                it->second = false;
+            // clock; carrying a recorded entry forward would let the next pass
+            // accept a real anomaly with no decline and no counter. Erase is a
+            // no-op for row-count tables, which share this batch but have no
+            // guard entry to begin with.
+            guard.last_reported.erase(plans[i].table);
         }
     }
     if (!batch.committed) {
