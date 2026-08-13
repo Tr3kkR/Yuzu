@@ -510,6 +510,14 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
     // (ADR-0009). Unbounded with_txn (not with_txn_for): startup is serial,
     // same discipline as the ctor's unbounded acquire() (ADR-0012 §2(a)).
     std::string failure_detail;
+    // gov unhappy-path Finding UP-H (hardening round 5, verification pass):
+    // only the identity-mismatch and lifecycle-direction branches below
+    // embed "which side to trust" guidance in failure_detail — the three
+    // genuine DB-error branches (insert/read-back/marker-stamp failure)
+    // carry only a raw Postgres error, no row-vs-row content to point at.
+    // The wrapper below must not presuppose that guidance exists for every
+    // failure class.
+    bool row_conflict_guidance = false;
     bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
         for (const auto& j : legacy_jobs) {
             // RETURNING id + PQntuples() (never a bare PGRES_COMMAND_OK check on
@@ -572,6 +580,7 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
                 stored.target_host == j.target_host && stored.os == j.os &&
                 stored.method == j.method && stored.created_at == j.created_at;
             if (!identity_matches) {
+                row_conflict_guidance = true;
                 failure_detail =
                     std::string("legacy deployment_jobs row id='") + j.id +
                     "' already exists with DIFFERENT identity (stored: target_host='" +
@@ -623,6 +632,7 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
             const bool terminal_disagreement =
                 legacy_rank == stored_rank && legacy_rank == 2 && j.status != stored.status;
             if (legacy_ahead || terminal_disagreement) {
+                row_conflict_guidance = true;
                 failure_detail =
                     std::string("legacy deployment_jobs row id='") + j.id +
                     "' lifecycle " + (legacy_ahead ? "shows MORE progress than" : "reports a "
@@ -639,8 +649,9 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
                     "side here — do NOT edit the retained legacy file to make it match "
                     "Postgres, that would destroy the only record of what the "
                     "pre-migration binary actually did. Reconcile Postgres to the correct "
-                    "outcome (consulting both values above) or explicitly accept the loss, "
-                    "then restart";
+                    "outcome (consulting both values above, e.g. via UPDATE) or, to explicitly "
+                    "accept the loss, move the whole legacy file aside so this backfill is "
+                    "never retried against it, then restart";
                 spdlog::error(
                     "DeploymentStore::migrate_from_sqlite: row {} legacy snapshot conflicts "
                     "with the current Postgres value ({}) — refusing to stamp a backfill "
@@ -676,24 +687,42 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
     if (!ok) {
         // gov unhappy-path Finding UP-F (hardening round 5): this text used
         // to blanket-instruct "fix the legacy file," which is actively
-        // wrong for the legacy-ahead/terminal-disagreement case above
-        // (where Postgres, not the legacy file, is the stale/contradicted
-        // side) — an operator following it literally could destroy the
-        // only evidence of what the pre-migration binary actually did.
-        // Which side is at fault differs per failure branch, so this stays
-        // neutral and defers to the specific guidance already embedded in
-        // "Offending" above; it only adds the mechanical how-to-inspect
-        // step, never a which-side-to-trust one.
-        spdlog::error(
-            "DeploymentStore::migrate_from_sqlite: backfill transaction failed and was rolled "
-            "back — deployment job data NOT migrated. Offending: {}. See the guidance above "
-            "for which side to reconcile. The retained read-only legacy file is at {} (e.g. "
-            "`sqlite3 {} \"SELECT * FROM deployment_jobs WHERE id='<id>'\"` to inspect it) — "
-            "compare it against Postgres's current row for the same id, then restart the "
-            "server once resolved; the backfill marker was NOT stamped, so the next boot "
-            "retries the whole backfill.",
-            failure_detail.empty() ? "unknown (see the specific-row error above)" : failure_detail,
-            legacy_db_path.string(), legacy_db_path.string());
+        // wrong for the legacy-ahead/terminal-disagreement case (where
+        // Postgres, not the legacy file, is the stale/contradicted side) —
+        // an operator following it literally could destroy the only
+        // evidence of what the pre-migration binary actually did.
+        // gov unhappy-path Finding UP-H (same round, verification pass):
+        // that fix still presupposed "which side to reconcile" guidance
+        // exists for EVERY failure class, but only the identity-mismatch
+        // and lifecycle-direction branches actually embed row-vs-row
+        // content in failure_detail — the three genuine DB-error branches
+        // (insert/read-back/marker-stamp failure) carry only a raw
+        // Postgres error, nothing to "compare against Postgres's current
+        // row" for. row_conflict_guidance (set only in those two branches)
+        // now picks between two texts instead of dangling a reference to
+        // guidance that may not exist.
+        const std::string& offending =
+            failure_detail.empty() ? std::string("unknown (see the specific-row error above)")
+                                   : failure_detail;
+        if (row_conflict_guidance) {
+            spdlog::error(
+                "DeploymentStore::migrate_from_sqlite: backfill transaction failed and was "
+                "rolled back — deployment job data NOT migrated. Offending: {}. See the "
+                "guidance above for which side to reconcile. The retained read-only legacy "
+                "file is at {} (e.g. `sqlite3 {} \"SELECT * FROM deployment_jobs WHERE "
+                "id='<id>'\"` to inspect it) — compare it against Postgres's current row for "
+                "the same id, then restart the server once resolved; the backfill marker was "
+                "NOT stamped, so the next boot retries the whole backfill.",
+                offending, legacy_db_path.string(), legacy_db_path.string());
+        } else {
+            spdlog::error(
+                "DeploymentStore::migrate_from_sqlite: backfill transaction failed and was "
+                "rolled back — deployment job data NOT migrated. Offending: {}. This is a "
+                "database or legacy-file-read failure, not a row-content disagreement — "
+                "resolve the underlying error above and restart the server; the backfill "
+                "marker was NOT stamped, so the next boot retries the whole backfill.",
+                offending);
+        }
         return false;
     }
     spdlog::info("DeploymentStore::migrate_from_sqlite: backfill complete");

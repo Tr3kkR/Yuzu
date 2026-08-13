@@ -952,6 +952,52 @@ TEST_CASE("migrate_from_sqlite fails closed on a legacy row with an unrecognised
     CHECK(jobs->empty());
 }
 
+// Regression test for gov unhappy-path Finding UP-H (SHOULD, hardening
+// round 5, verification pass): a genuine DB-level failure (not a row-vs-row
+// content disagreement) must NOT get the row-conflict remediation text
+// ("compare it against Postgres's current row for the same id") — there is
+// no row-level failure_detail for that guidance to refer to. DROPping the
+// table mid-transaction (same technique as the existing "genuine store
+// failure" test above) forces the per-row INSERT itself to fail with a
+// real Postgres error, exercising the row_conflict_guidance=false path.
+TEST_CASE("migrate_from_sqlite gives generic (not row-comparison) guidance on a genuine "
+          "database failure",
+          "[deployment_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deployment_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    DeploymentJob job;
+    job.id = "4444444444444444";
+    job.target_host = "db-error.example.com";
+    job.os = "linux";
+    job.method = "manual";
+    job.status = "pending";
+    job.created_at = 8000;
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_db_error") / "deployment-jobs.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    write_legacy_sqlite_db(legacy_path, {job});
+
+    {
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult d{PQexec(conn.get(), "DROP TABLE deployment_store.deployment_jobs CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    std::string captured;
+    {
+        LogCapture capture;
+        CHECK_FALSE(store.migrate_from_sqlite(legacy_path));
+        captured = capture.str();
+    }
+    CHECK(captured.find("database or legacy-file-read failure") != std::string::npos);
+    CHECK(captured.find("which side to reconcile") == std::string::npos);
+    CHECK(captured.find("compare it against Postgres's current row") == std::string::npos);
+}
+
 // Regression test for the fingerprint canonicalization's injectivity (gov
 // quality-engineer SHOULD): id="a", target_host="b\x1fc" and
 // id="a\x1fb", target_host="c" (all other fields equal) canonicalize to the

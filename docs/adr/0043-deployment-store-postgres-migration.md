@@ -141,12 +141,15 @@ been migrated once:
 - **Lifecycle** (`status`, `started_at`, `completed_at`, `error`) legitimately changes
   post-migration via live traffic on whichever replica migrated the row first. Which side is
   AHEAD decides the outcome, using the status enum's natural order
-  (`pending < running < {completed, failed, cancelled}`, the three terminal states tied): if
-  Postgres's value is equal-or-ahead of the legacy row — a legacy snapshot predating progress
-  already live in Postgres — this is a benign no-op; Postgres's value is kept and the drift is
-  WARNING-logged (naming all four lifecycle values on both sides) so it stays visible without
-  blocking the boot. If the LEGACY row is instead ahead of Postgres, the whole backfill
-  transaction fails closed the same as an identity mismatch — see Finding A below.
+  (`pending < running < {completed, failed, cancelled}`, the three terminal states tied at the
+  same rank): if Postgres's status is strictly ahead of the legacy row, or the two sides are tied
+  at the SAME status — a legacy snapshot predating progress already live in Postgres — this is a
+  benign no-op; Postgres's value is kept and the drift is WARNING-logged (naming all four
+  lifecycle values on both sides) so it stays visible without blocking the boot. Two directions
+  fail the whole backfill transaction closed instead, the same as an identity mismatch: the LEGACY
+  row is strictly ahead of Postgres (see Finding A below), or the two sides are tied at rank but
+  report DIFFERENT terminal statuses — e.g. one `completed`, the other `failed` — since rank alone
+  can't order two disagreeing final outcomes (see Finding UP-E below).
 
 This still does not need `RbacStore`'s refuse-on-mismatch COMPLEXITY (no operator-adjudicated
 "which value is right" branch for the ordinary case) — but it does need the underlying discipline
@@ -195,9 +198,21 @@ reachable failure had the legacy file as the plausible suspect. Finding A's fix 
 its own case: `failure_detail` there names Postgres as the stale/contradicted side. An operator
 following the old wrapper text literally could edit the legacy file to match Postgres, destroying
 the only evidence of what the pre-migration binary actually did — laundered through the exact
-remediation path the message recommended. Fixed: the wrapper no longer asserts which side to
-trust; it defers to the specific guidance already embedded in `failure_detail` and keeps only the
-mechanical how-to-inspect step.
+remediation path the message recommended.
+
+**Finding UP-H (hardening round 5, verification pass): the first UP-F fix over-generalized — it
+still unconditionally pointed at "the guidance above," but only 2 of the 5 failure branches
+(identity mismatch, legacy-ahead/terminal-disagreement) actually embed row-vs-row content in
+`failure_detail`.** The 3 genuine DB-error branches (insert failure, read-back failure,
+marker-stamp failure) carry only a raw Postgres error — nothing to "compare against Postgres's
+current row" for, and the marker-stamp case doesn't even name a row id. Fixed: a
+`row_conflict_guidance` flag, set only in the two branches that actually carry side-specific
+guidance, now selects between two remediation texts — the row-comparison guidance where it applies,
+and a plain "this is a database or legacy-file-read failure, resolve the underlying error and
+restart" text everywhere else. Re-derived severity: the reviewer's own native label was SHOULD, but
+the recorded facts (confusing-but-honest guidance, no destructive action implied, distinct from
+UP-F's directly-harmful instruction) derive LOW/NICE per the standard rubric — recorded as a
+disagreement between native and derived severity rather than silently accepting either label.
 
 **Finding DW-8 (hardening round 5): the legacy file's `status` column was read with no
 validation.** `create_job`/`update_status` both reject anything outside the 5 known status values
@@ -226,8 +241,11 @@ Gate 8 re-review (unhappy-path again) found that partition was itself directionl
 above — which the status-order direction check resolves; a fourth Gate 8 re-review (cpp-expert,
 cpp-safety, unhappy-path, docs-writer, consistency-auditor) found the direction check's own gaps —
 Findings UP-E, UP-F, and DW-8 above — which the terminal-disagreement check, the corrected
-remediation message, and the legacy-status validation resolve respectively. Each round is recorded
-in its governance ledger fragment (`governance.d/deployment-store-pg*.jsonl`); this section states
+remediation message, and the legacy-status validation resolve respectively; a same-round
+verification pass (the same four reviewers re-checking their own findings' fixes) found one more
+refinement — Finding UP-H above — and one stale ADR paragraph (this section's own UP-F
+description, corrected in place rather than recorded as a further stacked round). Each round is
+recorded in its governance ledger fragment (`governance.d/deployment-store-pg*.jsonl`); this section states
 only the design that shipped.
 
 **Trade-off accepted:** unlike `RbacStore` (which stats the legacy path cheaply before touching
