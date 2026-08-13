@@ -29,6 +29,7 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "saml_principal.hpp" // saml_principal_id — ADR-2001 PR4a
 #include "test_route_sink.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include <yuzu/server/auth.hpp>
@@ -363,28 +364,36 @@ TEST_CASE("POST /api/v1/elevate: an OIDC session cannot borrow a legacy identity
     CHECK_FALSE(auth::is_elevated(*s));
 }
 
-TEST_CASE("POST /api/v1/elevate: a SAML session whose NameID collides with a provisioned OIDC "
-          "principal is denied (identity-source mismatch, not just the no-amr gate)",
+TEST_CASE("POST /api/v1/elevate: a SAML session whose stable principal collides with a "
+          "provisioned OIDC-sourced row is denied (identity-source mismatch, not just the "
+          "no-amr gate)",
           "[pg][sso][jit][routes][saml]") {
     SsoJitHarness h;
-    // The other half of cons-N2: a crafted SAML NameID equal to a real,
-    // eligible OIDC principal string. SAML sessions already fail closed at
-    // the amr-proof / MFA gates further down this handler (SAML carries no
-    // amr claim), but this pins that the identity-source guard denies it
-    // FIRST and independently — so a future SAML-MFA workstream that adds
-    // an amr-equivalent for SAML cannot accidentally reopen this specific
-    // cross-protocol collision.
-    const std::string iss = "https://idp.example.com/";
-    const std::string sub = "sub-mallory-saml";
-    const std::string principal = "oidc:" + iss + "#" + sub;
+    // ADR-2001 PR4a re-key: a SAML session's stable principal is now
+    // `saml:<entity_id>#<name_id>` (saml_principal.hpp), so a crafted raw
+    // NameID can no longer collide with an `oidc:<iss>#<sub>` row at the
+    // STRING level — the "saml:" prefix makes the two principal spaces
+    // disjoint by construction (a strictly stronger guarantee than the
+    // guard this test originally pinned). This test instead seeds an
+    // AuthDB row keyed on the SAML session's OWN stable principal but
+    // sourced as `identity_source="oidc"` (modelling a row that could
+    // otherwise exist), so the request still reaches the
+    // identity-source-MISMATCH branch specifically (never the amr/no-such-
+    // row branches) — SAML sessions already fail closed at the amr-proof/
+    // MFA gates further down this handler (SAML carries no amr claim), but
+    // this pins that the identity-source guard denies it FIRST and
+    // independently.
+    const std::string entity_id = "https://idp.example.com/";
+    const std::string name_id = "mallory@example.com";
+    const std::string principal = saml::saml_principal_id(entity_id, name_id);
 
-    REQUIRE(h.auth_db->upsert_sso_identity(principal, iss, sub, "Real OIDC User", "oidc")
+    REQUIRE(h.auth_db
+                ->upsert_sso_identity(principal, "https://other-idp.example.com/", "sub-x",
+                                      "Real OIDC User", "oidc")
                 .has_value());
     REQUIRE(h.auth_db->set_elevation_eligible(principal, true).has_value());
 
-    // A SAML session whose NameID is crafted to equal the OIDC principal
-    // string verbatim.
-    auto token = h.auth_mgr.create_saml_session(principal);
+    auto token = h.auth_mgr.create_saml_session(name_id, entity_id);
 
     auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
     REQUIRE(res);

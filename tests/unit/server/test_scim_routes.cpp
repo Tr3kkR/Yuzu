@@ -25,9 +25,15 @@
 
 #include "scim_routes.hpp"
 
+#include "analytics_event.hpp"
+#include "analytics_event_store.hpp"
+#include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "deprovision_revoke.hpp"
+#include "oidc_principal.hpp"
 #include "on_behalf_guard.hpp"
 #include "rate_limiter.hpp"
+#include "saml_principal.hpp"
 #include "test_route_sink.hpp"
 #include "web_utils.hpp"
 
@@ -73,6 +79,16 @@ struct Fixture {
     yuzu::test::AuthDbPg auth_db;
     auth::AuthManager auth_mgr;
     std::unique_ptr<ScimStore> scim_store;
+    // ADR-2001 §§1,3: shares auth_db's PgPool, same "one PgPool, independent
+    // connections" pattern as scim_store above — wired into the deprovision
+    // seams' credentials-FIRST revoke.
+    std::unique_ptr<ApiTokenStore> token_store;
+    // ADR-2001 D1: the codebase's actual severity channel — AnalyticsEvent
+    // ::severity via AnalyticsEventStore, the SAME mechanism AuthRoutes::
+    // emit_event uses for Severity::kCritical break-glass events. SQLite,
+    // ":memory:" per its own header doc ("in tests") — independent of the
+    // PG stores above, so no shared-pool concern here.
+    std::unique_ptr<AnalyticsEventStore> analytics_store;
     // AuditStore ported to Postgres (ADR-0006): shares auth_db's PgPool/
     // database (same "one PgPool" pattern as ScimStore above) in the normal
     // case; `broken_audit` instead points it at an unroutable pool so
@@ -81,6 +97,10 @@ struct Fixture {
     std::unique_ptr<AuditStore> audit_store;
     test::TestRouteSink sink;
     std::unique_ptr<ScimRoutes> routes;
+    // ADR-2001: wired unconditionally (harmless no-op for every existing
+    // test that doesn't inspect it) so D1/D2 metric assertions can read it
+    // directly, mirroring ScimIntegrationServer's `metrics` member below.
+    yuzu::MetricsRegistry metrics;
     const std::string token{"unit-test-scim-bearer-token-0123456789"};
 
     /// `broken_audit=true` points AuditStore at an unroutable pool so every
@@ -92,10 +112,17 @@ struct Fixture {
     /// promotes to admin.
     explicit Fixture(bool broken_audit = false, std::string scim_admin_group = {}) {
         auth_mgr.set_auth_db(auth_db.get());
+        auth_mgr.set_metrics_registry(&metrics);
 
         scim_store = std::make_unique<ScimStore>(auth_db.pool());
         REQUIRE(scim_store->is_open());
         REQUIRE(scim_store->set_token(token, "test"));
+
+        token_store = std::make_unique<ApiTokenStore>(auth_db.pool());
+        REQUIRE(token_store->is_open());
+
+        analytics_store = std::make_unique<AnalyticsEventStore>(":memory:");
+        REQUIRE(analytics_store->is_open());
 
         if (broken_audit) {
             audit_bad_pool.emplace(yuzu::server::pg::PgPool::Options{
@@ -109,12 +136,15 @@ struct Fixture {
 
         routes = std::make_unique<ScimRoutes>();
         routes->register_routes(sink, scim_store.get(), &auth_mgr, audit_store.get(),
-                                std::move(scim_admin_group));
+                                std::move(scim_admin_group), /*engine_principal_store=*/nullptr,
+                                token_store.get(), analytics_store.get());
     }
 
     ~Fixture() {
         routes.reset();
         audit_store.reset();
+        analytics_store.reset();
+        token_store.reset();
         scim_store.reset();
     }
 
@@ -1092,7 +1122,9 @@ TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a C
 
     test::TestRouteSink cold_sink;
     ScimRoutes cold_routes;
-    cold_routes.register_routes(cold_sink, f.scim_store.get(), &cold_auth_mgr, f.audit_store.get());
+    cold_routes.register_routes(cold_sink, f.scim_store.get(), &cold_auth_mgr, f.audit_store.get(),
+                                /*scim_admin_group=*/{}, /*engine_principal_store=*/nullptr,
+                                f.token_store.get());
 
     auto del_admin =
         cold_sink.dispatch("DELETE", "/scim/v2/Users/" + id, {}, "application/scim+json",
@@ -1117,6 +1149,704 @@ TEST_CASE("ScimRoutes: deprovision refused for a DB-elevated admin even with a C
     // DB-authoritative source of truth agrees with cold_auth_mgr here.
     CHECK_FALSE(cold_auth_mgr.get_user_role("dana").has_value());
     CHECK_FALSE(f.auth_db->get_user("dana").has_value());
+}
+
+// ── ADR-2001 Task 3: deprovision credential revoke ──────────────────────────
+//
+// The principal-set resolver (`resolve_deprovision_principals`,
+// deprovision_revoke.hpp) and the credentials-FIRST orchestrator
+// (`revoke_deprovision_credentials`) tested directly against the fixture's
+// real ScimStore/ApiTokenStore/AuthManager, then the four HTTP wiring seams
+// (PATCH/PUT active:false via deactivate(), DELETE, create-with-
+// active:false, and the dashboard delete in test_settings_routes_users.cpp).
+
+TEST_CASE("resolve_deprovision_principals: returns {slug} when no links exist",
+         "[pg][scim][adr2001][resolver]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("no-links-user");
+    REQUIRE(resource.has_value());
+
+    auto principals =
+        resolve_deprovision_principals(*f.scim_store, resource->scim_id, "no-links-user");
+    REQUIRE(principals.has_value());
+    REQUIRE(principals->size() == 1);
+    CHECK((*principals)[0] == "no-links-user");
+}
+
+TEST_CASE("resolve_deprovision_principals: returns {slug, oidc:<iss>#<sub>, ...} for every "
+         "linked identity (MUTATION-CHECK target — see the comment below)",
+         "[pg][scim][adr2001][resolver]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("multi-link-user");
+    REQUIRE(resource.has_value());
+    REQUIRE(f.scim_store->upsert_link("https://idp-a.example.com/", "sub-a", resource->scim_id));
+    REQUIRE(f.scim_store->upsert_link("https://idp-b.example.com/", "sub-b", resource->scim_id));
+
+    auto principals =
+        resolve_deprovision_principals(*f.scim_store, resource->scim_id, "multi-link-user");
+    REQUIRE(principals.has_value());
+    // MUTATION-CHECK (ADR-2001 task spec, manually verified during
+    // development): commenting out the `for (const auto& linked : *links)
+    // principals.push_back(...)` loop in deprovision_revoke.cpp's
+    // resolve_deprovision_principals collapses this to size()==1 and fails
+    // this REQUIRE — confirming the test actually exercises the join
+    // rather than passing vacuously with the linkage silently broken.
+    REQUIRE(principals->size() == 3);
+    CHECK(std::find(principals->begin(), principals->end(), "multi-link-user") !=
+         principals->end());
+    CHECK(std::find(principals->begin(), principals->end(),
+                    oidc::oidc_principal_id("https://idp-a.example.com/", "sub-a")) !=
+         principals->end());
+    CHECK(std::find(principals->begin(), principals->end(),
+                    oidc::oidc_principal_id("https://idp-b.example.com/", "sub-b")) !=
+         principals->end());
+}
+
+TEST_CASE("resolve_deprovision_principals: fails closed (nullopt) when links_for_scim_id "
+         "cannot answer — never silently read as \"no links to revoke\"",
+         "[pg][scim][adr2001][resolver][failclosed]") {
+    // Same unroutable-pool idiom the fixture's own broken_audit uses — the
+    // store's migration fails, is_open() is false, and links_for_scim_id's
+    // own `!open_` guard returns nullopt rather than an engaged-empty
+    // vector.
+    yuzu::server::pg::PgPool unroutable{
+        {.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ScimStore broken_store{unroutable};
+    REQUIRE_FALSE(broken_store.is_open());
+
+    auto principals = resolve_deprovision_principals(broken_store, "any-scim-id", "any-username");
+    CHECK_FALSE(principals.has_value());
+}
+
+// ── ADR-2001 governance Gate 7 BLOCKING fix (UP-7) ───────────────────────────
+//
+// `resolve_deprovision_principals_for_username` (the dashboard-delete
+// variant) used to call `ScimStore::get_by_username`, which collapses "no
+// such resource" and "the store could not answer" into the same bare
+// `nullopt` — so under a pool-exhaustion blip a KNOWN linked user's OIDC
+// identities were silently dropped (degraded to the slug-only set, the same
+// outcome as "never a SCIM user"). The fix routes through the tri-state
+// `get_by_username_checked` instead.
+
+TEST_CASE("resolve_deprovision_principals_for_username: degrades to {username} when the "
+         "username genuinely has no SCIM resource",
+         "[pg][scim][adr2001][resolver]") {
+    Fixture f;
+    // Nothing created for this username — a genuine (store-answered) miss.
+    auto principals =
+        resolve_deprovision_principals_for_username(f.scim_store.get(), "never-provisioned");
+    REQUIRE(principals.has_value());
+    REQUIRE(principals->size() == 1);
+    CHECK((*principals)[0] == "never-provisioned");
+}
+
+TEST_CASE("resolve_deprovision_principals_for_username: resolves the full principal set for a "
+         "KNOWN SCIM-linked username",
+         "[pg][scim][adr2001][resolver]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("linked-dash-user");
+    REQUIRE(resource.has_value());
+    REQUIRE(f.scim_store->upsert_link("https://idp.example.com/", "sub-dash", resource->scim_id));
+
+    auto principals =
+        resolve_deprovision_principals_for_username(f.scim_store.get(), "linked-dash-user");
+    REQUIRE(principals.has_value());
+    REQUIRE(principals->size() == 2);
+    CHECK(std::find(principals->begin(), principals->end(), "linked-dash-user") !=
+         principals->end());
+    CHECK(std::find(principals->begin(), principals->end(),
+                    oidc::oidc_principal_id("https://idp.example.com/", "sub-dash")) !=
+         principals->end());
+}
+
+TEST_CASE("resolve_deprovision_principals_for_username: FAILS CLOSED (nullopt) on a store "
+         "blip for a KNOWN username — MUTATION-CHECK target, see the comment below",
+         "[pg][scim][adr2001][resolver][failclosed]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("blip-user");
+    REQUIRE(resource.has_value());
+
+    // A second ScimStore handle over a DEDICATED size-1 pool to the SAME
+    // database — the "hog the pool" idiom (test_api_token_store.cpp "an
+    // EXHAUSTED connection pool is kUnavailable"; also used just above at
+    // line ~1462 for the PATCH-fails-closed mutation-check) forces the
+    // second store's runtime `try_acquire_for` calls to time out, without
+    // touching `f`'s own healthy store/pool. Construct THEN hog — the
+    // store's own migration lease must be taken and released first, or the
+    // hog below would deadlock the constructor's blocking `acquire()`.
+    yuzu::server::pg::PgPool starved{{.conninfo = f.auth_db.dsn(), .size = 1}};
+    ScimStore starved_store{starved};
+    REQUIRE(starved_store.is_open());
+    auto hog = starved.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog); // holds the pool's only connection
+
+    auto principals =
+        resolve_deprovision_principals_for_username(&starved_store, "blip-user");
+    // MUTATION-CHECK (manually verified during development): reverting
+    // `resolve_deprovision_principals_for_username` to call
+    // `get_by_username` (which collapses "not found" and "store error" into
+    // one bare nullopt, then unconditionally degrades to
+    // `{username}`) turns this into an ENGAGED `{blip-user}` vector instead
+    // of `nullopt` — confirming this REQUIRE actually exercises the tri-
+    // state fail-closed path rather than passing vacuously.
+    CHECK_FALSE(principals.has_value());
+}
+
+// ── ADR-2001 PR4a: the SAML pass ─────────────────────────────────────────
+//
+// `resolve_deprovision_principals` now also unions in every
+// `saml::saml_principal_id(entity_id, name_id)` from
+// `ScimStore::saml_links_for_scim_id(scim_id)`, fail-closed on ITS nullopt
+// exactly like the pre-existing OIDC pass above.
+
+TEST_CASE("resolve_deprovision_principals: returns {slug, saml:<entity>#<name>, ...} for "
+         "every linked SAML identity (MUTATION-CHECK target — see the comment below)",
+         "[pg][scim][adr2001][resolver][saml]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("multi-saml-link-user");
+    REQUIRE(resource.has_value());
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp-a.example.com/saml/metadata",
+                                           "a@example.com", resource->scim_id));
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp-b.example.com/saml/metadata",
+                                           "b@example.com", resource->scim_id));
+
+    auto principals = resolve_deprovision_principals(*f.scim_store, resource->scim_id,
+                                                      "multi-saml-link-user");
+    REQUIRE(principals.has_value());
+    // MUTATION-CHECK (manually verified during development): commenting out
+    // the `for (const auto& linked : *saml_links) principals.push_back(...)`
+    // loop in deprovision_revoke.cpp's resolve_deprovision_principals
+    // collapses this to size()==1 and fails this REQUIRE — confirming the
+    // test actually exercises the SAML join rather than passing vacuously
+    // with the linkage silently broken.
+    REQUIRE(principals->size() == 3);
+    CHECK(std::find(principals->begin(), principals->end(), "multi-saml-link-user") !=
+         principals->end());
+    CHECK(std::find(principals->begin(), principals->end(),
+                    saml::saml_principal_id("https://idp-a.example.com/saml/metadata",
+                                            "a@example.com")) != principals->end());
+    CHECK(std::find(principals->begin(), principals->end(),
+                    saml::saml_principal_id("https://idp-b.example.com/saml/metadata",
+                                            "b@example.com")) != principals->end());
+}
+
+TEST_CASE("resolve_deprovision_principals: a slug with BOTH an OIDC and a SAML link resolves "
+         "the union of both",
+         "[pg][scim][adr2001][resolver][saml]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("dual-linked-user");
+    REQUIRE(resource.has_value());
+    REQUIRE(f.scim_store->upsert_link("https://oidc-idp.example.com/", "sub-dual",
+                                      resource->scim_id));
+    REQUIRE(f.scim_store->upsert_saml_link("https://saml-idp.example.com/saml/metadata",
+                                           "dual@example.com", resource->scim_id));
+
+    auto principals =
+        resolve_deprovision_principals(*f.scim_store, resource->scim_id, "dual-linked-user");
+    REQUIRE(principals.has_value());
+    REQUIRE(principals->size() == 3);
+    CHECK(std::find(principals->begin(), principals->end(),
+                    oidc::oidc_principal_id("https://oidc-idp.example.com/", "sub-dual")) !=
+         principals->end());
+    CHECK(std::find(principals->begin(), principals->end(),
+                    saml::saml_principal_id("https://saml-idp.example.com/saml/metadata",
+                                            "dual@example.com")) != principals->end());
+}
+
+TEST_CASE("resolve_deprovision_principals: fails closed (nullopt) when "
+         "saml_links_for_scim_id SPECIFICALLY cannot answer even though the OIDC links read "
+         "succeeds cleanly — MUTATION-CHECK target, see the comment below",
+         "[pg][scim][adr2001][resolver][saml][failclosed]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("saml-blip-user");
+    REQUIRE(resource.has_value());
+
+    // Break ONLY the saml_identity_links table so its query fails while
+    // identity_links (OIDC, untouched) stays intact and would answer fine
+    // (zero rows — an engaged-but-empty, non-failing answer).
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(f.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult drop{
+            PQexec(conn.get(), "DROP TABLE scim_store.saml_identity_links")};
+        REQUIRE(drop.ok());
+    }
+
+    auto principals =
+        resolve_deprovision_principals(*f.scim_store, resource->scim_id, "saml-blip-user");
+    // MUTATION-CHECK (manually verified during development): a
+    // resolve_deprovision_principals that never calls (or never checks the
+    // nullopt of) saml_links_for_scim_id would return an ENGAGED {slug}
+    // vector here — the OIDC read alone succeeds cleanly with zero links —
+    // instead of nullopt, confirming this test exercises the SAML-specific
+    // fail-closed branch specifically (the OIDC-side fail-closed test
+    // earlier in this file already covers a wholly-broken store, which
+    // cannot tell the two branches apart).
+    CHECK_FALSE(principals.has_value());
+}
+
+TEST_CASE("revoke_deprovision_credentials: revokes a SAML-linked user's SAML session (keyed "
+         "on the stable principal) — MUTATION-CHECK target, see the comment below",
+         "[pg][scim][adr2001][orchestrator][saml]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("saml-yolanda");
+    REQUIRE(resource.has_value());
+
+    const std::string entity_id = "https://idp.example.com/saml/metadata";
+    const std::string name_id   = "yolanda@example.com";
+    REQUIRE(f.scim_store->upsert_saml_link(entity_id, name_id, resource->scim_id));
+
+    auto saml_session = f.auth_mgr.create_saml_session(name_id, entity_id);
+    REQUIRE_FALSE(saml_session.empty());
+    REQUIRE(f.auth_mgr.validate_session(saml_session).has_value());
+
+    auto principals =
+        resolve_deprovision_principals(*f.scim_store, resource->scim_id, "saml-yolanda");
+    REQUIRE(principals.has_value());
+    REQUIRE(principals->size() == 2);
+
+    auto result = revoke_deprovision_credentials(*f.token_store, f.auth_mgr, *principals);
+    CHECK(result.sessions_revoked == 1);
+
+    // MUTATION-CHECK (manually verified during development): reverting
+    // `AuthManager::create_saml_session` to key the session's `username` on
+    // the raw NameID (the pre-ADR-2001-PR4a behaviour) makes this CHECK
+    // fail — the session SURVIVES, because `saml::saml_principal_id(
+    // entity_id, name_id)` (what `resolve_deprovision_principals` resolved
+    // above) no longer matches the session's actual key (bare
+    // "yolanda@example.com") — confirming this test actually catches the
+    // exact ADR-2001 silent-under-revocation failure mode ("reported
+    // success, revoked nothing") for the SAML re-key specifically.
+    CHECK_FALSE(f.auth_mgr.validate_session(saml_session).has_value());
+}
+
+TEST_CASE("revoke_deprovision_credentials: revokes tokens and sessions for EVERY principal in "
+         "the resolved set",
+         "[pg][scim][adr2001][orchestrator]") {
+    Fixture f;
+    auto slug_token = f.token_store->create_token("t1", "yolanda");
+    REQUIRE(slug_token.has_value());
+    const std::string oidc_principal =
+        oidc::oidc_principal_id("https://idp.example.com/", "sub-yolanda");
+    auto oidc_token = f.token_store->create_token("t2", oidc_principal);
+    REQUIRE(oidc_token.has_value());
+
+    auto slug_session = f.auth_mgr.create_local_session("yolanda", auth::Role::user, true);
+    auto oidc_session = f.auth_mgr.create_oidc_session("Yolanda", "y@example.com", "sub-yolanda",
+                                                        "https://idp.example.com/");
+    REQUIRE_FALSE(slug_session.empty());
+    REQUIRE_FALSE(oidc_session.empty());
+    REQUIRE(f.auth_mgr.validate_session(slug_session).has_value());
+    REQUIRE(f.auth_mgr.validate_session(oidc_session).has_value());
+
+    auto result = revoke_deprovision_credentials(*f.token_store, f.auth_mgr,
+                                                  {"yolanda", oidc_principal});
+    CHECK(result.api_tokens_persisted);
+    CHECK(result.api_tokens_revoked == 2);
+    CHECK(result.sessions_revoked == 2);
+
+    CHECK_FALSE(f.token_store->validate_token(*slug_token).has_value());
+    CHECK_FALSE(f.token_store->validate_token(*oidc_token).has_value());
+    CHECK_FALSE(f.auth_mgr.validate_session(slug_session).has_value());
+    CHECK_FALSE(f.auth_mgr.validate_session(oidc_session).has_value());
+}
+
+TEST_CASE("ScimRoutes: PATCH active=false revokes API tokens AND sessions for BOTH the slug "
+         "and every linked OIDC identity (credentials-FIRST, ADR-2001 §3)",
+         "[pg][scim][routes][adr2001][deprovision]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "trent"}})->body);
+    auto id = created["id"].get<std::string>();
+
+    const std::string iss = "https://idp.example.com/";
+    const std::string sub = "sub-trent-1";
+    REQUIRE(f.scim_store->upsert_link(iss, sub, id));
+    const std::string oidc_principal = oidc::oidc_principal_id(iss, sub);
+
+    auto slug_token = f.token_store->create_token("slug-token", "trent");
+    REQUIRE(slug_token.has_value());
+    auto oidc_token = f.token_store->create_token("oidc-token", oidc_principal);
+    REQUIRE(oidc_token.has_value());
+
+    auto slug_session = f.auth_mgr.create_local_session("trent", auth::Role::user, true);
+    auto oidc_session =
+        f.auth_mgr.create_oidc_session("Trent", "trent@example.com", sub, iss);
+    REQUIRE(f.auth_mgr.validate_session(slug_session).has_value());
+    REQUIRE(f.auth_mgr.validate_session(oidc_session).has_value());
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    // The whole point of the linkage: BOTH tokens revoked, BOTH sessions
+    // gone — not just the slug's own. A test that stays green with the
+    // oidc: principal untouched is the exact false-green ADR-2001 exists to
+    // prevent (see the resolver mutation-check test above for the same
+    // property pinned at the resolver layer directly).
+    CHECK_FALSE(f.token_store->validate_token(*slug_token).has_value());
+    CHECK_FALSE(f.token_store->validate_token(*oidc_token).has_value());
+    CHECK_FALSE(f.auth_mgr.validate_session(slug_session).has_value());
+    CHECK_FALSE(f.auth_mgr.validate_session(oidc_session).has_value());
+
+    AuditQuery q;
+    q.action = "scim.user.deactivated";
+    q.target_id = id;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].result == "success");
+    CHECK((*rows)[0].detail.find("api_tokens_revoked=2") != std::string::npos);
+    CHECK((*rows)[0].detail.find("sessions_revoked=2") != std::string::npos);
+}
+
+TEST_CASE("ScimRoutes: credentials-first ordering — the revoke happens BEFORE the account is "
+         "marked inactive",
+         "[pg][scim][routes][adr2001][deprovision]") {
+    // Ordering assertion via the audit trail: `deactivate()`'s credential
+    // revoke runs, and only on success does remove_user()/set_active(false)
+    // follow — so a persisted "api_tokens_revoked=" detail on the SAME
+    // "scim.user.deactivated" success row that marks the account inactive
+    // is only reachable if the revoke ran first (a revoke error aborts
+    // before remove_user ever runs — see the fail-closed test below).
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "ursula"}})->body);
+    auto id = created["id"].get<std::string>();
+    auto token = f.token_store->create_token("t", "ursula");
+    REQUIRE(token.has_value());
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_FALSE(f.token_store->validate_token(*token).has_value());
+    CHECK_FALSE(f.auth_mgr.get_user_role("ursula").has_value()); // account inactive
+}
+
+TEST_CASE("ScimRoutes: DELETE revokes API tokens for BOTH the slug and every linked OIDC "
+         "identity",
+         "[pg][scim][routes][adr2001][delete]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "victor"}})->body);
+    auto id = created["id"].get<std::string>();
+
+    const std::string iss = "https://idp.example.com/";
+    const std::string sub = "sub-victor-1";
+    REQUIRE(f.scim_store->upsert_link(iss, sub, id));
+    const std::string oidc_principal = oidc::oidc_principal_id(iss, sub);
+
+    auto slug_token = f.token_store->create_token("slug-token", "victor");
+    REQUIRE(slug_token.has_value());
+    auto oidc_token = f.token_store->create_token("oidc-token", oidc_principal);
+    REQUIRE(oidc_token.has_value());
+
+    auto res = f.del("/scim/v2/Users/" + id);
+    REQUIRE(res);
+    CHECK(res->status == 204);
+
+    CHECK_FALSE(f.token_store->validate_token(*slug_token).has_value());
+    CHECK_FALSE(f.token_store->validate_token(*oidc_token).has_value());
+}
+
+TEST_CASE("ScimRoutes: create-with-active:false revokes a pre-existing slug-keyed token before "
+         "the account goes inactive",
+         "[pg][scim][routes][adr2001][create]") {
+    // A slug-keyed API token minted against a username BEFORE that username
+    // is provisioned via SCIM is unusual (SCIM users are normally SSO-only,
+    // ADR-2001 context) but not impossible (ApiTokenStore does not require
+    // the principal to already exist) — this pins that the create-with-
+    // active:false seam still revokes it, matching the other three
+    // deprovision seams rather than silently skipping the slug's own
+    // credentials because the account is brand new.
+    Fixture f;
+    auto pre_token = f.token_store->create_token("pre-existing", "walter");
+    REQUIRE(pre_token.has_value());
+
+    auto res = f.post("/scim/v2/Users", {{"userName", "walter"}, {"active", false}});
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK(json::parse(res->body)["active"] == false);
+
+    CHECK_FALSE(f.token_store->validate_token(*pre_token).has_value());
+    CHECK_FALSE(f.auth_mgr.get_user_role("walter").has_value());
+}
+
+TEST_CASE("ScimRoutes: PATCH active=false fails closed when a token revoke does not persist — "
+         "never reports a clean deprovision (ADR-2001 §3 fail-closed mutation-check)",
+         "[pg][scim][routes][adr2001][deprovision][failclosed]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "uma"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.get_user_role("uma").has_value());
+
+    // A dedicated size-1 pool for a SECOND ApiTokenStore over the SAME
+    // database, registered on a fresh sink alongside the fixture's healthy
+    // ScimStore/AuthDB — the "hog the pool" idiom
+    // (test_api_token_store.cpp "an EXHAUSTED connection pool is
+    // kUnavailable") forces revoke_for_principal's try_acquire_for to time
+    // out and return std::unexpected, without degrading AuthDB/ScimStore's
+    // own health (so provenance/role checks still pass cleanly).
+    yuzu::server::pg::PgPool starved_pool{{.conninfo = f.auth_db.dsn(), .size = 1}};
+    ApiTokenStore starved_token_store{starved_pool};
+    REQUIRE(starved_token_store.is_open());
+
+    test::TestRouteSink starved_sink;
+    ScimRoutes starved_routes;
+    starved_routes.register_routes(starved_sink, f.scim_store.get(), &f.auth_mgr,
+                                   f.audit_store.get(), /*scim_admin_group=*/{},
+                                   /*engine_principal_store=*/nullptr, &starved_token_store);
+
+    auto hog = starved_pool.try_acquire_for(std::chrono::seconds{5});
+    REQUIRE(hog); // holds the pool's only connection
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = starved_sink.dispatch("PATCH", "/scim/v2/Users/" + id, patch_body.dump(),
+                                     "application/scim+json", f.auth_header());
+    REQUIRE(res);
+    CHECK(res->status == 500);
+    hog.reset(); // release before touching the DB again below
+
+    // NOT a clean success: the account is still active/live — never marked
+    // inactive on top of a credential revoke that never persisted.
+    // MUTATION-CHECK (ADR-2001 task spec, manually verified during
+    // development): removing `revoke_linked_credentials_or_fail`'s early
+    // `return false` in deactivate() (letting a non-persisted revoke fall
+    // through to remove_user/set_active/the 200 success response) makes
+    // this same request report 200 and get_user_role() come back empty —
+    // failing both CHECKs below.
+    CHECK(f.auth_mgr.get_user_role("uma").has_value());
+    auto stored = f.scim_store->get_by_scim_id(id);
+    REQUIRE(stored.has_value());
+    CHECK(stored->active);
+
+    AuditQuery q;
+    q.action = "scim.user.deactivated";
+    q.target_id = id;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].result == "partial");
+    CHECK((*rows)[0].detail.find("api_tokens_db_error=true") != std::string::npos);
+}
+
+TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITH an active linked identity is a "
+         "LOUD signal: a proper-result audit row + the role-refused metric + a "
+         "Severity::kCritical analytics event",
+         "[pg][scim][routes][adr2001][d1]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "xena"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->upsert_link("https://idp.example.com/", "sub-xena", id));
+    REQUIRE(f.auth_mgr.update_role("xena", auth::Role::admin));
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    // #2021 behavior UNCHANGED: still refused.
+    CHECK(res->status == 404);
+    CHECK(f.auth_mgr.get_user_role("xena").value() == auth::Role::admin);
+
+    // AuditEvent has no severity field — its `result` column carries a
+    // REAL outcome value, never a severity string. The termination did NOT
+    // complete, so "failure" (not "kCritical", which corrupted this column
+    // and defeated any consumer keying off a real result value).
+    AuditQuery q;
+    q.action = "scim.user.deprovision_role_refused_with_link";
+    q.target_id = id;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].result == "failure");
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_role_refused_with_active_link_total").value() ==
+         1.0);
+
+    // The actual severity channel: an AnalyticsEvent recorded at
+    // Severity::kCritical (the same mechanism AuthRoutes::emit_event uses
+    // for break-glass logins) — asserted directly against the store, not
+    // inferred from a magic string in an unrelated column.
+    auto events = f.analytics_store->query_recent(10);
+    bool found_critical = false;
+    for (const auto& e : events) {
+        if (e.event_type == "scim.user.deprovision_role_refused_with_link") {
+            CHECK(e.severity == Severity::kCritical);
+            CHECK(e.attributes.value("scim_id", "") == id);
+            found_critical = true;
+        }
+    }
+    CHECK(found_critical);
+}
+
+TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITHOUT a link is a plain 404, no new "
+         "audit row, metric, or critical analytics event",
+         "[pg][scim][routes][adr2001][d1]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "yara"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.auth_mgr.update_role("yara", auth::Role::admin));
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 404);
+
+    AuditQuery q;
+    q.action = "scim.user.deprovision_role_refused_with_link";
+    q.target_id = id;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    CHECK(rows->empty());
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_role_refused_with_active_link_total").value() ==
+         0.0);
+
+    auto events = f.analytics_store->query_recent(10);
+    for (const auto& e : events)
+        CHECK(e.event_type != "scim.user.deprovision_role_refused_with_link");
+}
+
+TEST_CASE("ScimRoutes: D2 — a deprovision with a login observation but no formed link bumps "
+         "the unlinked-signal metric (CC6.8 false-green tripwire)",
+         "[pg][scim][routes][adr2001][d2]") {
+    Fixture f;
+    auto created =
+        json::parse(f.post("/scim/v2/Users", {{"userName", "zack"}, {"externalId", "ext-zack"}})
+                        ->body);
+    auto id = created["id"].get<std::string>();
+    // A login occurred whose claim value matches this slug's externalId,
+    // but under a DIFFERENT claim than the one configured as the SCIM link
+    // claim, so upsert_link never ran — the D2 scenario exactly.
+    REQUIRE(f.scim_store->record_login_observation("https://idp.example.com/", "sub-zack", "oid",
+                                                    "ext-zack"));
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_unlinked_total").value() == 1.0);
+}
+
+TEST_CASE("ScimRoutes: D2 — a deprovision with neither a link nor a matching observation does "
+         "NOT bump the unlinked-signal metric",
+         "[pg][scim][routes][adr2001][d2]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "amos"}, {"externalId", "ext-amos"}})->body);
+    auto id = created["id"].get<std::string>();
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_unlinked_total").value() == 0.0);
+}
+
+// ── Governance PR4a follow-up (C1/C2): D1/D2 must not be OIDC-only ────────
+//
+// PR4a joined SAML principals into the shared deprovision paths but left D1
+// gated on `links_for_scim_id` (OIDC only) and D2 gated on
+// `principals.size() != 1` (which SAML links now also inflate) — both
+// silently stopped firing for a SAML-only or SAML+unformed-OIDC user. These
+// four cases are the closure evidence for that fix.
+
+TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITH an active linked SAML identity "
+         "(ZERO OIDC links) is still a LOUD signal — PATCH deactivate",
+         "[pg][scim][routes][adr2001][d1][saml]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "priya"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp.example.com/saml/metadata",
+                                           "priya@example.com", id));
+    REQUIRE(f.auth_mgr.update_role("priya", auth::Role::admin));
+
+    // Confirm this is genuinely SAML-ONLY — zero OIDC identity_links rows.
+    auto oidc_links = f.scim_store->links_for_scim_id(id);
+    REQUIRE(oidc_links.has_value());
+    CHECK(oidc_links->empty());
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 404); // #2021 refusal unchanged
+    CHECK(f.auth_mgr.get_user_role("priya").value() == auth::Role::admin);
+
+    AuditQuery q;
+    q.action = "scim.user.deprovision_role_refused_with_link";
+    q.target_id = id;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].result == "failure");
+    CHECK((*rows)[0].detail.find("SAML") != std::string::npos);
+    // MUTATION-CHECK (governance C1, manually verified during development):
+    // reverting the D1 branches to a bare
+    // `scim_store->links_for_scim_id(...)` (OIDC only) makes this metric
+    // read 0.0 and this audit row not exist — a SAML-only-linked
+    // role-refusal fires NOTHING, exactly the gap this test closes.
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_role_refused_with_active_link_total").value() ==
+         1.0);
+}
+
+TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITH an active linked SAML identity "
+         "(ZERO OIDC links) is still a LOUD signal — DELETE",
+         "[pg][scim][routes][adr2001][d1][saml]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "quinn"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp.example.com/saml/metadata",
+                                           "quinn@example.com", id));
+    REQUIRE(f.auth_mgr.update_role("quinn", auth::Role::admin));
+
+    auto res = f.del("/scim/v2/Users/" + id);
+    REQUIRE(res);
+    CHECK(res->status == 404); // #2021 refusal unchanged
+    CHECK(f.auth_mgr.get_user_role("quinn").value() == auth::Role::admin);
+
+    AuditQuery q;
+    q.action = "scim.user.deprovision_role_refused_with_link";
+    q.target_id = id;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].result == "failure");
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_role_refused_with_active_link_total").value() ==
+         1.0);
+}
+
+TEST_CASE("ScimRoutes: D2 — a resource with ONE SAML link and ZERO OIDC links still bumps the "
+         "unlinked-OIDC tripwire on a matching login observation (previously masked by the "
+         "coexisting SAML link inflating principals.size())",
+         "[pg][scim][routes][adr2001][d2][saml]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "rowan"}, {"externalId", "ext-rowan"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp.example.com/saml/metadata",
+                                           "rowan@example.com", id));
+    // A login occurred whose claim value matches this slug's externalId,
+    // under a DIFFERENT OIDC claim than the configured link claim, so
+    // upsert_link (OIDC) never ran — the D2 scenario, now coexisting with a
+    // formed SAML link on the same scim_id.
+    REQUIRE(f.scim_store->record_login_observation("https://idp.example.com/", "sub-rowan", "oid",
+                                                    "ext-rowan"));
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // MUTATION-CHECK (governance C2, manually verified during development):
+    // reverting maybe_flag_d2_unlinked to gate on `principals.size() != 1`
+    // sees size()==2 here (slug + the SAML principal) and returns early —
+    // this metric reads 0.0 instead of 1.0, exactly the masking this test
+    // closes.
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_unlinked_total").value() == 1.0);
 }
 
 TEST_CASE("ScimRoutes: revive-on-reprovision refuses an operator-elevated account — 404, and "
@@ -1659,6 +2389,10 @@ struct ScimIntegrationServer {
     yuzu::test::AuthDbPg auth_db;
     auth::AuthManager auth_mgr;
     std::unique_ptr<ScimStore> scim_store;
+    // ADR-2001 §§1,3: shares auth_db's PgPool, same "one PgPool" pattern as
+    // scim_store/audit_store — wired into the deprovision seams'
+    // credentials-FIRST revoke.
+    std::unique_ptr<ApiTokenStore> token_store;
     // AuditStore ported to Postgres (ADR-0006): shares auth_db's PgPool/
     // database (same "one PgPool" pattern as ScimStore above).
     std::unique_ptr<AuditStore> audit_store;
@@ -1677,6 +2411,9 @@ struct ScimIntegrationServer {
         scim_store = std::make_unique<ScimStore>(auth_db.pool());
         REQUIRE(scim_store->is_open());
         REQUIRE(scim_store->set_token(token, "test"));
+
+        token_store = std::make_unique<ApiTokenStore>(auth_db.pool());
+        REQUIRE(token_store->is_open());
 
         audit_store = std::make_unique<AuditStore>(auth_db.pool());
         REQUIRE(audit_store->is_open());
@@ -1720,7 +2457,8 @@ struct ScimIntegrationServer {
 
         routes = std::make_unique<ScimRoutes>();
         routes->register_routes(svr, scim_store.get(), &auth_mgr, audit_store.get(),
-                                scim_admin_group);
+                                scim_admin_group, /*engine_principal_store=*/nullptr,
+                                token_store.get());
 
         port = svr.bind_to_any_port("127.0.0.1");
         REQUIRE(port > 0);
@@ -1739,6 +2477,7 @@ struct ScimIntegrationServer {
             server_thread.join();
         routes.reset();
         audit_store.reset();
+        token_store.reset();
         scim_store.reset();
     }
 };

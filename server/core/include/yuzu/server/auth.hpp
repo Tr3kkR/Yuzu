@@ -523,7 +523,21 @@ public:
     /// The session's `auth_source` is `"saml"`. `last_activity_at` is stamped
     /// per the standing invariant: any new session-creation site MUST stamp it
     /// or the idle-eviction gate will instantly expire the session (auth.hpp §78).
-    std::string create_saml_session(const std::string& name_id,
+    ///
+    /// ADR-2001 PR4a — the session's STABLE `username` (authorization
+    /// principal) is `saml::saml_principal_id(entity_id, name_id)`
+    /// (`"saml:" + entity_id + "#" + name_id`, saml_principal.hpp), NOT the
+    /// raw NameID: mirrors #1837's OIDC split exactly (`oidc_principal_id
+    /// (iss, sub)`) — a NameID is only unique per-IdP, so a bare NameID is
+    /// unsafe as a durable cross-IdP join key, and the same collision-risk
+    /// argument OIDC's split closes applies here. `display_name` stays the
+    /// raw `name_id` (human-readable rendering only — dashboard, audit
+    /// detail). `entity_id` is the operator-configured, boot-validated IdP
+    /// entityID (`Config::saml_idp_entity_id`) — already verified by
+    /// `SamlProvider::validate_response` to equal the assertion's signed
+    /// `<saml:Issuer>` before this is called (see the ACS handler,
+    /// auth_routes.cpp).
+    std::string create_saml_session(const std::string& name_id, const std::string& entity_id,
                                     const std::vector<std::string>& groups = {},
                                     const std::string& admin_group = {});
 
@@ -542,11 +556,12 @@ public:
     /// caller's session is already minted and must not be un-minted
     /// because provisioning failed; the principal simply cannot elevate
     /// until a future successful login provisions it. SAML is NOT wired
-    /// to this method yet — SAML sessions are keyed on the raw NameID
-    /// (no reserved-prefix stable principal; see `create_saml_session`'s
-    /// "#1837 fast-follow" comment), which `is_valid_principal` would
-    /// reject, so a SAML session cannot elevate until that fast-follow
-    /// lands (docs/auth-architecture.md).
+    /// to this method yet — ADR-2001 PR4a gave SAML a reserved-prefix
+    /// stable principal (`saml_principal_id`, see `create_saml_session`),
+    /// but no `auth.db` `users` row is ever provisioned for it, so a SAML
+    /// session still cannot elevate (JIT elevation's identity-source guard,
+    /// auth_routes.cpp, fails closed on the absent row) — that remains a
+    /// separate follow-up (docs/auth-architecture.md).
     void provision_sso_identity(const std::string& principal, const std::string& iss,
                                 const std::string& sub, const std::string& display_name);
 

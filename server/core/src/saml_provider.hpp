@@ -58,6 +58,19 @@ struct SamlConfig {
 struct SamlAssertion {
     std::string name_id;
 
+    /// ADR-2001 PR4a — the verified `<saml:NameID Format="...">` attribute,
+    /// read from the SAME XSW-verified assertion node as `name_id` (never a
+    /// second document-wide search — N2 parity). Empty when the assertion's
+    /// NameID carries no Format attribute at all. Consumed by
+    /// `saml_scim_link.hpp`'s `is_linkable_name_id_format` to decide whether
+    /// this NameID is a safe SCIM-externalId join key: only a STABLE format
+    /// (persistent, or the 1.1 emailAddress format) is; a `transient` (or
+    /// missing/empty) Format NameID is re-minted per login and must never be
+    /// trusted into a durable link. This field is purely descriptive — the
+    /// verifier itself never rejects a login based on Format; that decision
+    /// is entirely the login-site linking orchestration's.
+    std::string name_id_format;
+
     /// Group identifiers extracted from the configured `group_attribute`'s
     /// `<AttributeValue>` children. Always empty when `SamlConfig::group_attribute`
     /// is empty. Bounded to at most kMaxGroupValues entries (DoS guard).

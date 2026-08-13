@@ -1261,9 +1261,17 @@ The admin route emits two distinct 400 bodies — operators scripting the endpoi
 }
 ```
 
-The `username` parameter accepts either a strict local username OR a durable SSO principal (`is_valid_principal`, #1852) — in practice this means an **OIDC** principal (`oidc:<iss>#<sub>`), so an admin can force-log-out an SSO operator authenticated via OIDC today. Local usernames stay on the strict alphanumeric/`._-` charset; an SSO principal permits the `: # / . _ - @ ~ % |` alphabet a real IdP issuer URL and opaque subject need. NUL bytes, control characters, newlines, and shell/SQL metacharacters (`;`, `=`, `\`, quotes, backtick, space) are rejected in both cases — passing them through to the SQL bind would silently truncate/diverge from the audited target string (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
+The `username` parameter accepts either a strict local username OR a durable SSO principal (`is_valid_principal`, #1852) — an **OIDC** principal (`oidc:<iss>#<sub>`) or, since ADR-2001 PR4a, a **SAML** principal (`saml:<entity_id>#<NameID>`), so an admin can force-log-out an SSO operator authenticated via either protocol. Local usernames stay on the strict alphanumeric/`._-` charset; an SSO principal permits the `: # / . _ - @ ~ % |` alphabet a real IdP issuer URL and opaque subject need. NUL bytes, control characters, newlines, and shell/SQL metacharacters (`;`, `=`, `\`, quotes, backtick, space) are rejected in both cases — passing them through to the SQL bind would silently truncate/diverge from the audited target string (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
 
-**SAML is NOT force-loggable today.** A SAML session's `Session::username` is the raw IdP-supplied NameID (`create_saml_session` sets it verbatim, never a `saml:<idp>#<nameid>` shape) — a NameID is commonly an email address, and `@` fails `is_valid_principal` (it lacks the `saml:` reserved prefix that would unlock the wider SSO charset). A SAML operator's NameID therefore typically 400s against this endpoint, and there is no other revocation lever for a SAML session. This is a tracked gap, not an intentional restriction — see #1859/#1860.
+**SAML sessions are now force-loggable (ADR-2001 PR4a).** A SAML session's `Session::username` is the stable principal `saml:<entity_id>#<NameID>` (`saml_principal_id`, mirroring the OIDC shape exactly), not the raw NameID — `create_saml_session` mints it via the `saml:` reserved prefix, which `is_valid_principal` accepts on the same wider SSO charset as `oidc:`. An admin can therefore force-log-out a SAML operator with:
+
+```bash
+curl -s -X DELETE \
+  -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/sessions?username=saml%3Aentity-id%23NameID"
+```
+
+(URL-encode the `:` and `#`.) SAML sessions are also revoked automatically as part of SCIM deprovision — see "SCIM ↔ SAML identity linkage" in `docs/user-manual/scim-provisioning.md`, which covers the NameID-Format precondition for that automatic linkage. This closes the gap previously tracked as #1859/#1860.
 
 **Error (403) -- caller lacks `UserManagement:Write`:**
 
@@ -7659,6 +7667,8 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.group.updated` | `success` / `denied` / `failure` | `PUT`/`PATCH /scim/v2/Groups/{id}` succeeds / rejected `409` — rename onto an existing `displayName` / fails `500` |
 | `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed) |
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
+| `scim.user.deprovision_role_refused_with_link` | `failure` | ADR-2001 D1: a role-refused deprovision (`deprovision_role_ok` 404 — the slug's role is not `user`) for a slug with ≥1 active linked OIDC identity, whose tokens are therefore NOT auto-revoked. Always written alongside `yuzu_scim_deprovision_role_refused_with_active_link_total` — see `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
+| `auth.oidc.deprovisioned_denied` | `failure` | ADR-2001 §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the store could not answer — fail-closed). Emitted from `GET /auth/callback`, not a `/scim/v2/*` route — listed here because it is part of the same ADR-2001 linkage. `detail` carries `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource (deactivated, or orphaned by a hard-deleted `scim_resources` row) drove the denial, or `reason=scim_store_unavailable` when the store could not answer (fail-closed — no `scim_id` to name); and — only on the post-mint re-check path (a concurrent deprovision landed after the primary check) — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). The two `reason` values keep a genuine deprovision (CC6.8 evidence) distinguishable from a store outage. Pairs with `yuzu_auth_oidc_deprovisioned_denied_total`. |
 
 #### Metrics
 
@@ -7668,8 +7678,20 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 `yuzu_scim_role_change_failures_total` (a role change that was decided but
 failed to durably apply — pairs with `scim.user.role_changed` `failure`
 rows).
+
+**ADR-2001 (SCIM↔OIDC identity linkage, CC6.8):**
+`yuzu_scim_deprovision_role_refused_with_active_link_total` (D1 — a
+deprovision was refused for a slug with an active linked federated identity
+whose tokens were not auto-revoked; a human must terminate them manually),
+`yuzu_scim_deprovision_unlinked_total` (D2 — a deprovision found a
+login observation that should have matched the slug's `externalId` but no
+link had formed, almost always a misconfigured `--oidc-scim-link-claim`),
+and `yuzu_auth_oidc_deprovisioned_denied_total` (§4/PR3 — the deny-at-login
+backstop refused an OIDC re-login against a deprovisioned linked identity;
+see the audit action above and `docs/user-manual/metrics.md` "SSO login
+metrics").
 Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
-Metrics.
+Metrics and "SCIM ↔ OIDC identity linkage for deprovision" § New metrics.
 
 ---
 

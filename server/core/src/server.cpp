@@ -2089,6 +2089,87 @@ public:
                           "group-membership recompute - a sustained non-zero rate means role "
                           "changes are silently not taking effect",
                           "counter");
+        // ADR-2001 D1/D2 (governance Gate 7 BLOCKING fix, #3): describe()'d
+        // unconditionally here rather than left to lazily create at first
+        // increment (scim_routes.cpp) — a purely-lazy metric is absent from
+        // /metrics until the first incident, which is exactly the wrong
+        // moment for an alert rule to discover the series does not exist
+        // yet. Mirrors every other SCIM counter in this block.
+        metrics_.describe("yuzu_scim_deprovision_role_refused_with_active_link_total",
+                          "Total SCIM deprovisions refused (#2021's role-refusal fork) for a "
+                          "slug that has at least one active linked OIDC identity — the "
+                          "termination did NOT complete: the federated identity's tokens were "
+                          "NOT auto-revoked and a human must terminate them manually",
+                          "counter");
+        metrics_.describe("yuzu_scim_deprovision_unlinked_total",
+                          "ADR-2001 D2 tripwire: a deprovision resolved NO linked OIDC identity "
+                          "for a slug, but a recorded login-observation claim value matches that "
+                          "slug's externalId — the user DID authenticate via OIDC but the "
+                          "identity link never formed, almost certainly a misconfigured "
+                          "--oidc-scim-link-claim (a deprovision that revoked nothing for a "
+                          "federated user who exists)",
+                          "counter");
+        // ADR-2001 §2 (governance Gate 7 SHOULD fix, #6): a ScimStore outage
+        // during a login window previously only spdlog::warn'd on a failed
+        // upsert_link/record_login_observation, leaving un-linked
+        // identities invisible until the next login (or never, if the
+        // write keeps failing). Bumped by link_oidc_login_to_scim on either
+        // failure.
+        metrics_.describe("yuzu_scim_oidc_link_write_failures_total",
+                          "Total ADR-2001 identity-link/login-observation writes that failed "
+                          "during OIDC login (ScimStore outage) — the login itself always "
+                          "succeeds (fail-OPEN by design), but a sustained non-zero rate means "
+                          "identity links and/or D2 login observations are silently not being "
+                          "recorded",
+                          "counter");
+        // ADR-2001 PR4a — the SAML analogue of the OIDC counter immediately
+        // above. Bumped by link_saml_login_to_scim on an upsert_saml_link
+        // failure (saml_scim_link.cpp). Same fail-OPEN posture: the SAML
+        // login itself always succeeds; a sustained non-zero rate means
+        // SAML identities are silently not being linked, and therefore
+        // WON'T be revoked on a later deprovision (the exact CC6.8 gap
+        // ADR-2001 exists to close) — same recurring pre-seed lesson as the
+        // block below (a purely-lazy metric is absent from /metrics until
+        // the first incident, which is exactly the wrong moment for an
+        // alert rule to discover the series does not exist yet).
+        metrics_.describe("yuzu_scim_saml_link_write_failures_total",
+                          "Total ADR-2001 PR4a SAML identity-link writes that failed during "
+                          "SAML login (ScimStore outage) — the login itself always succeeds "
+                          "(fail-OPEN by design), but a sustained non-zero rate means SAML "
+                          "identities are silently not being linked and won't be revoked on "
+                          "deprovision",
+                          "counter");
+
+        // ADR-2001 §4 — deny-at-login backstop. Bumped by
+        // `oidc_login_denied_deprovisioned`'s two call sites in
+        // auth_routes.cpp's /auth/callback (the primary pre-mint check and
+        // the post-mint re-check for the codex-caught concurrent-deprovision
+        // race) on every DENY — a non-zero rate is the CC6.8 backstop
+        // actually firing, i.e. a deprovisioned federated identity attempted
+        // to re-authenticate. It also fires on the fail-closed
+        // `scim_store_unavailable` branch (the ScimStore couldn't be asked),
+        // so a non-zero rate is not proof of a real deprovision alone — see
+        // the metric description below and docs/user-manual/metrics.md.
+        metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_total",
+                          "Total OIDC logins denied at /auth/callback because the identity's "
+                          "linked SCIM resource is deprovisioned (deactivated, or orphaned by a "
+                          "hard-deleted scim_resources row) OR because the ScimStore could not "
+                          "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
+                          "closing the re-login-mints-fresh-tokens window; correlate with the "
+                          "audit reason= field to distinguish a real deprovision from a store "
+                          "outage",
+                          "counter");
+        // describe() only registers HELP/TYPE metadata; the series is absent
+        // from /metrics until first .increment(). Instantiate each bare
+        // counter at 0 now so absent()-style alert rules on the CC6.8
+        // tripwires stay meaningful from boot (Gate 8 re-review fix; mirrors
+        // the NVD/quota/access-review pre-seed precedent above and
+        // docs/observability-conventions.md).
+        metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
+        metrics_.counter("yuzu_scim_deprovision_unlinked_total");
+        metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
+        metrics_.counter("yuzu_scim_saml_link_write_failures_total");
+        metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -2661,6 +2742,7 @@ public:
             oidc_cfg.redirect_uri = cfg_.oidc_redirect_uri;
             oidc_cfg.admin_group_id = cfg_.oidc_admin_group;
             oidc_cfg.skip_tls_verify = cfg_.oidc_skip_tls_verify;
+            oidc_cfg.scim_link_claim = cfg_.oidc_scim_link_claim;
             if (cfg_.oidc_skip_tls_verify)
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
@@ -3153,9 +3235,23 @@ public:
         if (pg_pool_ && !startup_failed_) {
             scim_store_ = std::make_unique<ScimStore>(*pg_pool_);
             if (!scim_store_->is_open()) {
-                spdlog::error("[PG] Refusing to start: SCIM store migration/open failed "
-                              "(database reachable but the scim_store schema could not be "
-                              "created/opened)");
+                // Governance Gate 7 SHOULD fix (#7): name the likely cause —
+                // migration v3's partial-unique index on external_id
+                // (scim_resources_external_id_uniq) fails to CREATE, and so
+                // the whole migration (and this store's boot) fails closed,
+                // when a pre-existing deployment already has a duplicate
+                // non-empty external_id across two scim_resources rows.
+                // `docs/user-manual/*` (docs-writer's ADR-2001 runbook)
+                // documents the operator remediation for the diagnostic
+                // query below.
+                spdlog::error(
+                    "[PG] Refusing to start: SCIM store migration/open failed (database "
+                    "reachable but the scim_store schema could not be created/opened). Most "
+                    "likely cause: migration v3's partial-unique index on scim_resources."
+                    "external_id rejected a PRE-EXISTING DUPLICATE non-empty external_id "
+                    "across two rows. Diagnose with: SELECT external_id, COUNT(*) FROM "
+                    "scim_store.scim_resources WHERE external_id IS NOT NULL GROUP BY "
+                    "external_id HAVING COUNT(*) > 1;");
                 startup_failed_ = true;
             }
         }
@@ -4661,12 +4757,39 @@ public:
             }
         }
 
-        // Phase 7: Deployment Jobs (Issue 7.7)
-        {
-            auto deploy_db = cfg_.db_dir() / "deployment-jobs.db";
-            deployment_store_ = std::make_unique<DeploymentStore>(deploy_db);
-            if (deployment_store_ && deployment_store_->is_open()) {
-                spdlog::info("DeploymentStore initialized at {}", deploy_db.string());
+        // Phase 7: Deployment Jobs (Issue 7.7). Migrated Postgres store
+        // (ADR-0006/ADR-0043, schema `deployment_store`) — construction
+        // fail-CLOSED per ADR-0012 §1 (same template as ResultSetStore
+        // above): a reachable database whose schema can't migrate/open is a
+        // fatal startup error, never a serve-degraded state.
+        // `migrate_from_sqlite` runs the one-time, idempotent legacy-
+        // `deployment-jobs.db` backfill (ADR-0009) — AUTHORITATIVE posture
+        // means a backfill failure is ALSO fatal (never serve on top of a
+        // partially-migrated schema). NOT `DeploymentRunStore` (the `/auto`
+        // Deploy stage's own, unrelated PG store) — see deployment_store.hpp's
+        // file header for the naming trap.
+        if (pg_pool_ && !startup_failed_) {
+            deployment_store_ = std::make_unique<DeploymentStore>(*pg_pool_);
+            if (!deployment_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: deployment store migration/open failed "
+                              "(database reachable but the deployment_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                auto deploy_db = cfg_.db_dir() / "deployment-jobs.db";
+                if (!deployment_store_->migrate_from_sqlite(deploy_db)) {
+                    spdlog::error("[PG] Refusing to start: deployment-jobs legacy-SQLite "
+                                  "backfill failed (see prior log lines) — deployment_store is "
+                                  "authoritative and must not serve partially-migrated data. "
+                                  "Operator remediation: repair {} or move it aside to skip the "
+                                  "backfill (jobs in it will NOT carry over)",
+                                  deploy_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("DeploymentStore initialized (schema deployment_store; legacy "
+                                 "backfill source {})",
+                                 deploy_db.string());
+                }
             }
         }
 
@@ -5106,6 +5229,16 @@ public:
         // checked here) makes AuthRoutes::synthesize_token_session fail closed
         // for every engine-kind token rather than dereference a dangling store.
         auth_routes_->set_engine_principal_store(engine_principal_store_.get());
+        // ADR-2001 §2/D2 — link formation + login observation at the OIDC
+        // login site are fail-OPEN by design, so a null scim_store_ (no PG
+        // configured) is a safe no-op rather than a login-time failure.
+        // Gated on cfg_.scim_enable (mirrors the /readyz scim_store exemption
+        // above) — Postgres is the mandatory substrate so scim_store_ is
+        // non-null on every deployment, and without this gate a server
+        // running OIDC SSO with SCIM disabled would deny every OIDC login
+        // during a transient Postgres blip (store-unavailable reads as
+        // fail-closed deny-at-login) even though the feature is off.
+        auth_routes_->set_scim_store(cfg_.scim_enable ? scim_store_.get() : nullptr);
 
         start_web_server();
 
@@ -9415,6 +9548,11 @@ private:
             // this store never joins the readyz-vs-healthz drift class the rows
             // above were added to fix.
             bool discovery_ok = discovery_store_ && discovery_store_->is_open();
+            // DeploymentStore (ADR-0043, gov sre finding, hardening
+            // round) — parity with every other migrated authoritative store's
+            // readyz/healthz wiring; construction is already fail-closed, this
+            // is belt-and-braces against a runtime is_open() flip.
+            bool deployment_ok = deployment_store_ && deployment_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -9422,7 +9560,8 @@ private:
                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok;
+                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
+                deployment_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -9449,7 +9588,8 @@ private:
                   {"rbac_store", rbac_ok ? "ok" : "error"},
                   {"result_set_store", result_set_ok ? "ok" : "error"},
                   {"management_group_store", mgmt_group_ok ? "ok" : "error"},
-                  {"discovery_store", discovery_ok ? "ok" : "error"}}},
+                  {"discovery_store", discovery_ok ? "ok" : "error"},
+                  {"deployment_store", deployment_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -9670,6 +9810,13 @@ private:
                 // (startup_failed_) per ADR-0012 §1, but the readyz entry stays
                 // as belt-and-braces against a runtime is_open() flip.
                 {"result_set_store", result_set_store_ && result_set_store_->is_open()},
+                // Migrated Postgres store (ADR-0043, gov sre finding, hardening
+                // round). Load-bearing for all 4 /api/deployment-jobs routes;
+                // construction is already fail-closed (startup_failed_), but the
+                // readyz entry stays for parity with every OTHER migrated
+                // authoritative store on this ladder (all of which are wired in
+                // here) as belt-and-braces against a runtime is_open() flip.
+                {"deployment_store", deployment_store_ && deployment_store_->is_open()},
                 // PKI PR2: ca.db is load-bearing only when the install is on
                 // built-in default certs (PR3+ make it load-bearing for mTLS
                 // issuance/revocation). When the operator brought their own certs
@@ -10389,6 +10536,16 @@ private:
         }
         if (directory_sync_) {
             settings_routes_->set_access_review_directory_sync(directory_sync_.get());
+        }
+        // ADR-2001 §§1,3: the dashboard user DELETE deprovision seam
+        // resolves the SCIM slug -> linked-OIDC principal set through
+        // scim_store_ (born-on-PG, constructed unconditionally in the ctor
+        // above alongside api_token_store_) before revoking credentials.
+        // Nullable/deferred-wiring, same posture as the setters above — a
+        // null store degrades the resolver to the slug-only set rather than
+        // failing closed (see deprovision_revoke.hpp's doc comment).
+        if (scim_store_) {
+            settings_routes_->set_scim_store(scim_store_.get());
         }
         settings_routes_->register_routes(
             *web_server_,
@@ -15881,9 +16038,22 @@ private:
                 startup_failed_ = true;
             }
             scim_routes_ = std::make_unique<ScimRoutes>();
+            // ADR-2001 §3: token_store threads ApiTokenStore into the
+            // deprovision seams so PATCH/PUT active:false, DELETE, and
+            // create-with-active:false revoke API tokens credentials-FIRST
+            // across the resolved slug + linked-OIDC principal set.
+            // ADR-2001 D1: analytics_store is the codebase's actual
+            // severity channel (AnalyticsEvent::severity via
+            // AnalyticsEventStore, the same mechanism AuthRoutes::
+            // emit_event uses) — threaded so the role-refused-with-link
+            // signal can be raised at Severity::kCritical; AuditEvent
+            // itself carries no severity field. Nullable/deferred like the
+            // other optional stores above — analytics_store_ may be null
+            // when --analytics-db is unset.
             scim_routes_->register_routes(*web_server_, scim_store_.get(), &auth_mgr_,
                                           audit_store_.get(), cfg_.scim_admin_group,
-                                          engine_principal_store_.get());
+                                          engine_principal_store_.get(),
+                                          api_token_store_.get(), analytics_store_.get());
         }
 
         // M/H3 follow-up (2026-07-10 review): a SCIM boot failure above set
@@ -17169,7 +17339,9 @@ private:
     std::unique_ptr<DirectorySync> directory_sync_;
     std::unique_ptr<PatchManager> patch_manager_;
 
-    // Phase 7: Deployment Jobs (Issue 7.7) & Discovery (Issue 7.18)
+    // Phase 7: Deployment Jobs (Issue 7.7) & Discovery (Issue 7.18).
+    // DeploymentStore is now Postgres (ADR-0043) — declared after pg_pool_
+    // (above) so it destructs before the pool; Discovery stays SQLite.
     std::unique_ptr<DeploymentStore> deployment_store_;
     std::unique_ptr<DiscoveryStore> discovery_store_;
 

@@ -1110,10 +1110,14 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
     // ── 14. Extract NameID (all reads from the verified 'assertion' node) ─────
     // subject is guaranteed non-null at this point (mandatory check above).
     std::string name_id;
+    std::string name_id_format; // ADR-2001 PR4a — see SamlAssertion::name_id_format
     {
         const xmlNodePtr name_id_node =
             find_child_ns(subject, "NameID", kSamlAssertionNs);
-        if (name_id_node) name_id = get_text(name_id_node);
+        if (name_id_node) {
+            name_id = get_text(name_id_node);
+            name_id_format = get_attr(name_id_node, "Format");
+        }
     }
     if (name_id.empty()) {
         return std::unexpected("no NameID found in verified assertion");
@@ -1129,7 +1133,8 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
 
     spdlog::info("SamlProvider: assertion accepted (name_id={}, groups={})", name_id,
                  groups.size());
-    return SamlAssertion{std::move(name_id), std::move(groups), group_cap_truncated};
+    return SamlAssertion{std::move(name_id), std::move(name_id_format), std::move(groups),
+                         group_cap_truncated};
 }
 
 // ── cleanup ───────────────────────────────────────────────────────────────────
