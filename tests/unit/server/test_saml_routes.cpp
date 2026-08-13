@@ -16,6 +16,7 @@
  */
 
 #include "auth_routes.hpp"
+#include "saml_principal.hpp"
 #include "saml_provider.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
@@ -618,6 +619,16 @@ static std::string extract_authn_request_id(const std::string& url) {
 static std::string run_saml_acs_flow(SamlRoutesFixture& fix, const SamlTestFixture& f,
                                      const std::string& name_id,
                                      const std::vector<std::string>& groups) {
+    // ADR-2001 PR4a — the ACS handler reads cfg_.saml_idp_entity_id (a
+    // SEPARATE field from the SamlProvider's own SamlConfig::idp_entity_id,
+    // which `f.make_config()` sets) to build the stable SAML principal and
+    // gate its sanitation; production wires the same value into both (see
+    // server.cpp's saml_cfg.idp_entity_id = cfg_.saml_idp_entity_id), so
+    // tests must keep them in sync here too — an unset cfg.saml_idp_entity_id
+    // (empty by default) would fail the sanitation gate and every login below
+    // would 302 to /login?error=saml instead of minting a session.
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id;
+
     auto start_res = fix.sink.Get("/auth/saml/start");
     if (!start_res || start_res->status != 302) return {};
     const auto redirect_location = start_res->get_header_value("Location");
@@ -952,6 +963,9 @@ TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_sour
 
     // provider must outlive fix (SamlRoutesFixture holds a non-owning pointer).
     SamlRoutesFixture fix(&provider);
+    // ADR-2001 PR4a — see run_saml_acs_flow's comment: keep in sync with
+    // the SamlProvider's own idp_entity_id (f.make_config() above).
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id;
 
     // ── Step 1: GET /auth/saml/start to register a solicited request ID ──────
     // validate_response rejects unsolicited responses: InResponseTo must match
@@ -1067,7 +1081,11 @@ TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_sour
     const auto& sess = maybe_session.value();
     CHECK(sess.auth_source == "saml");
     CHECK(sess.role == auth::Role::user);
-    CHECK(sess.username == name_id);
+    // ADR-2001 PR4a — the session's stable authorization principal is
+    // saml:<entity_id>#<name_id>, NOT the raw NameID; display_name stays
+    // the raw NameID for human-readable rendering.
+    CHECK(sess.username == saml::saml_principal_id(f.idp_entity_id, name_id));
+    CHECK(sess.display_name == name_id);
 
     // ── Step 8: Verify the audit record ───────────────────────────────────────
     // audit_log_for_principal is called on success with action="auth.saml_login"
@@ -1101,6 +1119,7 @@ TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an a
 
     SamlRoutesFixture fix(&provider);
     fix.cfg.saml_admin_group = "admins";
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     auto start_res = fix.sink.Get("/auth/saml/start");
     REQUIRE(start_res != nullptr);
@@ -1165,7 +1184,10 @@ TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an a
     auto maybe_session = fix.auth_mgr.validate_session(session_token);
     REQUIRE(maybe_session.has_value());
     CHECK(maybe_session->role == auth::Role::admin);
-    CHECK(maybe_session->username == name_id);
+    // ADR-2001 PR4a — stable principal, not the raw NameID (see the first
+    // success-path test's comment above for the full rationale).
+    CHECK(maybe_session->username == saml::saml_principal_id(f.idp_entity_id, name_id));
+    CHECK(maybe_session->display_name == name_id);
 
     // Audit must reflect the RESOLVED admin role, not a hard-coded "user".
     const auto events = fix.audit_events();
@@ -1195,6 +1217,7 @@ TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint 
 
     SamlRoutesFixture fix(&provider);
     fix.cfg.saml_admin_group = "admins";
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     auto start_res = fix.sink.Get("/auth/saml/start");
     REQUIRE(start_res != nullptr);
@@ -1261,7 +1284,9 @@ TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint 
     auto maybe_session = fix.auth_mgr.validate_session(session_token);
     REQUIRE(maybe_session.has_value());
     CHECK(maybe_session->role == auth::Role::user);
-    CHECK(maybe_session->username == name_id);
+    // ADR-2001 PR4a — stable principal, not the raw NameID.
+    CHECK(maybe_session->username == saml::saml_principal_id(f.idp_entity_id, name_id));
+    CHECK(maybe_session->display_name == name_id);
 
     const auto events = fix.audit_events();
     REQUIRE_FALSE(events.empty());
@@ -1441,6 +1466,7 @@ TEST_CASE("SAML ACS — assertion with no AttributeStatement mints a user sessio
 
     SamlRoutesFixture fix(&provider);
     fix.cfg.saml_admin_group = "admins";
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     auto start_res = fix.sink.Get("/auth/saml/start");
     REQUIRE(start_res != nullptr);
@@ -1528,6 +1554,7 @@ TEST_CASE("SAML ACS — unsafe RelayState values fall back to /",
     SamlProvider provider(std::move(saml_cfg));
     REQUIRE(provider.is_enabled());
     SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     // Each unsafe relay state: {description, url-encoded form value}.
     // The form body is application/x-www-form-urlencoded; extract_form_value
@@ -1724,6 +1751,7 @@ TEST_CASE("SAML ACS — shadow-prefix cookie does not shadow real binding cookie
     SamlProvider provider(std::move(saml_cfg));
     REQUIRE(provider.is_enabled());
     SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     // Register a solicited request.
     auto start_res = fix.sink.Get("/auth/saml/start");
@@ -1791,6 +1819,7 @@ TEST_CASE("SAML ACS — RelayState with path traversal (..) falls back to / (H-D
     SamlProvider provider(std::move(saml_cfg));
     REQUIRE(provider.is_enabled());
     SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     // Cases: {description, url-encoded RelayState value for the form body}
     // url_decode runs inside extract_form_value before is_safe_relay_state.
@@ -1851,6 +1880,7 @@ TEST_CASE("SAML ACS — valid RelayState /dashboard is accepted (H-D)",
     SamlProvider provider(std::move(saml_cfg));
     REQUIRE(provider.is_enabled());
     SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     auto start = fix.sink.Get("/auth/saml/start");
     REQUIRE(start != nullptr);

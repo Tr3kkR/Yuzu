@@ -131,6 +131,23 @@ const std::vector<pg::PgMigration>& migrations() {
          // code path needed: the index creation IS the detector.
          "CREATE UNIQUE INDEX scim_resources_external_id_uniq ON scim_resources (external_id) "
          "WHERE external_id IS NOT NULL;"},
+        // v4 (ADR-2001 PR4a): saml_identity_links — the SAML analogue of
+        // v3's identity_links, durably recording the (entity_id, name_id)
+        // SAML identity that a successful SAML login resolved to a SCIM
+        // resource. Deliberately a SEPARATE table (never a generalization
+        // of identity_links) — keeps this PR off PR3's scim_store schema
+        // surface. UNIQUE (entity_id, name_id): one link per SAML identity.
+        // Secondary index on scim_id: deprovision looks up BY scim_id,
+        // which the (entity_id, name_id) key does not serve — same
+        // rationale as identity_links_scim_id_idx above.
+        {4,
+         "CREATE TABLE saml_identity_links ("
+         "  entity_id  TEXT NOT NULL,"
+         "  name_id    TEXT NOT NULL,"
+         "  scim_id    TEXT NOT NULL,"
+         "  linked_at  BIGINT NOT NULL,"
+         "  UNIQUE (entity_id, name_id));"
+         "CREATE INDEX saml_identity_links_scim_id_idx ON saml_identity_links (scim_id);"},
     };
     return kMigrations;
 }
@@ -925,6 +942,56 @@ ScimStore::links_for_scim_id(const std::string& scim_id) const {
     results.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
         results.push_back(LinkedIdentity{.iss = col(res.get(), i, 0), .sub = col(res.get(), i, 1)});
+    return results;
+}
+
+// ── SAML identity linkage (ADR-2001 PR4a) ───────────────────────────────
+
+bool ScimStore::upsert_saml_link(const std::string& entity_id, const std::string& name_id,
+                                 const std::string& scim_id) {
+    if (!open_ || entity_id.empty() || name_id.empty() || scim_id.empty())
+        return false;
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO scim_store.saml_identity_links (entity_id, name_id, scim_id, linked_at) "
+        "VALUES ($1, $2, $3, extract(epoch FROM now())::bigint) "
+        "ON CONFLICT (entity_id, name_id) DO UPDATE "
+        "SET scim_id = EXCLUDED.scim_id, linked_at = EXCLUDED.linked_at",
+        std::vector<std::string>{entity_id, name_id, scim_id});
+    return res.status() == PGRES_COMMAND_OK;
+}
+
+std::optional<std::vector<SamlLinkedIdentity>>
+ScimStore::saml_links_for_scim_id(const std::string& scim_id) const {
+    if (!open_)
+        return std::nullopt; // store unusable — never "no linked identities"
+    if (scim_id.empty())
+        return std::vector<SamlLinkedIdentity>{}; // no scim_id asked for → genuinely nothing
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT entity_id, name_id FROM scim_store.saml_identity_links WHERE scim_id = $1 "
+        "ORDER BY entity_id ASC, name_id ASC",
+        std::vector<std::string>{scim_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt;
+
+    const int rows = PQntuples(res.get());
+    std::vector<SamlLinkedIdentity> results;
+    results.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        results.push_back(
+            SamlLinkedIdentity{.entity_id = col(res.get(), i, 0), .name_id = col(res.get(), i, 1)});
+    }
     return results;
 }
 

@@ -22,6 +22,8 @@
 #include "oidc_scim_link.hpp" // link_oidc_login_to_scim — ADR-2001 §2/D2 login-site orchestration
 #include "principal_class.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — the unified A4 denial wrapper (#1470)
+#include "saml_principal.hpp"  // saml_principal_id / is_valid_saml_component — ADR-2001 PR4a
+#include "saml_scim_link.hpp"  // link_saml_login_to_scim — ADR-2001 PR4a login-site orchestration
 
 #include <ctime>
 
@@ -2865,6 +2867,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // clean redirect-to-login as an ordinary validation failure rather than
         // an uncaught exception surfacing as a non-A4 500.
         std::string saml_name_id;
+        std::string saml_principal; // ADR-2001 PR4a stable principal — saml::saml_principal_id
         std::string session_token;
         // cons-NICE: mirror the OIDC call site's provider-presence ternary
         // (defense-in-depth — saml_provider_ is always non-null on this
@@ -2873,6 +2876,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // outside the try block so the post-login audit row (comp-S1 / UP-5,
         // below) can also reference it.
         auto saml_admin_gid = saml_provider_ ? cfg_.saml_admin_group : std::string{};
+        // ADR-2001 PR4a — the operator-configured, boot-validated IdP
+        // entityID (already verified by validate_response below to equal
+        // the assertion's signed <saml:Issuer>). This is the single-IdP
+        // precondition the SAML principal/link design relies on.
+        const std::string& saml_entity_id = cfg_.saml_idp_entity_id;
         try {
             auto result = saml_provider_->validate_response(saml_response_b64, binding_cookie);
             if (!result) {
@@ -2905,8 +2913,45 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 res.set_redirect("/login?error=saml");
                 return;
             }
-            session_token = auth_mgr_.create_saml_session(saml_name_id, result.value().groups,
-                                                           saml_admin_gid);
+
+            // ADR-2001 PR4a — sanitise both NameID and entity_id BEFORE
+            // either enters the stable principal (the durable RBAC/session
+            // key) or the saml_identity_links store, mirroring
+            // OidcProvider::validate_claims' sub/oid rule exactly. A
+            // malformed value fails the login outright (fail-closed) rather
+            // than being sanitised-and-continued — same posture OIDC takes
+            // for the same class of durable-join-key input.
+            if (!saml::is_valid_saml_component(saml_name_id) ||
+                !saml::is_valid_saml_component(saml_entity_id)) {
+                spdlog::warn("SAML login rejected: NameID or entity_id failed sanitation");
+                audit_log(req, "auth.saml_login_failed", "error", {}, {},
+                          "NameID or entity_id failed sanitation");
+                emit_event("auth.saml_login_failed", req,
+                           {{"source_ip", req.remote_addr},
+                            {"error", "NameID or entity_id failed sanitation"}},
+                           {}, Severity::kWarn);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}})
+                        .increment();
+                }
+                res.set_header("Set-Cookie", kBindCookieClear);
+                res.set_redirect("/login?error=saml");
+                return;
+            }
+
+            saml_principal = saml::saml_principal_id(saml_entity_id, saml_name_id);
+
+            // ADR-2001 PR4a — form a durable SCIM<->SAML identity link when
+            // the NameID Format is stable (see saml_scim_link.hpp), BEFORE
+            // minting the session. Fail-OPEN: never fails this login. No
+            // AuthManager::mu_ is held across this ScimStore call (mint
+            // happens next, after this returns).
+            saml::link_saml_login_to_scim(scim_store_, saml_entity_id, saml_name_id,
+                                          result.value().name_id_format,
+                                          auth_mgr_.metrics_registry());
+
+            session_token = auth_mgr_.create_saml_session(saml_name_id, saml_entity_id,
+                                                           result.value().groups, saml_admin_gid);
 
             // #1828.3: the verifier flags (rather than logs or increments
             // directly — it has no metrics handle) when the assertion's
@@ -2955,15 +3000,24 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // against the single configured saml_admin_gid, so there is exactly
         // one candidate group to log — no ambiguity about which of possibly
         // several assertion groups triggered the promotion.
-        auto saml_audit_detail = (saml_effective_role == auth::role_to_string(auth::Role::admin))
-                                     ? "auth_source=saml;admin_group=" + saml_admin_gid
-                                     : std::string{"auth_source=saml"};
-        audit_log_for_principal(req, "auth.saml_login", "ok", saml_name_id, saml_effective_role,
-                                "User", saml_name_id, saml_audit_detail);
+        // ADR-2001 PR4a — mirror the OIDC audit pattern exactly (auth.oidc_
+        // login above): the STABLE `saml_principal` is the audit KEY
+        // (never sanitized — it is not a detail value), the raw NameID is
+        // carried in `detail` via sanitize_detail_value (a control/newline
+        // byte there is an audit-log injection/readability hazard, same
+        // rationale as OIDC's display/email handling).
+        auto saml_audit_detail =
+            std::string("auth_source=saml;name_id=") + detail::sanitize_detail_value(saml_name_id);
+        if (saml_effective_role == auth::role_to_string(auth::Role::admin)) {
+            saml_audit_detail += ";admin_group=" + saml_admin_gid;
+        }
+        audit_log_for_principal(req, "auth.saml_login", "ok", saml_principal, saml_effective_role,
+                                "User", saml_principal, saml_audit_detail);
         emit_event("auth.saml_login", req,
                    {{"source_ip", req.remote_addr},
-                    {"username", saml_name_id},
-                    {"auth_method", "saml"}});
+                    {"username", saml_principal},
+                    {"auth_method", "saml"},
+                    {"name_id", detail::sanitize_detail_value(saml_name_id)}});
         if (auto* m = auth_mgr_.metrics_registry()) {
             // #1828.1: role label lets a SIEM/Grafana query distinguish admin
             // vs user SSO logins without joining against the audit store —

@@ -81,6 +81,17 @@ struct LinkedIdentity {
     std::string sub;
 };
 
+/// One SAML NameID identity linked to a SCIM resource (ADR-2001 PR4a,
+/// `saml_identity_links` table — the SAML analogue of `LinkedIdentity`
+/// above). Deliberately a SEPARATE table/struct rather than a generalized
+/// `identity_links`, so this stays off the OIDC linkage surface (PR3). The
+/// owning `scim_id` is the query input for `saml_links_for_scim_id` and is
+/// deliberately not repeated on this struct.
+struct SamlLinkedIdentity {
+    std::string entity_id;
+    std::string name_id;
+};
+
 /// A single SCIM Group resource (slice 2, #2021): the IdP-facing group `id`/
 /// `externalId`/`displayName` — membership itself lives in the separate
 /// `scim_group_members` join table, not on this struct.
@@ -335,6 +346,37 @@ public:
     /// genuinely has no linked OIDC identity yet.
     std::optional<std::vector<LinkedIdentity>>
     links_for_scim_id(const std::string& scim_id) const;
+
+    // ── SAML identity linkage (ADR-2001 PR4a) ────────────────────────────
+    //
+    // `saml_identity_links` durably records the (entity_id, name_id) SAML
+    // identity that a successful SAML login resolved to a SCIM resource
+    // (`saml_scim_link.cpp`'s login-site orchestration). A SEPARATE table
+    // from `identity_links` (OIDC) — keeps this PR off PR3's scim_store
+    // schema surface. No route/orchestration logic here — this store owns
+    // the table only (INV-31-3, one owning store).
+
+    /// Idempotent upsert keyed `(entity_id, name_id)` (the table's UNIQUE
+    /// constraint — one link per SAML identity). Re-linking the same
+    /// `(entity_id, name_id)` updates `scim_id` and bumps `linked_at` to
+    /// now. Returns false on CSPRNG/db failure or an empty
+    /// `entity_id`/`name_id`/`scim_id`. Mirrors `upsert_link`'s fail-OPEN
+    /// contract from the login path's point of view — the CALLER
+    /// (`saml_scim_link.cpp`) must not fail a login because this returned
+    /// false.
+    bool upsert_saml_link(const std::string& entity_id, const std::string& name_id,
+                          const std::string& scim_id);
+
+    /// Every SAML identity currently linked to `scim_id` — the deprovision
+    /// seam's lookup direction, mirroring `links_for_scim_id` exactly.
+    /// `nullopt` when the store could not answer: a deprovision path
+    /// folding this into "nothing to revoke" on a transient blip is exactly
+    /// the CC6.8 gap ADR-2001 exists to close, so callers MUST fail closed
+    /// on `nullopt` rather than treat it as "no linked identities". An
+    /// engaged-but-empty vector means the scim_id genuinely has no linked
+    /// SAML identity yet.
+    std::optional<std::vector<SamlLinkedIdentity>>
+    saml_links_for_scim_id(const std::string& scim_id) const;
 
     // ── OIDC login observations (ADR-2001 D2 detector) ───────────────────
     //

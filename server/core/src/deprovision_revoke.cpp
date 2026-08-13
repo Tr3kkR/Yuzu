@@ -2,6 +2,7 @@
 
 #include "api_token_store.hpp"
 #include "oidc_principal.hpp"
+#include "saml_principal.hpp"
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/scim_store.hpp>
@@ -17,11 +18,19 @@ resolve_deprovision_principals(ScimStore& scim_store, const std::string& scim_id
     if (!links.has_value())
         return std::nullopt; // fail closed — the store could not answer
 
+    // ADR-2001 PR4a — SAML second pass, mirroring the OIDC pass immediately
+    // above exactly (same fail-closed contract on its own nullopt).
+    auto saml_links = scim_store.saml_links_for_scim_id(scim_id);
+    if (!saml_links.has_value())
+        return std::nullopt; // fail closed — the store could not answer
+
     std::vector<std::string> principals;
-    principals.reserve(1 + links->size());
+    principals.reserve(1 + links->size() + saml_links->size());
     principals.push_back(slug_username);
     for (const auto& linked : *links)
         principals.push_back(oidc::oidc_principal_id(linked.iss, linked.sub));
+    for (const auto& linked : *saml_links)
+        principals.push_back(saml::saml_principal_id(linked.entity_id, linked.name_id));
     return principals;
 }
 

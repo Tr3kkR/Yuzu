@@ -409,6 +409,7 @@ yuzu_server_core_lib = static_library(
     'src/oidc_provider.cpp',
     'src/oidc_scim_link.cpp',
     'src/saml_provider.cpp',
+    'src/saml_scim_link.cpp',
     'src/error_codes.cpp',
     'src/result_envelope.cpp',
     'src/concurrency_manager.cpp',
