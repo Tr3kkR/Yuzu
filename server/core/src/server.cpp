@@ -17340,8 +17340,9 @@ private:
     std::unique_ptr<PatchManager> patch_manager_;
 
     // Phase 7: Deployment Jobs (Issue 7.7) & Discovery (Issue 7.18).
-    // DeploymentStore is now Postgres (ADR-0043) — declared after pg_pool_
-    // (above) so it destructs before the pool; Discovery stays SQLite.
+    // Both are now Postgres (DeploymentStore: ADR-0043, DiscoveryStore:
+    // ADR-0044) — both borrow pg_pool_ and are declared after it (above)
+    // so they destruct before the pool does.
     std::unique_ptr<DeploymentStore> deployment_store_;
     std::unique_ptr<DiscoveryStore> discovery_store_;
 

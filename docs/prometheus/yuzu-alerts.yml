@@ -2238,7 +2238,7 @@ groups:
           runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
       - alert: YuzuDiscoveryReadDegraded
         # A discovery_store list_devices read degraded and the caller failed
-        # closed (503, per ADR-0043 §Reads), never a silently-empty device
+        # closed (503, per ADR-0044 §Reads), never a silently-empty device
         # list. /readyz stays green under pure pool saturation, so this
         # store-specific counter is the only signal — same class as
         # YuzuMgmtGroupReadDegraded / YuzuInventoryReadDegraded above.
@@ -2258,11 +2258,11 @@ groups:
             failed to open at boot (should not be reachable post-boot given
             fail-closed construction — investigate as a possible regression if
             seen). Do not read a 503 window as "no devices discovered".
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0043"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0044"
       - alert: YuzuDiscoveryBackfillFailing
         # Mirrors YuzuAuditBackfillFailing's shape, NOT YuzuMgmtGroupBackfillFailing's
         # (sre Gate 6 finding): the one-time legacy discovery.db -> discovery_store
-        # backfill (ADR-0043) runs during server CONSTRUCTION, and a failure sets
+        # backfill (ADR-0044) runs during server CONSTRUCTION, and a failure sets
         # startup_failed_ so run() returns before the HTTP listener starts —
         # /metrics is never served and a result="failed" sample is never scraped.
         # An expression keyed on result="failed" (the mgmt-group shape) can
@@ -2298,7 +2298,7 @@ groups:
           summary: "No server is reporting a completed discovery-store backfill (possible boot refusal)"
           description: >-
             No scraped Yuzu server has reported a successful one-time legacy
-            discovery.db -> PostgreSQL discovery_store backfill (ADR-0043) in
+            discovery.db -> PostgreSQL discovery_store backfill (ADR-0044) in
             the last 15 minutes. After an upgrade the usual cause is a server
             that FAILED the backfill: it fails CLOSED, refuses to serve, and
             retries on the next start — a restart loop with no
@@ -2307,7 +2307,7 @@ groups:
             legacy file / managed-agent_id reconciliation conflict) — it carries
             the remediation. See the runbook for what each reason means and how
             to resolve it.
-          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0043"
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0044"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which
