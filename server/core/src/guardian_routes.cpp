@@ -10,6 +10,7 @@
 #include "guardian_form_render.hpp"
 #include "guardian_push_builder.hpp"  // guardian_enforced_on_platform / platform_display_name / os_target_matches
 #include "guardian_rule_spec.hpp"
+#include "rest_a4_envelope.hpp"
 #include "secure_random.hpp"
 #include "store_errors.hpp"
 #include "web_utils.hpp"
@@ -272,6 +273,23 @@ rollup_by_rule(const std::vector<yuzu::server::GuardianAgentRuleStatus>& rows,
 }
 
 } // namespace
+
+bool GuardianRoutes::deny_service_scoped_(const httplib::Request& req,
+                                          httplib::Response& res) const {
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return true; // auth_fn_ already wrote 401/redirect; caller returns.
+    if (session->token_scope_service.empty())
+        return false;
+    const auto cid = detail::make_correlation_id();
+    res.status = 403;
+    res.set_content(
+        detail::error_json_a4(
+            403, "service-scoped tokens may not read this fleet-wide Guardian view", cid,
+            detail::A4ErrorOpts{.permission = "GuaranteedState:Read"}),
+        "application/json");
+    return true;
+}
 
 // ── Fragment renderers ───────────────────────────────────────────────────────
 
@@ -2150,8 +2168,17 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // fragment return 403.
 
     // -- Status rollup (view = fleet|guard|agent|mgroup|baseline) ----------
+    // deny_service_scoped_ runs BEFORE perm_fn_ (independent of RBAC on/off
+    // branch ordering inside require_permission — see its doc comment):
+    // require_permission's service-token branch checks only the ITServiceOwner
+    // ROLE, never the token's own service-tag scope, so perm_fn_ alone would
+    // let a token scoped to one service read this fleet-wide view. Blanket
+    // deny (not a per-agent scope, mirrors the fleet /guaranteed-state/events
+    // REST deny) since these fragments have no single agent_id to confine a
+    // per-target check against.
     sink.Get("/fragments/guardian/status",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 const std::string view = req.has_param("view") ? req.get_param_value("view") : "fleet";
                 res.set_content(render_status_fragment(view), "text/html; charset=utf-8");
@@ -2160,14 +2187,17 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // -- Guards list (optional ?status= filter) ----------------------------
     sink.Get("/fragments/guardian/guards",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 const std::string sf = req.has_param("status") ? req.get_param_value("status") : "";
                 res.set_content(render_guards_fragment(sf), "text/html; charset=utf-8");
             });
 
-    // -- Event timeline (optional ?type= / ?severity= filters) -------------
+    // -- Event timeline (optional ?type= / ?severity= filters) — fleet-wide,
+    // full agent_id per row (SEC-2): same blanket deny as /status above.
     sink.Get("/fragments/guardian/events",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 const std::string tf = req.has_param("type") ? req.get_param_value("type") : "";
                 const std::string sf = req.has_param("severity") ? req.get_param_value("severity") : "";
@@ -2175,23 +2205,41 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
             });
 
     // -- Per-guard detail (content for the /guardian/guard/<id> full page) --
+    // Worst SEC-2 disclosure: agent_id + hostname + state + updated_at for
+    // EVERY reporting agent, fleet-wide, for one rule. Blanket service-token
+    // deny (as above) plus an accountability audit-on-open — a control
+    // separate from authorization — matching device_routes.cpp's per-device
+    // Guardian lens verb (`guardian.device.view`). GuardianRoutes::AuditFn is
+    // void (no persist-failure signal, unlike RestApiV1::AuditFn), so this
+    // is a direct fire-and-forget call — the same set-and-proceed idiom every
+    // other audit_fn_ call site in this file already uses; a transient audit
+    // hiccup must not blank this operator's lens.
     sink.Get(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/page)",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
-                res.set_content(render_guard_page_fragment(req.matches[1].str()),
-                                "text/html; charset=utf-8");
+                const std::string guard_id = req.matches[1].str();
+                if (audit_fn_)
+                    audit_fn_(req, "guardian.device.view", "success", "Guard", guard_id,
+                              "per-guard fleet-wide agent status drilldown via dashboard fragment");
+                res.set_content(render_guard_page_fragment(guard_id), "text/html; charset=utf-8");
             });
 
     // -- Baselines list ----------------------------------------------------
     sink.Get("/fragments/guardian/baselines",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baselines_fragment(), "text/html; charset=utf-8");
             });
 
     // -- Per-baseline detail (content for the /guardian/baseline/<id> page) --
+    // Discloses an agent_id 12-char prefix per member (SEC-2, milder than the
+    // guard drilldown but still identity-adjacent fleet-wide): same blanket
+    // deny as /status above.
     sink.Get(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/page)",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baseline_page_fragment(req.matches[1].str()),
                                 "text/html; charset=utf-8");

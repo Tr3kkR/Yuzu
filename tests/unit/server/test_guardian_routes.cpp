@@ -114,6 +114,12 @@ struct Harness {
 
     std::string session_user{"alice"};
     auth::Role session_role{auth::Role::admin};
+    // Non-empty simulates a service-scoped API token session (SEC-2: the
+    // fleet-wide/identity-bearing Guardian fragments blanket-deny these —
+    // perm_fn_'s service-token branch checks only the ITServiceOwner role,
+    // never the token's own service-tag scope). Default empty preserves every
+    // other test's ordinary-operator session.
+    std::string session_token_scope_service;
 
     // "Securable:Operation" entries the perm_fn should DENY (default: grant all).
     std::set<std::string> denied;
@@ -150,6 +156,7 @@ struct Harness {
             auth::Session s;
             s.username = session_user;
             s.role = session_role;
+            s.token_scope_service = session_token_scope_service;
             return s;
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -428,6 +435,104 @@ TEST_CASE("guard/baseline /page fragments are gated on GuaranteedState:Read",
     auto b = h.sink.dispatch("GET", "/fragments/guardian/baseline/bl1/page", "", "");
     REQUIRE(b != nullptr);
     CHECK(b->status == 403);
+}
+
+// ── SEC-2 regression coverage: a service-scoped API token (e.g. a token
+// carrying the seeded ITServiceOwner role's GuaranteedState:Read grant) must
+// be blanket-denied on every fleet-wide/identity-bearing Guardian fragment —
+// perm_fn_'s service-token branch checks only the ITServiceOwner ROLE, never
+// the token's own service-tag scope, so perm_fn_ alone is not confinement.
+// /status and /guards/ /events had NO permission-gate test at all before this. ──
+
+TEST_CASE("Guardian data fragments deny a service-scoped token, regardless of "
+          "GuaranteedState:Read",
+          "[pg][guardian_routes][rbac][security]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+    h.session_token_scope_service = "printers"; // any non-empty service scope
+
+    auto status = h.sink.dispatch("GET", "/fragments/guardian/status", "", "");
+    REQUIRE(status != nullptr);
+    CHECK(status->status == 403);
+
+    auto guards = h.sink.dispatch("GET", "/fragments/guardian/guards", "", "");
+    REQUIRE(guards != nullptr);
+    CHECK(guards->status == 403);
+
+    auto events = h.sink.dispatch("GET", "/fragments/guardian/events", "", "");
+    REQUIRE(events != nullptr);
+    CHECK(events->status == 403);
+
+    auto guard_page = h.sink.dispatch("GET", "/fragments/guardian/guard/g1/page", "", "");
+    REQUIRE(guard_page != nullptr);
+    CHECK(guard_page->status == 403);
+    CHECK(guard_page->body.find("GuardOne") == std::string::npos); // no identity leaked
+
+    auto baselines = h.sink.dispatch("GET", "/fragments/guardian/baselines", "", "");
+    REQUIRE(baselines != nullptr);
+    CHECK(baselines->status == 403);
+
+    auto baseline_page = h.sink.dispatch("GET", "/fragments/guardian/baseline/bl1/page", "", "");
+    REQUIRE(baseline_page != nullptr);
+    CHECK(baseline_page->status == 403);
+
+    // Denied before any read reached the audit path — no evidence of an
+    // unauthorized access to conflate with a legitimate one.
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("status/guards/events fragments are gated on GuaranteedState:Read (previously untested)",
+          "[pg][guardian_routes][rbac]") {
+    Harness h;
+    h.denied = {"GuaranteedState:Read"};
+
+    auto status = h.sink.dispatch("GET", "/fragments/guardian/status", "", "");
+    REQUIRE(status != nullptr);
+    CHECK(status->status == 403);
+
+    auto guards = h.sink.dispatch("GET", "/fragments/guardian/guards", "", "");
+    REQUIRE(guards != nullptr);
+    CHECK(guards->status == 403);
+
+    auto events = h.sink.dispatch("GET", "/fragments/guardian/events", "", "");
+    REQUIRE(events != nullptr);
+    CHECK(events->status == 403);
+
+    auto baselines = h.sink.dispatch("GET", "/fragments/guardian/baselines", "", "");
+    REQUIRE(baselines != nullptr);
+    CHECK(baselines->status == 403);
+}
+
+TEST_CASE("an ordinary (non-service-scoped) session still reaches every Guardian fragment",
+          "[pg][guardian_routes][rbac]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+    // session_token_scope_service left empty (default) — the ordinary path.
+
+    for (const char* path : {"/fragments/guardian/status", "/fragments/guardian/guards",
+                             "/fragments/guardian/events", "/fragments/guardian/guard/g1/page",
+                             "/fragments/guardian/baselines",
+                             "/fragments/guardian/baseline/bl1/page"}) {
+        auto res = h.sink.dispatch("GET", path, "", "");
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+    }
+}
+
+TEST_CASE("the per-guard drilldown emits a guardian.device.view audit-on-open",
+          "[pg][guardian_routes][audit][security]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+
+    auto res = h.sink.dispatch("GET", "/fragments/guardian/guard/g1/page", "", "");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    REQUIRE(h.audit_count("guardian.device.view", "success") == 1);
+    // Every other fragment is NOT the worst-disclosure surface and stays
+    // un-audited (matches its existing set-and-proceed dashboard-read posture).
+    CHECK(h.audit_log.size() == 1);
 }
 
 TEST_CASE("guard/baseline /page fragments render a seeded id",
