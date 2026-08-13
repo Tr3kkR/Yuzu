@@ -755,6 +755,100 @@ TEST_CASE("ScimStore: oidc_login_observations upsert-on-relogin + observation_ma
     }
 }
 
+// ── ADR-2001 PR4a — SAML identity linkage (migration v4) ────────────────
+//
+// saml_identity_links — the SAML analogue of v3's identity_links. A
+// SEPARATE table from identity_links (never a generalization) — keeps this
+// PR off PR3's scim_store schema surface. No scim_resources.external_id
+// ambiguity guard is re-tested here (that guard, and its migration, are
+// v3's — this table adds no new one; find_unique_active_by_external_id is
+// already covered above).
+
+TEST_CASE("ScimStore: saml_identity_links upsert + saml_links_for_scim_id",
+         "[pg][scim][2001][linkage][saml]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("upsert_saml_link is idempotent and saml_links_for_scim_id returns it") {
+        REQUIRE(store.upsert_saml_link("https://idp.example.com/saml/metadata",
+                                       "alice@example.com", "scim-alice"));
+        REQUIRE(store.upsert_saml_link("https://idp.example.com/saml/metadata",
+                                       "alice@example.com", "scim-alice")); // repeat
+
+        auto links = store.saml_links_for_scim_id("scim-alice");
+        REQUIRE(links.has_value());
+        REQUIRE(links->size() == 1);
+        CHECK((*links)[0].entity_id == "https://idp.example.com/saml/metadata");
+        CHECK((*links)[0].name_id == "alice@example.com");
+    }
+
+    SECTION("multiple (entity_id,name_id) identities can link to the same scim_id") {
+        REQUIRE(store.upsert_saml_link("https://idp-a.example.com/", "a@example.com",
+                                       "scim-bob"));
+        REQUIRE(store.upsert_saml_link("https://idp-b.example.com/", "b@example.com",
+                                       "scim-bob"));
+
+        auto links = store.saml_links_for_scim_id("scim-bob");
+        REQUIRE(links.has_value());
+        REQUIRE(links->size() == 2);
+    }
+
+    SECTION("saml_links_for_scim_id returns an engaged-but-empty vector for an unknown "
+           "scim_id") {
+        auto links = store.saml_links_for_scim_id("no-such-scim-id");
+        REQUIRE(links.has_value());
+        CHECK(links->empty());
+    }
+
+    SECTION("re-linking the same (entity_id,name_id) to a different scim_id moves the link "
+           "(UNIQUE (entity_id,name_id) enforced)") {
+        REQUIRE(store.upsert_saml_link("https://idp.example.com/", "move@example.com",
+                                       "scim-old"));
+        REQUIRE(store.upsert_saml_link("https://idp.example.com/", "move@example.com",
+                                       "scim-new"));
+
+        CHECK(store.saml_links_for_scim_id("scim-old")->empty());
+        auto new_links = store.saml_links_for_scim_id("scim-new");
+        REQUIRE(new_links.has_value());
+        REQUIRE(new_links->size() == 1);
+        CHECK((*new_links)[0].name_id == "move@example.com");
+    }
+
+    SECTION("upsert_saml_link rejects empty entity_id/name_id/scim_id") {
+        CHECK_FALSE(store.upsert_saml_link("", "name", "scim-x"));
+        CHECK_FALSE(store.upsert_saml_link("entity", "", "scim-x"));
+        CHECK_FALSE(store.upsert_saml_link("entity", "name", ""));
+    }
+}
+
+TEST_CASE("ScimStore: saml_identity_links and identity_links (OIDC) are independent tables",
+         "[pg][scim][2001][linkage][saml]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    // Link the SAME scim_id from both sides — an OIDC link and a SAML link
+    // coexisting on one SCIM resource must not interfere with each other's
+    // read (a shared/generalized table would risk exactly this).
+    REQUIRE(store.upsert_link("https://oidc-idp.example.com/", "sub-1", "scim-both"));
+    REQUIRE(store.upsert_saml_link("https://saml-idp.example.com/", "name@example.com",
+                                   "scim-both"));
+
+    auto oidc_links = store.links_for_scim_id("scim-both");
+    auto saml_links = store.saml_links_for_scim_id("scim-both");
+    REQUIRE(oidc_links.has_value());
+    REQUIRE(saml_links.has_value());
+    REQUIRE(oidc_links->size() == 1);
+    REQUIRE(saml_links->size() == 1);
+    CHECK((*oidc_links)[0].sub == "sub-1");
+    CHECK((*saml_links)[0].name_id == "name@example.com");
+}
+
 // ── ADR-2001 §4 — deny-at-login backstop accessor ───────────────────────
 
 TEST_CASE("ScimStore: linked_resource_active — deny-at-login backstop tri-state + scim_id",

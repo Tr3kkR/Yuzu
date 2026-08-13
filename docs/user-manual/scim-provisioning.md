@@ -328,7 +328,11 @@ has the same effect:
 > dashboard's manual delete) revokes the user's **sessions and their API/MCP
 > tokens**, both for the SCIM slug itself and for any OIDC identity linked
 > to it (see [SCIM ↔ OIDC identity linkage](#scim--oidc-identity-linkage-federated-token-revocation)
-> below for how the link forms and what to configure). Revocation is durable
+> below for how the link forms and what to configure), as well as any
+> **SAML** session linked to it (SAML has no separate token-mint path; any
+> token minted under a SAML principal is revoked with that principal — see
+> [SCIM ↔ SAML identity linkage](#scim--saml-identity-linkage-federated-session-revocation)
+> below). Revocation is durable
 > within roughly **60 seconds** of the deprovision reaching Yuzu — a
 > concurrently in-flight request can still see a token as valid for that
 > brief window (the `ApiTokenStore` in-memory validate cache), but the
@@ -499,6 +503,87 @@ call in the window you're checking produces no signal either way; treat a
 zero rate as "nothing detected yet," not as proof every federated user is
 correctly linked.
 
+## SCIM ↔ SAML identity linkage (federated session revocation)
+
+If your users sign in via SAML SSO rather than a Yuzu-local password or
+OIDC, a successful login can also form a durable link between their SAML
+identity and their SCIM slug (ADR-2001 PR4a) — the SAML analogue of the
+[SCIM ↔ OIDC identity linkage](#scim--oidc-identity-linkage-federated-token-revocation)
+above. When the link exists, deprovisioning the SCIM slug revokes the
+linked SAML session too, not just the slug's own credentials.
+
+**What this does.** A SAML session's authorization principal is the stable
+`saml:<entity_id>#<NameID>` string (`saml_principal_id`), not the raw
+NameID — see [REST API Reference](rest-api.md) `DELETE /api/v1/sessions`.
+At login, if the assertion's NameID resolves to exactly one active SCIM
+resource by `externalId`, Yuzu upserts a `saml_identity_links` row for
+`(entity_id, NameID)` → that resource. On a subsequent SCIM deprovision of
+that resource, Yuzu looks up every linked SAML identity and revokes its
+session, in addition to the slug's own.
+
+**The NameID-Format contract.** Unlike OIDC (whose `sub`/`oid` claim is
+always a stable, IdP-assigned value), a SAML NameID's stability depends on
+its `Format`. Yuzu only forms a link when the asserted NameID's `Format` is
+one of:
+
+- `urn:oasis:names:tc:SAML:2.0:nameid-format:persistent`
+- `urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress`
+
+and its value equals the SCIM resource's `externalId`. A missing, empty, or
+any other `Format` — including the SAML 2.0 `transient` format — is treated
+conservatively as **not linkable**; no link forms and no error is raised
+(the login still succeeds).
+
+> **Warning — many IdPs default to `transient` NameID.** If your IdP issues
+> a `transient` NameID (a common out-of-the-box default for a SAML 2.0
+> application), **no link will ever form for that population, silently.**
+> Deprovisioning those users' SCIM slugs will revoke the slug's own
+> credentials but will **not** reach their SAML sessions — they can
+> continue using an already-established SAML session until it naturally
+> expires. Configure your IdP to assert a stable NameID Format
+> (`persistent` or the SAML 1.1 `emailAddress` format) whose value equals
+> the SCIM `externalId` you push for the same user, and verify the link is
+> forming (watch `yuzu_scim_saml_link_write_failures_total`, below, and
+> confirm no unexpected `0`-link population) before relying on this for
+> offboarding evidence.
+
+**What deprovision-revoke actually does.** The linked-SAML-identity revoke
+invalidates the user's active SAML session cookie(s), forcing
+re-authentication. SAML has no separate token-mint path — any token minted
+under a SAML principal is revoked with that principal on deprovision the
+same way an OIDC-linked token is, so in practice a SAML deprovision's
+observable effect is the session teardown described above.
+
+**Metric.** `yuzu_scim_saml_link_write_failures_total` (counter, no labels)
+bumps when a SAML login's identity-link *write* fails (a ScimStore outage
+during the login window) — the login itself always succeeds; link writes
+are fail-OPEN by design. A sustained non-zero rate means SAML identities are
+silently not linking during that window; correlate with ScimStore/Postgres
+health. See [Metrics reference](metrics.md) for the full row.
+
+**Residual: SAML deny-at-login is not yet shipped.** Unlike deprovision's
+session-revoke, there is currently no SAML equivalent of "reject a
+deprovisioned user's next login outright" (tracked as PR4b / #3066). A
+deprovisioned SAML user whose IdP still authenticates them can obtain a
+**new** SAML session immediately after their old one is revoked — Yuzu will
+revoke it again on the *next* deprovision pass (e.g. if your IdP re-sends a
+deactivate), but between those two points the account is not locked out at
+the login boundary. Treat disabling the account at your IdP as the
+authoritative offboarding step; SCIM deprovision's SAML session-revoke is
+defense-in-depth on top of that, not a substitute for it.
+
+**Rotating your IdP's entity ID strands existing links.** `saml_identity_links`
+rows are keyed on `(entity_id, NameID)`. If you rotate
+`--saml-idp-entity-id` (e.g. migrating to a new IdP tenant), every
+previously-formed link is keyed on the *old* entity_id and will not match
+new logins until each affected user signs in again (re-forming the link
+under the new entity_id). A deprovision that runs after the rotation but
+before a given user's first post-rotation login will not find — and
+therefore cannot revoke — that user's pre-rotation-keyed session. This is
+an operational caveat of the rotation, not a code defect; plan an
+entity_id rotation with a brief window where you also expect to
+re-validate SAML session coverage for affected users.
+
 ## Reprovisioning a returning employee
 
 If someone leaves and is later re-hired, and your IdP re-issues a `POST`
@@ -563,5 +648,6 @@ with a **currently-active** account.
   deprovision-ordering decision).
 - `docs/adr/2001-scim-oidc-identity-linkage.md` — the ADR behind
   [SCIM ↔ OIDC identity linkage](#scim--oidc-identity-linkage-federated-token-revocation)
-  above (design rationale, the D1/D2 forks, and the deny-at-login backstop
-  shipped as PR3).
+  and [SCIM ↔ SAML identity linkage](#scim--saml-identity-linkage-federated-session-revocation)
+  above (design rationale, the D1/D2 forks, the OIDC deny-at-login backstop
+  shipped as PR3, and the SAML deny-at-login deferred to PR4b).

@@ -680,12 +680,25 @@ as dead code in the #1837 governance hardening round.
 `username`; the dashboard JS shows `display_name`, falling back to
 `username` for a legacy/local session predating this field.
 
-**SAML is unaffected this slice.** `create_saml_session` still keys
-`username` on the raw NameID (`display_name` is set to the same value,
-purely for render-site parity) — SAML does not sync to `rbac_store` yet
-(dropped in #1827), so the collision this fix closes is dormant there.
-Keying SAML on `entity_id#NameID` is a tracked fast-follow, to land
-alongside SAML group sync.
+**SAML was unaffected this slice; since resolved (ADR-2001 PR4a).** At the
+time of the #1837 hardening round documented above, `create_saml_session`
+still keyed `username` on the raw NameID (`display_name` set to the same
+value, purely for render-site parity) — SAML does not sync to `rbac_store`
+yet (dropped in #1827), so the collision risk this fix closes was dormant
+there. ADR-2001 PR4a has since closed the SAML side of the same gap:
+`create_saml_session` now keys `username` on the stable
+`saml_principal_id(entity_id, name_id)` (`"saml:" + entity_id + "#" +
+name_id`, `saml_principal.hpp`), mirroring the OIDC split above
+byte-for-byte; `display_name` still carries the raw NameID for render-site
+parity. This unlocks force-logout (`DELETE /api/v1/sessions?username=
+saml:<entity_id>#<NameID>`, `is_valid_principal` accepts the `saml:`
+reserved prefix on the same wider SSO charset as `oidc:`) and SCIM
+deprovision-time session revocation for linked SAML identities (see
+`docs/user-manual/scim-provisioning.md` "SCIM ↔ SAML identity linkage").
+JIT elevation is **not** part of this fix — no `auth.db` `users` row is
+provisioned for a SAML principal, so `provision_sso_identity` is still not
+wired to SAML (`AuthManager::provision_sso_identity`'s docstring) and a
+SAML session still cannot elevate.
 
 **Audit-detail-field injection defense (`sanitize_detail_value`).** Every
 IdP-supplied value that reaches an audit `detail` string or an
@@ -825,15 +838,18 @@ record.** Four fixes on top of the base restoration above:
   does not touch `#` — a durable SSO principal's `#` was silently truncated
   by the browser's URL-fragment parsing before the request left the client.
 
-SAML is unaffected by this restoration: `create_saml_session` still keys
-`username` on the raw NameID (no reserved-prefix stable principal — see
-"SAML is unaffected this slice" above), so `is_valid_principal` does not
-recognise it as an SSO principal and `provision_sso_identity` is not called
-from the SAML ACS handler. A SAML session is therefore provisioned nowhere
-and cannot elevate — not because of a missing MFA proof specifically, but
-because there is no durable identity row to hold `elevation_eligible` on in
-the first place. Keying SAML on `entity_id#NameID` (the tracked fast-follow
-noted above) is a prerequisite for extending this restoration to SAML.
+SAML still cannot elevate, though the reason has narrowed since ADR-2001
+PR4a (see "SAML was unaffected this slice; since resolved" above):
+`create_saml_session` now keys `username` on the reserved-prefix stable
+principal `saml:<entity_id>#<NameID>`, so `is_valid_principal` DOES
+recognise it as an SSO principal (unlocking force-logout, per that section)
+— but `provision_sso_identity` is still never called from the SAML ACS
+handler, so no `auth.db` `users` row is provisioned for a SAML principal.
+A SAML session therefore still cannot elevate — not because of a missing
+MFA proof specifically, and no longer because `is_valid_principal` rejects
+the identity shape, but because there is no durable identity row to hold
+`elevation_eligible` on in the first place. Wiring `provision_sso_identity`
+into the SAML ACS handler is a tracked follow-up, separate from PR4a.
 
 **This is not a regression of a previously-supported flow.** Before #1837,
 `Session::username` for an OIDC session was the mutable display name
@@ -1820,6 +1836,125 @@ server/scim_json.hpp` + `server/core/src/scim_json.cpp` (JSON codec +
 discovery documents), `server/core/src/scim_routes.{hpp,cpp}` (HTTP routes).
 Tests: `tests/unit/server/test_scim_store.cpp`,
 `test_scim_json.cpp`, `test_scim_routes.cpp`.
+
+### SAML ↔ SCIM identity linkage (ADR-2001 PR4a, CC6.8)
+
+`docs/adr/2001-scim-oidc-identity-linkage.md` (Accepted, SAML addendum). The
+SAML analogue of "SCIM ↔ OIDC identity linkage for deprovision" above, shipped
+as **PR4a** — the SAML counterpart of that section's PR1+PR2. Before PR4a, a
+SAML login's session was keyed on the raw NameID alone, and no link to any
+SCIM resource was ever recorded, so a SCIM deprovision could not reach a
+SAML-authenticated identity's session at all.
+
+**Stable principal: `saml:<entity_id>#<NameID>`.** `AuthManager::
+create_saml_session` now keys the session's `username` (the authorization/
+audit/revoke principal) on `saml::saml_principal_id(entity_id, name_id)`
+(`server/core/src/saml_principal.hpp`) — `"saml:" + entity_id + "#" +
+name_id`, mirroring `oidc_principal_id(iss, sub)`'s shape byte-for-byte and
+built through the same kind of single shared builder (both the session-mint
+site and the deprovision resolver route through it, so a hand-built copy at
+either site cannot drift from the other and silently miss a session on
+revoke). `display_name` stays the raw NameID — human-readable rendering
+only (dashboard, audit detail), never the authorization key. Both the NameID
+and the `entity_id` are sanitised at the ACS handler (non-empty, ≤255 bytes,
+no control bytes — the same rule `OidcProvider::validate_claims` applies to
+`sub`/`oid`) **before** either value enters the principal string or the link
+store; a malformed value fails the SAML login outright (redirect
+`/login?error=saml`, no session minted) — fail-closed, the same posture OIDC
+takes for the same class of durable-join-key input.
+
+**Single-IdP precondition — stronger than the OIDC side.** SAML's join key
+is the assertion's NameID; unlike OIDC's `--oidc-scim-link-claim` (which
+selects among candidate claims), there is exactly one candidate value and no
+per-issuer partitioning question, because Yuzu accepts assertions from
+exactly one pinned IdP (`--saml-idp-cert` + `--saml-idp-entity-id`, both
+already required — `SamlProvider::is_enabled()`). `--saml-idp-entity-id` is
+now additionally load-bearing for the principal build itself: it is the
+`entity_id` half of every `saml:<entity_id>#<NameID>` string, verified by
+`SamlProvider::validate_response` to equal the assertion's signed
+`<saml:Issuer>` before the ACS handler ever reads it. This single-pinned-IdP
+shape is what makes a bare NameID→`externalId` match safe by construction —
+the multi-IdP partitioning caveat the OIDC section's constraint 5 states does
+not apply here as written, because there is only ever one IdP to partition
+against.
+
+**The NameID Format contract — a NameID is a safe join key ONLY when it is
+STABLE and equals the SCIM `externalId`.** SAML's `<NameID>` element carries
+an optional `Format` attribute; `SamlProvider::validate_response` now reads
+it into `SamlAssertion::name_id_format` from the same XSW-verified assertion
+node as the NameID itself. A link to a SCIM resource forms **only** when the
+Format is one of the two STABLE URIs Yuzu treats as safe —
+`urn:oasis:names:tc:SAML:2.0:nameid-format:persistent` or the SAML 1.1
+`urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress`
+(`saml::is_linkable_name_id_format`, `saml_scim_link.hpp`). A `transient`
+Format — re-minted per login by design — or an `unspecified`/missing Format
+is conservatively treated as **not linkable**; Yuzu never coerces or
+normalizes an unstable NameID into a linkable one. **This is an operator
+configuration obligation, not something Yuzu can enforce on the IdP's
+behalf: the operator must configure their IdP to emit a NameID that is both
+a stable Format and equal to the SCIM `externalId` it provisions that same
+user with.** A NameID that is stable-Format but numerically different from
+the SCIM `externalId` (or an IdP left on `transient`) simply never forms a
+link — the SAML login still succeeds, but that identity is **unlinkable, and
+therefore unrevocable via SCIM deprovision**. This is the direct SAML
+analogue of the OIDC section's D2 case (a mismatched/misconfigured join
+claim) — with no equivalent detector: SAML has exactly one candidate join
+key (there is no `--saml-oidc-link-claim` knob to misconfigure among several
+candidates), so there is no "should-have-matched-a-different-candidate"
+signal to record, and no `saml_login_observations` table exists.
+
+**Link formation (login-time, fail-open).** On a successful SAML login with a
+linkable NameID Format, Yuzu compares the NameID against
+`scim_resources.external_id` using the same `find_unique_active_by_external_id`
+exactly-one-active-match rule the OIDC side uses (`ScimStore`) — zero matches
+is normal (no link), more than one match forms no link (never an arbitrary
+pick). A formed link is recorded in a **dedicated `saml_identity_links`
+table** (`ScimStore` migration v4 — a separate table from OIDC's
+`identity_links`, deliberately not a generalization of it, keeping this PR
+off the OIDC linkage schema surface), keyed `(entity_id, name_id)` unique
+with a secondary index on `scim_id`. The link write itself is fail-open — a
+write failure never fails the login, mirroring the OIDC side's posture
+exactly (`saml::link_saml_login_to_scim`, `saml_scim_link.{hpp,cpp}`).
+
+**Deprovision-time revoke: SAML has no API tokens, so revoke = session
+invalidation.** `resolve_deprovision_principals`
+(`deprovision_revoke.cpp`) now runs a second pass alongside the existing
+OIDC one: for every row `ScimStore::saml_links_for_scim_id(scim_id)` returns,
+it adds `saml::saml_principal_id(entity_id, name_id)` to the principal set a
+deprovision revokes — fail-**closed** on that lookup's own `nullopt`, exactly
+like the OIDC pass (a store blip must never be read as "no linked SAML
+identity"). Because SAML never mints API/MCP tokens (there is no
+`revoke_for_principal` call site keyed on a `saml:` principal — only
+`create_saml_session` mints anything for one), the practical effect of
+resolving a `saml:` principal into the revoke set is **session
+invalidation only**: the linked SAML session (if still live) is torn down;
+there are no SAML-keyed tokens to revoke.
+
+**PR4b (deny-at-login, #3066) has NOT shipped — read this residual as
+literally as the OIDC section's PR3 residual.** PR4a closes the *deprovision-
+time* gap: an existing SAML session for a deprovisioned, linked identity is
+now revoked. It does **not** close the login-time gap — a deprovisioned SAML
+identity is not yet refused *at* `/saml/acs`. Concretely: after a SCIM
+deprovision, that person can still present a valid, signed SAML assertion and
+successfully re-authenticate, minting a brand-new session — exactly the SAML
+analogue of the window the OIDC section's PR3 (deny-at-login) closes for
+OIDC, and not yet closed here. That freshly-minted session is correctly torn
+down again on the *next* deprovision pass (the link persists, so the next
+pass finds it), but it is live in the meantime. Do not describe SAML
+deprovision as fully closing CC6.8 without naming this window until PR4b
+ships.
+
+Implementation: `server/core/src/saml_principal.hpp` (the single
+`saml_principal_id(entity_id, name_id)` builder), `server/core/src/
+saml_scim_link.{hpp,cpp}` (login-site link orchestration + the NameID Format
+gate), `server/core/include/yuzu/server/scim_store.hpp` + `scim_store.cpp`
+(the `saml_identity_links` table, migration v4), `server/core/src/
+deprovision_revoke.cpp` (the SAML second pass), `server/core/src/
+saml_provider.{hpp,cpp}` (`SamlAssertion::name_id_format` extraction).
+Tests: `tests/unit/server/test_saml_principal.cpp`,
+`test_saml_scim_link.cpp`, `test_saml_provider.cpp`, `test_saml_routes.cpp`,
+`test_scim_store_pg.cpp`, `test_scim_routes.cpp`,
+`test_auth_sso_identity.cpp`.
 
 ## Granular RBAC (Phase 3)
 

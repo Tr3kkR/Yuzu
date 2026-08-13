@@ -107,5 +107,117 @@ The full analysis of each fork is retained below for the build team.
   **Forward caveat — single-primary Postgres reads assumed.** The guarantee above is sound only because Yuzu's Postgres deployment is single-primary today: every `linked_resource_active` read lands on the same primary a deprovision write just landed on, so there is no replica-lag window beyond the microsecond check-then-mint gap already described. If read-replica routing is ever introduced for `ScimStore`, a check could read a stale, not-yet-replicated `scim_resources.active` value, and this residual would widen from a microsecond window to ordinary replica lag — revisit deny-at-login's guarantee at that point. Not a current defect; single-primary is the shipped, verified configuration.
 - **Orphaned links (the `scim_resources` row was hard-DELETEd by a SCIM `DELETE`) are handled, not a gap.** `linked_resource_active`'s LEFT JOIN surfaces a deleted-but-still-linked `identity_links` row as `active == nullopt` (an INNER join would instead have silently treated the now-rowless join as "no link" and let the deprovisioned identity re-authenticate). The deny decision then distinguishes two orphaned sub-cases: if an **active resource now exists for the login's externalId** (`find_unique_active_by_external_id`), the identity was DELETE'd and re-`POST`ed under a new `scim_id` — a returning employee — so the login **proceeds** and the imminent `link_oidc_login_to_scim` repoints the stale link; if **no** active resource exists, it is genuinely deprovisioned and is **denied** (like an explicitly deactivated one). This reprovision distinction is scoped to the orphaned branch only — the `external_id` unique index guarantees an explicitly-deactivated (row-present) resource can have no active same-externalId sibling. Denying orphaned links unconditionally (the pre-fix behaviour) would permanently lock out a returning re-provisioned employee.
 
+## SAML ↔ SCIM identity linkage (PR4a addendum, accepted 2026-08-13)
+
+This ADR's title and body above are OIDC-specific by construction (§5's
+`oidc_principal_id`, the `identity_links` table, `--oidc-scim-link-claim`).
+**PR4a extends the same closing argument to SAML**, delivering the SAML
+analogue of PR1+PR2 (link formation + deprovision-time revoke). SAML
+deny-at-login — the analogue of §4/PR3 above — is **PR4b (#3066), NOT shipped
+by this addendum.**
+
+**Why a SAML gap exists at all.** Exactly the same root cause as the OIDC
+case: prior to PR4a, a SAML login minted a session keyed on the raw NameID
+(`AuthManager::create_saml_session`, the "#1837 fast-follow" comment it
+replaced), with no link ever recorded to the SCIM resource that provisioned
+that person. A SCIM deprovision therefore reached zero SAML sessions for a
+federated user's identity while reporting a clean success — the same
+silent-under-revocation shape §"Context" above describes for OIDC tokens,
+here for SAML sessions.
+
+**1. The stable principal: `saml:<entity_id>#<NameID>`, one builder.**
+`saml::saml_principal_id(entity_id, name_id)` (`server/core/src/
+saml_principal.hpp`) is `"saml:" + entity_id + "#" + name_id` — the SAML
+mirror of §5's `oidc_principal_id(iss, sub)`, for the identical reason: a
+NameID is only guaranteed unique *within* one IdP, so a bare NameID is unsafe
+as a durable session/RBAC key the moment more than one IdP (or, before this
+addendum, a future multi-tenant deployment) could assert it. Every
+construction site — the session-mint site (`AuthManager::
+create_saml_session`) and the deprovision-time resolver
+(`deprovision_revoke.cpp`) — routes through this one function; a hand-built
+copy at either site would silently drift and miss sessions on revoke,
+exactly §5's stated failure mode.
+
+**2. Session-key / display-name split.** `create_saml_session`'s `username`
+(the authorization/audit/revoke key) becomes the stable principal;
+`display_name` stays the raw NameID (rendering only). This is the SAML
+mirror of the OIDC session's own username/display split.
+
+**3. The NameID-Format contract (architect codex-sol plan-review BLOCK,
+2026-08-12).** A NameID is a safe join key against a SCIM `externalId`
+**only when it carries a STABLE Format AND its value equals that
+`externalId`** — an assertion's `<NameID Format="...">` attribute is read
+(`SamlAssertion::name_id_format`, from the same XSW-verified node as the
+NameID itself) and gated: a link forms only for
+`urn:oasis:names:tc:SAML:2.0:nameid-format:persistent` or the SAML 1.1
+`urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress`
+(`saml::is_linkable_name_id_format`). `transient` (re-minted per login by
+design), `unspecified`, and a missing Format are all treated conservatively
+as **not linkable** — Yuzu never normalizes a NameID into a linkable shape.
+This is a configuration contract on the operator, stated explicitly: **the
+operator MUST configure their IdP to emit a NameID that is both a stable
+Format and numerically equal to the externalId SCIM provisions that person
+with.** Yuzu's role is to reject an unacceptable Format outright, never to
+coerce one. A stable-Format NameID that simply doesn't match any
+`externalId` — or a deployment left on `transient` — forms no link; the
+login still succeeds (this is not a login-time authorization gate, only a
+linkability gate), but that identity is unlinkable and therefore
+**unrevocable via SCIM deprovision** — the documented residual below.
+
+**4. Single-IdP precondition — stronger than the OIDC case.** §"Hard
+constraints" constraint 5 above requires the OIDC side to reason about
+multiple possible issuers sharing one `externalId` space; SAML does not face
+that question in the same way, because Yuzu already requires exactly one
+pinned IdP cert + one pinned `--saml-idp-entity-id`
+(`SamlProvider::is_enabled()`), and `SamlProvider::validate_response`
+verifies the assertion's signed `<saml:Issuer>` equals that pinned
+`entity_id` before anything downstream ever sees it. One pinned IdP is what
+makes a bare NameID→`externalId` match safe by construction here, without
+needing an `iss`-partitioned `externalId` space the way a future multi-IdP
+OIDC configuration would.
+
+**5. `saml_identity_links` (ScimStore migration v4).** A dedicated table —
+deliberately **not** a generalization of §2's `identity_links` (keeps this
+addendum off PR3's OIDC schema surface) — keyed `(entity_id, name_id)`
+unique, secondary-indexed on `scim_id` (the deprovision lookup direction).
+Link formation reuses the same `find_unique_active_by_external_id`
+exactly-one-active-match rule §2 established for OIDC (zero matches: no link,
+normal; more than one: no link, never an arbitrary pick). The write is
+fail-**open** — a write failure never fails the login, mirroring §2's OIDC
+contract exactly.
+
+**6. Deprovision revokes the SAML session — and any token minted under it.**
+`resolve_deprovision_principals` (§3's resolver) gained a second pass:
+`saml::saml_principal_id(entity_id, name_id)` for every row
+`ScimStore::saml_links_for_scim_id(scim_id)` returns, fail-**closed** on that
+call's own `nullopt` (the identical contract §3 gives the OIDC pass). SAML
+has no *separate* token-mint path — the only session-mint call site keyed on
+a `saml:` principal is `create_saml_session` — but the revoke functions
+(`revoke_for_principal` et al.) are principal-agnostic: any token that was
+minted with a `saml:` principal as its owner (e.g. via the HTMX
+settings-page token-create route, which stamps the calling session's
+username onto the token regardless of that session's auth source) is
+revoked right alongside the session when its `saml:` principal is resolved
+into the revoke set. In practice this means a SAML deprovision's dominant
+observable effect is the session teardown, since the SAML login flow itself
+never mints a token — but it is not the *only* thing revoked for that
+principal.
+
+**7. The residual, stated as honestly as §"Known residuals" states PR3's.**
+PR4b (deny-at-login, #3066) has **not** shipped. A SAML identity whose linked
+SCIM slug is already deprovisioned is **not yet refused at `/saml/acs`** — a
+person who still holds a valid, signed assertion from the IdP can
+re-authenticate after their SCIM deprovision and mint a fresh session. That
+fresh session is correctly revoked again on the *next* deprovision pass (the
+link persists), but it is live in the meantime — precisely the window
+§"Known residuals" describes for OIDC's PR3 gap, now open on the SAML side
+until PR4b lands. Do not describe SAML deprovision as fully closing CC6.8 for
+the federated SAML population without naming this window.
+
 ## Review provenance
 Rev 2 folds: architect B1 (`oid` unbuilt) + B2 (overload infeasible) + lease-nesting/reorder/resolver/index/helper notes; security-guardian F1 (D1), F2 (D2), F3 (single-issuer precondition, constraint 5), F4 (`oid`, constraint 3), F5 (constraint 4 wording), F6 (60s residual), F7 (generic deny redirect). Both reviews called the core reconciliation idea sound; the defects were in the provenance interaction and the fail-loud realizability, now surfaced as D1/D2.
+
+The SAML addendum (PR4a, 2026-08-13) folds one architect (codex-sol) BLOCK
+from its plan review: the NameID-Format gate above (item 3) — an earlier
+draft of the plan treated any NameID as a safe join key, which the BLOCK
+correctly identified as unsafe for `transient` NameIDs.
