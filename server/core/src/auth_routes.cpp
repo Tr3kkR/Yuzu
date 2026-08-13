@@ -3035,6 +3035,50 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
             saml_principal = saml::saml_principal_id(saml_entity_id, saml_name_id);
 
+            // ADR-2001 §4 (PR4b) — deny-at-login backstop, PRIMARY check.
+            // Runs before every mutation below (link formation, session
+            // mint) so a denied login leaves no side effect behind — a
+            // deprovisioned SCIM user must not be able to re-authenticate
+            // and mint a fresh session just by round-tripping the IdP
+            // again. `saml_login_denied_deprovisioned` is fail-CLOSED: a
+            // ScimStore that cannot answer denies, exactly like a
+            // resolved-inactive link or a genuinely-orphaned (not
+            // re-provisioned) one. Emits the BYTE-IDENTICAL
+            // `/login?error=saml` redirect every other SAML failure branch
+            // above uses — no "deprovisioned"/oracle wording reaches the
+            // browser; the reason (and, when known, the driving scim_id —
+            // server-generated CSPRNG hex, never IdP input, so no
+            // sanitize_detail_value needed) lives only in the server-side
+            // audit row. Mirrors the OIDC primary check's U6 fix: a
+            // store-unavailable DENY (`scim_id` absent) is audited as
+            // `scim_store_unavailable`, never as
+            // `linked_scim_resource_inactive` — the latter is fictional
+            // CC6.8 evidence when the store simply couldn't be asked.
+            if (auto decision =
+                    saml::saml_login_denied_deprovisioned(scim_store_, saml_entity_id, saml_name_id);
+                decision.denied) {
+                spdlog::warn("SAML login denied for '{}': linked SCIM resource is deprovisioned",
+                            saml_principal);
+                std::string deny_detail = decision.scim_id
+                                              ? "reason=linked_scim_resource_inactive;scim_id=" +
+                                                    *decision.scim_id
+                                              : "reason=scim_store_unavailable";
+                audit_log_for_principal(req, "auth.saml.deprovisioned_denied", "failure",
+                                        saml_principal, "user", "User", saml_principal,
+                                        deny_detail);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+                    // Also bump the established general SAML login counter
+                    // so dashboards keyed on it don't undercount during a
+                    // deny episode — every other /saml/acs failure path
+                    // bumps this series too.
+                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+                }
+                res.set_header("Set-Cookie", kBindCookieClear);
+                res.set_redirect("/login?error=saml");
+                return;
+            }
+
             // ADR-2001 PR4a — form a durable SCIM<->SAML identity link when
             // the NameID Format is stable (see saml_scim_link.hpp), BEFORE
             // minting the session. Fail-OPEN: never fails this login. No
@@ -3046,6 +3090,60 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
             session_token = auth_mgr_.create_saml_session(saml_name_id, saml_entity_id,
                                                            result.value().groups, saml_admin_gid);
+
+            // ADR-2001 §4 (PR4b) — deny-at-login backstop, POST-MINT
+            // RE-CHECK (the codex-caught check-then-mint race, mirrors the
+            // OIDC side). The primary check above ran before this login's
+            // own mint; a concurrent SCIM deactivate/DELETE could have
+            // landed in the window between that check and
+            // `create_saml_session` above. Re-resolve the SAME decision via
+            // the SAME helper and, if it has now flipped to DENY,
+            // invalidate the session just minted rather than hand it out —
+            // this self-heals the race without holding a cross-store lock
+            // over the mint. Runs BEFORE the Set-Cookie header below so a
+            // denied login never reaches the browser with a live cookie.
+            // `saml_principal` is exactly the `username` `create_saml_session`
+            // minted the session under (`saml::saml_principal_id(entity_id,
+            // name_id)` — see `AuthManager::create_saml_session`), so it is
+            // the correct key to invalidate.
+            if (auto decision =
+                    saml::saml_login_denied_deprovisioned(scim_store_, saml_entity_id, saml_name_id);
+                decision.denied) {
+                spdlog::warn("SAML login denied for '{}' on post-mint re-check: linked SCIM "
+                            "resource is deprovisioned (concurrent deprovision race)",
+                            saml_principal);
+                auto revoke_result = auth_mgr_.invalidate_user_sessions(saml_principal);
+                // Mirrors the OIDC side's U6 fix: a store-unavailable DENY
+                // (`scim_id` absent) is audited as `scim_store_unavailable`,
+                // never as `linked_scim_resource_inactive` (fictional
+                // CC6.8 evidence on a mere outage) — mirrors the primary
+                // check's reason string.
+                std::string recheck_detail = decision.scim_id
+                                                 ? "reason=linked_scim_resource_inactive;scim_id=" +
+                                                       *decision.scim_id
+                                                 : "reason=scim_store_unavailable";
+                recheck_detail += ";post_mint_recheck=true;sessions_invalidated=" +
+                                  std::to_string(revoke_result.count);
+                if (!revoke_result.db_persisted) {
+                    // RevokeResult's contract (auth.hpp): a "success" audit
+                    // row that hides a DB persistence failure produces
+                    // fictional CC6.3/CC6.6 evidence — surface it in the
+                    // row itself.
+                    recheck_detail += ";db_persisted=false";
+                }
+                audit_log_for_principal(req, "auth.saml.deprovisioned_denied", "failure",
+                                        saml_principal, "user", "User", saml_principal,
+                                        recheck_detail);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+                    // Also bump the established general SAML login counter
+                    // — see the primary check above.
+                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+                }
+                res.set_header("Set-Cookie", kBindCookieClear);
+                res.set_redirect("/login?error=saml");
+                return;
+            }
 
             // #1828.3: the verifier flags (rather than logs or increments
             // directly — it has no metrics handle) when the assertion's

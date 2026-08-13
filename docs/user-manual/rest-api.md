@@ -7394,7 +7394,7 @@ Begin the SAML 2.0 SP-initiated login flow. Builds an `<samlp:AuthnRequest>` and
 
 #### `POST /saml/acs`
 
-SAML Assertion Consumer Service endpoint. The IdP POSTs the `<samlp:Response>` here after authentication (HTTP-POST binding). The server validates the signed assertion (signature, audience, recipient, expiry, `InResponseTo` single-use) and mints a session cookie on success. On validation failure, the browser is redirected to `/login` with an error. Available only when SAML is enabled (see `GET /auth/saml/start`).
+SAML Assertion Consumer Service endpoint. The IdP POSTs the `<samlp:Response>` here after authentication (HTTP-POST binding). The server validates the signed assertion (signature, audience, recipient, expiry, `InResponseTo` single-use) and mints a session cookie on success. On validation failure, the browser is redirected to `/login` with an error. Available only when SAML is enabled (see `GET /auth/saml/start`). When SCIM linkage is configured (ADR-2001 §4/PR4b), a login whose linked SCIM resource resolves deprovisioned is also refused here — see `auth.saml.deprovisioned_denied` below and `docs/user-manual/scim-provisioning.md` "Deny-at-login: a deprovisioned SAML identity cannot re-authenticate".
 
 ---
 
@@ -7606,6 +7606,7 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
 | `scim.user.deprovision_role_refused_with_link` | `failure` | ADR-2001 D1: a role-refused deprovision (`deprovision_role_ok` 404 — the slug's role is not `user`) for a slug with ≥1 active linked OIDC identity, whose tokens are therefore NOT auto-revoked. Always written alongside `yuzu_scim_deprovision_role_refused_with_active_link_total` — see `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
 | `auth.oidc.deprovisioned_denied` | `failure` | ADR-2001 §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the store could not answer — fail-closed). Emitted from `GET /auth/callback`, not a `/scim/v2/*` route — listed here because it is part of the same ADR-2001 linkage. `detail` carries `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource (deactivated, or orphaned by a hard-deleted `scim_resources` row) drove the denial, or `reason=scim_store_unavailable` when the store could not answer (fail-closed — no `scim_id` to name); and — only on the post-mint re-check path (a concurrent deprovision landed after the primary check) — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). The two `reason` values keep a genuine deprovision (CC6.8 evidence) distinguishable from a store outage. Pairs with `yuzu_auth_oidc_deprovisioned_denied_total`. |
+| `auth.saml.deprovisioned_denied` | `failure` | ADR-2001 §4/PR4b, the SAML analogue of the row above: a SAML login was refused at `POST /saml/acs` because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row) or because `ScimStore` could not answer at all (fail-closed). Principal is the `saml:<entity_id>#<NameID>` string. `detail` uses the identical shape the OIDC row above uses: `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource drove the denial, or `reason=scim_store_unavailable` (no `scim_id`) when the store itself could not be asked; and — only on the post-mint re-check path — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). Pairs with `yuzu_auth_saml_deprovisioned_denied_total`. |
 
 #### Metrics
 
@@ -7623,10 +7624,14 @@ whose tokens were not auto-revoked; a human must terminate them manually),
 `yuzu_scim_deprovision_unlinked_total` (D2 — a deprovision found a
 login observation that should have matched the slug's `externalId` but no
 link had formed, almost always a misconfigured `--oidc-scim-link-claim`),
-and `yuzu_auth_oidc_deprovisioned_denied_total` (§4/PR3 — the deny-at-login
-backstop refused an OIDC re-login against a deprovisioned linked identity;
-see the audit action above and `docs/user-manual/metrics.md` "SSO login
-metrics").
+`yuzu_auth_oidc_deprovisioned_denied_total` (§4/PR3 — the deny-at-login
+backstop refused an OIDC re-login against a deprovisioned linked identity),
+`yuzu_scim_saml_link_write_failures_total` (a SAML login's identity-link
+write failed — see `docs/user-manual/scim-provisioning.md` "SCIM ↔ SAML
+identity linkage"), and `yuzu_auth_saml_deprovisioned_denied_total`
+(§4/PR4b — the SAML analogue of the OIDC deny-at-login backstop above,
+refused a SAML re-login against a deprovisioned linked identity); see the
+audit actions above and `docs/user-manual/metrics.md` "SSO login metrics".
 Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
 Metrics and "SCIM ↔ OIDC identity linkage for deprovision" § New metrics.
 

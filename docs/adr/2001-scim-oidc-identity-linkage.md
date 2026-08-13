@@ -1,6 +1,6 @@
 # ADR-2001 — SCIM ↔ OIDC identity linkage for deprovision (SOC 2 CC6.8)
 
-**Status:** Accepted (rev 3, 2026-08-12 — D1/D2/D3 decided; see "Decisions" below). **PR1+PR2+PR3 all SHIPPED** — the deny-at-login backstop (§4) has landed; see "Known residuals" for the honest scope of what it closes.
+**Status:** Accepted (rev 3, 2026-08-12 — D1/D2/D3 decided; see "Decisions" below). **PR1+PR2+PR3 all SHIPPED** — the deny-at-login backstop (§4) has landed; see "Known residuals" for the honest scope of what it closes. **PR4a+PR4b (SAML addendum) also SHIPPED** — the SAML analogue of §4/PR3 has landed; see the addendum's item 8 for the honest scope of what it closes on the SAML side.
 **Authors:** Fraser Jarvis (@fjarvis)
 **Date:** 2026-08-12
 **Relates to:** ADR-0031 (`0031-engine-principal-store.md`), ADR-0017 (management-group confinement), ADR-0012 (PG store contract), the SCIM v2 provisioning surface, the OIDC stable-principal decision (#1837), and the #2021 SCIM role/provenance guard.
@@ -113,8 +113,8 @@ This ADR's title and body above are OIDC-specific by construction (§5's
 `oidc_principal_id`, the `identity_links` table, `--oidc-scim-link-claim`).
 **PR4a extends the same closing argument to SAML**, delivering the SAML
 analogue of PR1+PR2 (link formation + deprovision-time revoke). SAML
-deny-at-login — the analogue of §4/PR3 above — is **PR4b (#3066), NOT shipped
-by this addendum.**
+deny-at-login — the analogue of §4/PR3 above — is **PR4b (#3066), SHIPPED**
+(2026-08-13, see item 8 below).
 
 **Why a SAML gap exists at all.** Exactly the same root cause as the OIDC
 case: prior to PR4a, a SAML login minted a session keyed on the raw NameID
@@ -203,16 +203,96 @@ observable effect is the session teardown, since the SAML login flow itself
 never mints a token — but it is not the *only* thing revoked for that
 principal.
 
-**7. The residual, stated as honestly as §"Known residuals" states PR3's.**
-PR4b (deny-at-login, #3066) has **not** shipped. A SAML identity whose linked
-SCIM slug is already deprovisioned is **not yet refused at `/saml/acs`** — a
-person who still holds a valid, signed assertion from the IdP can
-re-authenticate after their SCIM deprovision and mint a fresh session. That
-fresh session is correctly revoked again on the *next* deprovision pass (the
-link persists), but it is live in the meantime — precisely the window
-§"Known residuals" describes for OIDC's PR3 gap, now open on the SAML side
-until PR4b lands. Do not describe SAML deprovision as fully closing CC6.8 for
-the federated SAML population without naming this window.
+**7. The residual, before PR4b — retained here as history.** Before PR4b
+shipped, a SAML identity whose linked SCIM slug was already deprovisioned
+was not refused at `/saml/acs`: a person who still held a valid, signed
+assertion from the IdP could re-authenticate after their SCIM deprovision
+and mint a fresh session, correctly revoked again on the *next* deprovision
+pass but live in the meantime — precisely the window §"Known residuals"
+describes for OIDC's PR3 gap. Item 8 below records what PR4b closed and, as
+honestly as §"Known residuals" does for OIDC, what it did not.
+
+**8. Deny-at-login backstop — PR4b (#3066), SHIPPED 2026-08-13. The SAML
+analogue of §4/PR3 above, same shape, same fail-closed posture.**
+`ScimStore::saml_linked_resource_active(entity_id, name_id)` resolves the
+identity in one query — a LEFT JOIN from `saml_identity_links` to
+`scim_resources`, reusing §4's `LinkedResourceState` tri-state shape
+byte-for-byte — and, exactly like §4's `linked_resource_active`: an INNER
+join would collapse an orphaned link (the `scim_resources` row hard-DELETEd,
+`saml_identity_links` not FK-cascaded) into "no rows," which reads as "no
+link" and would let a fully-deprovisioned identity re-authenticate — the
+LEFT JOIN closes that.
+
+`saml::saml_login_denied_deprovisioned(scim_store, entity_id, name_id)`
+(`saml_scim_link.{hpp,cpp}`) is the single pure decision function both call
+sites in `/saml/acs` share, mirroring §4's `oidc_login_denied_deprovisioned`
+structure exactly:
+
+1. **Primary check**, immediately after `saml_principal` is computed and
+   strictly **before** any mutation below it (link formation, session mint)
+   — a denied login leaves no side effect behind.
+2. **Post-mint re-check**, run again immediately after
+   `create_saml_session` and strictly **before** the `Set-Cookie` header is
+   written. If a concurrent SCIM deactivate/DELETE landed in the window
+   between the primary check and the mint, this re-check catches it: it
+   calls `AuthManager::invalidate_user_sessions` on the session just minted
+   and denies — self-healing the check-then-mint race the identical way §4
+   does for OIDC, without holding a cross-store lease over the mint.
+
+Unlike the OIDC side, there is no separate `link_claim_value` parameter —
+SAML has exactly one join key (the NameID itself, see item 3 above), so the
+orphaned-branch reprovision check (`find_unique_active_by_external_id`)
+always resolves against `name_id`. The reprovision distinction is scoped to
+the orphaned branch only, for the identical reason §4 states: the
+`external_id` unique index means an explicitly-deactivated (row-present)
+resource can have no active same-externalId sibling, so the deactivated
+branch stays an unconditional deny.
+
+Both deny sites emit the **byte-identical** `/login?error=saml` redirect
+every other SAML failure branch in `/saml/acs` uses (no "deprovisioned"
+wording reaches the browser — no oracle, mirroring §4's U6 fix exactly), a
+server-side audit row `auth.saml.deprovisioned_denied` (`result=failure`,
+principal = the `saml:<entity_id>#<NameID>` principal), and increment the
+pre-seeded counter `yuzu_auth_saml_deprovisioned_denied_total`. `detail`
+distinguishes the two denial causes the same way §4's OIDC row does:
+`reason=linked_scim_resource_inactive;scim_id=<id>` when an actually
+resolved (deactivated or orphaned-not-reprovisioned) SCIM resource drove the
+denial, versus `reason=scim_store_unavailable` (no `scim_id`) on the
+fail-closed store-unavailable path. On the post-mint re-check path only,
+`detail` additionally carries `;post_mint_recheck=true;sessions_invalidated=
+<N>`, and `;db_persisted=false` if the session-revoke write itself did not
+persist.
+
+PR4b inherits the `--scim-enable` gate for free: `/saml/acs` reads the same
+gated `AuthRoutes::scim_store_` member the primary/deprovision SCIM routes
+already null-check, so with SCIM off `saml_login_denied_deprovisioned`
+receives a null store and unconditionally proceeds — no feature-off SAML
+login outage, and no new availability coupling beyond the one §4 already
+introduces for OIDC while `--scim-enable` is on.
+
+**The honest guarantee, exactly as scoped as §4's for OIDC.** Deny-at-login
+**fully closes** the dominant case for SAML too: a re-login against an
+**already-completed** deprovision is refused, unconditionally. It
+**narrows, but does not eliminate by construction**, the same
+in-flight-deprovision race §4 describes for OIDC, for the identical
+reasons (the cross-store-lock deadlock hazard, §3 above) — bounded by the
+post-mint re-check in the overwhelming majority of timings, with a
+microsecond check-then-mint gap remaining theoretically possible. SAML has
+no API/MCP token validate-cache to bound a slipped session against (SAML
+mints no tokens); a session that does slip through is bounded only by the
+session's own TTL, the identical residual §"Known residuals" states for a
+slipped OIDC session. **Test coverage caveat, stated once and applying to
+both providers' ACS/callback wiring:** there is no mock-IdP integration
+harness in this codebase exercising a live `/saml/acs` (or `/auth/callback`)
+round-trip end to end — `saml_login_denied_deprovisioned` and
+`oidc_login_denied_deprovisioned` are each covered by direct unit tests
+against the decision function (`test_saml_scim_link.cpp`,
+`test_oidc_scim_link.cpp`), and the two call sites' wiring into the route
+handler (ordering relative to link formation/mint/`Set-Cookie`, the audit
+detail construction, the redirect) is verified by code inspection rather
+than an end-to-end test exercising a real assertion/token exchange. This is
+an existing, not newly-introduced, test-coverage limitation shared by both
+providers' deny-at-login backstops.
 
 ## Review provenance
 Rev 2 folds: architect B1 (`oid` unbuilt) + B2 (overload infeasible) + lease-nesting/reorder/resolver/index/helper notes; security-guardian F1 (D1), F2 (D2), F3 (single-issuer precondition, constraint 5), F4 (`oid`, constraint 3), F5 (constraint 4 wording), F6 (60s residual), F7 (generic deny redirect). Both reviews called the core reconciliation idea sound; the defects were in the provenance interaction and the fail-loud realizability, now surfaced as D1/D2.
@@ -221,3 +301,9 @@ The SAML addendum (PR4a, 2026-08-13) folds one architect (codex-sol) BLOCK
 from its plan review: the NameID-Format gate above (item 3) — an earlier
 draft of the plan treated any NameID as a safe join key, which the BLOCK
 correctly identified as unsafe for `transient` NameIDs.
+
+PR4b (2026-08-13) closed the addendum's item 7 residual by porting §4's
+deny-at-login backstop to SAML unchanged in shape (item 8 above) — no new
+review findings against the design beyond the ones §4/PR3 already resolved
+for OIDC; the LEFT-join/fail-closed/orphan-reprovision invariants carried
+over directly.

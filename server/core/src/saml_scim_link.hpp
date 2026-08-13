@@ -35,6 +35,7 @@
 /// that login — the documented residual (see docs/adr/2001-scim-oidc-
 /// identity-linkage.md).
 
+#include <optional>
 #include <string>
 
 namespace yuzu {
@@ -81,5 +82,83 @@ namespace yuzu::server::saml {
 void link_saml_login_to_scim(ScimStore* scim_store, const std::string& entity_id,
                              const std::string& name_id, const std::string& name_id_format,
                              yuzu::MetricsRegistry* metrics = nullptr);
+
+/// ADR-2001 §4 (PR4b) — the deny-at-login backstop's resolve-and-decide
+/// result. SAML analogue of `oidc_scim_link.hpp`'s `OidcLoginDenyDecision`
+/// — same shape, same field-for-field meaning: `denied` is the single
+/// question the login path needs answered; `scim_id` — when the decision
+/// came from an actual linked identity (deactivated or orphaned) — names
+/// which SCIM resource drove a DENY, and is `nullopt` on every PROCEED
+/// outcome and on the store-unavailable DENY (there is no resource to
+/// name — the store could not be asked).
+struct SamlLoginDenyDecision {
+    bool denied{false};
+    std::optional<std::string> scim_id;
+};
+
+/// ADR-2001 §4 (PR4b) — the deny-at-login backstop's resolve-and-decide
+/// step, SAML analogue of `oidc_scim_link.hpp`'s
+/// `oidc_login_denied_deprovisioned`. Resolves `(entity_id, name_id)` via
+/// `ScimStore::saml_linked_resource_active` and collapses its state into
+/// the single question the login path needs: MUST this login be denied,
+/// and if so, which SCIM resource drove it? Called from `/saml/acs`
+/// TWICE — once before any mint, once again immediately after (the same
+/// codex-caught check-then-mint race OIDC closes) — so both call sites
+/// share exactly one decision function.
+///
+/// Unlike the OIDC side, there is no separate `link_claim_value` parameter:
+/// SAML has exactly one join key (the NameID) and no claim-selection knob
+/// (see the file header), so the reprovision check below always resolves
+/// against `name_id` itself — the SAME value used to resolve
+/// `saml_linked_resource_active` above it.
+///
+/// `denied == true` iff:
+///  - `scim_store` is present but could not answer
+///    (`saml_linked_resource_active`'s OUTER `nullopt`) — fail-closed,
+///    never treated as "no link"; `scim_id` is `nullopt` (no resource to
+///    name — the caller's audit row must say "store unavailable", never
+///    "resource inactive", mirroring OIDC's U6 fix);
+///  - the linked resource resolved DEACTIVATED (engaged, `scim_id` set,
+///    `active == false`) — `scim_id` carries the linked resource's id;
+///  - the linked resource resolved ORPHANED (engaged, `scim_id` set,
+///    `active == nullopt` — the `scim_resources` row was hard-deleted) AND
+///    no ACTIVE resource exists for `name_id`
+///    (`ScimStore::find_unique_active_by_external_id` returns `nullopt`) —
+///    i.e. genuinely deprovisioned, not re-provisioned; `scim_id` carries
+///    the stale (now-gone) linked resource's id.
+///
+/// `denied == false` (`scim_id` always `nullopt`) iff:
+///  - `scim_store` is null — SCIM/ADR-2001 linkage is not configured at
+///    all (mirrors `link_saml_login_to_scim`'s null-safety: no store means
+///    no link could ever have formed, so there is nothing to deny against
+///    — "feature off", not "store degraded");
+///  - no `saml_identity_links` row exists for this identity (engaged,
+///    `scim_id == nullopt`) — an unlinked SAML identity is not a
+///    deprovisioned SCIM user;
+///  - the linked resource resolved ACTIVE (engaged, `active == true`);
+///  - the linked resource resolved ORPHANED, but an ACTIVE resource now
+///    exists for `name_id` — the identity was DELETE'd then re-CREATE'd
+///    under a new `scim_id` (a returning, re-provisioned user). PROCEED
+///    lets the login continue; the imminent `link_saml_login_to_scim` call
+///    repoints the stale `(entity_id, name_id)` link row to the new
+///    `scim_id`, so the NEXT login resolves clean via the ordinary
+///    active-link path.
+///
+/// The INACTIVE (deactivated, not orphaned) branch deliberately does NOT
+/// run this reprovision check — mirrors the OIDC helper's rationale
+/// exactly (see `oidc_scim_link.hpp`): reactivation is `active:true` on
+/// the SAME `scim_id`, and the partial-unique index on
+/// `scim_resources.external_id` prevents a second active resource sharing
+/// the externalId while the inactive row still holds it.
+///
+/// Pure decision function: no audit, no metrics, no redirect — the caller
+/// owns every side effect of a DENY (the byte-identical `/login?error=saml`
+/// redirect, the `auth.saml.deprovisioned_denied` audit row carrying
+/// `scim_id` when known, the `yuzu_auth_saml_deprovisioned_denied_total`
+/// bump, and — on the post-mint call only — invalidating the session just
+/// minted).
+[[nodiscard]] SamlLoginDenyDecision
+saml_login_denied_deprovisioned(ScimStore* scim_store, const std::string& entity_id,
+                                const std::string& name_id);
 
 } // namespace yuzu::server::saml

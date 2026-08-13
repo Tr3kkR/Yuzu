@@ -78,6 +78,7 @@ Every SAML and OIDC login attempt — success or failure — increments its prov
 | `yuzu_auth_saml_login_total{result, role}` | counter | SAML `/saml/acs` outcomes. `result` is `ok` or `error`. `role` is the resolved session role (`admin` / `user`) on `result="ok"`, and `role="none"` on every `result="error"` series (no session was ever created, so there is no role to attribute the failure to). |
 | `yuzu_auth_oidc_login_total{result, role}` | counter | OIDC `/auth/callback` outcomes. Same `{result, role}` shape as the SAML counter above — `role="none"` on all error-path increments (IdP-returned error, missing `code`/`state`, and token-exchange/claim-validation failure). |
 | `yuzu_auth_oidc_deprovisioned_denied_total` | counter, no labels | ADR-2001 §4/PR3 — the deny-at-login backstop: an OIDC login was refused, at either the primary pre-mint check or the post-mint re-check in `/auth/callback`, because the identity's linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the `ScimStore` could not answer — fail-closed). A **non-zero value may mean EITHER a deprovisioned federated identity attempted to re-authenticate, OR a ScimStore/Postgres outage denied logins fail-closed — correlate with `yuzu_pg_acquire_wait_seconds`/`yuzu_pg_acquire_timeout_total` and the audit `reason=` (`linked_scim_resource_inactive` vs `scim_store_unavailable`) to distinguish.** Operator action: confirm the deprovision was intentional (expected after an offboarding); if it recurs against the same identity, the user or their IdP session may not yet be aware of the termination — no code action is needed, this is the backstop working as designed. A sustained non-zero rate with no matching recent SCIM deprovision may instead indicate `ScimStore`/Postgres availability trouble (the store-unavailable path also denies and bumps this counter) — correlate with Postgres health before assuming every increment is a legitimate deny. See "SCIM deprovision-linkage metrics (ADR-2001, CC6.8)" below and `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
+| `yuzu_auth_saml_deprovisioned_denied_total` | counter, no labels | ADR-2001 §4/PR4b — the SAML analogue of the row above: a SAML login was refused, at either the primary pre-mint check or the post-mint re-check in `POST /saml/acs`, because the identity's linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the `ScimStore` could not answer — fail-closed). Same dual-cause caveat as the OIDC counter: a non-zero value may mean either a deprovisioned federated identity attempted to re-authenticate, or a `ScimStore`/Postgres outage denied logins fail-closed — correlate with `yuzu_pg_acquire_wait_seconds`/`yuzu_pg_acquire_timeout_total` and the audit `reason=` (`linked_scim_resource_inactive` vs `scim_store_unavailable`) to distinguish. Operator action is identical to the OIDC counter's. See "SCIM deprovision-linkage metrics (ADR-2001, CC6.8)" below and `docs/auth-architecture.md` "SCIM ↔ SAML identity linkage". |
 | `yuzu_saml_group_cap_truncated_total` | counter, no labels | Bumped once per SAML login (not once per dropped group value) when the assertion's `groups` attribute exceeded the 64-value cap and real group values were dropped. A non-zero rate means some SAML-asserted group-based RBAC role mappings may not be taking effect for the affected principal — check the assertion's attribute statement. OIDC has no equivalent counter: OIDC group claims are bounded by JWT/ID-token size rather than a fixed value-count cap, so the two providers hit different limits and are not expected to have parity here. |
 
 ## SCIM deprovision-linkage metrics (ADR-2001, CC6.8)
@@ -89,10 +90,12 @@ and both pair with a dedicated audit action,
 `scim.user.deprovision_role_refused_with_link` — see
 `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision"
 and `docs/user-manual/scim-provisioning.md` "SCIM ↔ OIDC identity linkage"
-for the full operator runbook. A third ADR-2001 counter,
-`yuzu_auth_oidc_deprovisioned_denied_total` — the §4/PR3 deny-at-login
-backstop firing at OIDC login rather than at SCIM deprovision time — lives
-in "SSO login metrics" above, next to its sibling `yuzu_auth_oidc_login_total`.
+for the full operator runbook. Two further ADR-2001 counters,
+`yuzu_auth_oidc_deprovisioned_denied_total` (§4/PR3) and
+`yuzu_auth_saml_deprovisioned_denied_total` (§4/PR4b) — the deny-at-login
+backstops firing at OIDC/SAML login rather than at SCIM deprovision time —
+live in "SSO login metrics" above, next to their siblings
+`yuzu_auth_oidc_login_total`/`yuzu_auth_saml_login_total`.
 
 | Metric | Type | Meaning |
 |---|---|---|
