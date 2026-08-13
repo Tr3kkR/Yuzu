@@ -24,8 +24,12 @@
   completing that same job), that's a safe no-op — the database's current value is kept and the
   drift is logged at warning level for visibility, without blocking the boot. If instead the
   LEGACY file is further along than the database (e.g. after a rollback to the previous release
-  runs against this same file and genuinely progresses the job, then rolls forward again), the
-  boot fails closed the same as an identity mismatch, so that progress is never silently lost.
+  runs against this same file and genuinely progresses the job, then rolls forward again), or the
+  two sides reached DIFFERENT final outcomes (e.g. one shows `completed`, the other `failed`) even
+  without one being simply "further along," the boot fails closed the same as an identity
+  mismatch, so that progress or disagreement is never silently lost or papered over. A legacy
+  job's status is also validated before it can reach the database at all — an unrecognised status
+  (e.g. from a hand-edited legacy file) fails the boot closed rather than being silently accepted.
   `POST /api/deployment-jobs`'s `target_host` validation (unchanged, already live)
   also now rejects a leading or trailing `-` — not a valid DNS label, and defense-in-depth
   against a future SSH-option-injection shape (`-oProxyCommand=...`) for a not-yet-built `ssh`

@@ -173,11 +173,42 @@ lifecycle further than Postgres ever saw (Postgres isn't written to while rolled
 keeping Postgres's less-advanced value on roll-forward — as "same identity, different lifecycle is
 always benign" would suggest — would discard that real progress with only a WARNING log as
 evidence, inside a legacy-file retention window that itself expires after one release. Fixed:
-the direction check above treats a legacy row ranked strictly ahead of Postgres's current value as
-the suspicious case and fails the boot closed, same remediation shape as an identity mismatch. A
-same-rank divergence among the three terminal states (e.g. `completed` vs. `failed` with no
-ordering between them) is treated as the benign, Postgres-wins case — accepted as a narrow edge
-case matching this store's general "trust the live value" posture, not specifically re-litigated.
+the direction check treats a legacy row ranked strictly ahead of Postgres's current value as
+the suspicious case and fails the boot closed, same remediation shape as an identity mismatch.
+
+**Finding UP-E / cpp-expert Finding 1 (hardening round 5): a same-rank divergence among the three
+terminal states was initially left as the benign, Postgres-wins case** — accepted in the paragraph
+above as a narrow edge case matching this store's general "trust the live value" posture. That
+acceptance did not survive review: `completed` vs. `failed` vs. `cancelled` genuinely disagreeing
+about which terminal outcome occurred is not "who's further along" (rank has no opinion between
+tied values), it's a contradiction about what actually happened, produced by the exact same
+rollback mechanism Finding A's fix already treats as real. Two independent reviewers (cpp-expert,
+unhappy-path) found this in the same round. Fixed: a same-rank, different-status pair between the
+terminal states now fails the boot closed too, alongside the strictly-ahead case above — a
+same-status tie (differing only by timestamp or error text) remains the benign no-op it always
+was.
+
+**Finding UP-F (hardening round 5): the shared fail-closed remediation message gave backwards
+guidance for the new legacy-ahead/terminal-disagreement cases.** It read "inspect/fix the
+referenced row in the retained read-only legacy file" for every failure class — written when every
+reachable failure had the legacy file as the plausible suspect. Finding A's fix inverted that for
+its own case: `failure_detail` there names Postgres as the stale/contradicted side. An operator
+following the old wrapper text literally could edit the legacy file to match Postgres, destroying
+the only evidence of what the pre-migration binary actually did — laundered through the exact
+remediation path the message recommended. Fixed: the wrapper no longer asserts which side to
+trust; it defers to the specific guidance already embedded in `failure_detail` and keeps only the
+mechanical how-to-inspect step.
+
+**Finding DW-8 (hardening round 5): the legacy file's `status` column was read with no
+validation.** `create_job`/`update_status` both reject anything outside the 5 known status values
+before it reaches Postgres — but the legacy-file read loop in `migrate_from_sqlite` didn't, so a
+hand-edited or corrupted legacy file's garbage status could land in Postgres on a row's first
+(non-conflicting) insert. Because `lifecycle_rank`'s unrecognised-value fallback is already
+maximal, a corrupted stored value could then never be seen as "behind" any future legitimate
+legacy row, permanently masking the corruption as benign. Fixed: the legacy-read loop now
+validates each row's status against `lifecycle_rank`'s own maximal-fallback sentinel before it can
+reach Postgres at all, before any Postgres round trip — the same fail-closed-before-Postgres
+posture the mid-scan-corruption guard already uses.
 
 `canonicalize_legacy_jobs`'s field serialization uses length-prefixed fields
 (`<byte-length>:<bytes>`, the standard netstring/bencode technique) rather than raw `\x1f`/`\x1e`
@@ -185,16 +216,19 @@ delimiter bytes: a delimiter byte inside a field's own content could shift a row
 boundary enough to make two DIFFERENT row sets hash identically, which the length-prefixed
 encoding closes structurally (verified by a dedicated shifted-field-boundary regression test).
 
-**Hardening history:** this design went through four review rounds before landing — an
+**Hardening history:** this design went through five review rounds before landing — an
 adversarial PR review (fjarvis: Kimi+Codex) found the missing `PQntuples()` check above; a Gate 8
 re-review (security-guardian+docs-writer) found the first fix over-corrected to fail closed on
 ANY conflict, including a benign identical re-encounter; a second Gate 8 re-review (unhappy-path)
 found that fix in turn still failed closed on ordinary lifecycle progress in a legitimate
 multi-replica boot sequence, which is what the identity/lifecycle partition resolved; a third
 Gate 8 re-review (unhappy-path again) found that partition was itself directionless — Finding A
-above — which the status-order direction check resolves. Each round is recorded in its governance
-ledger fragment (`governance.d/deployment-store-pg*.jsonl`); this section states only the design
-that shipped.
+above — which the status-order direction check resolves; a fourth Gate 8 re-review (cpp-expert,
+cpp-safety, unhappy-path, docs-writer, consistency-auditor) found the direction check's own gaps —
+Findings UP-E, UP-F, and DW-8 above — which the terminal-disagreement check, the corrected
+remediation message, and the legacy-status validation resolve respectively. Each round is recorded
+in its governance ledger fragment (`governance.d/deployment-store-pg*.jsonl`); this section states
+only the design that shipped.
 
 **Trade-off accepted:** unlike `RbacStore` (which stats the legacy path cheaply before touching
 Postgres, and skips entirely once the file is moved aside post-migration), this design reads the
