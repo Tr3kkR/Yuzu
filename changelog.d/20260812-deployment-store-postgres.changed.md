@@ -13,7 +13,16 @@
   as a startup log line naming the exact file and a repair-or-move-aside remediation, not a
   practical operational concern. Similarly, if two replicas' legacy files disagree on the
   content of a job sharing the same id (e.g. a data directory cloned or restored to provision a
-  second replica, then diverged), the backfill compares the two and fails the boot closed rather
-  than silently keeping whichever one landed first — identical-content rows are always a silent,
-  safe no-op; only a genuine divergence stops the boot, again with the offending id named in the
-  startup log.
+  second replica, then diverged), the backfill compares the two: a difference in the job's
+  identity (target host/OS/method/creation time — fields that never change once a job exists)
+  fails the boot closed with the offending id named in the startup log, since that shape is
+  provably outside the model. A difference confined to the job's lifecycle (status/timestamps/
+  error — fields a job's own progress legitimately changes after migration, e.g. a slower-booting
+  replica whose legacy file predates a sibling replica completing that same job) is a safe no-op:
+  the database's current value is kept and the drift is logged at warning level for visibility,
+  without blocking the boot. `POST /api/deployment-jobs`'s `target_host` validation (unchanged, already live)
+  also now rejects a leading or trailing `-` — not a valid DNS label, and defense-in-depth
+  against a future SSH-option-injection shape (`-oProxyCommand=...`) for a not-yet-built `ssh`
+  method executor. This applies to the already-released endpoint independent of the Postgres
+  migration; a caller currently passing such a hostname (unusual — RFC 1123 already disallows it
+  as a DNS label) now gets `400` where it previously succeeded.

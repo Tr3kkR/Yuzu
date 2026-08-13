@@ -547,7 +547,7 @@ TEST_CASE("migrate_from_sqlite: a sourceless (fileless) boot never blocks a late
 
 // Regression test for gov fjarvis BLOCKING: a job id already present in
 // Postgres (from an EARLIER, successful backfill of a DIFFERENT legacy
-// file) with DIFFERENT content than a LATER legacy file's row sharing that
+// file) with DIFFERENT IDENTITY than a LATER legacy file's row sharing that
 // same id must never be silently discarded by `ON CONFLICT (id) DO
 // NOTHING` while the later file's fingerprint gets stamped complete anyway
 // — the exact "trust PGRES_COMMAND_OK to mean YOUR row won" anti-pattern
@@ -556,9 +556,13 @@ TEST_CASE("migrate_from_sqlite: a sourceless (fileless) boot never blocks a late
 // worked example that motivated the rule). This can happen in practice via
 // two legacy files that share an id by construction — e.g. one replica's
 // data directory cloned to provision another, then each independently
-// mutated before either migrates.
+// mutated before either migrates. The two rows below differ on
+// `target_host` — an IDENTITY field (deployment_store.cpp's design note
+// above migrate_from_sqlite) — which is what makes this the fail-closed
+// case rather than the benign lifecycle-drift no-op covered separately
+// below.
 TEST_CASE("migrate_from_sqlite fails closed (not silently) when a legacy row's id already "
-          "exists in Postgres with different content",
+          "exists in Postgres with different identity",
           "[deployment_store][pg][backfill]") {
     YUZU_REQUIRE_PG_DB_TPL(db, deployment_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -677,6 +681,92 @@ TEST_CASE("migrate_from_sqlite treats an identical-content id conflict as a beni
     REQUIRE(new_got.has_value());
     REQUIRE(new_got->has_value());
     CHECK((*new_got)->target_host == "new.example.com");
+}
+
+// Regression test for gov unhappy-path UP-1 (SHOULD, hardening round 3): a
+// job already migrated once and then legitimately progressed via live
+// traffic (update_status) must NOT be treated as a content conflict when a
+// legacy file whose snapshot predates that progress is backfilled again —
+// e.g. a slower-booting replica sharing the same original legacy content,
+// re-migrating after a restart, while a sibling replica already advanced
+// the SAME job's status. The prior design compared status/started_at/
+// completed_at/error as part of "identical content" and would have failed
+// this boot closed on every retry, forever, for a scenario that is not
+// corruption. The fix: only IDENTITY fields (target_host/os/method/
+// created_at) gate fail-closed; a LIFECYCLE-only difference is a benign
+// no-op that keeps Postgres's live value and logs a WARNING instead of
+// blocking the boot.
+TEST_CASE("migrate_from_sqlite treats a lifecycle-only difference as a benign no-op, keeps "
+          "Postgres's live value, and warns rather than failing closed",
+          "[deployment_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deployment_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string shared_id = "9999999999999999";
+
+    // First legacy file: the job as originally created, still pending.
+    DeploymentJob original;
+    original.id = shared_id;
+    original.target_host = "progressed.example.com";
+    original.os = "linux";
+    original.method = "manual";
+    original.status = "pending";
+    original.created_at = 4000;
+    auto first_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_lifecycle_first") / "deployment-jobs.db";
+    std::filesystem::create_directories(first_path.parent_path());
+    write_legacy_sqlite_db(first_path, {original});
+    REQUIRE(store.migrate_from_sqlite(first_path));
+
+    // Live traffic on THIS replica (standing in for "some replica") advances
+    // the job past what the legacy snapshot shows — the ordinary lifecycle
+    // update_status/cancel_job already cover elsewhere in this file.
+    REQUIRE(store.update_status(shared_id, "completed").has_value());
+    auto progressed = store.get_job(shared_id);
+    REQUIRE(progressed.has_value());
+    REQUIRE(progressed->has_value());
+    CHECK((*progressed)->status == "completed");
+
+    // A SECOND legacy file — different overall content (so its fingerprint
+    // differs and it reaches the per-row conflict path), same shared id,
+    // SAME identity as `original`, but its own lifecycle snapshot still
+    // shows the PRE-progress state. This models a sibling replica's stale
+    // legacy copy, or this same replica re-migrating from an unmoved legacy
+    // file after a restart.
+    DeploymentJob stale_snapshot = original; // identity fields byte-identical
+    DeploymentJob padding_job;
+    padding_job.id = "8888888888888888";
+    padding_job.target_host = "padding.example.com";
+    padding_job.os = "linux";
+    padding_job.method = "manual";
+    padding_job.status = "pending";
+    padding_job.created_at = 4001;
+    auto second_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_lifecycle_second") / "deployment-jobs.db";
+    std::filesystem::create_directories(second_path.parent_path());
+    write_legacy_sqlite_db(second_path, {stale_snapshot, padding_job});
+
+    std::string captured;
+    {
+        LogCapture capture;
+        CHECK(store.migrate_from_sqlite(second_path)); // succeeds — never fails closed
+        captured = capture.str();
+    }
+    CHECK(captured.find("already migrated with lifecycle progress") != std::string::npos);
+
+    // Postgres's live (more advanced) value survives untouched — the stale
+    // legacy snapshot never reverts it.
+    auto after = store.get_job(shared_id);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->status == "completed");
+
+    // The genuinely new sibling row in the same file still lands.
+    auto padding_got = store.get_job(padding_job.id);
+    REQUIRE(padding_got.has_value());
+    REQUIRE(padding_got->has_value());
 }
 
 // Regression test for the fingerprint canonicalization's injectivity (gov

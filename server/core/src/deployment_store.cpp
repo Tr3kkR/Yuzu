@@ -204,34 +204,61 @@ DeploymentStore::DeploymentStore(pg::PgPool& pool) : pool_(pool) {
     open_ = true;
 }
 
-// ── Backfill (ADR-0009) ──────────────────────────────────────────────────────
+// ── Backfill (ADR-0043) ───────────────────────────────────────────────────
 //
-// Content-fingerprinted, not a single fleet-wide completion flag
-// (adversarial-review hardening round, 2026-08-12 — Kimi+Codex independently
-// found, then jointly confirmed under cross-examination, that the original
-// single-row marker let a fileless replica's "nothing to backfill" stamp
-// permanently wave through a DIFFERENT, holder replica's real legacy data:
-// docs/postgres-store-playbook.md "Local source absence never creates
-// terminal migration state on its own"). Completion is now tracked PER
-// DISTINCT LEGACY-FILE CONTENT: a fileless (or schema-less/empty) replica
-// computes and stamps the sourceless sentinel; a replica holding real rows
-// computes a SHA-256 fingerprint of ITS OWN content and checks/stamps THAT
-// specific value. A holder's real fingerprint can never be satisfied by a
-// sourceless stamp, so it always proceeds to copy its own data — the
-// anti-pattern is closed structurally, not by ordering the two checks.
+// Content-fingerprinted, not a single fleet-wide completion flag: completion
+// is tracked PER DISTINCT LEGACY-FILE CONTENT, so a fileless replica's
+// "nothing to backfill" stamp can never satisfy a holder replica's real data
+// (docs/postgres-store-playbook.md "Local source absence never creates
+// terminal migration state on its own"). A fileless (or schema-less/empty)
+// replica computes and stamps the sourceless sentinel; a replica holding
+// real rows computes a SHA-256 fingerprint of its own content (length-
+// prefixed field encoding — see canonicalize_legacy_jobs below, chosen for
+// provable injectivity over raw-delimiter encoding) and checks/stamps that
+// specific value.
 //
-// Deliberately simpler than RbacStore's post-#2703 reference shape (single
-// marker + stored fingerprint + refuse-on-mismatch/refuse-on-sourceless-
-// stored branches, docs/ops-runbooks/rbac-store-backfill-recovery.md): that
-// complexity exists there because RBAC identifiers (role/group names) are
-// small and human-chosen, so a late real backfill risks silently clobbering
-// live post-cutover grants sharing the same name. DeploymentStore's `id` is
-// a 64-bit random surrogate key (generate_id()) — collision across
-// independently-generated ids is practically impossible, so every replica's
-// real content is safe to copy independently and idempotently
-// (`ON CONFLICT (id) DO NOTHING`) whenever its OWN fingerprint hasn't been
-// seen before; there is no clobber risk to reason about and no
-// operator-adjudicated refuse path needed.
+// Per-row conflict handling on `id` (`ON CONFLICT (id) DO NOTHING`)
+// partitions the compared columns into two classes, because they behave
+// differently after a row is first migrated:
+//
+//   - IDENTITY (target_host, os, method, created_at): set once at INSERT
+//     and never mutated afterward — update_status/cancel_job (below) touch
+//     only the lifecycle columns. A conflicting row whose identity differs
+//     is therefore provably outside this store's model (corruption, a
+//     hand-edited legacy file, or an astronomical collision on the random
+//     64-bit generate_id() surrogate key) and fails the boot closed, naming
+//     the offending id.
+//   - LIFECYCLE (status, started_at, completed_at, error): legitimately
+//     changes post-migration via live traffic on whichever replica migrated
+//     the row first. A legacy snapshot showing an earlier lifecycle state
+//     for the SAME identity is the ordinary shape of that progress, not a
+//     conflict — Postgres already holds the live, authoritative value for
+//     that id, so this is a benign no-op. The drift is WARNING-logged
+//     (naming both values) rather than silently swallowed, so it stays
+//     visible to an operator; it never blocks the boot.
+//
+// Deliberately simpler than RbacStore's post-#2703 reference shape (refuse
+// on ANY column mismatch, docs/ops-runbooks/rbac-store-backfill-recovery.md):
+// RBAC identifiers are small and human-chosen, so two independently-
+// authored grants can legitimately collide on name and both need operator
+// adjudication. DeploymentStore's id is random and machine-generated, so a
+// shared id is always the SAME logical job observed twice (via cloned or
+// restored legacy files sharing a common origin, or a replica re-reading
+// its own already-migrated file) — never two independently-valuable rows
+// that happen to collide — which is what makes "identity fixed, lifecycle
+// may have moved on" the correct comparison instead of a byte-for-byte one.
+//
+// SQL shape note: this uses plain `DO NOTHING` plus a separate read-back
+// `SELECT` and an application-level comparison, which deliberately diverges
+// from docs/postgres-store-playbook.md's `DO UPDATE ... WHERE <condition>
+// RETURNING` recipe for "two writers can legitimately agree on identical
+// content." Backfill-vs-backfill is lock-safe (Postgres blocks the
+// conflicting INSERT until the winner commits), so the only live race
+// window is against an already-serving sibling's normal traffic on that
+// exact row between the failed insert and the read-back — worst case a
+// spurious fail-closed boot on a genuine identity mismatch, never silent
+// data loss, so the simpler two-statement shape was kept over the atomic
+// recipe.
 //
 // Trade-off accepted: this reads the local legacy file (if present) on
 // EVERY boot rather than short-circuiting on a single marker, because
@@ -451,17 +478,15 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
 
             // Conflict: a row with this id already exists. An `ON CONFLICT`
             // match is on id ALONE — Postgres never compares the other
-            // columns — so this does NOT by itself mean the content differs
-            // (gov security-guardian/docs-writer SHOULD, hardening round 2:
-            // the original fix asserted "DIFFERENT content" unconditionally,
-            // which is false whenever a superset legacy file re-backfills
-            // rows that were already correctly migrated). Read the existing
-            // row back and compare field-by-field before deciding: identical
-            // content is a genuine, benign "already migrated this exact
-            // row" no-op (the same class of agreement the fingerprint
-            // marker below already trusts); differing content is the real
-            // anomaly this whole check exists to catch, and THAT fails
-            // closed with an honestly-earned message.
+            // columns — so this does NOT by itself mean the content differs.
+            // Read the existing row back and compare it in two classes (see
+            // the design note above migrate_from_sqlite): an IDENTITY
+            // mismatch (target_host/os/method/created_at) is provably
+            // outside this store's model and fails closed; a LIFECYCLE-only
+            // difference (status/started_at/completed_at/error) is the
+            // ordinary shape of post-migration progress and is a benign
+            // no-op — Postgres's live value is kept, and the drift is
+            // WARNING-logged rather than silently swallowed.
             std::string existing_sql = std::string("SELECT ") + kJobCols +
                                        " FROM deployment_store.deployment_jobs WHERE id=$1";
             pg::PgResult existing =
@@ -477,27 +502,41 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
                 return false;
             }
             const DeploymentJob stored = read_job(existing.get(), 0);
-            const bool identical =
+            const bool identity_matches =
                 stored.target_host == j.target_host && stored.os == j.os &&
-                stored.method == j.method && stored.status == j.status &&
-                stored.created_at == j.created_at && stored.started_at == j.started_at &&
+                stored.method == j.method && stored.created_at == j.created_at;
+            if (!identity_matches) {
+                failure_detail =
+                    std::string("legacy deployment_jobs row id='") + j.id +
+                    "' already exists with DIFFERENT identity (stored: target_host='" +
+                    stored.target_host + "' os='" + stored.os + "' method='" + stored.method +
+                    "' created_at=" + std::to_string(stored.created_at) +
+                    "; legacy: target_host='" + j.target_host + "' os='" + j.os +
+                    "' method='" + j.method + "' created_at=" + std::to_string(j.created_at) +
+                    ") — refusing to silently discard it";
+                spdlog::error("DeploymentStore::migrate_from_sqlite: row {} conflicts with "
+                              "different IDENTITY — refusing to stamp a backfill that would "
+                              "silently discard it",
+                              j.id);
+                return false;
+            }
+            const bool lifecycle_matches =
+                stored.status == j.status && stored.started_at == j.started_at &&
                 stored.completed_at == j.completed_at && stored.error == j.error;
-            if (identical) {
+            if (lifecycle_matches) {
                 spdlog::debug("DeploymentStore::migrate_from_sqlite: row {} already present "
                               "with identical content, skipping (benign no-op)",
                               j.id);
-                continue;
+            } else {
+                spdlog::warn(
+                    "DeploymentStore::migrate_from_sqlite: row {} already migrated with "
+                    "lifecycle progress since this legacy snapshot was taken (legacy "
+                    "status='{}' vs current status='{}') — keeping the current Postgres "
+                    "value; this is expected on a replica whose legacy file predates that "
+                    "progress, not a conflict",
+                    j.id, j.status, stored.status);
             }
-            failure_detail = std::string("legacy deployment_jobs row id='") + j.id +
-                             "' already exists with DIFFERENT content (stored: target_host='" +
-                             stored.target_host + "' status='" + stored.status +
-                             "'; legacy: target_host='" + j.target_host + "' status='" +
-                             j.status + "') — refusing to silently discard it";
-            spdlog::error("DeploymentStore::migrate_from_sqlite: row {} conflicts with "
-                          "different content — refusing to stamp a backfill that would "
-                          "silently discard it",
-                          j.id);
-            return false;
+            continue;
         }
         pg::PgResult marker = pg::exec_params(
             conn,

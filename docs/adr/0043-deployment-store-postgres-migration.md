@@ -114,55 +114,68 @@ why). The shipped design instead tracks completion PER DISTINCT LEGACY-FILE CONT
 - `server.cpp` treats a backfill failure exactly like a migration/open failure -- fatal,
   `startup_failed_`, never a serve-degraded state.
 
-**Deliberately simpler than `RbacStore`'s post-#2703 reference shape** (single marker + stored
-fingerprint + refuse-on-mismatch/refuse-on-sourceless-stored branches,
-`docs/ops-runbooks/rbac-store-backfill-recovery.md`): that complexity exists there because RBAC
-identifiers (role/group names) are small and human-chosen, so a late real backfill risks silently
-clobbering live post-cutover grants sharing the same name -- the reference implementation refuses
-and asks an operator to adjudicate rather than guess. `DeploymentStore`'s `id` is a 64-bit random
-surrogate key (`generate_id()`); collision across INDEPENDENTLY-generated ids across replicas is
-practically impossible. This is a deliberate, documented divergence from the reference shape
-(playbook: "copy the SHAPE... record which way you went"), not an oversight.
+**Deliberately simpler than `RbacStore`'s post-#2703 reference shape** (refuse on ANY column
+mismatch, `docs/ops-runbooks/rbac-store-backfill-recovery.md`): that complexity exists there
+because RBAC identifiers (role/group names) are small and human-chosen, so two independently-
+authored grants can legitimately collide on name and both need operator adjudication.
+`DeploymentStore`'s `id` is a 64-bit random surrogate key (`generate_id()`) — a shared id is
+never two independently-valuable rows that happen to collide, it is always the SAME logical job
+observed twice: via a replica re-reading its own already-migrated file, or via a data directory
+that was cloned or restored to provision a second replica and then diverged. This is a deliberate,
+documented divergence from the reference shape (playbook: "copy the SHAPE... record which way you
+went"), not an oversight.
 
-**Narrower correction (fjarvis PR review, pre-merge hardening round):** the independent-generation
-premise above does NOT cover ids that are shared by construction rather than independently
-generated -- a replica provisioned by cloning or restoring another replica's data directory (or an
-operator-driven merge of two previously-separate deployments) can produce two DIFFERENT legacy
-files sharing the SAME id with DIFFERENT content. The original backfill insert
-(`INSERT ... ON CONFLICT (id) DO NOTHING`) checked only `PGRES_COMMAND_OK`, which proves the
-statement executed, never that THIS row won the conflict -- exactly the anti-pattern
-`docs/postgres-store-playbook.md`'s "Anti-patterns reviewers reject" section documents
-(`AuditStore::stamp_complete`, ADR-0040, #2697, is the worked example that motivated the rule). A
-same-id row already present from an earlier backfill would silently no-op, and the fingerprint
-covering the LOSING file would still stamp complete, permanently. **Fixed**: the job insert now
-uses `RETURNING id` + `PQntuples()`.
+**Per-row conflict handling.** The backfill insert (`INSERT ... ON CONFLICT (id) DO NOTHING
+RETURNING id`) checks `PQntuples()`, not merely `PGRES_COMMAND_OK` — proving a statement executed
+is not proof this row won the conflict (the anti-pattern `docs/postgres-store-playbook.md`'s
+"Anti-patterns reviewers reject" section documents; `AuditStore::stamp_complete`, ADR-0040, #2697,
+is the worked example that motivated the rule). On a conflict, the existing row is read back and
+compared against the legacy row in two classes, because they behave differently once a row has
+been migrated once:
 
-**Second correction, same round:** the first cut of this fix treated ANY conflict as proof of
-differing content and failed closed unconditionally. That is not true -- `ON CONFLICT` matches on
-`id` ALONE, and the fix's own motivating scenario (a cloned/restored legacy file) typically
-produces a SUPERSET of already-migrated rows, most of them byte-identical to what's already in
-Postgres. Failing the whole boot on an identical-content re-encounter is an avoidable false
-refusal, and the original error text ("already exists ... with DIFFERENT legacy-file content")
-asserted a fact the code never checked. **Fixed further**: on a conflict, the existing row is read
-back and compared field-by-field against the legacy row. Identical content is a genuine, benign
-no-op -- the same class of agreement the fingerprint marker already trusts -- and the loop
-continues; differing content is the real anomaly, and THAT fails the whole transaction closed with
-an honestly-earned message naming both the stored and legacy values. This still does not need
-`RbacStore`'s refuse-on-mismatch COMPLEXITY (no operator-adjudicated "which value is right"
-branch) -- a genuine content divergence here is always treated as fail-closed, never resolved by
-guessing -- but it DOES need the underlying discipline the playbook already names as universal ("a
-'first writer wins' contract... needs `PQcmdTuples()`... or `RETURNING` + `PQntuples()`"), which
-the original cut of this store missed applying to the per-row insert (it was already applied
-correctly to the MARKER insert, where an identical fingerprint value is proof two writers
-legitimately agree on content and a `DO NOTHING` conflict there is a genuine no-op, not a
-data-loss risk).
+- **Identity** (`target_host`, `os`, `method`, `created_at`) is set once at INSERT and never
+  mutated afterward — `update_status`/`cancel_job` touch only the lifecycle columns below. A
+  conflicting row whose identity differs is therefore provably outside this store's model
+  (corruption, a hand-edited legacy file, or an astronomical id collision), and the whole backfill
+  transaction fails closed with a message naming both the stored and legacy identity values.
+- **Lifecycle** (`status`, `started_at`, `completed_at`, `error`) legitimately changes
+  post-migration via live traffic on whichever replica migrated the row first. A legacy snapshot
+  showing an earlier lifecycle state for the SAME identity is the ordinary shape of that progress,
+  not a conflict — Postgres already holds the live, authoritative value, so this is a benign
+  no-op. The drift is WARNING-logged (naming both values) so it stays visible rather than
+  silently swallowed, but it never blocks the boot.
 
-Also fixed in the same round: `canonicalize_legacy_jobs`'s field serialization moved from raw
-`\x1f`/`\x1e` delimiter bytes to length-prefixed fields (`<byte-length>:<bytes>`, the standard
-netstring/bencode technique) -- the delimiter-byte encoding was not injective over unconstrained
-legacy `TEXT` (a `\x1f` inside a field's own content could shift a row's apparent field boundary
-enough to make two DIFFERENT row sets hash identically). Fingerprint version bumped to `v2` to
-mark the encoding change (not a compatibility concern -- nothing has shipped with `v1` yet).
+This still does not need `RbacStore`'s refuse-on-mismatch COMPLEXITY (no operator-adjudicated
+"which value is right" branch) — an identity divergence here is always unambiguous corruption,
+never a "which value is right" judgment call — but it does need the underlying discipline the
+playbook already names as universal ("a 'first writer wins' contract... needs `PQcmdTuples()`...
+or `RETURNING` + `PQntuples()`"), which is now applied consistently to both the per-row insert and
+the marker insert (an identical marker fingerprint is proof two writers legitimately agree on
+content; a `DO NOTHING` conflict there was already a genuine no-op).
+
+The SQL shape here (plain `DO NOTHING` + a separate read-back `SELECT` + an application-level
+comparison) deliberately diverges from the playbook's `DO UPDATE ... WHERE <condition> RETURNING`
+recipe for "two writers can legitimately agree on identical content": backfill-vs-backfill is
+lock-safe (Postgres blocks the conflicting `INSERT` until the winner commits), so the only live
+race window is against an already-serving sibling's normal traffic on that exact row between the
+failed insert and the read-back — worst case a spurious fail-closed boot on a genuine identity
+mismatch, never silent data loss, so the simpler two-statement shape was kept over the atomic
+recipe (playbook: "record which way you went").
+
+`canonicalize_legacy_jobs`'s field serialization uses length-prefixed fields
+(`<byte-length>:<bytes>`, the standard netstring/bencode technique) rather than raw `\x1f`/`\x1e`
+delimiter bytes: a delimiter byte inside a field's own content could shift a row's apparent field
+boundary enough to make two DIFFERENT row sets hash identically, which the length-prefixed
+encoding closes structurally (verified by a dedicated shifted-field-boundary regression test).
+
+**Hardening history:** this design went through three review rounds before landing — an
+adversarial PR review (fjarvis: Kimi+Codex) found the missing `PQntuples()` check above; a Gate 8
+re-review (security-guardian+docs-writer) found the first fix over-corrected to fail closed on
+ANY conflict, including a benign identical re-encounter; a second Gate 8 re-review (unhappy-path)
+found that fix in turn still failed closed on ordinary lifecycle progress in a legitimate
+multi-replica boot sequence, which is what the identity/lifecycle partition above resolves. Each
+round is recorded in its governance ledger fragment (`governance.d/deployment-store-pg*.jsonl`);
+this section states only the design that shipped.
 
 **Trade-off accepted:** unlike `RbacStore` (which stats the legacy path cheaply before touching
 Postgres, and skips entirely once the file is moved aside post-migration), this design reads the
