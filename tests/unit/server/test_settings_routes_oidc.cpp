@@ -239,6 +239,39 @@ TEST_CASE("Settings OIDC: a secret CONTAINING the placeholder is refused, not si
     CHECK(h.audited.back().find("oidc.configure|failure|") != std::string::npos);
 }
 
+TEST_CASE("Settings OIDC: hot-reload preserves the configured link claim (ADR-2001 gap fix)",
+          "[settings][oidc][adr2001]") {
+    // Before the fix, this handler built a fresh local oidc::OidcConfig that left
+    // scim_link_claim at its struct default ("sub") regardless of what the operator
+    // configured via --oidc-scim-link-claim -- silently reverting an Entra ("oid")
+    // deployment's link claim the moment ANY OIDC setting was saved via the Settings
+    // UI, until the next process restart re-read the flag.
+    OidcHarness h;
+    h.cfg.oidc_scim_link_claim = "oid";
+
+    auto res = h.sink.Post("/api/settings/oidc", oidc_form("brand-new-secret"),
+                           "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(h.oidc_provider != nullptr);
+
+    // Differential probe mirroring test_oidc_provider.cpp's "missing oid is rejected
+    // when oid is the link claim": a claims set with a valid sub but an EMPTY oid is
+    // rejected iff the reloaded provider's link claim is "oid" -- and would be wrongly
+    // ACCEPTED under the bugged "sub" default this test pins against.
+    oidc::IdTokenClaims claims;
+    claims.iss = "https://idp.example";
+    claims.aud = "cid";
+    claims.sub = "user-123";
+    claims.nonce = "n";
+    claims.exp = 9999999999;
+    // claims.oid left at its default-constructed empty string.
+
+    auto result = h.oidc_provider->validate_claims(claims, "n");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("oid") != std::string::npos);
+}
+
 TEST_CASE("Settings OIDC: an EXACT placeholder still means unchanged, and reports saved",
           "[settings][oidc][secret]") {
     // The benign case the CONTAINS rule was over-serving: pasting the token back from the

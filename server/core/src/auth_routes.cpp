@@ -18,6 +18,8 @@
 #include "mcp_policy.hpp"
 #include "mfa_qr.hpp"
 #include "mfa_step_up.hpp"
+#include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
+#include "oidc_scim_link.hpp" // link_oidc_login_to_scim — ADR-2001 §2/D2 login-site orchestration
 #include "principal_class.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — the unified A4 denial wrapper (#1470)
 
@@ -2433,9 +2435,10 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // must never collide onto — or silently migrate onto — the same
         // principal, which #1832's RBAC reconcile would otherwise make
         // destructive (one user's login deleting the other's group
-        // memberships). Mirrors AuthManager::create_oidc_session's
-        // construction exactly.
-        const std::string username = "oidc:" + claims.iss + "#" + claims.sub;
+        // memberships). ADR-2001 §5 — built through the single shared
+        // helper, which is also what AuthManager::create_oidc_session uses,
+        // so the two mint sites cannot drift apart.
+        const std::string username = oidc::oidc_principal_id(claims.iss, claims.sub);
         auto admin_gid = oidc_provider_ ? cfg_.oidc_admin_group : std::string{};
 
         // #1832 — reconcile IdP group memberships into the RBAC store BEFORE
@@ -2618,6 +2621,34 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // `provision_sso_identity` itself; the session minted above is
         // never un-minted because of it (a login must not fail here).
         auth_mgr_.provision_sso_identity(username, claims.iss, claims.sub, display);
+
+        // ADR-2001 §2/D2 — form a durable SCIM identity link (if the
+        // configured link-claim value matches EXACTLY ONE active SCIM
+        // resource) and ALWAYS record a login observation for EACH
+        // candidate claim (sub AND oid — governance Gate 7 BLOCKING fix, the
+        // D2 tripwire), regardless of whether a link formed. Goes through
+        // ScimStore's own leased accessors — no AuthManager::mu_ is held
+        // here (both create_oidc_session above and provision_sso_identity
+        // have already returned, releasing their own internal locks).
+        // `link_oidc_login_to_scim` is fail-OPEN by construction (never
+        // throws, never returns an error to check) — it must never fail
+        // this login, which has already succeeded above. A missing link is
+        // instead caught later by the D2 detector (`observation_matches`)
+        // against the observations written here.
+        //
+        // `--oidc-scim-link-claim` (default "sub"; allow-list {sub, oid}
+        // enforced fail-closed at boot, main.cpp) selects which validated
+        // claim value is the SCIM externalId join key for LINK FORMATION
+        // only. `claims.oid` is parsed unconditionally by
+        // OidcProvider::parse_id_token but validated sub-equivalently by
+        // validate_claims ONLY when it is the configured link claim — safe
+        // to pass through unconditionally here because
+        // `link_oidc_login_to_scim` re-sanitizes every candidate claim
+        // before trusting it into a durable observation row.
+        oidc::link_oidc_login_to_scim(
+            scim_store_, claims.iss, claims.sub, claims.oid, cfg_.oidc_scim_link_claim,
+            cfg_.oidc_scim_link_claim == "oid" ? claims.oid : claims.sub,
+            auth_mgr_.metrics_registry());
 
         res.set_header("Set-Cookie", "yuzu_session=" + session_token + session_cookie_attrs());
 
