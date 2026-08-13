@@ -1039,6 +1039,16 @@ pending full status ingest, tracked separately.
   not apply a service-scoped token's own service-tag confinement (it only
   checks a role grant), so admitting it here would have let a token scoped
   to one service read a fleet-wide count.
+- **`403`** on the per-agent route (`/status/{agent_id}`) — new. This route
+  moved from a bare global permission check (any authenticated
+  `GuaranteedState:Read` holder got `200`, even with a management-group
+  scope that does not cover the requested device) to the same per-device
+  scoped check `GET /guaranteed-state/device-compliance` uses. A caller
+  whose `GuaranteedState:Read` grant is confined to management groups that
+  do not include the requested `agent_id` now gets `403` instead of a
+  `200` carrying placeholder-zero data for a device outside their scope. A
+  global (non-group-confined) grant is unaffected — it still passes
+  fleet-wide, same as before.
 - **`503`** on the per-agent route (`/status/{agent_id}`) — new failure
   mode. This route now performs a **behavioral-PII access audit**
   (`guardian.device.view`, same verb as `GET
@@ -1054,12 +1064,17 @@ pending full status ingest, tracked separately.
 **Who this affects.** Any integration polling either route that (a) uses a
 service-scoped API token against the fleet route — that call now needs
 either a non-service-scoped credential or a per-agent call against
-`/status/{agent_id}` instead; or (b) treats every response as `200` — both
-routes can now return `403`/`503` and a client that does not already retry
-on `5xx` (standard practice for every other Guaranteed State route) should
-add that handling. No change for a global-permission, non-service-scoped
-caller on the happy path beyond `errored_rules` becoming a real, changing
-number instead of a constant `0`.
+`/status/{agent_id}` instead; (b) holds a management-group-**confined**
+(not global) `GuaranteedState:Read` grant and polls `/status/{agent_id}`
+for a device outside that scope — that call now gets `403` where it
+previously got `200` with placeholder data, the same confinement
+`/guaranteed-state/device-compliance` has always enforced; or (c) treats
+every response as `200` — both routes can now return `403`/`503` and a
+client that does not already retry on `5xx` (standard practice for every
+other Guaranteed State route) should add that handling. No change for a
+global-permission, non-service-scoped caller on the happy path beyond
+`errored_rules` becoming a real, changing number instead of a constant
+`0`.
 
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 
