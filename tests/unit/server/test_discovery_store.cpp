@@ -17,7 +17,7 @@
  *    legacy file; migrates legacy rows and is idempotent on re-run; refuses
  *    (fail-closed) on a corrupt legacy file.
  *
- * Migrated Postgres store (ADR-0043, authoritative/fail-hard per ADR-0012
+ * Migrated Postgres store (ADR-0044, authoritative/fail-hard per ADR-0012
  * §1). PG-gated: skips when YUZU_TEST_POSTGRES_DSN is unset, fails when set
  * but broken (test_helpers.hpp skip-vs-fail contract). Store-behaviour cases
  * use the pre-migrated PgTestTemplate variant

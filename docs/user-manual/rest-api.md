@@ -3761,7 +3761,7 @@ Recent delivery attempts for a target (default 50, override via `?limit=N`). Eac
 
 ### Network Discovery
 
-Network-discovered devices (Issue 7.18) — raw scan results agents report before an operator promotes a device to a managed agent. Backed by `discovery_store` on the shared PostgreSQL substrate (ADR-0043). Not to be confused with [Discovery (A2)](#discovery-a2) above, which is the unrelated agentic self-discovery family (`/api/v1/discover/*`).
+Network-discovered devices (Issue 7.18) — raw scan results agents report before an operator promotes a device to a managed agent. Backed by `discovery_store` on the shared PostgreSQL substrate (ADR-0044). Not to be confused with [Discovery (A2)](#discovery-a2) above, which is the unrelated agentic self-discovery family (`/api/v1/discover/*`).
 
 #### `POST /api/discovery/scan`
 
@@ -3817,7 +3817,7 @@ List discovered devices. Requires `Infrastructure:Read`. Optional `?subnet=` que
 
 **Response (503, degraded read):** `{"error":{"code":503,"message":"discovery read degraded"},"meta":{"api_version":"v1"}}`. `discovery_store` is an authoritative store (ADR-0012 §1) — a query/pool failure surfaces as `503`, never as a silently-empty device list. See `yuzu_server_discovery_read_degrade_total{reason}` (`store_not_open`/`pool_acquire_timeout`/`query_error`).
 
-`mark_managed` and `clear_results` exist on the underlying store but have **no REST route today** — dead surface, noted in ADR-0043's Follow-ups.
+`mark_managed` and `clear_results` exist on the underlying store but have **no REST route today** — dead surface, noted in ADR-0044's Follow-ups.
 
 ---
 

@@ -1025,7 +1025,7 @@ records the one-time backfill outcome (`completed` / `fresh` / `failed`).
 and dynamic-group scope expressions are unchanged — only the storage substrate
 and the fail-closed read posture change.
 
-## Network-discovered device data migrates to Postgres (mandatory backfill, DiscoveryStore, ADR-0043)
+## Network-discovered device data migrates to Postgres (mandatory backfill, DiscoveryStore, ADR-0044)
 
 The `DiscoveryStore` — the network-discovered devices behind `POST /api/discovery/scan`
 and `GET /api/discovery/results` — moves from the SQLite `discovery.db` file to the

@@ -1275,7 +1275,7 @@ public:
                           "counter");
         for (const auto result : {"completed", "fresh", "failed"})
             metrics_.counter("yuzu_server_mgmt_group_backfill_total", {{"result", result}});
-        // DiscoveryStore observability (ADR-0043). The read-degrade counter is
+        // DiscoveryStore observability (ADR-0044). The read-degrade counter is
         // the fail-closed signal: a non-zero rate means list_devices could not
         // answer (store_not_open/pool_acquire_timeout/query_error) — /readyz
         // stays green under pure pool saturation, so this is the read-path
@@ -1290,7 +1290,7 @@ public:
         metrics_.describe("yuzu_server_discovery_backfill_total",
                           "DiscoveryStore legacy-SQLite backfill outcomes by result "
                           "(completed = rows migrated + reconciled; fresh = no legacy DB / empty; "
-                          "failed = fail-closed refusal). One-time at boot (ADR-0043)",
+                          "failed = fail-closed refusal). One-time at boot (ADR-0044)",
                           "counter");
         for (const auto result : {"completed", "fresh", "failed"})
             metrics_.counter("yuzu_server_discovery_backfill_total", {{"result", result}});
@@ -9411,7 +9411,7 @@ private:
             // rows above document. A degraded confinement store fails RbacStore's
             // list gate closed, so surface it.
             bool mgmt_group_ok = mgmt_group_store_ && mgmt_group_store_->is_open();
-            // DiscoveryStore (ADR-0043) — wired into /readyz; adding here too so
+            // DiscoveryStore (ADR-0044) — wired into /readyz; adding here too so
             // this store never joins the readyz-vs-healthz drift class the rows
             // above were added to fix.
             bool discovery_ok = discovery_store_ && discovery_store_->is_open();
@@ -9689,7 +9689,7 @@ private:
                 {"scim_store", !cfg_.scim_enable ||
                                    (scim_store_ && scim_store_->is_open() &&
                                     scim_store_->has_token())},
-                // Wave 2 migrated Postgres store (ADR-0006/0009/0043, schema
+                // Wave 2 migrated Postgres store (ADR-0006/0009/0044, schema
                 // `discovery_store`). AUTHORITATIVE per ADR-0012 §1 — the
                 // operator-set `managed` flag is real state. Construction
                 // fail-closed already makes a not-open state unreachable in
