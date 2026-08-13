@@ -1260,9 +1260,17 @@ The admin route emits two distinct 400 bodies — operators scripting the endpoi
 }
 ```
 
-The `username` parameter accepts either a strict local username OR a durable SSO principal (`is_valid_principal`, #1852) — in practice this means an **OIDC** principal (`oidc:<iss>#<sub>`), so an admin can force-log-out an SSO operator authenticated via OIDC today. Local usernames stay on the strict alphanumeric/`._-` charset; an SSO principal permits the `: # / . _ - @ ~ % |` alphabet a real IdP issuer URL and opaque subject need. NUL bytes, control characters, newlines, and shell/SQL metacharacters (`;`, `=`, `\`, quotes, backtick, space) are rejected in both cases — passing them through to the SQL bind would silently truncate/diverge from the audited target string (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
+The `username` parameter accepts either a strict local username OR a durable SSO principal (`is_valid_principal`, #1852) — an **OIDC** principal (`oidc:<iss>#<sub>`) or, since ADR-2001 PR4a, a **SAML** principal (`saml:<entity_id>#<NameID>`), so an admin can force-log-out an SSO operator authenticated via either protocol. Local usernames stay on the strict alphanumeric/`._-` charset; an SSO principal permits the `: # / . _ - @ ~ % |` alphabet a real IdP issuer URL and opaque subject need. NUL bytes, control characters, newlines, and shell/SQL metacharacters (`;`, `=`, `\`, quotes, backtick, space) are rejected in both cases — passing them through to the SQL bind would silently truncate/diverge from the audited target string (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
 
-**SAML is NOT force-loggable today.** A SAML session's `Session::username` is the raw IdP-supplied NameID (`create_saml_session` sets it verbatim, never a `saml:<idp>#<nameid>` shape) — a NameID is commonly an email address, and `@` fails `is_valid_principal` (it lacks the `saml:` reserved prefix that would unlock the wider SSO charset). A SAML operator's NameID therefore typically 400s against this endpoint, and there is no other revocation lever for a SAML session. This is a tracked gap, not an intentional restriction — see #1859/#1860.
+**SAML sessions are now force-loggable (ADR-2001 PR4a).** A SAML session's `Session::username` is the stable principal `saml:<entity_id>#<NameID>` (`saml_principal_id`, mirroring the OIDC shape exactly), not the raw NameID — `create_saml_session` mints it via the `saml:` reserved prefix, which `is_valid_principal` accepts on the same wider SSO charset as `oidc:`. An admin can therefore force-log-out a SAML operator with:
+
+```bash
+curl -s -X DELETE \
+  -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/sessions?username=saml%3Aentity-id%23NameID"
+```
+
+(URL-encode the `:` and `#`.) SAML sessions are also revoked automatically as part of SCIM deprovision — see "SCIM ↔ SAML identity linkage" in `docs/user-manual/scim-provisioning.md`, which covers the NameID-Format precondition for that automatic linkage. This closes the gap previously tracked as #1859/#1860.
 
 **Error (403) -- caller lacks `UserManagement:Write`:**
 

@@ -2103,6 +2103,23 @@ public:
                           "identity links and/or D2 login observations are silently not being "
                           "recorded",
                           "counter");
+        // ADR-2001 PR4a — the SAML analogue of the OIDC counter immediately
+        // above. Bumped by link_saml_login_to_scim on an upsert_saml_link
+        // failure (saml_scim_link.cpp). Same fail-OPEN posture: the SAML
+        // login itself always succeeds; a sustained non-zero rate means
+        // SAML identities are silently not being linked, and therefore
+        // WON'T be revoked on a later deprovision (the exact CC6.8 gap
+        // ADR-2001 exists to close) — same recurring pre-seed lesson as the
+        // block below (a purely-lazy metric is absent from /metrics until
+        // the first incident, which is exactly the wrong moment for an
+        // alert rule to discover the series does not exist yet).
+        metrics_.describe("yuzu_scim_saml_link_write_failures_total",
+                          "Total ADR-2001 PR4a SAML identity-link writes that failed during "
+                          "SAML login (ScimStore outage) — the login itself always succeeds "
+                          "(fail-OPEN by design), but a sustained non-zero rate means SAML "
+                          "identities are silently not being linked and won't be revoked on "
+                          "deprovision",
+                          "counter");
         // describe() only registers HELP/TYPE metadata; the series is absent
         // from /metrics until first .increment(). Instantiate each bare
         // counter at 0 now so absent()-style alert rules on the CC6.8
@@ -2112,6 +2129,7 @@ public:
         metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
         metrics_.counter("yuzu_scim_deprovision_unlinked_total");
         metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
+        metrics_.counter("yuzu_scim_saml_link_write_failures_total");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning

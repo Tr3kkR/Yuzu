@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 
+using yuzu::MetricsRegistry;
 using yuzu::server::ScimStore;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
@@ -267,4 +268,85 @@ TEST_CASE("link_saml_login_to_scim: a closed/unusable ScimStore is fail-OPEN —
     REQUIRE_FALSE(token.empty());
     auto session = auth_mgr.validate_session(token);
     REQUIRE(session.has_value());
+}
+
+// ── yuzu_scim_saml_link_write_failures_total (compliance F2) ────────────
+//
+// The counter must fire on a genuine WRITE failure specifically — not on a
+// wholly-closed/unreachable store, which never reaches the write at all
+// (find_unique_active_by_external_id's own `!open_` guard returns nullopt
+// first, and link_saml_login_to_scim returns before ever calling
+// upsert_saml_link — see the fail-OPEN test above, which is a DIFFERENT
+// code path and does not exercise this counter). To force a write failure
+// while the READ still succeeds, drop ONLY the saml_identity_links table
+// (mirrors the mutation-check idiom used elsewhere in this PR) — the
+// scim_resources lookup still finds the resource, then the INSERT into the
+// now-missing table fails.
+//
+// The sibling OIDC counter (yuzu_scim_oidc_link_write_failures_total,
+// server.cpp) has no equivalent unit-level assertion today — pre-existing
+// gap, not expanded here (scope is the new SAML counter only).
+TEST_CASE("link_saml_login_to_scim: yuzu_scim_saml_link_write_failures_total increments on a "
+         "forced upsert_saml_link failure (the read still succeeds)",
+         "[pg][saml][scim][2001][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto resource = store.create_resource("frank", "frank@example.com");
+    REQUIRE(resource.has_value());
+
+    // Drop the write target. scim_resources (the read path) is untouched.
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult drop{PQexec(conn.get(), "DROP TABLE scim_store.saml_identity_links")};
+    REQUIRE(drop.ok());
+
+    MetricsRegistry metrics;
+    // Baseline: absent-but-pre-seeded semantics are server.cpp's job (the
+    // boot-time bare .counter() call) — this fresh, unregistered
+    // MetricsRegistry starts every series at 0 either way, so a plain
+    // pre/post comparison is sufficient here without duplicating that
+    // pre-seed wiring in a unit test.
+    const double before = metrics.counter("yuzu_scim_saml_link_write_failures_total").value();
+
+    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "frank@example.com",
+                            kPersistent, &metrics);
+
+    // The read succeeded (a real match existed) and the write failed (the
+    // table is gone) — confirms this test exercises the WRITE-failure path,
+    // not the store-closed path the fail-OPEN test above already covers.
+    auto links = store.saml_links_for_scim_id(resource->scim_id);
+    // saml_links_for_scim_id itself now queries the dropped table too, so
+    // it also fails — nullopt is the expected (and consistent) outcome
+    // here, not a second independent assertion of "no link formed".
+    CHECK_FALSE(links.has_value());
+
+    const double after = metrics.counter("yuzu_scim_saml_link_write_failures_total").value();
+    CHECK(after == before + 1.0);
+}
+
+TEST_CASE("link_saml_login_to_scim: a null metrics pointer is a safe no-op (no crash on a "
+         "forced write failure with no MetricsRegistry wired)",
+         "[pg][saml][scim][2001][metrics]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto resource = store.create_resource("grace", "grace@example.com");
+    REQUIRE(resource.has_value());
+
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult drop{PQexec(conn.get(), "DROP TABLE scim_store.saml_identity_links")};
+    REQUIRE(drop.ok());
+
+    // Default metrics=nullptr (test/CLI contexts, per the header doc).
+    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "grace@example.com",
+                            kPersistent);
+    SUCCEED("did not throw despite a null metrics pointer and a forced write failure");
 }

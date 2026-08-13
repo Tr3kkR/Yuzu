@@ -1105,6 +1105,182 @@ TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_sour
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// ADR-2001 PR4a — NameID sanitation gate, WIRED at the ACS handler
+// (quality-engineer MEDIUM: is_valid_saml_component's own unit tests
+// (test_saml_principal.cpp) only exercise the pure function — this pins
+// that the ACS handler actually calls it and fails closed on the wire).
+//
+// Mirrors run_saml_acs_flow's own start -> binding-cookie -> build-response
+// -> dispatch sequence (same fixture, same InResponseTo/binding-cookie
+// dance) but keeps the httplib::Response so the redirect target, the
+// audit row, and the metric can all be asserted directly — run_saml_acs_flow
+// deliberately returns only the session token (or "") for its five simpler
+// callers below, which is not enough to assert the specific failure shape
+// this test needs.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("SAML ACS — a NameID exceeding 255 bytes fails the sanitation gate: redirects to "
+          "/login?error=saml, records auth.saml_login_failed, and mints NO session",
+          "[pg][saml][auth_routes][2001]") {
+#if defined(_WIN32)
+    SKIP("SamlProvider always disabled on Windows (N4)");
+#else
+    const auto& f = saml_test_fixture();
+    auto saml_cfg = f.make_config();
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+    SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
+
+    auto start_res = fix.sink.Get("/auth/saml/start");
+    REQUIRE(start_res != nullptr);
+    REQUIRE(start_res->status == 302);
+    const auto redirect_location = start_res->get_header_value("Location");
+    REQUIRE_FALSE(redirect_location.empty());
+
+    std::string binding_secret;
+    {
+        const auto sc = start_res->get_header_value("Set-Cookie");
+        REQUIRE(sc.find("__Host-yuzu_saml_bind=") != std::string::npos);
+        const std::string pfx = "__Host-yuzu_saml_bind=";
+        const auto val_start = sc.find(pfx) + pfx.size();
+        const auto val_end   = sc.find(';', val_start);
+        binding_secret = sc.substr(val_start,
+            val_end == std::string::npos ? std::string::npos : val_end - val_start);
+    }
+    REQUIRE(binding_secret.size() == 64);
+
+    const auto request_id = extract_authn_request_id(redirect_location);
+    REQUIRE_FALSE(request_id.empty());
+
+    // 300 bytes of plain ASCII — well-formed XML text content (so
+    // validate_response accepts it: non-empty, no XSW/signature concerns),
+    // but exceeds is_valid_saml_component's 255-byte cap.
+    const std::string oversized_name_id(300, 'a');
+    REQUIRE(oversized_name_id.size() > 255);
+    const auto response_b64 = f.make_response(request_id, oversized_name_id);
+
+    std::string encoded_response;
+    encoded_response.reserve(response_b64.size() + 16);
+    for (unsigned char c : response_b64) {
+        if (c == '+') {
+            encoded_response += "%2B";
+        } else {
+            encoded_response += static_cast<char>(c);
+        }
+    }
+    const auto form_body = "SAMLResponse=" + encoded_response + "&RelayState=%2F";
+
+    auto acs_res = fix.sink.dispatch(
+        "POST", "/saml/acs", form_body, "application/x-www-form-urlencoded",
+        {{"Cookie", "__Host-yuzu_saml_bind=" + binding_secret}});
+    REQUIRE(acs_res != nullptr);
+
+    // Fail-closed redirect, never a minted session.
+    CHECK(acs_res->status == 302);
+    CHECK(acs_res->get_header_value("Location") == "/login?error=saml");
+    {
+        bool found_session_cookie = false;
+        for (std::size_t i = 0; ; ++i) {
+            const auto sc = acs_res->get_header_value("Set-Cookie", "", i);
+            if (sc.empty()) break;
+            if (sc.find("yuzu_session=") != std::string::npos) found_session_cookie = true;
+        }
+        CHECK_FALSE(found_session_cookie);
+    }
+
+    // Audit row: auth.saml_login_failed, never auth.saml_login.
+    const auto events = fix.audit_events();
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.saml_login_failed");
+    CHECK(events.front().result == "error");
+
+    // Metric: the error-result counter, never the ok-result one.
+    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
+    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "ok"}, {"role", "user"}}) == 0.0);
+#endif
+}
+
+TEST_CASE("SAML ACS — an entity_id containing a control byte fails the sanitation gate the "
+          "same way (redirect + audit.saml_login_failed + no session)",
+          "[pg][saml][auth_routes][2001]") {
+#if defined(_WIN32)
+    SKIP("SamlProvider always disabled on Windows (N4)");
+#else
+    const auto& f = saml_test_fixture();
+    auto saml_cfg = f.make_config();
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+    SamlRoutesFixture fix(&provider);
+    // Deliberately DIVERGE cfg.saml_idp_entity_id from the SamlProvider's
+    // own idp_entity_id (which must still match for Issuer verification to
+    // pass) — a control byte here models an operator-side misconfiguration/
+    // corruption reaching cfg_.saml_idp_entity_id at the ACS handler, which
+    // must reject exactly like a malformed NameID (both flow through the
+    // same is_valid_saml_component gate, auth_routes.cpp).
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id + "\x01";
+
+    auto start_res = fix.sink.Get("/auth/saml/start");
+    REQUIRE(start_res != nullptr);
+    REQUIRE(start_res->status == 302);
+    const auto redirect_location = start_res->get_header_value("Location");
+    REQUIRE_FALSE(redirect_location.empty());
+
+    std::string binding_secret;
+    {
+        const auto sc = start_res->get_header_value("Set-Cookie");
+        REQUIRE(sc.find("__Host-yuzu_saml_bind=") != std::string::npos);
+        const std::string pfx = "__Host-yuzu_saml_bind=";
+        const auto val_start = sc.find(pfx) + pfx.size();
+        const auto val_end   = sc.find(';', val_start);
+        binding_secret = sc.substr(val_start,
+            val_end == std::string::npos ? std::string::npos : val_end - val_start);
+    }
+    REQUIRE(binding_secret.size() == 64);
+
+    const auto request_id = extract_authn_request_id(redirect_location);
+    REQUIRE_FALSE(request_id.empty());
+
+    // A perfectly valid NameID — only entity_id is malformed.
+    const auto response_b64 = f.make_response(request_id, "control_byte_entity@example.test");
+
+    std::string encoded_response;
+    encoded_response.reserve(response_b64.size() + 16);
+    for (unsigned char c : response_b64) {
+        if (c == '+') {
+            encoded_response += "%2B";
+        } else {
+            encoded_response += static_cast<char>(c);
+        }
+    }
+    const auto form_body = "SAMLResponse=" + encoded_response + "&RelayState=%2F";
+
+    auto acs_res = fix.sink.dispatch(
+        "POST", "/saml/acs", form_body, "application/x-www-form-urlencoded",
+        {{"Cookie", "__Host-yuzu_saml_bind=" + binding_secret}});
+    REQUIRE(acs_res != nullptr);
+
+    CHECK(acs_res->status == 302);
+    CHECK(acs_res->get_header_value("Location") == "/login?error=saml");
+    {
+        bool found_session_cookie = false;
+        for (std::size_t i = 0; ; ++i) {
+            const auto sc = acs_res->get_header_value("Set-Cookie", "", i);
+            if (sc.empty()) break;
+            if (sc.find("yuzu_session=") != std::string::npos) found_session_cookie = true;
+        }
+        CHECK_FALSE(found_session_cookie);
+    }
+
+    const auto events = fix.audit_events();
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.saml_login_failed");
+    CHECK(events.front().result == "error");
+#endif
+}
+
 TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an admin session",
           "[pg][saml][auth_routes]") {
 #if defined(_WIN32)

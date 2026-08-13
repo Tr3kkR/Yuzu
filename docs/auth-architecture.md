@@ -680,12 +680,25 @@ as dead code in the #1837 governance hardening round.
 `username`; the dashboard JS shows `display_name`, falling back to
 `username` for a legacy/local session predating this field.
 
-**SAML is unaffected this slice.** `create_saml_session` still keys
-`username` on the raw NameID (`display_name` is set to the same value,
-purely for render-site parity) — SAML does not sync to `rbac_store` yet
-(dropped in #1827), so the collision this fix closes is dormant there.
-Keying SAML on `entity_id#NameID` is a tracked fast-follow, to land
-alongside SAML group sync.
+**SAML was unaffected this slice; since resolved (ADR-2001 PR4a).** At the
+time of the #1837 hardening round documented above, `create_saml_session`
+still keyed `username` on the raw NameID (`display_name` set to the same
+value, purely for render-site parity) — SAML does not sync to `rbac_store`
+yet (dropped in #1827), so the collision risk this fix closes was dormant
+there. ADR-2001 PR4a has since closed the SAML side of the same gap:
+`create_saml_session` now keys `username` on the stable
+`saml_principal_id(entity_id, name_id)` (`"saml:" + entity_id + "#" +
+name_id`, `saml_principal.hpp`), mirroring the OIDC split above
+byte-for-byte; `display_name` still carries the raw NameID for render-site
+parity. This unlocks force-logout (`DELETE /api/v1/sessions?username=
+saml:<entity_id>#<NameID>`, `is_valid_principal` accepts the `saml:`
+reserved prefix on the same wider SSO charset as `oidc:`) and SCIM
+deprovision-time session revocation for linked SAML identities (see
+`docs/user-manual/scim-provisioning.md` "SCIM ↔ SAML identity linkage").
+JIT elevation is **not** part of this fix — no `auth.db` `users` row is
+provisioned for a SAML principal, so `provision_sso_identity` is still not
+wired to SAML (`AuthManager::provision_sso_identity`'s docstring) and a
+SAML session still cannot elevate.
 
 **Audit-detail-field injection defense (`sanitize_detail_value`).** Every
 IdP-supplied value that reaches an audit `detail` string or an
@@ -825,15 +838,18 @@ record.** Four fixes on top of the base restoration above:
   does not touch `#` — a durable SSO principal's `#` was silently truncated
   by the browser's URL-fragment parsing before the request left the client.
 
-SAML is unaffected by this restoration: `create_saml_session` still keys
-`username` on the raw NameID (no reserved-prefix stable principal — see
-"SAML is unaffected this slice" above), so `is_valid_principal` does not
-recognise it as an SSO principal and `provision_sso_identity` is not called
-from the SAML ACS handler. A SAML session is therefore provisioned nowhere
-and cannot elevate — not because of a missing MFA proof specifically, but
-because there is no durable identity row to hold `elevation_eligible` on in
-the first place. Keying SAML on `entity_id#NameID` (the tracked fast-follow
-noted above) is a prerequisite for extending this restoration to SAML.
+SAML still cannot elevate, though the reason has narrowed since ADR-2001
+PR4a (see "SAML was unaffected this slice; since resolved" above):
+`create_saml_session` now keys `username` on the reserved-prefix stable
+principal `saml:<entity_id>#<NameID>`, so `is_valid_principal` DOES
+recognise it as an SSO principal (unlocking force-logout, per that section)
+— but `provision_sso_identity` is still never called from the SAML ACS
+handler, so no `auth.db` `users` row is provisioned for a SAML principal.
+A SAML session therefore still cannot elevate — not because of a missing
+MFA proof specifically, and no longer because `is_valid_principal` rejects
+the identity shape, but because there is no durable identity row to hold
+`elevation_eligible` on in the first place. Wiring `provision_sso_identity`
+into the SAML ACS handler is a tracked follow-up, separate from PR4a.
 
 **This is not a regression of a previously-supported flow.** Before #1837,
 `Session::username` for an OIDC session was the mutable display name
