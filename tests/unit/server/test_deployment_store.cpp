@@ -619,6 +619,131 @@ TEST_CASE("migrate_from_sqlite fails closed (not silently) when a legacy row's i
     CHECK_FALSE(store.migrate_from_sqlite(second_path));
 }
 
+// Companion to the conflict-with-different-content test above: an `ON
+// CONFLICT` match is on id ALONE, so a conflict does not by itself mean the
+// content differs (gov security-guardian/docs-writer SHOULD, hardening
+// round 2). A legacy file that is a SUPERSET of what's already migrated —
+// re-encountering a byte-identical row alongside genuinely new ones, e.g. a
+// cloned replica's file with a few local additions — must succeed, not be
+// refused as if it were the differing-content case.
+TEST_CASE("migrate_from_sqlite treats an identical-content id conflict as a benign no-op, not "
+          "a failure",
+          "[deployment_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deployment_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    DeploymentJob shared;
+    shared.id = "eeeeeeeeeeeeeeee";
+    shared.target_host = "shared.example.com";
+    shared.os = "linux";
+    shared.method = "manual";
+    shared.status = "pending";
+    shared.created_at = 3000;
+
+    auto first_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_identical_first") / "deployment-jobs.db";
+    std::filesystem::create_directories(first_path.parent_path());
+    write_legacy_sqlite_db(first_path, {shared});
+    REQUIRE(store.migrate_from_sqlite(first_path));
+
+    // A SECOND, larger legacy file: the SAME shared row (byte-identical)
+    // plus one genuinely NEW row. Different overall file content means a
+    // different fingerprint, so this is not short-circuited by the marker
+    // check — it must reach the per-row conflict path for `shared` and
+    // correctly treat it as benign.
+    DeploymentJob new_job;
+    new_job.id = "ffffffffffffffff";
+    new_job.target_host = "new.example.com";
+    new_job.os = "linux";
+    new_job.method = "manual";
+    new_job.status = "pending";
+    new_job.created_at = 3001;
+    auto superset_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_identical_superset") /
+        "deployment-jobs.db";
+    std::filesystem::create_directories(superset_path.parent_path());
+    write_legacy_sqlite_db(superset_path, {shared, new_job});
+
+    REQUIRE(store.migrate_from_sqlite(superset_path));
+
+    // Both rows present: the identical-content conflict did not abort the
+    // pass, and the genuinely new sibling row landed too.
+    auto jobs = store.list_jobs();
+    REQUIRE(jobs.has_value());
+    CHECK(jobs->size() == 2);
+    auto new_got = store.get_job(new_job.id);
+    REQUIRE(new_got.has_value());
+    REQUIRE(new_got->has_value());
+    CHECK((*new_got)->target_host == "new.example.com");
+}
+
+// Regression test for the fingerprint canonicalization's injectivity (gov
+// quality-engineer SHOULD): id="a", target_host="b\x1fc" and
+// id="a\x1fb", target_host="c" (all other fields equal) canonicalize to the
+// BYTE-IDENTICAL string under the OLD raw-delimiter (\x1f/\x1e) encoding —
+// verified by hand: "a" + \x1f + "b\x1fc" + \x1f... == "a\x1fb" + \x1f +
+// "c" + \x1f... — because a delimiter byte embedded in one field is
+// indistinguishable from a real field boundary. Under the CURRENT
+// length-prefixed encoding they must NOT collide. This is observable
+// through the public API: backfilling both (different-id, so never
+// row-conflicting) single-job legacy files must land BOTH ids — under the
+// old encoding, the second file's fingerprint would equal the first's,
+// short-circuiting via the "already processed" marker and silently
+// dropping the second row entirely.
+TEST_CASE("migrate_from_sqlite: two files whose rows differ only by a shifted field boundary "
+          "do not collide (fingerprint injectivity)",
+          "[deployment_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deployment_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    DeploymentJob job_a;
+    job_a.id = "a";
+    // Adjacent string literal concatenation, NOT "b\x1fc": a \x hex escape
+    // greedily consumes every following hex digit, so "b\x1fc" would parse
+    // as 'b' + the single (out-of-range, truncating) escape \x1fc == 0x1fc
+    // -> 0xfc, not the intended 'b' + 0x1f + 'c' three-byte sequence.
+    job_a.target_host = "b\x1f" "c";
+    job_a.os = "linux";
+    job_a.method = "manual";
+    job_a.status = "pending";
+    job_a.created_at = 1000;
+    auto path_a = yuzu::test::unique_temp_path("yuzu_test_deploy_boundary_a") /
+                 "deployment-jobs.db";
+    std::filesystem::create_directories(path_a.parent_path());
+    write_legacy_sqlite_db(path_a, {job_a});
+    REQUIRE(store.migrate_from_sqlite(path_a));
+
+    DeploymentJob job_b;
+    job_b.id = "a\x1f" "b"; // see the adjacent-literal note above
+    job_b.target_host = "c";
+    job_b.os = "linux";
+    job_b.method = "manual";
+    job_b.status = "pending";
+    job_b.created_at = 1000;
+    auto path_b = yuzu::test::unique_temp_path("yuzu_test_deploy_boundary_b") /
+                 "deployment-jobs.db";
+    std::filesystem::create_directories(path_b.parent_path());
+    write_legacy_sqlite_db(path_b, {job_b});
+    REQUIRE(store.migrate_from_sqlite(path_b));
+
+    // Both ids must be present. Under a delimiter-byte-collision regression,
+    // job_b's file would hash identically to job_a's, the marker check
+    // would report "already processed", and job_b would never land.
+    auto got_a = store.get_job(job_a.id);
+    REQUIRE(got_a.has_value());
+    REQUIRE(got_a->has_value());
+    CHECK((*got_a)->target_host == "b\x1f" "c");
+
+    auto got_b = store.get_job(job_b.id);
+    REQUIRE(got_b.has_value());
+    REQUIRE(got_b->has_value());
+    CHECK((*got_b)->target_host == "c");
+}
+
 TEST_CASE("DeploymentStore::migrate_from_sqlite copies a populated legacy file exactly once",
           "[deployment_store][pg][backfill]") {
     YUZU_REQUIRE_PG_DB_TPL(db, deployment_store_tpl);

@@ -135,16 +135,27 @@ statement executed, never that THIS row won the conflict -- exactly the anti-pat
 (`AuditStore::stamp_complete`, ADR-0040, #2697, is the worked example that motivated the rule). A
 same-id row already present from an earlier backfill would silently no-op, and the fingerprint
 covering the LOSING file would still stamp complete, permanently. **Fixed**: the job insert now
-uses `RETURNING id` + `PQntuples()`; zero rows returned means the id already existed with
-(necessarily, since the fingerprint differs) different content, and the whole transaction fails
-closed -- named row, no partial commit, next boot retries. This does not need `RbacStore`'s
-refuse-on-mismatch COMPLEXITY (no operator-adjudicated "which value is right" branch), because a
-job-id conflict during backfill is always treated as fail-closed here, never resolved by guessing;
-it DOES need the underlying discipline the playbook already names as universal ("a 'first writer
-wins' contract... needs `PQcmdTuples()`... or `RETURNING` + `PQntuples()`"), which the original cut
-of this store missed applying to the per-row insert (it was already applied correctly to the
-MARKER insert, where an identical fingerprint value is proof two writers legitimately agree on
-content and a `DO NOTHING` conflict there is a genuine no-op, not a data-loss risk).
+uses `RETURNING id` + `PQntuples()`.
+
+**Second correction, same round:** the first cut of this fix treated ANY conflict as proof of
+differing content and failed closed unconditionally. That is not true -- `ON CONFLICT` matches on
+`id` ALONE, and the fix's own motivating scenario (a cloned/restored legacy file) typically
+produces a SUPERSET of already-migrated rows, most of them byte-identical to what's already in
+Postgres. Failing the whole boot on an identical-content re-encounter is an avoidable false
+refusal, and the original error text ("already exists ... with DIFFERENT legacy-file content")
+asserted a fact the code never checked. **Fixed further**: on a conflict, the existing row is read
+back and compared field-by-field against the legacy row. Identical content is a genuine, benign
+no-op -- the same class of agreement the fingerprint marker already trusts -- and the loop
+continues; differing content is the real anomaly, and THAT fails the whole transaction closed with
+an honestly-earned message naming both the stored and legacy values. This still does not need
+`RbacStore`'s refuse-on-mismatch COMPLEXITY (no operator-adjudicated "which value is right"
+branch) -- a genuine content divergence here is always treated as fail-closed, never resolved by
+guessing -- but it DOES need the underlying discipline the playbook already names as universal ("a
+'first writer wins' contract... needs `PQcmdTuples()`... or `RETURNING` + `PQntuples()`"), which
+the original cut of this store missed applying to the per-row insert (it was already applied
+correctly to the MARKER insert, where an identical fingerprint value is proof two writers
+legitimately agree on content and a `DO NOTHING` conflict there is a genuine no-op, not a
+data-loss risk).
 
 Also fixed in the same round: `canonicalize_legacy_jobs`'s field serialization moved from raw
 `\x1f`/`\x1e` delimiter bytes to length-prefixed fields (`<byte-length>:<bytes>`, the standard

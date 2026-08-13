@@ -11,4 +11,9 @@
   `deployment-jobs.db` now fails the WHOLE server's boot (previously it only silently disabled
   this one feature) — this store is small and low-volume, so this should only ever be observed
   as a startup log line naming the exact file and a repair-or-move-aside remediation, not a
-  practical operational concern.
+  practical operational concern. Similarly, if two replicas' legacy files disagree on the
+  content of a job sharing the same id (e.g. a data directory cloned or restored to provision a
+  second replica, then diverged), the backfill compares the two and fails the boot closed rather
+  than silently keeping whichever one landed first — identical-content rows are always a silent,
+  safe no-op; only a genuine divergence stops the boot, again with the offending id named in the
+  startup log.

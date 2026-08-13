@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <string_view>
 
 namespace yuzu::server {
 
@@ -423,17 +424,10 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
             // docs/postgres-store-playbook.md's own "Anti-patterns reviewers
             // reject"): PGRES_COMMAND_OK only proves the STATEMENT executed,
             // never that THIS row won the conflict — a same-id row already
-            // present (e.g. from a second legacy file with overlapping ids and
-            // DIFFERENT content, such as a cloned/restored data directory)
-            // silently no-ops, and the fingerprint stamped at the end of this
-            // transaction would make that permanent: the file is never
-            // reconsidered. Unlike the marker insert below — where an identical
-            // fingerprint value IS proof two writers agree on content, so a
-            // conflict there is a legitimate no-op — a job-id conflict during
-            // backfill is never expected (ids are independently-random 64-bit
-            // surrogate keys) and is therefore treated as an anomaly: fail the
-            // whole transaction closed, name the offending row, and let the
-            // next boot retry after an operator investigates.
+            // present (e.g. from a second legacy file with overlapping ids,
+            // such as a cloned/restored data directory) silently no-ops, and
+            // the fingerprint stamped at the end of this transaction would
+            // make that permanent: the file is never reconsidered.
             pg::PgResult res = pg::exec_params(
                 conn,
                 "INSERT INTO deployment_store.deployment_jobs "
@@ -452,21 +446,58 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
                               j.id, PQerrorMessage(conn));
                 return false;
             }
-            if (PQntuples(res.get()) == 0) {
-                failure_detail =
-                    std::string("legacy deployment_jobs row id='") + j.id +
-                    "' (target_host='" + j.target_host +
-                    "') already exists in deployment_store.deployment_jobs with DIFFERENT "
-                    "legacy-file content than what is currently in Postgres — refusing to "
-                    "silently discard it (a same-id row landing here from another source is "
-                    "unexpected: ids are independently-random surrogate keys)";
-                spdlog::error(
-                    "DeploymentStore::migrate_from_sqlite: row {} already present, ON "
-                    "CONFLICT no-op — refusing to stamp a backfill that may have silently "
-                    "discarded diverging content",
-                    j.id);
+            if (PQntuples(res.get()) > 0)
+                continue; // inserted cleanly — no conflict, nothing further to check
+
+            // Conflict: a row with this id already exists. An `ON CONFLICT`
+            // match is on id ALONE — Postgres never compares the other
+            // columns — so this does NOT by itself mean the content differs
+            // (gov security-guardian/docs-writer SHOULD, hardening round 2:
+            // the original fix asserted "DIFFERENT content" unconditionally,
+            // which is false whenever a superset legacy file re-backfills
+            // rows that were already correctly migrated). Read the existing
+            // row back and compare field-by-field before deciding: identical
+            // content is a genuine, benign "already migrated this exact
+            // row" no-op (the same class of agreement the fingerprint
+            // marker below already trusts); differing content is the real
+            // anomaly this whole check exists to catch, and THAT fails
+            // closed with an honestly-earned message.
+            std::string existing_sql = std::string("SELECT ") + kJobCols +
+                                       " FROM deployment_store.deployment_jobs WHERE id=$1";
+            pg::PgResult existing =
+                pg::exec_params(conn, existing_sql.c_str(), std::vector<std::string>{j.id});
+            if (existing.status() != PGRES_TUPLES_OK || PQntuples(existing.get()) == 0) {
+                failure_detail = std::string("legacy deployment_jobs row id='") + j.id +
+                                 "': conflicted on insert but the existing row could not be "
+                                 "read back for comparison: " +
+                                 PQerrorMessage(conn);
+                spdlog::error("DeploymentStore::migrate_from_sqlite: row {} conflicted but "
+                              "the existing row read-back failed: {}",
+                              j.id, PQerrorMessage(conn));
                 return false;
             }
+            const DeploymentJob stored = read_job(existing.get(), 0);
+            const bool identical =
+                stored.target_host == j.target_host && stored.os == j.os &&
+                stored.method == j.method && stored.status == j.status &&
+                stored.created_at == j.created_at && stored.started_at == j.started_at &&
+                stored.completed_at == j.completed_at && stored.error == j.error;
+            if (identical) {
+                spdlog::debug("DeploymentStore::migrate_from_sqlite: row {} already present "
+                              "with identical content, skipping (benign no-op)",
+                              j.id);
+                continue;
+            }
+            failure_detail = std::string("legacy deployment_jobs row id='") + j.id +
+                             "' already exists with DIFFERENT content (stored: target_host='" +
+                             stored.target_host + "' status='" + stored.status +
+                             "'; legacy: target_host='" + j.target_host + "' status='" +
+                             j.status + "') — refusing to silently discard it";
+            spdlog::error("DeploymentStore::migrate_from_sqlite: row {} conflicts with "
+                          "different content — refusing to stamp a backfill that would "
+                          "silently discard it",
+                          j.id);
+            return false;
         }
         pg::PgResult marker = pg::exec_params(
             conn,
