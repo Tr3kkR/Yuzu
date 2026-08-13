@@ -294,6 +294,29 @@ than an end-to-end test exercising a real assertion/token exchange. This is
 an existing, not newly-introduced, test-coverage limitation shared by both
 providers' deny-at-login backstops.
 
+**Residual — pinned-trust-anchor rotation orphans links (both providers).**
+Identity links are keyed on the pinned IdP identifier — `entity_id` for SAML,
+`iss` for OIDC — because that identifier is part of the principal identity
+itself (it is what keeps a `saml:` and an `oidc:` principal from colliding on
+a shared NameID/subject). Rotating `--saml-idp-entity-id` (or the OIDC
+`--oidc-issuer`) therefore leaves every existing link row keyed on the *old*
+value, so a lookup under the new identifier returns zero rows and reads as
+"no link → proceed": the deny-at-login backstop does not fire for an
+already-deprovisioned identity logging in under the rotated identifier, and
+it **cannot re-arm itself via SCIM** (a link re-forms only against an *active*
+resource, and a deprovisioned resource is inactive — so re-running SCIM
+deprovision does nothing). Within the single-pinned-IdP designed envelope (one
+stable identifier) the control holds; a rotation is re-establishing the trust
+anchor, and across it the operator relies on the **primary** termination
+control — the IdP ceasing to assert for a terminated user. This is a deliberate
+residual of the single-pinned-IdP linkage model, not a code gap the deny logic
+can close without abandoning the `entity_id`/`iss`-scoped link key. Full
+treatment (mechanism, why re-deprovision does not help, the symmetric OIDC
+case) is in `docs/auth-architecture.md` → "SAML ↔ SCIM identity linkage",
+"Residual — rotating the pinned trust anchor orphans existing links". Surfaced
+independently by the PR4b governance unhappy-path review and a Hermes
+access-review pass.
+
 ## Review provenance
 Rev 2 folds: architect B1 (`oid` unbuilt) + B2 (overload infeasible) + lease-nesting/reorder/resolver/index/helper notes; security-guardian F1 (D1), F2 (D2), F3 (single-issuer precondition, constraint 5), F4 (`oid`, constraint 3), F5 (constraint 4 wording), F6 (60s residual), F7 (generic deny redirect). Both reviews called the core reconciliation idea sound; the defects were in the provenance interaction and the fail-loud realizability, now surfaced as D1/D2.
 
