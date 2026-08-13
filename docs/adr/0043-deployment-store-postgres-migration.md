@@ -120,12 +120,38 @@ fingerprint + refuse-on-mismatch/refuse-on-sourceless-stored branches,
 identifiers (role/group names) are small and human-chosen, so a late real backfill risks silently
 clobbering live post-cutover grants sharing the same name -- the reference implementation refuses
 and asks an operator to adjudicate rather than guess. `DeploymentStore`'s `id` is a 64-bit random
-surrogate key (`generate_id()`); collision across independently-generated ids across replicas is
-practically impossible, so every replica's real content is safe to copy independently and
-idempotently (`ON CONFLICT (id) DO NOTHING`) whenever its own fingerprint hasn't been seen before
--- there is no clobber risk to reason about and no operator-adjudicated refuse path needed. This
-is a deliberate, documented divergence from the reference shape (playbook: "copy the SHAPE...
-record which way you went"), not an oversight.
+surrogate key (`generate_id()`); collision across INDEPENDENTLY-generated ids across replicas is
+practically impossible. This is a deliberate, documented divergence from the reference shape
+(playbook: "copy the SHAPE... record which way you went"), not an oversight.
+
+**Narrower correction (fjarvis PR review, pre-merge hardening round):** the independent-generation
+premise above does NOT cover ids that are shared by construction rather than independently
+generated -- a replica provisioned by cloning or restoring another replica's data directory (or an
+operator-driven merge of two previously-separate deployments) can produce two DIFFERENT legacy
+files sharing the SAME id with DIFFERENT content. The original backfill insert
+(`INSERT ... ON CONFLICT (id) DO NOTHING`) checked only `PGRES_COMMAND_OK`, which proves the
+statement executed, never that THIS row won the conflict -- exactly the anti-pattern
+`docs/postgres-store-playbook.md`'s "Anti-patterns reviewers reject" section documents
+(`AuditStore::stamp_complete`, ADR-0040, #2697, is the worked example that motivated the rule). A
+same-id row already present from an earlier backfill would silently no-op, and the fingerprint
+covering the LOSING file would still stamp complete, permanently. **Fixed**: the job insert now
+uses `RETURNING id` + `PQntuples()`; zero rows returned means the id already existed with
+(necessarily, since the fingerprint differs) different content, and the whole transaction fails
+closed -- named row, no partial commit, next boot retries. This does not need `RbacStore`'s
+refuse-on-mismatch COMPLEXITY (no operator-adjudicated "which value is right" branch), because a
+job-id conflict during backfill is always treated as fail-closed here, never resolved by guessing;
+it DOES need the underlying discipline the playbook already names as universal ("a 'first writer
+wins' contract... needs `PQcmdTuples()`... or `RETURNING` + `PQntuples()`"), which the original cut
+of this store missed applying to the per-row insert (it was already applied correctly to the
+MARKER insert, where an identical fingerprint value is proof two writers legitimately agree on
+content and a `DO NOTHING` conflict there is a genuine no-op, not a data-loss risk).
+
+Also fixed in the same round: `canonicalize_legacy_jobs`'s field serialization moved from raw
+`\x1f`/`\x1e` delimiter bytes to length-prefixed fields (`<byte-length>:<bytes>`, the standard
+netstring/bencode technique) -- the delimiter-byte encoding was not injective over unconstrained
+legacy `TEXT` (a `\x1f` inside a field's own content could shift a row's apparent field boundary
+enough to make two DIFFERENT row sets hash identically). Fingerprint version bumped to `v2` to
+mark the encoding change (not a compatibility concern -- nothing has shipped with `v1` yet).
 
 **Trade-off accepted:** unlike `RbacStore` (which stats the legacy path cheaply before touching
 Postgres, and skips entirely once the file is moved aside post-migration), this design reads the

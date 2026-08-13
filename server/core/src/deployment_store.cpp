@@ -58,33 +58,41 @@ std::string sha256_hex(const std::string& in) {
 // Canonicalizes a legacy job snapshot into a stable, order-independent
 // string for fingerprinting. Sorted so the same set of rows always
 // canonicalizes identically regardless of the SELECT's physical row order.
+//
+// Length-prefixed fields (gov fjarvis MEDIUM), not raw delimiter bytes: an
+// unescaped '\x1f'/'\x1e' separator is not injective over unconstrained
+// legacy TEXT — id="a", target_host="b\x1fc" and id="a\x1fb",
+// target_host="c" would canonicalize identically. `append_field` writes
+// each field as `<byte-length>:<bytes>`, so the boundary is determined by
+// the length prefix, never by scanning for a byte that could also appear
+// inside the field — the standard netstring/bencode technique. With a
+// FIXED field count per row (9, exactly what's written below), this makes
+// the whole encoding injective: two different (row-content) tuples can
+// never produce the same byte stream.
+void append_field(std::string& out, std::string_view field) {
+    out += std::to_string(field.size());
+    out += ':';
+    out += field;
+}
+
 std::string canonicalize_legacy_jobs(const std::vector<DeploymentJob>& jobs) {
     std::vector<std::string> rows;
     rows.reserve(jobs.size());
     for (const auto& j : jobs) {
         std::string r;
-        r += j.id;
-        r += '\x1f';
-        r += j.target_host;
-        r += '\x1f';
-        r += j.os;
-        r += '\x1f';
-        r += j.method;
-        r += '\x1f';
-        r += j.status;
-        r += '\x1f';
-        r += std::to_string(j.created_at);
-        r += '\x1f';
-        r += std::to_string(j.started_at);
-        r += '\x1f';
-        r += std::to_string(j.completed_at);
-        r += '\x1f';
-        r += j.error;
-        r += '\x1e';
+        append_field(r, j.id);
+        append_field(r, j.target_host);
+        append_field(r, j.os);
+        append_field(r, j.method);
+        append_field(r, j.status);
+        append_field(r, std::to_string(j.created_at));
+        append_field(r, std::to_string(j.started_at));
+        append_field(r, std::to_string(j.completed_at));
+        append_field(r, j.error);
         rows.push_back(std::move(r));
     }
     std::sort(rows.begin(), rows.end());
-    std::string canon = "deployment-legacy-fingerprint-v1\n";
+    std::string canon = "deployment-legacy-fingerprint-v2\n";
     for (const auto& r : rows)
         canon += r;
     return canon;
@@ -410,22 +418,53 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
     std::string failure_detail;
     bool ok = pool_.with_txn([&](PGconn* conn) -> bool {
         for (const auto& j : legacy_jobs) {
+            // RETURNING id + PQntuples() (never a bare PGRES_COMMAND_OK check on
+            // an ON CONFLICT DO NOTHING insert, gov fjarvis BLOCKING /
+            // docs/postgres-store-playbook.md's own "Anti-patterns reviewers
+            // reject"): PGRES_COMMAND_OK only proves the STATEMENT executed,
+            // never that THIS row won the conflict — a same-id row already
+            // present (e.g. from a second legacy file with overlapping ids and
+            // DIFFERENT content, such as a cloned/restored data directory)
+            // silently no-ops, and the fingerprint stamped at the end of this
+            // transaction would make that permanent: the file is never
+            // reconsidered. Unlike the marker insert below — where an identical
+            // fingerprint value IS proof two writers agree on content, so a
+            // conflict there is a legitimate no-op — a job-id conflict during
+            // backfill is never expected (ids are independently-random 64-bit
+            // surrogate keys) and is therefore treated as an anomaly: fail the
+            // whole transaction closed, name the offending row, and let the
+            // next boot retry after an operator investigates.
             pg::PgResult res = pg::exec_params(
                 conn,
                 "INSERT INTO deployment_store.deployment_jobs "
                 "(id, target_host, os, method, status, created_at, started_at, completed_at, "
                 " error) VALUES ($1,$2,$3,$4,$5,$6::bigint,$7::bigint,$8::bigint,$9) "
-                "ON CONFLICT (id) DO NOTHING",
+                "ON CONFLICT (id) DO NOTHING RETURNING id",
                 std::vector<std::string>{j.id, j.target_host, j.os, j.method, j.status,
                                          std::to_string(j.created_at),
                                          std::to_string(j.started_at),
                                          std::to_string(j.completed_at), j.error});
-            if (res.status() != PGRES_COMMAND_OK) {
+            if (res.status() != PGRES_TUPLES_OK) {
                 failure_detail = std::string("legacy deployment_jobs row id='") + j.id +
                                  "' (target_host='" + j.target_host + "'): " +
                                  PQerrorMessage(conn);
                 spdlog::error("DeploymentStore::migrate_from_sqlite: insert of {} failed: {}",
                               j.id, PQerrorMessage(conn));
+                return false;
+            }
+            if (PQntuples(res.get()) == 0) {
+                failure_detail =
+                    std::string("legacy deployment_jobs row id='") + j.id +
+                    "' (target_host='" + j.target_host +
+                    "') already exists in deployment_store.deployment_jobs with DIFFERENT "
+                    "legacy-file content than what is currently in Postgres — refusing to "
+                    "silently discard it (a same-id row landing here from another source is "
+                    "unexpected: ids are independently-random surrogate keys)";
+                spdlog::error(
+                    "DeploymentStore::migrate_from_sqlite: row {} already present, ON "
+                    "CONFLICT no-op — refusing to stamp a backfill that may have silently "
+                    "discarded diverging content",
+                    j.id);
                 return false;
             }
         }
@@ -481,6 +520,15 @@ DeploymentStore::create_job(const std::string& target_host, const std::string& o
     if (!std::all_of(target_host.begin(), target_host.end(), is_valid_hostname_char))
         return std::unexpected(
             "target_host contains invalid characters (only [a-zA-Z0-9._-] allowed)");
+    // A leading '-' is a valid DNS-allowlist character sequence but never a
+    // valid DNS label (RFC 1123: a label starts/ends alphanumeric) — it is
+    // also exactly the SSH-option-injection shape ("-oProxyCommand=...",
+    // "-Jjump.host", "-Ffile") the allowlist's own doc comment names as the
+    // future risk it defends against (gov fjarvis MEDIUM — empirically
+    // verified: "-Jjump.evil.com"/"-Ffile" passed the allowlist above before
+    // this check existed). Reject it now, while it is still free.
+    if (target_host.front() == '-' || target_host.back() == '-')
+        return std::unexpected("target_host must not start or end with '-'");
 
     if (os != "windows" && os != "linux" && os != "darwin")
         return std::unexpected("os must be windows, linux, or darwin");

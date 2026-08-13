@@ -212,6 +212,18 @@ TEST_CASE("create_job validates target_host/os/method before writing", "[deploym
         auto r = store.create_job(std::string(254, 'a'), "linux", "manual");
         REQUIRE_FALSE(r.has_value());
     }
+    SECTION("an SSH-option-injection-shaped leading-dash host is rejected") {
+        // gov fjarvis MEDIUM — empirically these passed the char-allowlist
+        // before the leading/trailing '-' check existed: real SSH option
+        // shapes ("-oProxyCommand=...", "-Jjump.host", "-Ffile") a future
+        // ssh-method executor could pass straight to a command line.
+        auto r = store.create_job("-Jjump.evil.com", "linux", "ssh");
+        REQUIRE_FALSE(r.has_value());
+    }
+    SECTION("a trailing-dash host is rejected") {
+        auto r = store.create_job("host.example.com-", "linux", "manual");
+        REQUIRE_FALSE(r.has_value());
+    }
     SECTION("an unrecognised os is rejected") {
         auto r = store.create_job("host.example.com", "beos", "manual");
         REQUIRE_FALSE(r.has_value());
@@ -531,6 +543,80 @@ TEST_CASE("migrate_from_sqlite: a sourceless (fileless) boot never blocks a late
     auto jobs = store.list_jobs();
     REQUIRE(jobs.has_value());
     CHECK(jobs->size() == 1);
+}
+
+// Regression test for gov fjarvis BLOCKING: a job id already present in
+// Postgres (from an EARLIER, successful backfill of a DIFFERENT legacy
+// file) with DIFFERENT content than a LATER legacy file's row sharing that
+// same id must never be silently discarded by `ON CONFLICT (id) DO
+// NOTHING` while the later file's fingerprint gets stamped complete anyway
+// — the exact "trust PGRES_COMMAND_OK to mean YOUR row won" anti-pattern
+// docs/postgres-store-playbook.md's "Anti-patterns reviewers reject"
+// section documents (AuditStore::stamp_complete, ADR-0040, #2697, is the
+// worked example that motivated the rule). This can happen in practice via
+// two legacy files that share an id by construction — e.g. one replica's
+// data directory cloned to provision another, then each independently
+// mutated before either migrates.
+TEST_CASE("migrate_from_sqlite fails closed (not silently) when a legacy row's id already "
+          "exists in Postgres with different content",
+          "[deployment_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deployment_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string shared_id = "dddddddddddddddd";
+
+    DeploymentJob first;
+    first.id = shared_id;
+    first.target_host = "first-replica.example.com";
+    first.os = "linux";
+    first.method = "manual";
+    first.status = "pending";
+    first.created_at = 1000;
+    auto first_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_conflict_first") / "deployment-jobs.db";
+    std::filesystem::create_directories(first_path.parent_path());
+    write_legacy_sqlite_db(first_path, {first});
+    REQUIRE(store.migrate_from_sqlite(first_path));
+
+    auto got1 = store.get_job(shared_id);
+    REQUIRE(got1.has_value());
+    REQUIRE(got1->has_value());
+    CHECK((*got1)->status == "pending");
+
+    // A SECOND legacy file, DIFFERENT overall content (so its fingerprint
+    // differs and it is not short-circuited by the marker check), but
+    // sharing the SAME job id with a DIFFERENT status — the scenario a
+    // cloned/restored data directory can produce.
+    DeploymentJob second;
+    second.id = shared_id;
+    second.target_host = "second-replica.example.com";
+    second.os = "linux";
+    second.method = "manual";
+    second.status = "completed";
+    second.created_at = 1000;
+    second.completed_at = 2000;
+    auto second_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_conflict_second") / "deployment-jobs.db";
+    std::filesystem::create_directories(second_path.parent_path());
+    write_legacy_sqlite_db(second_path, {second});
+
+    CHECK_FALSE(store.migrate_from_sqlite(second_path));
+
+    // The original row must survive UNCHANGED — no silent partial
+    // overwrite AND no silent discard-with-stamped-success.
+    auto got2 = store.get_job(shared_id);
+    REQUIRE(got2.has_value());
+    REQUIRE(got2->has_value());
+    CHECK((*got2)->status == "pending");
+    CHECK((*got2)->target_host == "first-replica.example.com");
+
+    // The failed pass must not have stamped its fingerprint complete — a
+    // retry (e.g. after an operator reconciles the two files by hand)
+    // fails the SAME way again, never silently "succeeds" on a stale
+    // no-op.
+    CHECK_FALSE(store.migrate_from_sqlite(second_path));
 }
 
 TEST_CASE("DeploymentStore::migrate_from_sqlite copies a populated legacy file exactly once",
