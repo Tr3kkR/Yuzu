@@ -1204,6 +1204,13 @@ TEST_CASE("REST gs.status: a service-scoped token is denied outright (World-A / 
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(res->body.find("errored_rules") == std::string::npos);
+    // Governance SEC-4/COMP-1: the denial was previously silent in the audit trail
+    // despite an in-code comment claiming parity with the (audited) session-revoke
+    // self-target guard. Now audited.
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.status.denied");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].detail.find("printers") != std::string::npos);
 }
 
 // ── #2298 item 6d: per-agent status route (previously untested at REST level) ──

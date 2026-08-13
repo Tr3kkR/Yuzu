@@ -5585,18 +5585,22 @@ behind the dashboard's Unhealthy Guards card, not the (reaped, 30-day) event log
 `compliant_rules` and `drifted_rules` stay `0` deliberately — full status ingest
 (`action=="status"`) lands in a later rung. A **service-scoped API token is denied
 (`403`) outright**: this route aggregates across every agent's census, and a token
-scoped to one service must not read the fleet-wide count.
+scoped to one service must not read the fleet-wide count. **Unlike the per-agent
+route below, this route is NOT management-group-confined** — a non-service-scoped
+caller holding a `GuaranteedState:Read` grant sees the unfiltered fleet-wide count
+regardless of any management-group scope restriction on their role; tracked as
+[#3038](https://github.com/Tr3kkR/Yuzu/issues/3038).
 
-- **Permission:** `GuaranteedState:Read` (non-service-scoped only — see above)
+- **Permission:** `GuaranteedState:Read` (non-service-scoped only — see above; management-group confinement not yet enforced, #3038)
 - **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
 - **5xx:** `503` if the Guaranteed State store is unavailable or degraded — never a silent `0`.
 
 #### `GET /api/v1/guaranteed-state/status/{agent_id}`
 
-Per-agent status. `errored_rules` is the same census derivation as the fleet route
-(also intersected against the live rule catalogue), scoped to this agent; `total_rules`
-is the count of rules with any census entry for this agent (not the fleet catalogue
-size). `compliant_rules`/`drifted_rules` stay `0` for the same reason as the fleet
+Per-agent status. `errored_rules` and `total_rules` are BOTH real and BOTH intersected
+against the live rule catalogue (a census row for a since-deleted rule counts toward
+neither) — `total_rules` is the count of rules with any census entry for this agent
+still present in that catalogue, not the fleet catalogue size. `compliant_rules`/`drifted_rules` stay `0` for the same reason as the fleet
 route. Per-device behavioral read: scoped the same
 way as `GET /guaranteed-state/device-compliance` (a global grant passes fleet-wide,
 otherwise the caller must hold Read via a management group the device is in), and
