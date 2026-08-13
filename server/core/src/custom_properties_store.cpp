@@ -1185,6 +1185,14 @@ bool CustomPropertiesStore::migrate_from_sqlite(const std::filesystem::path& leg
     spdlog::info("CustomPropertiesStore: migrate_from_sqlite: backfilled {} properties, {} "
                  "schemas from {}",
                  snap.properties.size(), snap.schemas.size(), legacy_db_path.string());
+    // Close the legacy read-only handle FIRST: Windows refuses to rename a
+    // file with an open handle (ERROR_SHARING_VIOLATION), so leaving
+    // `legacy` open here silently defeats the move-aside on MSVC (POSIX
+    // allows rename-with-open-handle, so this passed on Linux/macOS CI and
+    // was only caught by the Windows leg — mirrors RbacStore's identical
+    // fix, rbac_store.cpp). All legacy reads are already materialised into
+    // `snap` above, so closing early loses nothing.
+    legacy.close();
     move_legacy_aside(legacy_db_path);
     backfill_metric("success");
     return true;
