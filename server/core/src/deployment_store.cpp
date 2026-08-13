@@ -76,6 +76,26 @@ void append_field(std::string& out, std::string_view field) {
     out += field;
 }
 
+// A job's status only ever moves forward through pending -> running ->
+// {completed, failed, cancelled} (the three terminal states are tied — this
+// store doesn't need to order between them, only detect forward motion).
+// Used solely to pick a DIRECTION for a lifecycle-only backfill conflict
+// (gov unhappy-path Finding A, hardening round 4). Both `create_job` and
+// `update_status` reject anything outside the 5 known values before it ever
+// reaches Postgres, so an unrecognised string here cannot occur via this
+// store's own write paths; ranked maximally (3) purely so a hypothetical
+// out-of-band value on the LEGACY side resolves toward fail-closed rather
+// than being silently trusted as "behind".
+int lifecycle_rank(const std::string& status) {
+    if (status == "pending")
+        return 0;
+    if (status == "running")
+        return 1;
+    if (status == "completed" || status == "failed" || status == "cancelled")
+        return 2;
+    return 3;
+}
+
 std::string canonicalize_legacy_jobs(const std::vector<DeploymentJob>& jobs) {
     std::vector<std::string> rows;
     rows.reserve(jobs.size());
@@ -230,23 +250,33 @@ DeploymentStore::DeploymentStore(pg::PgPool& pool) : pool_(pool) {
 //     the offending id.
 //   - LIFECYCLE (status, started_at, completed_at, error): legitimately
 //     changes post-migration via live traffic on whichever replica migrated
-//     the row first. A legacy snapshot showing an earlier lifecycle state
-//     for the SAME identity is the ordinary shape of that progress, not a
-//     conflict — Postgres already holds the live, authoritative value for
-//     that id, so this is a benign no-op. The drift is WARNING-logged
-//     (naming both values) rather than silently swallowed, so it stays
-//     visible to an operator; it never blocks the boot.
+//     the row first. Which side is AHEAD decides the outcome (gov
+//     unhappy-path Finding A, hardening round 4 — see lifecycle_rank
+//     below): if Postgres's status is equal-or-ahead of the legacy row —
+//     the ordinary shape of a legacy snapshot predating progress already
+//     live in Postgres — this is a benign no-op; Postgres's value is kept
+//     and the drift is WARNING-logged (naming all four values) rather than
+//     silently swallowed, so it stays visible without blocking the boot. If
+//     the LEGACY row is instead ahead of Postgres — the ADR-0009
+//     rollback-then-roll-forward shape, where the pre-migration binary
+//     genuinely progressed the job further while rolled back — silently
+//     keeping Postgres's less-advanced value would discard real progress,
+//     so that direction fails the boot closed instead, same as an identity
+//     mismatch.
 //
 // Deliberately simpler than RbacStore's post-#2703 reference shape (refuse
 // on ANY column mismatch, docs/ops-runbooks/rbac-store-backfill-recovery.md):
 // RBAC identifiers are small and human-chosen, so two independently-
 // authored grants can legitimately collide on name and both need operator
-// adjudication. DeploymentStore's id is random and machine-generated, so a
-// shared id is always the SAME logical job observed twice (via cloned or
-// restored legacy files sharing a common origin, or a replica re-reading
-// its own already-migrated file) — never two independently-valuable rows
-// that happen to collide — which is what makes "identity fixed, lifecycle
-// may have moved on" the correct comparison instead of a byte-for-byte one.
+// adjudication. DeploymentStore's id is random and machine-generated, so —
+// outside an astronomical id collision on the 64-bit generate_id() surrogate
+// key (the rare case the IDENTITY branch above exists to catch) — a shared
+// id is always the SAME logical job observed twice (via cloned or restored
+// legacy files sharing a common origin, or a replica re-reading its own
+// already-migrated file), never two independently-valuable rows that happen
+// to collide, which is what makes "identity fixed, lifecycle may have moved
+// on in either direction" the correct comparison instead of a byte-for-byte
+// one.
 //
 // SQL shape note: this uses plain `DO NOTHING` plus a separate read-back
 // `SELECT` and an application-level comparison, which deliberately diverges
@@ -255,10 +285,13 @@ DeploymentStore::DeploymentStore(pg::PgPool& pool) : pool_(pool) {
 // content." Backfill-vs-backfill is lock-safe (Postgres blocks the
 // conflicting INSERT until the winner commits), so the only live race
 // window is against an already-serving sibling's normal traffic on that
-// exact row between the failed insert and the read-back — worst case a
-// spurious fail-closed boot on a genuine identity mismatch, never silent
-// data loss, so the simpler two-statement shape was kept over the atomic
-// recipe.
+// exact row between the failed insert and the read-back — and since
+// IDENTITY columns are write-once (never touched by that traffic), the race
+// can only ever perturb what the read-back sees among the LIFECYCLE
+// columns, never fabricate an identity mismatch. Worst case is therefore a
+// stale lifecycle comparison resolved by the direction check above, never
+// silent data loss, so the simpler two-statement shape was kept over the
+// atomic recipe.
 //
 // Trade-off accepted: this reads the local legacy file (if present) on
 // EVERY boot rather than short-circuiting on a single marker, because
@@ -527,15 +560,52 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
                 spdlog::debug("DeploymentStore::migrate_from_sqlite: row {} already present "
                               "with identical content, skipping (benign no-op)",
                               j.id);
-            } else {
-                spdlog::warn(
-                    "DeploymentStore::migrate_from_sqlite: row {} already migrated with "
-                    "lifecycle progress since this legacy snapshot was taken (legacy "
-                    "status='{}' vs current status='{}') — keeping the current Postgres "
-                    "value; this is expected on a replica whose legacy file predates that "
-                    "progress, not a conflict",
-                    j.id, j.status, stored.status);
+                continue;
             }
+            // A lifecycle difference alone is not automatically benign: it
+            // matters WHICH side is ahead (gov unhappy-path Finding A,
+            // hardening round 4). The expected shape — a replica whose
+            // legacy snapshot predates progress already live in Postgres —
+            // has Postgres equal-or-ahead of the legacy row; that is a
+            // benign no-op, Postgres's value is kept, and the drift is
+            // WARNING-logged for visibility. The opposite direction — the
+            // LEGACY row is ahead of what Postgres currently holds — is the
+            // ADR-0009 rollback-then-roll-forward shape: the pre-migration
+            // binary ran against this same legacy file while rolled back
+            // and genuinely progressed the job further than Postgres ever
+            // saw. Silently keeping Postgres's less-advanced value there
+            // would discard real progress, so that direction fails the
+            // whole backfill closed instead, the same as an identity
+            // mismatch.
+            if (lifecycle_rank(j.status) > lifecycle_rank(stored.status)) {
+                failure_detail =
+                    std::string("legacy deployment_jobs row id='") + j.id +
+                    "' shows MORE lifecycle progress than Postgres's current value (stored: "
+                    "status='" + stored.status + "' started_at=" +
+                    std::to_string(stored.started_at) + " completed_at=" +
+                    std::to_string(stored.completed_at) + " error='" + stored.error +
+                    "'; legacy: status='" + j.status + "' started_at=" +
+                    std::to_string(j.started_at) + " completed_at=" +
+                    std::to_string(j.completed_at) + " error='" + j.error +
+                    "') — likely a rollback-then-roll-forward cycle (ADR-0009) progressed "
+                    "this job while running the pre-migration binary; refusing to silently "
+                    "discard that progress";
+                spdlog::error(
+                    "DeploymentStore::migrate_from_sqlite: row {} legacy snapshot shows MORE "
+                    "lifecycle progress than the current Postgres value — refusing to stamp "
+                    "a backfill that would silently discard it",
+                    j.id);
+                return false;
+            }
+            spdlog::warn(
+                "DeploymentStore::migrate_from_sqlite: row {} already migrated with lifecycle "
+                "progress since this legacy snapshot was taken (legacy status='{}' "
+                "started_at={} completed_at={} error='{}' vs current status='{}' "
+                "started_at={} completed_at={} error='{}') — keeping the current Postgres "
+                "value; this is expected on a replica whose legacy file predates that "
+                "progress, not a conflict",
+                j.id, j.status, j.started_at, j.completed_at, j.error, stored.status,
+                stored.started_at, stored.completed_at, stored.error);
             continue;
         }
         pg::PgResult marker = pg::exec_params(

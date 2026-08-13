@@ -118,12 +118,12 @@ why). The shipped design instead tracks completion PER DISTINCT LEGACY-FILE CONT
 mismatch, `docs/ops-runbooks/rbac-store-backfill-recovery.md`): that complexity exists there
 because RBAC identifiers (role/group names) are small and human-chosen, so two independently-
 authored grants can legitimately collide on name and both need operator adjudication.
-`DeploymentStore`'s `id` is a 64-bit random surrogate key (`generate_id()`) — a shared id is
-never two independently-valuable rows that happen to collide, it is always the SAME logical job
-observed twice: via a replica re-reading its own already-migrated file, or via a data directory
-that was cloned or restored to provision a second replica and then diverged. This is a deliberate,
-documented divergence from the reference shape (playbook: "copy the SHAPE... record which way you
-went"), not an oversight.
+`DeploymentStore`'s `id` is a 64-bit random surrogate key (`generate_id()`) — outside an
+astronomical id collision (the rare case the IDENTITY branch below exists to catch), a shared id
+is always the SAME logical job observed twice: via a replica re-reading its own already-migrated
+file, or via a data directory that was cloned or restored to provision a second replica and then
+diverged. This is a deliberate, documented divergence from the reference shape (playbook: "copy
+the SHAPE... record which way you went"), not an oversight.
 
 **Per-row conflict handling.** The backfill insert (`INSERT ... ON CONFLICT (id) DO NOTHING
 RETURNING id`) checks `PQntuples()`, not merely `PGRES_COMMAND_OK` — proving a statement executed
@@ -139,28 +139,45 @@ been migrated once:
   (corruption, a hand-edited legacy file, or an astronomical id collision), and the whole backfill
   transaction fails closed with a message naming both the stored and legacy identity values.
 - **Lifecycle** (`status`, `started_at`, `completed_at`, `error`) legitimately changes
-  post-migration via live traffic on whichever replica migrated the row first. A legacy snapshot
-  showing an earlier lifecycle state for the SAME identity is the ordinary shape of that progress,
-  not a conflict — Postgres already holds the live, authoritative value, so this is a benign
-  no-op. The drift is WARNING-logged (naming both values) so it stays visible rather than
-  silently swallowed, but it never blocks the boot.
+  post-migration via live traffic on whichever replica migrated the row first. Which side is
+  AHEAD decides the outcome, using the status enum's natural order
+  (`pending < running < {completed, failed, cancelled}`, the three terminal states tied): if
+  Postgres's value is equal-or-ahead of the legacy row — a legacy snapshot predating progress
+  already live in Postgres — this is a benign no-op; Postgres's value is kept and the drift is
+  WARNING-logged (naming all four lifecycle values on both sides) so it stays visible without
+  blocking the boot. If the LEGACY row is instead ahead of Postgres, the whole backfill
+  transaction fails closed the same as an identity mismatch — see Finding A below.
 
 This still does not need `RbacStore`'s refuse-on-mismatch COMPLEXITY (no operator-adjudicated
-"which value is right" branch) — an identity divergence here is always unambiguous corruption,
-never a "which value is right" judgment call — but it does need the underlying discipline the
-playbook already names as universal ("a 'first writer wins' contract... needs `PQcmdTuples()`...
-or `RETURNING` + `PQntuples()`"), which is now applied consistently to both the per-row insert and
-the marker insert (an identical marker fingerprint is proof two writers legitimately agree on
-content; a `DO NOTHING` conflict there was already a genuine no-op).
+"which value is right" branch for the ordinary case) — but it does need the underlying discipline
+the playbook already names as universal ("a 'first writer wins' contract... needs
+`PQcmdTuples()`... or `RETURNING` + `PQntuples()`"), which is now applied consistently to both the
+per-row insert and the marker insert (an identical marker fingerprint is proof two writers
+legitimately agree on content; a `DO NOTHING` conflict there was already a genuine no-op).
 
 The SQL shape here (plain `DO NOTHING` + a separate read-back `SELECT` + an application-level
 comparison) deliberately diverges from the playbook's `DO UPDATE ... WHERE <condition> RETURNING`
 recipe for "two writers can legitimately agree on identical content": backfill-vs-backfill is
 lock-safe (Postgres blocks the conflicting `INSERT` until the winner commits), so the only live
 race window is against an already-serving sibling's normal traffic on that exact row between the
-failed insert and the read-back — worst case a spurious fail-closed boot on a genuine identity
-mismatch, never silent data loss, so the simpler two-statement shape was kept over the atomic
-recipe (playbook: "record which way you went").
+failed insert and the read-back — and since IDENTITY columns are write-once (never touched by
+that traffic), the race can only ever perturb what the read-back sees among the LIFECYCLE columns,
+never fabricate an identity mismatch. Worst case is therefore a stale lifecycle comparison
+resolved by the direction check above, never silent data loss, so the simpler two-statement shape
+was kept over the atomic recipe (playbook: "record which way you went").
+
+**Finding A (gov unhappy-path, hardening round 4): the direct structural counterpart of the
+lifecycle fix, in the opposite direction.** ADR-0009's rollback-then-roll-forward window means the
+pre-migration SQLite-only binary can run again after a rollback and genuinely progress a job's
+lifecycle further than Postgres ever saw (Postgres isn't written to while rolled back). Silently
+keeping Postgres's less-advanced value on roll-forward — as "same identity, different lifecycle is
+always benign" would suggest — would discard that real progress with only a WARNING log as
+evidence, inside a legacy-file retention window that itself expires after one release. Fixed:
+the direction check above treats a legacy row ranked strictly ahead of Postgres's current value as
+the suspicious case and fails the boot closed, same remediation shape as an identity mismatch. A
+same-rank divergence among the three terminal states (e.g. `completed` vs. `failed` with no
+ordering between them) is treated as the benign, Postgres-wins case — accepted as a narrow edge
+case matching this store's general "trust the live value" posture, not specifically re-litigated.
 
 `canonicalize_legacy_jobs`'s field serialization uses length-prefixed fields
 (`<byte-length>:<bytes>`, the standard netstring/bencode technique) rather than raw `\x1f`/`\x1e`
@@ -168,14 +185,16 @@ delimiter bytes: a delimiter byte inside a field's own content could shift a row
 boundary enough to make two DIFFERENT row sets hash identically, which the length-prefixed
 encoding closes structurally (verified by a dedicated shifted-field-boundary regression test).
 
-**Hardening history:** this design went through three review rounds before landing — an
+**Hardening history:** this design went through four review rounds before landing — an
 adversarial PR review (fjarvis: Kimi+Codex) found the missing `PQntuples()` check above; a Gate 8
 re-review (security-guardian+docs-writer) found the first fix over-corrected to fail closed on
 ANY conflict, including a benign identical re-encounter; a second Gate 8 re-review (unhappy-path)
 found that fix in turn still failed closed on ordinary lifecycle progress in a legitimate
-multi-replica boot sequence, which is what the identity/lifecycle partition above resolves. Each
-round is recorded in its governance ledger fragment (`governance.d/deployment-store-pg*.jsonl`);
-this section states only the design that shipped.
+multi-replica boot sequence, which is what the identity/lifecycle partition resolved; a third
+Gate 8 re-review (unhappy-path again) found that partition was itself directionless — Finding A
+above — which the status-order direction check resolves. Each round is recorded in its governance
+ledger fragment (`governance.d/deployment-store-pg*.jsonl`); this section states only the design
+that shipped.
 
 **Trade-off accepted:** unlike `RbacStore` (which stats the legacy path cheaply before touching
 Postgres, and skips entirely once the file is moved aside post-migration), this design reads the

@@ -15,12 +15,18 @@
   content of a job sharing the same id (e.g. a data directory cloned or restored to provision a
   second replica, then diverged), the backfill compares the two: a difference in the job's
   identity (target host/OS/method/creation time — fields that never change once a job exists)
-  fails the boot closed with the offending id named in the startup log, since that shape is
-  provably outside the model. A difference confined to the job's lifecycle (status/timestamps/
-  error — fields a job's own progress legitimately changes after migration, e.g. a slower-booting
-  replica whose legacy file predates a sibling replica completing that same job) is a safe no-op:
-  the database's current value is kept and the drift is logged at warning level for visibility,
-  without blocking the boot. `POST /api/deployment-jobs`'s `target_host` validation (unchanged, already live)
+  fails the boot closed with the offending id named in the startup log, since that combination
+  should never occur under normal operation (data corruption, a hand-edited legacy file, or two
+  unrelated jobs whose ids collided). A difference confined to the job's lifecycle
+  (status/timestamps/error — fields a job's own progress legitimately changes after migration)
+  depends on which side is further along: if the database's value is at least as far along as the
+  legacy file (e.g. a slower-booting replica whose legacy file predates a sibling replica
+  completing that same job), that's a safe no-op — the database's current value is kept and the
+  drift is logged at warning level for visibility, without blocking the boot. If instead the
+  LEGACY file is further along than the database (e.g. after a rollback to the previous release
+  runs against this same file and genuinely progresses the job, then rolls forward again), the
+  boot fails closed the same as an identity mismatch, so that progress is never silently lost.
+  `POST /api/deployment-jobs`'s `target_host` validation (unchanged, already live)
   also now rejects a leading or trailing `-` — not a valid DNS label, and defense-in-depth
   against a future SSH-option-injection shape (`-oProxyCommand=...`) for a not-yet-built `ssh`
   method executor. This applies to the already-released endpoint independent of the Postgres

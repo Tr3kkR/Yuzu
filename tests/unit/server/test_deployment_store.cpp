@@ -590,9 +590,13 @@ TEST_CASE("migrate_from_sqlite fails closed (not silently) when a legacy row's i
     CHECK((*got1)->status == "pending");
 
     // A SECOND legacy file, DIFFERENT overall content (so its fingerprint
-    // differs and it is not short-circuited by the marker check), but
-    // sharing the SAME job id with a DIFFERENT status — the scenario a
-    // cloned/restored data directory can produce.
+    // differs and it is not short-circuited by the marker check), sharing
+    // the SAME job id but a DIFFERENT `target_host` — an IDENTITY field,
+    // which is what makes this the fail-closed case (the incidentally
+    // different `status` below would, on its own with matching identity,
+    // hit the separate lifecycle-direction check — see the "legacy AHEAD"
+    // test further down — not this one). The scenario a cloned/restored
+    // data directory can produce.
     DeploymentJob second;
     second.id = shared_id;
     second.target_host = "second-replica.example.com";
@@ -623,7 +627,7 @@ TEST_CASE("migrate_from_sqlite fails closed (not silently) when a legacy row's i
     CHECK_FALSE(store.migrate_from_sqlite(second_path));
 }
 
-// Companion to the conflict-with-different-content test above: an `ON
+// Companion to the conflict-with-different-identity test above: an `ON
 // CONFLICT` match is on id ALONE, so a conflict does not by itself mean the
 // content differs (gov security-guardian/docs-writer SHOULD, hardening
 // round 2). A legacy file that is a SUPERSET of what's already migrated —
@@ -767,6 +771,75 @@ TEST_CASE("migrate_from_sqlite treats a lifecycle-only difference as a benign no
     auto padding_got = store.get_job(padding_job.id);
     REQUIRE(padding_got.has_value());
     REQUIRE(padding_got->has_value());
+}
+
+// Regression test for gov unhappy-path Finding A (SHOULD, hardening round
+// 4) — the direct structural counterpart of UP-1 above, in the OPPOSITE
+// direction. ADR-0009's rollback-then-roll-forward window means the
+// pre-migration SQLite-only binary can run again after a rollback and
+// genuinely progress a job's lifecycle further than Postgres ever saw
+// (Postgres isn't written to while rolled back). If the backfill then
+// silently kept Postgres's LESS-advanced value on roll-forward — as a
+// same-identity/different-lifecycle conflict alone would suggest is always
+// safe — that real progress would be discarded with only a WARNING log as
+// evidence, inside a legacy-file retention window that itself expires
+// after one release. The fix: when the LEGACY row's status ranks strictly
+// ahead of Postgres's current value, the direction is treated as
+// suspicious rather than benign, and the whole backfill fails closed the
+// same way an identity mismatch does.
+TEST_CASE("migrate_from_sqlite fails closed when a legacy row's lifecycle is AHEAD of "
+          "Postgres's current value",
+          "[deployment_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deployment_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string shared_id = "7777777777777777";
+
+    // First legacy file: the job as originally created, still pending —
+    // migrated normally.
+    DeploymentJob original;
+    original.id = shared_id;
+    original.target_host = "rolled-back.example.com";
+    original.os = "linux";
+    original.method = "manual";
+    original.status = "pending";
+    original.created_at = 5000;
+    auto first_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_ahead_first") / "deployment-jobs.db";
+    std::filesystem::create_directories(first_path.parent_path());
+    write_legacy_sqlite_db(first_path, {original});
+    REQUIRE(store.migrate_from_sqlite(first_path));
+
+    // A SECOND legacy file — same identity, but its lifecycle snapshot is
+    // now AHEAD of Postgres's current ("pending") value: this stands in for
+    // the pre-migration binary having completed the job while the
+    // deployment was rolled back to it, with Postgres never touched during
+    // that window.
+    DeploymentJob rolled_back_progress = original;
+    rolled_back_progress.status = "completed";
+    rolled_back_progress.completed_at = 5500;
+    rolled_back_progress.error = "";
+    auto second_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_ahead_second") / "deployment-jobs.db";
+    std::filesystem::create_directories(second_path.parent_path());
+    write_legacy_sqlite_db(second_path, {rolled_back_progress});
+
+    CHECK_FALSE(store.migrate_from_sqlite(second_path)); // fails closed, not silently kept
+
+    // Postgres's stale "pending" value is untouched (no partial write), and
+    // the legacy file's more-advanced "completed" state was never adopted
+    // either — the operator must reconcile, same remediation shape as an
+    // identity mismatch.
+    auto after = store.get_job(shared_id);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->status == "pending");
+
+    // The failed pass must not have stamped its fingerprint complete — a
+    // retry fails the SAME way again until an operator reconciles.
+    CHECK_FALSE(store.migrate_from_sqlite(second_path));
 }
 
 // Regression test for the fingerprint canonicalization's injectivity (gov
