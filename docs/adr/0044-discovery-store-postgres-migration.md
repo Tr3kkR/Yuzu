@@ -144,6 +144,12 @@ partially-migrated discovery data). Added to both the `/healthz` and `/readyz` c
 - `mark_managed`/`clear_results` have no REST route today (only `upsert_device` via
   `POST /api/discovery/scan` and `list_devices` via `GET /api/discovery/results` are reachable) —
   pre-existing, unrelated to this migration.
-- `POST /api/discovery/scan`'s handler always responds `200`/audits `"success"` even when every
-  individual `upsert_device` call fails (e.g. under a degraded pool) — pre-existing, unrelated to
-  this migration, flagged by Gate 2 security-guardian for a follow-up issue.
+- ~~`POST /api/discovery/scan`'s handler always responds `200`/audits `"success"` even when every
+  individual `upsert_device` call fails~~ — **resolved** (fjarvis's PR #3064 re-review, in two
+  stages: commit `1ef811b7f` made the handler track per-device failures and return `503` on total
+  failure / `"status":"partial"` on a mixed batch, auditing `"success"`/`"partial_failure"`/
+  `"failure"`; a follow-on commit renamed the audit outcome to `"partial"` to match this
+  codebase's established convention, so the final state audits
+  `"success"`/`"partial"`/`"failure"`). Remaining gap in the same area, still open: no write-side
+  Prometheus degrade counter (unlike the read
+  path's `yuzu_server_discovery_read_degrade_total`) — tracked as a follow-up issue.

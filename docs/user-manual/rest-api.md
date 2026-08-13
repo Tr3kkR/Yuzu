@@ -3789,13 +3789,29 @@ Store discovery scan results. Requires `Infrastructure:Write`. Upserts one row p
 
 `devices[].ip_address` is required per entry; an entry with an empty `ip_address` is silently skipped and not counted.
 
-**Response (200):**
+**Response (200, all or partial success):**
 
 ```json
-{"status": "ok", "devices_stored": 1}
+{"status": "ok", "devices_stored": 1, "devices_failed": 0}
 ```
 
-**Note:** this endpoint always returns `200` and audits `discovery.scan` as `"success"` even when individual device upserts fail (e.g. under a degraded Postgres pool) — `devices_stored` may be lower than `devices.length` with no other signal in the response body. `yuzu_server_discovery_read_degrade_total` does **not** cover this path — it is populated only by `GET /api/discovery/results`. There is currently no scan-path-specific degrade signal; `devices_stored < devices.length` in the response body is the only per-request evidence, and the shared `yuzu_pg_*` connection-pool metrics are the closest backend-health proxy. Pre-existing behavior, tracked as a follow-up.
+A partial batch failure (e.g. under a degraded Postgres pool) still returns `200` but `"status": "partial"` with `devices_failed > 0`, and audits `discovery.scan` as `"partial"`:
+
+```json
+{"status": "partial", "devices_stored": 1, "devices_failed": 1}
+```
+
+**Response (503, every attempted device failed):**
+
+```json
+{"error":{"code":503,"message":"discovery scan storage degraded"},"meta":{"api_version":"v1"}}
+```
+
+Returned only when every device the request attempted to persist failed — an entry skipped for an empty `ip_address` is not counted as an attempt, so an all-skip batch still returns `200`/`"ok"`. Audits `discovery.scan` as `"failure"`.
+
+Re-sending the exact same request body after a `503` or a `"partial"` response is safe: `upsert_device` is idempotent per `ip_address` (see the upsert semantics above), so a byte-identical retry does not double-count or corrupt already-stored devices. This is narrower than "safe to re-scan": a fresh scan is not a replay, and `mac_address`/`subnet` overwrite unconditionally on every upsert (unlike `hostname`, which only refreshes on a non-empty value) — a re-scan that this time fails to resolve a device's MAC (e.g. a transient ARP miss) will blank a previously known-good `mac_address`, not merely retry the failed write.
+
+There is currently no scan-path-specific Prometheus degrade signal (unlike `GET /api/discovery/results`, which increments `yuzu_server_discovery_read_degrade_total`) — `devices_failed` in the response body, and the audit trail's `"partial"`/`"failure"` outcomes, are the per-request evidence today; the shared `yuzu_pg_*` connection-pool metrics are the closest backend-health proxy. A write-path degrade counter is tracked as a follow-up.
 
 #### `GET /api/discovery/results`
 

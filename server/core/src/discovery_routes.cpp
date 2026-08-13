@@ -784,14 +784,17 @@ void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  // detection, so a scan that silently stored nothing must
                  // never be indistinguishable from one that stored
                  // everything. Mirrors the GET route's authoritative-store
-                 // posture (ADR-0012 §1) and the ok/no_agents/partial
-                 // three-way result naming BundleOrchestrator::dispatch
-                 // already uses for the same fan-out-with-partial-failure
-                 // shape.
+                 // posture (ADR-0012 §1) and the established "partial" audit
+                 // outcome this codebase already uses for the identical
+                 // some-succeeded-some-failed shape (api_token.rotate,
+                 // session.revoke_all, user.delete, sle.agent.decommission,
+                 // scim identity-link resolution) — not
+                 // BundleOrchestrator::dispatch's ok/no_agents/partial set,
+                 // which is a Prometheus metric label, not an audit outcome.
                  const bool any_failed = failed > 0;
-                 const bool total_failure = any_failed && upserted == 0 && failed > 0;
+                 const bool total_failure = any_failed && upserted == 0;
                  const char* audit_outcome =
-                     !any_failed ? "success" : (upserted > 0 ? "partial_failure" : "failure");
+                     !any_failed ? "success" : (upserted > 0 ? "partial" : "failure");
                  audit_fn(req, "discovery.scan", audit_outcome, "Discovery", subnet,
                           std::to_string(upserted) + "/" + std::to_string(upserted + failed) +
                               " devices stored");

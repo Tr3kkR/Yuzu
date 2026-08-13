@@ -1094,9 +1094,21 @@ counter — a non-zero rate means the discovery view is degraded, **not** that n
 were found. `yuzu_server_discovery_backfill_total{result}` records the one-time
 backfill outcome (`completed` / `fresh` / `failed`).
 
-**Not affected:** the discovery REST surface's request/response shape and the
-scan-ingest workflow are unchanged — only the storage substrate and the new
-degraded-read status code change.
+**Breaking — `POST /api/discovery/scan`'s response contract changed.** The endpoint no
+longer always returns `200 {"status":"ok",...}`: the response gains a `devices_failed`
+count, `status` is `"partial"` when some but not all devices in a batch persisted, and
+the endpoint returns **503** when every attempted device failed to persist (previously
+this was silently reported as `200`/`"ok"`, with the `discovery.scan` audit row always
+saying `"success"` regardless of outcome — the audit outcome is now
+`"success"`/`"partial"`/`"failure"`). A caller that asserts a bare `status == "ok"`, or
+that treats any 5xx from this endpoint as a hard failure needing operator escalation,
+should account for the new value and status code. Re-sending the exact same request body
+is safe — `upsert_device` is idempotent per `ip_address`, so a byte-identical retry cannot
+double-count or corrupt already-stored devices — but a fresh re-scan is not the same
+thing: `mac_address`/`subnet` overwrite unconditionally on every upsert, so a re-scan that
+fails to resolve a device's MAC this time will blank a previously known-good value rather
+than simply retry the earlier failure. See the REST API reference's Network Discovery
+section for the full response shapes.
 
 ## Upgrade Order
 
