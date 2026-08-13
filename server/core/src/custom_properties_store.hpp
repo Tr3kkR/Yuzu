@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file custom_properties_store.hpp
-/// Migrated Postgres store (ADR-0006/ADR-0043, schema `custom_properties_store`).
+/// Migrated Postgres store (ADR-0006/ADR-0044, schema `custom_properties_store`).
 /// Typed operator-authored metadata for devices — property VALUES the operator
 /// sets per-agent (`custom_properties`) plus optional per-key TYPE/VALIDATION
 /// definitions (`custom_property_schemas`) — usable in scope expressions via

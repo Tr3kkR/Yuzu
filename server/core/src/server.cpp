@@ -4484,7 +4484,7 @@ public:
                 apply_runtime_config_overrides();
             }
         }
-        // Migrated Postgres store (ADR-0006/ADR-0043, schema
+        // Migrated Postgres store (ADR-0006/ADR-0044, schema
         // `custom_properties_store`) — construction fail-CLOSED per ADR-0012
         // §1 (same template as ManagementGroupStore above): a reachable
         // database whose schema can't migrate/open is a fatal startup error,
@@ -6744,7 +6744,7 @@ public:
         if (gateway_service_)
             gateway_service_->set_mgmt_group_store(nullptr);
         mgmt_group_store_.reset();
-        // CustomPropertiesStore borrows pg_pool_ (ADR-0043) — drop before the
+        // CustomPropertiesStore borrows pg_pool_ (ADR-0044) — drop before the
         // pool, matching every other migrated store's belt-and-braces
         // discipline (declaration order alone is a coincidence, not a
         // contract — a future caller wired here mid-`stop()` must not find a
