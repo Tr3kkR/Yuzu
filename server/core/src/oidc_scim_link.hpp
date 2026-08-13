@@ -73,8 +73,7 @@ namespace yuzu::server::oidc {
 /// login has already succeeded by the time this runs and must not be
 /// undone by a store hiccup here.
 void link_oidc_login_to_scim(ScimStore* scim_store, const std::string& iss, const std::string& sub,
-                             const std::string& oid, const std::string& link_claim_name,
-                             const std::string& link_claim_value,
+                             const std::string& oid, const std::string& link_claim_value,
                              yuzu::MetricsRegistry* metrics = nullptr);
 
 /// ADR-2001 §4 — the deny-at-login backstop's resolve-and-decide result.

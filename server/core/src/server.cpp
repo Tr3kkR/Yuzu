@@ -2109,12 +2109,18 @@ public:
         // the post-mint re-check for the codex-caught concurrent-deprovision
         // race) on every DENY — a non-zero rate is the CC6.8 backstop
         // actually firing, i.e. a deprovisioned federated identity attempted
-        // to re-authenticate.
+        // to re-authenticate. It also fires on the fail-closed
+        // `scim_store_unavailable` branch (the ScimStore couldn't be asked),
+        // so a non-zero rate is not proof of a real deprovision alone — see
+        // the metric description below and docs/user-manual/metrics.md.
         metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_total",
                           "Total OIDC logins denied at /auth/callback because the identity's "
                           "linked SCIM resource is deprovisioned (deactivated, or orphaned by a "
-                          "hard-deleted scim_resources row) — the ADR-2001 §4 deny-at-login "
-                          "backstop closing the re-login-mints-fresh-tokens window",
+                          "hard-deleted scim_resources row) OR because the ScimStore could not "
+                          "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
+                          "closing the re-login-mints-fresh-tokens window; correlate with the "
+                          "audit reason= field to distinguish a real deprovision from a store "
+                          "outage",
                           "counter");
         // describe() only registers HELP/TYPE metadata; the series is absent
         // from /metrics until first .increment(). Instantiate each bare
@@ -5132,7 +5138,13 @@ public:
         // ADR-2001 §2/D2 — link formation + login observation at the OIDC
         // login site are fail-OPEN by design, so a null scim_store_ (no PG
         // configured) is a safe no-op rather than a login-time failure.
-        auth_routes_->set_scim_store(scim_store_.get());
+        // Gated on cfg_.scim_enable (mirrors the /readyz scim_store exemption
+        // above) — Postgres is the mandatory substrate so scim_store_ is
+        // non-null on every deployment, and without this gate a server
+        // running OIDC SSO with SCIM disabled would deny every OIDC login
+        // during a transient Postgres blip (store-unavailable reads as
+        // fail-closed deny-at-login) even though the feature is off.
+        auth_routes_->set_scim_store(cfg_.scim_enable ? scim_store_.get() : nullptr);
 
         start_web_server();
 

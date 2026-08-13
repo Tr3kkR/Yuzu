@@ -39,8 +39,7 @@ void bump_link_write_failure(yuzu::MetricsRegistry* metrics) {
 } // namespace
 
 void link_oidc_login_to_scim(ScimStore* scim_store, const std::string& iss, const std::string& sub,
-                             const std::string& oid, const std::string& link_claim_name,
-                             const std::string& link_claim_value,
+                             const std::string& oid, const std::string& link_claim_value,
                              yuzu::MetricsRegistry* metrics) {
     if (!scim_store)
         return;
@@ -62,9 +61,9 @@ void link_oidc_login_to_scim(ScimStore* scim_store, const std::string& iss, cons
 
     // D2 tripwire (governance Gate 7 BLOCKING fix, the crux): record an
     // observation for EACH candidate claim that is present and sane — not
-    // just `link_claim_name`/`link_claim_value` (the configured one). This
-    // is what lets a later deprovision's `observation_matches(external_id)`
-    // find the NON-configured candidate under a misconfigured
+    // just `link_claim_value` (the configured one). This is what lets a
+    // later deprovision's `observation_matches(external_id)` find the
+    // NON-configured candidate under a misconfigured
     // `--oidc-scim-link-claim` (see the .hpp doc comment).
     const std::array<std::pair<const char*, const std::string&>, 2> candidates{{
         {"sub", sub},

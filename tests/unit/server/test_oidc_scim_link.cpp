@@ -74,7 +74,7 @@ TEST_CASE("link_oidc_login_to_scim: exactly-one active match forms the link",
     auto resource = store.create_resource("alice", "ext-alice");
     REQUIRE(resource.has_value());
 
-    link_oidc_login_to_scim(&store, "https://idp.example.com/", "sub-alice", /*oid=*/"", "sub",
+    link_oidc_login_to_scim(&store, "https://idp.example.com/", "sub-alice", /*oid=*/"",
                             "ext-alice");
 
     auto links = store.links_for_scim_id(resource->scim_id);
@@ -104,7 +104,7 @@ TEST_CASE("link_oidc_login_to_scim: zero matches forms no link, but the observat
     // happens per-candidate-claim (sub AND oid), so the mismatched value
     // must land in one of the two candidate slots to be recorded.
     link_oidc_login_to_scim(&store, "https://idp.example.com/", "sub-nomatch",
-                            /*oid=*/"no-such-ext-id", "sub", "no-such-ext-id");
+                            /*oid=*/"no-such-ext-id", "no-such-ext-id");
 
     auto links = store.links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
@@ -146,7 +146,7 @@ TEST_CASE("link_oidc_login_to_scim: TWO active matches forms NO link (mis-link g
     // Same "oid carries the tested value" adjustment as the zero-match test
     // above.
     link_oidc_login_to_scim(&store, "https://idp.example.com/", "sub-ambiguous",
-                            /*oid=*/"dup-ext", "sub", "dup-ext");
+                            /*oid=*/"dup-ext", "dup-ext");
 
     // Neither candidate resource picked up the link — an ambiguous
     // externalId must never resolve to an arbitrary row.
@@ -163,7 +163,7 @@ TEST_CASE("link_oidc_login_to_scim: TWO active matches forms NO link (mis-link g
 
 TEST_CASE("link_oidc_login_to_scim: a null ScimStore is a safe no-op", "[oidc][scim][2001]") {
     // Mirrors the "no PG configured" boot posture — must not crash.
-    link_oidc_login_to_scim(nullptr, "https://idp.example.com/", "sub-x", /*oid=*/"", "sub",
+    link_oidc_login_to_scim(nullptr, "https://idp.example.com/", "sub-x", /*oid=*/"",
                             "ext-x");
     SUCCEED("did not throw");
 }
@@ -181,7 +181,7 @@ TEST_CASE("link_oidc_login_to_scim: a closed/unusable ScimStore is fail-OPEN —
 
     // Must not throw despite every underlying write failing.
     link_oidc_login_to_scim(&broken_store, "https://idp.example.com/", "sub-failopen",
-                            /*oid=*/"", "sub", "ext-failopen");
+                            /*oid=*/"", "ext-failopen");
     SUCCEED("did not throw despite a closed store");
 
     // The login itself is independent of this call: a session minted before
@@ -232,7 +232,7 @@ TEST_CASE("link_oidc_login_to_scim: misconfigured Entra link-claim — no link f
     // formation is keyed on `sub`, which does NOT match the externalId.
     const std::string iss = "https://login.microsoftonline.com/tenant-id/v2.0";
     const std::string sub_value = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    link_oidc_login_to_scim(&store, iss, sub_value, oid_value, /*link_claim_name=*/"sub",
+    link_oidc_login_to_scim(&store, iss, sub_value, oid_value,
                             /*link_claim_value=*/sub_value);
 
     // No link formed — the configured claim (sub) never matched anything.
@@ -249,7 +249,7 @@ TEST_CASE("link_oidc_login_to_scim: misconfigured Entra link-claim — no link f
 
     // MUTATION-CHECK (manually verified during development): reverting
     // `link_oidc_login_to_scim` to record only the configured
-    // (link_claim_name, link_claim_value) pair — i.e. dropping the `oid`
+    // (sub, link_claim_value) pair — i.e. dropping the `oid`
     // candidate loop entirely — makes the `observation_matches(oid_value)`
     // assertion above fail (no row for the oid value exists), confirming
     // this test actually exercises the D2 tripwire fix rather than passing
@@ -270,7 +270,7 @@ TEST_CASE("link_oidc_login_to_scim: an empty/unsanitized oid candidate is never 
     // Okta-style IdP: no `oid` claim at all (empty string, as
     // OidcProvider::parse_id_token leaves it when absent).
     link_oidc_login_to_scim(&store, "https://idp.okta.example.com/", "sub-okta", /*oid=*/"",
-                            "sub", "sub-okta");
+                            "sub-okta");
 
     CHECK(store.observation_matches("sub-okta"));
     // No row was ever inserted for an empty claim_value — observation_matches
@@ -500,6 +500,72 @@ TEST_CASE("oidc_login_denied_deprovisioned: a closed/unusable ScimStore fails CL
     // identity re-authenticate by luck of timing).
 }
 
+// ── Review follow-up (PR3 BLOCKER) — gate deny-at-login on --scim-enable ──
+//
+// Postgres is the mandatory substrate, so `scim_store_` is non-null on
+// EVERY deployment — before this fix, server.cpp wired it into AuthRoutes
+// UNCONDITIONALLY (`auth_routes_->set_scim_store(scim_store_.get())`), so a
+// server running OIDC SSO with `--scim-enable=false` denied ALL OIDC logins
+// during a transient Postgres blip (a degraded store reads as
+// `scim_store_unavailable` -> deny, exactly the "closed/unusable ScimStore
+// fails CLOSED" case above). The fix gates the wiring itself:
+// `auth_routes_->set_scim_store(cfg_.scim_enable ? scim_store_.get() :
+// nullptr)` — mirroring the pre-existing `/readyz` `scim_store` check,
+// which already exempts itself the same way
+// (`!cfg_.scim_enable || (scim_store_ && ...)`).
+//
+// There is no server-construction harness that reaches the private
+// `ServerImpl::run()` wiring line directly (`ServerImpl` has no test
+// seam — see the other TEST_CASEs in this file, none construct one), so
+// this test pins the WIRING EXPRESSION itself — reproduced verbatim from
+// server.cpp — feeding it a store standing in for "Postgres is
+// unreachable" and asserting the null side of the ternary makes
+// `oidc_login_denied_deprovisioned` inert, never reaching the degraded
+// store at all.
+TEST_CASE("deny-at-login wiring: scim_enable=false + a degraded/unavailable "
+          "ScimStore => OIDC login proceeds (deny-at-login gated off, "
+          "MUTATION-CHECK target, see the comment below)",
+          "[pg][oidc][scim][2001][deny-at-login][scimenable]") {
+    // Stands in for "Postgres is unreachable" — same broken-pool
+    // construction as the fail-CLOSED test above, which on its own (fed
+    // directly, as if wired unconditionally) DENIES.
+    PgPool broken_pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1}};
+    ScimStore broken_store{broken_pool};
+    REQUIRE_FALSE(broken_store.is_open());
+
+    // Sanity: an unconditionally-wired (old, buggy) store DENIES even
+    // though SCIM is "disabled" in this scenario — this is the bug the
+    // fix closes.
+    auto unconditional = oidc_login_denied_deprovisioned(&broken_store, "https://idp.example.com/",
+                                                          "sub-scimoff", "ext-scimoff");
+    CHECK(unconditional.denied);
+
+    // The fix: server.cpp's wiring line, reproduced verbatim —
+    //   auth_routes_->set_scim_store(cfg_.scim_enable ? scim_store_.get() : nullptr);
+    // with cfg_.scim_enable == false and scim_store_.get() == &broken_store.
+    constexpr bool scim_enable = false;
+    ScimStore* wired_store = scim_enable ? &broken_store : nullptr;
+    REQUIRE(wired_store == nullptr);
+
+    // With SCIM disabled, deny-at-login must be INERT: the degraded store
+    // is never even consulted (the null=proceed contract, pinned by the
+    // "a null ScimStore proceeds" test above) — the login proceeds despite
+    // the Postgres blip.
+    auto decision = oidc_login_denied_deprovisioned(wired_store, "https://idp.example.com/",
+                                                     "sub-scimoff", "ext-scimoff");
+    CHECK_FALSE(decision.denied);
+    CHECK_FALSE(decision.scim_id.has_value());
+
+    // MUTATION-CHECK (manually verified during development): reverting the
+    // wiring expression to the pre-fix unconditional
+    // `scim_store_.get()` — i.e. `wired_store = &broken_store;` regardless
+    // of `scim_enable` — makes the `decision.denied` assertion above fail
+    // (CHECK_FALSE(decision.denied) sees `denied == true` instead), which
+    // is exactly the regression this test exists to catch: a
+    // `--scim-enable=false` deployment denying every OIDC login during a
+    // transient Postgres blip.
+}
+
 // ── Governance unhappy-path finding U1 — reprovision after SCIM DELETE ──
 //
 // Bug: SCIM DELETE hard-deletes scim_resources and orphans the
@@ -547,7 +613,7 @@ TEST_CASE("oidc_login_denied_deprovisioned U1 (a): DELETE then re-CREATE under t
     // A real login re-links: link_oidc_login_to_scim repoints the stale
     // (iss,sub) row to the NEW scim_id (the same externalId still resolves
     // to exactly one active resource — the re-created one).
-    link_oidc_login_to_scim(&store, iss, sub, /*oid=*/"", "sub", external_id);
+    link_oidc_login_to_scim(&store, iss, sub, /*oid=*/"", external_id);
     auto links = store.links_for_scim_id(reprovisioned->scim_id);
     REQUIRE(links.has_value());
     REQUIRE(links->size() == 1);

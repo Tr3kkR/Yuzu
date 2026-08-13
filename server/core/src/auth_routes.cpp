@@ -2479,6 +2479,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "user", "User", username, deny_detail);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+                // Also bump the established general OIDC login counter so
+                // dashboards keyed on it don't undercount during a deny
+                // episode — every other /auth/callback failure path bumps
+                // this series too.
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
             }
             res.set_redirect("/login?error=sso_failed");
             return;
@@ -2689,8 +2694,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // `link_oidc_login_to_scim` re-sanitizes every candidate claim
         // before trusting it into a durable observation row.
         oidc::link_oidc_login_to_scim(scim_store_, claims.iss, claims.sub, claims.oid,
-                                      cfg_.oidc_scim_link_claim, link_claim_value,
-                                      auth_mgr_.metrics_registry());
+                                      link_claim_value, auth_mgr_.metrics_registry());
 
         // ADR-2001 §4 — deny-at-login backstop, POST-MINT RE-CHECK (the
         // codex-caught check-then-mint race, user-approved). The primary
@@ -2732,6 +2736,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "user", "User", username, recheck_detail);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+                // Also bump the established general OIDC login counter — see
+                // the primary check above.
+                m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
             }
             res.set_redirect("/login?error=sso_failed");
             return;
