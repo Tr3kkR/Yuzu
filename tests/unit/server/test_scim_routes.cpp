@@ -1746,6 +1746,109 @@ TEST_CASE("ScimRoutes: D2 — a deprovision with neither a link nor a matching o
     CHECK(f.metrics.counter("yuzu_scim_deprovision_unlinked_total").value() == 0.0);
 }
 
+// ── Governance PR4a follow-up (C1/C2): D1/D2 must not be OIDC-only ────────
+//
+// PR4a joined SAML principals into the shared deprovision paths but left D1
+// gated on `links_for_scim_id` (OIDC only) and D2 gated on
+// `principals.size() != 1` (which SAML links now also inflate) — both
+// silently stopped firing for a SAML-only or SAML+unformed-OIDC user. These
+// four cases are the closure evidence for that fix.
+
+TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITH an active linked SAML identity "
+         "(ZERO OIDC links) is still a LOUD signal — PATCH deactivate",
+         "[pg][scim][routes][adr2001][d1][saml]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "priya"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp.example.com/saml/metadata",
+                                           "priya@example.com", id));
+    REQUIRE(f.auth_mgr.update_role("priya", auth::Role::admin));
+
+    // Confirm this is genuinely SAML-ONLY — zero OIDC identity_links rows.
+    auto oidc_links = f.scim_store->links_for_scim_id(id);
+    REQUIRE(oidc_links.has_value());
+    CHECK(oidc_links->empty());
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 404); // #2021 refusal unchanged
+    CHECK(f.auth_mgr.get_user_role("priya").value() == auth::Role::admin);
+
+    AuditQuery q;
+    q.action = "scim.user.deprovision_role_refused_with_link";
+    q.target_id = id;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].result == "failure");
+    CHECK((*rows)[0].detail.find("SAML") != std::string::npos);
+    // MUTATION-CHECK (governance C1, manually verified during development):
+    // reverting the D1 branches to a bare
+    // `scim_store->links_for_scim_id(...)` (OIDC only) makes this metric
+    // read 0.0 and this audit row not exist — a SAML-only-linked
+    // role-refusal fires NOTHING, exactly the gap this test closes.
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_role_refused_with_active_link_total").value() ==
+         1.0);
+}
+
+TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITH an active linked SAML identity "
+         "(ZERO OIDC links) is still a LOUD signal — DELETE",
+         "[pg][scim][routes][adr2001][d1][saml]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "quinn"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp.example.com/saml/metadata",
+                                           "quinn@example.com", id));
+    REQUIRE(f.auth_mgr.update_role("quinn", auth::Role::admin));
+
+    auto res = f.del("/scim/v2/Users/" + id);
+    REQUIRE(res);
+    CHECK(res->status == 404); // #2021 refusal unchanged
+    CHECK(f.auth_mgr.get_user_role("quinn").value() == auth::Role::admin);
+
+    AuditQuery q;
+    q.action = "scim.user.deprovision_role_refused_with_link";
+    q.target_id = id;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].result == "failure");
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_role_refused_with_active_link_total").value() ==
+         1.0);
+}
+
+TEST_CASE("ScimRoutes: D2 — a resource with ONE SAML link and ZERO OIDC links still bumps the "
+         "unlinked-OIDC tripwire on a matching login observation (previously masked by the "
+         "coexisting SAML link inflating principals.size())",
+         "[pg][scim][routes][adr2001][d2][saml]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "rowan"}, {"externalId", "ext-rowan"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp.example.com/saml/metadata",
+                                           "rowan@example.com", id));
+    // A login occurred whose claim value matches this slug's externalId,
+    // under a DIFFERENT OIDC claim than the configured link claim, so
+    // upsert_link (OIDC) never ran — the D2 scenario, now coexisting with a
+    // formed SAML link on the same scim_id.
+    REQUIRE(f.scim_store->record_login_observation("https://idp.example.com/", "sub-rowan", "oid",
+                                                    "ext-rowan"));
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // MUTATION-CHECK (governance C2, manually verified during development):
+    // reverting maybe_flag_d2_unlinked to gate on `principals.size() != 1`
+    // sees size()==2 here (slug + the SAML principal) and returns early —
+    // this metric reads 0.0 instead of 1.0, exactly the masking this test
+    // closes.
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_unlinked_total").value() == 1.0);
+}
+
 TEST_CASE("ScimRoutes: revive-on-reprovision refuses an operator-elevated account — 404, and "
          "the remove_user() undo leaves the account INACTIVE, not reactivated-at-elevated-role "
          "(UP-N5/FIX-5, Gate-8 round-2)",

@@ -178,15 +178,21 @@ normal; more than one: no link, never an arbitrary pick). The write is
 fail-**open** — a write failure never fails the login, mirroring §2's OIDC
 contract exactly.
 
-**6. Deprovision revokes the SAML session — SAML has no API tokens.**
+**6. Deprovision revokes the SAML session — and any token minted under it.**
 `resolve_deprovision_principals` (§3's resolver) gained a second pass:
 `saml::saml_principal_id(entity_id, name_id)` for every row
 `ScimStore::saml_links_for_scim_id(scim_id)` returns, fail-**closed** on that
-call's own `nullopt` (the identical contract §3 gives the OIDC pass). Because
-SAML mints no API/MCP tokens — there is no token-mint call site keyed on a
-`saml:` principal, only `create_saml_session` — resolving a `saml:` principal
-into the revoke set has one practical effect: the linked SAML **session**, if
-still live, is torn down. There is nothing else to revoke for that
+call's own `nullopt` (the identical contract §3 gives the OIDC pass). SAML
+has no *separate* token-mint path — the only session-mint call site keyed on
+a `saml:` principal is `create_saml_session` — but the revoke functions
+(`revoke_for_principal` et al.) are principal-agnostic: any token that was
+minted with a `saml:` principal as its owner (e.g. via the HTMX
+settings-page token-create route, which stamps the calling session's
+username onto the token regardless of that session's auth source) is
+revoked right alongside the session when its `saml:` principal is resolved
+into the revoke set. In practice this means a SAML deprovision's dominant
+observable effect is the session teardown, since the SAML login flow itself
+never mints a token — but it is not the *only* thing revoked for that
 principal.
 
 **7. The residual, stated as honestly as §"Known residuals" states PR3's.**

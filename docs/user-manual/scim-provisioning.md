@@ -329,8 +329,9 @@ has the same effect:
 > tokens**, both for the SCIM slug itself and for any OIDC identity linked
 > to it (see [SCIM ↔ OIDC identity linkage](#scim--oidc-identity-linkage-federated-token-revocation)
 > below for how the link forms and what to configure), as well as any
-> **SAML** session linked to it (session-only — SAML mints no API/MCP
-> tokens; see [SCIM ↔ SAML identity linkage](#scim--saml-identity-linkage-federated-session-revocation)
+> **SAML** session linked to it (SAML has no separate token-mint path; any
+> token minted under a SAML principal is revoked with that principal — see
+> [SCIM ↔ SAML identity linkage](#scim--saml-identity-linkage-federated-session-revocation)
 > below). Revocation is durable
 > within roughly **60 seconds** of the deprovision reaching Yuzu — a
 > concurrently in-flight request can still see a token as valid for that
@@ -527,10 +528,11 @@ conservatively as **not linkable**; no link forms and no error is raised
 > offboarding evidence.
 
 **What deprovision-revoke actually does.** The linked-SAML-identity revoke
-is **session-only** — it invalidates the user's active SAML session
-cookie(s), forcing re-authentication. SAML mints no API/MCP tokens (unlike
-OIDC, there is no `saml:`-keyed token-minting path), so there is nothing
-equivalent to OIDC's federated *token* revocation to perform here.
+invalidates the user's active SAML session cookie(s), forcing
+re-authentication. SAML has no separate token-mint path — any token minted
+under a SAML principal is revoked with that principal on deprovision the
+same way an OIDC-linked token is, so in practice a SAML deprovision's
+observable effect is the session teardown described above.
 
 **Metric.** `yuzu_scim_saml_link_write_failures_total` (counter, no labels)
 bumps when a SAML login's identity-link *write* fails (a ScimStore outage
