@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -1999,4 +2000,32 @@ TEST_CASE("TAR #2361: the FIRST pass with no stored anchor declines instead of d
     run_retention(*f.db, kT0 + 1, f.guard);
     CHECK(row_count(*f.db, "process_hourly") == 1);
     CHECK(declines_of(f.guard, "process_hourly") == 1); // not counted twice
+}
+
+TEST_CASE("TAR #2573: an implausible caller clock declines the whole pass and does not poison "
+          "the anchor",
+          "[tar][retention][clock-guard]") {
+    // `run_retention`'s `now_epoch` parameter feeds `horizon = now_epoch +
+    // kTarRetentionFutureSlackSec` (one addition from signed overflow) AND the
+    // durable anchor write, which is unconditional and runs before any
+    // per-table decision -- so an implausible `now` would otherwise poison the
+    // comparison point for every future pass, not just this one. Same role as
+    // the audit sibling's kMaxPlausibleNow clamp; see kTarMaxPlausibleNow.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1);
+
+    constexpr int64_t kImplausibleNow = std::numeric_limits<int64_t>::max() / 2;
+    run_retention(*f.db, kImplausibleNow, f.guard);
+
+    // The pass must decline outright and leave the anchor exactly as primed.
+    CHECK(f.db->get_config("retention_guard_last_pass", "") == std::to_string(kT0));
+    CHECK(row_count(*f.db, "process_hourly") == 6); // nothing deleted
+    CHECK(declines_of(f.guard, "process_hourly") == 0); // not a per-table decline
+    CHECK(failures_of(f.guard, "__implausible_now__") == 1);
+
+    // And it costs exactly one pass: a plausible `now` right after proceeds
+    // normally, using the still-good anchor.
+    run_retention(*f.db, kT0 + 1, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") == 1);
 }

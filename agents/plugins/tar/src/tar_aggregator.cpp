@@ -17,6 +17,7 @@
 #include <chrono>
 #include <ctime>
 #include <format>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -379,6 +380,23 @@ constexpr std::string_view kRetentionLastPassKey = "retention_guard_last_pass";
 // warehouse table can collide with.
 constexpr std::string_view kClockStateFailureKey = "__clock_state__";
 
+// UPPER bound only, same role as the audit sibling's `kMaxPlausibleNow`
+// (audit_store.cpp) -- a NEGATIVE reading is the legitimate dead-CMOS case this
+// whole guard exists for and must never be rejected on sign alone. Guards two
+// things: `horizon = now_epoch + kTarRetentionFutureSlackSec` below, one
+// addition away from signed overflow with no clamp at all; and the durable
+// anchor write a few lines down, which -- unlike the arithmetic -- is not a UB
+// concern but a PERSISTENCE one: an implausible `now_epoch` persisted as
+// `kRetentionLastPassKey` poisons every future pass's elapsed-time check, not
+// just this one.
+constexpr int64_t kTarMaxPlausibleNow = std::numeric_limits<int64_t>::max() / 4;
+
+// Reported when `now_epoch` itself is implausible, BEFORE anything about the
+// stored anchor is examined. Deliberately a distinct sentinel from
+// `kClockStateFailureKey`: that one means "the write failed", this one means
+// "the value handed to this pass was never trustworthy enough to write".
+constexpr std::string_view kImplausibleNowKey = "__implausible_now__";
+
 // Does any row match? Runs through the TRUSTED connection. `execute_user_query`
 // is the authorizer-sandboxed path for untrusted operator SQL (tar.sql, #760)
 // and is deliberately NOT used here: this SQL is built from registry constants
@@ -481,6 +499,21 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
     if (!db.is_open()) {
         spdlog::warn("TAR retention: skipped, the TAR database is closed. Storage is offline on "
                      "this endpoint until the agent restarts (see `tar status`).");
+        return;
+    }
+
+    // Refuse an implausible caller clock BEFORE it can poison anything -- the
+    // durable anchor write below is unconditional and runs before any per-table
+    // decision, so a garbage `now_epoch` reaching it would corrupt the
+    // comparison point for every future pass, not just this one. Upper bound
+    // only (#2573); see kTarMaxPlausibleNow.
+    if (now_epoch > kTarMaxPlausibleNow) {
+        spdlog::warn("TAR retention: skipped, the clock reading handed to this pass ({}) is not "
+                     "plausible. Not persisted as the comparison point; retention resumes once a "
+                     "sane reading arrives.",
+                     now_epoch);
+        std::lock_guard lock(guard.mu);
+        ++guard.failures[std::string{kImplausibleNowKey}];
         return;
     }
 
