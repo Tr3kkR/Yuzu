@@ -77,16 +77,24 @@ void append_field(std::string& out, std::string_view field) {
 }
 
 // A job's status only ever moves forward through pending -> running ->
-// {completed, failed, cancelled} (the three terminal states are tied — this
-// store doesn't need to order between them, only detect forward motion).
-// Used solely to pick a DIRECTION for a lifecycle-only backfill conflict
-// (gov unhappy-path Finding A, hardening round 4). Both `create_job` and
-// `update_status` reject anything outside the 5 known values before it ever
-// reaches Postgres, so an unrecognised string here cannot occur via this
-// store's own write paths; ranked maximally (3) purely so a hypothetical
-// out-of-band value on the LEGACY side resolves toward fail-closed rather
-// than being silently trusted as "behind".
-int lifecycle_rank(const std::string& status) {
+// {completed, failed, cancelled}. The three terminal states rank equal here
+// — this function only orders BY PROGRESS, not by which terminal outcome
+// occurred — but migrate_from_sqlite's caller does NOT treat every
+// equal-rank pair as interchangeable: two DIFFERENT terminal statuses at
+// the same rank (e.g. completed vs failed) are a disagreement about what
+// actually happened, not silently-equivalent progress, and are handled as
+// their own case there (gov unhappy-path Finding UP-E / cpp-expert,
+// hardening round 5). Used to pick a DIRECTION for a lifecycle-only
+// backfill conflict (gov unhappy-path Finding A, hardening round 4).
+// `create_job`/`update_status` reject anything outside the 5 known values
+// before it ever reaches Postgres via THOSE paths; the legacy-file read
+// loop in migrate_from_sqlite (gov docs-writer, hardening round 5) also
+// validates against this same rank (== 3 means unrecognised) before a row
+// can reach Postgres via backfill, closing what was otherwise the one
+// remaining write path this rank scheme couldn't see. Ranked maximally (3)
+// so that validation check is a single reused condition rather than a
+// second parallel enum list.
+int lifecycle_rank(std::string_view status) {
     if (status == "pending")
         return 0;
     if (status == "running")
@@ -252,17 +260,23 @@ DeploymentStore::DeploymentStore(pg::PgPool& pool) : pool_(pool) {
 //     changes post-migration via live traffic on whichever replica migrated
 //     the row first. Which side is AHEAD decides the outcome (gov
 //     unhappy-path Finding A, hardening round 4 — see lifecycle_rank
-//     below): if Postgres's status is equal-or-ahead of the legacy row —
-//     the ordinary shape of a legacy snapshot predating progress already
-//     live in Postgres — this is a benign no-op; Postgres's value is kept
-//     and the drift is WARNING-logged (naming all four values) rather than
-//     silently swallowed, so it stays visible without blocking the boot. If
-//     the LEGACY row is instead ahead of Postgres — the ADR-0009
-//     rollback-then-roll-forward shape, where the pre-migration binary
-//     genuinely progressed the job further while rolled back — silently
-//     keeping Postgres's less-advanced value would discard real progress,
-//     so that direction fails the boot closed instead, same as an identity
-//     mismatch.
+//     below): if Postgres's status is strictly ahead of the legacy row, or
+//     the two sides are tied at the SAME status — the ordinary shape of a
+//     legacy snapshot predating progress already live in Postgres — this
+//     is a benign no-op; Postgres's value is kept and the drift is
+//     WARNING-logged (naming all four lifecycle fields on both sides)
+//     rather than silently swallowed, so it stays visible without blocking
+//     the boot. Two directions fail the boot closed instead, same as an
+//     identity mismatch (round 5, gov unhappy-path Finding UP-E / cpp-expert
+//     Finding 1): the LEGACY row is strictly ahead of Postgres — the
+//     ADR-0009 rollback-then-roll-forward shape, where the pre-migration
+//     binary genuinely progressed the job further while rolled back, so
+//     silently keeping Postgres's less-advanced value would discard real
+//     progress — OR both sides are TIED at a terminal status (completed/
+//     failed/cancelled) but DISAGREE on which one: rank alone can't order
+//     two different final outcomes, and that same rollback mechanism can
+//     just as easily produce two independently-terminated conclusions as a
+//     strict lead.
 //
 // Deliberately simpler than RbacStore's post-#2703 reference shape (refuse
 // on ANY column mismatch, docs/ops-runbooks/rbac-store-backfill-recovery.md):
@@ -386,6 +400,25 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
                 j.started_at = sqlite3_column_int64(s.get(), 6);
                 j.completed_at = sqlite3_column_int64(s.get(), 7);
                 j.error = safe(reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 8)));
+                // gov docs-writer (hardening round 5): lifecycle_rank's
+                // comment claims an unrecognised status "cannot occur via
+                // this store's own write paths" — true of create_job/
+                // update_status, but this legacy-file read was the one
+                // remaining path where it could: a hand-edited/corrupted
+                // legacy file's status column is never otherwise validated
+                // before landing in Postgres on a row's first (non-
+                // conflicting) insert. Reusing lifecycle_rank's own
+                // maximal-fallback (3) as the validity check closes that
+                // gap here, before any Postgres round trip, matching the
+                // mid-scan-corruption guard below.
+                if (lifecycle_rank(j.status) == 3) {
+                    spdlog::error(
+                        "DeploymentStore::migrate_from_sqlite: legacy deployment_jobs row "
+                        "{} has an unrecognised status '{}' — refusing to stamp a backfill "
+                        "containing it",
+                        j.id, j.status);
+                    return false;
+                }
                 legacy_jobs.push_back(std::move(j));
             }
             // H2 (governance): require the terminal code to be SQLITE_DONE —
@@ -566,21 +599,34 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
             // matters WHICH side is ahead (gov unhappy-path Finding A,
             // hardening round 4). The expected shape — a replica whose
             // legacy snapshot predates progress already live in Postgres —
-            // has Postgres equal-or-ahead of the legacy row; that is a
+            // has Postgres strictly ahead of the legacy row; that is a
             // benign no-op, Postgres's value is kept, and the drift is
-            // WARNING-logged for visibility. The opposite direction — the
-            // LEGACY row is ahead of what Postgres currently holds — is the
-            // ADR-0009 rollback-then-roll-forward shape: the pre-migration
+            // WARNING-logged for visibility. Two directions fail the whole
+            // backfill closed instead, the same as an identity mismatch
+            // (gov unhappy-path/cpp-expert, hardening round 5 — Finding
+            // UP-E/cpp-expert Finding 1): the LEGACY row is strictly ahead
+            // of what Postgres currently holds — the ADR-0009
+            // rollback-then-roll-forward shape, where the pre-migration
             // binary ran against this same legacy file while rolled back
             // and genuinely progressed the job further than Postgres ever
-            // saw. Silently keeping Postgres's less-advanced value there
-            // would discard real progress, so that direction fails the
-            // whole backfill closed instead, the same as an identity
-            // mismatch.
-            if (lifecycle_rank(j.status) > lifecycle_rank(stored.status)) {
+            // saw — OR both sides are at a TERMINAL status (completed/
+            // failed/cancelled, tied at the same rank) but DISAGREE on
+            // which one: rank alone can't order two different final
+            // outcomes, and the same rollback mechanism can just as easily
+            // produce two independently-terminated conclusions as it can a
+            // strict lead. Silently keeping Postgres's value in either case
+            // would discard real, contradictory evidence about what
+            // actually happened to this job.
+            const int legacy_rank = lifecycle_rank(j.status);
+            const int stored_rank = lifecycle_rank(stored.status);
+            const bool legacy_ahead = legacy_rank > stored_rank;
+            const bool terminal_disagreement =
+                legacy_rank == stored_rank && legacy_rank == 2 && j.status != stored.status;
+            if (legacy_ahead || terminal_disagreement) {
                 failure_detail =
                     std::string("legacy deployment_jobs row id='") + j.id +
-                    "' shows MORE lifecycle progress than Postgres's current value (stored: "
+                    "' lifecycle " + (legacy_ahead ? "shows MORE progress than" : "reports a "
+                    "DIFFERENT terminal outcome than") + " Postgres's current value (stored: "
                     "status='" + stored.status + "' started_at=" +
                     std::to_string(stored.started_at) + " completed_at=" +
                     std::to_string(stored.completed_at) + " error='" + stored.error +
@@ -589,12 +635,17 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
                     std::to_string(j.completed_at) + " error='" + j.error +
                     "') — likely a rollback-then-roll-forward cycle (ADR-0009) progressed "
                     "this job while running the pre-migration binary; refusing to silently "
-                    "discard that progress";
+                    "discard that evidence. Postgres's value is the STALE or CONTRADICTED "
+                    "side here — do NOT edit the retained legacy file to make it match "
+                    "Postgres, that would destroy the only record of what the "
+                    "pre-migration binary actually did. Reconcile Postgres to the correct "
+                    "outcome (consulting both values above) or explicitly accept the loss, "
+                    "then restart";
                 spdlog::error(
-                    "DeploymentStore::migrate_from_sqlite: row {} legacy snapshot shows MORE "
-                    "lifecycle progress than the current Postgres value — refusing to stamp "
-                    "a backfill that would silently discard it",
-                    j.id);
+                    "DeploymentStore::migrate_from_sqlite: row {} legacy snapshot conflicts "
+                    "with the current Postgres value ({}) — refusing to stamp a backfill "
+                    "that would silently discard it",
+                    j.id, legacy_ahead ? "more progress" : "different terminal outcome");
                 return false;
             }
             spdlog::warn(
@@ -623,12 +674,24 @@ bool DeploymentStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
         return true;
     });
     if (!ok) {
+        // gov unhappy-path Finding UP-F (hardening round 5): this text used
+        // to blanket-instruct "fix the legacy file," which is actively
+        // wrong for the legacy-ahead/terminal-disagreement case above
+        // (where Postgres, not the legacy file, is the stale/contradicted
+        // side) — an operator following it literally could destroy the
+        // only evidence of what the pre-migration binary actually did.
+        // Which side is at fault differs per failure branch, so this stays
+        // neutral and defers to the specific guidance already embedded in
+        // "Offending" above; it only adds the mechanical how-to-inspect
+        // step, never a which-side-to-trust one.
         spdlog::error(
             "DeploymentStore::migrate_from_sqlite: backfill transaction failed and was rolled "
-            "back — deployment job data NOT migrated. Offending: {}. Remediation: inspect/fix "
-            "the referenced row in the retained read-only legacy file ({}) — e.g. `sqlite3 {} "
-            "\"SELECT * FROM deployment_jobs WHERE id='<id>'\"` — then restart the server; the "
-            "backfill marker was NOT stamped, so the next boot retries the whole backfill.",
+            "back — deployment job data NOT migrated. Offending: {}. See the guidance above "
+            "for which side to reconcile. The retained read-only legacy file is at {} (e.g. "
+            "`sqlite3 {} \"SELECT * FROM deployment_jobs WHERE id='<id>'\"` to inspect it) — "
+            "compare it against Postgres's current row for the same id, then restart the "
+            "server once resolved; the backfill marker was NOT stamped, so the next boot "
+            "retries the whole backfill.",
             failure_detail.empty() ? "unknown (see the specific-row error above)" : failure_detail,
             legacy_db_path.string(), legacy_db_path.string());
         return false;

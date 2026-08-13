@@ -842,6 +842,116 @@ TEST_CASE("migrate_from_sqlite fails closed when a legacy row's lifecycle is AHE
     CHECK_FALSE(store.migrate_from_sqlite(second_path));
 }
 
+// Regression test for gov unhappy-path Finding UP-E / cpp-expert Finding 1
+// (SHOULD, hardening round 5): `lifecycle_rank` ties the three terminal
+// statuses (completed/failed/cancelled) at the same rank, so a legacy row
+// and its Postgres counterpart DISAGREEING on which terminal outcome
+// occurred — not just "who's further along" — must not fall through the
+// rank-only `>` check into the benign no-op path. Same rollback-then-roll-
+// forward mechanism as the AHEAD test above, but landing on a tied rank
+// with a different status rather than a strictly higher one.
+TEST_CASE("migrate_from_sqlite fails closed when a legacy row reports a DIFFERENT terminal "
+          "outcome than Postgres's current value, even at the same lifecycle rank",
+          "[deployment_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deployment_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string shared_id = "6666666666666666";
+
+    DeploymentJob original;
+    original.id = shared_id;
+    original.target_host = "diverged-terminal.example.com";
+    original.os = "linux";
+    original.method = "manual";
+    original.status = "running";
+    original.created_at = 6000;
+    original.started_at = 6100;
+    auto first_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_terminal_first") / "deployment-jobs.db";
+    std::filesystem::create_directories(first_path.parent_path());
+    write_legacy_sqlite_db(first_path, {original});
+    REQUIRE(store.migrate_from_sqlite(first_path));
+
+    REQUIRE(store.update_status(shared_id, "completed").has_value());
+
+    // A SECOND legacy file — same identity, but this snapshot reached a
+    // DIFFERENT terminal outcome (failed, with an error) than what Postgres
+    // now holds (completed). Both rank 2 — a tie, not "legacy ahead" — so
+    // this specifically exercises the terminal_disagreement branch, not the
+    // legacy_ahead one already covered above.
+    DeploymentJob diverged = original;
+    diverged.status = "failed";
+    diverged.completed_at = 6500;
+    diverged.error = "connection refused";
+    auto second_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_terminal_second") / "deployment-jobs.db";
+    std::filesystem::create_directories(second_path.parent_path());
+    write_legacy_sqlite_db(second_path, {diverged});
+
+    std::string captured;
+    {
+        LogCapture capture;
+        CHECK_FALSE(store.migrate_from_sqlite(second_path)); // fails closed, not silently kept
+        captured = capture.str();
+    }
+    CHECK(captured.find("different terminal outcome") != std::string::npos);
+
+    // Postgres's "completed" value is untouched — neither side was silently
+    // adopted or discarded.
+    auto after = store.get_job(shared_id);
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->status == "completed");
+
+    // Retries fail the same way until an operator reconciles.
+    CHECK_FALSE(store.migrate_from_sqlite(second_path));
+}
+
+// Regression test for gov docs-writer (hardening round 5): a legacy file's
+// `status` column is read raw from untrusted SQLite with no validation —
+// unlike `create_job`/`update_status`, which both reject anything outside
+// the 5 known values before it ever reaches Postgres. Without this check,
+// a hand-edited/corrupted legacy file's garbage status could land in
+// Postgres on a row's first (non-conflicting) insert, and — because
+// `lifecycle_rank`'s unrecognised-value fallback (3) is already maximal —
+// no future legitimate legacy row could ever be seen as "ahead" of it,
+// permanently masking the corruption as benign.
+TEST_CASE("migrate_from_sqlite fails closed on a legacy row with an unrecognised status, "
+          "before ever reaching Postgres",
+          "[deployment_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deployment_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    DeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    DeploymentJob garbage;
+    garbage.id = "5555555555555555";
+    garbage.target_host = "corrupt.example.com";
+    garbage.os = "linux";
+    garbage.method = "manual";
+    garbage.status = "not-a-real-status"; // outside the 5 known values
+    garbage.created_at = 7000;
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_deploy_bad_status") / "deployment-jobs.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    write_legacy_sqlite_db(legacy_path, {garbage});
+
+    std::string captured;
+    {
+        LogCapture capture;
+        CHECK_FALSE(store.migrate_from_sqlite(legacy_path));
+        captured = capture.str();
+    }
+    CHECK(captured.find("unrecognised status") != std::string::npos);
+
+    // Nothing landed — the row never reached Postgres at all.
+    auto jobs = store.list_jobs();
+    REQUIRE(jobs.has_value());
+    CHECK(jobs->empty());
+}
+
 // Regression test for the fingerprint canonicalization's injectivity (gov
 // quality-engineer SHOULD): id="a", target_host="b\x1fc" and
 // id="a\x1fb", target_host="c" (all other fields equal) canonicalize to the
