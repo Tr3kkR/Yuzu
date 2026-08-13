@@ -921,7 +921,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous. The server resolves the scope and delivers each in-scope agent a per-agent filtered rule set (os_target + scope_expr).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "503": {"description": "service unavailable"}}}
     },
     "/guaranteed-state/events": {
-      "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Limit is capped at 1000 at the REST boundary. An agent-scoped query (non-empty agent_id) returns that device's individual-identifying behavioural signal history and emits a dex.device.view audit before serving; it FAILS CLOSED — 503 + Sec-Audit-Failed: true (retryable, A4 envelope with retry_after_ms) — if that audit row cannot persist, parity with GET /api/v1/dex/devices/{id}. A query with no agent_id is a bulk operational query, not individually audited.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string"}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit or offset"}, "503": {"description": "Audit row could not persist on an agent-scoped query — behavioural data withheld; carries Sec-Audit-Failed: true and is retryable (A4 envelope).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Two gated shapes behind one route. An agent-scoped query (non-empty agent_id, max 256 chars, no control characters) requires per-device-scoped GuaranteedState:Read (management-group aware; a service-scoped token is confined to its own service's agents) and returns that device's individual-identifying behavioural signal history. A fleet-wide query (no agent_id) requires global GuaranteedState:Read AND denies a service-scoped token outright (403) — the fleet fan-out returns every reporting agent's agent_id + detail_json, which the bare service-token role check alone would not confine. BOTH shapes emit a dex.device.view audit (target_type Agent for the per-device shape, GuaranteedState for the fleet shape) and FAIL CLOSED — 503 + Sec-Audit-Failed: true (retryable, A4 envelope with retry_after_ms) — if that audit row cannot persist, parity with GET /api/v1/dex/devices/{id}. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit/offset, or agent_id too long / contains a control character"}, "403": {"description": "A service-scoped token queried the fleet-wide (no agent_id) shape, or an agent-scoped query named a device outside the caller's scope"}, "503": {"description": "Audit row could not persist — behavioural data withheld on both the agent-scoped and fleet-wide shapes; carries Sec-Audit-Failed: true and is retryable (A4 envelope).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/guaranteed-state/status": {
       "get": {"summary": "Fleet Guaranteed State status rollup", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. PR 2 returns a placeholder with zero compliant/drifted/errored counts; real fleet aggregation lands in Guardian PR 4.", "responses": {"200": {"description": "Status rollup", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}}}
@@ -8598,42 +8598,134 @@ void RestApiV1::register_routes(
     // GET /events — query events with optional filters. Mirrors
     // `audit_store` query semantics. Caps `limit` at 1000 at the REST
     // boundary; the store enforces a hard upper bound at kMaxEventsLimit.
-    sink.Get("/api/v1/guaranteed-state/events", [perm_fn, audit_fn, guaranteed_state_store](
-                                                    const httplib::Request& req,
-                                                    httplib::Response& res) {
-        if (!perm_fn(req, res, "GuaranteedState", "Read"))
-            return;
+    //
+    // Two shapes behind one registration, gated differently:
+    //  - agent_id present: a per-device behavioral-history read. Scoped via
+    //    scoped_perm_fn (device-compliance's fail-closed contract, :10232 pattern)
+    //    so a management-group-confined operator isn't fail-closed out of devices
+    //    they can see, AND so a service-scoped token is confined to its own
+    //    service's agents (require_scoped_permission checks token_scope_service
+    //    per target — require_permission's service branch does not).
+    //  - agent_id absent: a fleet-wide fan-out of per-agent rows (agent_id +
+    //    detail_json each) — identity-linked, not an aggregate, so a
+    //    service-scoped token is denied outright: require_permission's
+    //    service-token branch checks only the ITServiceOwner ROLE, never the
+    //    token's own service-tag scope, so the bare gate alone would let a
+    //    token scoped to ONE service read every agent's behavioral history
+    //    fleet-wide. Denied here, ahead of/independent from perm_fn, so it
+    //    holds regardless of RBAC on/off branch ordering inside
+    //    require_permission. (A parallel deny is pending for the fleet
+    //    /guaranteed-state/status route on a separate, unmerged branch — this
+    //    route's deny does not depend on it landing.)
+    sink.Get("/api/v1/guaranteed-state/events",
+             [perm_fn, scoped_perm_fn, auth_fn, audit_fn, guaranteed_state_store](
+                 const httplib::Request& req, httplib::Response& res) {
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+
+        GuaranteedStateEventQuery q;
+        q.rule_id = req.has_param("rule_id") ? req.get_param_value("rule_id") : "";
+        q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
+        q.severity = req.has_param("severity") ? req.get_param_value("severity") : "";
+
+        if (!q.agent_id.empty()) {
+            // Same floor as device-compliance (auth::kMaxAgentIdLength, 256) and the
+            // same control-character rejection (NUL truncates the SQL bind while the
+            // audit detail records the full string; CR/LF forges audit-log lines).
+            if (q.agent_id.size() > auth::kMaxAgentIdLength) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "agent_id query parameter too long", cid),
+                                "application/json");
+                return;
+            }
+            const auto has_control_char = [](const std::string& s) {
+                for (unsigned char c : s)
+                    if (c < 0x20)
+                        return true;
+                return false;
+            };
+            if (has_control_char(q.agent_id)) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "agent_id query parameter contains control characters",
+                                          cid),
+                    "application/json");
+                return;
+            }
+        }
+
+        if (!q.agent_id.empty()) {
+            if (!scoped_perm_fn) {
+                spdlog::error("dex.device.view (events): scoped_perm_fn unwired — misconfigured "
+                              "call site; failing closed; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", q.agent_id))
+                return;
+        } else {
+            if (auto session = auth_fn(req, res)) {
+                if (!session->token_scope_service.empty()) {
+                    // This deny bypasses perm_fn/require_permission entirely, so
+                    // it does NOT get the auth.permission_required audit row that
+                    // route ordinarily leaves on a denial — record one explicitly
+                    // (same verb as the success path, "denied" result) so a
+                    // probing service token leaves a trace, not silence.
+                    (void)audit_fn(req, "dex.device.view", "denied", "GuaranteedState", "",
+                                   "fleet-wide Guaranteed State events denied to a "
+                                   "service-scoped token");
+                    res.status = 403;
+                    res.set_content(
+                        detail::error_json_a4(
+                            403,
+                            "service-scoped tokens may not read fleet-wide Guaranteed State "
+                            "events; supply agent_id",
+                            cid),
+                        "application/json");
+                    return;
+                }
+            } else {
+                return; // auth_fn already wrote the response (401/etc).
+            }
+            if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                return;
+        }
+
         if (!guaranteed_state_store) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
-        GuaranteedStateEventQuery q;
-        q.rule_id = req.has_param("rule_id") ? req.get_param_value("rule_id") : "";
-        q.agent_id = req.has_param("agent_id") ? req.get_param_value("agent_id") : "";
-        q.severity = req.has_param("severity") ? req.get_param_value("severity") : "";
-        // Behavioral-PII access audit (governance compliance-F1): an agent-scoped
-        // query returns that device's signal history incl. detail_json (which apps
-        // a person runs) — the same behavioral data the dashboard per-device view
-        // audits as dex.device.view. Emit the SAME verb so a SIEM filter catches
-        // both surfaces. A query with NO agent_id filter is a bulk operational
-        // query (not individual-identifying) and is deliberately not audited here.
-        // FAIL-CLOSED (governance #1549 consistency-B1): an agent-scoped query serves
-        // individual-identifying behavioral PII, so refuse to serve when the evidence
-        // row is KNOWN to have failed to persist — parity with GET /dex/devices/{id}.
-        // The shared #1647 helper sets Sec-Audit-Failed + adds the catch-arm log
-        // (a bad_alloc-class throw from audit_fn was previously silent here); a null
-        // audit_fn (audit-off) returns true and serves, per the AuditFn contract.
-        if (!q.agent_id.empty() &&
-            !detail::emit_behavioral_audit(
-                audit_fn, req, res, "dex.device.view", "success", "Agent", q.agent_id,
-                "DEX per-device events via REST /api/v1/guaranteed-state/events")) {
+
+        // Behavioral-PII access audit (governance compliance-F1), unconditional on
+        // BOTH branches now: the fleet branch's per-row projection carries agent_id +
+        // detail_json for every reporting agent, which IS individual-identifying —
+        // the same class of data the agent-scoped branch audits, not the true
+        // cross-machine aggregate dex.app_perf.compare set-and-proceed audits (that
+        // route returns only means/percentiles, no per-agent rows). FAIL-CLOSED on
+        // both branches via the shared #1647 helper, parity with GET
+        // /dex/devices/{id}: refuse to serve individual-identifying data when the
+        // evidence row is KNOWN to have failed to persist.
+        // target_type stays "Agent" on the per-device branch (unchanged from before
+        // this fix, and parity with device-compliance's "Agent", agent_id) — only
+        // the fleet branch, which has no single agent, uses "GuaranteedState" + an
+        // empty id. Collapsing both to one target_type would break the target-type
+        // taxonomy a SIEM filter / works-council per-device count relies on.
+        const bool fleet = q.agent_id.empty();
+        const std::string detail_msg = fleet ? "fleet-wide Guaranteed State events via REST "
+                                                "/api/v1/guaranteed-state/events"
+                                             : "DEX per-device events via REST "
+                                               "/api/v1/guaranteed-state/events";
+        if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.device.view", "success",
+                                           fleet ? "GuaranteedState" : "Agent", q.agent_id,
+                                           detail_msg)) {
             // A4 envelope (correlation_id + retry_after_ms) for parity with the
             // /dex/devices/{id} + baseline siblings (#1651 review K2); Sec-Audit-Failed
             // is already set by emit_behavioral_audit. The failure is transient — retry.
-            const auto cid = detail::make_correlation_id();
             res.status = 503;
-            res.set_header("X-Correlation-Id", cid);
             res.set_content(detail::error_json_a4(503,
                                                   "audit subsystem unavailable; refusing to serve "
                                                   "device data without durable evidence",
