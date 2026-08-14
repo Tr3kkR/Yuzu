@@ -204,6 +204,8 @@ The Guardian dashboard guard list (`/guardian`) exposes a per-Guard **Enable / D
 >
 > **Dashboard reads require `GuaranteedState:Read`** — an authenticated user without it gets a 403 on each data panel (the page shell still loads). The compliance overview shows the live per-(agent, rule) census from the store (see [Compliance overview](#compliance-overview)), not a fabricated percentage.
 >
+> **A service-scoped API token is additionally denied outright (403)** on every fleet-wide data panel — status, guards list, event timeline, the per-Guard drilldown, baselines list, and per-Baseline detail — regardless of the `GuaranteedState:Read` grant it carries. These panels have no single device to confine the token's service-tag scope against, unlike the shared device page's per-device Guardian lens (`GET /fragments/device/guardian?id=<agent_id>`), which a service-scoped token can still read for its own service's agents. The denial itself is audited (`guaranteed_state.fragment.access_denied`); the per-Guard drilldown additionally audits every successful open (`guaranteed_state.rule.view`) since it discloses every reporting agent's identity, hostname, and state for one rule fleet-wide.
+>
 > **Offline convergence:** an agent that was offline or unreachable when the deployed set changed re-converges automatically on reconnect. It reports its applied policy generation (`yuzu.guardian_generation`) in each heartbeat; the server re-pushes when that generation is behind the current store generation (rate-limited per agent). No manual re-push is needed after a network partition.
 
 ### 7. Create a Guard from the dashboard

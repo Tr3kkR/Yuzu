@@ -282,6 +282,15 @@ bool GuardianRoutes::deny_service_scoped_(const httplib::Request& req,
     if (session->token_scope_service.empty())
         return false;
     const auto cid = detail::make_correlation_id();
+    // One shared verb across all 6 fragments this gate covers (status, guards,
+    // events, guard/page, baselines, baseline/page) — a probing service token
+    // leaves a trace, not silence, mirroring the REST fleet-wide deny's own
+    // denial audit (rest_api_v1.cpp's events route). Fire-and-forget: this
+    // helper has no `res` write left to protect (the 403 below is already the
+    // safe outcome), matching this file's set-and-proceed audit posture.
+    if (audit_fn_)
+        audit_fn_(req, "guaranteed_state.fragment.access_denied", "denied", "GuaranteedState", "",
+                  "fleet-wide Guardian dashboard fragment denied to a service-scoped token");
     res.status = 403;
     res.set_content(
         detail::error_json_a4(
@@ -2208,19 +2217,27 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // Worst SEC-2 disclosure: agent_id + hostname + state + updated_at for
     // EVERY reporting agent, fleet-wide, for one rule. Blanket service-token
     // deny (as above) plus an accountability audit-on-open — a control
-    // separate from authorization — matching device_routes.cpp's per-device
-    // Guardian lens verb (`guardian.device.view`). GuardianRoutes::AuditFn is
-    // void (no persist-failure signal, unlike RestApiV1::AuditFn), so this
-    // is a direct fire-and-forget call — the same set-and-proceed idiom every
-    // other audit_fn_ call site in this file already uses; a transient audit
-    // hiccup must not blank this operator's lens.
+    // separate from authorization. Verb is `guaranteed_state.rule.view`, NOT
+    // device_routes.cpp's `guardian.device.view`: that verb's established
+    // contract (its only other emitter, target_type="Agent") means "an
+    // operator viewed THIS DEVICE's Guardian state" — this drilldown is the
+    // opposite shape, fleet-wide agents for ONE rule, so reusing it would
+    // silently corrupt a SIEM/works-council query filtering that verb by
+    // target_type=Agent. `target_type="GuaranteedState"` matches every other
+    // rule/guard-scoped verb in this file (guaranteed_state.rule.*,
+    // guaranteed_state.baseline.*). GuardianRoutes::AuditFn is void (no
+    // persist-failure signal, unlike RestApiV1::AuditFn), so both calls below
+    // are direct fire-and-forget — the same set-and-proceed idiom every other
+    // audit_fn_ call site in this file already uses; a transient audit hiccup
+    // must not blank this operator's lens, and a denial is not a leak.
     sink.Get(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/page)",
             [this](const httplib::Request& req, httplib::Response& res) {
                 if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 const std::string guard_id = req.matches[1].str();
                 if (audit_fn_)
-                    audit_fn_(req, "guardian.device.view", "success", "Guard", guard_id,
+                    audit_fn_(req, "guaranteed_state.rule.view", "success", "GuaranteedState",
+                              guard_id,
                               "per-guard fleet-wide agent status drilldown via dashboard fragment");
                 res.set_content(render_guard_page_fragment(guard_id), "text/html; charset=utf-8");
             });

@@ -177,6 +177,17 @@ struct RestGsHarness {
     // lambda reads it lazily at request time).
     std::vector<yuzu::server::AppPerfFleetRow> fleet_rows_;
 
+    // GET /dex/perf/devices and GET /network/devices read seams — always wired
+    // present-but-empty (unlike app_perf_providers_ above, no test here needs
+    // the provider-absent → 503 branch for these two routes, so no toggle).
+    // Reaches these routes' audit/deny paths without seeding fleet rows.
+    yuzu::server::DexPerfFn dex_perf_fn_ = [](const std::string&) {
+        return yuzu::server::DexPerfSnapshot{};
+    };
+    yuzu::server::NetPerfFn net_perf_fn_ = [](const std::string&) {
+        return yuzu::server::NetPerfSnapshot{};
+    };
+
     // What the wired VERIFY cohort provider returns (default = present-but-empty
     // CohortRead → the compare reads "insufficient"). A test sets member_count +
     // rows to drive the paired-compare path, or sets it to nullopt to prove the
@@ -365,8 +376,8 @@ struct RestGsHarness {
                             dispatch_arg,
                             /*step_up_fn=*/{},
                             /*guardian_push_fn=*/{},
-                            /*dex_perf_fn=*/{},
-                            /*net_perf_fn=*/{},
+                            dex_perf_fn_,
+                            net_perf_fn_,
                             /*lockout_clear_fn=*/{},
                             baseline_store.get(),
                             wire_scoped_perm ? RestApiV1::ScopedPermFn{scoped_perm_fn}
@@ -821,6 +832,7 @@ TEST_CASE("REST gs.events: agent_id with a control character → 400",
     auto res = h.sink.Get("/api/v1/guaranteed-state/events?agent_id=WS-1%0D%0Aforged");
     REQUIRE(res);
     CHECK(res->status == 400);
+    CHECK(h.last_scoped_agent_id.empty()); // rejected before the gate, like the too-long case
 }
 
 TEST_CASE("REST gs.events: NO agent_id (fleet) → 200 for an ordinary global session, NOW audited "
@@ -866,6 +878,8 @@ TEST_CASE("REST gs.events: NO agent_id + service-scoped token → 403, no data, 
     auto res = h.sink.Get("/api/v1/guaranteed-state/events");
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK(res->body.find("agent-A") == std::string::npos); // no PII in the denial body
+    CHECK(res->body.find("e-fleet-2") == std::string::npos);
     auto j = nlohmann::json::parse(res->body);
     CHECK(j["error"]["code"].get<int>() == 403);
     // No PII was served, but the denial itself IS recorded — a probing service
@@ -889,16 +903,99 @@ TEST_CASE("REST gs.events: a service-scoped token MAY still read its own agent v
     CHECK(h.last_scoped_agent_id == "WS-1");
 }
 
-TEST_CASE("REST gs.events: audit-persist failure on an agent_id query → 503, no data",
-          "[pg][rest][guaranteed_state][events]") {
+// ── Sibling-gap coverage: same vulnerability class as SEC-3, found by
+// governance on this branch — /dex/signals/{obs_type}, /dex/perf/devices, and
+// /network/devices all served fleet-wide identity-linked per-agent rows under
+// a bare global gate, confining nothing for a service-scoped token. ──────────
+
+TEST_CASE("REST dex/signals/{obs_type}: service-scoped token → 403, denial audited",
+          "[pg][rest][dex][signals][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "dex.signal.view");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_id.empty()); // unvalidated obs_type never embedded
+}
+
+TEST_CASE("REST dex/signals/{obs_type}: ordinary session still reaches the route",
+          "[pg][rest][dex][signals]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/signals/process.crashed");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+TEST_CASE("REST dex/perf/devices: service-scoped token → 403, denial audited",
+          "[pg][rest][dex][perf][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Get("/api/v1/dex/perf/devices");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "dex.perf.devices.view");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_type == "GuaranteedState");
+}
+
+TEST_CASE("REST dex/perf/devices: ordinary session reaches the route, audited success",
+          "[pg][rest][dex][perf]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/perf/devices");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "dex.perf.devices.view");
+    CHECK(h.audit_log[0].result == "success");
+}
+
+TEST_CASE("REST dex/perf/devices: audit-persist failure → 503, no data",
+          "[pg][rest][dex][perf]") {
     RestGsHarness h;
     h.audit_succeeds = false;
-    auto res = h.sink.Get("/api/v1/guaranteed-state/events?agent_id=WS-1");
+    auto res = h.sink.Get("/api/v1/dex/perf/devices");
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->has_header("Sec-Audit-Failed"));
 }
 
+TEST_CASE("REST network/devices: service-scoped token → 403, denial audited",
+          "[pg][rest][network][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Get("/api/v1/network/devices");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "network.devices.view");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_type == "GuaranteedState");
+}
+
+TEST_CASE("REST network/devices: ordinary session reaches the route, audited success",
+          "[pg][rest][network]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/network/devices");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "network.devices.view");
+    CHECK(h.audit_log[0].result == "success");
+}
+
+TEST_CASE("REST network/devices: audit-persist failure → 503, no data",
+          "[pg][rest][network]") {
+    RestGsHarness h;
+    h.audit_succeeds = false;
+    auto res = h.sink.Get("/api/v1/network/devices");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->has_header("Sec-Audit-Failed"));
+}
 
 TEST_CASE("REST gs.status: returns store rule_count rollup", "[pg][rest][guaranteed_state][status]") {
     RestGsHarness h;

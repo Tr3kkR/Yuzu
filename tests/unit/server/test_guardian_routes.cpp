@@ -477,9 +477,14 @@ TEST_CASE("Guardian data fragments deny a service-scoped token, regardless of "
     REQUIRE(baseline_page != nullptr);
     CHECK(baseline_page->status == 403);
 
-    // Denied before any read reached the audit path — no evidence of an
-    // unauthorized access to conflate with a legitimate one.
-    CHECK(h.audit_log.empty());
+    // Denied before any READ audit (no evidence of unauthorized DATA access to
+    // conflate with a legitimate one) — but the denial itself IS recorded, one
+    // row per fragment probed, so a probing service token leaves a trace.
+    REQUIRE(h.audit_log.size() == 6);
+    for (const auto& a : h.audit_log) {
+        CHECK(a.action == "guaranteed_state.fragment.access_denied");
+        CHECK(a.result == "denied");
+    }
 }
 
 TEST_CASE("status/guards/events fragments are gated on GuaranteedState:Read (previously untested)",
@@ -521,15 +526,18 @@ TEST_CASE("an ordinary (non-service-scoped) session still reaches every Guardian
     }
 }
 
-TEST_CASE("the per-guard drilldown emits a guardian.device.view audit-on-open",
+TEST_CASE("the per-guard drilldown emits a guaranteed_state.rule.view audit-on-open, scoped to "
+          "the CORRECT guard",
           "[pg][guardian_routes][audit][security]") {
     Harness h;
     h.seed_guard("g1", "GuardOne");
+    h.seed_guard("g2", "GuardTwo"); // a second guard in scope, to prove target_id isn't hardcoded
 
-    auto res = h.sink.dispatch("GET", "/fragments/guardian/guard/g1/page", "", "");
+    auto res = h.sink.dispatch("GET", "/fragments/guardian/guard/g2/page", "", "");
     REQUIRE(res != nullptr);
     CHECK(res->status == 200);
-    REQUIRE(h.audit_count("guardian.device.view", "success") == 1);
+    REQUIRE(h.audit_count("guaranteed_state.rule.view", "success") == 1);
+    CHECK(h.audit_log[0].target_id == "g2"); // the OPENED guard, not the first-seeded one
     // Every other fragment is NOT the worst-disclosure surface and stays
     // un-audited (matches its existing set-and-proceed dashboard-read posture).
     CHECK(h.audit_log.size() == 1);

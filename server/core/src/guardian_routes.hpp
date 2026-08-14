@@ -102,10 +102,14 @@ private:
     /// deny), so the deny is a blanket one. A parallel deny is pending on the
     /// fleet /guaranteed-state/status REST route on a separate, unmerged
     /// branch — this fragment's deny does not depend on it. Sets a 403 A4
-    /// body and returns true iff a service-scoped token was rejected;
-    /// callers `return` immediately when this returns true. Resolves its own
-    /// session via `auth_fn_` — safe to call before or after `perm_fn_`.
-    bool deny_service_scoped_(const httplib::Request& req, httplib::Response& res) const;
+    /// body and returns true when the response has already been written —
+    /// either a 401/redirect from an unauthenticated `auth_fn_` call, or the
+    /// 403 service-scope deny itself; callers `return` immediately in both
+    /// cases. Resolves its own session via `auth_fn_` — safe to call before
+    /// or after `perm_fn_`. `[[nodiscard]]`: a call site that drops the
+    /// return value would silently keep rendering after a written 401/403.
+    [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req,
+                                            httplib::Response& res) const;
 
     // -- Fragment renderers (called by route handlers) -------------------------
     std::string render_status_fragment(const std::string& view) const;
