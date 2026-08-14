@@ -115,6 +115,19 @@ abi4_declared_fixture_plugin = shared_library(
   install: false,
 )
 
+# Sibling of abi4_declared_fixture_plugin, built identically, but written
+# through the C++ `yuzu::Plugin` + YUZU_PLUGIN_EXPORT path rather than
+# hand-rolling the C descriptor. It is the regression proving the descriptor
+# seam (the two non-pure virtuals on yuzu::Plugin) actually reaches
+# capmatrix-gen — the path all 49 real plugins take.
+abi4_cpp_wrapper_fixture_plugin = shared_library(
+  'abi4_cpp_wrapper_fixture_plugin',
+  files('fixtures/abi4/abi4_cpp_wrapper_fixture_plugin.cpp'),
+  name_prefix: '',
+  dependencies: [yuzu_sdk_dep],
+  install: false,
+)
+
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 #
 # Proto-dep choice is platform-conditional (#572 + Windows MSVC follow-up):
@@ -166,6 +179,7 @@ agent_test_exe = executable(
     # above.
     'unit/test_runner_main.cpp',
     'unit/test_plugin_loader.cpp',
+    'unit/test_capability_registry_tables.cpp',
     'unit/test_sdk_utilities.cpp',
     'unit/test_temp_file.cpp',
     'unit/test_updater.cpp',
@@ -416,6 +430,7 @@ tar_test_exe = executable(
     'unit/test_tar_software.cpp',
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
+    'unit/test_tar_capability_table.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_perf.cpp',
@@ -572,6 +587,7 @@ if build_server
       'unit/server/test_upload_grant_store_pg.cpp',
       'unit/server/test_file_retrieval_routes.cpp',
       'unit/server/test_command_capability.cpp',
+      'unit/server/test_dex_obs_table.cpp',
       'unit/server/test_rest_access_review.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
@@ -1084,7 +1100,11 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent and buil
     args: [files('shell/test_capability_matrix_gate.sh'), meson.project_build_root()],
     suite: 'docs',
     timeout: 120,
-    depends: [abi3_fixture_plugin, abi4_declared_fixture_plugin],
+    depends: [
+      abi3_fixture_plugin,
+      abi4_declared_fixture_plugin,
+      abi4_cpp_wrapper_fixture_plugin,
+    ],
   )
 endif
 

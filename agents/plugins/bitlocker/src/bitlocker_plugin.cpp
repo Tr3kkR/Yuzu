@@ -225,6 +225,20 @@ void report_filevault_status(yuzu::CommandContext& ctx) {
 
 #endif
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// windows: manage-bde -status via raw _popen -- rung 3.
+// linux: lsblk + cryptsetup status via run_bounded_subprocess({"/bin/sh",
+// "-c", cmd}, ...) -- rung 3, ships via the plugin's own list_luks_volumes.
+// macos: fdesetup status + diskutil apfs list via the same runner path --
+// rung 3, ships via bitlocker_macos_apfs.hpp's pure parser.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"state",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "lsblk+cryptsetup", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "fdesetup+diskutil", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "manage_bde", nullptr}},
+};
+
 } // namespace
 
 class BitlockerPlugin final : public yuzu::Plugin {
@@ -238,6 +252,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"state", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

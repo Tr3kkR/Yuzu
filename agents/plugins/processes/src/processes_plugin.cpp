@@ -271,6 +271,56 @@ std::string resolve_exe_path(unsigned long) {
 }
 #endif
 
+// ABI4 capability declarations (#2204). All four actions call the same
+// enumerate_processes() (and, for the hashed/tree variants, resolve_exe_path
+// + sha256_file) — Linux (/proc) and Windows (CreateToolhelp32Snapshot +
+// QueryFullProcessImageNameW) are native in-process enumerations, rung 1.
+// macOS enumeration shells out via popen("ps -axo pid,ppid,comm") — an
+// ungoverned rung-3 shell exec per ADR-3002's "27 of 49 plugins ... sit at
+// an ungoverned rung 3" — even though the per-process path resolution
+// (proc_pidpath) and hashing that follow it are native/rung 1, so the
+// action as a whole is rung 3 on macOS.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "list",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "popen(ps -axo pid,ppid,comm)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "CreateToolhelp32Snapshot", nullptr},
+    },
+    {
+        /* .action      = */ "list_hashed",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration + readlink(/proc/<pid>/exe) + SHA-256",
+         nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256", nullptr},
+    },
+    {
+        /* .action      = */ "list_tree",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration + readlink(/proc/<pid>/exe) + SHA-256",
+         nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256", nullptr},
+    },
+    {
+        /* .action      = */ "query",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "popen(ps -axo pid,ppid,comm)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "CreateToolhelp32Snapshot", nullptr},
+    },
+};
+
 } // namespace
 
 class ProcessesPlugin final : public yuzu::Plugin {
@@ -284,6 +334,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"list", "list_hashed", "list_tree", "query", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
