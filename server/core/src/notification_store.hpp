@@ -106,11 +106,20 @@ public:
     /// List all notifications (newest first).
     std::vector<Notification> list_all(int limit = 100, int offset = 0);
 
-    /// Mark a notification as read. No-op on a closed store / query error.
-    void mark_read(int64_t id);
+    /// Mark a notification as read. Returns true only if the write is
+    /// confirmed to have affected exactly one row (`PQcmdTuples()`, never a
+    /// bare `PGRES_COMMAND_OK` on the UPDATE — that status is identical
+    /// whether the id matched or not). False on a closed store, a query
+    /// error, or a nonexistent id — the caller must not treat this call as
+    /// having succeeded, e.g. for an audit row asserting the mutation
+    /// landed (adversarial-review, fjarvis: an audit entry is compliance
+    /// evidence and must not assert success for a write that may never
+    /// have reached Postgres).
+    [[nodiscard]] bool mark_read(int64_t id);
 
-    /// Dismiss a notification (soft-delete). No-op on a closed store / query error.
-    void dismiss(int64_t id);
+    /// Dismiss a notification (soft-delete). Same confirmed-affected-row
+    /// contract as `mark_read` — see its doc comment.
+    [[nodiscard]] bool dismiss(int64_t id);
 
     /// Count unread, non-dismissed notifications. 0 on a closed store or
     /// query error (same display-only degrade as list_unread).

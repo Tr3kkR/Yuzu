@@ -763,37 +763,47 @@ std::vector<Notification> NotificationStore::list_all(int limit, int offset) {
     return out;
 }
 
-void NotificationStore::mark_read(int64_t id) {
+bool NotificationStore::mark_read(int64_t id) {
     if (!open_)
-        return;
+        return false;
     auto lease = pool_.try_acquire_for(kWriteAcquireTimeout);
     if (!lease) {
         spdlog::debug("NotificationStore: mark_read skipped, no connection in time ({})",
                       pool_.last_error());
-        return;
+        return false;
     }
     pg::PgResult res = pg::exec_params(
         lease.get(), "UPDATE notification_store.notifications SET read = TRUE WHERE id = $1::bigint",
         std::vector<std::string>{std::to_string(id)});
-    if (res.status() != PGRES_COMMAND_OK)
+    if (res.status() != PGRES_COMMAND_OK) {
         spdlog::debug("NotificationStore: mark_read({}) failed: {}", id, PQerrorMessage(lease.get()));
+        return false;
+    }
+    // PQcmdTuples(), not the bare PGRES_COMMAND_OK check above: that status
+    // is identical whether the WHERE clause matched a row or not — the
+    // #1033-class mutate-then-count trap this codebase's sqlite3_changes()
+    // ban exists to close on the Postgres side too.
+    return std::string_view(PQcmdTuples(res.get())) != "0";
 }
 
-void NotificationStore::dismiss(int64_t id) {
+bool NotificationStore::dismiss(int64_t id) {
     if (!open_)
-        return;
+        return false;
     auto lease = pool_.try_acquire_for(kWriteAcquireTimeout);
     if (!lease) {
         spdlog::debug("NotificationStore: dismiss skipped, no connection in time ({})",
                       pool_.last_error());
-        return;
+        return false;
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE notification_store.notifications SET dismissed = TRUE WHERE id = $1::bigint",
         std::vector<std::string>{std::to_string(id)});
-    if (res.status() != PGRES_COMMAND_OK)
+    if (res.status() != PGRES_COMMAND_OK) {
         spdlog::debug("NotificationStore: dismiss({}) failed: {}", id, PQerrorMessage(lease.get()));
+        return false;
+    }
+    return std::string_view(PQcmdTuples(res.get())) != "0";
 }
 
 std::size_t NotificationStore::count_unread() {

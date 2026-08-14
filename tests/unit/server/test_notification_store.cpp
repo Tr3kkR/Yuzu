@@ -140,7 +140,7 @@ TEST_CASE("NotificationStore: mark_read removes from unread", "[notification_sto
     auto id = store.create("info", "Test", "Test notification");
     REQUIRE(store.count_unread() == 1);
 
-    store.mark_read(id);
+    CHECK(store.mark_read(id));
 
     auto unread = store.list_unread();
     CHECK(unread.empty());
@@ -160,11 +160,36 @@ TEST_CASE("NotificationStore: dismiss removes from unread", "[notification_store
     auto id = store.create("warn", "Alert", "Something happened");
     REQUIRE(store.count_unread() == 1);
 
-    store.dismiss(id);
+    CHECK(store.dismiss(id));
 
     CHECK(store.count_unread() == 0);
     auto unread = store.list_unread();
     CHECK(unread.empty());
+}
+
+// Regression test for the fixed audit-integrity defect (adversarial-review,
+// fjarvis): mark_read/dismiss must report whether the write actually
+// affected a row, not just that the statement executed — an UPDATE against
+// a nonexistent id returns PGRES_COMMAND_OK either way, and the REST layer
+// relies on this return value to avoid asserting a "success" audit row for
+// a mutation that never landed.
+TEST_CASE("NotificationStore: mark_read and dismiss report false for a nonexistent id",
+          "[notification_store][pg]") {
+    NOTIFICATION_STORE(store);
+
+    auto id = store.create("info", "Real notification", "exists");
+    REQUIRE(id > 0);
+    const int64_t bogus_id = id + 999999;
+
+    CHECK_FALSE(store.mark_read(bogus_id));
+    CHECK_FALSE(store.dismiss(bogus_id));
+
+    // The real row is untouched by either no-op call.
+    CHECK(store.count_unread() == 1);
+    auto all = store.list_all();
+    REQUIRE(all.size() == 1);
+    CHECK(all[0].read == false);
+    CHECK(all[0].dismissed == false);
 }
 
 // ── Count unread ───────────────────────────────────────────────────────────
@@ -180,10 +205,10 @@ TEST_CASE("NotificationStore: count_unread tracks correctly", "[notification_sto
 
     CHECK(store.count_unread() == 3);
 
-    store.mark_read(id1);
+    CHECK(store.mark_read(id1));
     CHECK(store.count_unread() == 2);
 
-    store.dismiss(id2);
+    CHECK(store.dismiss(id2));
     CHECK(store.count_unread() == 1);
 }
 
