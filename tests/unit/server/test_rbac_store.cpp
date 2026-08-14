@@ -124,8 +124,10 @@ TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store][pg]") {
 TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto types = store.list_securable_types();
-    REQUIRE(types.size() == 23); // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2)
-                                 // +EnginePrincipal (#2376, cut away from Security:Read)
+    // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2) +EnginePrincipal
+    // (#2376, cut away from Security:Read) +PluginConfig +PluginSecret
+    // +UploadGrant (PR1.9a, peer finding PLAN-001) = 26.
+    REQUIRE(types.size() == 26);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -146,6 +148,9 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
     CHECK(has("Inventory"));
     CHECK(has("SoftwareLicensing")); // SLE securable (ADR-0024 Decision 9) — NOT `License`
     CHECK(has("AccessReview")); // Periodic Access Reviews (SOC 2 CC6.2), dedicated + narrow
+    CHECK(has("PluginConfig")); // PR1.9a: plugin kill-switch config
+    CHECK(has("PluginSecret")); // PR1.9a: plugin secret material
+    CHECK(has("UploadGrant"));  // PR1.9a: upload-grant mint/revoke lifecycle
     CHECK(has("EnginePrincipal")); // Engine-principal inventory + grant-graph reads (#2376),
                                    // cut away from the over-broad Security:Read
 }
@@ -182,14 +187,16 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
     RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 23 types * 5 CRUD ops = 115 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 116), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2, = 117), plus a single ApiToken:Rotate
-    // grant (P2 #11, SOC 2 CC6.3) = 118 permissions total. Push, Attest, and
+    // 26 types * 5 CRUD ops = 130 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 131), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 132), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 133 permissions total. Push, Attest, and
     // Rotate are deliberately NOT cross-seeded on other securables — see the
-    // rationale in rbac_store.cpp seed_defaults(). (23rd type: EnginePrincipal,
-    // #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 118);
+    // rationale in rbac_store.cpp seed_defaults(). (26th-24th: UploadGrant/
+    // PluginSecret/PluginConfig, PR1.9a peer finding PLAN-001; 23rd:
+    // EnginePrincipal, #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st:
+    // SoftwareLicensing, ADR-0024.)
+    CHECK(perms.size() == 133);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -227,6 +234,65 @@ TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store][pg]") {
         CHECK(p.effect == "allow");
         CHECK(p.securable_type != "Infrastructure");
     }
+}
+
+// ── PR1.9a (peer finding PLAN-001): PluginConfig / PluginSecret / UploadGrant ──
+
+namespace {
+
+bool has_grant(const std::vector<Permission>& perms, const std::string& securable_type,
+              const std::string& operation) {
+    return std::find_if(perms.begin(), perms.end(), [&](const Permission& p) {
+               return p.securable_type == securable_type && p.operation == operation &&
+                      p.effect == "allow";
+           }) != perms.end();
+}
+
+} // namespace
+
+TEST_CASE("RbacStore: seed data — Administrator has full CRUD on the three new securables",
+          "[rbac_store][plan-001][pg]") {
+    RBAC_STORE(store);
+    auto perms = store.get_role_permissions("Administrator");
+    for (const std::string& securable : {"PluginConfig", "PluginSecret", "UploadGrant"}) {
+        INFO("securable=" << securable);
+        for (const char* op : {"Read", "Write", "Execute", "Delete", "Approve"}) {
+            CHECK(has_grant(perms, securable, op));
+        }
+    }
+}
+
+TEST_CASE("RbacStore: seed data — PlatformEngineer has Read/Write/Delete on the three new "
+          "securables",
+          "[rbac_store][plan-001][pg]") {
+    RBAC_STORE(store);
+    auto perms = store.get_role_permissions("PlatformEngineer");
+    for (const std::string& securable : {"PluginConfig", "PluginSecret", "UploadGrant"}) {
+        INFO("securable=" << securable);
+        CHECK(has_grant(perms, securable, "Read"));
+        CHECK(has_grant(perms, securable, "Write"));
+        CHECK(has_grant(perms, securable, "Delete"));
+    }
+}
+
+TEST_CASE("RbacStore: seed data — Operator has Read on PluginConfig and UploadGrant, "
+          "nothing on PluginSecret",
+          "[rbac_store][plan-001][pg]") {
+    RBAC_STORE(store);
+    auto perms = store.get_role_permissions("Operator");
+
+    CHECK(has_grant(perms, "PluginConfig", "Read"));
+    CHECK(has_grant(perms, "UploadGrant", "Read"));
+
+    // Never PluginSecret — no grant of any operation, on any effect.
+    for (const auto& p : perms) {
+        CHECK(p.securable_type != "PluginSecret");
+    }
+    // And never Write/Delete on the two it does see.
+    CHECK_FALSE(has_grant(perms, "PluginConfig", "Write"));
+    CHECK_FALSE(has_grant(perms, "PluginConfig", "Delete"));
+    CHECK_FALSE(has_grant(perms, "UploadGrant", "Write"));
+    CHECK_FALSE(has_grant(perms, "UploadGrant", "Delete"));
 }
 
 // ── RBAC toggle ──────────────────────────────────────────────────────────────
