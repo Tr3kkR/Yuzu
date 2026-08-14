@@ -1110,6 +1110,67 @@ fails to resolve a device's MAC this time will blank a previously known-good val
 than simply retry the earlier failure. See the REST API reference's Network Discovery
 section for the full response shapes.
 
+## Guardian quarantine records migrate to Postgres (mandatory backfill, QuarantineStore, ADR-0047)
+
+The `QuarantineStore` — the Guardian device-quarantine bookkeeping behind
+`POST /api/v1/quarantine`, `DELETE /api/v1/quarantine/{agent_id}`, and the MCP
+`quarantine_device` tool — moves from the SQLite `quarantine.db` file to the server's
+PostgreSQL substrate in this release (ADR-0006 Wave 2), schema `quarantine_store`. It
+reuses the existing shared connection pool — no new connection flag or config is
+required.
+
+**This is NOT a fresh-start cutover.** An active quarantine record is live security
+containment state — losing it would silently un-quarantine a device in the server's
+view — so the migration performs a **mandatory one-time backfill** on first Postgres
+boot:
+
+- **What is preserved:** every quarantine record, active and released — agent_id,
+  status, who quarantined it, timestamps, the IP whitelist, and the reason — carries
+  over, in full history (not just the current active row).
+- **Fail-closed boot on backfill failure.** If the backfill cannot complete — a
+  Postgres write error, an unreadable legacy DB, an unrecognised legacy `status` value,
+  or a fingerprint mismatch (below) — the server **refuses to boot** rather than come
+  up with an empty or partial quarantine inventory. The backfill marker is only
+  stamped on success, so a failed attempt is **retried on the next start** once the
+  underlying cause is fixed.
+- **Fingerprint-verified, not marker-only**, the same shape `DiscoveryStore` uses
+  (see that section above for the full rationale): on a multi-replica deployment
+  sharing one Postgres database, a later-booting replica that still holds its own
+  legacy file verifies its content against the recorded fingerprint before trusting
+  an already-set completion marker. A "HOLDER-SIDE VERIFICATION FAILED" log line means
+  two replicas each hold `quarantine.db` files with genuinely different content — do
+  not force-boot around it; an operator needs to decide which is authoritative first.
+- **A 0-byte `quarantine.db` is refused, not treated as a fresh install** — same
+  rationale as `discovery.db` above (SQLite opens a 0-byte file as a valid empty
+  database, indistinguishable from "never used" without an explicit check, but a
+  genuine fresh install never has a file here at all).
+- **An unrecognised legacy `status` value refuses the boot.** The `status` column is
+  only ever `active` or `released`; a legacy row carrying anything else (e.g. from
+  manual DB surgery) fails the backfill closed with a log line naming the offending
+  `agent_id` and value, rather than silently inserting an unrecognised state or
+  silently dropping the row.
+- **Legacy file moved aside after a verified backfill.** Once the backfill is
+  confirmed complete, `quarantine.db` is renamed to
+  `quarantine.db.migrated-<epoch>` (the server never reads it again). Keep the
+  renamed file until you have confirmed quarantine history looks correct, then
+  dispose of it per your data-retention policy.
+
+**Operator-visible behaviour change (fail-closed reads).** `GET /api/v1/quarantine`
+now returns **503** on a degraded read (store not open, pool-acquire timeout, or query
+error) instead of silently rendering an empty quarantine list — previously, a local
+SQLite read essentially never failed short of file corruption, so this failure mode
+was not practically reachable. Watch the new
+`yuzu_server_quarantine_read_degrade_total{reason}` counter — a non-zero rate means
+the quarantine view is degraded, **not** that no devices are quarantined.
+`yuzu_server_quarantine_backfill_total{result}` records the one-time backfill outcome
+(`completed` / `fresh` / `failed`).
+
+**Not affected:** the agent-side quarantine firewall enforcement (WFP/nftables/pf
+block-all + exceptions) is untouched by this migration — only the server-side
+bookkeeping's storage substrate changes. `POST /api/v1/quarantine` and
+`DELETE /api/v1/quarantine/{agent_id}`'s request/response shapes, and the MCP
+`quarantine_device` tool's ticket-then-recall approval flow, are unchanged.
+
 ## Upgrade Order
 
 Always upgrade in this order:

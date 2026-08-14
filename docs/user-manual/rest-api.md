@@ -1428,6 +1428,11 @@ list entirely, not merely hidden from write access.
 
 **Permission:** `Security:Read`, scoped per-device
 
+> **Fail-closed on a degraded read (ADR-0047).** A store/pool/query failure
+> returns `503`, never a silently-empty list — a device could still be
+> actively contained while the caller would otherwise see "nothing
+> quarantined".
+
 **Response:**
 
 ```json
@@ -1486,6 +1491,11 @@ Quarantine a device.
 }
 ```
 
+> **`400` vs `503` (ADR-0047).** A `400` means a business/state error (a
+> missing `agent_id`, or the device is already quarantined) — retrying the
+> identical request will not succeed. A `503` means a genuine store/pool
+> failure — retrying is reasonable.
+
 ---
 
 #### `DELETE /api/v1/quarantine/{agent_id}`
@@ -1502,6 +1512,10 @@ Release a device from quarantine.
   "meta": { "api_version": "v1" }
 }
 ```
+
+> **`400` vs `503` (ADR-0047).** Same distinction as `POST` above — `400`
+> means the device is not currently quarantined (retrying will not help);
+> `503` means a genuine store/pool failure (retrying is reasonable).
 
 ---
 

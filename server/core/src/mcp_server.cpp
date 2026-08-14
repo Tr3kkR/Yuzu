@@ -7817,7 +7817,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
                 if (!quar_res) {
                     mcp_audit("failure", agent_id);
-                    res.set_content(error_response(id, kInvalidParams, quar_res.error()),
+                    // Mirrors the REST twin's 503-vs-400 classification
+                    // (is_quarantine_db_error, rest_api_v1.cpp): a genuine
+                    // store/pool/query failure is kInternalError, a
+                    // business/state error ("already quarantined") is
+                    // kInvalidParams.
+                    const int code = quar_res.error().starts_with(kQuarantineDbErrorPrefix)
+                                          ? kInternalError
+                                          : kInvalidParams;
+                    res.set_content(error_response(id, code, quar_res.error()),
                                     "application/json");
                     return;
                 }

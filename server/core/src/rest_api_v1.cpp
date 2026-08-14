@@ -66,6 +66,18 @@
 namespace yuzu::server {
 namespace {
 
+// Classifies a QuarantineStore write failure as a genuine DB/pool/query
+// failure (503) vs a business/state error like "already quarantined"/"not
+// quarantined" (400) — mirrors DeploymentStore's
+// is_deployment_db_error/kDeploymentDbErrorPrefix (discovery_routes.cpp,
+// adversarial-review MEDIUM hardening round, 2026-08-12: write routes
+// previously collapsed every failure, including genuine outages, to 400).
+// Keys off the SHARED constant (quarantine_store.hpp), never a local copy of
+// the literal.
+bool is_quarantine_db_error(const std::string& err) {
+    return err.starts_with(kQuarantineDbErrorPrefix);
+}
+
 // ── Lightweight JSON string builder ─────────────────────────────────────
 // Produces JSON output strings directly, bypassing nlohmann::json template
 // instantiation for construction.  Only ~80 lines vs 23 000 lines of
@@ -793,11 +805,11 @@ const std::string& openapi_spec() {
         // form.
         R"json(,
     "/quarantine": {
-      "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}},
-      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}}
+      "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable, or a degraded read (ADR-0047) — never rendered as an empty list"}}},
+      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, or the device is already quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/quarantine/{agent_id}": {
-      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}}
+      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/rbac/roles": {
       "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "responses": {"200": {"description": "List of roles"}}}
@@ -4171,10 +4183,19 @@ void RestApiV1::register_routes(
                 return;
             }
 
+            // AUTHORITATIVE read (ADR-0047): nullopt is a degraded read, NEVER
+            // rendered as an empty quarantine list — a device could still be
+            // actively contained while the caller sees "nothing quarantined".
             auto records = quarantine_store->list_quarantined();
+            if (!records) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "quarantine list unavailable — try again"),
+                                "application/json");
+                return;
+            }
             JArr arr;
             int64_t visible = 0;
-            for (const auto& r : records) {
+            for (const auto& r : *records) {
                 httplib::Response probe; // throwaway: per-record admit probe, never sent
                 if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id))
                     continue;
@@ -4235,7 +4256,7 @@ void RestApiV1::register_routes(
 
         auto result = quarantine_store->quarantine_device(agent_id, by, reason, whitelist);
         if (!result) {
-            res.status = 400;
+            res.status = is_quarantine_db_error(result.error()) ? 503 : 400;
             res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
@@ -4274,7 +4295,7 @@ void RestApiV1::register_routes(
 
             auto result = quarantine_store->release_device(agent_id);
             if (!result) {
-                res.status = 400;
+                res.status = is_quarantine_db_error(result.error()) ? 503 : 400;
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }

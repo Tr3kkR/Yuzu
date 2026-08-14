@@ -13,6 +13,8 @@
 #include "quarantine_store.hpp"
 #include "rest_api_v1.hpp"
 
+#include "pg/pg_pool.hpp"
+
 #include "../test_helpers.hpp"
 #include "test_route_sink.hpp"
 
@@ -26,6 +28,18 @@
 using namespace yuzu::server;
 
 namespace {
+
+// QuarantineStore migrated to Postgres (ADR-0006/0047) — SAME key as
+// test_quarantine_store.cpp's own template ("quarantinestore"); the registry
+// builds it once and replay-verifies this file's setup lambda produces the
+// identical structural fingerprint (test_helpers.hpp PgTestTemplate
+// contract).
+yuzu::test::PgTestTemplate quarantine_route_tpl{"quarantinestore", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    QuarantineStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("quarantinestore template: store failed to migrate");
+}};
 
 struct AuditCall {
     std::string action;
@@ -42,8 +56,7 @@ struct QuarantineRouteHarness {
     yuzu::server::test::TestRouteSink sink;
     RestApiV1 api;
 
-    yuzu::test::TempDbFile qdb{std::string_view{"yuzu_test_rest_quarantine-"}};
-    QuarantineStore quarantine_store{qdb.path};
+    QuarantineStore quarantine_store;
 
     // auth: empty session_user => require_auth writes 401 and returns nullopt.
     std::string session_user{"alice"};
@@ -59,7 +72,8 @@ struct QuarantineRouteHarness {
     std::unordered_map<std::string, bool> scope_allow_for;
     std::vector<AuditCall> audit_calls;
 
-    explicit QuarantineRouteHarness(bool wire_scope = true) {
+    explicit QuarantineRouteHarness(pg::PgPool& pool, bool wire_scope = true)
+        : quarantine_store(pool) {
         REQUIRE(quarantine_store.is_open());
 
         auto auth_fn = [this](const httplib::Request&,
@@ -131,7 +145,12 @@ struct QuarantineRouteHarness {
     }
 
     bool is_quarantined(const std::string& agent_id) {
-        for (const auto& r : quarantine_store.list_quarantined())
+        // AUTHORITATIVE read (ADR-0047): never silently treat a degraded
+        // read as "not found" — that would mask a real store/pool failure
+        // as a passing assertion.
+        auto list = quarantine_store.list_quarantined();
+        REQUIRE(list.has_value());
+        for (const auto& r : *list)
             if (r.agent_id == agent_id)
                 return true;
         return false;
@@ -144,8 +163,10 @@ const std::string kBody = R"({"agent_id":"agent-B","reason":"test"})";
 
 TEST_CASE("REST POST /api/v1/quarantine requires authentication before any store/body work "
           "(CDX-P1-02)",
-          "[rest][quarantine][authz]") {
-    QuarantineRouteHarness h;
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
     h.session_user = ""; // no session
     auto res = h.post(kBody);
     REQUIRE(res);
@@ -156,8 +177,10 @@ TEST_CASE("REST POST /api/v1/quarantine requires authentication before any store
 
 TEST_CASE("REST POST /api/v1/quarantine is denied per-target by the scoped gate (403, no write) "
           "(CDX-P1-02)",
-          "[rest][quarantine][authz]") {
-    QuarantineRouteHarness h;
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
     h.scope_allow = false;
     auto res = h.post(kBody);
     REQUIRE(res);
@@ -169,8 +192,10 @@ TEST_CASE("REST POST /api/v1/quarantine is denied per-target by the scoped gate 
 
 TEST_CASE("REST POST /api/v1/quarantine admits an in-scope caller and quarantines the device "
           "(201) (CDX-P1-02)",
-          "[rest][quarantine][authz]") {
-    QuarantineRouteHarness h;
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
     h.scope_allow = true;
     auto res = h.post(kBody);
     REQUIRE(res);
@@ -181,8 +206,10 @@ TEST_CASE("REST POST /api/v1/quarantine admits an in-scope caller and quarantine
 
 TEST_CASE("REST POST /api/v1/quarantine fails CLOSED (500) when the scope gate is unwired "
           "(CDX-P1-02)",
-          "[rest][quarantine][authz]") {
-    QuarantineRouteHarness h(/*wire_scope=*/false);
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool, /*wire_scope=*/false);
     auto res = h.post(kBody);
     REQUIRE(res);
     CHECK(res->status == 500); // never a silent global fallback
@@ -191,8 +218,10 @@ TEST_CASE("REST POST /api/v1/quarantine fails CLOSED (500) when the scope gate i
 
 TEST_CASE("REST POST /api/v1/quarantine rejects a malformed JSON body (400, no dispatch) "
           "(gov-fix)",
-          "[rest][quarantine][authz]") {
-    QuarantineRouteHarness h;
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
     // Not a JSON object at all -- must NOT reach scoped_perm_fn/.value() and
     // must NOT throw (this is the exact shape that, absent the is_discarded()/
     // is_object() guard, previously reached `body.value("agent_id","")` on a
@@ -205,9 +234,11 @@ TEST_CASE("REST POST /api/v1/quarantine rejects a malformed JSON body (400, no d
 }
 
 TEST_CASE("REST POST/DELETE /api/v1/quarantine audit the unwired-scope-gate 500 (gov-fix)",
-          "[rest][quarantine][authz]") {
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
     SECTION("POST") {
-        QuarantineRouteHarness h(/*wire_scope=*/false);
+        QuarantineRouteHarness h(qpool, /*wire_scope=*/false);
         auto res = h.post(kBody);
         REQUIRE(res);
         CHECK(res->status == 500);
@@ -217,7 +248,7 @@ TEST_CASE("REST POST/DELETE /api/v1/quarantine audit the unwired-scope-gate 500 
         CHECK(h.audit_calls[0].target_id == "agent-B");
     }
     SECTION("DELETE") {
-        QuarantineRouteHarness h(/*wire_scope=*/false);
+        QuarantineRouteHarness h(qpool, /*wire_scope=*/false);
         auto res = h.del("agent-B");
         REQUIRE(res);
         CHECK(res->status == 500);
@@ -230,9 +261,11 @@ TEST_CASE("REST POST/DELETE /api/v1/quarantine audit the unwired-scope-gate 500 
 
 TEST_CASE("REST GET /api/v1/quarantine admits-then-filters per record (gov-fix/consistency-"
           "auditor)",
-          "[rest][quarantine][authz]") {
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
     SECTION("an out-of-scope record is dropped from the list, an in-scope record is kept") {
-        QuarantineRouteHarness h;
+        QuarantineRouteHarness h(qpool);
         REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
         REQUIRE(h.quarantine_store.quarantine_device("agent-hidden", "seed", "r2", ""));
         h.scope_allow_for["agent-visible"] = true;
@@ -244,7 +277,7 @@ TEST_CASE("REST GET /api/v1/quarantine admits-then-filters per record (gov-fix/c
         CHECK(res->body.find("agent-hidden") == std::string::npos);
     }
     SECTION("unwired scope gate fails closed (500), not an unfiltered list") {
-        QuarantineRouteHarness h(/*wire_scope=*/false);
+        QuarantineRouteHarness h(qpool, /*wire_scope=*/false);
         REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
         auto res = h.get();
         REQUIRE(res);
@@ -252,7 +285,7 @@ TEST_CASE("REST GET /api/v1/quarantine admits-then-filters per record (gov-fix/c
         CHECK(res->body.find("agent-visible") == std::string::npos);
     }
     SECTION("no session is refused before any store work") {
-        QuarantineRouteHarness h;
+        QuarantineRouteHarness h(qpool);
         h.session_user = "";
         auto res = h.get();
         REQUIRE(res);
@@ -263,9 +296,11 @@ TEST_CASE("REST GET /api/v1/quarantine admits-then-filters per record (gov-fix/c
 
 TEST_CASE("REST DELETE /api/v1/quarantine admits in-scope and fails closed when unwired "
           "(CDX-P1-02)",
-          "[rest][quarantine][authz]") {
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
     SECTION("in-scope delete releases the device") {
-        QuarantineRouteHarness h;
+        QuarantineRouteHarness h(qpool);
         REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
         auto res = h.del("agent-B");
         REQUIRE(res);
@@ -274,7 +309,7 @@ TEST_CASE("REST DELETE /api/v1/quarantine admits in-scope and fails closed when 
         CHECK_FALSE(h.is_quarantined("agent-B"));
     }
     SECTION("out-of-scope delete is denied (403), device stays quarantined") {
-        QuarantineRouteHarness h;
+        QuarantineRouteHarness h(qpool);
         h.scope_allow = false;
         REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
         auto res = h.del("agent-B");
@@ -283,7 +318,7 @@ TEST_CASE("REST DELETE /api/v1/quarantine admits in-scope and fails closed when 
         CHECK(h.is_quarantined("agent-B")); // untouched
     }
     SECTION("unwired scope gate fails closed, device untouched") {
-        QuarantineRouteHarness h(/*wire_scope=*/false);
+        QuarantineRouteHarness h(qpool, /*wire_scope=*/false);
         REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", ""));
         auto res = h.del("agent-B");
         REQUIRE(res);
