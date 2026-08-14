@@ -447,11 +447,35 @@ satisfy the same private-key permission check as the HTTPS/gateway TLS keys
 unchanged.
 
 **Fail-closed:** a configured key that is unreadable, over-permissioned,
-exceeds 64 KiB, is malformed, or is not RSA disables SAML **entirely** at
-startup (loudly — an `ERROR` log line, never a silent fall-back to unsigned
-requests). A per-request signing failure fails `/auth/saml/start` rather
-than emitting an unsigned redirect. Changing `--saml-sp-key` requires a
-server restart (no hot-reload, same as the other SAML flags).
+exceeds 64 KiB, is malformed, encrypted/passphrase-protected, or is not RSA
+disables SAML **entirely** at startup (loudly — an `ERROR` log line, never a
+silent fall-back to unsigned requests). A per-request signing failure fails
+`/auth/saml/start` rather than emitting an unsigned redirect. Changing
+`--saml-sp-key` requires a server restart (no hot-reload, same as the other
+SAML flags).
+
+**Registering the signing certificate with your IdP.** Yuzu does not yet
+publish an SP metadata endpoint, so the IdP must be told about the signing
+key's public half manually — otherwise the IdP receives a signed request it
+cannot verify and rejects (or silently ignores) the signature even though
+Yuzu booted cleanly. Generate an **unencrypted** RSA private key and a
+self-signed public certificate, then register the certificate in your IdP's
+SP/relying-party application as the **request-signing (AuthnRequest)
+verification certificate**:
+
+```bash
+# Unencrypted RSA-2048 key (--saml-sp-key) + a self-signed public cert to hand the IdP
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout /etc/yuzu/saml-sp-key.pem -out /etc/yuzu/saml-sp-cert.pem \
+  -days 730 -subj "/CN=<your-sp-entity-id>"
+chmod 600 /etc/yuzu/saml-sp-key.pem   # must not be group/other-readable
+```
+
+Point `--saml-sp-key` at `saml-sp-key.pem` and upload `saml-sp-cert.pem` to
+the IdP (Okta, Entra ID, and PingFederate each expose a "request signature"
+or "signing certificate" field in the SP app config). The key **must be
+unencrypted** — a passphrase-protected key is rejected at boot rather than
+prompting for the passphrase.
 
 SAML is Linux/macOS only; AuthnRequest signing follows that same platform
 scope — there is no signing support on Windows (SAML is disabled there

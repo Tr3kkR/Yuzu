@@ -7,7 +7,7 @@
   `SigAlg`/`Signature` query parameters. The flag is optional and
   backward-compatible: when unset, AuthnRequests remain unsigned, same as
   prior releases. Fails closed — a configured key that is unreadable,
-  over-permissioned, oversized, malformed, or not RSA disables SAML entirely
+  over-permissioned, oversized, malformed, encrypted, or not RSA disables SAML entirely
   at boot (loudly, never a silent fall-back to unsigned requests), and a
   per-request signing failure fails `/auth/saml/start` rather than emitting
   an unsigned redirect.

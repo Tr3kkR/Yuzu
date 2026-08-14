@@ -1084,6 +1084,26 @@ static std::string generate_ec_key_pem() {
     return std::string(bptr->data, bptr->length);
 }
 
+/// A valid RSA-2048 key, PEM-encoded AES-256-CBC passphrase-encrypted. The
+/// provider must reject it WITHOUT prompting for the passphrase (UP-1).
+static std::string generate_encrypted_rsa_key_pem() {
+    EVP_PKEY* pkey = EVP_RSA_gen(2048);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    std::string pass = "test-passphrase";
+    REQUIRE(PEM_write_bio_PrivateKey(
+                bio, pkey, EVP_aes_256_cbc(),
+                reinterpret_cast<unsigned char*>(pass.data()),
+                static_cast<int>(pass.size()), nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TEST CASES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1236,12 +1256,13 @@ TEST_CASE("SAML: a non-RSA (EC) SP signing key is rejected — signing stays dis
 
     // The provider itself may still be otherwise enabled (IdP verification is
     // independent of SP signing) — but the redirect URL must never carry a
-    // signature produced from a rejected key.
+    // signature produced from a rejected key. Assert the URL is present
+    // UNCONDITIONALLY: a future regression that made is_enabled() false on a
+    // broken signing key would otherwise make this check silently vacuous.
     const auto authn = p.build_authn_request("myrelay");
-    if (!authn.url.empty()) {
-        CHECK(authn.url.find("SigAlg=") == std::string::npos);
-        CHECK(authn.url.find("Signature=") == std::string::npos);
-    }
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
 }
 
 TEST_CASE("SAML: a malformed SP signing key PEM is rejected", "[saml]") {
@@ -1252,6 +1273,26 @@ TEST_CASE("SAML: a malformed SP signing key PEM is rejected", "[saml]") {
 
     CHECK(p.signing_configured_but_broken());
     CHECK_FALSE(p.signing_init_error().empty());
+}
+
+TEST_CASE("SAML: an encrypted (passphrase-protected) SP signing key is rejected "
+          "without prompting",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = generate_encrypted_rsa_key_pem();
+    // If the ctor ever fell back to OpenSSL's default password callback this
+    // would prompt on /dev/tty and hang the test; the no-op callback makes it
+    // fail closed deterministically instead. (UP-1)
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK_FALSE(p.signing_init_error().empty());
+
+    const auto authn = p.build_authn_request("myrelay");
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
 }
 
 TEST_CASE("SAML: valid signed assertion is accepted", "[saml]") {

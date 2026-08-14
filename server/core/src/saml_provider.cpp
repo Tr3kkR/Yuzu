@@ -65,6 +65,8 @@ void SamlProvider::cleanup_expired_states_locked() {}
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
 
+#include <yuzu/secure_zero.hpp> // sanctioned std::string zeroizer (secure_buffer.hpp doctrine)
+
 #include <zlib.h>
 
 #include <algorithm>
@@ -546,6 +548,15 @@ static bool has_duplicate_id(xmlNodePtr node, xmlNodePtr exclude,
 namespace yuzu::server::saml {
 
 SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
+    // Wipe + clear the transit PEM on EVERY ctor exit path — declared FIRST so it
+    // also covers the !config_.enabled early-return and the xmlsec-init failure
+    // path below (both skip the parse block) — so raw private-key bytes never
+    // linger in the by-value config_ member. (security-guardian LOW / cpp-safety INFO)
+    struct PemCleanser {
+        std::string& pem;
+        ~PemCleanser() { yuzu::secure_zero(pem); } // wipes + clears; no-op when empty
+    } pem_cleanser{config_.sp_signing_key_pem};
+
     if (!config_.enabled) return;
     try {
         ensure_xmlsec_initialized();
@@ -562,13 +573,23 @@ SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
     // SAML loudly rather than shipping a silent unsigned fallback.
     if (config_.enabled && !config_.sp_signing_key_pem.empty()) {
         struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } };
+        // static_cast<int> is safe only because server.cpp caps the key-file
+        // read at kSamlCertMaxBytes (64 KiB) before populating this field, so
+        // the size never approaches INT_MAX. (cpp-expert N1)
         BioGuard bio{BIO_new_mem_buf(config_.sp_signing_key_pem.data(),
                                      static_cast<int>(config_.sp_signing_key_pem.size()))};
-        EVP_PKEY* raw_key = bio.b ? PEM_read_bio_PrivateKey(bio.b, nullptr, nullptr, nullptr)
+        // Explicit no-op password callback (returns a zero-length password): a
+        // passphrase-protected key then fails deterministically here instead of
+        // falling back to OpenSSL's default callback, which prompts on /dev/tty
+        // — hanging an interactive boot, misleading a headless one. (UP-1)
+        auto no_password = [](char*, int, int, void*) -> int { return 0; };
+        EVP_PKEY* raw_key = bio.b ? PEM_read_bio_PrivateKey(bio.b, nullptr, no_password, nullptr)
                                   : nullptr;
         if (!raw_key) {
             signing_init_failed_ = true;
-            signing_init_error_  = "SAML SP signing key: failed to parse PEM private key";
+            signing_init_error_  = "SAML SP signing key: failed to parse PEM private key "
+                                   "(an encrypted/passphrase-protected key is not supported; "
+                                   "provide an unencrypted RSA private key)";
             spdlog::error("SamlProvider: {}", signing_init_error_);
         } else {
             std::shared_ptr<EVP_PKEY> parsed(raw_key, EVP_PKEY_free);
@@ -587,11 +608,9 @@ SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
             }
         }
 
-        // Cleanse and clear the transit PEM copy now that parsing is done —
-        // never log it, never retain it beyond this point (config_ is a
-        // by-value member; the owned EVP_PKEY above is what's kept live).
-        OPENSSL_cleanse(config_.sp_signing_key_pem.data(), config_.sp_signing_key_pem.size());
-        config_.sp_signing_key_pem.clear();
+        // The transit PEM is wiped + cleared by pem_cleanser on ctor exit
+        // (declared above) on every path — never logged, never retained past
+        // parse (config_ is a by-value member; the owned EVP_PKEY stays live).
     }
 }
 

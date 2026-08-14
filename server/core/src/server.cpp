@@ -2905,7 +2905,8 @@ public:
         // immediately that the feature is disabled (fail-closed, never silently half-on).
 #ifdef _WIN32
         if (!cfg_.saml_idp_sso_url.empty() || !cfg_.saml_idp_cert.empty() ||
-            !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty()) {
+            !cfg_.saml_sp_entity_id.empty() || !cfg_.saml_sp_acs_url.empty() ||
+            !cfg_.saml_sp_key.empty()) {
             spdlog::error("SAML is not supported on Windows builds; SAML login disabled"
                           " — fail-closed");
         }
@@ -3005,6 +3006,11 @@ public:
                                         static_cast<std::size_t>(kSamlCertMaxBytes) + 1, '\0');
                                     key_file.read(key_pem.data(), kSamlCertMaxBytes + 1);
                                     if (!key_file.eof()) {
+                                        // Oversized: key_pem holds up to 64 KiB+1 of raw
+                                        // private-key bytes — wipe before discarding so they
+                                        // do not linger in freed heap (the success path wipes
+                                        // via the ctor once the buffer is moved in).
+                                        yuzu::secure_zero(key_pem);
                                         spdlog::error("SAML disabled: SP signing key '{}' "
                                                       "exceeds {} bytes (fail-closed)",
                                                       cfg_.saml_sp_key, kSamlCertMaxBytes);

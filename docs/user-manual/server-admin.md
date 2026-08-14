@@ -1835,10 +1835,18 @@ group/other-readable). Left unset (the default), AuthnRequests remain
 requests.
 
 Fails closed: a configured key that is unreadable, over-permissioned,
-exceeds 64 KiB, is malformed, or is not RSA disables SAML **entirely** at
-startup — loudly (an `ERROR` log line), never a silent fall-back to
-unsigned requests. A per-request signing failure fails `/auth/saml/start`
-rather than emitting an unsigned redirect.
+exceeds 64 KiB, is malformed, encrypted/passphrase-protected, or is not RSA
+disables SAML **entirely** at startup — loudly (an `ERROR` log line), never a
+silent fall-back to unsigned requests. A per-request signing failure fails
+`/auth/saml/start` rather than emitting an unsigned redirect. The key **must
+be unencrypted** — a passphrase-protected key is rejected, not prompted for.
+
+Yuzu does not yet publish an SP metadata endpoint, so you must register the
+signing key's **public certificate** with the IdP by hand (as the
+AuthnRequest/request-signing verification certificate) — otherwise the IdP
+rejects the signature despite a clean Yuzu boot. See the user manual's
+[AuthnRequest Signing](authentication.md#authnrequest-signing) section for
+the `openssl` keypair-generation and IdP-registration recipe.
 
 ### Known limitations in this release
 
