@@ -87,29 +87,42 @@ fs::path staging_dir() {
 #ifdef _WIN32
 class IncrementalSha256 {
 public:
-    IncrementalSha256() {
-        BCryptOpenAlgorithmProvider(&alg_, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
-        DWORD result_len = 0;
-        BCryptGetProperty(alg_, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_len_),
-                          sizeof(hash_len_), &result_len, 0);
-        BCryptCreateHash(alg_, &hash_, nullptr, 0, nullptr, 0, 0);
-    }
-    ~IncrementalSha256() {
-        if (hash_)
-            BCryptDestroyHash(hash_);
-        if (alg_)
-            BCryptCloseAlgorithmProvider(alg_, 0);
-    }
+    IncrementalSha256() { init(); }
+    ~IncrementalSha256() { destroy(); }
     IncrementalSha256(const IncrementalSha256&) = delete;
     IncrementalSha256& operator=(const IncrementalSha256&) = delete;
 
-    void update(const char* data, std::size_t len) {
-        BCryptHashData(hash_, reinterpret_cast<PUCHAR>(const_cast<char*>(data)),
-                       static_cast<ULONG>(len), 0);
+    /// Restart the digest so it covers nothing. An incremental hash cannot be
+    /// REWOUND, so this is how `do_upload` repairs its digest when a server
+    /// resync moves the acknowledged offset (see `rehash_prefix` there).
+    void reset() {
+        destroy();
+        init();
     }
-    std::string finalize() {
+
+    /// False once ANY crypto call has failed. Every subsequent operation
+    /// no-ops and `finalize()` yields nullopt, so a provider/allocation
+    /// failure surfaces as a controlled upload error instead of hashing
+    /// through invalid handles (governance: fail closed, never a silent
+    /// wrong digest).
+    [[nodiscard]] bool ok() const noexcept { return valid_; }
+
+    void update(const char* data, std::size_t len) {
+        if (!valid_)
+            return;
+        if (!BCRYPT_SUCCESS(BCryptHashData(hash_, reinterpret_cast<PUCHAR>(const_cast<char*>(data)),
+                                           static_cast<ULONG>(len), 0)))
+            valid_ = false;
+    }
+
+    [[nodiscard]] std::optional<std::string> finalize() {
+        if (!valid_)
+            return std::nullopt;
         std::vector<UCHAR> digest(hash_len_);
-        BCryptFinishHash(hash_, digest.data(), hash_len_, 0);
+        if (!BCRYPT_SUCCESS(BCryptFinishHash(hash_, digest.data(), hash_len_, 0))) {
+            valid_ = false;
+            return std::nullopt;
+        }
         std::string hex;
         for (auto b : digest)
             hex += std::format("{:02x}", b);
@@ -117,26 +130,77 @@ public:
     }
 
 private:
+    void init() {
+        valid_ = true;
+        if (!BCRYPT_SUCCESS(
+                BCryptOpenAlgorithmProvider(&alg_, BCRYPT_SHA256_ALGORITHM, nullptr, 0))) {
+            valid_ = false;
+            return;
+        }
+        DWORD result_len = 0;
+        if (!BCRYPT_SUCCESS(BCryptGetProperty(alg_, BCRYPT_HASH_LENGTH,
+                                              reinterpret_cast<PUCHAR>(&hash_len_),
+                                              sizeof(hash_len_), &result_len, 0))) {
+            valid_ = false;
+            return;
+        }
+        if (!BCRYPT_SUCCESS(BCryptCreateHash(alg_, &hash_, nullptr, 0, nullptr, 0, 0)))
+            valid_ = false;
+    }
+    void destroy() {
+        if (hash_) {
+            BCryptDestroyHash(hash_);
+            hash_ = nullptr;
+        }
+        if (alg_) {
+            BCryptCloseAlgorithmProvider(alg_, 0);
+            alg_ = nullptr;
+        }
+    }
+
     BCRYPT_ALG_HANDLE alg_{nullptr};
     BCRYPT_HASH_HANDLE hash_{nullptr};
     DWORD hash_len_{0};
+    bool valid_{false};
 };
 #else
 class IncrementalSha256 {
 public:
-    IncrementalSha256() : ctx_(EVP_MD_CTX_new()) { EVP_DigestInit_ex(ctx_, EVP_sha256(), nullptr); }
-    ~IncrementalSha256() {
-        if (ctx_)
-            EVP_MD_CTX_free(ctx_);
-    }
+    IncrementalSha256() { init(); }
+    ~IncrementalSha256() { destroy(); }
     IncrementalSha256(const IncrementalSha256&) = delete;
     IncrementalSha256& operator=(const IncrementalSha256&) = delete;
 
-    void update(const char* data, std::size_t len) { EVP_DigestUpdate(ctx_, data, len); }
-    std::string finalize() {
+    /// Restart the digest so it covers nothing. An incremental hash cannot be
+    /// REWOUND, so this is how `do_upload` repairs its digest when a server
+    /// resync moves the acknowledged offset (see `rehash_prefix` there).
+    void reset() {
+        destroy();
+        init();
+    }
+
+    /// False once ANY crypto call has failed. Every subsequent operation
+    /// no-ops and `finalize()` yields nullopt, so an allocation/init failure
+    /// surfaces as a controlled upload error instead of hashing through a
+    /// null context (governance: fail closed, never a silent wrong digest).
+    [[nodiscard]] bool ok() const noexcept { return valid_; }
+
+    void update(const char* data, std::size_t len) {
+        if (!valid_)
+            return;
+        if (EVP_DigestUpdate(ctx_, data, len) != 1)
+            valid_ = false;
+    }
+
+    [[nodiscard]] std::optional<std::string> finalize() {
+        if (!valid_)
+            return std::nullopt;
         unsigned char digest[EVP_MAX_MD_SIZE];
         unsigned int len = 0;
-        EVP_DigestFinal_ex(ctx_, digest, &len);
+        if (EVP_DigestFinal_ex(ctx_, digest, &len) != 1) {
+            valid_ = false;
+            return std::nullopt;
+        }
         std::string hex;
         for (unsigned i = 0; i < len; ++i)
             hex += std::format("{:02x}", digest[i]);
@@ -144,7 +208,19 @@ public:
     }
 
 private:
-    EVP_MD_CTX* ctx_;
+    void init() {
+        ctx_ = EVP_MD_CTX_new();
+        valid_ = ctx_ != nullptr && EVP_DigestInit_ex(ctx_, EVP_sha256(), nullptr) == 1;
+    }
+    void destroy() {
+        if (ctx_) {
+            EVP_MD_CTX_free(ctx_);
+            ctx_ = nullptr;
+        }
+    }
+
+    EVP_MD_CTX* ctx_{nullptr};
+    bool valid_{false};
 };
 #endif
 
@@ -155,7 +231,9 @@ std::string sha256_stream(std::ifstream& file) {
     char buf[8192];
     while (file.read(buf, sizeof(buf)) || file.gcount() > 0)
         hasher.update(buf, static_cast<std::size_t>(file.gcount()));
-    return hasher.finalize();
+    // Matches sha256_file's existing fail-empty convention below — a crypto
+    // provider failure here reads the same as an unopenable file.
+    return hasher.finalize().value_or(std::string{});
 }
 
 std::string sha256_file(const fs::path& path) {
@@ -898,33 +976,63 @@ private:
         ctx.report_progress(5);
 
         // ── Chunk streaming ──────────────────────────────────────────
-        // The commit digest is built INCREMENTALLY from the exact buffer
-        // just transmitted, fed to `hasher` the moment the server
-        // acknowledges it (never from a later, independent re-read — see
-        // the RAII-handle comment above, #P7-003). The one unavoidable
-        // exception is a RESUMED session's already-uploaded prefix
-        // (`session->offset > 0`, accepted in an earlier process's run):
-        // those bytes were never in THIS process's memory, so they are
-        // read once, up front, via the SAME open handle everything else
-        // below uses.
+        // The commit digest is built INCREMENTALLY, and the invariant that
+        // makes it correct is positional, not response-shaped: `hasher`
+        // must cover EXACTLY `[0, hashed_to)` of the local file at all
+        // times, and `hashed_to` must equal `offset` before the next chunk
+        // is planned. The ordinary path keeps that invariant by feeding
+        // `hasher` the exact buffer just transmitted the moment the server
+        // acknowledges it (never a later, independent re-read — see the
+        // RAII-handle comment above, #P7-003). Two situations cannot do
+        // that because the bytes were never in THIS process's memory or
+        // this hasher's history: a RESUMED session's already-uploaded
+        // prefix, and a `kResync` response whose authoritative offset jumps
+        // PAST what this hasher has hashed (the chunk landed on the server
+        // but this process never saw the success response, so it never
+        // called `update()` for it). Both repair the SAME way — read the
+        // missing range from the SAME open handle and hash it — via one
+        // shared helper so the two call sites cannot drift.
         IncrementalSha256 hasher;
-        if (session->offset > 0) {
+        std::int64_t hashed_to = 0;
+
+        // Advance `hasher` to cover `[hashed_to, target)`, reading from the
+        // same `file` handle. `plan_resync_rehash` (the pure decision this
+        // wraps — content_dist_upload_parsers.hpp) says whether there is
+        // anything to do; a `nullopt` covers the ordinary post-chunk case
+        // where `hashed_to` already equals the new offset. Returns false on
+        // a read or crypto failure, having already written the
+        // operator-facing error.
+        auto rehash_to = [&](std::int64_t target) -> bool {
+            auto range = up::plan_resync_rehash(hashed_to, target);
+            if (!range)
+                return true;
             file.clear();
-            file.seekg(0, std::ios::beg);
+            file.seekg(range->start, std::ios::beg);
             std::vector<char> prefix_buf(64 * 1024);
-            std::int64_t remaining = session->offset;
+            std::int64_t remaining = range->end - range->start;
             while (remaining > 0) {
                 const auto want = static_cast<std::streamsize>(
                     std::min<std::int64_t>(remaining, static_cast<std::int64_t>(prefix_buf.size())));
                 file.read(prefix_buf.data(), want);
                 if (file.gcount() != want) {
-                    ctx.write_output("error|failed to read local file while hashing an "
-                                     "already-uploaded prefix");
-                    return 1;
+                    ctx.write_output("error|failed to read local file while hashing "
+                                     "already-acknowledged bytes");
+                    return false;
                 }
                 hasher.update(prefix_buf.data(), static_cast<std::size_t>(want));
+                if (!hasher.ok()) {
+                    ctx.write_output("error|digest computation failed while hashing "
+                                     "already-acknowledged bytes");
+                    return false;
+                }
                 remaining -= want;
             }
+            hashed_to = target;
+            return true;
+        };
+
+        if (session->offset > 0 && !rehash_to(session->offset)) {
+            return 1;
         }
 
         std::int64_t offset = session->offset;
@@ -979,8 +1087,17 @@ private:
                 }
                 // Hash the SAME buffer just transmitted, now that the
                 // server has confirmed receipt of exactly this range.
+                // `spec->start == hashed_to` always holds here: either the
+                // previous iteration advanced both together, or the resync
+                // branch below called `rehash_to` before looping back.
                 hasher.update(buf.data(), buf.size());
+                if (!hasher.ok()) {
+                    abort_upload(client, cancel_path, session_header, ctx,
+                                "digest computation failed");
+                    return 1;
+                }
                 offset = *validated;
+                hashed_to = offset;
                 ctx.report_progress(
                     5 + static_cast<int>(offset * 90 / file_size)); // 5..95 while streaming
                 continue;
@@ -1000,6 +1117,16 @@ private:
                 if (!resynced) {
                     abort_upload(client, cancel_path, session_header, ctx,
                                 "server reported offset_mismatch without a usable offset");
+                    return 1;
+                }
+                // A FORWARD resync means the server accepted a chunk whose
+                // success response this process never saw — those bytes
+                // are in the file but never reached `hasher`. Repair the
+                // digest's coverage before adopting the new offset, or the
+                // eventual commit hash silently omits them (they were
+                // uploaded and are part of the file the server has; the
+                // committed digest must include them too).
+                if (*resynced > hashed_to && !rehash_to(*resynced)) {
                     return 1;
                 }
                 if (*resynced <= offset) {
@@ -1035,12 +1162,13 @@ private:
             }
         }
 
-        auto computed_hash = hasher.finalize();
-        if (computed_hash.empty()) {
+        auto finalized_hash = hasher.finalize();
+        if (!finalized_hash) {
             abort_upload(client, cancel_path, session_header, ctx,
                         "failed to compute upload hash");
             return 1;
         }
+        const std::string computed_hash = *finalized_hash;
 
         // ── Commit ───────────────────────────────────────────────────
         // Bounded retry loop mirroring session-open's, driven by the SAME

@@ -90,6 +90,38 @@ reconcile_resume_offset(std::int64_t authoritative_offset, std::int64_t file_siz
     return authoritative_offset;
 }
 
+/// A byte range `[start, end)` this process's running commit-digest hasher
+/// has not yet covered but must, before adopting `resynced_offset` as the
+/// new resume point.
+struct RehashRange {
+    std::int64_t start;
+    std::int64_t end; ///< exclusive
+};
+
+/// The commit digest is built incrementally as bytes are ACKNOWLEDGED, so
+/// its coverage (`hashed_to`) normally tracks `offset` exactly. A FORWARD
+/// resync breaks that: it means the server accepted a chunk whose success
+/// response this process never saw, so `hasher` was never fed that range —
+/// the bytes exist on disk and on the server, but not in the digest. This
+/// is the fix for the defect where a lost chunk-ack response, followed by a
+/// resync, produced a commit hash silently missing the acknowledged bytes
+/// (the eventual commit then 422s with `hash_mismatch`, the session is
+/// terminal, and the already-redeemed grant has no retry).
+///
+/// Returns the range to hash before advancing, or `nullopt` when
+/// `resynced_offset` does not exceed `hashed_to` — the ordinary case where
+/// nothing is missing (a resync that repeats or retreats, or one that
+/// exactly matches what has already been hashed). Never returns a range
+/// with `start < 0`: `hashed_to` is caller-tracked and only ever advances
+/// forward from 0, and `reconcile_resume_offset` has already bounded
+/// `resynced_offset` to `[0, file_size]` before this is called.
+[[nodiscard]] inline std::optional<RehashRange>
+plan_resync_rehash(std::int64_t hashed_to, std::int64_t resynced_offset) noexcept {
+    if (resynced_offset <= hashed_to)
+        return std::nullopt;
+    return RehashRange{hashed_to, resynced_offset};
+}
+
 /// Validates a SUCCESSFUL chunk PUT's acknowledged offset. Unlike
 /// `offset_mismatch` reconciliation (where the server's number is the only
 /// source of truth), a 200 ack is checked against what the agent already

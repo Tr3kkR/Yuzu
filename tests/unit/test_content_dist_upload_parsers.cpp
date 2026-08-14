@@ -5,6 +5,22 @@
  * receive protocol. Fixture strings only — no sockets, no filesystem, no
  * process spawns, no sleeps; `backoff_delay_ms` is checked as a pure
  * function of its input, never actually slept on.
+ *
+ * `plan_resync_rehash` below is the pure decision `do_upload`'s commit-hash
+ * repair (content_dist_plugin.cpp) is built on — a lost chunk-ack response
+ * followed by a forward resync used to leave the acknowledged bytes out of
+ * the commit digest, since the hasher is fed only on the ACK path and a
+ * lost ACK meant that feed never happened. The orchestration itself (the
+ * actual network loop, actual file reads, actual `IncrementalSha256`) is
+ * NOT unit-tested here, deliberately: it lives in the "no sockets, no
+ * filesystem, no process spawns" shell this file's own header comment
+ * names, and TLS is mandatory for every request that shell makes with no
+ * test-CA injection point — exercising it for real belongs on the
+ * integration surface (CLAUDE.md's "inject the boundary" / "prefer the
+ * integration surface" test-efficiency rules), not the unit suite. What is
+ * pinned here is the invariant the fix depends on: which byte range must be
+ * re-hashed, and that a resync which does NOT move past what has already
+ * been hashed triggers no repair at all.
  */
 
 #include "content_dist_upload_parsers.hpp"
@@ -73,6 +89,47 @@ TEST_CASE("reconcile_resume_offset rejects an offset outside the file",
          "[agent][content_dist][upload]") {
     CHECK_FALSE(reconcile_resume_offset(-1, 100).has_value());
     CHECK_FALSE(reconcile_resume_offset(101, 100).has_value());
+}
+
+TEST_CASE("plan_resync_rehash: the lost-ack scenario — a forward resync past what has "
+         "been hashed requires repairing exactly the gap",
+         "[agent][content_dist][upload]") {
+    // The exact defect: chunk 1 covers [0, 40) and the server accepts it,
+    // but this process never sees the 200 response (dropped connection),
+    // so `hasher` is never fed those bytes — hashed_to stays 0. The retry
+    // of chunk 1 then gets offset_mismatch with the server's real recorded
+    // offset, 40 (it already has those bytes). Repairing the digest means
+    // hashing exactly [0, 40) before adopting offset 40.
+    auto range = plan_resync_rehash(/*hashed_to=*/0, /*resynced_offset=*/40);
+    REQUIRE(range.has_value());
+    CHECK(range->start == 0);
+    CHECK(range->end == 40);
+}
+
+TEST_CASE("plan_resync_rehash: a resync that does not move past what is already hashed "
+         "requires no repair",
+         "[agent][content_dist][upload]") {
+    // The ordinary case: hasher already covers everything up to the
+    // current offset, so a resync landing at or behind that point is a
+    // no-op for the digest (it might still affect the send-side offset,
+    // but that is `reconcile_resume_offset`'s concern, not this one's).
+    CHECK_FALSE(plan_resync_rehash(/*hashed_to=*/40, /*resynced_offset=*/40).has_value());
+    CHECK_FALSE(plan_resync_rehash(/*hashed_to=*/40, /*resynced_offset=*/20).has_value());
+    CHECK_FALSE(plan_resync_rehash(/*hashed_to=*/40, /*resynced_offset=*/0).has_value());
+}
+
+TEST_CASE("plan_resync_rehash: a mid-stream loss (chunk 3 of 5 acknowledged silently) "
+         "still yields exactly the missing middle range",
+         "[agent][content_dist][upload]") {
+    // hashed_to sits at the end of chunk 2 (bytes [0,20) already fed to the
+    // hasher on their own successful acks); the lost ack belongs to chunk 3,
+    // [20,30); the resync target is 30. Only that ten-byte gap is missing —
+    // proving the range is anchored to hashed_to, not to 0, so a resume
+    // from a partial hasher state never re-hashes bytes it already has.
+    auto range = plan_resync_rehash(/*hashed_to=*/20, /*resynced_offset=*/30);
+    REQUIRE(range.has_value());
+    CHECK(range->start == 20);
+    CHECK(range->end == 30);
 }
 
 TEST_CASE("validate_chunk_ack accepts only the offset the request itself committed to",

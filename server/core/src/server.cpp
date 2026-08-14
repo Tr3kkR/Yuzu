@@ -15794,13 +15794,22 @@ private:
         // installer (content_dist) on the cleared-so-far devices, tracking the
         // per-device stage→execute state machine. Reuses the scoped
         // device provider (devices_fn) for the live re-authorization the MUTATING
-        // execute step requires, the SAME 6-param untracked dispatch (execution_id
+        // execute step requires, the SAME untracked dispatch (execution_id
         // "deployment-<id>-{stage,exec}" → skipped by notify_exec_tracker, like
         // preflight-), and a narrow ResponseStore poll seam (query_by_execution +
         // latest_per_agent). The cohort is read from preflight_run_store_.
+        //
+        // command_dispatch_CALLER_fn, not the bare system closure: every deploy
+        // advance is operator-triggered (a page load, poll, or create), never a
+        // background dispatcher, and the chokepoint must authorize
+        // content_dist.stage/execute_staged against the live caller's own
+        // SoftwareDeployment:Write grant rather than admit them unconditionally
+        // as a `.system = true` caller would (governance finding, review round
+        // following the origin/dev merge — the caller-carrying seam did not
+        // exist on dev when this route was written).
         deployment_routes_ = std::make_unique<DeploymentRoutes>();
         deployment_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, devices_fn, command_dispatch_fn,
+            *web_server_, auth_fn, perm_fn, devices_fn, command_dispatch_caller_fn,
             // Poll seam: execution_id → best (status, output) per agent. Same
             // scoring as the pre-flight collect (terminal beats running, then
             // non-empty output, then later arrival).

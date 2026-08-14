@@ -98,8 +98,11 @@ private:
 
     /// Advance a deployment one tick (re-auth from the live session) and render its
     /// progress block; self-repolls while in flight + under the page-poll cap.
-    std::string advance_and_render(const std::string& deployment_id, const std::string& viewer,
-                                   int attempt);
+    /// `caller` is the live session's dispatch identity (principal + role);
+    /// `caller.principal` doubles as the owner-scoped `viewer` for the store
+    /// reads below — the two were always the same value, now carried as one.
+    std::string advance_and_render(const std::string& deployment_id,
+                                   const yuzu::server::DispatchCaller& caller, int attempt);
 };
 
 } // namespace yuzu::server
