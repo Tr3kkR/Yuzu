@@ -31,7 +31,7 @@ magnitudes, and the acceptance evidence below is what would.
 | Arm | Deep-closure quality (F1) | Wall-clock (median) | Tokens vs grep |
 |---|---|---|---|
 | grep-only | 0.69–0.84 (25–35% of impact set silently missed) | 1235 s | baseline |
-| graph-only | 1.00 | 452 s | wins closures, LOSES string/route tasks 2.2x |
+| graph-only | 1.00 | 452 s | 2.2x MORE tokens on string/route tasks (wins closures) |
 | **hybrid (graph + text, agent chooses)** | **0.96–1.00** | **238 s** | **1.2–1.6x fewer** |
 
 Agents allocated between graph and text correctly when given both (tool-mix logged). One structural
@@ -44,8 +44,8 @@ references; both available libclang builds drop lambda bodies; the turnkey tool 
 index gate). The repo's existing daily CodeQL job already runs full traced C++ analysis on the Linux
 CI host, so a precise call-edge tier is nearer than the heuristic framing suggests — the remaining
 work is the call-edge query, export format, and schema integration, not host provisioning. The
-deployable tier TODAY is heuristic (universal-ctags extents/scopes/typerefs + tree-sitter call
-extraction, tiered name resolution T0–T4), and the observations above are OF that tier.
+deployable tier *today* is heuristic (universal-ctags extents/scopes/typerefs + tree-sitter call
+extraction, tiered name resolution T0–T4), and the observations above are *of* that tier.
 
 We propose a **single central instance** as the direction: one always-fresh truth for the committed
 codebase, zero consumer dependencies, and a single place where the CodeQL-precise edge tier can
@@ -115,7 +115,10 @@ flowchart LR
 3. **Freshness — the service PULLS.** `codegraph-svc` owns its own clone and its own identity,
    polls `origin/dev`, rebuilds (~20 s) when it moves, and swaps the in-RAM graph atomically,
    asserting the new SHA is a **descendant** of the currently served one (monotonic publication —
-   a late, older rebuild can never replace a newer graph). There is **no CI push step and no write
+   a late, older rebuild can never replace a newer graph). If `origin/dev` is rewritten so no
+   fetched SHA descends from the served one, the service refuses auto-publish, surfaces the
+   condition on its status endpoint, and an operator restart re-baselines against the current
+   remote — the invariant has a logged manual escape, never a silent bypass. There is **no CI push step and no write
    path into the service from CI jobs**: PR-triggered jobs on the shared runner identity have
    nothing to write to. Publication of build outputs on merge is not itself new for this repo
    (runner images and the docs site already publish post-merge); a long-lived queryable service on
@@ -167,7 +170,10 @@ sequenceDiagram
      all test callers are exactly where missing edges concentrate. Impact and completeness claims
      therefore still require diff or text inspection across those seams.
    - **When the service's built-SHA differs from local HEAD, diff inspection of the changed files
-     is REQUIRED, not advisory** — on a feature branch the missing edge is usually the edge under
+     is REQUIRED, not advisory.** REQUIRED here states the strength of the skill's instruction to
+     the agent and the client's behaviour (the flow forces the check) — it does NOT create a
+     governance-citable obligation; the non-invariant framing above governs this bullet too, on
+     acceptance as now — on a feature branch the missing edge is usually the edge under
      review, and knowing the graph is stale does not recover it.
 
 ```mermaid
@@ -177,6 +183,7 @@ flowchart TD
     K -- "string literals / routes /<br/>config keys" --> T["text search<br/>(Grep / rg)"]
     G --> SHA{"built-SHA =<br/>local HEAD?"}
     SHA -- no --> D["diff inspection of changed<br/>files REQUIRED"]
+    D --> T4
     SHA -- yes --> T4{"edge tagged [T4],<br/>or seam-adjacent?"}
     T4 -- yes --> V["Read the cited lines /<br/>sweep the seam by text"]
     T4 -- no --> U["use result<br/>(candidate index, not proof)"]
@@ -195,14 +202,17 @@ flowchart TD
 6. **Scope and non-goals**:
    - **NEVER** part of product binaries, customer deployments, or the shipped MCP server's tool
      surface. The service is development tooling on internal infrastructure; the product is not a
-     consumer and never gains a dependency on it.
+     consumer and never gains a dependency on it. Its HTTP endpoints are internal dev-tooling,
+     not product REST routes: agentic-first A1–A5 (routed-concerns row 28) do not apply to them.
    - **No graph database / no Postgres**: the store is a JSON file in RAM. (ADR-0004's
      graph-over-Postgres pattern concerns the product's fleet graph — unrelated.)
    - **C++ v1**; Erlang gateway via OTP xref is a filed follow-up. **Heuristic tier v1**; the
      CodeQL precise edge tier — for which the daily traced job on this host already exists — is
      the named upgrade path, adopted when the acceptance evidence justifies it.
    - The graph never carries a security control: nothing in governance, review, or release may
-     treat graph output as authoritative evidence of impact or reachability.
+     treat graph output as authoritative evidence of impact or reachability. CI-host consumers are
+     bound identically — any job that gates on graph output is itself a governance finding — and
+     direct API consumers (which bypass the client's banner) must check `/meta` age themselves.
 
 ## Unsettled — central exclusivity
 
@@ -267,7 +277,10 @@ and external contributors get a zero-cost no-op and plain text search; the servi
 so feature-branch divergence is inherent (mitigated by the REQUIRED diff-inspection rule, and
 addressed structurally only by the local tier if the topology measurement adopts it); serve-stale
 means a broken rebuild ages the graph visibly rather than failing closed — consumers must heed the
-age; one more internal container on the CI host.
+age; one more internal container on the CI host; a single shared static token carries no per-consumer
+attribution and is exported into third-party agent tools' environments — accepted for a
+read-only, internal, no-SLO service, revisited only if the service ever gains write or
+sensitive-read surface.
 **Risk:** extraction drift from ctags/tree-sitter upgrades — pinned versions plus fixture tests and
 the answer-key regression on every rebuild. Missing-edge blindness at indirect-dispatch seams is
 inherent to the heuristic tier — mitigated by the candidate-index framing and seam rules in the
@@ -276,8 +289,7 @@ precise tier. Host access for deployment requires runner-host coordination (see 
 
 ## Acceptance evidence
 
-Operational validation (deploys cleanly; client works on macOS, Linux, and Windows including
-the-rig; staleness banner and no-op fallback behave as specified) is a **precondition, not the
+Operational validation (deploys cleanly; client works on macOS, Linux, and Windows including a self-hosted Windows host; staleness banner and no-op fallback behave as specified) is a **precondition, not the
 decider**. Moving this ADR to `accepted` requires decider sign-off on evidence that speaks to the
 decision itself:
 
@@ -296,19 +308,28 @@ decision itself:
 5. **Feature-branch staleness replay** — recent PRs replayed at PR SHA vs dev SHA vs deliberately
    stale SHA; REQUIRED-diff-inspection vs warn-only compared. If forced inspection is what
    recovers correctness, the rule stays REQUIRED.
+Items 2 and 4 carry no pre-registered numeric floor; the deciders adjudicate them against the
+item-1 falsifiers (silently omitted security-relevant edges; recall bought only by unusable T4
+fan-out) rather than against a threshold invented after the results.
+
 6. **Shared-identity red team** — from a PR job on the CI host, attempt to reach or modify the
    service's clone, build inputs, or served graph. Pass condition: the write path is provably
-   unreachable from PR jobs.
+   unreachable from PR jobs. A smoke variant of this check is additionally a DEPLOYMENT
+   precondition at PR 2 — the isolation claim is demonstrated before the service first serves,
+   not only at acceptance.
 
 ## Rollout
 
-PR 1: this ADR (`status: proposed`). PR 2: builder + service + client + skill + doc pointers;
+PR 1: this ADR (`status: proposed`). PR 2: builder + service + client + skill + doc pointers (amending CLAUDE.md's existing
+“Search before reading” bullet to accommodate the guidance, not merely appending alongside it);
 service deployed to the Linux CI host — **requires runner-host access; coordinate with @Tr3kkR /
 the host owner**. PR 2's specification obligations, deliberately not designed in this ADR: API
 versioning; traversal depth and result caps (closure expansion must not be a cheap way to load the
 host); per-response graph SHA; TLS and token rotation; container isolation and resource limits
-against CI contention; the descendant-SHA publication assert; service status surfacing (age, last
-rebuild result). Follow-up issues at PR-2 time: Erlang gateway xref backend; CodeQL precise-tier
+against CI contention; the descendant-SHA publication assert and its re-baseline escape; cold-start/restart behaviour
+(rebuild-first vs serve-last-good, and the assert's baseline after restart); service status
+surfacing (age, last rebuild result); the skill's posture when graph age exceeds a stated
+threshold (prefer text search outright rather than an ever-growing diff-inspection burden). Follow-up issues at PR-2 time: Erlang gateway xref backend; CodeQL precise-tier
 adoption decision; fallback-frequency telemetry if outages prove common.
 
 Acceptance: per the Acceptance evidence section, by decider sign-off — never automatic.
