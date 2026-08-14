@@ -695,6 +695,8 @@ if build_server
       'unit/server/test_scim_store_pg.cpp',
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
+      'unit/server/test_discovery_store.cpp',
+      'unit/server/test_discovery_scan_route.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)

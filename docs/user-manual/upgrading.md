@@ -1025,6 +1025,91 @@ records the one-time backfill outcome (`completed` / `fresh` / `failed`).
 and dynamic-group scope expressions are unchanged — only the storage substrate
 and the fail-closed read posture change.
 
+## Network-discovered device data migrates to Postgres (mandatory backfill, DiscoveryStore, ADR-0044)
+
+The `DiscoveryStore` — the network-discovered devices behind `POST /api/discovery/scan`
+and `GET /api/discovery/results` — moves from the SQLite `discovery.db` file to the
+server's PostgreSQL substrate in this release (ADR-0006 Wave 2), schema
+`discovery_store`. It reuses the existing shared connection pool — no new connection
+flag or config is required.
+
+**This is NOT a fresh-start cutover.** The `managed` flag an operator has set on a
+discovered device (confirming "this is my enrolled agent") is real, non-regenerable
+operator intent, so the migration performs a **mandatory one-time backfill** on first
+Postgres boot:
+
+- **What is preserved:** every discovered device — IP/MAC/hostname, the `managed`
+  flag and its associated `agent_id`, and first-seen (`discovered_at`/`discovered_by`)
+  provenance — carries over (any field containing invalid UTF-8 or an embedded NUL
+  is scrubbed to U+FFFD on write, matching every other field in this store).
+- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
+  Postgres write error, an unreadable legacy DB, or a fingerprint mismatch (below) —
+  the server **refuses to boot** rather than come up with an empty or partial
+  discovered-device inventory. The backfill marker is only stamped on success, so a
+  failed attempt is **retried on the next start** once the underlying cause is fixed.
+- **Fingerprint-verified, not marker-only.** Unlike a plain "did the marker get
+  stamped" check, the backfill records a fingerprint of the migrated content
+  alongside the completion marker. On a multi-replica deployment sharing one
+  Postgres database, this lets a later-booting replica tell apart "this is the same
+  content I already migrated" from "a different replica's data was migrated, not
+  mine" — the latter fails closed rather than silently accepting a completion this
+  replica's own discovered devices were never part of. If you see a "HOLDER-SIDE
+  VERIFICATION FAILED" log line, do not force-boot around it: this indicates two
+  replicas each hold `discovery.db` files with genuinely different content, and an
+  operator needs to decide which is authoritative before either can proceed.
+- **A 0-byte `discovery.db` is refused, not treated as a fresh install.** SQLite
+  opens a 0-byte file as a valid empty database, which looks identical to "this
+  legacy store was created but never used" — but a genuine fresh install never has
+  a `discovery.db` file at all. If you see a log line saying this is "NOT a fresh
+  install... a truncated/corrupted real database", either delete the empty file and
+  retry (if the legacy store genuinely was never used) or restore `discovery.db`
+  from backup before retrying (if it held real data that got truncated).
+- **A conflict during backfill can also refuse the boot, not just a fingerprint
+  mismatch.** On a multi-replica deployment, if a live scan (or a `mark_managed`
+  call through a sibling replica) lands a row for an IP before this replica's own
+  backfill reaches it, and that legacy row was `managed=true` or had an
+  `agent_id` assigned, the backfill verifies the row already in Postgres carries
+  the same values before trusting the migration — refusing (with a
+  "reconciliation FAILED" log line naming the IP) rather than silently dropping
+  or misattributing an operator's managed-device assignment. **This does NOT
+  resolve itself on its own** — the legacy data is frozen and a retry
+  conflict-skips against the same mismatched row every time, so this replica
+  restart-loops until an operator manually reconciles: check
+  `discovery_store.discovered_devices` for the named IP to see which value is
+  actually correct, then either accept the value already in Postgres (delete the
+  legacy file and let this replica take the sourceless-skip path) or correct the
+  row via `mark_managed` before retrying.
+- **Legacy file moved aside after a verified backfill.** Once the backfill is
+  confirmed complete, `discovery.db` is renamed to
+  `discovery.db.migrated-<epoch>` (the server never reads it again). Keep the
+  renamed file until you have confirmed discovery data looks correct, then dispose
+  of it per your data-retention policy.
+
+**Operator-visible behaviour change (fail-closed reads).** `GET /api/discovery/results`
+now returns **503** on a degraded read (store not open, pool-acquire timeout, or query
+error) instead of silently rendering an empty device list — previously, a local SQLite
+read essentially never failed short of file corruption, so this failure mode was not
+practically reachable. Watch the new `yuzu_server_discovery_read_degrade_total{reason}`
+counter — a non-zero rate means the discovery view is degraded, **not** that no devices
+were found. `yuzu_server_discovery_backfill_total{result}` records the one-time
+backfill outcome (`completed` / `fresh` / `failed`).
+
+**Breaking — `POST /api/discovery/scan`'s response contract changed.** The endpoint no
+longer always returns `200 {"status":"ok",...}`: the response gains a `devices_failed`
+count, `status` is `"partial"` when some but not all devices in a batch persisted, and
+the endpoint returns **503** when every attempted device failed to persist (previously
+this was silently reported as `200`/`"ok"`, with the `discovery.scan` audit row always
+saying `"success"` regardless of outcome — the audit outcome is now
+`"success"`/`"partial"`/`"failure"`). A caller that asserts a bare `status == "ok"`, or
+that treats any 5xx from this endpoint as a hard failure needing operator escalation,
+should account for the new value and status code. Re-sending the exact same request body
+is safe — `upsert_device` is idempotent per `ip_address`, so a byte-identical retry cannot
+double-count or corrupt already-stored devices — but a fresh re-scan is not the same
+thing: `mac_address`/`subnet` overwrite unconditionally on every upsert, so a re-scan that
+fails to resolve a device's MAC this time will blank a previously known-good value rather
+than simply retry the earlier failure. See the REST API reference's Network Discovery
+section for the full response shapes.
+
 ## Upgrade Order
 
 Always upgrade in this order:
