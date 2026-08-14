@@ -50,6 +50,7 @@
 namespace yuzu::server {
 
 class PreflightRunStore;
+class HttpRouteSink;
 
 // ── PURE render functions (defined in deployment_ui.cpp) ─────────────────────
 
@@ -87,7 +88,33 @@ public:
                          DispatchFn dispatch_fn, PollFn poll_fn, AuditFn audit_fn,
                          PreflightRunStore* preflight_store, DeploymentRunStore* deploy_store);
 
+    /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
+    /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
+                         DispatchFn dispatch_fn, PollFn poll_fn, AuditFn audit_fn,
+                         PreflightRunStore* preflight_store, DeploymentRunStore* deploy_store);
+
 private:
+    /// Deny a service-scoped API token on a `/auto` Deploy surface that scopes
+    /// by `session->username` alone (the config form, result poll, and delete)
+    /// — SEC-2/SEC-3 confinement-gap class, same as PreflightRoutes'
+    /// deny_service_scoped_: `ApiToken::principal_id` ("username... who
+    /// created it") means a service-scoped token shares its creating human's
+    /// username, so username-only owner-scoping does not confine it to its
+    /// OWN service. The result-poll route additionally re-invokes the
+    /// deployment engine's mutating advance() tick on every call (unlike a
+    /// pure read) — denying it here narrows exposure (stops further devices
+    /// being admitted to an in-flight deployment on later ticks) but does NOT
+    /// by itself close the fleet-wide creation gap on `POST
+    /// /fragments/auto/deploy/run`, which remains a separate, deliberately
+    /// unfixed finding pending its own review of the guarded-transition
+    /// contract. Writes the 403 FIRST, audits after via the shared
+    /// try_persist_audit kernel, under `action`. Returns true iff denied
+    /// (caller returns immediately).
+    [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
+                                            const std::string& action,
+                                            const std::string& audit_detail) const;
+
     AuthFn auth_fn_;
     PermFn perm_fn_;
     DevicesFn devices_fn_;
