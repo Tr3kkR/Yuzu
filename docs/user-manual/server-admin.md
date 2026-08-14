@@ -226,6 +226,31 @@ HAVING COUNT(*) > 1;
 
 **How to raise a cap.** Edit the table in `server/core/src/body_cap_policy.hpp` (with review) and the matching row in `docs/user-manual/rest-api.md`. Do **not** reach for httplib's global `Server::set_payload_max_length` — that knob is shared by every route on the listener, including the ~70 MiB live-query bundle route and the OTA agent-binary upload, so a single global value can't fit every route class at once. Rejections are visible per class via `yuzu_body_cap_rejected_total{path_class,reason}` — see `docs/user-manual/metrics.md`.
 
+### vNEXT — `/auto` deployment execute now enforces per-device `Execution:Execute` confinement (breaking)
+
+**What changed.** `/auto` deployment advance (staging + executing an installer on a pre-flight
+run's go-cohort) previously dispatched every `content_dist.stage`/`content_dist.execute_staged`
+command under the server's own system authority, bypassing the caller-identity check the
+chokepoint performs for every other operator-facing dispatch surface — the check the route's own
+permission gate depends on to confine *which devices* an operator's `Execution:Execute` grant
+actually reaches. It now dispatches under the triggering operator's real identity and — as of a
+second, related fix landing in the same release — is confined to that operator's
+`Execution:Execute`-visible device set at the point of dispatch, the same per-device confinement
+`RestApiV1`/`WorkflowRoutes`/`BundleOrchestrator`/`McpServer`/`DashboardRoutes` already enforce.
+
+**Who this affects.** Only deployments where a role that can trigger `/auto` deploy
+(`Infrastructure:Read` + `SoftwareDeployment:Execute`, per the permissions table in
+[`preflight.md`](preflight.md#permissions)) holds a **management-group-scoped** `Execution:Execute`
+grant — narrower than the full fleet — rather than a global one. For that role, a deployment whose
+go-cohort includes a device outside the role's `Execution:Execute` scope will now correctly skip
+that device (visible as `skipped` in the deployment's device list) instead of executing on it.
+A role with a global `Execution:Execute` grant sees no change.
+
+**Before upgrading, check for any role combining a scoped `Execution:Execute` grant with
+`SoftwareDeployment:Execute`** — that combination is the only one affected. If none of your
+deployment-triggering roles hold a scoped (rather than global) `Execution:Execute` grant, this
+note does not affect you.
+
 ### vNEXT — an authorization-topology floor now applies regardless of RBAC, and engine-principal reads move off `Security:Read` (#2376) (breaking)
 
 This note has **two independent breaking directions** — read both, they
