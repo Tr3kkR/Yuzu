@@ -7721,15 +7721,27 @@ McpServer::HandlerFn McpServer::build_handler(
             // quarantine (mirror POST /api/v1/quarantine) AND dispatches the live
             // quarantine-plugin isolation via the same DispatchFn chain.
             if (tool_name == "quarantine_device") {
-                if (!quarantine_store || !quarantine_store->is_open()) {
-                    res.set_content(
-                        error_response(id, kInternalError, "Quarantine store unavailable"),
-                        "application/json");
-                    return;
-                }
+                // Parsed before the is_open() check below (pure arg-map
+                // reads, no failure mode) so a store-outage audit row can
+                // still carry the target agent_id (gov-fix compliance-officer
+                // C-2) instead of the audit call being skipped for lack of
+                // one.
                 auto agent_id = param_str(args, "agent_id");
                 auto reason = param_str(args, "reason");
                 auto whitelist = param_str(args, "whitelist");
+                if (!quarantine_store || !quarantine_store->is_open()) {
+                    mcp_audit("failure",
+                              "service unavailable — store not open, agent_id=" + agent_id);
+                    // gov-fix(enterprise-readiness F5): A5 requires a
+                    // transient failure to carry an honest retry_after_ms,
+                    // matching the engine-principal-store/software-licensing
+                    // store-unavailable siblings above.
+                    res.set_content(
+                        a4_error(kInternalError, "Quarantine store unavailable",
+                                 "retry the request", /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
                 if (agent_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
                                     "application/json");
@@ -7741,7 +7753,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // matching set_tag/delete_tag above — this was the last write tool
                 // still widening to the global perm_fn on an unwired scope gate.
                 if (!scoped_perm_fn) {
-                    mcp_audit("failure", "scope gate not configured");
+                    // gov-fix(compliance-officer C-3): carry agent_id in the
+                    // detail — mcp_audit's target_id is fixed to the tool
+                    // name, not the agent, for every MCP audit row.
+                    mcp_audit("failure", "scope gate not configured, agent_id=" + agent_id);
                     res.set_content(error_response(id, kInternalError, "scope gate not configured"),
                                     "application/json");
                     return;
@@ -7816,17 +7831,30 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
                 if (!quar_res) {
-                    mcp_audit("failure", agent_id);
+                    // gov-fix(compliance-officer C-3): carry the actual store
+                    // error, not just agent_id — REST's audit_fn call passes
+                    // result.error() as a distinct field from the target id;
+                    // mcp_audit only has one free-text `detail` slot, so both
+                    // go in it rather than dropping the error message.
+                    mcp_audit("failure", agent_id + ": " + quar_res.error());
                     // Mirrors the REST twin's 503-vs-400 classification
                     // (is_quarantine_db_error, rest_api_v1.cpp): a genuine
                     // store/pool/query failure is kInternalError, a
                     // business/state error ("already quarantined") is
                     // kInvalidParams.
-                    const int code = quar_res.error().starts_with(kQuarantineDbErrorPrefix)
-                                          ? kInternalError
-                                          : kInvalidParams;
-                    res.set_content(error_response(id, code, quar_res.error()),
-                                    "application/json");
+                    // gov-fix(enterprise-readiness F5): a genuine store/pool
+                    // failure is retryable (A5) — carry retry_after_ms only
+                    // on that branch, matching the engine-principal-store
+                    // sibling above; a business/state error stays
+                    // non-retryable (null).
+                    if (quar_res.error().starts_with(kQuarantineDbErrorPrefix)) {
+                        res.set_content(a4_error(kInternalError, quar_res.error(),
+                                                 "retry the request", /*retry_after_ms=*/5000),
+                                        "application/json");
+                    } else {
+                        res.set_content(a4_error(kInvalidParams, quar_res.error()),
+                                        "application/json");
+                    }
                     return;
                 }
                 // 2. Dispatch the live isolation command (plugin quarantine,

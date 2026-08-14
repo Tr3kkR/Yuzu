@@ -157,9 +157,10 @@ table with no such key (an agent can have many historical rows; `agent_id` alone
 Rather than synthesize an artificial per-row key (rejected — a SQLite-rowid-derived key would
 collide across two independently-numbered legacy files in the pathological case of two replicas
 each holding *different* real content, silently dropping one replica's real rows with no error),
-the row inserts, the `backfill_complete` marker, and the `backfill_source_fingerprint` marker are
-committed together in **one transaction**, guarded by a leading
-`pg_advisory_xact_lock(hashtextextended('quarantine_store:backfill', 0))` statement (its own
+the row inserts, the `backfill_complete` marker, and the `backfill_source_fingerprint` marker
+(plus a fourth `quarantine_meta` key, `backfill_row_count`, stamped as completeness evidence — see
+"Backfill completeness evidence" below) are committed together in **one transaction**, guarded by
+a leading `pg_advisory_xact_lock(hashtextextended('quarantine_store:backfill', 0))` statement (its own
 statement, strictly before the check-and-mutate work, per the playbook's `RbacStore`-derived
 warning that a lock embedded via CTE in the same statement as the check does not re-evaluate a
 statement's already-fixed snapshot).
@@ -240,6 +241,15 @@ required by that clause:
   unconditionally on a first-ever migration; safe to skip once a real migration has already
   completed for the fleet) — ported verbatim, same rationale (SQLite opens a 0-byte file as a
   valid empty database, indistinguishable from the legitimate no-`quarantine_records`-table case).
+- **Backfill completeness evidence (gov Gate 6 compliance-officer C-5).** Before this fix, the
+  only evidence a backfill left behind was the fact that boot succeeded — no info-level log naming
+  how many records moved, nothing queryable afterward. `migrate_from_sqlite` now logs
+  `backfill complete, N legacy quarantine record(s) migrated` at `info` level, and
+  `commit_backfill` stamps a fourth `quarantine_meta` key, `backfill_row_count`, in the SAME
+  transaction as `backfill_complete` — so an operator (or an auditor building SOC 2 evidence) can
+  answer "how much did the cutover actually move" from the running database without grepping
+  historical boot logs. `0` for both the no-legacy-file and no-`quarantine_records`-table
+  ("fresh") paths is itself meaningful evidence, not an omission.
 
 ### Lifecycle
 
@@ -289,15 +299,21 @@ record-keeping substrate changed.
   pre-existing, unrelated to this migration; the type-distinguishable read contract is applied to
   them anyway for API consistency with `list_quarantined`, per the playbook's "most migrated
   stores are authoritative" default.
-- **Retention/pruning is deliberately deferred, not overlooked (Gate 3 architect).**
-  `quarantine_records` is an unbounded, append-only history table with no prune pass in this
-  migration. A retention sweep here would owe the full seven-part clock-guarded-retention
-  contract (CLAUDE.md "Clock-guarded retention" standing invariant) — disproportionate to add in
-  the same PR as the storage-substrate migration itself, and #2508 already tracks the sibling
-  stores (`response_store`, `guaranteed_state_store`, `result_set_store`, `app_perf_*`,
-  `PreflightRunStore`, `DeploymentRunStore`) still owing the same contract. Recorded explicitly so
-  a future author does not read the silence as "nobody considered it" and add a bare
-  `DELETE ... WHERE ts < cutoff`.
+- **Indefinite retention is a DELIBERATE posture decision, not a deferred gap (Gate 3 architect;
+  reframed Gate 6 compliance-officer C-4).** `quarantine_records` is an unbounded, append-only
+  history table with **no prune pass, and this migration does not add one on purpose** —
+  a quarantine record is evidence that a specific containment decision was made, by whom, and
+  why; deleting that evidence after some retention window would be a REGRESSION for a SOC 2
+  security-containment control, not tech debt. This store is therefore **excluded** from #2508's
+  sibling sweep (`response_store`, `guaranteed_state_store`, `result_set_store`, `app_perf_*`,
+  `PreflightRunStore`, `DeploymentRunStore`) by design, not merely not-yet-reached — a future
+  author picking up #2508 should skip `quarantine_records` rather than treat its absence from a
+  prune pass as an oversight to fix. (If a genuine compliance/legal requirement for bounded
+  retention of containment evidence ever emerges, that is a separate, explicit, separately-reviewed
+  decision — same standing rule CLAUDE.md's "Clock-guarded retention" invariant states for the
+  no-prune stores that DO eventually need one — not a bare `DELETE ... WHERE ts < cutoff` added
+  here.) Recorded explicitly so a future author does not read the silence as "nobody considered
+  it".
 - **`kQuarantineDbErrorPrefix`/`is_quarantine_db_error` duplicates `DeploymentStore`'s identical
   `kDeploymentDbErrorPrefix`/`is_deployment_db_error` shape (Gate 3 architect).** Same literal
   (`"db_error: "`), same predicate, two independent homes. Benign at 2 consumers (each keys off
@@ -322,7 +338,8 @@ record-keeping substrate changed.
   migration** — the admit-then-filter shape itself predates this PR (#1788/CDX-P1-02); this
   migration only added the store-layer degrade check above it. Fixing it (pagination, or a
   bulk/batched authorization check) is a REST-contract change disproportionate to a storage
-  migration — filed as a follow-up issue rather than folded in here.
+  migration — to be filed as a follow-up issue in this run's post-merge follow-up batch (per the
+  governance skill), rather than folded in here.
 - **UP-6: the backfill's row-count cap is checked AFTER the full legacy snapshot is already loaded
   into memory, and the holder-side fingerprint-verification path (`legacy_quarantine_fingerprint`,
   which re-runs on every boot while a legacy file lingers) has no cap at all.** At the current
@@ -339,8 +356,10 @@ record-keeping substrate changed.
   backfill pattern** (built into `RbacStore`/`DiscoveryStore`/every store using this shape, not
   unique to quarantine) — this migration faithfully follows the established, precedent-set
   pattern; fixing the pattern itself is out of this PR's scope and blast radius. Documented here so
-  an operator considering rollback-then-reupgrade is warned, and filed as a follow-up against the
-  shared pattern (`docs/postgres-store-playbook.md`'s ADR-0040 section), not this store alone.
+  an operator considering rollback-then-reupgrade is warned (see `upgrading.md` and the
+  `quarantine-store-backfill-recovery.md` runbook, both fixed in the Gate 6 hardening round), and
+  to be filed as a follow-up against the shared pattern (`docs/postgres-store-playbook.md`'s
+  ADR-0040 section) in this run's post-merge follow-up batch, not fixed for this store alone.
 - **UP-9: a connection dying after a write commits but before the client receives the
   acknowledgement is answered on retry as a business error** (`"device is already
   quarantined"`/`"device is not quarantined"`, both 400) rather than distinguished from a caller
@@ -352,8 +371,8 @@ record-keeping substrate changed.
   retry is rejected with the SAME "already quarantined" 400 this PR did not change.** Verified
   **pre-existing and byte-identical before and after this migration** (confirmed via the Gate 4
   happy-path idempotency check against `origin/dev`) — the record-first/dispatch-second design and
-  its retry semantics are unrelated to the storage-backend migration. Filed as a follow-up against
-  the MCP tool's own design, not this PR.
+  its retry semantics are unrelated to the storage-backend migration. To be filed as a follow-up
+  against the MCP tool's own design in this run's post-merge follow-up batch, not this PR.
 - **UP-11: genuine store/pool/query failures include raw `PQerrorMessage(...)` text (host/port,
   never credentials — `pg_pool.hpp`'s own documented guarantee) in the client-facing error body
   and, new in the Gate 2 audit-on-failure fix, the persisted audit row.** This matches the

@@ -1429,9 +1429,18 @@ list entirely, not merely hidden from write access.
 **Permission:** `Security:Read`, scoped per-device
 
 > **Fail-closed on a degraded read (ADR-0047).** A store/pool/query failure
-> returns `503`, never a silently-empty list — a device could still be
-> actively contained while the caller would otherwise see "nothing
-> quarantined".
+> returns `503` (`"quarantine list unavailable — try again"`), never a
+> silently-empty list — a device could still be actively contained while the
+> caller would otherwise see "nothing quarantined". A **second, distinct**
+> `503` cause exists for the per-record admit-then-filter scope check itself:
+> if it hits an anomalous outcome partway through the list (neither an
+> explicit allow nor an explicit deny — most commonly a transient
+> engine-principal-store outage), the whole list fails closed with
+> `"authorization check unavailable — try again"` rather than silently
+> omitting the affected record(s). Only the first cause increments
+> `yuzu_server_quarantine_read_degrade_total` — see
+> `docs/user-manual/upgrading.md` and `docs/user-manual/metrics.md` for the
+> full distinction.
 
 **Response:**
 

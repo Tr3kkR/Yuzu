@@ -411,6 +411,24 @@ BackfillOutcome commit_backfill(pg::PgPool& pool, const std::vector<LRecord>& ro
             return false;
         }
 
+        // gov-fix(compliance-officer C-5): the only completeness evidence
+        // this backfill left behind was the fact that boot succeeded — no
+        // info-level log naming how much was migrated, and nothing queryable
+        // afterward. Persisted alongside the marker in the SAME transaction
+        // (reached only by the actual winner — a lost_race no-op returns
+        // before this point, so `rows.size()` here is this transaction's own
+        // insert count, never a racer's).
+        pg::PgResult rcr = pg::exec_params(
+            c,
+            "INSERT INTO quarantine_store.quarantine_meta (key, value) VALUES "
+            "('backfill_row_count', $1) ON CONFLICT (key) DO NOTHING",
+            std::vector<std::string>{std::to_string(rows.size())});
+        if (rcr.status() != PGRES_COMMAND_OK) {
+            spdlog::error("QuarantineStore: migrate_from_sqlite: row-count stamp failed: {}",
+                          PQerrorMessage(c));
+            return false;
+        }
+
         // Monotonic promotion (mirrors discovery_store.cpp's stamp_complete):
         // "sourceless" carries no evidence worth protecting, so a real
         // fingerprint may promote a stored "sourceless" value; a stored REAL
@@ -815,10 +833,16 @@ bool QuarantineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
                 spdlog::error(
                     "QuarantineStore: migrate_from_sqlite: HOLDER-SIDE VERIFICATION FAILED — "
                     "backfill_complete is already set with a DIFFERENT recorded source "
-                    "fingerprint ('{}') than this replica's own legacy db {} ('{}') — some "
-                    "other replica's legacy data was migrated, not this one's. Refusing to "
-                    "silently accept a completion this replica's quarantine records were "
-                    "never part of.",
+                    "fingerprint ('{}') than this replica's own legacy db {} ('{}'). Two "
+                    "distinct causes produce this same symptom: (1) on a multi-replica "
+                    "deployment, some OTHER replica's legacy data was migrated, not this "
+                    "one's; (2) on a SINGLE replica, this server was rolled back to a "
+                    "pre-migration build after the backfill completed, ran against the legacy "
+                    "quarantine.db again (creating new content), and is now being re-upgraded "
+                    "— the file no longer matches what was already migrated. Refusing to "
+                    "silently accept a completion this replica's current legacy content was "
+                    "never verified against; see the quarantine-store backfill recovery "
+                    "runbook for the remediation for each cause.",
                     *stored_fingerprint, legacy_db_path.string(), *verify_fp);
                 backfill_metric("failed");
                 return false;
@@ -932,8 +956,9 @@ bool QuarantineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
             spdlog::error(
                 "QuarantineStore: migrate_from_sqlite: legacy db {} holds {} quarantine "
                 "records, exceeding the {} sanity cap for a single backfill transaction — "
-                "refusing (fail-closed); this is unexpected for a manually-curated security "
-                "list, contact platform engineering before raising the cap",
+                "refusing (fail-closed); see docs/ops-runbooks/"
+                "quarantine-store-backfill-recovery.md for remediation (prune released records "
+                "out of the legacy file, or engage engineering to raise the compile-time cap)",
                 legacy_db_path.string(), snap.size(), kMaxBackfillRows);
             backfill_metric("failed");
             return false;
@@ -1007,6 +1032,13 @@ bool QuarantineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
         if (outcome.lost_race)
             continue; // retry: marker_present branch above handles it
 
+        // gov-fix(compliance-officer C-5): named completeness evidence, not
+        // just a boot that happened to succeed — the row count is also
+        // queryable afterward via quarantine_meta.backfill_row_count.
+        spdlog::info(
+            "QuarantineStore: migrate_from_sqlite: backfill complete, {} legacy quarantine "
+            "record(s) migrated from {}",
+            snap.size(), legacy_db_path.string());
         legacy.close(); // Windows refuses to rename a file with an open handle
         move_legacy_aside(legacy_db_path);
         backfill_metric("completed");

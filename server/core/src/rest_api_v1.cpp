@@ -805,7 +805,7 @@ const std::string& openapi_spec() {
         // form.
         R"json(,
     "/quarantine": {
-      "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable, or a degraded read (ADR-0047) — never rendered as an empty list"}}},
+      "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable, or a degraded read (ADR-0047) — never rendered as an empty list. Two distinct causes, distinguished by message: store/pool/query failure only increments yuzu_server_quarantine_read_degrade_total; a per-record admit-then-filter anomaly (e.g. transient engine-principal-store outage) does not"}}},
       "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, or the device is already quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/quarantine/{agent_id}": {
@@ -4248,6 +4248,12 @@ void RestApiV1::register_routes(
         if (!quarantine_store || !quarantine_store->is_open()) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            // gov-fix(compliance-officer C-2): the target agent_id is not yet
+            // known at this point (the body hasn't been parsed), so this is
+            // the one quarantine failure path that cannot carry a resource
+            // id — audited anyway rather than silently skipped.
+            audit_fn(req, "quarantine.enable", "failure", "Security", "",
+                     "service unavailable — store not open");
             return;
         }
 
@@ -4306,13 +4312,19 @@ void RestApiV1::register_routes(
             // CDX-P1-02: authenticate first (401 before any store work).
             if (!auth_fn(req, res))
                 return;
+            // Extracted before the is_open() check below (pure regex-match
+            // read, no failure mode) so a store-outage 503 can still carry
+            // the target agent_id in its audit row (gov-fix compliance-officer
+            // C-2) instead of the audit call being skipped for lack of one.
+            auto agent_id = req.matches[1].str();
             if (!quarantine_store || !quarantine_store->is_open()) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
+                         "service unavailable — store not open");
                 return;
             }
 
-            auto agent_id = req.matches[1].str();
             // CDX-P1-02: same sole per-target gate as POST above, mirroring
             // set_tag/delete_tag and the MCP quarantine_device twin — fail
             // CLOSED if unwired.

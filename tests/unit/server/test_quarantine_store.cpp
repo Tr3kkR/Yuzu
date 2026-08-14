@@ -316,6 +316,10 @@ TEST_CASE("QuarantineStore: backfill of a no-legacy path marks fresh", "[pg][qua
                           "'backfill_complete'") != "");
     CHECK(scalar(db.dsn(), "SELECT value FROM quarantine_store.quarantine_meta WHERE key = "
                           "'backfill_source_fingerprint'") == "sourceless");
+    // gov-fix(compliance-officer C-5): completeness evidence, queryable
+    // post-boot, not just an implicit "boot succeeded".
+    CHECK(scalar(db.dsn(), "SELECT value FROM quarantine_store.quarantine_meta WHERE key = "
+                          "'backfill_row_count'") == "0");
 }
 
 TEST_CASE("QuarantineStore: backfill migrates legacy records (active + released) and is idempotent",
@@ -336,6 +340,10 @@ TEST_CASE("QuarantineStore: backfill migrates legacy records (active + released)
     CHECK(scalar(db.dsn(), "SELECT count(*) FROM quarantine_store.quarantine_records") == "2");
     CHECK(scalar(db.dsn(), "SELECT value FROM quarantine_store.quarantine_meta WHERE key = "
                           "'backfill_complete'") != "");
+    // gov-fix(compliance-officer C-5): completeness evidence, queryable
+    // post-boot, not just an implicit "boot succeeded".
+    CHECK(scalar(db.dsn(), "SELECT value FROM quarantine_store.quarantine_meta WHERE key = "
+                          "'backfill_row_count'") == "2");
     CHECK_FALSE(std::filesystem::exists(legacy.path)); // moved aside after verified backfill
 
     auto active = store.get_status("agent-legacy-active");

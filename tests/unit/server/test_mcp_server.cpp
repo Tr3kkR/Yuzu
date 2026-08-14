@@ -10568,6 +10568,68 @@ TEST_CASE("MCP quarantine_device FAILS CLOSED when the scope gate is unwired (go
     }
 }
 
+// gov-fix(chaos-injector NICE-2): pins the store/business error split at the
+// MCP transport, mirroring the REST route's own pin
+// ("REST routes answer 503 (not 400) on a genuine store failure", test_rest_
+// quarantine_routes.cpp) — a genuine store/pool failure must classify
+// kInternalError + a retryable A5 hint, a business-state error ("already
+// quarantined") must classify kInvalidParams + non-retryable, and neither may
+// silently swap with the other.
+TEST_CASE("MCP quarantine_device classifies store failure vs business error "
+          "(kInternalError+retryable vs kInvalidParams+terminal)",
+          "[mcp][integration][quarantine][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
+
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start(); // default tier: no approval gate, single-call round-trip
+
+    SECTION("business error: agent already quarantined -> kInvalidParams, no retry") {
+        REQUIRE(quar.quarantine_device("agent-dup", "seed", "pre-seeded", "").has_value());
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":267,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-dup","reason":"dup"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] == "device is already quarantined");
+        // Non-retryable business error: no retry_after_ms hint.
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        REQUIRE_FALSE(ts.audit_details.empty());
+        CHECK(ts.audit_details.back().find("agent-dup: device is already quarantined") !=
+              std::string::npos);
+    }
+
+    SECTION("store failure: schema dropped -> kInternalError, retryable") {
+        {
+            pg::PgConn conn{PQconnectdb(qpgdb.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            pg::PgResult r{PQexec(conn.get(), "DROP SCHEMA quarantine_store CASCADE")};
+            REQUIRE(r.ok());
+        }
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":268,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-degraded","reason":"boom"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"].get<std::string>().starts_with(
+            yuzu::server::kQuarantineDbErrorPrefix));
+        // Retryable store failure: A5 requires an honest retry_after_ms.
+        CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+        REQUIRE_FALSE(ts.audit_details.empty());
+        CHECK(ts.audit_details.back().find("agent-degraded: ") != std::string::npos);
+        CHECK(ts.audit_details.back().find(yuzu::server::kQuarantineDbErrorPrefix) !=
+              std::string::npos);
+    }
+}
+
 // ── M1 (PR #1796): reviewer == submitter surfaces through the MCP error path ─
 // approval_manager.cpp enforces "reviewer cannot be the same as the submitter"
 // at the store; this proves the FULL MCP path: a ticket minted via the C8 gate
