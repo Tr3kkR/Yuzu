@@ -21,8 +21,8 @@ bool deny_service_scoped_schedule(AuthRoutes& auth_routes, const httplib::Reques
     res.status = 403;
     res.set_content(
         detail::error_json_a4(
-            403, "service-scoped tokens may not create, enable, or delete schedules", cid,
-            detail::A4ErrorOpts{.permission = "Execution:Execute"}),
+            403, "service-scoped tokens may not access this fleet-wide schedule surface", cid,
+            detail::A4ErrorOpts{.permission = "Schedule:Read"}),
         "application/json");
     // target_type "schedule" (lowercase) matches every existing schedule.*
     // success-path audit row in this file and server.cpp — a capitalized
@@ -86,6 +86,20 @@ void handle_create_schedule(AuthRoutes& auth_routes, ScheduleEngine* schedule_en
         res.status = 400;
         res.set_content(nlohmann::json({{"error", e.what()}}).dump(), "application/json");
     }
+}
+
+bool parse_schedule_enabled(const std::string& body) {
+    try {
+        auto j = nlohmann::json::parse(body);
+        if (j.contains("enabled")) {
+            if (j["enabled"].is_boolean())
+                return j["enabled"].get<bool>();
+            if (j["enabled"].is_string())
+                return j["enabled"].get<std::string>() != "false";
+        }
+    } catch (...) {
+    }
+    return true; // missing key / malformed body — pre-existing default
 }
 
 } // namespace yuzu::server

@@ -12921,6 +12921,14 @@ private:
                                                   httplib::Response& res) {
             if (!require_permission(req, res, "Schedule", "Read"))
                 return;
+            // guardian-confinement-2298 hardening sweep: ITServiceOwner grants
+            // full CRUD on Schedule, and query_schedules has no owner/service
+            // filter at all — a bare Schedule:Read gate lets a service-scoped
+            // token enumerate every schedule from every other service. No
+            // single schedule to confine per-target, so this is a blanket
+            // deny, same shape as the fleet-wide dashboard fragment twin.
+            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.list", ""))
+                return;
             if (!schedule_engine_) {
                 res.status = 503;
                 res.set_content(
@@ -13007,8 +13015,12 @@ private:
             }
 
             auto id = req.matches[1].str();
-            auto enabled_str = extract_json_string(req.body, "enabled");
-            bool enabled = (enabled_str != "false");
+            // guardian-confinement-2298: parse_schedule_enabled (schedule_routes.hpp)
+            // — extract_json_string only matches a JSON *string*, so a real
+            // JSON boolean {"enabled":false} used to silently fall through
+            // to the "absent" default (true), inverting the request and
+            // defeating the disable-always-reachable kill switch (H-01).
+            bool enabled = parse_schedule_enabled(req.body);
             // H-01 (#1806): re-enabling arms the schedule to fire unattended
             // through ScheduleRunner — the same fleet-wide-dispatch concern
             // as create, so it needs the same Execution:Execute gate.
@@ -16721,6 +16733,7 @@ private:
         } catch (...) {}
         return {};
     }
+
 
     static std::vector<std::string> extract_json_string_array(const std::string& body,
                                                               const std::string& key) {

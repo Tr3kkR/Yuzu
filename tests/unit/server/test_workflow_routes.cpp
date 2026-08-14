@@ -106,6 +106,10 @@ struct ExecHarness {
     std::unique_ptr<ExecutionEventBus> event_bus;
 
     bool perm_grant{true};
+    /// guardian-confinement-2298: empty by default (an ordinary session);
+    /// a test sets this to prove the /fragments/schedules service-scoped
+    /// deny fires independently of perm_grant.
+    std::string mock_token_scope_service;
     /// PR 2 hardening regression net: captures the execution_id passed to
     /// cmd_dispatch so a test can prove the FAST-agent race fix (mapping
     /// registered BEFORE dispatch). Empty when the dispatch path has no
@@ -202,11 +206,12 @@ struct ExecHarness {
             REQUIRE(workflows->is_open());
         }
 
-        auto auth_fn = [](const httplib::Request&,
-                          httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "tester";
             s.role = auth::Role::admin;
+            s.token_scope_service = mock_token_scope_service;
             return s;
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
@@ -1941,4 +1946,62 @@ TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible der
     CHECK(h.dispatch_calls == 1);
     REQUIRE(h.last_dispatch_exec_visible.has_value()); // PRESENT (deny), not nullopt
     CHECK(h.last_dispatch_exec_visible->empty());      // EMPTY → production sink reaches no one
+}
+
+// ── /fragments/schedules confinement (guardian-confinement-2298) ──────────
+//
+// Previously reachable by ANY authenticated session with no RBAC check at
+// all, and — even with a Schedule:Read gate — ITServiceOwner grants full
+// CRUD on Schedule with no owner/service filter anywhere in the query, so a
+// service-scoped token could enumerate every schedule from every other
+// service. schedule_engine stays nullptr in ExecHarness (never wired) —
+// the deny fires before the null-check, so these tests need no real store.
+
+TEST_CASE("/fragments/schedules: an ordinary session is now gated on Schedule:Read",
+          "[pg][workflow][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.perm_grant = false; // simulates a session lacking Schedule:Read
+
+    auto res = h.sink.Get("/fragments/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("/fragments/schedules: a service-scoped token is denied even holding Schedule:Read",
+          "[pg][workflow][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.perm_grant = true; // the stub perm_fn would otherwise let this through
+    h.mock_token_scope_service = "printers";
+
+    auto res = h.sink.Get("/fragments/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("service-scoped") != std::string::npos);
+
+    bool saw_denied = false;
+    for (const auto& c : h.audit_calls) {
+        if (c.action == "schedule.list.access_denied" && c.result == "denied")
+            saw_denied = true;
+    }
+    CHECK(saw_denied);
+}
+
+TEST_CASE("/fragments/schedules: an ordinary session with Schedule:Read reaches the list",
+          "[pg][workflow][schedules][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.perm_grant = true;
+
+    auto res = h.sink.Get("/fragments/schedules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // schedule_engine is nullptr in this harness — the "Not available" branch,
+    // not a denial. Confirms the deny/gate above didn't also block the
+    // legitimate path.
+    CHECK(res->body.find("Not available") != std::string::npos);
 }

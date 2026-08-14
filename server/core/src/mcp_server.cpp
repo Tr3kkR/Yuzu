@@ -5299,6 +5299,18 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── list_schedules ────────────────────────────────────────────
             if (tool_name == "list_schedules") {
+                // guardian-confinement-2298 hardening sweep: ITServiceOwner
+                // grants full CRUD on Schedule, and query_schedules has no
+                // owner/service filter of any kind — a bare Schedule:Read
+                // gate lets a service-scoped token enumerate every schedule
+                // from every other service. No single schedule to confine
+                // per-target against, same shape as the REST list twin's fix.
+                if (deny_fleet_wide_service_scoped(
+                        "schedule.list", "schedule",
+                        "fleet-wide schedule list denied to a service-scoped token (MCP "
+                        "list_schedules)",
+                        "service-scoped tokens may not read the fleet-wide schedule list"))
+                    return;
                 if (!tier_allows(tier, "Schedule", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),

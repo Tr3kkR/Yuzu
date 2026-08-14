@@ -3393,6 +3393,37 @@ TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is w
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
 }
 
+// guardian-confinement-2298 hardening sweep: ITServiceOwner grants full CRUD
+// on Schedule, and ScheduleEngine::query_schedules has no owner/service
+// filter of any kind, so a bare Schedule:Read tier/perm gate alone let a
+// service-scoped token enumerate every schedule from every other service.
+// The deny fires BEFORE the `!schedule_engine` null-check (mirrors the
+// ordering of every other deny_fleet_wide_service_scoped call site), so this
+// needs no real ScheduleEngine wired to prove — schedule_engine_for_test
+// stays nullptr.
+TEST_CASE("MCP: list_schedules denies a service-scoped token, denial audited",
+          "[mcp][integration][schedule][security]") {
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":47,"params":{"name":"list_schedules"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "schedule.list|denied")
+            saw_denied = true;
+        CHECK(a != "schedule.list|success");
+        CHECK(a != "mcp.list_schedules|success");
+    }
+    CHECK(saw_denied);
+}
+
 // ── F2a: DEX fleet-perf tools ────────────────────────────────────────────────
 
 namespace {

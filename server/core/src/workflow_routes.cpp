@@ -6,6 +6,7 @@
 #include "execution_event_bus.hpp"
 #include "http_route_sink.hpp"
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
+#include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
 #include "scope_engine.hpp"
 #include "web_utils.hpp"
 
@@ -904,11 +905,59 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          }));
              });
 
-    // GET /fragments/schedules -- schedule list HTMX fragment
-    sink.Get("/fragments/schedules", [auth_fn, schedule_engine](const httplib::Request& req,
-                                                                httplib::Response& res) {
+    // guardian-confinement-2298: fleet-wide schedule list has no single
+    // schedule/agent to confine per-target, mirrors GuardianRoutes'/
+    // RestApiV1's blanket service-scoped deny for the identical reason —
+    // ITServiceOwner grants full CRUD on Schedule, so a bare Schedule:Read
+    // gate alone would still let a service-scoped token enumerate every
+    // schedule from every other service. Runs BEFORE perm_fn (independent
+    // of RBAC on/off branch ordering), same as every other deny_service_
+    // scoped_ helper on this branch.
+    auto deny_service_scoped_schedule_list = [auth_fn, audit_fn](const httplib::Request& req,
+                                                                  httplib::Response& res) -> bool {
         auto session = auth_fn(req, res);
         if (!session)
+            return true; // auth_fn already wrote 401/redirect; caller returns.
+        if (session->token_scope_service.empty())
+            return false;
+        const auto cid = detail::make_correlation_id();
+        // Write the 403 FIRST, audit after (mirrors GuardianRoutes'
+        // deny_service_scoped_): a throwing audit_fn must not suppress the 403.
+        res.status = 403;
+        res.set_content(
+            detail::error_json_a4(
+                403, "service-scoped tokens may not read the fleet-wide schedule list", cid,
+                detail::A4ErrorOpts{.permission = "Schedule:Read"}),
+            "application/json");
+        if (audit_fn) {
+            try {
+                audit_fn(req, "schedule.list.access_denied", "denied", "schedule", "",
+                         "fleet-wide schedule list denied to a service-scoped token");
+            } catch (const std::exception& e) {
+                spdlog::warn("schedule.list.access_denied: audit_fn threw: {}", e.what());
+            } catch (...) {
+                spdlog::warn("schedule.list.access_denied: audit_fn threw (non-std)");
+            }
+        }
+        return true;
+    };
+
+    // GET /fragments/schedules -- schedule list HTMX fragment
+    sink.Get("/fragments/schedules", [perm_fn, schedule_engine,
+                                      deny_service_scoped_schedule_list](
+                                         const httplib::Request& req, httplib::Response& res) {
+        // deny_service_scoped_schedule_list already resolved (and validated)
+        // the session via auth_fn — a second auth_fn call here would be
+        // redundant, matching the original handler's only use of `session`
+        // (the existence check; the body never read the session itself).
+        if (deny_service_scoped_schedule_list(req, res))
+            return;
+        // sec-M1-style gate (mirrors /fragments/executions immediately above):
+        // the LIST exposes every schedule's name/frequency/enabled state/
+        // execution count fleet-wide — previously reachable by ANY
+        // authenticated session with no RBAC check at all (guardian-
+        // confinement-2298 hardening sweep).
+        if (!perm_fn(req, res, "Schedule", "Read"))
             return;
         if (!schedule_engine) {
             res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");

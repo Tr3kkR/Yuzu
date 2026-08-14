@@ -316,3 +316,20 @@ TEST_CASE("deny_service_scoped_schedule: denies a service-scoped session, writes
         CHECK(res.body.empty());
     }
 }
+
+// guardian-confinement-2298 hardening sweep: extract_json_string only
+// matches a JSON *string*, so a real JSON boolean {"enabled":false} — the
+// standards-compliant encoding every JSON client library produces for a
+// boolean field — used to silently fall through to the "absent" default
+// (true), inverting the request and defeating the disable-always-reachable
+// kill switch (H-01). Pure function, no harness needed.
+TEST_CASE("parse_schedule_enabled: accepts real JSON booleans, not just strings",
+          "[server][schedule][guardian-confinement]") {
+    CHECK(parse_schedule_enabled(R"({"enabled":true})") == true);
+    CHECK(parse_schedule_enabled(R"({"enabled":false})") == false); // the inversion bug
+    CHECK(parse_schedule_enabled(R"({"enabled":"true"})") == true);
+    CHECK(parse_schedule_enabled(R"({"enabled":"false"})") == false);
+    CHECK(parse_schedule_enabled(R"({})") == true);           // missing key -> default
+    CHECK(parse_schedule_enabled("not json") == true);        // malformed -> default
+    CHECK(parse_schedule_enabled(R"({"enabled":null})") == true); // non-bool/string -> default
+}
