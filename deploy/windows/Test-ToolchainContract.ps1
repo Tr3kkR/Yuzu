@@ -16,9 +16,11 @@ param(
   [string]$ModulePath = (Join-Path $PSScriptRoot 'Toolchain-Contract.psm1'),
   [string]$AssertPath = (Join-Path $PSScriptRoot 'Assert-Toolchain.ps1'),
   [string]$AssertVcpkgPath = (Join-Path $PSScriptRoot 'Assert-VcpkgCheckout.ps1'),
+  [string]$ManifestUpdaterPath = (Join-Path $PSScriptRoot 'Update-ToolchainManifest.ps1'),
   [string]$ProvisionPath = (Join-Path $PSScriptRoot 'Provision-Windows-Runner.ps1'),
   [string]$BaselineWorkflowPath = (Join-Path $PSScriptRoot '..\..\.github\workflows\vcpkg-baseline-update.yml'),
   [string]$CiWorkflowPath = (Join-Path $PSScriptRoot '..\..\.github\workflows\ci.yml'),
+  [string]$NightlyWorkflowPath = (Join-Path $PSScriptRoot '..\..\.github\workflows\nightly.yml'),
   [string]$ReleaseWorkflowPath = (Join-Path $PSScriptRoot '..\..\.github\workflows\release.yml')
 )
 $ErrorActionPreference = 'Stop'
@@ -52,6 +54,11 @@ function New-TestManifest {
       required = $true
     }
   }
+  $sdkVersion = [string]$contract.pins.windows_sdk
+  ($tools | Where-Object name -eq 'windows_sdk_header').path = "C:\Program Files (x86)\Windows Kits\10\Include\$sdkVersion\um\Windows.h"
+  ($tools | Where-Object name -eq 'windows_sdk_lib').path = "C:\Program Files (x86)\Windows Kits\10\Lib\$sdkVersion\um\x64\kernel32.lib"
+  ($tools | Where-Object name -eq 'windows_sdk_rc').path = "C:\Program Files (x86)\Windows Kits\10\bin\$sdkVersion\x64\rc.exe"
+  @($tools | Where-Object name -like 'windows_sdk_*').ForEach({ $_.version = $sdkVersion })
   [pscustomobject][ordered]@{
     schema = [string]$contract.schema
     generated = '2026-07-28T12:00:00Z'
@@ -88,6 +95,23 @@ function Copy-TestManifest([psobject]$Manifest){
     $copy.generated = $copy.generated.ToUniversalTime().ToString('o')
   }
   $copy
+}
+
+function Set-TestManifestTopology([psobject]$Manifest,[int]$RunnerCount){
+  $Manifest.runner_count = $RunnerCount
+  $Manifest.telemetry.databases = @(
+    for($n=0; $n -lt $RunnerCount; $n++){ "X:\fake\runner-$n.db" }
+  )
+  $Manifest.postgres_clusters = @(
+    for($n=0; $n -lt $RunnerCount; $n++){
+      [pscustomobject]@{
+        agent=$n; port=(5433 + $n); service="postgresql-fixture-$n"; bin="X:\fake\pg-$n\bin"
+        pg_ctl="X:\fake\pg-$n\bin\pg_ctl.exe"; postgres="X:\fake\pg-$n\bin\postgres.exe"
+        psql="X:\fake\pg-$n\bin\psql.exe"; pg_isready="X:\fake\pg-$n\bin\pg_isready.exe"
+      }
+    }
+  )
+  $Manifest
 }
 
 $probeState = [pscustomobject]@{ Calls = 0; RebarInvocationOk = $false }
@@ -142,12 +166,212 @@ function Invoke-ManifestTest([psobject]$Manifest,[scriptblock]$Runner,[psobject]
 
 Write-Host "Testing toolchain contract: $ContractPath" -ForegroundColor Cyan
 
+Check 'Visual Studio Installer exit codes classify success, reboot, and failure' {
+  (Get-YuzuInstallerDisposition -ExitCode 0) -eq 'Complete' -and
+  (Get-YuzuInstallerDisposition -ExitCode 1641) -eq 'RebootRequired' -and
+  (Get-YuzuInstallerDisposition -ExitCode 3010) -eq 'RebootRequired' -and
+  (Get-YuzuInstallerDisposition -ExitCode -1978334967) -eq 'RebootRequired' -and
+  (Get-YuzuInstallerDisposition -ExitCode -1978334966) -eq 'RebootRequired' -and
+  (Get-YuzuInstallerDisposition -ExitCode -1978334965) -eq 'RebootRequired' -and
+  (Get-YuzuInstallerDisposition -ExitCode 1603) -eq 'Failed'
+}
+Check 'installer exit policy sends direct and WinGet reboot results to its handler' {
+  $seen = [Collections.Generic.List[int]]::new()
+  foreach($code in @(1641,3010,-1978334967)){
+    $message = ''
+    try {
+      Invoke-YuzuInstallerExitPolicy -ExitCode $code -Context 'fixture' `
+        -RebootHandler { param($context,$exitCode) $seen.Add($exitCode) }
+    } catch { $message = $_.Exception.Message }
+    if($message -notmatch 'reboot handler returned'){ return $false }
+  }
+  ($seen -join ',') -eq '1641,3010,-1978334967'
+}
+Check 'installer exit policy accepts zero and rejects a hard failure' {
+  Invoke-YuzuInstallerExitPolicy -ExitCode 0 -Context 'fixture' -RebootHandler { throw 'not expected' }
+  $message = ''
+  try {
+    Invoke-YuzuInstallerExitPolicy -ExitCode 1603 -Context 'fixture' -RebootHandler { throw 'not expected' }
+  } catch { $message = $_.Exception.Message }
+  $message -match 'fixture failed \(exit 1603\)'
+}
+
+$artifactWork = Join-Path ([IO.Path]::GetTempPath()) "yuzu_test_sdk_paths_$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $artifactWork | Out-Null
+try {
+  $artifactTools = @('windows_sdk_header','windows_sdk_lib','windows_sdk_rc') | ForEach-Object {
+    [pscustomobject]@{ name=$_; path=(Join-Path $artifactWork $_); version='10.0.26100.0'; required=$true }
+  }
+  foreach($tool in $artifactTools){ Set-Content -LiteralPath $tool.path -Value 'fixture' -Encoding Ascii }
+  $result = Test-YuzuRequiredToolPaths -Tools $artifactTools
+  Check 'all required SDK artifact files pass the live path adapter' {
+    $result.Healthy -and @($result.Observations | Where-Object Exists).Count -eq 3
+  }
+  foreach($missingName in @('windows_sdk_header','windows_sdk_lib','windows_sdk_rc')){
+    $missing = @($artifactTools | Where-Object name -eq $missingName)[0]
+    Remove-Item -LiteralPath $missing.path
+    $result = Test-YuzuRequiredToolPaths -Tools $artifactTools
+    Check "deleting live $missingName fails with that artifact identity" {
+      (-not $result.Healthy) -and
+      @($result.Observations | Where-Object { $_.Required -and -not $_.Exists }).Count -eq 1 -and
+      @($result.Observations | Where-Object { $_.Required -and -not $_.Exists })[0].Name -eq $missingName
+    }
+    Set-Content -LiteralPath $missing.path -Value 'fixture' -Encoding Ascii
+  }
+  $result = Test-YuzuRequiredToolPaths -Tools $artifactTools -PathTester { throw 'fixture access denied' }
+  Check 'a live path probe error fails closed with its diagnostic cause' {
+    (-not $result.Healthy) -and
+    @($result.Observations | Where-Object { $_.Error -match 'fixture access denied' }).Count -eq 3
+  }
+} finally {
+  Remove-Item -LiteralPath $artifactWork -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 $valid = New-TestManifest
 $result = Invoke-ManifestTest $valid
 Check 'a complete matching manifest passes all executable probes' {
   $rebarProbe = @($result.Observations | Where-Object Name -eq 'rebar3')
-  $result.Healthy -and @($result.Observations).Count -eq 8 -and $probeState.Calls -eq 4 -and
+  $result.Healthy -and @($result.Observations).Count -eq 11 -and $probeState.Calls -eq 4 -and
   $rebarProbe.Count -eq 1 -and $probeState.RebarInvocationOk
+}
+
+$jsonDateManifest = New-TestManifest
+$jsonDateManifest.generated = '2026-08-14T09:20:25.3054480+00:00'
+$jsonDateManifest = $jsonDateManifest | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+$probeState.Calls = 0
+$result = Invoke-ManifestTest $jsonDateManifest
+Check 'a JSON-materialised ISO timestamp remains valid on day 13 or later' {
+  $result.Healthy -and $probeState.Calls -eq 4
+}
+
+foreach($runnerCount in @(1,4)){
+  $prior = Set-TestManifestTopology (Copy-TestManifest $valid) $runnerCount
+  $prior.tools = @($prior.tools | Where-Object { $_.name -notlike 'windows_sdk_*' })
+  $prior.pins.PSObject.Properties.Remove('windows_sdk')
+  $prior.pins | Add-Member -NotePropertyName build_jobs -NotePropertyValue 16
+  $expectedDatabases = @($prior.telemetry.databases)
+  $expectedClusters = $prior.postgres_clusters | ConvertTo-Json -Depth 5
+  $migrated = New-YuzuToolchainManifestDocument `
+      -PriorManifest $prior -Contract $contract -HostName 'HERMETIC' `
+      -GeneratedAt ([DateTimeOffset]'2026-08-11T12:00:00Z')
+  $probeState.Calls = 0
+  $result = Invoke-ManifestTest $migrated
+  Check "manifest-only migration preserves a $runnerCount-runner topology and adds SDK evidence" {
+    $result.Healthy -and $migrated.runner_count -eq $runnerCount -and
+    @($migrated.telemetry.databases).Count -eq $runnerCount -and
+    @($migrated.postgres_clusters).Count -eq $runnerCount -and
+    (@($migrated.telemetry.databases) -join "`0") -eq ($expectedDatabases -join "`0") -and
+    ($migrated.postgres_clusters | ConvertTo-Json -Depth 5) -eq $expectedClusters -and
+    @($migrated.tools | Where-Object { $_.name -like 'windows_sdk_*' }).Count -eq 3 -and
+    $migrated.pins.windows_sdk -eq '10.0.26100.0' -and
+    $migrated.pins.build_jobs -eq 16
+  }
+}
+
+$provisionerStyle = Set-TestManifestTopology (Copy-TestManifest $valid) 4
+$provisionerStylePins = [ordered]@{}
+foreach($pin in $provisionerStyle.pins.PSObject.Properties){
+  $provisionerStylePins[$pin.Name] = $pin.Value
+}
+$provisionerStylePins.build_jobs = 16
+$provisionerStyle.pins = $provisionerStylePins
+$provisionerManifest = New-YuzuToolchainManifestDocument `
+    -PriorManifest $provisionerStyle -Contract $contract -HostName 'HERMETIC'
+Check 'manifest builder preserves build_jobs from provisioner ordered-dictionary pins' {
+  $provisionerManifest.pins.build_jobs -eq 16
+}
+
+$badTopology = Set-TestManifestTopology (Copy-TestManifest $valid) 1
+$badTopology.telemetry.databases = @('X:\fake\runner-0.db','X:\fake\runner-1.db')
+Check 'manifest-only migration rejects a topology inconsistent with runner_count' {
+  try {
+    New-YuzuToolchainManifestDocument `
+        -PriorManifest $badTopology -Contract $contract -HostName 'HERMETIC' | Out-Null
+    $false
+  } catch { $_.Exception.Message -match 'topology does not match runner_count' }
+}
+
+$updateWork = Join-Path ([IO.Path]::GetTempPath()) "yuzu-manifest-update-$([guid]::NewGuid())"
+New-Item -ItemType Directory -Path $updateWork | Out-Null
+try {
+  $updateManifest = Join-Path $updateWork 'toolchain-manifest.json'
+  $passingAssert = Join-Path $updateWork 'assert-pass.ps1'
+  $failingAssert = Join-Path $updateWork 'assert-fail.ps1'
+  Set-Content -LiteralPath $passingAssert -Value 'exit 0' -Encoding UTF8
+  Set-Content -LiteralPath $failingAssert -Value 'exit 19' -Encoding UTF8
+  Set-Content -LiteralPath $updateManifest -Value '{"state":"prior"}' -Encoding UTF8
+  $installResult = Install-YuzuToolchainManifestCandidate `
+      -Candidate ([pscustomobject]@{ state='candidate' }) `
+      -ManifestPath $updateManifest -ContractPath $ContractPath -AssertPath $passingAssert
+  Check 'a passing child assertion reaches atomic replacement and retains the prior manifest' {
+    (Get-Content -LiteralPath $updateManifest -Raw) -match 'candidate' -and
+    (Get-Content -LiteralPath $installResult.BackupPath -Raw) -match 'prior'
+  }
+
+  Set-Content -LiteralPath $updateManifest -Value '{"state":"prior-failure"}' -Encoding UTF8
+  $failureMessage = ''
+  try {
+    Install-YuzuToolchainManifestCandidate `
+        -Candidate ([pscustomobject]@{ state='must-not-install' }) `
+        -ManifestPath $updateManifest -ContractPath $ContractPath -AssertPath $failingAssert | Out-Null
+  } catch { $failureMessage = $_.Exception.Message }
+  Check 'a failing child assertion preserves the prior manifest and removes its candidate' {
+    $failureMessage -match 'exited 19' -and
+    (Get-Content -LiteralPath $updateManifest -Raw) -match 'prior-failure' -and
+    -not (Get-ChildItem -LiteralPath $updateWork -Filter '*.candidate')
+  }
+
+  Set-Content -LiteralPath $updateManifest -Value '{"state":"prior-race"}' -Encoding UTF8
+  $raceMessage = ''
+  try {
+    Install-YuzuToolchainManifestCandidate `
+        -Candidate ([pscustomobject]@{ state='must-not-install-after-race' }) `
+        -ManifestPath $updateManifest -ContractPath $ContractPath -AssertPath $passingAssert `
+        -BeforeReplace { throw '[RUNNER-ACTIVE] fixture worker appeared' } | Out-Null
+  } catch { $raceMessage = $_.Exception.Message }
+  Check 'a failed pre-replace worker recheck preserves the prior manifest and removes its candidate' {
+    $raceMessage -match '^\[RUNNER-ACTIVE\]' -and
+    (Get-Content -LiteralPath $updateManifest -Raw) -match 'prior-race' -and
+    -not (Get-ChildItem -LiteralPath $updateWork -Filter '*.candidate')
+  }
+} finally {
+  Remove-Item -LiteralPath $updateWork -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$missingSdkLib = Copy-TestManifest $valid
+$missingSdkLib.tools = @($missingSdkLib.tools | Where-Object name -ne 'windows_sdk_lib')
+$probeState.Calls = 0
+$result = Invoke-ManifestTest $missingSdkLib
+Check 'an omitted Windows SDK library fails before executing a probe' {
+  (-not $result.Healthy) -and $probeState.Calls -eq 0 -and
+  ($result.Errors -join "`n") -match "exactly one 'windows_sdk_lib' tool; found 0"
+}
+
+$wrongSdkVersion = Copy-TestManifest $valid
+($wrongSdkVersion.tools | Where-Object name -eq 'windows_sdk_header').version = '10.0.22621.0'
+$probeState.Calls = 0
+$result = Invoke-ManifestTest $wrongSdkVersion
+Check 'a stale Windows SDK artifact version fails before executable probes' {
+  (-not $result.Healthy) -and $probeState.Calls -eq 0 -and
+  ($result.Errors -join "`n") -match "windows_sdk_header.*10\.0\.22621\.0.*10\.0\.26100\.0"
+}
+
+$wrongSdkPath = Copy-TestManifest $valid
+($wrongSdkPath.tools | Where-Object name -eq 'windows_sdk_rc').path = 'X:\fake\Windows Kits\10\bin\10.0.22621.0\x64\rc.exe'
+$probeState.Calls = 0
+$result = Invoke-ManifestTest $wrongSdkPath
+Check 'a Windows SDK artifact from another target directory fails before executable probes' {
+  (-not $result.Healthy) -and $probeState.Calls -eq 0 -and
+  ($result.Errors -join "`n") -match "windows_sdk_rc.*does not equal"
+}
+
+$wrongSdkRoot = Copy-TestManifest $valid
+($wrongSdkRoot.tools | Where-Object name -eq 'windows_sdk_lib').path = 'D:\quarantine\Windows Kits\10\Lib\10.0.26100.0\um\x64\kernel32.lib'
+$probeState.Calls = 0
+$result = Invoke-ManifestTest $wrongSdkRoot
+Check 'a Windows SDK artifact under an inactive root fails before executable probes' {
+  (-not $result.Healthy) -and $probeState.Calls -eq 0 -and
+  ($result.Errors -join "`n") -match "windows_sdk_lib.*does not equal"
 }
 
 # Exercise the exported function's real/default process adapter too. Injected
@@ -557,6 +781,13 @@ $parseErrors = $null
 $provisionAst = [System.Management.Automation.Language.Parser]::ParseFile(
   (Resolve-Path -LiteralPath $ProvisionPath).Path, [ref]$tokens, [ref]$parseErrors)
 Check 'the provisioning script remains syntactically valid' { $parseErrors.Count -eq 0 }
+$updaterTokens = $null
+$updaterParseErrors = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile(
+  (Resolve-Path -LiteralPath $ManifestUpdaterPath).Path, [ref]$updaterTokens, [ref]$updaterParseErrors)
+Check 'the manifest-only updater remains syntactically valid' {
+  $updaterParseErrors.Count -eq 0
+}
 $vcpkgTokens = $null
 $vcpkgParseErrors = $null
 [void][System.Management.Automation.Language.Parser]::ParseFile(
@@ -590,7 +821,8 @@ Check 'the authenticated PostgreSQL probe uses the bounded process primitive' {
 Check 'provisioning parameter defaults equal every reviewed pin' {
   $mapping = [ordered]@{
     PythonVersion='python'; MesonVersion='meson'; ErlangVersion='erlang'
-    Rebar3Version='rebar3'; PostgresVersion='postgres'; VcpkgBaseline='vcpkg_baseline'
+    Rebar3Version='rebar3'; PostgresVersion='postgres'; WindowsSdkVersion='windows_sdk'
+    VcpkgBaseline='vcpkg_baseline'
   }
   foreach($entry in $mapping.GetEnumerator()){
     $parameter = $parameterByName[$entry.Key]
@@ -608,16 +840,70 @@ Check 'provisioning parameter defaults equal every reviewed pin' {
 Check 'the provisioner compares every reviewed pin before its first Step' {
   $compareAt = $provisionText.IndexOf('$requestedPins.GetEnumerator()')
   $firstStepAt = $provisionText.IndexOf("Step 'winget sanity'")
-  $presentPins = @(@('python','meson','erlang','rebar3','postgres','vcpkg_baseline') |
+  $presentPins = @(@('python','meson','erlang','rebar3','postgres','windows_sdk','vcpkg_baseline') |
     Where-Object {
       $pattern = '(?m)^\s*' + [regex]::Escape([string]$_) + '='
       $provisionText -match $pattern
     })
-  $ok = $compareAt -ge 0 -and $firstStepAt -gt $compareAt -and $presentPins.Count -eq 6
+  $ok = $compareAt -ge 0 -and $firstStepAt -gt $compareAt -and $presentPins.Count -eq 7
   if(-not $ok){
     Write-Host "        compareAt=$compareAt firstStepAt=$firstStepAt pins=$($presentPins -join ',')" -ForegroundColor DarkYellow
   }
   $ok
+}
+Check 'a Visual Studio reboot-required result stops before manifest emission' {
+  $stopFunctions = @($provisionAst.FindAll({
+    param($ast)
+    $ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $ast.Name -eq 'Stop-YuzuProvisioningForReboot'
+  }, $true))
+  if($stopFunctions.Count -ne 1){ return $false }
+  $directExits = @($stopFunctions[0].Body.EndBlock.Statements | Where-Object {
+    $_ -is [System.Management.Automation.Language.ExitStatementAst]
+  })
+  $manifestAt = $provisionText.IndexOf('Step "emit toolchain manifest')
+  $directExits.Count -eq 1 -and $directExits[0].Pipeline.Extent.Text.Trim() -eq '3' -and
+    $directExits[0].Extent.EndOffset -lt $manifestAt
+}
+Check 'fresh and existing Build Tools paths both apply installer exit policy' {
+  $policyCalls = @($provisionAst.FindAll({
+    param($ast)
+    $ast -is [System.Management.Automation.Language.CommandAst] -and
+    $ast.GetCommandName() -eq 'Invoke-YuzuInstallerExitPolicy'
+  }, $true))
+  $wgFunctions = @($provisionAst.FindAll({
+    param($ast)
+    $ast -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $ast.Name -eq 'WG'
+  }, $true))
+  if($wgFunctions.Count -ne 1){ return $false }
+  $policyGuards = @($wgFunctions[0].Body.EndBlock.Statements | Where-Object {
+    $_ -is [System.Management.Automation.Language.IfStatementAst] -and
+    $_.Clauses.Count -eq 1 -and $_.Clauses[0].Item1.Extent.Text.Trim() -eq '$EnforceExitPolicy'
+  })
+  if($policyGuards.Count -ne 1){ return $false }
+  $guardPolicyCalls = @($policyGuards[0].Clauses[0].Item2.Statements | Where-Object {
+    $_ -is [System.Management.Automation.Language.PipelineAst] -and
+    @($_.PipelineElements | Where-Object {
+      $_ -is [System.Management.Automation.Language.CommandAst] -and
+      $_.GetCommandName() -eq 'Invoke-YuzuInstallerExitPolicy'
+    }).Count -eq 1
+  })
+  $freshCalls = @($provisionAst.FindAll({
+    param($ast)
+    $ast -is [System.Management.Automation.Language.CommandAst] -and
+    $ast.GetCommandName() -eq 'WG' -and
+    $ast.Extent.Text -match 'Microsoft\.VisualStudio\.2022\.BuildTools'
+  }, $true))
+  $modifyCalls = @($policyCalls | Where-Object {
+    $_.Extent.Text -match "-Context\s+'Visual Studio Installer modify'"
+  })
+  $manifestAt = $provisionText.IndexOf('Step "emit toolchain manifest')
+  $policyCalls.Count -eq 2 -and $guardPolicyCalls.Count -eq 1 -and
+    $guardPolicyCalls[0].Extent.Text -match '-RebootHandler.*Stop-YuzuProvisioningForReboot' -and
+    $freshCalls.Count -eq 1 -and $freshCalls[0].Extent.Text -match '-EnforceExitPolicy' -and
+    $modifyCalls.Count -eq 1 -and
+    $modifyCalls[0].Extent.Text -match '-RebootHandler.*Stop-YuzuProvisioningForReboot' -and
+    $modifyCalls[0].Extent.EndOffset -lt $manifestAt
 }
 Check 'the provisioner reconciles Python before pip or later provisioning steps' {
   $pythonStepAt = $provisionText.IndexOf("Step 'Python + Meson + Ninja + PyYAML'")
@@ -633,10 +919,18 @@ Check 'the emitted manifest carries the reviewed schema' {
   $provisionText -match '(?m)^\s*schema\s*=\s*\[string\]\$toolchainContract\.schema\s*$'
 }
 Check 'the deployed runner-control bundle contains contract, module, and assertion' {
-  foreach($name in @('toolchain-contract.json','Toolchain-Contract.psm1','Assert-Toolchain.ps1')){
+  foreach($name in @('toolchain-contract.json','Toolchain-Contract.psm1','Assert-Toolchain.ps1','Update-ToolchainManifest.ps1')){
     if($provisionText -notmatch [regex]::Escape("'$name'")){ return $false }
   }
   $true
+}
+Check 'the manifest-only updater is drained, live-asserted, and atomic' {
+  $updater = Get-Content -LiteralPath $ManifestUpdaterPath -Raw
+  @([regex]::Matches($updater, "Assert-NoActiveRunnerJob '")).Count -eq 2 -and
+    $updater -match "Name = 'Runner\.Worker\.exe'" -and
+    $updater -notmatch "Name = 'Runner\.Listener\.exe'" -and
+    $updater -match 'Install-YuzuToolchainManifestCandidate' -and
+    $updater -notmatch 'Provision-Windows-Runner\.ps1'
 }
 Check 'Windows CI gates the effective checkout after Setup vcpkg and before install' {
   $ciText = Get-Content -LiteralPath $CiWorkflowPath -Raw
@@ -652,7 +946,7 @@ Check 'Windows CI gates the effective checkout after Setup vcpkg and before inst
   $manifestAt -gt $windowsJobAt -and $manifestAt -lt $setupAt -and
   $assertAt -gt $setupAt -and $installAt -gt $assertAt -and
   $manifestStep -match 'Assert-Toolchain\.ps1' -and
-  $manifestStep -notmatch '(?im)^\s*if\s*:' -and $manifestStep -notmatch 'if\s*\(\s*Test-Path' -and
+  $manifestStep -notmatch '(?im)^\s*(?:if|continue-on-error)\s*:|if\s*\(\s*Test-Path|\|\|\s*true\b' -and
   $assertStep -match 'Assert-VcpkgCheckout\.ps1' -and
   $assertStep -notmatch '(?im)^\s*if\s*:' -and $assertStep -notmatch 'if\s*\(\s*Test-Path'
 }
@@ -669,7 +963,20 @@ Check 'Windows release gates the host manifest and effective vcpkg checkout' {
   $checkoutAt -gt $setupAt -and $installAt -gt $checkoutAt -and
   $releaseText -match 'Assert-Toolchain\.ps1' -and
   $releaseText -match 'Assert-VcpkgCheckout\.ps1' -and
-  $manifestStep -notmatch '(?im)^\s*if\s*:' -and $manifestStep -notmatch 'if\s*\(\s*Test-Path'
+  $manifestStep -notmatch '(?im)^\s*(?:if|continue-on-error)\s*:|if\s*\(\s*Test-Path|\|\|\s*true\b'
+}
+Check 'Windows nightly requires the host manifest without an optional guard' {
+  $nightlyText = Get-Content -LiteralPath $NightlyWorkflowPath -Raw
+  $windowsJobAt = $nightlyText.IndexOf("`n  windows-asan:")
+  $manifestAt = $nightlyText.IndexOf('- name: Assert toolchain manifest (self-hosted)', $windowsJobAt)
+  $nextStepAt = $nightlyText.IndexOf("`n      - name:", $manifestAt + 1)
+  $manifestStep = if($nextStepAt -gt $manifestAt){ $nightlyText.Substring($manifestAt, $nextStepAt - $manifestAt) } else { '' }
+  $disabledFixture = "- name: Assert toolchain manifest (self-hosted)`n        if: false`n        run: ./deploy/windows/Assert-Toolchain.ps1"
+  $suppressedFixture = "- name: Assert toolchain manifest (self-hosted)`n        continue-on-error: true`n        run: ./deploy/windows/Assert-Toolchain.ps1 || true"
+  $manifestAt -gt $windowsJobAt -and $manifestStep -match 'Assert-Toolchain\.ps1' -and
+    $manifestStep -notmatch '(?im)^\s*(?:if|continue-on-error)\s*:|optional|skipping manifest|if\s*\(\s*Test-Path|\|\|\s*true\b' -and
+    $disabledFixture -match '(?im)^\s*if\s*:' -and
+    $suppressedFixture -match '(?im)^\s*continue-on-error\s*:|\|\|\s*true\b'
 }
 Check 'schema-less compatibility is explicit and time-bounded' {
   $deadline = [DateTimeOffset]$contract.legacy_schema_compatibility_until
