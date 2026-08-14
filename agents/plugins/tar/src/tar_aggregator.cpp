@@ -514,6 +514,11 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
         // later coincide with a genuinely NEW anomaly's fact set on some other
         // table and mask it as a suppressed repeat instead of a fresh decline.
         // Clearing here is the whole-pass generalisation of the per-table rule.
+        // NOT mirrored on `audit_store`'s own equivalent bails (its pre-txn
+        // `now`/`is_open` checks) -- that store's dedup state is one durable
+        // row per DATABASE, this guard's is an in-memory map per TABLE, so
+        // "clear on bail" means something structurally different on each side
+        // and was never a shared contract to begin with (Gate 8 re-review).
         std::lock_guard lock(guard.mu);
         guard.last_reported.clear();
         return;
