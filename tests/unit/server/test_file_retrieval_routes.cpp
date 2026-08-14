@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "file_retrieval_routes.hpp"
+#include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
 #include "upload_grant_store.hpp"
 
@@ -29,6 +30,7 @@
 #include <unordered_map>
 
 using yuzu::server::Deps;
+using yuzu::server::RestApiV1;
 using yuzu::server::UploadGrantListAuthorization;
 using yuzu::server::UploadGrantListDecision;
 using yuzu::server::UploadGrantStore;
@@ -96,6 +98,101 @@ std::string mint_and_open(TestRouteSink& sink, const std::string& agent_id,
 }
 
 } // namespace
+
+// ── OpenAPI discoverability (A1) + the L8 doc-drift regression ──────────
+
+namespace {
+
+/// Minimal RestApiV1 registration used ONLY to exercise the served
+/// /api/v1/openapi.json document. `register_file_retrieval_routes` (every
+/// other fixture in this file) does not register that route — it is owned
+/// by RestApiV1::register_routes, which server.cpp mounts on the SAME
+/// httplib::Server alongside register_file_retrieval_routes. The
+/// openapi.json handler is a static-string return (`openapi_spec()`) that
+/// touches none of register_routes' many store/auth/audit dependencies, so
+/// every one of them is safely null/empty here — no PG, no RBAC, hermetic.
+struct OpenApiHarness {
+    RestApiV1 api;
+    TestRouteSink sink;
+
+    OpenApiHarness() {
+        api.register_routes(sink, RestApiV1::AuthFn{}, RestApiV1::PermFn{}, RestApiV1::AuditFn{},
+                            /*rbac_store=*/nullptr, /*mgmt_store=*/nullptr,
+                            /*token_store=*/nullptr, /*quarantine_store=*/nullptr,
+                            /*response_store=*/nullptr, /*instruction_store=*/nullptr,
+                            /*execution_tracker=*/nullptr, /*schedule_engine=*/nullptr,
+                            /*approval_manager=*/nullptr, /*tag_store=*/nullptr,
+                            /*audit_store=*/nullptr);
+    }
+};
+
+} // namespace
+
+TEST_CASE("OpenAPI doc: the removed legacy POST /api/v1/file-retrieval path is absent",
+          "[server][routes][upload][openapi]") {
+    // L8 (Codex): the hand-maintained OpenAPI string could silently keep
+    // listing a route that no longer exists (or regain it on some future
+    // revert) with nothing to catch the drift. Pin the negative fact: the
+    // served document never lists the removed legacy path. Checked as a
+    // JSON key (quoted, both bare and colon-terminated) so this can't
+    // collide with an unrelated prose mention of the substring
+    // "file-retrieval" — and confirmed by direct read of the raw OpenAPI
+    // string in rest_api_v1.cpp that no such mention exists there either.
+    OpenApiHarness h;
+    auto res = h.sink.dispatch("GET", "/api/v1/openapi.json");
+    REQUIRE(res != nullptr);
+    REQUIRE(res->status == 200);
+    CHECK(res->body.find(R"("/file-retrieval")") == std::string::npos);
+    CHECK(res->body.find("file-retrieval") == std::string::npos);
+}
+
+TEST_CASE("OpenAPI doc: the new upload-grant and plugin-config paths are present",
+          "[server][routes][upload][openapi]") {
+    // The other half of L8: the routes this branch ADDED must actually be
+    // documented — pins the operator-facing mint/list/revoke surface plus
+    // the plugin-config get/set/delete/kill-switch surface. Exact spelling
+    // per rest_api_v1.cpp's "paths" object (no /api/v1 prefix), matching
+    // the established test_rest_inventory_software.cpp /
+    // test_rest_bundle.cpp idiom for this document.
+    OpenApiHarness h;
+    auto res = h.sink.dispatch("GET", "/api/v1/openapi.json");
+    REQUIRE(res != nullptr);
+    REQUIRE(res->status == 200);
+    auto spec = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec.contains("paths"));
+    const auto& paths = spec["paths"];
+
+    // Upload-grant surface: operator mint/list/revoke + the agent session
+    // routes (reachability of these is already exercised end-to-end
+    // elsewhere in this file, e.g. "mint returns grant_id + grant_secret
+    // once, 201" and "revoke: 204 then 404 on replay" — this test covers
+    // only the DOCUMENT, not reachability, for that surface).
+    REQUIRE(paths.contains("/upload-grants"));
+    CHECK(paths["/upload-grants"].contains("post")); // mint
+    CHECK(paths["/upload-grants"].contains("get"));  // list
+    REQUIRE(paths.contains("/upload-grants/{grant_id}"));
+    CHECK(paths["/upload-grants/{grant_id}"].contains("delete")); // revoke
+    CHECK(paths.contains("/uploads"));
+    CHECK(paths.contains("/uploads/{upload_id}/chunk"));
+    CHECK(paths.contains("/uploads/{upload_id}"));
+    CHECK(paths.contains("/uploads/{upload_id}/commit"));
+
+    // Plugin-config surface: get/set/delete/kill-switch. Route
+    // REACHABILITY (not just documentation) for this surface is already
+    // covered by test_plugin_config_routes.cpp, so this test asserts the
+    // document only.
+    REQUIRE(paths.contains("/plugin-config"));
+    CHECK(paths["/plugin-config"].contains("get"));
+    REQUIRE(paths.contains("/plugin-config/{plugin}/{key}"));
+    CHECK(paths["/plugin-config/{plugin}/{key}"].contains("get"));
+    CHECK(paths["/plugin-config/{plugin}/{key}"].contains("put"));
+    CHECK(paths["/plugin-config/{plugin}/{key}"].contains("delete"));
+    CHECK(paths.contains("/plugin-config/{plugin}/{key}/secret"));
+    REQUIRE(paths.contains("/plugin-config/{plugin}/kill-switch"));
+    CHECK(paths["/plugin-config/{plugin}/kill-switch"].contains("get"));
+    CHECK(paths["/plugin-config/{plugin}/kill-switch"].contains("put"));
+}
 
 // ── Operator routes ─────────────────────────────────────────────────────
 
