@@ -809,4 +809,16 @@ std::string_view operator_token(CompOp op) {
     return ""; // unreachable if the switch stays exhaustive
 }
 
+void collect_attribute_suffixes(const Expression& expr, std::string_view prefix,
+                                std::vector<std::string>& out) {
+    if (const auto* cond = std::get_if<Condition>(&expr)) {
+        if (cond->attribute.starts_with(prefix))
+            out.push_back(cond->attribute.substr(prefix.size()));
+    } else if (const auto* comb = std::get_if<std::unique_ptr<Combinator>>(&expr)) {
+        if (*comb)
+            for (const auto& child : (*comb)->children)
+                collect_attribute_suffixes(child, prefix, out);
+    }
+}
+
 } // namespace yuzu::scope

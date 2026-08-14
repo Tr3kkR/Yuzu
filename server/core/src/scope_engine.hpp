@@ -76,6 +76,15 @@ bool evaluate(const Expression& expr, const AttributeResolver& resolver);
 /// Check if an expression is syntactically valid (convenience).
 std::expected<void, std::string> validate(std::string_view input);
 
+/// Collect the suffix of every condition attribute starting with `prefix`
+/// (e.g. prefix "tag:" on `tag:env == "prod"` appends "env"). Recursive over
+/// combinators; duplicates are preserved (callers that care dedupe). Backs
+/// the store-preload pattern: a caller resolving `tag:`/`props.` atoms
+/// preloads every referenced key in ONE bulk store query before its agent
+/// loop instead of a per-agent store round-trip (ADR-0045/ADR-0050).
+void collect_attribute_suffixes(const Expression& expr, std::string_view prefix,
+                                std::vector<std::string>& out);
+
 /// Canonical wire token for a comparison operator, e.g. `CompOp::Eq` -> `"=="`.
 /// Single source for the `GET /api/v1/discover/scope-kinds` operator catalog
 /// (`discover_routes.cpp`) so the published list can never silently diverge from
