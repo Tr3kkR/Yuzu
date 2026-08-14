@@ -186,6 +186,8 @@ The same engine is designed to be driven headless by an automation worker later.
 | Deploy to a go-cohort (create + first advance) | `Infrastructure:Read` + `SoftwareDeployment:Execute` |
 | View / track a deployment — each poll also advances the engine | `SoftwareDeployment:Read` + `SoftwareDeployment:Execute` |
 | Delete a deployment | `SoftwareDeployment:Execute` |
+| Open the Verify form | `Infrastructure:Read` |
+| Run a Verify comparison / open the per-machine drill | `GuaranteedState:Read` |
 
 The route-level permissions above gate *whether* you can open/advance a deployment at all. Each
 advance additionally dispatches per device through the same chokepoint every other operator
@@ -196,8 +198,6 @@ per-device confinement `Execution:Execute` enforces everywhere else (e.g. runnin
 above). A device outside that visible set is skipped, never executed on, regardless of whether
 it's in the go-cohort. A global `Execution:Execute` grant is unaffected; a management-group-scoped
 one confines deployment execution the same way it confines everything else.
-| Open the Verify form | `Infrastructure:Read` |
-| Run a Verify comparison / open the per-machine drill | `GuaranteedState:Read` |
 
 Deployments are **owner-scoped** (viewing, advancing, resuming, and deleting all
 require you to be the creator; another operator's deployment reads as not-found).
