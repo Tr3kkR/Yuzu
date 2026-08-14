@@ -34,9 +34,9 @@ Postgres API in this same PR. `rest_api_v1.{hpp,cpp}`
 takes `LicenseStore* license_store = nullptr` and registers `/api/v1/license*` routes behind
 `if (license_store)`; with no construction site the routes never register. History (pickaxe):
 construction was added in `acc6c481a` ("Add T2 capabilities") and removed by `2fcfb95b5`
-("Decompose server.cpp god object"). Dave confirmed 2026-08-14 that this dormancy is
-purposeful — licensing is shelved for now, not accidentally broken — so this ADR records it as
-a deliberate current state, not a defect, and files no issue for it.
+("Decompose server.cpp god object"). Confirmed with the product owner (2026-08-14) that this
+dormancy is purposeful — licensing is shelved for now, not accidentally broken — so this ADR
+records it as a deliberate current state, not a defect, and files no issue for it.
 
 **Re-wiring the store at boot is explicitly OUT OF SCOPE for this migration.** This ADR migrates
 the store's persistence layer only.
@@ -133,7 +133,15 @@ review (2026-08-14).
   pre-transition status under their own snapshot and independently compute a status transition,
   with no re-check on the `UPDATE` tying it back to what was read — the later `COMMIT` would
   silently clobber the earlier one's write. `FOR UPDATE` makes the second transaction's `SELECT`
-  block until the first commits, so it always computes from the freshest state.
+  block until the first commits, so it always computes from the freshest state. This locks the
+  WHOLE active-license row set for one `validate()` pass, not per-row, and carries no `ORDER BY`
+  — capacity note for whoever wires a periodic scheduler onto this later (gov Gate 6 sre): under a
+  large active-license count, overlapping passes across replicas fully serialize rather than
+  interleave, and — same ordering-deadlock class as the backfill loops above — two overlapping
+  passes locking multiple rows could in principle deadlock each other absent a defined lock
+  order. Bounded either way by libpq's connection-level `statement_timeout`/`lock_timeout` GUCs
+  (`pg/pg_pool.cpp`), not an unbounded pile-up; folded into the same follow-up issue as the
+  backfill ordering above.
 - `has_feature`/`seat_count`/`days_remaining`/`get_status` are converted to
   `std::expected<T, std::string>` even though nothing in the current tree calls them outside
   `rest_api_v1.cpp` (the first two) and tests (all four) — `has_feature` in particular is
@@ -155,7 +163,10 @@ conjunctions, but `LicenseStore` has no construction site in `server.cpp` at all
 mirroring how the store is not constructed, it is not probed either. There is nothing to wire a
 pointer that never exists into. Recorded explicitly, per the kickoff's instruction not to let
 this read as an oversight: when a future change re-wires construction, add the `/readyz`/
-`/healthz` conjunction entries at that time, matching the other migrated stores' pattern.
+`/healthz` conjunction entries at that time, matching the other migrated stores' pattern. That
+same re-wiring also re-triggers ADR-1005's standing REST+MCP-twin review question (Decision 1) —
+today the routes have zero reachability at all, not merely a missing MCP twin, so the question
+doesn't apply yet (gov Gate 6 enterprise-readiness).
 
 ### Backfill (ADR-0009)
 
@@ -245,6 +256,19 @@ no small-human-chosen-identifier collision risk `RbacStore` has to guard against
 - The mid-scan-corruption guard is the same shape as `DeploymentStore`'s: the terminal SQLite
   step code for each table's scan must be `SQLITE_DONE`, never merely "loop exited", so a
   corrupt page is never silently treated as an empty/complete table.
+- **Known, deferred, non-blocking: both backfill loops iterate in a content-dependent order**
+  (`activated_at ASC, id ASC` for licenses; `triggered_at ASC, id ASC` for alerts), not primary-key
+  order (gov Gate 4 unhappy-path UP-3, MEDIUM; gov Gate 5 chaos CH-1 additionally notes the UP-2
+  fix's `DO UPDATE` and the `validate()` `FOR UPDATE` scan below widen the same exposure class,
+  since both now take real row locks where the pre-fix code did not). Two replicas whose legacy
+  files order the same set of rows differently can acquire Postgres row locks in opposite order
+  and hit the deadlock detector, aborting one replica's transaction. This is self-terminating, not
+  a wedge: the aborted transaction leaves no partial writes (single `with_txn`), the fingerprint
+  marker is unstamped, and the next boot retries and resolves normally via the identity/lifecycle
+  or OR-merge conflict path. Deferred rather than fixed in this PR because it requires touching
+  `deployment_store.cpp`'s identical pattern too, not a `license_store`-local fix — tracked as a
+  follow-up issue (`ORDER BY id ASC` on both backfill loops, both stores, plus the `validate()`
+  scan below).
 
 ## Considered and rejected
 
