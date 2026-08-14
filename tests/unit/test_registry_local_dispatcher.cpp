@@ -45,6 +45,7 @@
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/plugin.h>
 
+#include <win_profiles.hpp>   // enumerate_profile_records (#2771 code-review C-M3)
 #include <win_reg_handle.hpp> // unique_hive_mount_name (#2771 code-review CFX-2)
 
 #include "local_dispatcher.hpp"
