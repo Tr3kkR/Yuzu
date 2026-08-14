@@ -220,6 +220,61 @@ TEST_CASE("revoke: 204 then 404 on replay", "[server][routes][upload]") {
     CHECK(res2->status == 404);
 }
 
+TEST_CASE("M9: revoke writes attempted -> success, and a not-found revoke writes "
+         "attempted -> failure (never a dangling attempted-only row)",
+         "[server][routes][upload]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, routes_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::test::TempDir blob_dir{"yuzu_test_upload_blobs_"};
+    TestRouteSink sink;
+
+    struct AuditRow {
+        std::string action, result, target_id;
+    };
+    std::vector<AuditRow> audits;
+    auto deps = make_deps(store, blob_dir.path, std::make_shared<std::int64_t>(1000));
+    deps.audit_fn = [&audits](const httplib::Request&, const std::string& action,
+                              const std::string& result, const std::string&,
+                              const std::string& target_id, const std::string&) {
+        audits.push_back({action, result, target_id});
+        return true;
+    };
+    yuzu::server::register_file_retrieval_routes(sink, deps);
+
+    auto minted = body_json(sink.dispatch(
+        "POST", "/api/v1/upload-grants",
+        nlohmann::json{{"agent_id", "agent-1"}, {"declared_max_size", 100}}.dump()));
+    auto grant_id = minted["grant_id"].get<std::string>();
+    audits.clear(); // drop the mint's own audit row(s) — this test is revoke-only
+
+    auto res1 = sink.dispatch("DELETE", "/api/v1/upload-grants/" + grant_id);
+    REQUIRE(res1 != nullptr);
+    REQUIRE(res1->status == 204);
+    REQUIRE(audits.size() == 2);
+    CHECK(audits[0].action == "upload_grant.revoke");
+    CHECK(audits[0].result == "attempted");
+    CHECK(audits[0].target_id == grant_id);
+    CHECK(audits[1].action == "upload_grant.revoke");
+    CHECK(audits[1].result == "success");
+    CHECK(audits[1].target_id == grant_id);
+
+    // Replay: the store call itself now reports not-found — the pair
+    // completes as attempted -> failure, never leaving the first row
+    // standing alone (which would misrepresent an ORDINARY 404 as an
+    // audit-persistence anomaly).
+    audits.clear();
+    auto res2 = sink.dispatch("DELETE", "/api/v1/upload-grants/" + grant_id);
+    REQUIRE(res2 != nullptr);
+    REQUIRE(res2->status == 404);
+    REQUIRE(audits.size() == 2);
+    CHECK(audits[0].result == "attempted");
+    CHECK(audits[1].result == "failure");
+    for (const auto& row : audits)
+        CHECK(row.result != "success");
+}
+
 // ── Agent surface: TLS gate ──────────────────────────────────────────────
 
 TEST_CASE("every agent route 400s tls_required when TLS is not enabled",
