@@ -428,6 +428,10 @@ TEST_CASE("REST routes answer 503 (not 400) on a genuine store failure, and audi
         CHECK(h.audit_calls[0].action == "quarantine.enable");
         CHECK(h.audit_calls[0].result == "failure");
         CHECK(h.audit_calls[0].detail.starts_with("db_error: "));
+        // gov-fix(consistency-auditor, Gate 8.2): the retry_after_ms:5000
+        // addition itself had zero wire-level assertions, even though this
+        // SECTION already forces the exact failure it targets.
+        CHECK(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
     }
     SECTION("DELETE") {
         auto res = h.del("agent-B");
@@ -437,6 +441,7 @@ TEST_CASE("REST routes answer 503 (not 400) on a genuine store failure, and audi
         CHECK(h.audit_calls[0].action == "quarantine.disable");
         CHECK(h.audit_calls[0].result == "failure");
         CHECK(h.audit_calls[0].detail.starts_with("db_error: "));
+        CHECK(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
     }
     SECTION("GET") {
         auto res = h.get();
@@ -464,6 +469,9 @@ TEST_CASE("REST POST/DELETE audit a business-error (400) failure, not just succe
         CHECK(h.audit_calls[1].action == "quarantine.enable");
         CHECK(h.audit_calls[1].result == "failure");
         CHECK(h.audit_calls[1].detail == "device is already quarantined");
+        // gov-fix(consistency-auditor, Gate 8.2): a business/state error is
+        // non-retryable — must stay null, never a fabricated retry hint.
+        CHECK(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
     }
     SECTION("DELETE: not quarantined") {
         QuarantineRouteHarness h(qpool);
@@ -474,5 +482,6 @@ TEST_CASE("REST POST/DELETE audit a business-error (400) failure, not just succe
         CHECK(h.audit_calls[0].action == "quarantine.disable");
         CHECK(h.audit_calls[0].result == "failure");
         CHECK(h.audit_calls[0].detail == "device is not quarantined");
+        CHECK(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
     }
 }

@@ -1392,14 +1392,24 @@ against the moved-aside legacy file.
 **Rollback note:** downgrading below the ADR-0047 release is **not** a simple binary
 swap-back once the backfill has completed — the old binary reads `quarantine.db`,
 which has already been renamed to `quarantine.db.migrated-<epoch>` and is no longer
-at its expected path, so a naive rollback finds no legacy file and behaves as a fresh
-install (an EMPTY quarantine view) unless you manually restore a backed-up
-`quarantine.db` first, per the generic [Rollback](#rollback) procedure below. If you
-restore that backup, run the old binary for a while (creating new quarantine/release
-activity in the restored file), and later **re-upgrade**, you will hit the
-single-replica cause of the "HOLDER-SIDE VERIFICATION FAILED" refusal described above
-— see `docs/ops-runbooks/quarantine-store-backfill-recovery.md` for the recovery
-procedure; do not repeatedly restart hoping it self-resolves, it will not.
+at its expected path. **Both paths below set up the same later-boot hazard — gov-fix
+(docs-writer, Gate 8.2): the naive path is NOT benign, it was previously described as
+though it were.**
+
+- **If you restore a backed-up `quarantine.db`** (per the generic [Rollback](#rollback)
+  procedure below) and run the old binary for a while, creating new quarantine/release
+  activity in the restored file, a later **re-upgrade** hits the single-replica cause
+  of the "HOLDER-SIDE VERIFICATION FAILED" refusal described above.
+- **If you do a naive rollback with no restore**, the old binary finds no file at the
+  vacated path and behaves as a fresh install (an EMPTY quarantine view) — but its
+  constructor unconditionally runs `CREATE TABLE IF NOT EXISTS` on that path regardless
+  of whether any quarantine/release action ever happens, creating a present-but-empty
+  table. A present-but-empty table fingerprints as real content, not `sourceless`, so
+  **merely booting the old binary at all — zero quarantine activity, no restore — is
+  independently sufficient** to hit the identical refusal on a later re-upgrade.
+
+Either way, see `docs/ops-runbooks/quarantine-store-backfill-recovery.md` for the
+recovery procedure; do not repeatedly restart hoping it self-resolves, it will not.
 
 **Not affected:** the agent-side quarantine firewall enforcement (WFP/nftables/pf
 block-all + exceptions) is untouched by this migration — only the server-side

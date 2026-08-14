@@ -7730,8 +7730,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto reason = param_str(args, "reason");
                 auto whitelist = param_str(args, "whitelist");
                 if (!quarantine_store || !quarantine_store->is_open()) {
+                    // gov-fix(consistency-auditor, Gate 8.2): "agent_id=<id>,
+                    // <message>" — same shape as the other two mcp_audit
+                    // calls in this handler, so one grep pattern extracts
+                    // agent_id from every quarantine_device audit row. The
+                    // prior round's fix only touched the write-failure call
+                    // site below; this one and the scope-gate-unwired call
+                    // still used the old "<message>, agent_id=<id>" shape.
                     mcp_audit("failure",
-                              "service unavailable — store not open, agent_id=" + agent_id);
+                              "agent_id=" + agent_id + ", service unavailable — store not open");
                     // gov-fix(enterprise-readiness F5): A5 requires a
                     // transient failure to carry an honest retry_after_ms,
                     // matching the engine-principal-store/software-licensing
@@ -7756,7 +7763,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     // gov-fix(compliance-officer C-3): carry agent_id in the
                     // detail — mcp_audit's target_id is fixed to the tool
                     // name, not the agent, for every MCP audit row.
-                    mcp_audit("failure", "scope gate not configured, agent_id=" + agent_id);
+                    // gov-fix(consistency-auditor, Gate 8.2): "agent_id=<id>,
+                    // <message>" shape, matching the other two mcp_audit
+                    // calls in this handler (see the is_open() branch above).
+                    mcp_audit("failure", "agent_id=" + agent_id + ", scope gate not configured");
                     res.set_content(error_response(id, kInternalError, "scope gate not configured"),
                                     "application/json");
                     return;

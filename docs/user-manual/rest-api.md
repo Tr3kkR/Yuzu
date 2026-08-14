@@ -1502,10 +1502,12 @@ Quarantine a device.
 
 > **`400` vs `503` (ADR-0047).** A `400` means a business/state error (a
 > missing `agent_id`, or the device is already quarantined) — retrying the
-> identical request will not succeed, and `error.data.retry_after_ms` is
+> identical request will not succeed, and `error.retry_after_ms` is
 > `null`. A `503` means a genuine store/pool failure — retrying is
-> reasonable, and `error.data.retry_after_ms` carries a concrete `5000`
-> hint (matches the MCP `quarantine_device` twin's A5 behavior).
+> reasonable, and `error.retry_after_ms` carries a concrete `5000`
+> hint (REST's envelope has no nested `data` object — that's MCP's JSON-RPC
+> shape; REST matches the MCP `quarantine_device` twin's A5 behavior, not
+> its exact field path).
 
 ---
 
