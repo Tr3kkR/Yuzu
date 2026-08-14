@@ -19,10 +19,13 @@
  */
 
 #include <cctype>
+#include <cstdint>
+#include <format>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::profiles {
@@ -218,6 +221,220 @@ struct ProfileInfo {
     out += field(info.profile_path);
     out += '|';
     out += hive_state_name(info.state);
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Hive-access outcome rendering (#2771 qa-S2 / up-S4)
+//
+// The status enum lives HERE, not in win_profiles.hpp, so the whole
+// output-decision layer for the hive ladder is reachable off-Windows and
+// unit-testable on every host. win_profiles.hpp aliases it back into
+// yuzu::win, so existing `yuzu::win::HiveAccessStatus::ok` call sites are
+// unchanged.
+// ---------------------------------------------------------------------------
+
+/// Outcome of the with_user_hive access ladder, rendered honestly by the
+/// caller instead of collapsing every non-ok case to silence.
+enum class HiveAccessStatus {
+    ok,                // fn was called against a reachable root
+    not_found,         // no live hive and no offline profile path to mount
+    privilege_missing, // an offline mount was needed but SeBackup/SeRestore
+                       // could not both be enabled
+    mount_failed,      // an offline mount was attempted (privileges ok) and
+                       // RegLoadKeyW (or the subsequent root open) failed
+};
+
+[[nodiscard]] constexpr std::string_view hive_access_status_name(HiveAccessStatus s) {
+    switch (s) {
+    case HiveAccessStatus::ok:
+        return "ok";
+    case HiveAccessStatus::not_found:
+        return "not_found";
+    case HiveAccessStatus::privilege_missing:
+        return "privilege_missing";
+    case HiveAccessStatus::mount_failed:
+        return "mount_failed";
+    }
+    return "not_found"; // unreachable — cases are exhaustive so -Wswitch flags enum drift
+}
+
+/// Outcome of resolving one value inside a reached user hive. Folds the
+/// key-OPEN result into the value-READ result so a caller renders one honest
+/// reason. `key_access_denied` is the #2771 up-S4 distinction: before it,
+/// do_get_user_value's inner RegOpenKeyExW treated every non-ERROR_SUCCESS
+/// alike, so an ACL'd or otherwise unreadable key was reported identically to
+/// a genuinely absent one. Absence of a key and absence of a value stay
+/// deliberately indistinguishable (the shipped string covers both) — up-S4
+/// asks only that infrastructure errors be separated from absence.
+enum class UserKeyStatus {
+    ok,
+    key_not_found,     // the subkey does not exist
+    key_access_denied, // the subkey exists but could not be opened (ACL, stale handle, lock)
+    value_not_found,   // the subkey opened; the value does not exist
+    value_oversized,   // the value exists but exceeds the read cap
+    value_malformed,   // declared numeric type with a size too small for that type
+};
+
+/// Renders the operator-facing lines for one hive-access outcome, in emission
+/// order: the unload warning first (when set), then the terminal error (when
+/// the status is not ok). Returns an empty vector for a clean success.
+///
+/// `mount_name` is the ACTUAL mount subkey the offline fallback used — it is
+/// salted per call (win_reg_handle.hpp's unique_hive_mount_name), so the
+/// remediation command must echo what was really mounted rather than
+/// reconstructing "YUZU_HIVE_<sid>", which is no longer the whole name.
+///
+/// The unload warning is emitted independently of `status` and BEFORE it:
+/// unload_failed can be true even on mount_failed (RegLoadKeyW can succeed
+/// while the subsequent root re-open fails), so a status-first switch that
+/// returned early would drop it.
+[[nodiscard]] inline std::vector<std::string> render_hive_access_lines(HiveAccessStatus status,
+                                                                       bool unload_failed,
+                                                                       std::string_view mount_name,
+                                                                       std::string_view sid) {
+    std::vector<std::string> out;
+    const std::string safe_sid = sanitize_field(sid);
+
+    if (unload_failed) {
+        // A leaked mount is system-wide, survives process death, and locks the
+        // profile's NTUSER.DAT until it is unloaded or the host reboots — most
+        // commonly a transient third-party handle (Search Indexer, AV, System
+        // Restore) into the newly-mounted branch, recoverable without reboot
+        // once that holder releases; a genuinely stuck holder is the rarer case
+        // reboot actually resolves.
+        const std::string safe_mount = sanitize_field(mount_name);
+        out.push_back(std::format(
+            "warning|hive_unload_failed: HKU\\{} for sid '{}' may remain mounted; retry "
+            "`reg unload HKU\\{}` once any process holding the branch (Search Indexer, AV, "
+            "System Restore) releases it",
+            safe_mount, safe_sid, safe_mount));
+    }
+
+    switch (status) {
+    case HiveAccessStatus::not_found:
+        out.push_back(std::format(
+            "error|no reachable hive for sid '{}' (not logged in and no profile path)", safe_sid));
+        break;
+    case HiveAccessStatus::privilege_missing:
+        out.emplace_back(
+            "error|privilege_missing: SeBackupPrivilege/SeRestorePrivilege could not be enabled");
+        break;
+    case HiveAccessStatus::mount_failed:
+        out.push_back(std::format("error|failed to load hive for sid '{}'", safe_sid));
+        break;
+    case HiveAccessStatus::ok:
+        break;
+    }
+    return out;
+}
+
+/// Renders the operator-facing error line for a non-ok UserKeyStatus.
+/// Returns "" for `ok` — the caller emits its value rows instead.
+[[nodiscard]] inline std::string render_user_key_error(UserKeyStatus status, std::string_view key) {
+    switch (status) {
+    case UserKeyStatus::ok:
+        return {};
+    case UserKeyStatus::key_access_denied:
+        return std::format("error|access denied opening key '{}' in user hive", sanitize_field(key));
+    case UserKeyStatus::value_oversized:
+        return "error|value exceeds 1 MiB limit";
+    case UserKeyStatus::value_malformed:
+        return "error|value size too small for its declared type";
+    case UserKeyStatus::key_not_found:
+    case UserKeyStatus::value_not_found:
+        return "error|key or value not found in user hive";
+    }
+    return "error|key or value not found in user hive"; // unreachable — see -Wswitch note above
+}
+
+// ---------------------------------------------------------------------------
+// Registry value decoding primitives (#2771 up-S3)
+//
+// Pure and windows.h-free so the decode DECISIONS (which branch, which type
+// name, where a REG_MULTI_SZ record ends) are tested on every host; the Win32
+// shell supplies only the bytes.
+// ---------------------------------------------------------------------------
+
+/// Registry value types, mirrored from winnt.h so this header stays
+/// windows.h-free. Values are fixed by the Windows ABI and cannot drift.
+inline constexpr std::uint32_t kRegNone = 0;
+inline constexpr std::uint32_t kRegSz = 1;
+inline constexpr std::uint32_t kRegExpandSz = 2;
+inline constexpr std::uint32_t kRegBinary = 3;
+inline constexpr std::uint32_t kRegDword = 4;
+inline constexpr std::uint32_t kRegDwordBigEndian = 5;
+inline constexpr std::uint32_t kRegLink = 6;
+inline constexpr std::uint32_t kRegMultiSz = 7;
+inline constexpr std::uint32_t kRegQword = 11;
+
+/// Canonical name for a registry value type. Absorbs registry_plugin.cpp's
+/// local copy; adds the three types up-S3 named, which previously fell into
+/// the hex-dump default and were all reported as REG_BINARY/REG_UNKNOWN.
+[[nodiscard]] constexpr std::string_view reg_type_name(std::uint32_t type) {
+    switch (type) {
+    case kRegNone:
+        return "REG_NONE";
+    case kRegSz:
+        return "REG_SZ";
+    case kRegExpandSz:
+        return "REG_EXPAND_SZ";
+    case kRegBinary:
+        return "REG_BINARY";
+    case kRegDword:
+        return "REG_DWORD";
+    case kRegDwordBigEndian:
+        return "REG_DWORD_BIG_ENDIAN";
+    case kRegLink:
+        return "REG_LINK";
+    case kRegMultiSz:
+        return "REG_MULTI_SZ";
+    case kRegQword:
+        return "REG_QWORD";
+    default:
+        return "REG_UNKNOWN";
+    }
+}
+
+/// Splits a REG_MULTI_SZ payload into its constituent records, returned as
+/// (offset, length) pairs into `data`. A REG_MULTI_SZ is a run of
+/// NUL-terminated strings closed by one extra NUL, so an EMPTY record
+/// terminates the list — trailing padding after it is not data. A final
+/// record with no terminating NUL (a malformed but observed shape) is still
+/// returned rather than dropped: reporting it is more honest than silently
+/// losing the last entry.
+///
+/// char16_t (not wchar_t) keeps this host-agnostic — wchar_t is 32-bit on
+/// Linux/macOS, so a wchar_t signature would not model the Windows bytes.
+[[nodiscard]] inline std::vector<std::pair<std::size_t, std::size_t>> multi_sz_records(
+    std::span<const char16_t> data) {
+    std::vector<std::pair<std::size_t, std::size_t>> out;
+    std::size_t start = 0;
+    while (start < data.size()) {
+        std::size_t end = start;
+        while (end < data.size() && data[end] != u'\0')
+            ++end;
+        if (end == start)
+            break; // empty record — the list terminator
+        out.emplace_back(start, end - start);
+        if (end >= data.size())
+            break; // unterminated final record, already captured
+        start = end + 1;
+    }
+    return out;
+}
+
+/// Lowercase hex encoding, byte per two chars. Extracted verbatim from
+/// win_profiles.hpp's read_reg_value default branch so the encoding is
+/// testable without a registry.
+[[nodiscard]] inline std::string hex_encode(std::span<const std::uint8_t> bytes) {
+    constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (std::uint8_t b : bytes) {
+        out += kHex[(b >> 4) & 0xF];
+        out += kHex[b & 0xF];
+    }
     return out;
 }
 
