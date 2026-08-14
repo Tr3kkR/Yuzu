@@ -93,16 +93,16 @@ Write-Host "Toolchain manifest: $ManifestPath" -ForegroundColor Cyan
 Write-Host ("  schema=$($m.schema)  host=$($m.host)  generated=$($m.generated)")
 
 Write-Host "`n-- tools --"
-foreach($t in $m.tools){
-  $ok = $t.path -and (Test-Path -LiteralPath $t.path)
-  $req = if($t.required){ 'required' } else { 'optional' }
-  if($ok){
-    Write-Host ("  [OK]   {0,-11} {1}  ({2})" -f $t.name, $t.path, ($t.version ?? '?')) -ForegroundColor Green
-  } elseif($t.required){
-    Write-Host ("  [MISS] {0,-11} {1}" -f $t.name, ($t.path ?? '<unset>')) -ForegroundColor Red
+$toolPaths = Test-YuzuRequiredToolPaths -Tools @($m.tools)
+foreach($t in @($toolPaths.Observations)){
+  if($t.Exists){
+    Write-Host ("  [OK]   {0,-11} {1}  ({2})" -f $t.Name, $t.Path, ($t.Version ?? '?')) -ForegroundColor Green
+  } elseif($t.Required){
+    $detail = if($t.Error){ " ($($t.Error))" } else { '' }
+    Write-Host ("  [MISS] {0,-11} {1}{2}" -f $t.Name, ($t.Path ?? '<unset>'), $detail) -ForegroundColor Red
     $fail++
   } else {
-    Write-Host ("  [warn] {0,-11} {1} (optional)" -f $t.name, ($t.path ?? '<unset>')) -ForegroundColor Yellow
+    Write-Host ("  [warn] {0,-11} {1} (optional)" -f $t.Name, ($t.Path ?? '<unset>')) -ForegroundColor Yellow
   }
 }
 

@@ -1,10 +1,11 @@
 #Requires -Version 7
 
 $script:SupportedSchema = 'yuzu/windows-toolchain/v1'
-$script:V1Pins = @('python','meson','erlang','rebar3','postgres')
+$script:V1Pins = @('python','meson','erlang','rebar3','postgres','windows_sdk')
 $script:V1JobPins = @('vcpkg_baseline')
 $script:V1Environment = @('CCACHE_DIR','RUNNER_TOOL_CACHE','YUZU_ESCRIPT','YUZU_REBAR3','YUZU_TEST_POSTGRES_DSN')
-$script:V1Tools = @('python','meson','ninja','cmake','git','ccache','escript','rebar3','msvc','msys2_bash','postgres')
+$script:V1Tools = @('python','meson','ninja','cmake','git','ccache','escript','rebar3','msvc','msys2_bash','postgres','windows_sdk_header','windows_sdk_lib','windows_sdk_rc')
+$script:V1ArtifactProbes = @('windows_sdk_header','windows_sdk_lib','windows_sdk_rc')
 $script:V1EffectiveCommands = @('python','meson','git')
 $script:V1ToolProbes = @('python','meson','rebar3','postgres')
 $script:V1FileProbes = @('Erlang OTP')
@@ -52,6 +53,114 @@ function Read-YuzuToolchainContract {
     Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -ErrorAction Stop
   } catch {
     throw "toolchain contract is not valid JSON: $Path ($($_.Exception.Message))"
+  }
+}
+
+function New-YuzuToolchainManifestDocument {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][psobject]$PriorManifest,
+    [Parameter(Mandatory)][psobject]$Contract,
+    [Parameter(Mandatory)][string]$HostName,
+    [DateTimeOffset]$GeneratedAt = [DateTimeOffset]::UtcNow
+  )
+
+  if([string]::IsNullOrWhiteSpace($HostName)){ throw 'manifest host name is required' }
+  if(-not [string]::Equals([string]$PriorManifest.host, $HostName, [StringComparison]::OrdinalIgnoreCase)){
+    throw "prior manifest host '$($PriorManifest.host ?? '<unset>')' does not match '$HostName'"
+  }
+  $runnerCount = 0
+  if(-not [int]::TryParse([string]$PriorManifest.runner_count, [ref]$runnerCount) -or $runnerCount -lt 1){
+    throw "prior manifest runner_count '$($PriorManifest.runner_count ?? '<unset>')' must be a positive integer"
+  }
+  $databases = @($PriorManifest.telemetry.databases)
+  $clusters = @($PriorManifest.postgres_clusters)
+  if($databases.Count -ne $runnerCount -or $clusters.Count -ne $runnerCount){
+    throw "prior manifest topology does not match runner_count $runnerCount"
+  }
+  $wantedAgents = @(0..($runnerCount - 1)) -join ','
+  $actualAgents = @($clusters | ForEach-Object { [int]$_.agent } | Sort-Object) -join ','
+  if($actualAgents -ne $wantedAgents){
+    throw "prior manifest PostgreSQL agents '$actualAgents' must be exactly '$wantedAgents'"
+  }
+
+  $artifactNames = @($Contract.artifact_probes | ForEach-Object { [string]$_.tool })
+  $tools = [Collections.Generic.List[object]]::new()
+  foreach($tool in @($PriorManifest.tools)){
+    if($artifactNames -notcontains [string]$tool.name){ $tools.Add($tool) }
+  }
+  foreach($probe in @($Contract.artifact_probes)){
+    $pin = [string]$Contract.pins.([string]$probe.pin)
+    $tools.Add([pscustomobject][ordered]@{
+      name=[string]$probe.tool
+      path=([string]$probe.path).Replace('{pin}', $pin)
+      version=$pin
+      required=$true
+    })
+  }
+
+  $pins = [ordered]@{}
+  foreach($pin in $Contract.pins.PSObject.Properties){ $pins[$pin.Name] = $pin.Value }
+  $buildJobs = $null
+  $hasBuildJobs = if($PriorManifest.pins -is [Collections.IDictionary]){
+    if($PriorManifest.pins.Contains('build_jobs')){
+      $buildJobs = $PriorManifest.pins['build_jobs']
+      $true
+    } else { $false }
+  } else {
+    $property = $PriorManifest.pins.PSObject.Properties['build_jobs']
+    if($null -ne $property){
+      $buildJobs = $property.Value
+      $true
+    } else { $false }
+  }
+  if($hasBuildJobs){
+    $pins.build_jobs = $buildJobs
+  }
+  $pins.vcpkg_baseline = [string]$Contract.job_pins.vcpkg_baseline
+
+  [pscustomobject][ordered]@{
+    schema=[string]$Contract.schema
+    generated=$GeneratedAt.ToUniversalTime().ToString('o')
+    host=$HostName
+    runner_count=$runnerCount
+    pins=[pscustomobject]$pins
+    env=$PriorManifest.env
+    telemetry=$PriorManifest.telemetry
+    postgres_clusters=$PriorManifest.postgres_clusters
+    tools=[object[]]$tools
+  }
+}
+
+function Install-YuzuToolchainManifestCandidate {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)][psobject]$Candidate,
+    [Parameter(Mandatory)][string]$ManifestPath,
+    [Parameter(Mandatory)][string]$ContractPath,
+    [Parameter(Mandatory)][string]$AssertPath,
+    [scriptblock]$BeforeReplace
+  )
+
+  $directory = Split-Path -Parent $ManifestPath
+  New-Item -ItemType Directory -Force -Path $directory | Out-Null
+  $leaf = Split-Path -Leaf $ManifestPath
+  $candidatePath = Join-Path $directory ".$leaf.$([guid]::NewGuid().ToString('N')).candidate"
+  $backupPath = "$ManifestPath.pre-update-$((Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffffffZ')).bak"
+  try {
+    $Candidate | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $candidatePath -Encoding UTF8
+    # Assert-Toolchain is a CLI wrapper and calls `exit`; invoking it with `&`
+    # would terminate this updater on success before File.Replace. A child pwsh
+    # preserves that CLI contract and turns its exit status into data here.
+    $pwsh = (Get-Process -Id $PID).Path
+    & $pwsh -NoProfile -File $AssertPath -ManifestPath $candidatePath -ContractPath $ContractPath
+    if($LASTEXITCODE -ne 0){ throw "candidate live assertion exited $LASTEXITCODE" }
+    if($BeforeReplace){ & $BeforeReplace }
+    [IO.File]::Replace($candidatePath, $ManifestPath, $backupPath, $true)
+    [pscustomobject]@{ ManifestPath=$ManifestPath; BackupPath=$backupPath }
+  } catch {
+    if(Test-Path -LiteralPath $candidatePath){ Remove-Item -LiteralPath $candidatePath -Force }
+    throw
   }
 }
 
@@ -153,6 +262,78 @@ function Resolve-YuzuPinnedPython {
   }
 }
 
+function Get-YuzuInstallerDisposition {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)]
+    [int]$ExitCode
+  )
+
+  switch($ExitCode){
+    0 { 'Complete'; break }
+    1641 { 'RebootRequired'; break }
+    3010 { 'RebootRequired'; break }
+    -1978334967 { 'RebootRequired'; break } # WinGet: reboot required to finish
+    -1978334966 { 'RebootRequired'; break } # WinGet: reboot required before install
+    -1978334965 { 'RebootRequired'; break } # WinGet: reboot initiated
+    default { 'Failed' }
+  }
+}
+
+function Invoke-YuzuInstallerExitPolicy {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)]
+    [int]$ExitCode,
+    [Parameter(Mandatory)]
+    [string]$Context,
+    [Parameter(Mandatory)]
+    [scriptblock]$RebootHandler
+  )
+
+  $disposition = Get-YuzuInstallerDisposition -ExitCode $ExitCode
+  if($disposition -eq 'Complete'){ return }
+  if($disposition -eq 'RebootRequired'){
+    & $RebootHandler $Context $ExitCode
+    throw "$Context requires a reboot, but its reboot handler returned"
+  }
+  throw "$Context failed (exit $ExitCode)"
+}
+
+function Test-YuzuRequiredToolPaths {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory)]
+    [AllowEmptyCollection()]
+    [object[]]$Tools,
+    [scriptblock]$PathTester
+  )
+
+  if(-not $PathTester){
+    $PathTester = { param([string]$path) Test-Path -LiteralPath $path }
+  }
+  $observations = foreach($tool in $Tools){
+    $exists = $false
+    $pathError = ''
+    if(-not [string]::IsNullOrWhiteSpace([string]$tool.path)){
+      try { $exists = [bool](& $PathTester ([string]$tool.path)) }
+      catch { $exists = $false; $pathError = $_.Exception.Message }
+    }
+    [pscustomobject]@{
+      Name = [string]$tool.name
+      Path = [string]$tool.path
+      Version = [string]$tool.version
+      Required = ($tool.required -eq $true)
+      Exists = $exists
+      Error = $pathError
+    }
+  }
+  [pscustomobject]@{
+    Healthy = @($observations | Where-Object { $_.Required -and -not $_.Exists }).Count -eq 0
+    Observations = [object[]]$observations
+  }
+}
+
 function Test-YuzuToolchainManifest {
   [CmdletBinding()]
   param(
@@ -228,6 +409,7 @@ function Test-YuzuToolchainManifest {
   $contractJobPins = @($Contract.job_pins.PSObject.Properties | ForEach-Object Name)
   $contractEnv = @($Contract.required_env | ForEach-Object { [string]$_ })
   $contractTools = @($Contract.required_tools | ForEach-Object { [string]$_ })
+  $artifactProbeNames = @($Contract.artifact_probes | ForEach-Object { [string]$_.tool })
   $effectiveCommands = @($Contract.effective_commands | ForEach-Object { [string]$_.command })
   $toolProbeNames = @($Contract.tool_probes | ForEach-Object { [string]$_.tool })
   $fileProbeNames = @($Contract.file_probes | ForEach-Object { [string]$_.name })
@@ -236,6 +418,7 @@ function Test-YuzuToolchainManifest {
   & $requireUnique 'job pin' $contractJobPins $script:V1JobPins
   & $requireUnique 'required env' $contractEnv $script:V1Environment
   & $requireUnique 'required tool' $contractTools $script:V1Tools
+  & $requireUnique 'artifact probe' $artifactProbeNames $script:V1ArtifactProbes
   & $requireUnique 'effective command' $effectiveCommands $script:V1EffectiveCommands
   & $requireUnique 'tool probe' $toolProbeNames $script:V1ToolProbes
   & $requireUnique 'file probe' $fileProbeNames $script:V1FileProbes
@@ -257,6 +440,15 @@ function Test-YuzuToolchainManifest {
   foreach($mapping in @($Contract.effective_commands)){
     if($contractTools -notcontains [string]$mapping.tool){
       $errors.Add("effective command '$($mapping.command)' references unknown tool '$($mapping.tool)'")
+    }
+  }
+  foreach($probe in @($Contract.artifact_probes)){
+    if($contractTools -notcontains [string]$probe.tool -or $contractPins -notcontains [string]$probe.pin){
+      $errors.Add("artifact probe '$($probe.tool)' references an unknown tool or pin")
+    }
+    if([string]::IsNullOrWhiteSpace([string]$probe.path) -or
+       -not ([string]$probe.path).Contains('{pin}')){
+      $errors.Add("artifact probe '$($probe.tool)' must have a path containing {pin}")
     }
   }
   foreach($probe in @($Contract.tool_probes)){
@@ -298,8 +490,15 @@ function Test-YuzuToolchainManifest {
            -not [string]::Equals([string]$Manifest.host, $ExpectedHost, [StringComparison]::OrdinalIgnoreCase)){
     $errors.Add("manifest host '$($Manifest.host)' does not match this computer '$ExpectedHost'")
   }
+  $generatedValue = $Manifest.generated
   $generated = [DateTimeOffset]::MinValue
-  if(-not [DateTimeOffset]::TryParse([string]$Manifest.generated, [ref]$generated)){
+  # PowerShell 7.5+ ConvertFrom-Json materialises ISO-8601 strings as DateTime.
+  # Casting that value back to string is culture-sensitive (for example,
+  # 14 August becomes 08/14 under en-US and then fails under en-GB).
+  $generatedIsValid = $generatedValue -is [DateTime] -or
+                      $generatedValue -is [DateTimeOffset] -or
+                      [DateTimeOffset]::TryParse([string]$generatedValue, [ref]$generated)
+  if(-not $generatedIsValid){
     $errors.Add("manifest generated timestamp '$($Manifest.generated ?? '<unset>')' is invalid")
   }
 
@@ -347,6 +546,24 @@ function Test-YuzuToolchainManifest {
     }
     if([string]::IsNullOrWhiteSpace([string]$matches[0].path)){
       $errors.Add("manifest tool '$name' has no path")
+    }
+  }
+
+  foreach($probe in @($Contract.artifact_probes)){
+    $matches = @($manifestTools | Where-Object { [string]$_.name -eq [string]$probe.tool })
+    if($matches.Count -ne 1){ continue }
+    $tool = $matches[0]
+    $expectedVersion = [string]$Manifest.pins.([string]$probe.pin)
+    if(-not [string]::Equals([string]$tool.version, $expectedVersion, [StringComparison]::OrdinalIgnoreCase)){
+      $errors.Add("manifest tool '$($probe.tool)' version is '$($tool.version ?? '<unset>')'; expected '$expectedVersion'")
+    }
+    $expectedPath = ([string]$probe.path).Replace('{pin}', $expectedVersion)
+    $actualPath = ConvertTo-YuzuCanonicalWindowsPath ([string]$tool.path)
+    $canonicalExpected = ConvertTo-YuzuCanonicalWindowsPath $expectedPath
+    $matched = [string]::Equals($actualPath, $canonicalExpected, [StringComparison]::OrdinalIgnoreCase)
+    $observations.Add([pscustomobject]@{ Name=[string]$probe.tool; Actual=[string]$tool.path; Expected=$expectedPath; Matched=$matched })
+    if(-not $matched){
+      $errors.Add("manifest tool '$($probe.tool)' path '$($tool.path)' does not equal '$expectedPath'")
     }
   }
 
@@ -586,4 +803,4 @@ function Test-YuzuVcpkgCheckout {
   }
 }
 
-Export-ModuleMember -Function Invoke-YuzuContractProbe,Read-YuzuToolchainContract,Resolve-YuzuEffectiveCommand,Resolve-YuzuPinnedPython,Test-YuzuToolchainManifest,Test-YuzuVcpkgCheckout
+Export-ModuleMember -Function Get-YuzuInstallerDisposition,Install-YuzuToolchainManifestCandidate,Invoke-YuzuContractProbe,Invoke-YuzuInstallerExitPolicy,New-YuzuToolchainManifestDocument,Read-YuzuToolchainContract,Resolve-YuzuEffectiveCommand,Resolve-YuzuPinnedPython,Test-YuzuRequiredToolPaths,Test-YuzuToolchainManifest,Test-YuzuVcpkgCheckout
