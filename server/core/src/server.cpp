@@ -14519,12 +14519,18 @@ private:
             // It feeds only fleet AGGREGATES (the crash-free rate denominator + the
             // score-distribution histogram). The device-id LISTS the re-review flagged
             // get their ids from the per-OBSERVATION store queries (dex_top_devices /
-            // dex_signal_devices / dex_app_devices / dex_perf_devices), which ARE
-            // scoped to the caller's management groups (VisibleSetFn). So the
-            // enumeration is closed independent of this provider. True per-TENANT
-            // aggregate RATES would also need the store-side crash/signal NUMERATORS
-            // (dex_crash_summary / dex_signal_summary) scoped — a tracked follow-up;
-            // scoping the denominator here without them would ship a misleading rate.
+            // dex_signal_devices / dex_app_devices / dex_perf_devices), which the
+            // dashboard fragments narrow via VisibleSetFn (username-keyed) — this
+            // closes the enumeration for a management-group-confined OPERATOR
+            // session, but NOT for a service-scoped API token: VisibleSetFn has no
+            // token_scope_service branch (same gap SEC-2/SEC-3 fixed elsewhere), so a
+            // service token whose username resolves to an unscoped grant still sees
+            // the whole fleet through these fragments. That axis is closed by an
+            // explicit deny_service_scoped_-style gate on each fragment, not by this
+            // provider or by VisibleSetFn. True per-TENANT aggregate RATES would also
+            // need the store-side crash/signal NUMERATORS (dex_crash_summary /
+            // dex_signal_summary) scoped — a tracked follow-up; scoping the
+            // denominator here without them would ship a misleading rate.
             [this]() -> DexFleet {
                 DexFleet f;
                 const auto ids = registry_.all_ids();

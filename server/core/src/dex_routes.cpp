@@ -2,6 +2,7 @@
 
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
+#include "rest_a4_envelope.hpp" // detail::error_json_a4, make_correlation_id (deny_service_scoped_)
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 
 #include <algorithm>
@@ -2595,6 +2596,28 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
     return h;
 }
 
+bool DexRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
+                                     const std::string& action,
+                                     const std::string& audit_detail) const {
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return true; // auth_fn_ already wrote the response (401/etc).
+    if (session->token_scope_service.empty())
+        return false;
+    const auto cid = detail::make_correlation_id();
+    // Write the 403 FIRST, audit after (mirrors GuardianRoutes::deny_service_scoped_):
+    // a throwing audit_fn_ must not be able to suppress the 403.
+    res.status = 403;
+    res.set_content(
+        detail::error_json_a4(
+            403, "service-scoped tokens may not read this fleet-wide DEX view", cid,
+            detail::A4ErrorOpts{.permission = "GuaranteedState:Read"}),
+        "application/json");
+    (void)detail::try_persist_audit(audit_fn_, req, action, "denied", "GuaranteedState", "",
+                                    audit_detail);
+    return true;
+}
+
 void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
@@ -2671,6 +2694,15 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // -- Overview fragment (gates on GuaranteedState:Read, like the Guardian reads) --
     sink.Get("/fragments/dex/overview", [this, resolve_visible](const httplib::Request& req,
                                                                 httplib::Response& res) {
+        // Fleet-wide identity-linked disclosure (SEC-2/SEC-3 class, found during
+        // a docs sweep): resolve_visible below is username-keyed (VisibleSetFn)
+        // and does not confine a service-scoped API token whose principal
+        // resolves to an unscoped grant — the top-devices list would still be
+        // fleet-wide. Denied here, ahead of/independent from perm_fn_.
+        if (deny_service_scoped_(req, res, "dex.overview.view",
+                                 "fleet-wide DEX overview top-devices list denied to a "
+                                 "service-scoped token"))
+            return;
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const std::string w = req.has_param("window") ? req.get_param_value("window") : "7d";
@@ -2723,6 +2755,18 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
              });
     sink.Get("/fragments/dex/catalogue/signal",
              [this, resolve_visible](const httplib::Request& req, httplib::Response& res) {
+                 // Fleet-wide identity-linked disclosure (SEC-2/SEC-3 class, found
+                 // during a docs sweep): resolve_visible below is username-keyed
+                 // and does not confine a service-scoped API token whose
+                 // principal resolves to an unscoped grant. Same verb as the
+                 // REST/MCP dex.signal.view emitters — this is a third emitter of
+                 // the same view. target_id left empty: the raw `type` param has
+                 // not been validated yet.
+                 if (deny_service_scoped_(req, res, "dex.signal.view",
+                                          "fleet-wide DEX signal most-affected-devices list "
+                                          "denied to a service-scoped token (dashboard "
+                                          "fragment)"))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Read"))
                      return;
                  const int window_days =
@@ -2781,6 +2825,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     // -- Per-app drill-down (blast radius). ?name=<process_name> --
     sink.Get("/fragments/dex/app", [this, resolve_visible](const httplib::Request& req,
                                                            httplib::Response& res) {
+        // Fleet-wide identity-linked disclosure (SEC-2/SEC-3 class, found during
+        // a docs sweep): resolve_visible below is username-keyed and does not
+        // confine a service-scoped API token whose principal resolves to an
+        // unscoped grant — the affected-devices list would still be fleet-wide.
+        if (deny_service_scoped_(req, res, "dex.app.view",
+                                 "fleet-wide DEX app affected-devices list denied to a "
+                                 "service-scoped token"))
+            return;
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const std::string name = req.has_param("name") ? req.get_param_value("name") : "";
@@ -2930,6 +2982,16 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
 
     sink.Get("/fragments/dex/perf/devices", [this, resolve_visible](const httplib::Request& req,
                                                                     httplib::Response& res) {
+        // Fleet-wide identity-linked disclosure (SEC-2/SEC-3 class, found during
+        // a docs sweep): resolve_visible below is username-keyed and does not
+        // confine a service-scoped API token whose principal resolves to an
+        // unscoped grant. Same verb as the REST/MCP dex.perf.device.view
+        // emitters — this is a third emitter of the same view (parity with
+        // /fragments/network/devices' identical twin treatment).
+        if (deny_service_scoped_(req, res, "dex.perf.device.view",
+                                 "fleet-wide DEX perf device list denied to a service-scoped "
+                                 "token (dashboard fragment)"))
+            return;
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
         const int window_days =
@@ -2964,6 +3026,13 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             } catch (...) {}
         }
         const auto vis = resolve_visible(req); // scope the per-device perf list
+        // Behavioral-PII access audit — same verb/target as the REST and MCP
+        // siblings. Set-and-proceed (HTML dashboard fragment, not REST's
+        // fail-closed): a transient audit hiccup must not blank this
+        // operator's view.
+        (void)detail::try_persist_audit(audit_fn_, req, "dex.perf.device.view", "success",
+                                        "GuaranteedState", "",
+                                        "fleet-wide DEX perf device list via dashboard fragment");
         res.set_content(render_dex_perf_devices_fragment(perf_fn_(cohort_key), metric,
                                                          not_reporting, cohort_filter, limit,
                                                          window_days, vis ? &*vis : nullptr),
