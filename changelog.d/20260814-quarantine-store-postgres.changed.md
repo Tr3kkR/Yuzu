@@ -32,9 +32,11 @@
   for the full list of refusal modes and remediation. Store-unavailable, scope-gate-unwired, and
   write-failure quarantine paths — including a store/pool outage discovered before the request
   could even be attributed to a device — now emit a `quarantine.enable`/`quarantine.disable`
-  audit row (previously silent); input-validation rejections (missing `agent_id`, oversized
-  `reason`/`whitelist`, a malformed whitelist token on MCP, a malformed JSON body on REST) do
-  not yet audit on either transport (tracked follow-up). `POST`/`DELETE
+  audit row (previously silent); on MCP, `quarantine_device`'s own input-validation rejections
+  (missing `agent_id`, oversized `reason`/`whitelist`, a malformed whitelist token) return before
+  any audit call; on REST, only the malformed-JSON-body 400 does — REST has no separate
+  `agent_id`/length checks of its own, so a missing `agent_id` there reaches the store and its
+  "agent_id is required" failure is audited same as any other store-write failure. `POST`/`DELETE
   /api/v1/quarantine` (REST) and the MCP `quarantine_device` tool carry `retry_after_ms: 5000` on
   a genuine store-failure `503`/`-32603` (never on the non-retryable `400`/`-32602` business-error
   case) — `GET`'s two 503 causes above do not carry this hint (REST-only; MCP has no quarantine
