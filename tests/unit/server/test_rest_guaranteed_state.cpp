@@ -889,6 +889,12 @@ TEST_CASE("REST gs.events: NO agent_id + service-scoped token → 403, no data, 
     CHECK(h.audit_log[0].action == "dex.device.view");
     CHECK(h.audit_log[0].result == "denied");
     CHECK(h.audit_log[0].target_type == "GuaranteedState");
+    // This route sets its own X-Correlation-Id before the deny check runs;
+    // deny_fleet_wide_service_scoped mints and sets its own on the deny path
+    // too. Gate 8 finding (guardian-confinement-2298 branch): confirm the
+    // shared helper's erase-then-set actually closes this instance, not just
+    // the one that surfaced it.
+    CHECK(res->headers.count("X-Correlation-Id") == 1);
 }
 
 TEST_CASE("REST gs.events: a service-scoped token MAY still read its own agent via agent_id "
@@ -940,6 +946,9 @@ TEST_CASE("REST dex/perf/devices: service-scoped token → 403, denial audited",
     CHECK(h.audit_log[0].action == "dex.perf.device.view");
     CHECK(h.audit_log[0].result == "denied");
     CHECK(h.audit_log[0].target_type == "GuaranteedState");
+    // Same shared-helper erase-then-set fix as gs.events above — this route
+    // also pre-sets its own X-Correlation-Id before reaching the deny.
+    CHECK(res->headers.count("X-Correlation-Id") == 1);
 }
 
 TEST_CASE("REST dex/perf/devices: ordinary session reaches the route, audited success",

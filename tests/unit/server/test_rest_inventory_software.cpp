@@ -219,7 +219,16 @@ TEST_CASE("REST inventory/software: service-scoped token denied, no data leaked,
     // shared deny helper, which mints its own — httplib's headers multimap
     // silently keeps both unless the helper erases first. Exactly one value
     // must reach the wire.
-    CHECK(res->headers.count("X-Correlation-Id") == 1);
+    REQUIRE(res->headers.count("X-Correlation-Id") == 1);
+    // Gate 8 compliance-officer finding: the persisted audit detail must
+    // carry the SAME correlation id as the response, so a support engineer
+    // holding only the id can find the matching audit row.
+    const auto returned_cid = res->get_header_value("X-Correlation-Id");
+    bool detail_has_cid = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "inventory.software.query" && a.result == "denied")
+            detail_has_cid = a.detail.find("cid=" + returned_cid) != std::string::npos;
+    CHECK(detail_has_cid);
 }
 
 TEST_CASE("REST inventory/software: path is in the OpenAPI spec (A1 discoverability)",

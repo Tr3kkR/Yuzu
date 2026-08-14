@@ -1385,9 +1385,18 @@ void RestApiV1::register_routes(
             return true; // auth_fn already wrote the response (401/etc).
         if (session->token_scope_service.empty())
             return false;
-        (void)detail::try_persist_audit(audit_fn, req, action, "denied", target_type, target_id,
-                                        audit_detail);
+        // cid minted BEFORE the audit call (not after, as an earlier round
+        // had it) so the persisted row carries the same id the response
+        // header echoes — the OpenAPI spec's correlation_id field documents
+        // this as a general A4 contract ("also echoed... in the audit row
+        // detail field"), which this helper's audit_detail didn't actually
+        // uphold until this fix (Gate 8 compliance-officer finding: the
+        // /inventory/software route's old hand-rolled deny embedded cid in
+        // its detail string; consolidating it into this shared helper lost
+        // that trail for all 6 callers, not just the one that surfaced it).
         const auto cid = detail::make_correlation_id();
+        (void)detail::try_persist_audit(audit_fn, req, action, "denied", target_type, target_id,
+                                        audit_detail + "; cid=" + cid);
         // erase-then-set: httplib's Response::headers is a multimap and
         // set_header alone is a bare emplace, so a caller that already set
         // X-Correlation-Id (several do, before reaching this deny) would
@@ -5971,9 +5980,8 @@ void RestApiV1::register_routes(
                  // Note: the shared helper mints its OWN X-Correlation-Id on the deny
                  // path (matching its other call sites) and erases the outer `cid`
                  // header set above before writing it, so the response carries exactly
-                 // one value — the outer `cid` is therefore deliberately not baked into
-                 // the audit detail string below (that would record a value the
-                 // response header no longer carries).
+                 // one value; it also appends that same id to the audit_detail string
+                 // below internally, so the outer `cid` here is not baked in twice.
                  if (deny_fleet_wide_service_scoped(
                          req, res, "inventory.software.query", "Inventory",
                          "fleet-wide software search denied to a service-scoped token",
