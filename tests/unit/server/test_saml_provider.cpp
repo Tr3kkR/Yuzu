@@ -1104,6 +1104,43 @@ static std::string generate_encrypted_rsa_key_pem() {
     return std::string(bptr->data, bptr->length);
 }
 
+/// A valid but WEAK (1024-bit) unencrypted RSA key — below the 2048-bit floor.
+static std::string generate_small_rsa_key_pem() {
+    EVP_PKEY* pkey = EVP_RSA_gen(1024);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+/// A valid RSA-PSS key (EVP_PKEY_RSA_PSS base id) — must be rejected by the
+/// RSA-only gate, never signed with PKCS#1 v1.5.
+static std::string generate_rsa_pss_key_pem() {
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA_PSS, nullptr);
+    REQUIRE(ctx != nullptr);
+    struct CtxGuard { EVP_PKEY_CTX* c; ~CtxGuard() { if (c) EVP_PKEY_CTX_free(c); } } cg{ctx};
+    REQUIRE(EVP_PKEY_keygen_init(ctx) == 1);
+    REQUIRE(EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) == 1);
+    EVP_PKEY* pkey = nullptr;
+    REQUIRE(EVP_PKEY_keygen(ctx, &pkey) == 1);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TEST CASES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1273,6 +1310,37 @@ TEST_CASE("SAML: a malformed SP signing key PEM is rejected", "[saml]") {
 
     CHECK(p.signing_configured_but_broken());
     CHECK_FALSE(p.signing_init_error().empty());
+}
+
+TEST_CASE("SAML: a weak (1024-bit) SP signing key is rejected — below the 2048-bit floor",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = generate_small_rsa_key_pem();
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK_FALSE(p.signing_init_error().empty());
+
+    const auto authn = p.build_authn_request("myrelay");
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
+}
+
+TEST_CASE("SAML: an RSA-PSS SP signing key is rejected by the RSA-only gate", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = generate_rsa_pss_key_pem();
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK_FALSE(p.signing_init_error().empty());
+
+    const auto authn = p.build_authn_request("myrelay");
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
 }
 
 TEST_CASE("SAML: an encrypted (passphrase-protected) SP signing key is rejected "

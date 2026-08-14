@@ -2,6 +2,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <yuzu/secure_zero.hpp> // sanctioned std::string zeroizer — used on BOTH platform branches
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Windows: compile stubs only — SAML is unsupported on Windows (N4).
 // Never return success-without-verify; is_enabled() returns false so callers
@@ -12,6 +14,10 @@
 namespace yuzu::server::saml {
 
 SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
+    // Wipe any transit SP signing PEM even on the (never-constructed-in-prod)
+    // Windows path, so a future Windows-port test that hands one in cannot leave
+    // raw key bytes in the config_ member. (Hermes pass-2 LOW; wipe-on-all-paths)
+    yuzu::secure_zero(config_.sp_signing_key_pem);
     spdlog::info("SamlProvider: SAML is not supported on Windows — provider disabled");
 }
 
@@ -60,12 +66,11 @@ void SamlProvider::cleanup_expired_states_locked() {}
 
 #include <openssl/bio.h>
 #include <openssl/crypto.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <openssl/rsa.h>
-
-#include <yuzu/secure_zero.hpp> // sanctioned std::string zeroizer (secure_buffer.hpp doctrine)
 
 #include <zlib.h>
 
@@ -586,6 +591,9 @@ SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
         EVP_PKEY* raw_key = bio.b ? PEM_read_bio_PrivateKey(bio.b, nullptr, no_password, nullptr)
                                   : nullptr;
         if (!raw_key) {
+            // Clear the thread-local OpenSSL error queue so our own parse failure
+            // does not leak into unrelated later diagnostics. (Hermes pass-2 LOW)
+            ERR_clear_error();
             signing_init_failed_ = true;
             signing_init_error_  = "SAML SP signing key: failed to parse PEM private key "
                                    "(an encrypted/passphrase-protected key is not supported; "
@@ -594,17 +602,29 @@ SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
         } else {
             std::shared_ptr<EVP_PKEY> parsed(raw_key, EVP_PKEY_free);
             const int base_id = EVP_PKEY_base_id(parsed.get());
+            const int bits    = EVP_PKEY_bits(parsed.get());
             if (base_id != EVP_PKEY_RSA) {
-                // Reject EC and RSA-PSS (and anything else) — only plain RSA
-                // (PKCS#1 v1.5) is supported. `parsed` destructs here
-                // (EVP_PKEY_free) — the rejected key is never retained.
+                // Reject EC and RSA-PSS (base id EVP_PKEY_RSA_PSS) and anything
+                // else — only plain RSA (PKCS#1 v1.5) is supported. `parsed`
+                // destructs here (EVP_PKEY_free) — the rejected key is never retained.
                 signing_init_failed_ = true;
                 signing_init_error_  = "SAML SP signing key must be an RSA key";
                 spdlog::error("SamlProvider: {} (EVP_PKEY base id={})", signing_init_error_,
                               base_id);
+            } else if (bits < 2048 || bits > 16384) {
+                // Floor: a sub-2048-bit RSA key is factorable, letting an attacker
+                // forge AuthnRequests and defeat the SP->IdP signing binding.
+                // Ceiling: an absurdly large key makes each per-request signature
+                // pathologically slow — an amplification vector on the
+                // unauthenticated /auth/saml/start. (Hermes HIGH + partial UP-3)
+                signing_init_failed_ = true;
+                signing_init_error_  = "SAML SP signing key size out of range "
+                                       "(RSA modulus must be 2048-16384 bits)";
+                spdlog::error("SamlProvider: {} ({} bits)", signing_init_error_, bits);
             } else {
                 sp_signing_key_ = std::move(parsed);
-                spdlog::info("SamlProvider: SP AuthnRequest signing enabled (RSA key configured)");
+                spdlog::info("SamlProvider: SP AuthnRequest signing enabled (RSA-{} key configured)",
+                             bits);
             }
         }
 

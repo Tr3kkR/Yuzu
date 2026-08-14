@@ -436,7 +436,7 @@ binding:
 
 | Flag | Env var | Description |
 |---|---|---|
-| `--saml-sp-key` | `YUZU_SAML_SP_KEY` | Path to the SP AuthnRequest signing private key PEM (**RSA only** — EC and RSA-PSS keys are rejected) |
+| `--saml-sp-key` | `YUZU_SAML_SP_KEY` | Path to the SP AuthnRequest signing private key PEM (**RSA only, 2048–16384 bits** — EC, RSA-PSS, and out-of-range keys are rejected) |
 
 When configured, AuthnRequests are signed with RSA PKCS#1 v1.5 + SHA-256
 (`SigAlg` `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`), carried as
@@ -447,8 +447,8 @@ satisfy the same private-key permission check as the HTTPS/gateway TLS keys
 unchanged.
 
 **Fail-closed:** a configured key that is unreadable, over-permissioned,
-exceeds 64 KiB, is malformed, encrypted/passphrase-protected, or is not RSA
-disables SAML **entirely** at startup (loudly — an `ERROR` log line, never a
+exceeds 64 KiB, is malformed, encrypted/passphrase-protected, is not RSA, or
+is outside the 2048–16384-bit range disables SAML **entirely** at startup (loudly — an `ERROR` log line, never a
 silent fall-back to unsigned requests). A per-request signing failure fails
 `/auth/saml/start` rather than emitting an unsigned redirect. Changing
 `--saml-sp-key` requires a server restart (no hot-reload, same as the other

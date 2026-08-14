@@ -6,8 +6,11 @@
   `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`), carried as the
   `SigAlg`/`Signature` query parameters. The flag is optional and
   backward-compatible: when unset, AuthnRequests remain unsigned, same as
-  prior releases. Fails closed — a configured key that is unreadable,
-  over-permissioned, oversized, malformed, encrypted, or not RSA disables SAML entirely
-  at boot (loudly, never a silent fall-back to unsigned requests), and a
+  prior releases. The signing key must be RSA 2048-16384 bits (a sub-2048-bit
+  key is factorable; the ceiling bounds signing cost on the pre-auth start
+  endpoint). Fails closed — a configured key that is unreadable,
+  over-permissioned, oversized, malformed, encrypted, wrong-size, or not RSA
+  disables SAML entirely at boot (loudly, never a silent fall-back to unsigned
+  requests), and a
   per-request signing failure fails `/auth/saml/start` rather than emitting
   an unsigned redirect.
