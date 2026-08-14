@@ -14,6 +14,7 @@
 
 #include "../test_helpers.hpp"
 #include "test_route_sink.hpp"
+#include "test_tag_store_pg_helper.hpp" // PG-backed TagStore (ADR-0050)
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -30,8 +31,8 @@ struct TagRouteHarness {
     yuzu::server::test::TestRouteSink sink;
     RestApiV1 api;
 
-    yuzu::test::TempDbFile tag_db{std::string_view{"yuzu_test_rest_tag-"}};
-    TagStore tag_store{tag_db.path};
+    yuzu::test::TagStorePg tag_bundle; // SKIPs the case when no PG DSN (ADR-0050)
+    TagStore& tag_store = *tag_bundle;
 
     // auth: empty session_user => require_auth writes 401 and returns nullopt.
     std::string session_user{"alice"};
@@ -107,21 +108,28 @@ struct TagRouteHarness {
 
 const std::string kBody = R"({"agent_id":"agent-B","key":"service","value":"ServiceA"})";
 
+// Typed-read unwrap: asserts the read is not a degrade; absent tag == "".
+std::string tag_value(TagStore& s, const std::string& agent, const std::string& key) {
+    auto v = s.get_tag(agent, key);
+    REQUIRE(v.has_value());
+    return v->value_or("");
+}
+
 } // namespace
 
 TEST_CASE("REST PUT /api/v1/tags requires authentication before any store/body work (CDX-R4-02)",
-          "[rest][tag][authz]") {
+          "[pg][rest][tag][authz]") {
     TagRouteHarness h;
     h.session_user = ""; // no session
     auto res = h.put(kBody);
     REQUIRE(res);
     CHECK(res->status == 401);
     CHECK_FALSE(h.scope_fn_called);
-    CHECK(h.tag_store.get_tag("agent-B", "service").empty()); // no write
+    CHECK(tag_value(h.tag_store, "agent-B", "service").empty()); // no write
 }
 
 TEST_CASE("REST PUT /api/v1/tags is denied per-target by the scoped gate (403, no write)",
-          "[rest][tag][authz]") {
+          "[pg][rest][tag][authz]") {
     TagRouteHarness h;
     h.scope_allow = false;
     auto res = h.put(kBody);
@@ -129,55 +137,55 @@ TEST_CASE("REST PUT /api/v1/tags is denied per-target by the scoped gate (403, n
     CHECK(res->status == 403);
     CHECK(h.scope_fn_called);
     CHECK(h.scoped_target == "agent-B"); // scoped on the PARSED target
-    CHECK(h.tag_store.get_tag("agent-B", "service").empty());
+    CHECK(tag_value(h.tag_store, "agent-B", "service").empty());
 }
 
 TEST_CASE("REST PUT /api/v1/tags admits an in-scope caller and writes the tag (200)",
-          "[rest][tag][authz]") {
+          "[pg][rest][tag][authz]") {
     TagRouteHarness h;
     h.scope_allow = true;
     auto res = h.put(kBody);
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(h.scope_fn_called);
-    CHECK(h.tag_store.get_tag("agent-B", "service") == "ServiceA");
+    CHECK(tag_value(h.tag_store, "agent-B", "service") == "ServiceA");
 }
 
 TEST_CASE("REST PUT /api/v1/tags fails CLOSED (500) when the scope gate is unwired (B4)",
-          "[rest][tag][authz]") {
+          "[pg][rest][tag][authz]") {
     TagRouteHarness h(/*wire_scope=*/false);
     auto res = h.put(kBody);
     REQUIRE(res);
     CHECK(res->status == 500); // never a silent global fallback
-    CHECK(h.tag_store.get_tag("agent-B", "service").empty());
+    CHECK(tag_value(h.tag_store, "agent-B", "service").empty());
 }
 
 TEST_CASE("REST DELETE /api/v1/tags admits in-scope and fails closed when unwired",
-          "[rest][tag][authz]") {
+          "[pg][rest][tag][authz]") {
     SECTION("in-scope delete removes the tag") {
         TagRouteHarness h;
-        h.tag_store.set_tag("agent-B", "service", "ServiceA", "seed");
+        REQUIRE(h.tag_store.set_tag("agent-B", "service", "ServiceA", "seed").has_value());
         auto res = h.del("agent-B", "service");
         REQUIRE(res);
         CHECK(res->status == 200);
         CHECK(h.scoped_target == "agent-B");
-        CHECK(h.tag_store.get_tag("agent-B", "service").empty());
+        CHECK(tag_value(h.tag_store, "agent-B", "service").empty());
     }
     SECTION("unwired scope gate fails closed, tag untouched") {
         TagRouteHarness h(/*wire_scope=*/false);
-        h.tag_store.set_tag("agent-B", "service", "ServiceA", "seed");
+        REQUIRE(h.tag_store.set_tag("agent-B", "service", "ServiceA", "seed").has_value());
         auto res = h.del("agent-B", "service");
         REQUIRE(res);
         CHECK(res->status == 500);
-        CHECK(h.tag_store.get_tag("agent-B", "service") == "ServiceA"); // not deleted
+        CHECK(tag_value(h.tag_store, "agent-B", "service") == "ServiceA"); // not deleted
     }
     SECTION("out-of-scope delete is denied (403), tag untouched") {
         TagRouteHarness h;
         h.scope_allow = false;
-        h.tag_store.set_tag("agent-B", "service", "ServiceA", "seed");
+        REQUIRE(h.tag_store.set_tag("agent-B", "service", "ServiceA", "seed").has_value());
         auto res = h.del("agent-B", "service");
         REQUIRE(res);
         CHECK(res->status == 403);
-        CHECK(h.tag_store.get_tag("agent-B", "service") == "ServiceA");
+        CHECK(tag_value(h.tag_store, "agent-B", "service") == "ServiceA");
     }
 }

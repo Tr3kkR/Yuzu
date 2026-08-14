@@ -32,6 +32,7 @@
 #include "../test_helpers.hpp"
 #include "test_mgmt_group_pg_helper.hpp" // PG-backed ManagementGroupStore (ADR-0042)
 #include "test_rbac_store_pg_helper.hpp" // PG-backed RbacStore (ADR-0041)
+#include "test_tag_store_pg_helper.hpp"  // PG-backed TagStore (ADR-0050)
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -322,8 +323,10 @@ VisibleSet resolve_and_compose(const yuzu::server::RbacStore& rbac, const std::s
     f.service_scoped = !token_scope_service.empty();
     if (f.service_scoped) {
         if (tags) {
-            auto svc = tags->agents_with_tag("service", token_scope_service);
-            f.service_tagged = std::unordered_set<std::string>(svc.begin(), svc.end());
+            // ADR-0050 typed read: a degraded store leaves service_tagged
+            // nullopt (deny-all), same as the production seam.
+            if (auto svc = tags->agents_with_tag("service", token_scope_service))
+                f.service_tagged = std::unordered_set<std::string>(svc->begin(), svc->end());
         }
         // tags == nullptr -> service_tagged stays nullopt -> fail closed.
         return yuzu::server::authz::compose_exec_visible(f);
@@ -385,11 +388,11 @@ TEST_CASE("authz_model #1788: a service-scoped token is narrowed even when the m
 TEST_CASE("authz_model #1788: a service-scoped token narrows to its service, over a global grant "
           "(CDX-001, live arm)",
           "[pg][authz_model][1788][service]") {
-    yuzu::test::TempDbFile tag_db{"yuzu_test_authzmodel_tags-"};
-    yuzu::server::TagStore tags{tag_db.path};
-    tags.set_tag("a_svcA1", "service", "serviceA");
-    tags.set_tag("a_svcA2", "service", "serviceA");
-    tags.set_tag("a_svcB1", "service", "serviceB");
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("a_svcA1", "service", "serviceA").has_value());
+    REQUIRE(tags.set_tag("a_svcA2", "service", "serviceA").has_value());
+    REQUIRE(tags.set_tag("a_svcB1", "service", "serviceB").has_value());
 
     // THE CDX-001 VECTOR, and the reason this needs a REAL RbacStore rather
     // than a tag store alone: the minting principal holds a GLOBAL
