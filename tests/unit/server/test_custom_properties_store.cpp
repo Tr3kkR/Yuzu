@@ -295,7 +295,6 @@ TEST_CASE("CustomPropertiesStore: delete all properties for agent",
 
     require_ok(store.set_property("agent-1", "role", "web"));
 
-
     store.delete_all_properties("agent-1");
 
     auto props = require_ok(store.get_properties("agent-1"));
@@ -311,7 +310,6 @@ TEST_CASE("CustomPropertiesStore: get_properties lists all for agent",
     require_ok(store.set_property("agent-1", "region", "us-east"));
 
     require_ok(store.set_property("agent-1", "role", "web"));
-
 
     auto props = require_ok(store.get_properties("agent-1"));
     REQUIRE(props.size() == 3);
@@ -335,7 +333,6 @@ TEST_CASE("CustomPropertiesStore: get_property_map", "[pg][custom_props][crud]")
     require_ok(store.set_property("agent-1", "env", "prod"));
 
     require_ok(store.set_property("agent-1", "region", "eu-west"));
-
 
     auto map = require_ok(store.get_property_map("agent-1"));
     REQUIRE(map.size() == 2);
@@ -447,7 +444,6 @@ TEST_CASE("CustomPropertiesStore: properties isolated per agent",
 
     require_ok(store.set_property("agent-2", "env", "staging"));
 
-
     CHECK(require_ok(store.get_value("agent-1", "env")) == "production");
     CHECK(require_ok(store.get_value("agent-2", "env")) == "staging");
 
@@ -468,7 +464,6 @@ TEST_CASE("CustomPropertiesStore: delete one agent does not affect another",
 
     require_ok(store.set_property("agent-2", "env", "staging"));
 
-
     store.delete_all_properties("agent-1");
 
     CHECK(require_ok(store.get_properties("agent-1")).empty());
@@ -483,7 +478,6 @@ TEST_CASE("CustomPropertiesStore: same key different agents", "[pg][custom_props
     require_ok(store.set_property("agent-2", "role", "db"));
 
     require_ok(store.set_property("agent-3", "role", "cache"));
-
 
     CHECK(require_ok(store.get_value("agent-1", "role")) == "web");
     CHECK(require_ok(store.get_value("agent-2", "role")) == "db");
@@ -536,7 +530,6 @@ TEST_CASE("CustomPropertiesStore: list schemas", "[pg][custom_props][schema]") {
 
     require_ok(store.upsert_schema(s3));
 
-
     auto schemas = store.list_schemas();
     REQUIRE(schemas.size() == 3);
     // Sorted by key
@@ -551,12 +544,10 @@ TEST_CASE("CustomPropertiesStore: update schema via upsert", "[pg][custom_props]
     CustomPropertySchema s1{.key = "env", .display_name = "Env", .type = "string"};
     require_ok(store.upsert_schema(s1));
 
-
     // Update display name
     CustomPropertySchema s2{.key = "env", .display_name = "Environment", .type = "string",
                              .description = "Updated"};
     require_ok(store.upsert_schema(s2));
-
 
     auto schema = store.get_schema("env");
     REQUIRE(schema.has_value());
@@ -574,7 +565,6 @@ TEST_CASE("CustomPropertiesStore: delete schema", "[pg][custom_props][schema]") 
 
     CustomPropertySchema s{.key = "env", .display_name = "Env", .type = "string"};
     require_ok(store.upsert_schema(s));
-
 
     auto del1 = store.delete_schema("env");
     REQUIRE(del1.has_value());
@@ -672,7 +662,6 @@ TEST_CASE("CustomPropertiesStore: schema type validation -- int",
     CustomPropertySchema s{.key = "port", .display_name = "Port", .type = "int"};
     require_ok(store.upsert_schema(s));
 
-
     // Valid int
     auto r1 = store.set_property("agent-1", "port", "8080");
     REQUIRE(r1.has_value());
@@ -689,7 +678,6 @@ TEST_CASE("CustomPropertiesStore: schema type validation -- bool",
 
     CustomPropertySchema s{.key = "active", .display_name = "Active", .type = "bool"};
     require_ok(store.upsert_schema(s));
-
 
     auto r1 = store.set_property("agent-1", "active", "true");
     REQUIRE(r1.has_value());
@@ -709,7 +697,6 @@ TEST_CASE("CustomPropertiesStore: schema type validation -- string accepts anyth
     CustomPropertySchema s{.key = "desc", .display_name = "Description", .type = "string"};
     require_ok(store.upsert_schema(s));
 
-
     auto r = store.set_property("agent-1", "desc", "anything goes here 123!@#");
     REQUIRE(r.has_value());
 }
@@ -721,7 +708,6 @@ TEST_CASE("CustomPropertiesStore: schema type validation -- datetime accepts any
     CustomPropertySchema s{.key = "enrolled_at", .display_name = "Enrolled At",
                             .type = "datetime"};
     require_ok(store.upsert_schema(s));
-
 
     auto r = store.set_property("agent-1", "enrolled_at", "2025-01-15T12:00:00Z");
     REQUIRE(r.has_value());
@@ -735,7 +721,6 @@ TEST_CASE("CustomPropertiesStore: schema regex validation", "[pg][custom_props][
                             .type = "string",
                             .validation_regex = "^(dev|staging|production)$"};
     require_ok(store.upsert_schema(s));
-
 
     // Matching values
     auto r1 = store.set_property("agent-1", "env", "production");
@@ -768,7 +753,6 @@ TEST_CASE("CustomPropertiesStore: schema type overrides provided type",
     CustomPropertySchema s{.key = "port", .display_name = "Port", .type = "int"};
     require_ok(store.upsert_schema(s));
 
-
     // Set with type "string" -- schema type should win
     auto r = store.set_property("agent-1", "port", "8080", "string");
     REQUIRE(r.has_value());
@@ -788,7 +772,6 @@ TEST_CASE("CustomPropertiesStore: schema regex with int type",
                             .type = "int",
                             .validation_regex = "^[0-9]{1,5}$"};
     require_ok(store.upsert_schema(s));
-
 
     // Valid: integer that matches regex
     auto r1 = store.set_property("agent-1", "port", "8080");
@@ -812,7 +795,6 @@ TEST_CASE("CustomPropertiesStore: delete schema removes validation",
                             .type = "string",
                             .validation_regex = "^(dev|prod)$"};
     require_ok(store.upsert_schema(s));
-
 
     // Rejected with schema
     auto r1 = store.set_property("agent-1", "env", "testing");
