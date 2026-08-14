@@ -847,8 +847,8 @@ TEST_CASE("device routes: /fragments/devices/list denies a service-scoped "
         audit_log.push_back(a + "|" + r);
         return true;
     };
-    yuzu::server::test::TestRouteSink sink;
     DeviceRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
     routes.register_routes(sink, serviceScopedAuth, perm, /*scoped_perm_fn=*/{}, devices,
                            /*lookup_fn=*/{}, &store, /*dispatch_fn=*/{}, /*responses_fn=*/{},
                            audit);

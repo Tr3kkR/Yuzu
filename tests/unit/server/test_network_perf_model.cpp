@@ -387,8 +387,8 @@ TEST_CASE("network devices fragment: service-scoped token denied, denial audited
         return snap;
     };
 
-    yuzu::server::test::TestRouteSink sink;
     NetworkRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
     routes.register_routes(sink, serviceScopedAuth, okPerm, recordingAudit, perf);
 
     // The overview fragment (aggregate, no agent_id) is UNAFFECTED — only the
@@ -425,8 +425,8 @@ TEST_CASE("network devices fragment: ordinary session reaches the route, audited
         return snap;
     };
 
-    yuzu::server::test::TestRouteSink sink;
     NetworkRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
     routes.register_routes(sink, okAuth, okPerm, recordingAudit, perf);
 
     auto drill = sink.Get("/fragments/network/devices");

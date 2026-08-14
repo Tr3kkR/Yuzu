@@ -185,7 +185,17 @@ TEST_CASE("render_run: a genuinely pending (not degraded) live read still "
 // is itself read-only.
 TEST_CASE("preflight routes: /fragments/auto/run denies a service-scoped "
           "token, denial audited, nothing dispatched",
-          "[preflight][routes][security]") {
+          "[pg][preflight][routes][security]") {
+    // A real, open store (rather than nullptr) so devices_fn_calls/dispatched
+    // below actually discriminate the fix: with a null run_store the handler's
+    // OWN unrelated "store unavailable" early-return would make both counters
+    // read 0 regardless of whether the deny fired (gov QE review — a nullptr
+    // store made the deny test's own dispatch-count assertions vacuous).
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
     auto serviceScopedAuth = [](const httplib::Request&, httplib::Response&) {
         auth::Session s;
         s.token_scope_service = "printers";
@@ -216,11 +226,11 @@ TEST_CASE("preflight routes: /fragments/auto/run denies a service-scoped "
         return true;
     };
 
-    yuzu::server::test::TestRouteSink sink;
     PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
     routes.register_routes(sink, serviceScopedAuth, okPerm, devices,
                            /*groups_fn=*/{}, /*group_members_fn=*/{}, dispatch,
-                           /*collect_fn=*/{}, audit, /*run_store=*/nullptr);
+                           /*collect_fn=*/{}, audit, &run_store);
 
     auto res = sink.Post("/fragments/auto/run", "", "application/x-www-form-urlencoded");
     REQUIRE(res);
@@ -270,8 +280,8 @@ TEST_CASE("preflight routes: /fragments/auto/run reaches resolve_targets + "
         return true;
     };
 
-    yuzu::server::test::TestRouteSink sink;
     PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
     routes.register_routes(sink, okAuth, okPerm, devices, /*groups_fn=*/{},
                            /*group_members_fn=*/{}, dispatch, /*collect_fn=*/{}, audit, &run_store);
 

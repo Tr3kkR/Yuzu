@@ -578,7 +578,7 @@ static const ToolDef kTools[] = {
      "The device list behind every fleet-performance drill: worst devices by a metric (default), "
      "devices NOT reporting perf (filter=not_reporting), or one cohort's members (cohort_key + "
      "cohort_value; empty value = untagged). Each row names an agent_id fleet-wide, so every call "
-     "is audit-logged (dex.perf.device.view); a service-scoped API token is denied (403) — no "
+     "is audit-logged (dex.perf.device.view); a service-scoped API token is denied — no "
      "single agent_id to confine against. Mirrors GET /api/v1/dex/perf/devices. Requires "
      "GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
@@ -717,7 +717,7 @@ static const ToolDef kTools[] = {
      "(cooc=device|app|network_only|degraded), or one cohort's members (key + cohort_value; empty "
      "value = untagged). Rows carry the co-occurring facts (under_pressure, app_unstable) — "
      "evidence, never a verdict. Each row names an agent_id fleet-wide, so every call is "
-     "audit-logged (network.device.view); a service-scoped API token is denied (403) — no single "
+     "audit-logged (network.device.view); a service-scoped API token is denied — no single "
      "agent_id to confine against. Mirrors GET /api/v1/network/devices. Requires "
      "GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"

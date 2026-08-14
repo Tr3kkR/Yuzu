@@ -1601,8 +1601,8 @@ TEST_CASE("DEX routes: service-scoped token denied on every fleet-wide device-li
         return snap;
     };
 
-    yuzu::server::test::TestRouteSink sink;
     DexRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
     routes.register_routes(sink, serviceScopedAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
                            /*responses_fn=*/{}, perf_fn);
 
@@ -1661,8 +1661,8 @@ TEST_CASE("DEX routes: ordinary session reaches /fragments/dex/perf/devices, "
         return snap;
     };
 
-    yuzu::server::test::TestRouteSink sink;
     DexRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
     routes.register_routes(sink, okAuth, okPerm, &store, fleet, audit, /*dispatch_fn=*/{},
                            /*responses_fn=*/{}, perf_fn);
 
