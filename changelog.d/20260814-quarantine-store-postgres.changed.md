@@ -31,7 +31,8 @@
   `docs/user-manual/upgrading.md` and `docs/ops-runbooks/quarantine-store-backfill-recovery.md`
   for the full list of refusal modes and remediation. Every quarantine failure path — including a
   store/pool outage discovered before the request could even be attributed to a device — now
-  emits a `quarantine.enable`/`quarantine.disable` audit row (previously silent); `POST`/`DELETE`
-  on both REST and MCP carry `retry_after_ms: 5000` on a genuine store-failure `503`/`-32603`
-  (never on the non-retryable `400`/`-32602` business-error case) — `GET`'s two 503 causes above
-  do not carry this hint on either transport today.
+  emits a `quarantine.enable`/`quarantine.disable` audit row (previously silent); `POST`/`DELETE
+  /api/v1/quarantine` (REST) and the MCP `quarantine_device` tool carry `retry_after_ms: 5000` on
+  a genuine store-failure `503`/`-32603` (never on the non-retryable `400`/`-32602` business-error
+  case) — `GET`'s two 503 causes above do not carry this hint (REST-only; MCP has no quarantine
+  list or release tool yet).
