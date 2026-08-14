@@ -2360,6 +2360,60 @@ groups:
             the remediation. See the runbook for what each reason means and how
             to resolve it.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0044"
+      - alert: YuzuNotificationBackfillFailing
+        # Mirrors YuzuDiscoveryBackfillFailing's shape (same underlying reason,
+        # not YuzuMgmtGroupBackfillFailing's result="failed" shape): the
+        # one-time legacy notifications.db -> notification_store backfill
+        # (ADR-0046) runs during server CONSTRUCTION, and a failure sets
+        # startup_failed_ so run() returns before the HTTP listener starts —
+        # /metrics is never served and a result="failed" sample is never
+        # scraped. An expression keyed on result="failed" can therefore never
+        # fire no matter how the counter behaves. What IS observable from
+        # outside is the ABSENCE of a success outcome — a server that refused
+        # to boot publishes no notification-backfill series at all.
+        #
+        # THIS RULE DEPENDS ON THE PRE-SEED. NotificationStore::set_metrics()
+        # is a bare pointer assignment — the seed lives in server.cpp's
+        # metrics registration block (the describe()/zero-loop right after
+        # DiscoveryStore's own, both pre-seeding their result sets to 0). That
+        # is what makes "series absent" mean "no server is serving" rather
+        # than "no server has this metric registered yet".
+        #
+        # TWO-WAY RESULT SPLIT (not discovery/rbac/mgmt-group's three-way
+        # fresh/completed/failed): this store's backfill is a single
+        # transaction with no multi-step outcome to report separately, so the
+        # wrapper (migrate_from_sqlite in notification_store.cpp) only ever
+        # emits result="success" or result="failed" — expr below matches
+        # "success" only, not "completed|fresh".
+        #
+        # LIMITS: fires only when NO scraped server reports a successful
+        # backfill, so in a multi-replica deployment one wedged replica among
+        # healthy ones will not trip it (shows up as `up == 0` instead). It
+        # ALSO fires during a legitimately long first-boot backfill on a large
+        # legacy notifications.db — expected during that upgrade window
+        # (silence it for the window). The BOOT LOG carries the actual
+        # remediation in every case (holder-side fingerprint mismatch /
+        # sourceless-marker refusal / unreadable legacy file) — this is the
+        # outside-in backstop, not the primary signal.
+        expr: |
+          absent_over_time(yuzu_server_notification_backfill_total{result="success"}[15m])
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No server is reporting a completed notification-store backfill (possible boot refusal)"
+          description: >-
+            No scraped Yuzu server has reported a successful one-time legacy
+            notifications.db -> PostgreSQL notification_store backfill
+            (ADR-0046) in the last 15 minutes. After an upgrade the usual
+            cause is a server that FAILED the backfill: it fails CLOSED,
+            refuses to serve, and retries on the next start — a restart loop
+            with the whole server down, not just the notification feed. Read
+            the server BOOT log for the specific refusal reason (holder-side
+            fingerprint mismatch / sourceless-marker refusal / unreadable
+            legacy file) — it carries the remediation. See the runbook for
+            what each reason means and how to resolve it.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#notification-feed-moves-to-postgresql--history-preserved-notificationstore-adr-0046"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which
