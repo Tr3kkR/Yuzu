@@ -419,6 +419,8 @@ yuzu_server_core_lib = static_library(
     'src/engine_principal_store.cpp',
     'src/access_review_model.cpp',
     'src/access_review_store.cpp',
+    'src/plugin_config_store.cpp',
+    'src/plugin_config_routes.cpp',
     'src/secure_random.cpp',
     'src/scim_store.cpp',
     'src/scim_json.cpp',

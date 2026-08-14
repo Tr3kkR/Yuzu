@@ -2,6 +2,7 @@
 
 #include "auth_routes.hpp"
 #include "schedule_engine.hpp"
+#include "schedule_params_parsers.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -36,6 +37,24 @@ void handle_create_schedule(AuthRoutes& auth_routes, ScheduleEngine* schedule_en
         sched.day_of_month = j.value("day_of_month", 1);
         sched.scope_expression = j.value("scope_expression", "");
         sched.requires_approval = j.value("requires_approval", false);
+
+        // Typed schedule parameters (PR1.5a). `parameters` is OPTIONAL — an
+        // omitted field dumps to the empty string, which the validator
+        // treats identically to an explicit "{}". Validating here (rather
+        // than deferring entirely to create_schedule's backstop) gives the
+        // caller a specific, typed 400 instead of a generic insert failure.
+        std::string params_raw;
+        if (j.contains("parameters"))
+            params_raw = j["parameters"].dump();
+        auto canon_params = validate_and_canonicalize_schedule_params(params_raw);
+        if (!canon_params) {
+            res.status = 400;
+            res.set_content(
+                nlohmann::json({{"error", std::string(to_string(canon_params.error()))}}).dump(),
+                "application/json");
+            return;
+        }
+        sched.parameter_values = *canon_params;
 
         if (auto session = auth_routes.resolve_session(req))
             sched.created_by = session->username;
