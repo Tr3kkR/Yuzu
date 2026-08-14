@@ -1025,6 +1025,77 @@ records the one-time backfill outcome (`completed` / `fresh` / `failed`).
 and dynamic-group scope expressions are unchanged — only the storage substrate
 and the fail-closed read posture change.
 
+## Custom properties migrate to Postgres (mandatory backfill, ADR-0045)
+
+The `CustomPropertiesStore` — operator-authored per-agent metadata (properties
+and their optional type/validation schemas) used in scope expressions via
+`props.<key>` — moves from the SQLite `custom-properties.db` file to the
+server's PostgreSQL substrate in this release (ADR-0006 Wave 2), schema
+`custom_properties_store`. It reuses the existing shared connection pool —
+**no new connection flag or config is required**.
+
+**This is NOT a fresh-start cutover.** Custom properties and their schemas are
+irreducible operator-authored asset-tagging data — losing them would silently
+break any `props.<key>`-scoped dispatch, policy, or push rule. The migration
+performs a **mandatory one-time backfill** on first Postgres boot:
+
+- **What is preserved:** every property (agent, key, value, type) and every
+  property schema (key, display name, type, description, validation regex)
+  carry over exactly.
+- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
+  Postgres write error, an unreadable legacy DB, or a holder-side
+  fingerprint-verification refusal (see below) — the server **refuses to
+  boot** rather than come up with partial data. The backfill marker is only
+  stamped on success, so a failed attempt is **retried on the next start**
+  once you have fixed the underlying cause.
+- **Legacy file moved aside after a verified backfill.** Once the backfill is
+  confirmed complete, `custom-properties.db` is renamed to
+  `custom-properties.db.migrated-<epoch>` (the server never reads it again).
+  If you do not see this file appear, the backfill did not run to completion.
+  Keep the renamed file until you have confirmed properties/schemas look
+  correct, then treat it as an operator-managed backup and dispose of it per
+  your data-retention policy.
+- **Multi-replica deployments: boot the replica holding the authoritative
+  `custom-properties.db` FIRST.** Unlike this store's SQLite era, a
+  multi-replica Postgres deployment shares ONE `custom_properties_store`
+  schema — the first replica to complete the backfill wins, and every other
+  replica's boot verifies its own local legacy file against what actually
+  landed rather than trusting the shared completion marker blindly. If two
+  replicas hold genuinely different legacy content (an unusual topology for
+  this store — `custom-properties.db` is ordinarily a single server's local
+  file, not something expected to diverge across replicas of the same
+  logical deployment), the second replica to boot refuses with a
+  **HOLDER-SIDE VERIFICATION FAILED** error rather than silently accepting
+  or silently overwriting the winner's data — see
+  `docs/ops-runbooks/custom-properties-store-backfill-recovery.md` for the
+  recovery procedure.
+- **Budget for a longer first boot.** First boot takes longer than usual while
+  the backfill runs; a large `custom-properties.db` (many agents/properties)
+  extends this further. **Widen your own orchestrator's startup budget
+  accordingly** (Kubernetes `startupProbe` failure/period budget, or the
+  Docker Compose healthcheck `start_period`) so it does not kill the server
+  mid-backfill and restart it into the same long boot repeatedly — do not
+  treat a slower-than-normal first boot as a hang.
+
+**Operator-visible behaviour change (fail-closed reads).** After cutover, a
+`props.<key>`-feeding read that degrades (store not open, pool-acquire
+timeout, or query error) now aborts the whole scope evaluation rather than
+silently resolving the property as absent — a `props.<key>`-scoped
+dispatch/policy/push rule now matches **nobody** while degraded, instead of
+(under a `NOT`/`!=` scope) silently matching **everybody**. `GET
+/api/agents/:id/properties` now returns **503** on a degraded read rather
+than an empty list. Watch the new
+`yuzu_server_custom_properties_read_degrade_total{reason}` counter — a
+non-zero rate means `props.<key>`-scoped rules may be silently matching
+nobody, not that operators removed the properties (see `docs/user-manual/
+metrics.md` and the shipped `YuzuCustomPropertiesReadDegraded` alert).
+`yuzu_server_custom_properties_backfill_total{result}` records the one-time
+backfill outcome.
+
+**Not affected:** the `props.<key>` scope-DSL syntax, the REST API request/
+response shapes, and property/schema semantics are unchanged — only the
+storage substrate and the fail-closed read posture change.
+
 ## Network-discovered device data migrates to Postgres (mandatory backfill, DiscoveryStore, ADR-0044)
 
 The `DiscoveryStore` — the network-discovered devices behind `POST /api/discovery/scan`

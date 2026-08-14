@@ -2559,7 +2559,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; as of governance M1 (2026-07-29) the **entire dispatch is aborted** — no devices are targeted, including from other scope atoms — recorded by a paired `scope.evaluation_aborted` row with `reason=owner_check_failed`. |
-| `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (result-set store could not answer an alias/owner/membership read — ADR-0036), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator). Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
+| `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>` bulk preload against the custom-properties store could not answer — ADR-0045; both abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator). Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
@@ -3465,6 +3465,15 @@ List all custom properties for a specific agent.
 
 **Permission:** `Infrastructure:Read`
 
+**Error (503) -- store degraded:** `custom_properties_store` is a migrated Postgres store
+(authoritative posture); a transient database read failure returns `503` rather than an
+empty/partial property list, so automation never mistakes a degraded read for "this agent has no
+properties."
+
+```json
+{"error":{"code":503,"message":"custom properties store degraded"},"meta":{"api_version":"v1"}}
+```
+
 **Response:**
 
 ```json
@@ -3517,6 +3526,17 @@ Set or update a custom property value on an agent. If a property schema exists f
 }
 ```
 
+**Note on database degrade:** unlike `GET /api/agents/:id/properties` above, a transient
+database failure during this write currently surfaces as this same `400` (`"database error"` /
+`"database write failed"`) rather than a distinguishable `503` — not yet type-widened. Most of
+this predates the Postgres migration (the SQLite original had the identical
+collapse-to-generic-error shape on an INSERT failure); it is called out here because a Postgres
+pool/query failure is a more routine occurrence than a local SQLite file error ever was. One
+sub-case is new in this release: a transient failure on the schema-validation lookup itself
+(rather than the property write) used to be silently treated as "no schema, accept any value" by
+the SQLite original — that fail-open is now closed, and this sub-case also surfaces as `400`
+(`"database error"`), correctly rejecting the write rather than accepting it unvalidated.
+
 ---
 
 #### `DELETE /api/agents/:id/properties/:key`
@@ -3534,6 +3554,10 @@ Delete a custom property from an agent.
 }
 ```
 
+**Note on database degrade:** a transient database failure during this delete currently surfaces
+as the same `404` ("property not found") a genuine miss would return — not yet type-widened,
+predates the Postgres migration. See the `PUT` note above.
+
 ---
 
 #### `GET /api/property-schemas`
@@ -3541,6 +3565,10 @@ Delete a custom property from an agent.
 List all property schemas. Schemas define the allowed keys, types, and validation constraints for custom properties.
 
 **Permission:** `Infrastructure:Read`
+
+**Note on database degrade:** a transient database failure during this list currently surfaces as
+a `200` with an empty `data` array — indistinguishable from "no schemas configured." Not yet
+type-widened, predates the Postgres migration. See the `PUT` note above.
 
 **Response:**
 

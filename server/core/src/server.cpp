@@ -4518,9 +4518,36 @@ public:
                 apply_runtime_config_overrides();
             }
         }
-        {
-            auto props_db = cfg_.db_dir() / "custom-properties.db";
-            custom_properties_store_ = std::make_unique<CustomPropertiesStore>(props_db);
+        // Migrated Postgres store (ADR-0006/ADR-0045, schema
+        // `custom_properties_store`) — construction fail-CLOSED per ADR-0012
+        // §1 (same template as ManagementGroupStore above): a reachable
+        // database whose schema can't migrate/open is a fatal startup error,
+        // never a serve-degraded asset-tagging substrate. `migrate_from_sqlite`
+        // runs the one-time, idempotent legacy-`custom-properties.db` backfill
+        // (ADR-0009) — AUTHORITATIVE operator-authored data means a backfill
+        // failure is ALSO fatal (never serve on top of partially-migrated
+        // custom properties/schemas).
+        if (pg_pool_ && !startup_failed_) {
+            custom_properties_store_ = std::make_unique<CustomPropertiesStore>(*pg_pool_);
+            if (!custom_properties_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: custom-properties store migration/open "
+                              "failed (database reachable but the custom_properties_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                custom_properties_store_->set_metrics(&metrics_);
+                auto props_db = cfg_.db_dir() / "custom-properties.db";
+                if (!custom_properties_store_->migrate_from_sqlite(props_db)) {
+                    spdlog::error("[PG] Refusing to start: custom-properties legacy-SQLite "
+                                  "backfill failed (see prior log lines) — custom_properties_store "
+                                  "is the AUTHORITATIVE asset-tagging substrate and must not serve "
+                                  "partially-migrated data. Operator remediation: repair {} or move "
+                                  "it aside to skip the backfill (custom properties/schemas in it "
+                                  "will NOT carry over)",
+                                  props_db.string());
+                    startup_failed_ = true;
+                }
+            }
         }
 
         // Phase 7: Workflow Engine
@@ -6780,6 +6807,25 @@ public:
         if (gateway_service_)
             gateway_service_->set_mgmt_group_store(nullptr);
         mgmt_group_store_.reset();
+        // CustomPropertiesStore borrows pg_pool_ (ADR-0045) — drop before the
+        // pool, matching every other migrated store's belt-and-braces
+        // discipline (declaration order alone is a coincidence, not a
+        // contract — a future caller wired here mid-`stop()` must not find a
+        // still-live store past this point). No OTHER consumer stores a raw
+        // pointer beyond its call duration: `AgentRegistry::evaluate_scope`
+        // takes it as a borrowed per-call argument, never stored, and every
+        // REST handler is quiesced by the drains above. `PolicyEvaluator`
+        // DOES hold a raw `custom_properties_store` pointer
+        // (`PolicyEvaluator::Deps`, wired near this store's construction) on
+        // its background `policy_eval_thread_` — that thread is already
+        // joined earlier in this same `stop()` (see `policy_eval_thread_
+        // .join()` above), before this reset runs, so it is not a live
+        // consumer at this point either; it is called out explicitly here
+        // (governance Gate 8 cpp-safety) because an earlier revision of this
+        // comment claimed "no background thread holds a raw pointer,"
+        // which was inaccurate — the thread exists, it is simply already
+        // joined by the time execution reaches this line.
+        custom_properties_store_.reset();
         // ResultSetStore borrows pg_pool_ — drop before the pool. The maintenance
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
@@ -10158,8 +10204,15 @@ private:
 
             auto agent_id = req.matches[1].str();
             auto props = custom_properties_store_->get_properties(agent_id);
+            if (!props) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"custom properties store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& p : props) {
+            for (const auto& p : *props) {
                 arr.push_back({{"key", p.key},
                                {"value", p.value},
                                {"type", p.type},
