@@ -227,11 +227,11 @@ struct RestGsHarness {
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& ids, const std::string&,
                    const std::unordered_map<std::string, std::string>&, const std::string&,
-                   const yuzu::server::authz::VisibleSet& exec_visible)
+                   const yuzu::server::DispatchCaller& caller)
             -> std::pair<std::string, int> {
             last_live_plugin = plugin;
             last_live_action = action;
-            last_live_exec_visible = exec_visible;
+            last_live_exec_visible = caller.exec_visible;
             // Model what the production seam does to the Ids arm rather than
             // ignoring the set the route just derived — otherwise this fake
             // reports a successful dispatch whatever confinement decided, which
@@ -239,7 +239,7 @@ struct RestGsHarness {
             // every pre-existing case here is unaffected.
             const bool admitted =
                 std::all_of(ids.begin(), ids.end(), [&](const std::string& id) {
-                    return yuzu::server::authz::in_scope(exec_visible, id);
+                    return yuzu::server::authz::in_scope(caller.exec_visible, id);
                 });
             return {plugin + "-live", admitted ? live_sent : 0};
         };

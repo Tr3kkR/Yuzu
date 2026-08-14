@@ -70,6 +70,9 @@ struct DispatchCall {
     std::unordered_map<std::string, std::string> params;
     // CDX-R7-02: the exec_visible set the handler threaded into dispatch.
     yuzu::server::authz::VisibleSet exec_visible;
+    // PLAN-006: the full DispatchCaller (identity + exec_visible) the handler
+    // threaded into dispatch, so a test can assert the principal half too.
+    yuzu::server::DispatchCaller caller;
 };
 struct AuditRow {
     std::string action, result, target_type, target_id, detail;
@@ -123,13 +126,15 @@ struct FragmentHarness {
     bool auth_ok{true};    ///< auth_fn verdict (false → handler returns early)
     int dispatch_sent{1};  ///< agents reached per dispatch (0 → offline 404)
 
-    /// CDX-R7-02: the per-request exec-visible derivation the handlers consult
-    /// for /api/dashboard/execute + tar-execute. Default returns nullopt
-    /// (UNFILTERED) so pre-existing fragment tests keep the full-fleet path; a
-    /// confinement test overrides it with a specific set; a fail-closed test
-    /// sets it to `{}` (genuinely unwired → the production handler denies all).
-    DashboardRoutes::ExecVisibleFn exec_visible_fn{
-        [](const httplib::Request&) { return yuzu::server::authz::VisibleSet{}; }};
+    /// CDX-R7-02 / PLAN-006: the per-request DispatchCaller derivation the
+    /// handlers consult for /api/dashboard/execute + tar-execute. Default
+    /// returns a DispatchCaller whose exec_visible is nullopt (UNFILTERED) so
+    /// pre-existing fragment tests keep the full-fleet path; a confinement
+    /// test overrides it with a specific set; a fail-closed test sets it to
+    /// `{}` (genuinely unwired → the production handler denies all).
+    DashboardRoutes::CallerFn caller_fn{[](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{}};
+    }};
 
     /// CDX-R7-02: what the harness resolve_fn returns for /api/dashboard/execute
     /// (empty → "unknown command", so the dispatch path is unreachable). A
@@ -138,7 +143,7 @@ struct FragmentHarness {
 
     /// @param with_dispatch false → register with an empty DispatchFn so the
     ///        "dispatch unavailable" 503 branch is reachable.
-    /// @param wire_exec_visible false → register with an EMPTY ExecVisibleFn so
+    /// @param wire_exec_visible false → register with an EMPTY CallerFn so
     ///        the production handler's own fail-closed branch (unwired → present-
     ///        empty deny-all) is exercised (CDX-R7-02).
     explicit FragmentHarness(bool with_dispatch = true, bool wire_exec_visible = true) {
@@ -174,9 +179,9 @@ struct FragmentHarness {
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& ids, const std::string& scope,
                    const std::unordered_map<std::string, std::string>& params,
-                   const yuzu::server::authz::VisibleSet& exec_visible)
+                   const yuzu::server::DispatchCaller& caller)
             -> std::pair<std::string, int> {
-            calls.push_back({plugin, action, scope, ids, params, exec_visible});
+            calls.push_back({plugin, action, scope, ids, params, caller.exec_visible, caller});
             return {"cmd-" + std::to_string(calls.size()), dispatch_sent};
         };
 
@@ -185,18 +190,17 @@ struct FragmentHarness {
                                /*tag_store=*/nullptr, /*event_bus=*/nullptr,
                                /*agents_json_fn=*/[] { return std::string{"[]"}; },
                                with_dispatch ? dispatch : DashboardRoutes::DispatchFn{},
-                               /*exec_visible_fn=*/
+                               /*caller_fn=*/
                                wire_exec_visible
-                                   ? DashboardRoutes::ExecVisibleFn{
-                                         [this](const httplib::Request& req) {
+                                   ? DashboardRoutes::CallerFn{
+                                         [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
                                              // Delegate to the reassignable member so
                                              // a test can override it after
                                              // construction (live read).
-                                             return exec_visible_fn
-                                                        ? exec_visible_fn(req)
-                                                        : yuzu::server::authz::VisibleSet{};
+                                             return caller_fn ? caller_fn(req)
+                                                              : yuzu::server::DispatchCaller{};
                                          }}
-                                   : DashboardRoutes::ExecVisibleFn{},
+                                   : DashboardRoutes::CallerFn{},
                                /*resolve_fn=*/
                                [this](const std::string&) { return resolve_to; },
                                &metrics, /*instruction_store=*/nullptr);
@@ -596,8 +600,9 @@ TEST_CASE("dashboard execute threads the caller's exec_visible into dispatch (CD
     h.resolve_to = {"os_info", "version"};
     h.dispatch_sent = 0; // stop before the result-render path (registry_ is null here)
     // Service-scoped confinement: the caller can see only dev-A.
-    h.exec_visible_fn = [](const httplib::Request&) {
-        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"dev-A"}};
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{
+            .exec_visible = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"dev-A"}}};
     };
     // Target dev-B (an id-list arm), which is OUTSIDE the caller's visible set.
     auto res = h.post("/api/dashboard/execute", "instruction=run&scope=dev-B");
@@ -616,8 +621,9 @@ TEST_CASE("dashboard execute broadcast still carries the caller's exec_visible (
     FragmentHarness h;
     h.resolve_to = {"os_info", "version"};
     h.dispatch_sent = 0;
-    h.exec_visible_fn = [](const httplib::Request&) {
-        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"dev-A"}};
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{
+            .exec_visible = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"dev-A"}}};
     };
     // CDX-R8-01: `__all__` is now passed THROUGH by name (the Broadcast arm),
     // not stripped to empty+empty (the None arm). Broadcast is named, never
@@ -665,7 +671,7 @@ TEST_CASE("dashboard execute still broadcasts when scope is OMITTED entirely (CD
 
 TEST_CASE("dashboard execute FAILS CLOSED when the exec-visible derivation is unwired (CDX-R7-02)",
           "[server][dashboard][execute][scope]") {
-    // Genuinely UNWIRED ExecVisibleFn: the production handler must hand dispatch
+    // Genuinely UNWIRED CallerFn: the production handler must hand dispatch
     // a PRESENT EMPTY visible set (deny all), never nullopt (unfiltered).
     FragmentHarness h(/*with_dispatch=*/true, /*wire_exec_visible=*/false);
     h.resolve_to = {"os_info", "version"};
@@ -675,6 +681,41 @@ TEST_CASE("dashboard execute FAILS CLOSED when the exec-visible derivation is un
     REQUIRE(h.calls.size() == 1);
     REQUIRE(h.calls[0].exec_visible.has_value()); // PRESENT (deny), not nullopt
     CHECK(h.calls[0].exec_visible->empty());       // EMPTY → production sink reaches no one
+}
+
+// PLAN-006: the identity sibling of the fail-closed test above — an unwired
+// CallerFn must hand dispatch an EMPTY principal too, not merely a deny-all
+// exec_visible.
+TEST_CASE("dashboard execute hands dispatch an EMPTY principal when the CallerFn is unwired "
+          "(PLAN-006)",
+          "[server][dashboard][execute][scope]") {
+    FragmentHarness h(/*with_dispatch=*/true, /*wire_exec_visible=*/false);
+    h.resolve_to = {"os_info", "version"};
+    h.dispatch_sent = 0;
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope=dev-A");
+    REQUIRE(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].caller.principal.empty());
+}
+
+// PLAN-006: the sibling of the confinement handoff test above, asserting the
+// IDENTITY half of DispatchCaller — a wired CallerFn's principal must reach
+// the dispatch seam, not just its exec_visible.
+TEST_CASE("dashboard execute threads the caller's principal into dispatch (PLAN-006)",
+          "[server][dashboard][execute][scope]") {
+    FragmentHarness h;
+    h.resolve_to = {"os_info", "version"};
+    h.dispatch_sent = 0;
+    h.caller_fn = [](const httplib::Request&) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{.principal = "dash-operator",
+                                            .principal_role = "admin"};
+    };
+    auto res = h.post("/api/dashboard/execute", "instruction=run&scope=dev-A");
+    REQUIRE(res->status == 200);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].caller.principal == "dash-operator");
+    CHECK(h.calls[0].caller.principal_role == "admin");
+    CHECK_FALSE(h.calls[0].caller.system);
 }
 
 TEST_CASE("dashboard execute REFUSES a PERCENT-ENCODED supplied-but-empty scope "

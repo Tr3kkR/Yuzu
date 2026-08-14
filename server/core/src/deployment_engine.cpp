@@ -52,7 +52,8 @@ best_response_per_agent(const std::vector<StoredResponse>& rows) {
 }
 
 void advance(const EngineDeps& deps, const std::string& deployment_id, const DeploymentConfig& cfg,
-             const std::unordered_set<std::string>& authorized) {
+             const std::unordered_set<std::string>& authorized,
+             const yuzu::server::DispatchCaller& caller) {
     if (deps.store == nullptr || deployment_id.empty())
         return;
 
@@ -119,7 +120,7 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
         if (!claimed.empty())
             deps.dispatch_fn("content_dist", "stage", claimed, "",
                              {{"url", cfg.url}, {"filename", cfg.filename}, {"sha256", cfg.sha256}},
-                             stage_execution_id(deployment_id));
+                             stage_execution_id(deployment_id), caller);
     }
 
     // ── 6. CAS-claim + dispatch EXECUTE to authorized 'staged' devices ───────
@@ -138,7 +139,7 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
             if (!cfg.args.empty())
                 params["args"] = cfg.args;
             deps.dispatch_fn("content_dist", "execute_staged", claimed, "", params,
-                             exec_execution_id(deployment_id));
+                             exec_execution_id(deployment_id), caller);
         }
     }
 

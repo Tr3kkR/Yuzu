@@ -163,8 +163,11 @@ reference is `docs/mcp-server.md` "Revocation." and the upgrade note in
 **Addendum — per-device dispatch confinement, one seam for every operator
 surface (CC6.1/CC6.3, #1788/ADR-0033).** Every operator-facing dispatch path —
 `POST /api/command`, MCP `execute_instruction`/`execute_bundle`, REST
-`POST /api/v1/bundles`, the dashboard execute route, TAR `purge_source`, and
-`POST /api/instructions|workflows/{id}/execute` — now intersects its resolved
+`POST /api/v1/bundles`, the dashboard execute route, TAR `purge_source`,
+`POST /api/instructions|workflows/{id}/execute`, and `/auto` deployment
+staging/execution (`DeploymentRoutes`, joined this release — previously
+dispatched under system authority with no per-device confinement at all) —
+now intersects its resolved
 target set against ONE derived visibility decision (`derive_exec_visible` →
 `dispatch_confined_arms`) before sending, instead of four independently
 hand-rolled arm-classification copies. A service-scoped token is confined to
