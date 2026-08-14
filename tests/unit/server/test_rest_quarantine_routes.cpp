@@ -72,12 +72,18 @@ struct QuarantineRouteHarness {
     // decisions -- the single `scope_allow` bool can't express that. Checked
     // before falling back to `scope_allow`.
     std::unordered_map<std::string, bool> scope_allow_for;
-    // Per-agent DEGRADE simulation (gov Gate 2 security-guardian): a real
-    // require_scoped_permission returns false with res.status==503 on an
-    // RBAC/tag-store outage (engine-principal / service-scoped-token
-    // branches, auth_routes.cpp) -- distinct from a 403 denial. Checked
-    // before scope_allow_for/scope_allow.
-    std::unordered_set<std::string> scope_degrade_for;
+    // Per-agent DEGRADE simulation, keyed to the STATUS a real
+    // require_scoped_permission genuinely returns on a degrade -- distinct
+    // from a 403 denial. 503 on an RBAC/tag-store outage (engine-principal /
+    // service-scoped-token branches, auth_routes.cpp). 401 (gov Gate 4
+    // unhappy-path, UP-1) when its INTERNAL require_auth re-check hits an
+    // engine-principal store outage mid-request -- EngineLookupStatus::
+    // StoreUnreachable collapses to the same nullopt/401 as a genuinely
+    // absent session (auth_routes.cpp's own comment: distinguishing the two
+    // end-to-end is a "noted follow-on, not required by this slice"), even
+    // though the SAME caller already authenticated successfully once via
+    // auth_fn above. Checked before scope_allow_for/scope_allow.
+    std::unordered_map<std::string, int> scope_degrade_for;
     std::vector<AuditCall> audit_calls;
 
     explicit QuarantineRouteHarness(pg::PgPool& pool, bool wire_scope = true)
@@ -115,8 +121,8 @@ struct QuarantineRouteHarness {
                                const std::string& agent_id) -> bool {
                 scope_fn_called = true;
                 scoped_target = agent_id;
-                if (scope_degrade_for.count(agent_id)) {
-                    res.status = 503;
+                if (auto it = scope_degrade_for.find(agent_id); it != scope_degrade_for.end()) {
+                    res.status = it->second;
                     return false;
                 }
                 auto it = scope_allow_for.find(agent_id);
@@ -316,12 +322,34 @@ TEST_CASE("REST GET /api/v1/quarantine admits-then-filters per record (gov-fix/c
         REQUIRE(h.quarantine_store.quarantine_device("agent-degraded", "seed", "r2", ""));
         REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
         h.scope_allow_for["agent-visible"] = true;
-        h.scope_degrade_for.insert("agent-degraded");
+        h.scope_degrade_for["agent-degraded"] = 503;
         auto res = h.get();
         REQUIRE(res);
         CHECK(res->status == 503);
         // Neither record is rendered -- not a partial list that silently
         // dropped only the degraded one.
+        CHECK(res->body.find("agent-visible") == std::string::npos);
+        CHECK(res->body.find("agent-degraded") == std::string::npos);
+    }
+    // gov Gate 4 (unhappy-path, UP-1): the ORIGINAL Gate 2 fix only checked
+    // for probe.status==503, missing that require_scoped_permission's
+    // INTERNAL require_auth re-check can ALSO fail with 401 mid-request on
+    // an engine-principal store outage (EngineLookupStatus::
+    // StoreUnreachable collapses to the same nullopt/401 as a genuinely
+    // absent session) -- even though the caller already authenticated once,
+    // successfully, via the outer auth_fn. A 401 must fail the list closed
+    // exactly like a 503, never be silently filtered as if it were a 403
+    // denial.
+    SECTION("a per-record scope-gate DEGRADE surfacing as 401 (not just 503) also fails the "
+            "whole list closed") {
+        QuarantineRouteHarness h(qpool);
+        REQUIRE(h.quarantine_store.quarantine_device("agent-degraded", "seed", "r2", ""));
+        REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
+        h.scope_allow_for["agent-visible"] = true;
+        h.scope_degrade_for["agent-degraded"] = 401;
+        auto res = h.get();
+        REQUIRE(res);
+        CHECK(res->status == 503);
         CHECK(res->body.find("agent-visible") == std::string::npos);
         CHECK(res->body.find("agent-degraded") == std::string::npos);
     }

@@ -4198,16 +4198,28 @@ void RestApiV1::register_routes(
             for (const auto& r : *records) {
                 httplib::Response probe; // throwaway: per-record admit probe, never sent
                 if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id)) {
-                    // gov-fix(security-guardian): a per-record 503 (RBAC/tag-store
-                    // degraded — require_scoped_permission's engine-principal and
-                    // service-scoped-token branches genuinely return this, distinct
-                    // from a 403 denial) is NOT a denial and must not be silently
-                    // filtered out — that would render a degraded authz check as
-                    // "not quarantined", the exact fail-open the store-layer nullopt
-                    // check above exists to close, just one layer up. Fail the WHOLE
-                    // list closed rather than return a list that omitted an unknown
-                    // number of records for a reason other than scope.
-                    if (probe.status == 503) {
+                    // gov-fix(security-guardian, widened by unhappy-path Gate 4):
+                    // a per-record degrade is NOT a denial and must not be
+                    // silently filtered out — that would render a degraded
+                    // authz check as "not quarantined", the exact fail-open
+                    // the store-layer nullopt check above exists to close,
+                    // just one layer up. The auth caller has ALREADY been
+                    // authenticated once by auth_fn above, using the SAME
+                    // req — every per-record call re-derives authorization
+                    // from scratch (require_scoped_permission calls
+                    // require_auth internally on every invocation), so any
+                    // outcome OTHER than an explicit 403 (a genuine scope
+                    // denial) is anomalous mid-request and must fail the
+                    // WHOLE list closed, not just the RBAC/tag-store-degrade
+                    // 503 case: a transient engine-principal store outage
+                    // landing between auth_fn's initial check and a later
+                    // per-record probe surfaces as a bare 401 (require_auth
+                    // does not distinguish "no session" from "could not
+                    // determine" for that principal class — see
+                    // EngineLookupStatus::StoreUnreachable's own comment,
+                    // auth_routes.cpp), which the original 503-only check
+                    // would have silently treated as a denial.
+                    if (probe.status != 403) {
                         res.status = 503;
                         res.set_content(
                             detail::a4_error(res, "authorization check unavailable — try again"),

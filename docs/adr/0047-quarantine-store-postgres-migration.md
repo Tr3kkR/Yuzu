@@ -46,7 +46,6 @@ CREATE TABLE quarantine_records (
     reason          TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX idx_quarantine_agent ON quarantine_records(agent_id);
-CREATE INDEX idx_quarantine_status ON quarantine_records(status);
 CREATE UNIQUE INDEX idx_quarantine_agent_active ON quarantine_records(agent_id) WHERE status = 'active';
 CREATE TABLE quarantine_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 ```
@@ -57,7 +56,10 @@ value-preserving tightening, not a behavior change). The `id` column is internal
 response ever exposes it (verified — `rest_api_v1.cpp`'s quarantine JSON bodies emit only
 `agent_id`/`status`/`quarantined_by`/`quarantined_at`/`whitelist`/`reason`), so nothing depends on
 SQLite rowid semantics surviving the cutover, and Postgres is free to assign fresh `BIGSERIAL`
-values on backfill.
+values on backfill. Does NOT port a plain index on `status` (gov Gate 3 architect) — the only
+status-predicated query (`list_quarantined`'s `WHERE status = 'active'`) is already servable by
+the partial unique index below, and a second, redundant btree on a 2-value column would be pure
+write amplification on this append-only history table.
 
 **New: a partial unique index enforces "at most one active record per agent" at the database
 level** (`idx_quarantine_agent_active`), replacing the legacy check-then-insert-under-mutex
@@ -168,10 +170,21 @@ requires one transaction while it streams a bounded row from the legacy store." 
 required by that clause:
 
 - **Per-row memory is capped**: the legacy file is read once into an in-memory snapshot
-  (`read_legacy_snapshot`), and the count is capped at `kMaxBackfillRows` (500,000) — refused
+  (`read_legacy_snapshot`, unfiltered — the cap counts EVERY row, active and released, not just
+  active ones), and the count is capped at `kMaxBackfillRows` (**5,000** — lowered from an initial
+  500,000 in Gate 3 review, see "Sized against the transaction bound" below) — refused
   (fail-closed, operator remediation required) rather than silently truncated if exceeded.
-  Quarantine records are manually-curated security events, not a high-volume telemetry stream;
-  this ceiling is a sanity/DoS guard, not an expected-to-bind limit.
+  Quarantine records are manually-curated security events, not a high-volume telemetry stream,
+  and this store's retention is unbounded (see "Follow-ups" — no prune pass exists), so a
+  long-lived fleet accumulating full history could plausibly approach this ceiling over years;
+  it is a sanity/DoS-AND-lock-hold-duration guard, not purely an expected-never-to-bind limit.
+  **Sized against the transaction bound, not chosen independently of it**: `commit_backfill`'s
+  row-insert loop is one round-trip PER ROW under the exclusive backfill advisory lock — every
+  other replica reaching that lock (a same-boot race, or a later boot before this one's marker
+  commits) blocks for the winner's full insert duration. 5,000 keeps even a pessimistic ~10ms/row
+  round-trip comfortably under `kBackfillTxnTimeout` (60s) rather than racing its own bound; the
+  original 500,000 would have meant potentially minutes of fleet-wide boot refusal for every
+  replica but the winner.
 - **Retry behavior is explicit**: under the advisory lock, the transaction re-checks the
   `backfill_complete` marker (a concurrent racer may have committed between this replica's
   earlier short-lease marker check and this transaction acquiring the lock) — if now present, the
@@ -300,3 +313,51 @@ record-keeping substrate changed.
   (a canonical-preimage hash + occurrence ordinal, `ON CONFLICT DO NOTHING`) instead, which trades
   the atomicity guarantee for real resumability. Neither this ADR nor the playbook currently states
   the choice or the crossover point explicitly.
+
+**Gate 4 unhappy-path findings — verified real, deliberately deferred (not fixed in this PR):**
+
+- **UP-2: `list_quarantined`'s admit-then-filter loop is O(N) per-record re-authorization with no
+  pagination**, so a large active-quarantine set means N sequential auth/RBAC lookups sharing the
+  same connection pool every other store also leases from. **Pre-existing, not introduced by this
+  migration** — the admit-then-filter shape itself predates this PR (#1788/CDX-P1-02); this
+  migration only added the store-layer degrade check above it. Fixing it (pagination, or a
+  bulk/batched authorization check) is a REST-contract change disproportionate to a storage
+  migration — filed as a follow-up issue rather than folded in here.
+- **UP-6: the backfill's row-count cap is checked AFTER the full legacy snapshot is already loaded
+  into memory, and the holder-side fingerprint-verification path (`legacy_quarantine_fingerprint`,
+  which re-runs on every boot while a legacy file lingers) has no cap at all.** At the current
+  `kMaxBackfillRows` (5,000, lowered from the original 500,000 specifically for lock-hold-duration
+  reasons — see above), the realistic memory footprint is small (low single-digit MB even loaded
+  uncapped), so this is a structural gap without a practical exploit path today; worth tightening
+  if the cap is ever raised for a genuinely high-volume future store copying this pattern.
+- **UP-7: rolling back to the pre-migration SQLite binary after a successful backfill, then
+  re-upgrading, can permanently refuse to boot ("HOLDER-SIDE VERIFICATION FAILED").** The old
+  binary's `CREATE TABLE IF NOT EXISTS` recreates an EMPTY `quarantine_records` table at the
+  original path (the real data was renamed aside, not deleted, by the prior migration); an empty
+  table still fingerprints as real (not `sourceless`) content, so it can never match the original
+  real fingerprint. **This is a class-level gap in the shared ADR-0040 fingerprint-verification
+  backfill pattern** (built into `RbacStore`/`DiscoveryStore`/every store using this shape, not
+  unique to quarantine) — this migration faithfully follows the established, precedent-set
+  pattern; fixing the pattern itself is out of this PR's scope and blast radius. Documented here so
+  an operator considering rollback-then-reupgrade is warned, and filed as a follow-up against the
+  shared pattern (`docs/postgres-store-playbook.md`'s ADR-0040 section), not this store alone.
+- **UP-9: a connection dying after a write commits but before the client receives the
+  acknowledgement is answered on retry as a business error** (`"device is already
+  quarantined"`/`"device is not quarantined"`, both 400) rather than distinguished from a caller
+  error — the caller cannot tell "my own write already landed" from "someone else's state".
+  Solving this needs idempotency keys, which no store's write path in this codebase currently
+  implements; a systemic gap, not something to solve uniquely for quarantine.
+- **UP-10: the MCP `quarantine_device` tool records the quarantine before dispatching live
+  isolation (#289 design D2); if dispatch fails or the agent is offline (`agents_reached: 0`), a
+  retry is rejected with the SAME "already quarantined" 400 this PR did not change.** Verified
+  **pre-existing and byte-identical before and after this migration** (confirmed via the Gate 4
+  happy-path idempotency check against `origin/dev`) — the record-first/dispatch-second design and
+  its retry semantics are unrelated to the storage-backend migration. Filed as a follow-up against
+  the MCP tool's own design, not this PR.
+- **UP-11: genuine store/pool/query failures include raw `PQerrorMessage(...)` text (host/port,
+  never credentials — `pg_pool.hpp`'s own documented guarantee) in the client-facing error body
+  and, new in the Gate 2 audit-on-failure fix, the persisted audit row.** This matches the
+  established convention every other migrated store's error-string construction already uses
+  (`DiscoveryStore`, `DeploymentStore`, etc.) — diverging from it uniquely for quarantine would be
+  inconsistent rather than more secure; a systemic tightening (if ever desired) belongs at the
+  shared `pg::exec_params`/error-construction layer, not one store's migration.

@@ -1274,10 +1274,14 @@ boot:
   pre-existing data corruption or a hand-edited file. The backfill checks for this
   before touching Postgres and names the offending `agent_id`, rather than aborting
   mid-transaction on a raw database constraint-violation error.
-- **More than 500,000 legacy records refuses the boot** as a sanity/DoS cap on a
-  single backfill transaction — quarantine records are a manually-curated security
-  list, so this is not expected to bind in practice; contact platform engineering
-  before raising it if it does.
+- **More than 5,000 legacy records refuses the boot** as a sanity cap sized against the
+  single backfill transaction's own time budget (the row-insert loop is one round-trip per
+  row under an exclusive cross-replica lock, so an oversized backfill would otherwise block
+  every OTHER replica's boot for its full duration). The cap counts every legacy record,
+  active and released — this store's retention is unbounded by design (no prune pass), so a
+  long-lived fleet's full quarantine history could plausibly approach this over years, unlike
+  a purely never-expected-to-bind DoS guard; contact platform engineering before raising it
+  if you hit it.
 - **Legacy file moved aside after a verified backfill.** Once the backfill is
   confirmed complete, `quarantine.db` is renamed to
   `quarantine.db.migrated-<epoch>` (the server never reads it again). If the rename
