@@ -2217,13 +2217,31 @@ public:
         // so a non-zero rate is not proof of a real deprovision alone — see
         // the metric description below and docs/user-manual/metrics.md.
         metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_total",
-                          "Total OIDC logins denied at /auth/callback because the identity's "
+                          "TOTAL OIDC logins denied at /auth/callback because the identity's "
                           "linked SCIM resource is deprovisioned (deactivated, or orphaned by a "
                           "hard-deleted scim_resources row) OR because the ScimStore could not "
                           "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
-                          "closing the re-login-mints-fresh-tokens window; correlate with the "
-                          "audit reason= field to distinguish a real deprovision from a store "
-                          "outage",
+                          "closing the re-login-mints-fresh-tokens window. This is the SUM of "
+                          "yuzu_auth_oidc_deprovisioned_denied_genuine_total and "
+                          "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total below — "
+                          "alert on the genuine sub-counter, not this total (#3069)",
+                          "counter");
+        // #3069 — split the total above into a genuine-deny signal and a
+        // store-unavailable signal. Both call sites in auth_routes.cpp
+        // already compute `decision.scim_id` to build the audit `reason=`
+        // string; these counters key off the SAME predicate (present =
+        // genuine, absent = store outage) rather than re-deriving it.
+        metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_genuine_total",
+                          "OIDC logins denied at /auth/callback because the identity's linked "
+                          "SCIM resource is genuinely deprovisioned (a real deactivated-identity "
+                          "re-login was refused) — the CC6.8-alertable signal; excludes "
+                          "store-unavailable fail-closed denies",
+                          "counter");
+        metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
+                          "OIDC logins denied at /auth/callback because the ScimStore could not "
+                          "be reached (fail-closed deny during a ScimStore outage) — an "
+                          "AVAILABILITY signal, not a termination event; correlate with "
+                          "PostgreSQL health, do not treat as a CC6.8 deprovision-deny",
                           "counter");
         // ADR-2001 §4 (PR4b) — the SAML analogue of the OIDC counter
         // immediately above. Bumped by `saml_login_denied_deprovisioned`'s
@@ -2231,13 +2249,28 @@ public:
         // pre-mint check and the post-mint re-check for the codex-caught
         // concurrent-deprovision race) on every DENY.
         metrics_.describe("yuzu_auth_saml_deprovisioned_denied_total",
-                          "Total SAML logins denied at /saml/acs because the identity's linked "
+                          "TOTAL SAML logins denied at /saml/acs because the identity's linked "
                           "SCIM resource is deprovisioned (deactivated, or orphaned by a "
                           "hard-deleted scim_resources row) OR because the ScimStore could not "
                           "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
-                          "closing the re-login-mints-fresh-tokens window; correlate with the "
-                          "audit reason= field to distinguish a real deprovision from a store "
-                          "outage",
+                          "closing the re-login-mints-fresh-tokens window. This is the SUM of "
+                          "yuzu_auth_saml_deprovisioned_denied_genuine_total and "
+                          "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total below — "
+                          "alert on the genuine sub-counter, not this total (#3069)",
+                          "counter");
+        // #3069 — SAML analogue of the OIDC split above; same
+        // `decision.scim_id` predicate.
+        metrics_.describe("yuzu_auth_saml_deprovisioned_denied_genuine_total",
+                          "SAML logins denied at /saml/acs because the identity's linked SCIM "
+                          "resource is genuinely deprovisioned (a real deactivated-identity "
+                          "re-login was refused) — the CC6.8-alertable signal; excludes "
+                          "store-unavailable fail-closed denies",
+                          "counter");
+        metrics_.describe("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
+                          "SAML logins denied at /saml/acs because the ScimStore could not be "
+                          "reached (fail-closed deny during a ScimStore outage) — an "
+                          "AVAILABILITY signal, not a termination event; correlate with "
+                          "PostgreSQL health, do not treat as a CC6.8 deprovision-deny",
                           "counter");
         // describe() only registers HELP/TYPE metadata; the series is absent
         // from /metrics until first .increment(). Instantiate each bare
@@ -2247,10 +2280,15 @@ public:
         // docs/observability-conventions.md).
         metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
         metrics_.counter("yuzu_scim_deprovision_unlinked_total");
+        metrics_.counter("yuzu_scim_provenance_denied_total");
         metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
         metrics_.counter("yuzu_scim_saml_link_write_failures_total");
         metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");
+        metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_genuine_total");
+        metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_total");
+        metrics_.counter("yuzu_auth_saml_deprovisioned_denied_genuine_total");
+        metrics_.counter("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total");
         metrics_.counter("yuzu_scim_saml_link_unmatched_total");
         metrics_.counter("yuzu_scim_saml_link_ambiguous_total");
         metrics_.counter("yuzu_scim_saml_link_lookup_failures_total");
