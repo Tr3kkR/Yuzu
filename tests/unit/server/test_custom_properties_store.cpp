@@ -38,6 +38,7 @@ using yuzu::server::CustomProperty;
 using yuzu::server::CustomPropertiesReadError;
 using yuzu::server::CustomPropertiesStore;
 using yuzu::server::CustomPropertySchema;
+using yuzu::server::kCustomPropertiesDbErrorPrefix;
 using yuzu::server::SqliteDb;
 using yuzu::server::SqliteErrMsg;
 using yuzu::server::SqliteStmt;
@@ -111,6 +112,17 @@ template <typename T>
 T require_ok(const std::expected<T, CustomPropertiesReadError>& r) {
     REQUIRE(r.has_value());
     return *r;
+}
+
+// Asserts a set_property/upsert_schema setup call succeeded — these return
+// std::expected<void, std::string>, a distinct overload from the typed-read
+// one above. A silently-discarded failure here would let every assertion
+// that follows test the wrong (unset) state while still passing (gov Gate 8
+// finding, fjarvis review of PR #3097 — 40 MSVC C4834 sites, pre-existing,
+// newly visible under the stricter [[nodiscard]] MSVC's <expected> now
+// carries on std::expected<void, E> that libstdc++ does not).
+void require_ok(const std::expected<void, std::string>& r) {
+    REQUIRE(r.has_value());
 }
 
 } // namespace
@@ -197,7 +209,8 @@ TEST_CASE("CustomPropertiesStore: set and get property", "[pg][custom_props][cru
 TEST_CASE("CustomPropertiesStore: get_value shortcut", "[pg][custom_props][crud]") {
     PROPS_SHARED(store, pool);
 
-    store.set_property("agent-1", "region", "us-east-1");
+    require_ok(store.set_property("agent-1", "region", "us-east-1"));
+
     CHECK(require_ok(store.get_value("agent-1", "region")) == "us-east-1");
 }
 
@@ -220,15 +233,18 @@ TEST_CASE("CustomPropertiesStore: get_property nonexistent returns nullopt (not 
 TEST_CASE("CustomPropertiesStore: set overwrites existing", "[pg][custom_props][crud]") {
     PROPS_SHARED(store, pool);
 
-    store.set_property("agent-1", "env", "staging");
-    store.set_property("agent-1", "env", "production");
+    require_ok(store.set_property("agent-1", "env", "staging"));
+
+    require_ok(store.set_property("agent-1", "env", "production"));
+
     CHECK(require_ok(store.get_value("agent-1", "env")) == "production");
 }
 
 TEST_CASE("CustomPropertiesStore: set with custom type", "[pg][custom_props][crud]") {
     PROPS_SHARED(store, pool);
 
-    store.set_property("agent-1", "port", "8080", "int");
+    require_ok(store.set_property("agent-1", "port", "8080", "int"));
+
     auto prop = require_ok(store.get_property("agent-1", "port"));
     REQUIRE(prop.has_value());
     CHECK(prop->type == "int");
@@ -254,7 +270,8 @@ TEST_CASE("CustomPropertiesStore: set with overlength value rejected",
 TEST_CASE("CustomPropertiesStore: delete property", "[pg][custom_props][crud]") {
     PROPS_SHARED(store, pool);
 
-    store.set_property("agent-1", "env", "prod");
+    require_ok(store.set_property("agent-1", "env", "prod"));
+
     CHECK(store.delete_property("agent-1", "env") == true);
     CHECK(*store.get_property("agent-1", "env") == std::nullopt);
 
@@ -272,9 +289,11 @@ TEST_CASE("CustomPropertiesStore: delete all properties for agent",
           "[pg][custom_props][crud]") {
     PROPS_SHARED(store, pool);
 
-    store.set_property("agent-1", "env", "prod");
-    store.set_property("agent-1", "region", "us-east");
-    store.set_property("agent-1", "role", "web");
+    require_ok(store.set_property("agent-1", "env", "prod"));
+
+    require_ok(store.set_property("agent-1", "region", "us-east"));
+
+    require_ok(store.set_property("agent-1", "role", "web"));
 
     store.delete_all_properties("agent-1");
 
@@ -286,9 +305,11 @@ TEST_CASE("CustomPropertiesStore: get_properties lists all for agent",
           "[pg][custom_props][crud]") {
     PROPS_SHARED(store, pool);
 
-    store.set_property("agent-1", "env", "prod");
-    store.set_property("agent-1", "region", "us-east");
-    store.set_property("agent-1", "role", "web");
+    require_ok(store.set_property("agent-1", "env", "prod"));
+
+    require_ok(store.set_property("agent-1", "region", "us-east"));
+
+    require_ok(store.set_property("agent-1", "role", "web"));
 
     auto props = require_ok(store.get_properties("agent-1"));
     REQUIRE(props.size() == 3);
@@ -309,8 +330,9 @@ TEST_CASE("CustomPropertiesStore: get_properties for empty agent", "[pg][custom_
 TEST_CASE("CustomPropertiesStore: get_property_map", "[pg][custom_props][crud]") {
     PROPS_SHARED(store, pool);
 
-    store.set_property("agent-1", "env", "prod");
-    store.set_property("agent-1", "region", "eu-west");
+    require_ok(store.set_property("agent-1", "env", "prod"));
+
+    require_ok(store.set_property("agent-1", "region", "eu-west"));
 
     auto map = require_ok(store.get_property_map("agent-1"));
     REQUIRE(map.size() == 2);
@@ -333,10 +355,13 @@ TEST_CASE("CustomPropertiesStore: get_values_for_keys bulk-preloads across agent
           "[pg][custom_props][bulk]") {
     PROPS_SHARED(store, pool);
 
-    store.set_property("agent-1", "env", "prod");
-    store.set_property("agent-1", "region", "us-east");
-    store.set_property("agent-2", "env", "staging");
-    store.set_property("agent-3", "role", "web"); // not one of the requested keys' agents only
+    require_ok(store.set_property("agent-1", "env", "prod"));
+
+    require_ok(store.set_property("agent-1", "region", "us-east"));
+
+    require_ok(store.set_property("agent-2", "env", "staging"));
+
+    require_ok(store.set_property("agent-3", "role", "web")); // not one of the requested keys' agents only
 
     auto result = require_ok(store.get_values_for_keys({"env", "region"}));
     REQUIRE(result.size() == 2); // agent-1, agent-2 (agent-3 has no env/region)
@@ -351,7 +376,8 @@ TEST_CASE("CustomPropertiesStore: get_values_for_keys bulk-preloads across agent
 TEST_CASE("CustomPropertiesStore: get_values_for_keys with empty keys returns empty map, no query",
           "[pg][custom_props][bulk]") {
     PROPS_SHARED(store, pool);
-    store.set_property("agent-1", "env", "prod");
+    require_ok(store.set_property("agent-1", "env", "prod"));
+
     auto result = require_ok(store.get_values_for_keys({}));
     CHECK(result.empty());
 }
@@ -359,7 +385,8 @@ TEST_CASE("CustomPropertiesStore: get_values_for_keys with empty keys returns em
 TEST_CASE("CustomPropertiesStore: get_values_for_keys with no matching properties",
           "[pg][custom_props][bulk]") {
     PROPS_SHARED(store, pool);
-    store.set_property("agent-1", "env", "prod");
+    require_ok(store.set_property("agent-1", "env", "prod"));
+
     auto result = require_ok(store.get_values_for_keys({"nonexistent"}));
     CHECK(result.empty());
 }
@@ -383,11 +410,26 @@ TEST_CASE("CustomPropertiesStore: reads degrade to kDegraded on a closed store",
     CHECK(store.get_property_map("agent-1").error() == CustomPropertiesReadError::kDegraded);
     CHECK(store.get_values_for_keys({"k"}).error() == CustomPropertiesReadError::kDegraded);
 
-    // set_property on a closed store is also an error (not silently
-    // accepted) — same posture, string-error channel (unchanged contract).
+    // get_schema/delete_schema widened to the same typed contract (gov Gate 8
+    // finding, fjarvis re-review of PR #3065) — degrade on a closed store,
+    // never a silent "not found".
+    CHECK(store.get_schema("k").error() == CustomPropertiesReadError::kDegraded);
+    CHECK(store.delete_schema("k").error() == CustomPropertiesReadError::kDegraded);
+
+    // set_property/upsert_schema on a closed store are also errors (not
+    // silently accepted) — same posture, string-error channel, now prefixed
+    // with kCustomPropertiesDbErrorPrefix so a REST route can classify a
+    // genuine store outage (503) apart from caller-input validation (400)
+    // (gov Gate 8 finding, fjarvis re-review of PR #3065 — the route
+    // previously mapped every failure, including a store outage, to 400).
     auto set_result = store.set_property("agent-1", "k", "v");
     REQUIRE(!set_result.has_value());
-    CHECK(set_result.error() == "store not open");
+    CHECK(set_result.error() == std::string(kCustomPropertiesDbErrorPrefix) + "store not open");
+
+    CustomPropertySchema schema{.key = "k", .display_name = "K", .type = "string"};
+    auto schema_result = store.upsert_schema(schema);
+    REQUIRE(!schema_result.has_value());
+    CHECK(schema_result.error() == std::string(kCustomPropertiesDbErrorPrefix) + "store not open");
 }
 
 // ============================================================================
@@ -398,8 +440,9 @@ TEST_CASE("CustomPropertiesStore: properties isolated per agent",
           "[pg][custom_props][isolation]") {
     PROPS_SHARED(store, pool);
 
-    store.set_property("agent-1", "env", "production");
-    store.set_property("agent-2", "env", "staging");
+    require_ok(store.set_property("agent-1", "env", "production"));
+
+    require_ok(store.set_property("agent-2", "env", "staging"));
 
     CHECK(require_ok(store.get_value("agent-1", "env")) == "production");
     CHECK(require_ok(store.get_value("agent-2", "env")) == "staging");
@@ -417,8 +460,9 @@ TEST_CASE("CustomPropertiesStore: delete one agent does not affect another",
           "[pg][custom_props][isolation]") {
     PROPS_SHARED(store, pool);
 
-    store.set_property("agent-1", "env", "prod");
-    store.set_property("agent-2", "env", "staging");
+    require_ok(store.set_property("agent-1", "env", "prod"));
+
+    require_ok(store.set_property("agent-2", "env", "staging"));
 
     store.delete_all_properties("agent-1");
 
@@ -429,9 +473,11 @@ TEST_CASE("CustomPropertiesStore: delete one agent does not affect another",
 TEST_CASE("CustomPropertiesStore: same key different agents", "[pg][custom_props][isolation]") {
     PROPS_SHARED(store, pool);
 
-    store.set_property("agent-1", "role", "web");
-    store.set_property("agent-2", "role", "db");
-    store.set_property("agent-3", "role", "cache");
+    require_ok(store.set_property("agent-1", "role", "web"));
+
+    require_ok(store.set_property("agent-2", "role", "db"));
+
+    require_ok(store.set_property("agent-3", "role", "cache"));
 
     CHECK(require_ok(store.get_value("agent-1", "role")) == "web");
     CHECK(require_ok(store.get_value("agent-2", "role")) == "db");
@@ -463,11 +509,12 @@ TEST_CASE("CustomPropertiesStore: create and get schema", "[pg][custom_props][sc
 
     auto retrieved = store.get_schema("environment");
     REQUIRE(retrieved.has_value());
-    CHECK(retrieved->key == "environment");
-    CHECK(retrieved->display_name == "Environment");
-    CHECK(retrieved->type == "string");
-    CHECK(retrieved->description == "Deployment environment");
-    CHECK(retrieved->validation_regex == "^(dev|staging|production)$");
+    REQUIRE(retrieved->has_value());
+    CHECK((*retrieved)->key == "environment");
+    CHECK((*retrieved)->display_name == "Environment");
+    CHECK((*retrieved)->type == "string");
+    CHECK((*retrieved)->description == "Deployment environment");
+    CHECK((*retrieved)->validation_regex == "^(dev|staging|production)$");
 }
 
 TEST_CASE("CustomPropertiesStore: list schemas", "[pg][custom_props][schema]") {
@@ -477,9 +524,11 @@ TEST_CASE("CustomPropertiesStore: list schemas", "[pg][custom_props][schema]") {
     CustomPropertySchema s2{.key = "port", .display_name = "Port", .type = "int"};
     CustomPropertySchema s3{.key = "active", .display_name = "Active", .type = "bool"};
 
-    store.upsert_schema(s1);
-    store.upsert_schema(s2);
-    store.upsert_schema(s3);
+    require_ok(store.upsert_schema(s1));
+
+    require_ok(store.upsert_schema(s2));
+
+    require_ok(store.upsert_schema(s3));
 
     auto schemas = store.list_schemas();
     REQUIRE(schemas.size() == 3);
@@ -493,17 +542,18 @@ TEST_CASE("CustomPropertiesStore: update schema via upsert", "[pg][custom_props]
     PROPS_SHARED(store, pool);
 
     CustomPropertySchema s1{.key = "env", .display_name = "Env", .type = "string"};
-    store.upsert_schema(s1);
+    require_ok(store.upsert_schema(s1));
 
     // Update display name
     CustomPropertySchema s2{.key = "env", .display_name = "Environment", .type = "string",
                              .description = "Updated"};
-    store.upsert_schema(s2);
+    require_ok(store.upsert_schema(s2));
 
     auto schema = store.get_schema("env");
     REQUIRE(schema.has_value());
-    CHECK(schema->display_name == "Environment");
-    CHECK(schema->description == "Updated");
+    REQUIRE(schema->has_value());
+    CHECK((*schema)->display_name == "Environment");
+    CHECK((*schema)->description == "Updated");
 
     // Still only one schema
     auto all = store.list_schemas();
@@ -514,22 +564,34 @@ TEST_CASE("CustomPropertiesStore: delete schema", "[pg][custom_props][schema]") 
     PROPS_SHARED(store, pool);
 
     CustomPropertySchema s{.key = "env", .display_name = "Env", .type = "string"};
-    store.upsert_schema(s);
+    require_ok(store.upsert_schema(s));
 
-    CHECK(store.delete_schema("env") == true);
-    CHECK(store.get_schema("env") == std::nullopt);
-    CHECK(store.delete_schema("env") == false);
+    auto del1 = store.delete_schema("env");
+    REQUIRE(del1.has_value());
+    CHECK(*del1 == true);
+
+    auto after = store.get_schema("env");
+    REQUIRE(after.has_value());
+    CHECK(*after == std::nullopt);
+
+    auto del2 = store.delete_schema("env");
+    REQUIRE(del2.has_value());
+    CHECK(*del2 == false);
 }
 
 TEST_CASE("CustomPropertiesStore: delete nonexistent schema", "[pg][custom_props][schema]") {
     PROPS_SHARED(store, pool);
-    CHECK(store.delete_schema("nonexistent") == false);
+    auto del = store.delete_schema("nonexistent");
+    REQUIRE(del.has_value());
+    CHECK(*del == false);
 }
 
 TEST_CASE("CustomPropertiesStore: get nonexistent schema returns nullopt",
           "[pg][custom_props][schema]") {
     PROPS_SHARED(store, pool);
-    CHECK(store.get_schema("nonexistent") == std::nullopt);
+    auto schema = store.get_schema("nonexistent");
+    REQUIRE(schema.has_value());
+    CHECK(*schema == std::nullopt);
 }
 
 TEST_CASE("CustomPropertiesStore: schema with invalid key rejected",
@@ -598,7 +660,7 @@ TEST_CASE("CustomPropertiesStore: schema type validation -- int",
     PROPS_SHARED(store, pool);
 
     CustomPropertySchema s{.key = "port", .display_name = "Port", .type = "int"};
-    store.upsert_schema(s);
+    require_ok(store.upsert_schema(s));
 
     // Valid int
     auto r1 = store.set_property("agent-1", "port", "8080");
@@ -615,7 +677,7 @@ TEST_CASE("CustomPropertiesStore: schema type validation -- bool",
     PROPS_SHARED(store, pool);
 
     CustomPropertySchema s{.key = "active", .display_name = "Active", .type = "bool"};
-    store.upsert_schema(s);
+    require_ok(store.upsert_schema(s));
 
     auto r1 = store.set_property("agent-1", "active", "true");
     REQUIRE(r1.has_value());
@@ -633,7 +695,7 @@ TEST_CASE("CustomPropertiesStore: schema type validation -- string accepts anyth
     PROPS_SHARED(store, pool);
 
     CustomPropertySchema s{.key = "desc", .display_name = "Description", .type = "string"};
-    store.upsert_schema(s);
+    require_ok(store.upsert_schema(s));
 
     auto r = store.set_property("agent-1", "desc", "anything goes here 123!@#");
     REQUIRE(r.has_value());
@@ -645,7 +707,7 @@ TEST_CASE("CustomPropertiesStore: schema type validation -- datetime accepts any
 
     CustomPropertySchema s{.key = "enrolled_at", .display_name = "Enrolled At",
                             .type = "datetime"};
-    store.upsert_schema(s);
+    require_ok(store.upsert_schema(s));
 
     auto r = store.set_property("agent-1", "enrolled_at", "2025-01-15T12:00:00Z");
     REQUIRE(r.has_value());
@@ -658,7 +720,7 @@ TEST_CASE("CustomPropertiesStore: schema regex validation", "[pg][custom_props][
                             .display_name = "Environment",
                             .type = "string",
                             .validation_regex = "^(dev|staging|production)$"};
-    store.upsert_schema(s);
+    require_ok(store.upsert_schema(s));
 
     // Matching values
     auto r1 = store.set_property("agent-1", "env", "production");
@@ -689,7 +751,7 @@ TEST_CASE("CustomPropertiesStore: schema type overrides provided type",
 
     // Define schema with type "int"
     CustomPropertySchema s{.key = "port", .display_name = "Port", .type = "int"};
-    store.upsert_schema(s);
+    require_ok(store.upsert_schema(s));
 
     // Set with type "string" -- schema type should win
     auto r = store.set_property("agent-1", "port", "8080", "string");
@@ -709,7 +771,7 @@ TEST_CASE("CustomPropertiesStore: schema regex with int type",
                             .display_name = "Port",
                             .type = "int",
                             .validation_regex = "^[0-9]{1,5}$"};
-    store.upsert_schema(s);
+    require_ok(store.upsert_schema(s));
 
     // Valid: integer that matches regex
     auto r1 = store.set_property("agent-1", "port", "8080");
@@ -732,14 +794,16 @@ TEST_CASE("CustomPropertiesStore: delete schema removes validation",
                             .display_name = "Env",
                             .type = "string",
                             .validation_regex = "^(dev|prod)$"};
-    store.upsert_schema(s);
+    require_ok(store.upsert_schema(s));
 
     // Rejected with schema
     auto r1 = store.set_property("agent-1", "env", "testing");
     REQUIRE(!r1.has_value());
 
     // Delete schema
-    store.delete_schema("env");
+    auto del = store.delete_schema("env");
+    REQUIRE(del.has_value());
+    CHECK(*del == true);
 
     // Accepted without schema
     auto r2 = store.set_property("agent-1", "env", "testing");
@@ -842,8 +906,9 @@ TEST_CASE("CustomPropertiesStore: backfill copies properties and schemas from le
 
     auto schema = store.get_schema("env");
     REQUIRE(schema.has_value());
-    CHECK(schema->display_name == "Environment");
-    CHECK(schema->validation_regex == "^(dev|staging|production)$");
+    REQUIRE(schema->has_value());
+    CHECK((*schema)->display_name == "Environment");
+    CHECK((*schema)->validation_regex == "^(dev|staging|production)$");
 
     // Legacy file was moved aside (one-release rollback window, ADR-0009).
     CHECK_FALSE(std::filesystem::exists(legacy.path));

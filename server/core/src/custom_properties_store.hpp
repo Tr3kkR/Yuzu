@@ -83,6 +83,18 @@ class PgPool;
 
 namespace yuzu::server {
 
+/// Machine-checkable prefix on every `CustomPropertiesStore` `unexpected()`
+/// string that represents a genuine DB/lease failure rather than caller-input
+/// validation or a schema-mismatch business rule (mirrors `DeploymentStore`'s
+/// `kDeploymentDbErrorPrefix` idiom, `deployment_store.hpp`). Exported here —
+/// not left as a private literal duplicated at the REST-route classification
+/// site — so the two can never silently drift apart (same "gov F3" reasoning
+/// DeploymentStore's own comment records). Applies to `set_property` and
+/// `upsert_schema`'s `std::expected<void, std::string>` error channel only;
+/// the typed-`CustomPropertiesReadError` reads below don't need it — they
+/// already carry `kDegraded` as a distinct type, not a string to classify.
+inline constexpr const char* kCustomPropertiesDbErrorPrefix = "db_error: ";
+
 struct CustomProperty {
     std::string agent_id;
     std::string key;
@@ -209,15 +221,25 @@ public:
     /// — schema listing is an admin-surface read, not scope/dispatch-feeding).
     [[nodiscard]] std::vector<CustomPropertySchema> list_schemas() const;
 
-    /// A single schema, or `nullopt` on "not found" or a store/query failure.
-    [[nodiscard]] std::optional<CustomPropertySchema> get_schema(const std::string& key) const;
+    /// A single schema. `nullopt` == read fine, no such schema.
+    /// `std::unexpected(kDegraded)` == store/pool/query failure — widened
+    /// from a plain `std::optional` (gov Gate 8 finding, fjarvis re-review of
+    /// PR #3065): unlike `list_schemas`/`delete_property`, this had no
+    /// callers to justify keeping the SQLite-era not-found/degrade
+    /// conflation, so there was no reason to keep it. Not currently called
+    /// by any REST route (schema lookup is only exposed via `list_schemas`
+    /// today) — widened ahead of a future caller inheriting the wrong shape.
+    [[nodiscard]] std::expected<std::optional<CustomPropertySchema>, CustomPropertiesReadError>
+    get_schema(const std::string& key) const;
 
     /// Create or update a property schema.
     std::expected<void, std::string> upsert_schema(const CustomPropertySchema& schema);
 
-    /// Delete a property schema. Returns false on "not found" or a store/query
-    /// failure.
-    bool delete_schema(const std::string& key);
+    /// Delete a property schema. `true` == deleted, `false` == read fine, no
+    /// such schema. `std::unexpected(kDegraded)` == store/pool/query failure
+    /// — widened for the same reason as `get_schema` above (gov Gate 8
+    /// finding, fjarvis re-review of PR #3065).
+    [[nodiscard]] std::expected<bool, CustomPropertiesReadError> delete_schema(const std::string& key);
 
     // ── Validation ───────────────────────────────────────────────────────
 
