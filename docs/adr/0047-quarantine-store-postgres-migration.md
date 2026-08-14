@@ -199,14 +199,21 @@ required by that clause:
   `duplicate key value violates unique constraint "idx_quarantine_agent_active"` error instead of
   a named, actionable log line naming the `agent_id`.
 - **The backfill advisory lock's wait is explicitly widened to `kBackfillTxnTimeout` (gov Gate 2
-  security-guardian, hardening round).** The pool's connection-level `lock_timeout` GUC defaults
-  to 10s (ADR-0012) — far shorter than the backfill transaction's own bound. Without an explicit
-  `SET LOCAL lock_timeout` matching `kBackfillTxnTimeout`, a replica losing the first-ever-
-  migration race would abort its wait for `kBackfillLockSql` (and thus refuse to boot) whenever
-  the WINNER's own row-insert loop simply took longer than 10s — even though the winner's
-  transaction is itself correctly bounded by `kBackfillTxnTimeout`. This is a narrow, self-
-  healing-on-restart race (documented in `upgrading.md`), but the fix removes an unnecessary
-  boot failure for a legitimately-slow (not wedged) winner.
+  security-guardian; corrected in Gate 3 by cpp-expert + cpp-safety + architect, who
+  independently found the same gap).** The pool's connection-level `lock_timeout` GUC defaults to
+  10s (ADR-0012) — far shorter than the backfill's own bound. **`with_txn_for(kBackfillTxnTimeout,
+  ...)` bounds only the pool-ACQUIRE wait, never statement execution**
+  (`docs/postgres-store-playbook.md`'s explicit anti-pattern — the SAME mistake #2530 and
+  `AuditStore::migrate_from_sqlite` made before this store existed): a lock wait IS the statement
+  executing, just blocked, so the pool's connection-level `statement_timeout` GUC (default 30s,
+  not overridden by `server.cpp`'s `PgPool::Options`) ALSO bounds it — and being shorter than
+  `lock_timeout`, is what actually determines the effective wait. Setting only `SET LOCAL
+  lock_timeout` (the Gate 2 fix) therefore widened the wait 10s → 30s, not → `kBackfillTxnTimeout`
+  (60s) as the fix intended and this ADR's Gate-2 revision claimed. The fix now sets BOTH `SET
+  LOCAL statement_timeout` and `SET LOCAL lock_timeout` to `kBackfillTxnTimeout`, matching
+  `NotificationStore::migrate_from_sqlite`'s identical fix for the identical hazard. This is a
+  narrow, self-healing-on-restart race (documented in `upgrading.md`), but the fix removes an
+  unnecessary boot failure for a legitimately-slow (not wedged) winner.
 - **No IDENTITY/LIFECYCLE column-conflict partition (unlike `DeploymentStore`/#3062).** That
   partition exists to resolve a real row *already present in Postgres* (from a prior backfill or
   live traffic) disagreeing with the legacy row trying to land on top of it via `ON CONFLICT DO
@@ -265,7 +272,31 @@ record-keeping substrate changed.
 
 ## Follow-ups
 
-- None identified at migration time. `get_status`/`get_history` currently have no REST/MCP
-  caller (confirmed by repo-wide grep) — pre-existing, unrelated to this migration; the
-  type-distinguishable read contract is applied to them anyway for API consistency with
-  `list_quarantined`, per the playbook's "most migrated stores are authoritative" default.
+- `get_status`/`get_history` currently have no REST/MCP caller (confirmed by repo-wide grep) —
+  pre-existing, unrelated to this migration; the type-distinguishable read contract is applied to
+  them anyway for API consistency with `list_quarantined`, per the playbook's "most migrated
+  stores are authoritative" default.
+- **Retention/pruning is deliberately deferred, not overlooked (Gate 3 architect).**
+  `quarantine_records` is an unbounded, append-only history table with no prune pass in this
+  migration. A retention sweep here would owe the full seven-part clock-guarded-retention
+  contract (CLAUDE.md "Clock-guarded retention" standing invariant) — disproportionate to add in
+  the same PR as the storage-substrate migration itself, and #2508 already tracks the sibling
+  stores (`response_store`, `guaranteed_state_store`, `result_set_store`, `app_perf_*`,
+  `PreflightRunStore`, `DeploymentRunStore`) still owing the same contract. Recorded explicitly so
+  a future author does not read the silence as "nobody considered it" and add a bare
+  `DELETE ... WHERE ts < cutoff`.
+- **`kQuarantineDbErrorPrefix`/`is_quarantine_db_error` duplicates `DeploymentStore`'s identical
+  `kDeploymentDbErrorPrefix`/`is_deployment_db_error` shape (Gate 3 architect).** Same literal
+  (`"db_error: "`), same predicate, two independent homes. Benign at 2 consumers (each keys off
+  its own constant, no drift risk yet), but the ladder guarantees a third — worth centralizing
+  into a shared `pg::is_store_db_error`-style helper once one lands, not before.
+- **Backfilling a store with no natural per-row key (Gate 3 architect design judgment) should
+  become a `docs/postgres-store-playbook.md` section**, not stay a single store's ADR: the
+  single-advisory-locked-transaction shape this store uses is the right default for a small,
+  security-critical, no-key dataset (all-or-nothing atomicity beats per-row resumability when N is
+  small and the store is authoritative-gated), but it is premise-dependent on N staying small — a
+  future store on the ladder with the same no-key shape but high expected volume (`AnalyticsEventStore`
+  is flagged high-volume) should reach for a content-derived per-row key
+  (a canonical-preimage hash + occurrence ordinal, `ON CONFLICT DO NOTHING`) instead, which trades
+  the atomicity guarantee for real resumability. Neither this ADR nor the playbook currently states
+  the choice or the crossover point explicitly.

@@ -125,6 +125,11 @@ TEST_CASE("QuarantineStore: quarantine_device rejects an empty agent_id", "[pg][
 
     auto result = store.quarantine_device("", "admin", "reason", "");
     CHECK_FALSE(result.has_value());
+    // gov-fix(quality-engineer): exact message, not just has_value() --
+    // this precondition-miss must stay UNPREFIXED (a 400 business error, not
+    // a db_error:-prefixed 503) or the REST/MCP classification silently
+    // misroutes it.
+    CHECK(result.error() == "agent_id is required");
 }
 
 // Verifies the ON CONFLICT (agent_id) WHERE status = 'active' DO NOTHING

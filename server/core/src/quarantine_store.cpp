@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -60,7 +61,17 @@ constexpr const char* kSourcelessFingerprint = "sourceless";
 // (fail-closed) rather than silently truncated if exceeded — quarantine
 // records are manually-curated security events, not a high-volume telemetry
 // stream, so this ceiling is not expected to bind in practice.
-constexpr std::size_t kMaxBackfillRows = 500000;
+//
+// gov-fix(architect, Gate 3): sized against kBackfillTxnTimeout, not chosen
+// independently of it. commit_backfill's row-insert loop is one round-trip
+// PER ROW under the exclusive backfill advisory lock (no batching) — every
+// OTHER replica reaching that lock (a same-boot race, or a later boot before
+// this one's marker commits) blocks for the winner's full insert duration.
+// At a much larger cap this could mean minutes of fleet-wide boot refusal
+// for every replica but the winner. 5,000 keeps even a pessimistic ~10ms/row
+// round-trip (contention, network) comfortably under kBackfillTxnTimeout
+// (60s), leaving margin rather than racing its own bound.
+constexpr std::size_t kMaxBackfillRows = 5000;
 
 // Serializes concurrent first-ever-migration attempts across replicas (see
 // ADR-0047 "Backfill" — no natural per-row key means the row-insert loop
@@ -307,20 +318,36 @@ BackfillOutcome commit_backfill(pg::PgPool& pool, const std::vector<LRecord>& ro
                                 std::string_view fingerprint) {
     BackfillOutcome out;
     out.ok = pool.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
-        // gov-fix(security-guardian): the pool's connection-level lock_timeout
-        // GUC (default 10s, ADR-0012) is far shorter than kBackfillTxnTimeout —
-        // a replica losing the first-ever-migration race would otherwise abort
-        // its wait for kBackfillLockSql (and thus refuse to boot) whenever the
-        // WINNER's own row-insert loop simply takes longer than 10s, even
-        // though the winner's transaction is itself correctly bounded by
-        // kBackfillTxnTimeout. Widen the LOCAL lock wait to match, so a loser
-        // only fails if the winner is genuinely wedged past its own bound, not
-        // merely slower than the pool's generic connection default.
-        pg::PgResult lt = pg::exec_params(
-            c,
-            ("SET LOCAL lock_timeout = '" + std::to_string(kBackfillTxnTimeout.count()) + "ms'")
-                .c_str(),
-            std::vector<std::string>{});
+        // gov-fix(security-guardian, cpp-expert): the pool's connection-level
+        // lock_timeout GUC (default 10s, ADR-0012) is far shorter than
+        // kBackfillTxnTimeout — a replica losing the first-ever-migration race
+        // would otherwise abort its wait for kBackfillLockSql (and thus
+        // refuse to boot) whenever the WINNER's own row-insert loop simply
+        // takes longer than 10s, even though the winner's transaction is
+        // itself correctly bounded by kBackfillTxnTimeout. Widening ONLY
+        // lock_timeout is insufficient (cpp-expert Gate 3 re-review): the
+        // pool's connection-level statement_timeout GUC (default 30s,
+        // pg_pool.hpp, not overridden by server.cpp's PgPool::Options) ALSO
+        // bounds a lock wait — a lock-wait IS the statement executing, just
+        // blocked — so it silently caps the effective wait at 30s regardless
+        // of what lock_timeout is set to. Both must be widened together; this
+        // is the SAME anti-pattern docs/postgres-store-playbook.md documents
+        // ("Assuming a per-operation timeout parameter bounds statement
+        // execution — it only bounds the pool-ACQUIRE wait") and the same fix
+        // shape NotificationStore::migrate_from_sqlite already uses.
+        const std::string set_timeout_sql =
+            std::format("SET LOCAL statement_timeout = '{}ms'", kBackfillTxnTimeout.count());
+        pg::PgResult st = pg::exec_params(c, set_timeout_sql.c_str(), std::vector<std::string>{});
+        if (st.status() != PGRES_COMMAND_OK) {
+            spdlog::error("QuarantineStore: migrate_from_sqlite: backfill statement_timeout set "
+                         "failed: {}",
+                         PQerrorMessage(c));
+            return false;
+        }
+        const std::string set_lock_timeout_sql =
+            std::format("SET LOCAL lock_timeout = '{}ms'", kBackfillTxnTimeout.count());
+        pg::PgResult lt =
+            pg::exec_params(c, set_lock_timeout_sql.c_str(), std::vector<std::string>{});
         if (lt.status() != PGRES_COMMAND_OK) {
             spdlog::error("QuarantineStore: migrate_from_sqlite: backfill lock_timeout set "
                          "failed: {}",
@@ -437,7 +464,16 @@ const std::vector<pg::PgMigration>& migrations() {
          "  whitelist       TEXT NOT NULL DEFAULT '',"
          "  reason          TEXT NOT NULL DEFAULT '');"
          "CREATE INDEX idx_quarantine_agent ON quarantine_records(agent_id);"
-         "CREATE INDEX idx_quarantine_status ON quarantine_records(status);"
+         // gov-fix(architect, Gate 3): a plain index on `status` (ported
+         // column-for-column from the legacy SQLite schema) was dropped — the
+         // only status-predicated query is `list_quarantined`'s
+         // `WHERE status = 'active'`, already servable by the partial unique
+         // index below (Postgres can use a partial index whose predicate
+         // matches a query's WHERE clause even when the query doesn't filter
+         // on the index's own key column). No query filters on any other
+         // status value. A second, redundant btree on a 2-value column would
+         // be pure write amplification on this append-only history table.
+         //
          // Enforces "at most one active record per agent" at the database
          // level — quarantine_device's ON CONFLICT target.
          "CREATE UNIQUE INDEX idx_quarantine_agent_active ON quarantine_records(agent_id) "
@@ -929,11 +965,17 @@ bool QuarantineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
         // named, actionable log line. Catch it here, before any row reaches
         // Postgres, matching the status-value check above.
         {
+            // gov-fix(cpp-safety): key on the SANITIZED agent_id — the same
+            // transform commit_backfill's INSERT actually binds. Two
+            // raw-distinct ids that sanitize to the same value (e.g. differing
+            // only in an invalid-UTF-8 byte) would otherwise bypass this
+            // check and still hit the raw unique-constraint abort it exists
+            // to prevent.
             std::unordered_set<std::string> seen_active;
             for (const auto& r : snap) {
                 if (r.status != "active")
                     continue;
-                if (!seen_active.insert(r.agent_id).second) {
+                if (!seen_active.insert(sanitize_pg_text(r.agent_id)).second) {
                     spdlog::error(
                         "QuarantineStore: migrate_from_sqlite: legacy db {} has more than one "
                         "'active' record for agent_id='{}' — the legacy SQLite schema never "

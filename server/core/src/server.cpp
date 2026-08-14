@@ -6949,6 +6949,17 @@ public:
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
         result_set_store_.reset();
+        // QuarantineStore (ADR-0047) borrows pg_pool_ — drop explicitly rather
+        // than relying solely on reverse-declaration-order destruction (gov
+        // Gate 3 cpp-safety): declaration order alone is a real guarantee for
+        // the EVENTUAL ~ServerImpl teardown, but stop() calls pg_pool_.reset()
+        // directly, WHILE quarantine_store_ is still alive holding a bound
+        // pg::PgPool& — a window where that reference is dangling if anything
+        // still reached it. Every HTTP/gRPC handler holding the raw pointer is
+        // quiesced by the drains above; this reset makes that safety
+        // structural rather than incidental on nothing calling in during the
+        // window.
+        quarantine_store_.reset();
         // ResponseStore (ADR-0039) borrows pg_pool_ — unwire the consumer that
         // holds the raw pointer (agent_service_'s Subscribe-stream ingest) before
         // dropping it, then drop before the pool. The maintenance thread that
@@ -17309,10 +17320,13 @@ private:
     std::unique_ptr<ApiTokenStore> api_token_store_;
     /// Migrated Postgres store (ADR-0006/ADR-0047, schema `quarantine_store`).
     /// Borrows pg_pool_ (declared earlier, destructs later) and is declared
-    /// after it, so normal reverse-declaration-order destruction already
-    /// destructs this before the pool (ADR-0012 destruct-before-pool
-    /// discipline) — no explicit reset() needed in stop(), matching
-    /// deployment_store_/discovery_store_ below.
+    /// after it, so normal reverse-declaration-order destruction destructs
+    /// this before the pool for the EVENTUAL ~ServerImpl teardown (ADR-0012
+    /// destruct-before-pool discipline). That alone does NOT cover stop()'s
+    /// own explicit `pg_pool_.reset()` call, which runs while this member is
+    /// still alive (gov Gate 3 cpp-safety) — see the explicit
+    /// `quarantine_store_.reset()` in stop(), alongside
+    /// api_token_store_/engine_principal_store_/result_set_store_'s.
     std::unique_ptr<QuarantineStore> quarantine_store_;
     /// Migrated Postgres store (ADR-0006/ADR-0036, schema `result_set_store`).
     /// Borrows pg_pool_ (declared earlier, destructs later) — declared here so

@@ -14,6 +14,7 @@
 #include "rest_api_v1.hpp"
 
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
 #include "test_route_sink.hpp"
@@ -305,8 +306,15 @@ TEST_CASE("REST GET /api/v1/quarantine admits-then-filters per record (gov-fix/c
     SECTION("a per-record scope-gate DEGRADE (503) fails the whole list closed, never a "
             "silently-filtered partial list") {
         QuarantineRouteHarness h(qpool);
-        REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
+        // gov-fix(quality-engineer): seed the DEGRADED agent FIRST (lower id)
+        // and the visible one SECOND (higher id) -- list_quarantined orders
+        // `quarantined_at DESC, id DESC`, so the visible record is probed
+        // and added to the response array BEFORE the degrade is hit. This
+        // exercises the actual discard-a-partially-built-list path; the
+        // reverse seed order would let the degrade fire on the FIRST record
+        // probed, never proving a non-empty `arr` gets thrown away too.
         REQUIRE(h.quarantine_store.quarantine_device("agent-degraded", "seed", "r2", ""));
+        REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
         h.scope_allow_for["agent-visible"] = true;
         h.scope_degrade_for.insert("agent-degraded");
         auto res = h.get();
@@ -357,5 +365,86 @@ TEST_CASE("REST DELETE /api/v1/quarantine admits in-scope and fails closed when 
         REQUIRE(res);
         CHECK(res->status == 500);
         CHECK(h.is_quarantined("agent-B")); // untouched
+    }
+}
+
+// gov Gate 3 (quality-engineer): a store-level test proving
+// quarantine_device()/release_device() return a db_error:-prefixed message
+// on a genuine failure does NOT prove the ROUTE actually maps that to 503 --
+// the whole is_quarantine_db_error/kQuarantineDbErrorPrefix classification
+// chain, plus the is_open()-guard and audit-on-failure fixes from this same
+// governance round, had ZERO REST-layer coverage. Force a genuine store
+// failure (not a business error) by dropping the schema out from under an
+// already-open store: open_ is cached at construction (never re-verified),
+// so the route's is_open() guard passes and the query fails live.
+TEST_CASE("REST routes answer 503 (not 400) on a genuine store failure, and audit it "
+          "(gov Gate 3)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    QuarantineRouteHarness h(qpool);
+    REQUIRE(h.quarantine_store.quarantine_device("agent-B", "seed", "pre-seeded", "").has_value());
+
+    {
+        pg::PgConn conn{PQconnectdb(qdb.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(), "DROP SCHEMA quarantine_store CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    SECTION("POST") {
+        auto res = h.post(R"({"agent_id":"agent-new","reason":"test"})");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        REQUIRE(h.audit_calls.size() == 1);
+        CHECK(h.audit_calls[0].action == "quarantine.enable");
+        CHECK(h.audit_calls[0].result == "failure");
+        CHECK(h.audit_calls[0].detail.starts_with("db_error: "));
+    }
+    SECTION("DELETE") {
+        auto res = h.del("agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        REQUIRE(h.audit_calls.size() == 1);
+        CHECK(h.audit_calls[0].action == "quarantine.disable");
+        CHECK(h.audit_calls[0].result == "failure");
+        CHECK(h.audit_calls[0].detail.starts_with("db_error: "));
+    }
+    SECTION("GET") {
+        auto res = h.get();
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("agent-B") == std::string::npos);
+    }
+}
+
+// gov Gate 3 (quality-engineer): the audit-on-failure fix (this governance
+// round) has no test proving the BUSINESS-error (400) branch audits too --
+// only the unwired-scope-gate (500) branch had coverage before this.
+TEST_CASE("REST POST/DELETE audit a business-error (400) failure, not just success/500 "
+          "(gov Gate 3)",
+          "[rest][quarantine][authz][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qdb, quarantine_route_tpl);
+    pg::PgPool qpool{{.conninfo = qdb.dsn(), .size = 4}};
+    SECTION("POST: already quarantined") {
+        QuarantineRouteHarness h(qpool);
+        REQUIRE(h.post(kBody)->status == 201);
+        auto res = h.post(kBody);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE(h.audit_calls.size() == 2); // first success, then this failure
+        CHECK(h.audit_calls[1].action == "quarantine.enable");
+        CHECK(h.audit_calls[1].result == "failure");
+        CHECK(h.audit_calls[1].detail == "device is already quarantined");
+    }
+    SECTION("DELETE: not quarantined") {
+        QuarantineRouteHarness h(qpool);
+        auto res = h.del("agent-never-quarantined");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE(h.audit_calls.size() == 1);
+        CHECK(h.audit_calls[0].action == "quarantine.disable");
+        CHECK(h.audit_calls[0].result == "failure");
+        CHECK(h.audit_calls[0].detail == "device is not quarantined");
     }
 }
