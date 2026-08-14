@@ -303,6 +303,21 @@ void bump_deprovision_unlinked(auth::AuthManager* auth_mgr) {
         m->counter("yuzu_scim_deprovision_unlinked_total").increment();
 }
 
+/// ADR-2001 #3072 — the SAML analogue of `bump_deprovision_unlinked`/
+/// `yuzu_scim_deprovision_unlinked_total`: a deprovision resolved NO linked
+/// SAML identity for a slug, but a recorded SAML login observation shows a
+/// NameID matching that slug's externalId — the user DID authenticate via
+/// SAML but the identity link never formed (either a non-linkable NameID
+/// Format, or a genuine store hiccup on the write side). SEPARATE counter
+/// from the OIDC one — the two federation protocols are independently
+/// actionable signals.
+void bump_deprovision_saml_unlinked(auth::AuthManager* auth_mgr) {
+    if (!auth_mgr)
+        return;
+    if (auto* m = auth_mgr->metrics_registry())
+        m->counter("yuzu_scim_deprovision_saml_unlinked_total").increment();
+}
+
 // ── Audit ────────────────────────────────────────────────────────────────
 
 /// Emit a SCIM audit row. AuditStore::log is [[nodiscard]] bool; per the
@@ -819,6 +834,39 @@ void maybe_flag_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_mgr,
     bump_deprovision_unlinked(auth_mgr);
 }
 
+/// ADR-2001 #3072 — SAML analogue of `maybe_flag_d2_unlinked` above. Fires
+/// the SAML D2 tripwire when `resource`'s scim_id has NO linked SAML
+/// identity AND a recorded SAML login observation shows a NameID matching
+/// its externalId. MUST query `saml_links_for_scim_id` SPECIFICALLY — never
+/// `links_for_scim_id` (OIDC) or a `principals.size()` proxy — mirroring the
+/// PR4a C2 lesson `maybe_flag_d2_unlinked` already learned: an OIDC link
+/// coexisting on the same scim_id must never mask a missing SAML link, and
+/// vice-versa. `scim_store`/`auth_mgr` may be null (defense in depth,
+/// matching every other helper on this surface); a no-op then.
+void maybe_flag_saml_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_mgr,
+                                 const ScimResource& resource) {
+    if (!scim_store || resource.external_id.empty())
+        return;
+    auto saml_links = scim_store->saml_links_for_scim_id(resource.scim_id);
+    if (!saml_links.has_value()) {
+        spdlog::warn("ScimRoutes: SAML D2 — saml_links_for_scim_id lookup failed for "
+                    "scim_id={} (store blip); skipping the unlinked-SAML tripwire check "
+                    "rather than risk a false positive off an unconfirmed read",
+                    resource.scim_id);
+        return;
+    }
+    if (!saml_links->empty())
+        return; // a SAML link IS formed for this scim_id — nothing to flag
+    auto observed = scim_store->saml_observation_matches(resource.external_id);
+    if (!observed.has_value() || !*observed)
+        return; // nullopt (store blip) or a genuine no-match — skip either way
+    spdlog::warn("ScimRoutes: deprovision of '{}' (scim_id={}) found a SAML login observation "
+                "matching externalId '{}' but no formed saml_identity_link — the user "
+                "authenticated via SAML but the identity was never linked",
+                resource.username, resource.scim_id, resource.external_id);
+    bump_deprovision_saml_unlinked(auth_mgr);
+}
+
 /// ADR-2001 §§1,3 — resolve the deprovision principal set for `resource` and
 /// revoke credentials (tokens then sessions, per principal) across it,
 /// credentials-FIRST, before the caller proceeds to mark the account
@@ -857,6 +905,7 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
         return false;
     }
     maybe_flag_d2_unlinked(scim_store, auth_mgr, resource);
+    maybe_flag_saml_d2_unlinked(scim_store, auth_mgr, resource);
     if (!token_store || !token_store->is_open()) {
         spdlog::error("ScimRoutes: ApiTokenStore unavailable — refusing to deprovision '{}' "
                      "(scim_id={}) without being able to revoke its credentials",

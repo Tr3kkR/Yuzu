@@ -42,6 +42,7 @@ using yuzu::server::saml::is_linkable_name_id_format;
 using yuzu::server::saml::link_saml_login_to_scim;
 using yuzu::server::saml::saml_login_denied_deprovisioned;
 using yuzu::server::saml::SamlLoginDenyDecision;
+using yuzu::server::saml::SamlScimLinkOutcome;
 
 namespace {
 
@@ -91,8 +92,9 @@ TEST_CASE("link_saml_login_to_scim: exactly-one active match with a persistent F
     auto resource = store.create_resource("alice", "alice@example.com");
     REQUIRE(resource.has_value());
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "alice@example.com",
-                            kPersistent);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "alice@example.com", kPersistent);
+    CHECK(outcome == SamlScimLinkOutcome::linked);
 
     auto links = store.saml_links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
@@ -113,8 +115,9 @@ TEST_CASE("link_saml_login_to_scim: exactly-one active match with the SAML 1.1 e
     auto resource = store.create_resource("bob", "bob@example.com");
     REQUIRE(resource.has_value());
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "bob@example.com",
-                            kEmail11);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "bob@example.com", kEmail11);
+    CHECK(outcome == SamlScimLinkOutcome::linked);
 
     auto links = store.saml_links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
@@ -137,8 +140,9 @@ TEST_CASE("link_saml_login_to_scim: a transient NameID Format forms NO link — 
     // externalId matches EXACTLY — only the Format is unstable. If the
     // Format gate were removed, this would form a link (mis-linking a
     // per-login-reassigned identifier into a durable row).
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "carol@example.com",
-                            kTransient);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "carol@example.com", kTransient);
+    CHECK(outcome == SamlScimLinkOutcome::not_linkable);
 
     // MUTATION-CHECK (manually verified during development): removing the
     // `if (!is_linkable_name_id_format(name_id_format)) return;` guard in
@@ -148,6 +152,18 @@ TEST_CASE("link_saml_login_to_scim: a transient NameID Format forms NO link — 
     auto links = store.saml_links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
     CHECK(links->empty());
+
+    // ADR-2001 #3072 — the observation is still recorded UNCONDITIONALLY,
+    // before this gate, even though the format is unstable/unlinkable.
+    // MUTATION-CHECK (task spec): moving the
+    // `record_saml_login_observation` call to AFTER the
+    // `is_linkable_name_id_format` gate makes this assertion fail (a
+    // transient-format login would then record nothing) — confirming this
+    // is the D2-observability half of the fix, not just the link-formation
+    // guard above.
+    auto observed = store.saml_observation_matches("carol@example.com");
+    REQUIRE(observed.has_value());
+    CHECK(*observed);
 
     // The login itself is independent of this call — mirrors
     // test_oidc_scim_link.cpp's fail-OPEN pattern: a session minted before
@@ -172,8 +188,9 @@ TEST_CASE("link_saml_login_to_scim: a missing/empty NameID Format forms NO link"
     auto resource = store.create_resource("dave", "dave@example.com");
     REQUIRE(resource.has_value());
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "dave@example.com",
-                            /*name_id_format=*/"");
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "dave@example.com", /*name_id_format=*/"");
+    CHECK(outcome == SamlScimLinkOutcome::not_linkable);
 
     auto links = store.saml_links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
@@ -192,12 +209,20 @@ TEST_CASE("link_saml_login_to_scim: zero matches forms no link", "[pg][saml][sci
     auto resource = store.create_resource("erin", "erin@example.com");
     REQUIRE(resource.has_value());
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
-                            "no-such-name-id@example.com", kPersistent);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "no-such-name-id@example.com", kPersistent);
+    CHECK(outcome == SamlScimLinkOutcome::no_active_match);
 
     auto links = store.saml_links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
     CHECK(links->empty());
+
+    // ADR-2001 #3072 — the observation is recorded even though no link
+    // formed (the D2 signal fires regardless of match outcome, mirroring
+    // the OIDC side's zero-match test).
+    auto observed = store.saml_observation_matches("no-such-name-id@example.com");
+    REQUIRE(observed.has_value());
+    CHECK(*observed);
 }
 
 // Mutation-check (ADR-2001 PR4a spec, mirrors test_oidc_scim_link.cpp's own
@@ -227,8 +252,9 @@ TEST_CASE("link_saml_login_to_scim: TWO active matches forms NO link (mis-link g
     REQUIRE(r2.has_value());
     REQUIRE(r1->scim_id != r2->scim_id);
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
-                            "dup-name-id@example.com", kPersistent);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "dup-name-id@example.com", kPersistent);
+    CHECK(outcome == SamlScimLinkOutcome::ambiguous_match);
 
     auto links1 = store.saml_links_for_scim_id(r1->scim_id);
     auto links2 = store.saml_links_for_scim_id(r2->scim_id);
@@ -240,13 +266,14 @@ TEST_CASE("link_saml_login_to_scim: TWO active matches forms NO link (mis-link g
 
 TEST_CASE("link_saml_login_to_scim: a null ScimStore is a safe no-op", "[saml][scim][2001]") {
     // Mirrors the "no PG configured" boot posture — must not crash.
-    link_saml_login_to_scim(nullptr, "https://idp.example.com/saml/metadata", "x@example.com",
-                            kPersistent);
+    auto outcome = link_saml_login_to_scim(nullptr, "https://idp.example.com/saml/metadata",
+                                           "x@example.com", kPersistent);
+    CHECK(outcome == SamlScimLinkOutcome::not_linkable);
     SUCCEED("did not throw");
 }
 
 TEST_CASE("link_saml_login_to_scim: a closed/unusable ScimStore is fail-OPEN — call returns "
-          "normally and a SAML session minted independently stays valid",
+          "normally (lookup_store_error) and a SAML session minted independently stays valid",
           "[pg][saml][scim][2001][failopen]") {
     // A store whose pool cannot deliver a connection (invalid conninfo)
     // reports !is_open(), so every ScimStore accessor called through it
@@ -256,9 +283,13 @@ TEST_CASE("link_saml_login_to_scim: a closed/unusable ScimStore is fail-OPEN —
     ScimStore broken_store{broken_pool};
     REQUIRE_FALSE(broken_store.is_open());
 
-    // Must not throw despite every underlying write failing.
-    link_saml_login_to_scim(&broken_store, "https://idp.example.com/saml/metadata",
-                            "failopen@example.com", kPersistent);
+    // Must not throw despite every underlying write failing. The store is
+    // non-null (unlike the null-store test above) so this reaches the
+    // linkable-format branch and the lookup itself reports store_error —
+    // distinguishable from a genuine no_active_match.
+    auto outcome = link_saml_login_to_scim(&broken_store, "https://idp.example.com/saml/metadata",
+                                           "failopen@example.com", kPersistent);
+    CHECK(outcome == SamlScimLinkOutcome::lookup_store_error);
     SUCCEED("did not throw despite a closed store");
 
     // The login itself is independent of this call (mint-then-link at the
@@ -314,8 +345,9 @@ TEST_CASE("link_saml_login_to_scim: yuzu_scim_saml_link_write_failures_total inc
     // pre-seed wiring in a unit test.
     const double before = metrics.counter("yuzu_scim_saml_link_write_failures_total").value();
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "frank@example.com",
-                            kPersistent, &metrics);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "frank@example.com", kPersistent, &metrics);
+    CHECK(outcome == SamlScimLinkOutcome::link_write_error);
 
     // The read succeeded (a real match existed) and the write failed (the
     // table is gone) — confirms this test exercises the WRITE-failure path,

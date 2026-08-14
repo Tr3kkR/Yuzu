@@ -1903,10 +1903,13 @@ the SCIM `externalId` (or an IdP left on `transient`) simply never forms a
 link — the SAML login still succeeds, but that identity is **unlinkable, and
 therefore unrevocable via SCIM deprovision**. This is the direct SAML
 analogue of the OIDC section's D2 case (a mismatched/misconfigured join
-claim) — with no equivalent detector: SAML has exactly one candidate join
-key (there is no `--saml-oidc-link-claim` knob to misconfigure among several
-candidates), so there is no "should-have-matched-a-different-candidate"
-signal to record, and no `saml_login_observations` table exists.
+claim), and — as of **#3072 (2026-08-14), SHIPPED** — SAML now has its own
+D2-style observability, described in "SAML D2 observability (#3072)" below.
+Unlike OIDC there is still no `--saml-scim-link-claim` knob to misconfigure
+among several candidates (SAML has exactly one candidate join key, the
+NameID itself), so #3072's detector shape necessarily differs from OIDC's
+D2 — see that section for the honest scope of what it can and cannot
+attribute.
 
 **Link formation (login-time, fail-open).** On a successful SAML login with a
 linkable NameID Format, Yuzu compares the NameID against
@@ -2043,6 +2046,159 @@ Tests: `tests/unit/server/test_saml_principal.cpp`,
 `test_saml_scim_link.cpp`, `test_saml_provider.cpp`, `test_saml_routes.cpp`,
 `test_scim_store_pg.cpp`, `test_scim_routes.cpp`,
 `test_auth_sso_identity.cpp`.
+
+### SAML D2 observability (#3072, SHIPPED 2026-08-14)
+
+Before #3072, SAML's version of D2 was a genuine, stated gap: unlike OIDC —
+which has a `--oidc-scim-link-claim` knob an operator can misconfigure among
+several candidate claims, and therefore a candidate to detect a mismatch
+against — SAML has exactly one join key (the NameID), so there was nothing
+to record a "should-have-matched" observation about. #3072 closes that gap
+with a SAML-shaped detector, not a copy of OIDC's: it splits the signal
+across **login time** (three new, always-on, observe-and-proceed signals)
+and **deprovision time** (one D2-style tripwire), because the two catch
+genuinely different failure shapes on SAML — see "Honest scope" below.
+
+**New table: `saml_login_observations` (`ScimStore` migration v5).** The
+SAML analogue of `oidc_login_observations` (§"D2" above) — keyed
+`(entity_id, name_id, name_id_format)` **unique**, secondary-indexed on
+`name_id` (`saml_observation_matches` looks up by `name_id` alone, which the
+3-column unique key does not serve). `name_id_format` is deliberately part
+of the uniqueness key rather than folded into `(entity_id, name_id)` alone:
+a later login presenting the same NameID value under a **stable** Format
+must not silently overwrite — and so erase — an earlier observation
+recorded under an **unstable** Format; each `(entity_id, name_id, format)`
+triple is its own row. Bounded upsert (`seen_at` refreshed on every login,
+one row per distinct NameID+Format pair) — no GC/retention obligation,
+matching `oidc_login_observations`' no-GC posture.
+
+`ScimStore::record_saml_login_observation(entity_id, name_id,
+name_id_format)` records **every** SAML login's NameID observation,
+including an unstable-Format one — it is called **before** the
+linkable-Format gate in `link_saml_login_to_scim`, unconditionally.
+Observe-only: the NameID is never normalized here, and this call never
+influences whether a link forms. `ScimStore::saml_observation_matches(name_id)`
+returns a tri-state `std::optional<bool>` mirroring `observation_matches`'
+OIDC contract: `nullopt` means the store could not answer (closed, lease
+timeout, failed statement) and the caller **must** skip rather than
+false-positive a "never seen"; engaged `true`/`false` are a genuine
+seen/not-seen answer.
+
+**`find_unique_active_by_external_id_checked` — the store-error-aware
+lookup #3072 needed to build the login-time signals.**
+`ScimStore::find_unique_active_by_external_id` (used by both OIDC and SAML
+link formation) always collapsed "zero matches", "ambiguous (>1) matches",
+and "the store could not answer" into the same `nullopt` — sufficient for
+link formation's fail-open posture, but not enough to drive a distinct
+audit verb per cause. The new `find_unique_active_by_external_id_checked`
+returns a 4-state `ActiveExternalIdLookupResult{status, resource}` —
+`matched` / `no_match` / `ambiguous` / `store_error` — with the identical
+underlying query and the identical ADR-2001 §2 mis-link guard (no `LIMIT 1`;
+more than one row is `ambiguous`, never an arbitrary pick). The plain
+`find_unique_active_by_external_id` is now a thin, byte-unchanged
+compatibility wrapper over it (`matched` → the resource, every other status
+→ `nullopt`) — every pre-existing caller (OIDC link formation, both
+providers' orphan/reprovision checks, SAML link formation, deny-at-login)
+keeps its exact prior behaviour.
+
+**`link_saml_login_to_scim` now returns a typed `SamlScimLinkOutcome`**
+(`saml_scim_link.hpp`) instead of `void` — `not_linkable` / `linked` /
+`no_active_match` / `ambiguous_match` / `lookup_store_error` /
+`link_write_error` — so `POST /saml/acs` can drive per-outcome audit/metric
+signals without re-deriving the cause. Every value is still a **proceed**
+outcome for the login itself: login-time linking stays fail-open by
+contract, unchanged from before #3072 (the PR4b deny-at-login backstop
+above is the only SAML-side path that can refuse the login).
+
+**Two new login-time audit verbs at `POST /saml/acs`, observe-and-proceed —
+these are NOT denies.** The SAML login still succeeds on every branch below;
+only the audit trail and a counter change:
+
+- `auth.saml.link_unmatched` (`result=failure`) — fires on
+  `SamlScimLinkOutcome::no_active_match` (`reason=
+  no_active_external_id_match;name_id_format=<format>`) **or**
+  `::ambiguous_match` (`reason=
+  ambiguous_active_external_id_match;name_id_format=<format>`). The two
+  causes share one audit action but bump **separate** counters
+  (`yuzu_scim_saml_link_unmatched_total` vs
+  `yuzu_scim_saml_link_ambiguous_total`) — an ambiguous `externalId` is a
+  distinct, more actionable misconfiguration (duplicate/stale SCIM data)
+  than ordinary IdP/SCIM drift, and stays separately countable in metrics
+  even though the audit `detail` already distinguishes the two by `reason=`.
+- `auth.saml.link_lookup_failed` (`result=failure`,
+  `reason=scim_store_unavailable`) — fires on `::lookup_store_error`: the
+  `ScimStore` lookup itself could not answer. Distinct from
+  `link_unmatched` so a store outage is never misread as "the identity has
+  no matching SCIM user."
+
+`::linked`, `::not_linkable`, and `::link_write_error` keep the pre-#3072
+behaviour — no new login-time audit row (`link_write_error` still bumps the
+pre-existing `yuzu_scim_saml_link_write_failures_total` inside
+`link_saml_login_to_scim` itself, unchanged).
+
+**Deprovision-time D2: `maybe_flag_saml_d2_unlinked`.** The SAML analogue of
+`maybe_flag_d2_unlinked` (§"D2" above) — fires when a deprovisioned
+resource's `externalId` has **zero** linked SAML identities
+(`ScimStore::saml_links_for_scim_id`) but a recorded SAML login observation
+shows a NameID matching that `externalId`. It queries
+`saml_links_for_scim_id` **specifically** — never OIDC's `links_for_scim_id`
+or a `principals.size()` proxy — mirroring the PR4a C2 lesson
+`maybe_flag_d2_unlinked` already learned: an OIDC link coexisting on the
+same `scim_id` must never mask a missing SAML link, and vice versa. Bumps
+the new `yuzu_scim_deprovision_saml_unlinked_total` counter; a store-error
+`saml_links_for_scim_id`/`saml_observation_matches` read is skipped rather
+than risking a false positive off an unconfirmed read (the identical
+fail-safe posture `maybe_flag_d2_unlinked` takes).
+
+**Honest scope — read this before treating #3072 as SAML's D2 in full.**
+The login-time signals and the deprovision-time D2 tripwire are
+**complementary, not overlapping**, because SAML's single-candidate-NameID
+model forces a split OIDC's multi-candidate-claim model does not need:
+
+- The **login-time signals** catch a **stable-Format** NameID that failed
+  to link — no active match, an ambiguous match, or a store error — at the
+  moment it happens, because at that moment the store lookup that would
+  answer "does this NameID match any active `externalId`" has already run
+  as part of ordinary link formation.
+- The **deprovision-time D2 tripwire** catches the complementary case: an
+  **unstable-Format** NameID (`transient`/`unspecified`/missing) whose
+  *value* nonetheless matches the deprovisioned resource's `externalId` —
+  a login that was never even attempted as a link (the Format gate skipped
+  the lookup entirely), but whose observation record still lets deprovision
+  time notice the value would have matched.
+- **What neither one attributes: a stable-Format NameID that never matches
+  any `externalId`, discovered only at deprovision time.** SAML has no
+  second candidate the way OIDC's `sub`/`oid` pair does, so there is no
+  second value to re-check against the deprovisioned resource's
+  `externalId` after the fact — attributing that case at deprovision time
+  would mean guessing, and a guessed CC6.8 attribution is worse than an
+  honestly-absent one. This case is caught at **login time instead** (via
+  `link_unmatched`/`link_lookup_failed` above, which fire at the moment the
+  mismatch is observable) — true **deprovision-time** attribution for a
+  pure stable-Format drift case is deferred to **issue #3098** (a second
+  SAML join attribute, or an operator-configured mapping, would be needed
+  to give deprovision time a second candidate to check the way OIDC's `oid`
+  gives D2 one).
+
+New metrics: `yuzu_scim_saml_link_unmatched_total`,
+`yuzu_scim_saml_link_ambiguous_total`,
+`yuzu_scim_saml_link_lookup_failures_total`,
+`yuzu_scim_deprovision_saml_unlinked_total` — see
+`docs/user-manual/metrics.md` "SCIM deprovision-linkage metrics" for the
+operator-facing description of each, and
+`docs/user-manual/rest-api.md`'s SCIM audit-actions table for the two new
+audit verbs.
+
+Implementation: `server/core/include/yuzu/server/scim_store.hpp` +
+`scim_store.cpp` (`saml_login_observations` table migration v5,
+`record_saml_login_observation`, `saml_observation_matches`,
+`find_unique_active_by_external_id_checked`), `server/core/src/
+saml_scim_link.{hpp,cpp}` (`SamlScimLinkOutcome`, the unconditional
+observation write), `server/core/src/auth_routes.cpp` (the two login-time
+audit/metric branches at `/saml/acs`), `server/core/src/scim_routes.cpp`
+(`maybe_flag_saml_d2_unlinked`), `server/core/src/server.cpp` (the four
+counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
+`test_scim_routes.cpp`, `test_scim_store_pg.cpp`.
 
 ## Granular RBAC (Phase 3)
 

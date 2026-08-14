@@ -1,6 +1,6 @@
 # ADR-2001 — SCIM ↔ OIDC identity linkage for deprovision (SOC 2 CC6.8)
 
-**Status:** Accepted (rev 3, 2026-08-12 — D1/D2/D3 decided; see "Decisions" below). **PR1+PR2+PR3 all SHIPPED** — the deny-at-login backstop (§4) has landed; see "Known residuals" for the honest scope of what it closes. **PR4a+PR4b (SAML addendum) also SHIPPED** — the SAML analogue of §4/PR3 has landed; see the addendum's item 8 for the honest scope of what it closes on the SAML side.
+**Status:** Accepted (rev 3, 2026-08-12 — D1/D2/D3 decided; see "Decisions" below). **PR1+PR2+PR3 all SHIPPED** — the deny-at-login backstop (§4) has landed; see "Known residuals" for the honest scope of what it closes. **PR4a+PR4b (SAML addendum) also SHIPPED** — the SAML analogue of §4/PR3 has landed; see the addendum's item 8 for the honest scope of what it closes on the SAML side. **#3072 (SAML D2 observability) also SHIPPED (2026-08-14)** — the SAML analogue of D2 above, shaped for SAML's single-candidate-NameID model; see the addendum's item 9 for the detector shape and the honest scope of what it can and cannot attribute, and issue #3098 for the one gap it deliberately does not close.
 **Authors:** Fraser Jarvis (@fjarvis)
 **Date:** 2026-08-12
 **Relates to:** ADR-0031 (`0031-engine-principal-store.md`), ADR-0017 (management-group confinement), ADR-0012 (PG store contract), the SCIM v2 provisioning surface, the OIDC stable-principal decision (#1837), and the #2021 SCIM role/provenance guard.
@@ -317,6 +317,94 @@ case) is in `docs/auth-architecture.md` → "SAML ↔ SCIM identity linkage",
 independently by the PR4b governance unhappy-path review and a Hermes
 access-review pass.
 
+**9. SAML D2 observability — #3072, SHIPPED 2026-08-14.** §"D2" above
+(under "The forks, analysed") notes SAML's version of D2 was, until now, a
+stated non-gap rather than a gap: OIDC's D2 exists to catch a misconfigured
+`--oidc-scim-link-claim` among several candidate claims (`sub`/`oid`), and
+SAML has no such knob — exactly one candidate join key, the NameID. That
+reasoning is still correct as far as it goes, but it left a real, distinct
+gap unaddressed: nothing recorded *whether* a SAML login had even been
+attempted for an `externalId` that later turned up unlinked at
+deprovision. #3072 closes that, with a detector shaped for SAML's
+single-candidate model rather than a re-skin of OIDC's multi-candidate one.
+
+A new `saml_login_observations` table (`ScimStore` migration v5, keyed
+`(entity_id, name_id, name_id_format)` unique, secondary-indexed on
+`name_id`) records every SAML login's NameID observation — including an
+unstable-Format one — **unconditionally**, before the NameID-Format
+linkable gate in `link_saml_login_to_scim` runs. This is the SAML analogue
+of §"Decisions"' D2 bullet ("record every OIDC login's attempted
+link-claim value... regardless of match"), adapted to a single candidate:
+there is nothing to choose among, but there is still a durable "a login
+was attempted under this value" fact worth keeping. `name_id_format` is
+part of the uniqueness key specifically so a later stable-Format login
+cannot silently overwrite an earlier unstable-Format observation of the
+same value.
+
+`link_saml_login_to_scim` now returns a typed `SamlScimLinkOutcome`
+(`not_linkable` / `linked` / `no_active_match` / `ambiguous_match` /
+`lookup_store_error` / `link_write_error`) instead of `void`, built on a
+new store-layer lookup, `find_unique_active_by_external_id_checked`, that
+distinguishes `no_match`/`ambiguous`/`store_error` where the pre-#3072
+`find_unique_active_by_external_id` collapsed all three into one `nullopt`
+(that plain function is now a byte-compatible wrapper over the checked
+one — every existing caller keeps its exact prior behaviour). Every
+`SamlScimLinkOutcome` value is still a **proceed** outcome for the login —
+login-time linking remains fail-open by contract, unchanged from PR4a;
+`no_active_match` and `ambiguous_match` each drive a login-time,
+observe-and-proceed audit row (`auth.saml.link_unmatched`, `detail`
+distinguishing the two by `reason=`) and a separate counter
+(`yuzu_scim_saml_link_unmatched_total` /
+`yuzu_scim_saml_link_ambiguous_total` — kept separate because an ambiguous
+`externalId` is a more actionable misconfiguration than ordinary drift);
+`lookup_store_error` drives `auth.saml.link_lookup_failed` and
+`yuzu_scim_saml_link_lookup_failures_total`, distinct from the two above
+so a store outage is never misread as "no matching SCIM user."
+
+At deprovision time, `maybe_flag_saml_d2_unlinked` (the direct SAML
+analogue of D2's `maybe_flag_d2_unlinked`) fires
+`yuzu_scim_deprovision_saml_unlinked_total` when a deprovisioned
+resource's `externalId` has zero rows in `saml_identity_links`
+(`ScimStore::saml_links_for_scim_id`, queried **specifically** — never
+OIDC's `links_for_scim_id`, and never a `principals.size()` proxy, the
+same C2-derived discipline item 6 above already applies to the ordinary
+SAML revoke pass) but a `saml_login_observations` row shows a NameID
+matching that `externalId`.
+
+**The honest split — why this is two detectors, not one, and what neither
+one covers.** Login-time and deprovision-time catch genuinely different
+SAML failure shapes, not the same shape observed twice:
+
+- *Login-time* (`link_unmatched`/`link_lookup_failed`) fires for a
+  **stable-Format** NameID whose active-`externalId` lookup actually ran
+  and returned zero/ambiguous/error — because a stable-Format login always
+  reaches that lookup as part of ordinary link formation.
+- *Deprovision-time* (`maybe_flag_saml_d2_unlinked`) fires for an
+  **unstable-Format** NameID whose *value* matches — a login that never
+  reached the lookup at all (the Format gate short-circuited it), so only
+  the observation record, checked later, can surface the match.
+- **Neither one attributes a stable-Format NameID that never matches any
+  `externalId`, if that fact is only discovered at deprovision time.**
+  OIDC's D2 can re-check a *second* candidate claim (`oid`) against the
+  deprovisioned resource after the fact; SAML has no second candidate to
+  fall back to, so re-checking at deprovision time would mean guessing,
+  not detecting. This case is caught at **login time instead**
+  (`link_unmatched`'s `no_active_match` branch fires the moment the
+  mismatch is observable) — the detector is not blind to it, it simply
+  fires at a different point in the lifecycle than the OIDC reader might
+  expect. True **deprovision-time** attribution of a pure stable-Format
+  drift case — i.e., proving from deprovision-time evidence alone, without
+  relying on having caught the earlier login, that a given deprovisioned
+  slug's `externalId` was a SAML drift case — is deferred to **issue
+  #3098** (a second SAML join attribute, or an operator-configured
+  mapping, is the design space item #3098 opens; #3072 deliberately does
+  not attempt it, to avoid fabricating CC6.8 evidence from a
+  single-candidate join key).
+
+Full description (table schema, all four call sites, the audit-verb detail
+shapes, the metric descriptions): `docs/auth-architecture.md` "SAML D2
+observability (#3072)".
+
 ## Review provenance
 Rev 2 folds: architect B1 (`oid` unbuilt) + B2 (overload infeasible) + lease-nesting/reorder/resolver/index/helper notes; security-guardian F1 (D1), F2 (D2), F3 (single-issuer precondition, constraint 5), F4 (`oid`, constraint 3), F5 (constraint 4 wording), F6 (60s residual), F7 (generic deny redirect). Both reviews called the core reconciliation idea sound; the defects were in the provenance interaction and the fail-loud realizability, now surfaced as D1/D2.
 
@@ -330,3 +418,13 @@ deny-at-login backstop to SAML unchanged in shape (item 8 above) — no new
 review findings against the design beyond the ones §4/PR3 already resolved
 for OIDC; the LEFT-join/fail-closed/orphan-reprovision invariants carried
 over directly.
+
+#3072 (2026-08-14, item 9 above) closes the observability gap the addendum
+had, until then, correctly argued was a non-gap given SAML's
+single-candidate join key — the argument was sound for a claim-selection
+detector, but did not account for a value-observation detector, which
+needs no candidate selection to be worth building. Governance review
+confirmed the C2-derived `saml_links_for_scim_id`-specificity discipline
+(item 6 above) is correctly re-applied in `maybe_flag_saml_d2_unlinked`,
+and that the #3098 deferral is stated honestly rather than silently
+absorbed into #3072's scope.
