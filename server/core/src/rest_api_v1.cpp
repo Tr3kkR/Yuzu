@@ -333,6 +333,23 @@ static int access_review_error_status(const std::string& err) {
     return err.starts_with("not_found:") ? 404 : 503;
 }
 
+// LicenseStore (docs/adr/0048-...md) error mapping — three-way, unlike
+// access_review_error_status's binary shape: LicenseStore's own methods still validate some
+// inputs internally (e.g. "license key already activated", "organization cannot be empty")
+// rather than pre-validating in the route, so a THIRD bucket is needed for those. `not_found: `
+// (license_store.hpp's machine-checkable idiom) -> 404; `kLicenseDbErrorPrefix` (a genuine
+// DB/lease failure) -> 503; anything else (validation / business-rule error) -> 400. Preserves
+// the pre-migration DELETE route's 404-for-missing-id behavior that a DeploymentStore-style
+// binary (prefix vs else) classifier would have regressed to 400 (ADR-0048 "Considered and
+// rejected").
+static int license_error_status(const std::string& err) {
+    if (err.starts_with("not_found:"))
+        return 404;
+    if (err.starts_with(yuzu::server::kLicenseDbErrorPrefix))
+        return 503;
+    return 400;
+}
+
 // A present-but-wrong-typed JSON body field (e.g. {"title": 5}) must degrade
 // to the default rather than throw nlohmann's type_error.302 out of
 // `body.value(key, default)` (-> uncaught -> 500). Mirrors MCP's
@@ -7889,19 +7906,30 @@ void RestApiV1::register_routes(
                 return;
             auto lic = license_store->get_active_license();
             if (!lic) {
+                res.status = license_error_status(lic.error());
+                res.set_content(detail::a4_error(res, lic.error()), "application/json");
+                return;
+            }
+            if (!lic->has_value()) {
                 res.set_content(ok_json(JObj().add("status", "none").str()), "application/json");
                 return;
             }
+            auto days = license_store->days_remaining();
+            if (!days) {
+                res.status = license_error_status(days.error());
+                res.set_content(detail::a4_error(res, days.error()), "application/json");
+                return;
+            }
             auto data = JObj()
-                            .add("id", lic->id)
-                            .add("organization", lic->organization)
-                            .add("seat_count", lic->seat_count)
-                            .add("seats_used", lic->seats_used)
-                            .add("issued_at", lic->issued_at)
-                            .add("expires_at", lic->expires_at)
-                            .add("edition", lic->edition)
-                            .add("status", lic->status)
-                            .add("days_remaining", license_store->days_remaining())
+                            .add("id", (*lic)->id)
+                            .add("organization", (*lic)->organization)
+                            .add("seat_count", (*lic)->seat_count)
+                            .add("seats_used", (*lic)->seats_used)
+                            .add("issued_at", (*lic)->issued_at)
+                            .add("expires_at", (*lic)->expires_at)
+                            .add("edition", (*lic)->edition)
+                            .add("status", (*lic)->status)
+                            .add("days_remaining", *days)
                             .str();
             res.set_content(ok_json(data), "application/json");
         });
@@ -7929,7 +7957,7 @@ void RestApiV1::register_routes(
 
             auto result = license_store->activate_license(lic, key);
             if (!result) {
-                res.status = 400;
+                res.status = license_error_status(result.error());
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
@@ -7947,12 +7975,13 @@ void RestApiV1::register_routes(
             if (!perm_fn(req, res, "License", "Write"))
                 return;
             auto id = req.matches[1].str();
-            if (license_store->remove_license(id)) {
+            auto removed = license_store->remove_license(id);
+            if (removed) {
                 audit_fn(req, "license.remove", "success", "License", id, "");
                 res.set_content(ok_json(JObj().add("removed", true).str()), "application/json");
             } else {
-                res.status = 404;
-                res.set_content(detail::a4_error(res, "license not found"), "application/json");
+                res.status = license_error_status(removed.error());
+                res.set_content(detail::a4_error(res, removed.error()), "application/json");
             }
         });
 
@@ -7962,8 +7991,14 @@ void RestApiV1::register_routes(
                          return;
                      bool unack = req.has_param("unacknowledged");
                      auto alerts = license_store->list_alerts(unack);
+                     if (!alerts) {
+                         res.status = license_error_status(alerts.error());
+                         res.set_content(detail::a4_error(res, alerts.error()),
+                                         "application/json");
+                         return;
+                     }
                      JArr arr;
-                     for (const auto& a : alerts) {
+                     for (const auto& a : *alerts) {
                          arr.add(JObj()
                                      .add("id", a.id)
                                      .add("alert_type", a.alert_type)
@@ -7971,7 +8006,7 @@ void RestApiV1::register_routes(
                                      .add("triggered_at", a.triggered_at)
                                      .add("acknowledged", a.acknowledged));
                      }
-                     res.set_content(list_json(arr.str(), static_cast<int64_t>(alerts.size())),
+                     res.set_content(list_json(arr.str(), static_cast<int64_t>(alerts->size())),
                                      "application/json");
                  });
     }
