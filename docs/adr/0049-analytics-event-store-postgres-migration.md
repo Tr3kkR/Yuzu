@@ -77,8 +77,14 @@ The spool is transient by design and a **drained row is already delivered** — 
 nothing. The honest exception is **undrained rows at cutover**: in healthy operation that's
 bounded by the drain interval (≤10s of events), but if sinks were failing pre-upgrade it could be
 up to whatever backlog had accumulated. Recorded as a deliberate, bounded loss, not assumed by
-analogy to ResponseStore: no backfill, the legacy `analytics.db` is never read on upgrade, and a
-one-time loud boot log records the reset (matches the ResponseStore precedent's shape).
+analogy to ResponseStore: no backfill, the legacy `analytics.db` is never read on upgrade.
+**Correction (adversarial review, 2026-08-14):** the boot log recording this is a steady-state
+`info` line on every successful open, not a one-time warning — the ResponseStore precedent this
+originally matched has the identical shape (a `warn` that fires on every restart, not just the
+actual cutover boot), and copying it uncorrected would have shipped the same doc/code mismatch
+here. There is no cheap way to distinguish "this is the actual cutover boot" from "the 400th boot
+since," so the log is phrased as an ongoing fact ("analytics spool on Postgres — legacy
+analytics.db is not migrated"), not a one-time event notification.
 
 ### Secrets — none
 
@@ -188,8 +194,9 @@ flagged here explicitly for confirmation, per the kickoff doc's governance check
 ## Consequences
 
 - Any events undrained at Postgres cutover are lost (bounded by the drain interval in healthy
-  operation) — a one-time loud boot log + `changelog.d/` "Changed" fragment + a
-  `docs/user-manual`/`docs/upgrading.md` note record the deliberate reset.
+  operation) — a steady-state boot `info` log (not a one-time event, see the Backfill section's
+  correction above) + `changelog.d/` "Changed" fragment + a `docs/user-manual`/`docs/upgrading.md`
+  note record the deliberate reset.
 - `total_emitted()` semantics narrow slightly: an in-process atomic (matches the store's own
   documented "since opened" contract) rather than a durable `COUNT(*)` — a value that used to
   survive a process restart (by re-querying SQLite) now resets to 0 on restart, same as

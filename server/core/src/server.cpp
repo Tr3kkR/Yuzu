@@ -4055,10 +4055,42 @@ public:
                 analytics_store_.reset();
             } else {
                 analytics_store_->set_metrics(&metrics_);
-                spdlog::warn("[PG] analytics spool reset on Postgres cutover — the legacy "
-                             "analytics.db is not migrated (ADR-0049, skippable backfill class); "
-                             "any events undrained at cutover are lost, new events buffer "
-                             "normally from first boot");
+                // Bounded-label counters (ADR-0049) — described + pre-seeded
+                // per docs/observability-conventions.md's pre-seed-to-0 rule
+                // (adversarial review finding, 2026-08-14) so the family +
+                // HELP/TYPE are present on a healthy server and absent()
+                // alerts stay meaningful, matching the
+                // yuzu_server_mgmt_group_read_degrade_total /
+                // yuzu_server_discovery_read_degrade_total precedent above.
+                metrics_.describe("yuzu_server_analytics_emit_dropped_total",
+                                  "AnalyticsEventStore::emit() drops (fail-soft ingest, ADR-0049) "
+                                  "by reason (store_not_open/pool_acquire_timeout/query_error/"
+                                  "serialize_error) — never a silent swallow",
+                                  "counter");
+                for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error",
+                                          "serialize_error"})
+                    metrics_.counter("yuzu_server_analytics_emit_dropped_total",
+                                     {{"reason", reason}});
+                metrics_.describe("yuzu_server_analytics_read_degrade_total",
+                                  "AnalyticsEventStore query_recent/pending_count reads that "
+                                  "returned a degrade (nullopt) rather than a result, by method "
+                                  "and reason (store_not_open/pool_acquire_timeout/query_error)",
+                                  "counter");
+                for (const auto method : {"query_recent", "pending_count"})
+                    for (const auto reason :
+                        {"store_not_open", "pool_acquire_timeout", "query_error"})
+                        metrics_.counter("yuzu_server_analytics_read_degrade_total",
+                                         {{"method", method}, {"reason", reason}});
+                // info, not warn: this branch runs on EVERY successful open,
+                // i.e. every restart forever, not just the actual cutover
+                // boot (adversarial review finding, 2026-08-14) — a warn
+                // here would cry wolf on every routine restart after the
+                // real cutover already happened once. Steady-state fact,
+                // not an event.
+                spdlog::info("[PG] analytics spool on Postgres (schema analytics_event_store) — "
+                             "legacy analytics.db is not migrated (ADR-0049, skippable backfill "
+                             "class); events undrained at the original cutover were lost then, "
+                             "new events buffer normally");
                 if (!cfg_.analytics_jsonl_path.empty()) {
                     analytics_store_->add_sink(make_jsonlines_sink(cfg_.analytics_jsonl_path));
                 }

@@ -589,8 +589,10 @@ authoritative or compliance evidence (ADR-0009 skippable backfill), so the
 legacy `analytics.db` is **never read** on upgrade.
 
 **What happens on first PG boot:**
-- The server logs a one-time `analytics spool reset on Postgres cutover`
-  warning.
+- The server logs `[PG] analytics spool on Postgres ...` at info level — this
+  line appears on every subsequent restart too (it states the store's
+  steady-state configuration, not a one-time cutover event), so don't expect
+  it to disappear after the first boot.
 - Any events buffered but not yet drained to a sink at the moment of cutover
   are lost. In healthy operation this is bounded by the drain interval
   (10s default); if a sink was failing before the upgrade, whatever backlog

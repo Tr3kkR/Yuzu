@@ -6,11 +6,17 @@
 /// background thread drains undrained rows to registered `AnalyticsEventSink`s
 /// in batches. Not operator state — expendable, best-effort telemetry.
 ///
-/// Posture (ADR-0012 §1 / ADR-0049): CONSTRUCTION is fail-closed like every
-/// other Postgres-backed store (a reachable database whose schema can't be
-/// migrated is a deploy error) — but only when the feature is enabled
-/// (`--analytics-drain-interval`'s sibling `cfg_.analytics_enabled`); the
-/// store is simply not constructed when the feature is off. RUNTIME ingest is
+/// Posture (ADR-0012 §1 / ADR-0049): CONSTRUCTION is a DELIBERATE DIVERGENCE
+/// from the playbook's fatal-on-migration-failure default — unlike every
+/// other Postgres-backed store, a migration/open failure here leaves
+/// `is_open()` false rather than failing server startup: `server.cpp` logs
+/// and disables the feature for the run (`analytics_store_.reset()`) instead
+/// of setting `startup_failed_`, because every caller already null-guards
+/// this store and analytics defaults ON, so gating boot on this one
+/// non-critical table would contradict its own fail-soft posture. See
+/// ADR-0049 §"Construction posture" for the full argument. The store is
+/// simply not constructed at all when `--no-analytics`
+/// (`cfg_.analytics_enabled = false`) is passed. RUNTIME ingest is
 /// fail-SOFT (`emit()` never blocks or throws into the calling request path —
 /// writers include the auth/SCIM routes) and reads (`query_recent`,
 /// `pending_count`) are degrade-distinguishable at the seam
