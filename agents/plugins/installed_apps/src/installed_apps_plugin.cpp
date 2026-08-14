@@ -175,9 +175,12 @@ using namespace yuzu::installed_apps::reg_utf8;
 // RAII closer for an HKEY. Closing every handle into a RegLoadKeyW-mounted hive
 // BEFORE the unload is load-bearing: RegUnLoadKeyW fails (ERROR_ACCESS_DENIED)
 // while any subtree handle is open, so a leaked HKEY on a throw path would defeat
-// the HiveUnloadGuard in do_list_per_user. Destruction order guarantees these
-// callee handles close as the exception leaves enumerate_uninstall_key, before
-// the caller's unload guard runs (#1662 Gate-8).
+// the unload guard. Destruction order guarantees these callee handles close as
+// the exception leaves enumerate_uninstall_key, before the caller's unload guard
+// runs (#1662 Gate-8). Since #2771 that guard is agents/shared/win_reg_handle.hpp's
+// ScopedUserHive (do_list_per_user's own HiveUnloadGuard was deleted, migrated
+// onto the shared ladder) -- this file's HKeyCloser itself is unchanged and still
+// used for every enumerate_uninstall_key call, hive-mounted or not.
 struct HKeyCloser {
     HKEY h;
     explicit HKeyCloser(HKEY k) : h(k) {}

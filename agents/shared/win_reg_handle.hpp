@@ -1,13 +1,20 @@
 // win_reg_handle.hpp -- RAII owners for HKEY and RegLoadKeyW-mounted hives.
 //
-// Canonical home for the HKEY-RAII pattern (PR1.7). Six independent copies of
-// this shape exist across the tree (licensing_win.cpp's HKeyCloser/
-// HiveUnloadGuard, installed_apps_plugin.cpp's function-local closer,
-// tar_mapdrive_collector.cpp's RegKeyGuard/HiveUnloadGuard, plus .put()-style
-// wrappers in rdp_control_plugin.cpp and tar_software_collector.cpp) --
-// mirrors the win_sc_handle.hpp (#1822) precedent of landing a shared header
-// first; sweeping the existing call sites onto it is a separate follow-up,
-// matching that precedent's own note about win_str.hpp/#1681.
+// Canonical home for the HKEY-RAII pattern (PR1.7). Originally six
+// independent copies of this shape existed across the tree; #2771 swept the
+// three HiveUnloadGuard copies feeding the per-user hive ladder specifically
+// (licensing_win.cpp's, installed_apps_plugin.cpp's, tar_mapdrive_collector
+// .cpp's -- all deleted, replaced by ScopedUserHive) onto this header. Their
+// sibling plain-HKEY closers remain as local types in three of those same
+// files (licensing_win.cpp's HKeyCloser, installed_apps_plugin.cpp's
+// function-local HKeyCloser, tar_mapdrive_collector.cpp's RegKeyGuard) --
+// they are still used for OTHER (non-hive-mount) opens in those files, e.g.
+// enumerate_uninstall_key, WinRegProbeHost, MRU/network-drive reads, and
+// were out of this PR's scope. rdp_control_plugin.cpp's and
+// tar_software_collector.cpp's .put()-style wrappers are likewise untouched.
+// Sweeping any of these remaining copies onto RegKey is a separate
+// follow-up, matching the win_sc_handle.hpp (#1822) precedent's own note
+// about win_str.hpp/#1681.
 //
 // Windows-only by construction (#ifdef _WIN32); the header is empty
 // elsewhere.
@@ -49,11 +56,18 @@ namespace yuzu::win {
 /// from under another's open handles, and a crashed process's stale mount no
 /// longer poisons a fixed name forever.
 ///
-/// WHAT IT DOES NOT FIX: two concurrent OFFLINE reads of the same logged-out
-/// profile still cannot both succeed. RegLoadKeyW opens the hive FILE with
-/// exclusive access, so the loser now fails with ERROR_SHARING_VIOLATION
-/// instead of a name collision — a different error, not a working read. Do
-/// not describe the collision as resolved.
+/// WHAT IT DOES NOT FIX ON ITS OWN: RegLoadKeyW opens the hive FILE with
+/// exclusive access, so this salt alone would not let two concurrent
+/// OFFLINE reads of the same logged-out profile both succeed -- the loser
+/// would fail with ERROR_SHARING_VIOLATION instead of a name collision, a
+/// different error, not a working read. That race IS closed, but by
+/// with_user_hive's offline_hive_mutex (win_profiles.hpp), NOT by this
+/// salt -- the mutex serialises the whole offline arm process-wide, so a
+/// second in-process caller queues and then succeeds rather than racing
+/// the file lock at all (#2771 code-review CODEX-P1-04). The residual this
+/// salt-plus-mutex pair does NOT reach is a mount from OUTSIDE this
+/// process -- a second agent instance, or an external `reg load` -- which
+/// still contends for the same exclusive file lock unguarded.
 [[nodiscard]] inline std::wstring unique_hive_mount_name(std::wstring_view sid) {
     static constexpr wchar_t kHex[] = L"0123456789abcdef";
     static const std::uint64_t base = [] {
@@ -141,9 +155,13 @@ private:
 // outlive the mount -- there is no other way to obtain one.
 //
 // Callers should derive `mount_name` from unique_hive_mount_name() rather
-// than a fixed string, so two callers cannot alias one another's mount. That
-// does NOT let two concurrent offline reads of the SAME profile both succeed
-// -- RegLoadKeyW holds the hive file exclusively; see that function's note.
+// than a fixed string, so two callers cannot alias one another's mount.
+// Within this agent process, `with_user_hive` (win_profiles.hpp) additionally
+// serialises the whole offline arm through offline_hive_mutex(), so two
+// in-process callers targeting the same profile queue rather than race the
+// exclusive hive-file lock -- see that function's note and
+// unique_hive_mount_name()'s doc comment for the residual this pair does
+// NOT reach (a mount from outside this process).
 class ScopedUserHive {
 public:
     /// Attempts RegLoadKeyW(HKEY_USERS, mount_name, hive_file_path) immediately.

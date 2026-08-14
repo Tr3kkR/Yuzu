@@ -14,8 +14,10 @@
  * ADR-0024 D11 invariant (binds this header, not just license_scan's per-user
  * records): when a profile's display name cannot be resolved,
  * ProfileInfo::profile_name stays EMPTY — it must NEVER fall back to the SID.
- * installed_apps_plugin.cpp's `username = sid` fallback does not follow this
- * rule; this header deliberately does not clone it.
+ * installed_apps_plugin.cpp's do_list_per_user originally carried a
+ * `username = sid` fallback that violated this rule; #2771 migrated it onto
+ * this header (which renders the empty case as "-" for display, never the
+ * SID) rather than cloning the old fallback.
  */
 
 #include <cctype>

@@ -175,8 +175,24 @@ inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
         }
         out.push_back(std::move(rec));
     }
-    if (truncated)
-        *truncated = (out.size() >= kMaxProfiles);
+    if (truncated) {
+        // #2771 code-review C-M3: `out.size() >= kMaxProfiles` means "the cap
+        // was REACHED", not "records were DROPPED" -- a host with EXACTLY
+        // kMaxProfiles subkeys hits the former without the latter, and the
+        // old check reported truncation on a complete list. One extra
+        // RegEnumKeyExW probe (nothing is stored from it) settles whether a
+        // NEXT entry actually exists before claiming anything was lost.
+        // license_scan turns a false truncated=true into a false ok=false
+        // surface failure, so this is not cosmetic.
+        if (out.size() >= kMaxProfiles) {
+            wchar_t probe_buf[kSidBufLen]{};
+            DWORD probe_len = kSidBufLen;
+            *truncated = (RegEnumKeyExW(profiles.get(), idx, probe_buf, &probe_len, nullptr,
+                                       nullptr, nullptr, nullptr) == ERROR_SUCCESS);
+        } else {
+            *truncated = false;
+        }
+    }
     return out;
 }
 
@@ -202,9 +218,10 @@ inline std::vector<std::string> enumerate_hku_subkeys() {
 // and SeRestorePrivilege enabled (granted by
 // scripts/install-agent-user.ps1; a hardened install may strip them) -- and
 // restores the token's PRIOR attributes for that privilege on scope exit.
-// licensing_win.cpp's enable_privilege (the accepted precedent this ladder
-// was ported from) leaves the privilege enabled for the rest of the
-// process; this type closes that gap without touching that file. Checks
+// licensing_win.cpp's enable_privilege (the shape this ladder was ported
+// from, and the process-wide privilege leak it carried) is deleted as of
+// #2771 -- license_scan now calls this type via with_user_hive like every
+// other consumer. Checks
 // GetLastError()==ERROR_SUCCESS after the enabling AdjustTokenPrivileges,
 // which "succeeds" even when the privilege is absent from the token
 // entirely (ERROR_NOT_ALL_ASSIGNED) -- a bare return-value check would
@@ -333,6 +350,21 @@ using yuzu::agent::offline_hive_mutex;
 // doc comment for the common transient-holder case reboot isn't actually
 // required for). yuzu::profiles::render_hive_access_lines turns a report
 // into the operator-facing lines.
+//
+// Two residuals, recorded explicitly per code-review C-L4/C-L5 (the
+// fork_lock.hpp precedent for stating a lock's own residual rather than
+// letting a reader assume it is airtight):
+// - `fn` runs under offline_hive_mutex() for the WHOLE offline arm (privilege
+//   enable through unload) -- it must not re-enter this function (self-
+//   deadlock, non-recursive mutex) and must not block for long, the same
+//   discipline fork_lock.hpp asks of its own callers.
+// - PrivilegeScope enables SeBackup/SeRestore on the PROCESS token, not a
+//   thread token, so for the duration of an offline mount every thread in
+//   the agent process technically has those privileges available (e.g. to
+//   FILE_FLAG_BACKUP_SEMANTICS opens elsewhere) -- a strict improvement over
+//   the pre-#2771 license_scan, which left them enabled for the rest of the
+//   process, but a thread-token-scoped enable (ImpersonateSelf +
+//   OpenThreadToken) would confine this further. Not done here.
 template <typename Fn>
 HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profile_path_utf8,
                                 Fn&& fn, HiveAccessReport* report = nullptr) {
@@ -415,12 +447,35 @@ inline ReadValueStatus read_reg_value(HKEY root, const std::string& value_name,
     if (RegQueryValueExW(root, wname.c_str(), nullptr, &type, nullptr, &size) != ERROR_SUCCESS)
         return ReadValueStatus::not_found;
 
-    const bool exceeds_cap = size > kMaxRegValueBytes;
+    bool exceeds_cap = size > kMaxRegValueBytes;
     if (exceeds_cap)
         size = kMaxRegValueBytes;
 
     std::vector<BYTE> data(size);
-    if (RegQueryValueExW(root, wname.c_str(), nullptr, &type, data.data(), &size) != ERROR_SUCCESS) {
+    LSTATUS read_rc = RegQueryValueExW(root, wname.c_str(), nullptr, &type, data.data(), &size);
+    if (read_rc == ERROR_MORE_DATA && !exceeds_cap) {
+        // #2771 code-review CODEX-P1-02: a value that GROWS between the size
+        // query and the data query (an ordinary race with a concurrent
+        // writer, not exotic) also returns ERROR_MORE_DATA here even though
+        // the first size we saw was under the cap -- treating that
+        // identically to "the value was deleted" would report a value that
+        // demonstrably EXISTS as `not_found`, contradicting this function's
+        // whole "distinguish absence from failure" purpose. One bounded
+        // retry against a freshly queried size closes the race rather than
+        // reporting a false negative; if it still doesn't fit, the value has
+        // grown past the cap, which IS oversized.
+        DWORD fresh_size = 0;
+        if (RegQueryValueExW(root, wname.c_str(), nullptr, &type, nullptr, &fresh_size) ==
+            ERROR_SUCCESS) {
+            exceeds_cap = fresh_size > kMaxRegValueBytes;
+            size = exceeds_cap ? kMaxRegValueBytes : fresh_size;
+            data.assign(size, BYTE{0});
+            read_rc = RegQueryValueExW(root, wname.c_str(), nullptr, &type, data.data(), &size);
+        } else {
+            read_rc = ERROR_FILE_NOT_FOUND; // genuinely gone by the retry
+        }
+    }
+    if (read_rc != ERROR_SUCCESS) {
         // A capped buffer that was too small for the real value surfaces
         // here as ERROR_MORE_DATA -- an honestly oversized value, not a
         // missing one. Any other failure at this point is a genuine miss
@@ -464,15 +519,21 @@ inline ReadValueStatus read_reg_value(HKEY root, const std::string& value_name,
         // operator error/type taxonomy rather than silently accepted.
         static_assert(sizeof(wchar_t) == sizeof(char16_t),
                       "REG_MULTI_SZ decoding assumes UTF-16 wchar_t (Windows)");
-        // reinterpret_cast justification (code-review Standards S7): `data`
-        // is a std::vector<BYTE> sized/filled directly by RegQueryValueExW
-        // for a REG_MULTI_SZ value, which the Win32 ABI guarantees is
-        // 2-byte-aligned UTF-16 -- vector's own allocator already gives
-        // >=alignof(char16_t) for any non-trivial size, so this differs from
-        // an arbitrary byte buffer. Read-only (const), no ownership transfer
+        // reinterpret_cast justification (code-review Standards S7, revised
+        // per CODEX-P1-03): alignment comes from the C++ ALLOCATOR, not a
+        // Win32 promise -- std::vector<BYTE>'s default allocator calls
+        // operator new, which returns storage aligned to
+        // alignof(std::max_align_t) regardless of the vector's element type;
+        // that is >= alignof(char16_t) unconditionally, verified empirically
+        // (20 trials, odd and even sizes, always max_align_t-aligned).
+        // Win32 has no say in it either way -- RegQueryValueExW only knows
+        // it was handed an LPBYTE. Read-only (const), no ownership transfer
         // -- `chars` borrows `data`'s lifetime for this function's duration
-        // only. Same shape as the pre-existing, unchanged REG_SZ branch two
-        // cases above.
+        // only. This is the SAME cast shape as the pre-existing, UNCHANGED
+        // REG_SZ branch two cases above (also reinterpret_cast<const
+        // wchar_t*> over this same std::vector<BYTE>) -- not a new risk
+        // profile this PR introduces, and not something this PR's scope
+        // extends to fixing project-wide.
         const auto* chars = reinterpret_cast<const char16_t*>(data.data());
         const std::size_t nch = size / sizeof(wchar_t);
         out_value.clear();
@@ -489,8 +550,16 @@ inline ReadValueStatus read_reg_value(HKEY root, const std::string& value_name,
         break;
     }
     case REG_LINK:
-        // A symbolic-link target: a string, not opaque bytes.
-        out_value = reg_sz_to_utf8(reinterpret_cast<const wchar_t*>(data.data()), size);
+        // A symbolic-link target: a string, not opaque bytes. Sanitised
+        // (#2771 code-review CODEX-P1-01): before this PR, REG_LINK fell
+        // into the hex-dump default branch below, which is inert against
+        // pipe/newline injection by construction. Decoding it as a raw
+        // string is what makes injection reachable here for the first
+        // time, so it gets the same treatment as REG_MULTI_SZ's records --
+        // a target containing '|' or a newline cannot forge a column or
+        // row in the output protocol.
+        out_value = yuzu::profiles::sanitize_field(
+            reg_sz_to_utf8(reinterpret_cast<const wchar_t*>(data.data()), size));
         out_type_name = "REG_LINK";
         break;
     default:

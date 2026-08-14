@@ -310,14 +310,33 @@ TEST_CASE("unique_hive_mount_name: produces distinct, well-formed names",
     CHECK(m1.size() < 255);
     CHECK(m2.size() < 255);
 
-    // 1000 calls, no collisions -- exercises the counter wraparound path too
-    // (the same check the orchestrator ran manually during code review).
+    // 1000 calls, no collisions -- a distinctness sample, NOT a wraparound
+    // test (code-review CODEX-P1-06): the counter is std::uint64_t, so 1000
+    // iterations is nowhere near reachable wraparound territory. Same check
+    // the orchestrator ran manually during code review.
     std::vector<std::wstring> names;
     names.reserve(1000);
     for (int i = 0; i < 1000; ++i)
         names.push_back(yuzu::win::unique_hive_mount_name(sid));
     std::sort(names.begin(), names.end());
     CHECK(std::adjacent_find(names.begin(), names.end()) == names.end());
+}
+
+TEST_CASE("enumerate_profile_records: truncated means records were dropped, not "
+         "cap-reached (#2771 code-review C-M3)",
+         "[registry][windows]") {
+    // C-M3: the ORIGINAL check was `out.size() >= kMaxProfiles`, true for
+    // "hit the cap" whether or not a further profile actually existed -- a
+    // host with EXACTLY 512 raw ProfileList subkeys got a false truncation
+    // warning, and license_scan turned that into a false ok=false surface.
+    // Every real CI/dev host has far fewer than 512 profiles, so this pins
+    // the honest-case regression: truncated must be false when nothing was
+    // dropped, not merely "usually false because the cap is rarely hit".
+    bool ok = false;
+    bool truncated = true; // pre-set to the WRONG answer -- must be cleared
+    yuzu::win::enumerate_profile_records(ok, &truncated);
+    REQUIRE(ok);
+    CHECK_FALSE(truncated);
 }
 
 #endif // _WIN32
