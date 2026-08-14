@@ -222,10 +222,19 @@ groups:
 
   # ── yuzu-scim — ADR-2001 (SCIM ↔ OIDC/SAML identity-link revoke chokepoint,
   # CC6.8) ─────────────────────────────────────────────────────────────────
-  # All counters here are boot-seeded to 0 (never absent on a build that ships
-  # this feature), so the `increase(x[1h]) > 0` idiom is correct and
-  # `absent()` would be the wrong shape — see YuzuOnBehalfAssertionRejected
-  # above for the precedent this group follows.
+  # Every BARE (unlabeled) counter in this group is boot-seeded to 0 (never
+  # absent on a build that ships this feature — see server.cpp's bare-seed
+  # block), so the `increase(x[1h]) > 0` idiom catches even the FIRST
+  # occurrence and `absent()` would be the wrong shape for those rules — see
+  # YuzuOnBehalfAssertionRejected above for the precedent this group follows.
+  # The ONE exception is `yuzu_scim_audit_write_failures_total{action=...}`
+  # (YuzuScimAuditWriteFailures below): it carries a runtime `action` label
+  # the server cannot enumerate in advance, so it is a genuinely BORN-AT-1
+  # series — its first-ever `action` value has no zero sample to increase
+  # from, so `increase(...)>0` can lag one evaluation cycle on a truly
+  # isolated first failure of that action (it still fires reliably on
+  # recurrence/sustained failures, and does not affect any other counter in
+  # this group).
   - name: yuzu-scim
     rules:
       # D1: a SCIM deprovision refused to demote/deprovision a slug that is
@@ -303,7 +312,7 @@ groups:
       # Genuine deny (OIDC): the deny-at-login backstop refused a login for an
       # identity it could positively confirm was deprovisioned (not merely
       # store-unavailable — that is a SEPARATE counter,
-      # ..._deprovision_denied_store_unavailable_total, deliberately excluded
+      # ..._deprovisioned_denied_store_unavailable_total, deliberately excluded
       # here so a Postgres outage cannot trip this alert; #3069). Expected but
       # noteworthy — an operator may want to know a deprovisioned identity is
       # still attempting to log in.
@@ -323,7 +332,7 @@ groups:
             This is the GENUINE counter, not the total: a Postgres pool
             outage or a scim_store degrade denies logins too but increments
             only
-            yuzu_auth_oidc_deprovision_denied_store_unavailable_total, never
+            yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total, never
             this one, so a firing here means a genuinely deprovisioned
             identity is attempting to authenticate — expected if that account
             was recently deprovisioned, worth investigating if not. Correlate
@@ -345,7 +354,7 @@ groups:
             name_id)) it positively confirmed is deprovisioned. This is the
             GENUINE counter, not the total: a store-unavailable denial
             increments only
-            yuzu_auth_saml_deprovision_denied_store_unavailable_total, never
+            yuzu_auth_saml_deprovisioned_denied_store_unavailable_total, never
             this one — so a firing here means a genuinely deprovisioned SAML
             identity is attempting to authenticate, not a Postgres outage.
             Correlate via the auth.saml.deprovisioned_denied audit row.
@@ -397,7 +406,13 @@ groups:
             happened, which SOC 2 CC6.8 relies on being complete. Check the
             server log around the time of the failing action for the audit
             store write error (pool exhaustion, statement timeout, disk
-            pressure) and confirm no other SCIM mutations are affected.
+            pressure) and confirm no other SCIM mutations are affected. NOTE:
+            this counter is dynamically labeled by `action` and is NOT
+            boot-seeded (the server cannot enumerate every action value in
+            advance) — a truly isolated first failure of a given `action`
+            may lag up to one evaluation cycle before this rule fires;
+            treat a single fresh occurrence with that in mind, and rely on
+            recurrence/sustained failures for confident detection.
           runbook_url: "https://docs.yuzu.io/runbooks/scim-audit-write-failures"
 
   - name: yuzu-mcp

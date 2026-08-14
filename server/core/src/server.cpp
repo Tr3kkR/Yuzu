@@ -2208,7 +2208,7 @@ public:
                           "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
                           "closing the re-login-mints-fresh-tokens window. This is the SUM of "
                           "yuzu_auth_oidc_deprovisioned_denied_genuine_total and "
-                          "yuzu_auth_oidc_deprovision_denied_store_unavailable_total below — "
+                          "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total below — "
                           "alert on the genuine sub-counter, not this total (#3069)",
                           "counter");
         // #3069 — split the total above into a genuine-deny signal and a
@@ -2222,7 +2222,7 @@ public:
                           "re-login was refused) — the CC6.8-alertable signal; excludes "
                           "store-unavailable fail-closed denies",
                           "counter");
-        metrics_.describe("yuzu_auth_oidc_deprovision_denied_store_unavailable_total",
+        metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
                           "OIDC logins denied at /auth/callback because the ScimStore could not "
                           "be reached (fail-closed deny during a ScimStore outage) — an "
                           "AVAILABILITY signal, not a termination event; correlate with "
@@ -2240,7 +2240,7 @@ public:
                           "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
                           "closing the re-login-mints-fresh-tokens window. This is the SUM of "
                           "yuzu_auth_saml_deprovisioned_denied_genuine_total and "
-                          "yuzu_auth_saml_deprovision_denied_store_unavailable_total below — "
+                          "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total below — "
                           "alert on the genuine sub-counter, not this total (#3069)",
                           "counter");
         // #3069 — SAML analogue of the OIDC split above; same
@@ -2251,7 +2251,7 @@ public:
                           "re-login was refused) — the CC6.8-alertable signal; excludes "
                           "store-unavailable fail-closed denies",
                           "counter");
-        metrics_.describe("yuzu_auth_saml_deprovision_denied_store_unavailable_total",
+        metrics_.describe("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
                           "SAML logins denied at /saml/acs because the ScimStore could not be "
                           "reached (fail-closed deny during a ScimStore outage) — an "
                           "AVAILABILITY signal, not a termination event; correlate with "
@@ -2265,14 +2265,15 @@ public:
         // docs/observability-conventions.md).
         metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
         metrics_.counter("yuzu_scim_deprovision_unlinked_total");
+        metrics_.counter("yuzu_scim_provenance_denied_total");
         metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
         metrics_.counter("yuzu_scim_saml_link_write_failures_total");
         metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");
         metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_genuine_total");
-        metrics_.counter("yuzu_auth_oidc_deprovision_denied_store_unavailable_total");
+        metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_genuine_total");
-        metrics_.counter("yuzu_auth_saml_deprovision_denied_store_unavailable_total");
+        metrics_.counter("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total");
         metrics_.counter("yuzu_scim_saml_link_unmatched_total");
         metrics_.counter("yuzu_scim_saml_link_ambiguous_total");
         metrics_.counter("yuzu_scim_saml_link_lookup_failures_total");
