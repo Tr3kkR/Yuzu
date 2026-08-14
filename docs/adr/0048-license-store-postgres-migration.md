@@ -127,7 +127,13 @@ review (2026-08-14).
   commit atomically, or none do. This is a deliberate strengthening over the original — which
   processed each active license independently, best-effort, ignoring write failures — consistent
   with "surface failures, don't swallow" for a write path (kickoff lesson #3, the #3064
-  precedent).
+  precedent). The initial `SELECT ... WHERE status = 'active'` additionally takes `FOR UPDATE`
+  (gov Gate 4 unhappy-path UP-1, HIGH): without the row lock, two overlapping `validate()`
+  transactions (e.g. two server replicas sharing this Postgres) could each read the
+  pre-transition status under their own snapshot and independently compute a status transition,
+  with no re-check on the `UPDATE` tying it back to what was read — the later `COMMIT` would
+  silently clobber the earlier one's write. `FOR UPDATE` makes the second transaction's `SELECT`
+  block until the first commits, so it always computes from the freshest state.
 - `has_feature`/`seat_count`/`days_remaining`/`get_status` are converted to
   `std::expected<T, std::string>` even though nothing in the current tree calls them outside
   `rest_api_v1.cpp` (the first two) and tests (all four) — `has_feature` in particular is
@@ -203,26 +209,33 @@ no small-human-chosen-identifier collision risk `RbacStore` has to guard against
   `DeploymentStore`.
 - **`license_alerts` gets a deliberately SIMPLER treatment than `licenses`**, justified by what
   the two tables represent: alerts are derived/notification records regenerable by `validate()`,
-  not independent operator-authored entitlement state — losing an alert's `acknowledged`
-  transition on an adversarial multi-replica-diverging-snapshot backfill is a minor UX
-  inconvenience (re-acknowledge it), not a security- or compliance-relevant silent loss, unlike
-  `licenses.status` which gates `has_feature`/seat enforcement. Concretely: `license_alerts` has
-  no legacy-preserved identity column to conflict on (its `id` is always freshly minted by
-  Postgres), so a plain per-row `INSERT` with no matching key would duplicate an alert already
-  migrated by an overlapping-but-differently-fingerprinted legacy snapshot from a sibling
-  replica (the license-table analogue of the "identical-content conflict is a benign no-op" case
-  `DeploymentStore`'s superset test exercises). The fix is a `UNIQUE (license_id, alert_type,
-  triggered_at)` constraint plus `ON CONFLICT (license_id, alert_type, triggered_at) DO NOTHING`
-  on the backfill insert — semantically sound (the same license, alert type, and trigger second
-  is definitionally the same event) and, as of this writing, never tripped by live traffic
-  (`add_alert`'s 24-hour app-level dedup window means two genuinely-distinct alerts of the same
-  type for the same license are never generated in the same second either — a future change
-  that shrinks that window would need to re-examine this claim). An `INSERT ... WHERE NOT EXISTS`
-  without the DB constraint was considered and rejected: it reopens the READ COMMITTED
-  fixed-snapshot race the playbook documents at length under `RbacStore`'s round-4
-  bug — a concurrent revoke-and-reinsert can blow past a `WHERE NOT EXISTS` taken from a stale
-  snapshot. The constraint makes the insert atomic and race-free without needing an explicit
-  advisory lock.
+  not independent operator-authored entitlement state, unlike `licenses.status` which gates
+  `has_feature`/seat enforcement — with one deliberate exception, `acknowledged` (see below).
+  Concretely: `license_alerts` has no legacy-preserved identity column to conflict on (its `id`
+  is always freshly minted by Postgres), so a plain per-row `INSERT` with no matching key would
+  duplicate an alert already migrated by an overlapping-but-differently-fingerprinted legacy
+  snapshot from a sibling replica (the license-table analogue of the "identical-content conflict
+  is a benign no-op" case `DeploymentStore`'s superset test exercises). The fix is a
+  `UNIQUE (license_id, alert_type, triggered_at)` constraint plus
+  `ON CONFLICT (license_id, alert_type, triggered_at) DO UPDATE SET acknowledged = ... OR
+  EXCLUDED.acknowledged` on the backfill insert — the unique key is semantically sound (the same
+  license, alert type, and trigger second is definitionally the same event), and, as of this
+  writing, never tripped by live traffic (`add_alert`'s 24-hour app-level dedup window means two
+  genuinely-distinct alerts of the same type for the same license are never generated in the same
+  second either — a future change that shrinks that window would need to re-examine this claim).
+  **`acknowledged` is the one field this store DOES treat as operator-authored, not derived** (gov
+  Gate 4 unhappy-path UP-2, HIGH): a plain `DO NOTHING` left it untouched on conflict, so a second
+  replica backfilling from a legacy file that differs only in `acknowledged` would silently
+  discard a real dismissal if it lost the fingerprint race. `acknowledge_alert()` only ever sets
+  the flag `true`, never back to `false`, so it is write-once monotonic — the same write-once
+  criterion `licenses`' IDENTITY columns use, just with a two-value domain instead of a mismatch
+  check. ORing the two sides on conflict is therefore always correct regardless of arrival order:
+  the row ends up acknowledged iff either side ever recorded that, with no fail-closed path
+  needed. An `INSERT ... WHERE NOT EXISTS` without the DB constraint was considered and rejected:
+  it reopens the READ COMMITTED fixed-snapshot race the playbook documents at length under
+  `RbacStore`'s round-4 bug — a concurrent revoke-and-reinsert can blow past a `WHERE NOT EXISTS`
+  taken from a stale snapshot. The constraint makes the insert atomic and race-free without
+  needing an explicit advisory lock.
 - Legacy files are read READ-ONLY and never deleted/moved — retained for the ADR-0009
   one-release rollback window.
 - Every legacy `status`/`alert_type` value is validated against the known enum set **before** it

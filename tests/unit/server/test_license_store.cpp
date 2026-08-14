@@ -51,9 +51,11 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using yuzu::server::License;
@@ -537,6 +539,112 @@ TEST_CASE("validate: calling twice in quick succession dedups the alert within 2
             ++expired_count;
     }
     CHECK(expired_count == 1);
+}
+
+TEST_CASE("validate: SELECT ... FOR UPDATE serializes overlapping status transitions "
+          "(gov Gate 4 unhappy-path UP-1 regression)",
+          "[license_store][pg][concurrency]") {
+    // Defect this catches: without a row lock on the initial SELECT, two overlapping
+    // validate() transactions (e.g. two server replicas sharing this Postgres) each read the
+    // pre-transition status under their own snapshot and the later COMMIT silently clobbers
+    // the earlier one's write with no error. Reproducing the exact lost-update byte-for-byte
+    // needs precise interleaving this store has no clock-injection seam to control, so this
+    // proves the mechanism directly instead: hold a manual row lock open on a second raw
+    // connection, confirm a concurrent validate() call blocks for as long as the lock is
+    // held, then confirm it completes correctly once released — the observable behaviour
+    // FOR UPDATE is responsible for.
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto future = now_epoch() + 86400 * 365;
+    REQUIRE(store.activate_license(make_license("Lock Org", 10, future), "KEY-LOCK").has_value());
+    // Establish the row as 'active' before contending for its lock.
+    REQUIRE(store.validate(5).has_value());
+    REQUIRE(*store.get_status() == "active");
+
+    // Hold a manual FOR UPDATE lock on the license row from a second raw connection.
+    PgPool::Lease locker = pool.acquire();
+    REQUIRE(locker);
+    PgResult begin{PQexec(locker.get(), "BEGIN")};
+    REQUIRE(begin.ok());
+    PgResult lock{PQexec(locker.get(), "SELECT id FROM license_store.licenses "
+                                       "WHERE status = 'active' FOR UPDATE")};
+    REQUIRE(lock.ok());
+
+    std::promise<std::expected<void, std::string>> result_promise;
+    auto result_future = result_promise.get_future();
+    std::thread validator([&] {
+        result_promise.set_value(store.validate(15)); // 15 exceeds the 10-seat limit
+    });
+
+    // The concurrent validate() must still be blocked on the row lock — it must NOT have
+    // raced ahead and read/written the row while the manual lock is held.
+    CHECK(result_future.wait_for(std::chrono::milliseconds(300)) != std::future_status::ready);
+
+    PgResult commit{PQexec(locker.get(), "COMMIT")};
+    REQUIRE(commit.ok());
+
+    REQUIRE(result_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    validator.join();
+    REQUIRE(result_future.get().has_value());
+
+    auto status = store.get_status();
+    REQUIRE(status.has_value());
+    CHECK(*status == "exceeded");
+}
+
+TEST_CASE("migrate_from_sqlite: a legacy acknowledged=true alert survives a second, "
+          "conflicting backfill pass (gov Gate 4 unhappy-path UP-2 regression)",
+          "[license_store][pg][backfill]") {
+    // Defect this catches: the pre-fix backfill inserted alerts with ON CONFLICT ... DO
+    // NOTHING, which left `acknowledged` entirely untouched on a conflict. Two replicas with
+    // divergent legacy files — one recording an operator's real dismissal (acknowledged=true),
+    // one not — would silently lose that dismissal if the unacknowledged copy backfilled
+    // first, with no error and no log line naming the alerts table specifically.
+    // `acknowledged` is write-once monotonic (acknowledge_alert() only ever sets it true), so
+    // the fix ORs the two sides on conflict. This drives the unacknowledged pass FIRST — the
+    // only arrival order that distinguishes the old DO-NOTHING behaviour (would leave it
+    // false) from the fixed OR-merge (leaves it true).
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
+    REQUIRE(store.is_open());
+
+    LegacyLicenseFixture lic;
+    lic.id = std::string(32, '4');
+    lic.license_key_hash = std::string(64, 'c');
+    lic.organization = "AckMerge Org";
+    lic.seat_count = 5;
+    lic.issued_at = 9000;
+    lic.status = "active";
+    lic.activated_at = 9000;
+
+    LegacyAlertFixture alert;
+    alert.license_id = lic.id;
+    alert.alert_type = "expired";
+    alert.message = "expired";
+    alert.triggered_at = 9500;
+    alert.acknowledged = false;
+
+    auto first_path =
+        yuzu::test::unique_temp_path("yuzu_test_license_ackmerge_first") / "license.db";
+    std::filesystem::create_directories(first_path.parent_path());
+    write_legacy_sqlite_db(first_path, {lic}, {alert});
+    REQUIRE(store.migrate_from_sqlite(first_path));
+
+    alert.acknowledged = true; // a second, divergent legacy snapshot recording the dismissal
+    auto second_path =
+        yuzu::test::unique_temp_path("yuzu_test_license_ackmerge_second") / "license.db";
+    std::filesystem::create_directories(second_path.parent_path());
+    write_legacy_sqlite_db(second_path, {lic}, {alert});
+    REQUIRE(store.migrate_from_sqlite(second_path));
+
+    auto alerts = store.list_alerts();
+    REQUIRE(alerts.has_value());
+    REQUIRE(alerts->size() == 1);
+    CHECK((*alerts)[0].acknowledged); // the true seen on either pass must stick
 }
 
 // ── Alerts ────────────────────────────────────────────────────────────────

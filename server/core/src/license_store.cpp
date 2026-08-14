@@ -842,12 +842,21 @@ bool LicenseStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pa
             // documented SOFT reference (no FK, an orphaned alert is legitimate), so it is
             // sanitized here rather than hex-validated like licenses.id/license_key_hash: a
             // format check would incorrectly reject a legitimately-diverged reference.
+            //
+            // ON CONFLICT ... DO UPDATE (gov Gate 4 unhappy-path UP-2, HIGH): a plain DO NOTHING
+            // left `acknowledged` untouched on conflict, so a second replica backfilling from a
+            // legacy file that differs only in `acknowledged` would silently discard an
+            // operator's real dismissal if it lost the race to be first. `acknowledged` is
+            // write-once monotonic (acknowledge_alert() only ever sets it true, never back to
+            // false — see that method), so OR-ing the two sides is a safe, order-independent
+            // merge: the row ends up acknowledged iff either side ever recorded that.
             pg::PgResult res = pg::exec_params(
                 conn,
                 "INSERT INTO license_store.license_alerts "
                 "(license_id, alert_type, message, triggered_at, acknowledged) "
                 "VALUES ($1,$2,$3,$4::bigint,$5) "
-                "ON CONFLICT (license_id, alert_type, triggered_at) DO NOTHING",
+                "ON CONFLICT (license_id, alert_type, triggered_at) DO UPDATE SET "
+                "acknowledged = license_store.license_alerts.acknowledged OR EXCLUDED.acknowledged",
                 std::vector<std::string>{sanitize_pg_text(a.license_id), a.alert_type,
                                          sanitize_pg_text(a.message),
                                          std::to_string(a.triggered_at),
@@ -1053,11 +1062,19 @@ std::expected<void, std::string> LicenseStore::validate(std::int64_t current_age
     // One transaction for the whole pass (ADR-0048 hardening over the pre-migration version,
     // which processed each license independently and ignored write failures): every status
     // transition and the alerts it produces commit atomically, or none do.
+    //
+    // FOR UPDATE (gov Gate 4 unhappy-path UP-1, HIGH): without a row lock, two overlapping
+    // validate() transactions (e.g. two server replicas sharing this Postgres) each read the
+    // same pre-transition status under their own snapshot, independently compute a new status,
+    // and the later COMMIT silently clobbers the earlier one's write with no error — the
+    // UPDATE below has no re-check against what was read. FOR UPDATE makes the second
+    // transaction's SELECT block until the first commits, so it re-reads the already-updated
+    // row instead of racing against it.
     bool ok = pool_.with_txn_for(kValidateTimeout, [&](PGconn* conn) -> bool {
         pg::PgResult res = pg::exec_params(
             conn,
             "SELECT id, seat_count, expires_at, status FROM license_store.licenses "
-            "WHERE status = 'active'",
+            "WHERE status = 'active' FOR UPDATE",
             std::vector<std::string>{});
         if (res.status() != PGRES_TUPLES_OK) {
             db_err = PQerrorMessage(conn);
