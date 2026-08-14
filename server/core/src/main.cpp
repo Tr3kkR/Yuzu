@@ -742,6 +742,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--saml-sp-acs-url", cfg.saml_sp_acs_url,
                    "SAML SP Assertion Consumer Service URL (POST binding endpoint)")
         ->envname("YUZU_SAML_SP_ACS_URL");
+    app.add_option("--saml-sp-key", cfg.saml_sp_key,
+                   "Filesystem path to SP AuthnRequest signing private-key PEM (RSA); when "
+                   "set, AuthnRequests are signed (HTTP-Redirect binding)")
+        ->envname("YUZU_SAML_SP_KEY");
     app.add_option("--saml-group-attribute", cfg.saml_group_attribute,
                    "SAML <Attribute Name=\"...\"> whose values are group identifiers "
                    "(e.g. the Entra groups claim URI); empty disables group parsing")

@@ -2865,13 +2865,25 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(detail::error_json_a4(500, "Failed to build SAML AuthnRequest", cid),
                             "application/json");
             spdlog::error("SAML /auth/saml/start: build_authn_request threw: {}", e.what());
+            // Count SP-initiated failures the same way the ACS paths do, so the
+            // signing-failure leg is not the one SAML-login failure mode absent
+            // from yuzu_auth_saml_login_total.
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+            }
             return;
         }
         if (authn_url.empty()) {
             res.status = 500;
             res.set_content(detail::error_json_a4(500, "Failed to build SAML AuthnRequest", cid),
                             "application/json");
+            // An empty URL is the per-request signing-failure signal
+            // (build_authn_request returns {} rather than emit an unsigned
+            // redirect once an SP signing key is configured).
             spdlog::error("SAML /auth/saml/start: build_authn_request returned empty URL");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+            }
             return;
         }
         // Set the browser-binding cookie so the ACS can verify this browser
