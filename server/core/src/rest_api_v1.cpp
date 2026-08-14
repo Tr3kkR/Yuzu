@@ -1377,24 +1377,26 @@ void RestApiV1::register_routes(
     auto deny_fleet_wide_service_scoped =
         [auth_fn, audit_fn](const httplib::Request& req, httplib::Response& res,
                             const std::string& action, const std::string& target_type,
-                            const std::string& audit_detail, const std::string& message) -> bool {
+                            const std::string& audit_detail, const std::string& message,
+                            const std::string& target_id = "",
+                            const std::string& permission = "GuaranteedState:Read") -> bool {
         auto session = auth_fn(req, res);
         if (!session)
             return true; // auth_fn already wrote the response (401/etc).
         if (session->token_scope_service.empty())
             return false;
-        (void)detail::try_persist_audit(audit_fn, req, action, "denied", target_type, "",
+        (void)detail::try_persist_audit(audit_fn, req, action, "denied", target_type, target_id,
                                         audit_detail);
         const auto cid = detail::make_correlation_id();
         res.set_header("X-Correlation-Id", cid);
         res.status = 403;
-        // Every current caller gates on GuaranteedState:Read (gov Gate 4
-        // consistency review: every other 403 this permission gate produces,
-        // via require_permission, carries .permission — this was the one
-        // that didn't).
+        // Every current caller gates on GuaranteedState:Read by default (gov
+        // Gate 4 consistency review: every other 403 this permission gate
+        // produces, via require_permission, carries .permission — this was
+        // the one that didn't). A non-GuaranteedState caller (e.g.
+        // Inventory:Read) passes its own securable explicitly.
         res.set_content(
-            detail::error_json_a4(403, message, cid,
-                                  detail::A4ErrorOpts{.permission = "GuaranteedState:Read"}),
+            detail::error_json_a4(403, message, cid, detail::A4ErrorOpts{.permission = permission}),
             "application/json");
         return true;
     };
@@ -5935,8 +5937,9 @@ void RestApiV1::register_routes(
     // sink → false, not a 500 with no trail) — full parity with the MCP sibling's
     // mcp_audit (which wraps the same kernel), not just the bool-surfacing half.
     sink.Get("/api/v1/inventory/software",
-             [auth_fn, perm_fn, audit_fn, software_inventory_store, inventory_scope_fn](
-                 const httplib::Request& req, httplib::Response& res) {
+             [auth_fn, perm_fn, audit_fn, software_inventory_store, inventory_scope_fn,
+              deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                              httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid); // echo on every path (A3)
 
@@ -5951,23 +5954,24 @@ void RestApiV1::register_routes(
                  // is INERT under the global Inventory:Read gate (see its own comment)
                  // — neither axis it (or perm_fn above) checks is the token's own
                  // service-tag scope, and this route has no scoped_perm_fn wired for a
-                 // per-target check even when agent_id is supplied. Blanket deny,
-                 // matching the dashboard fragment twin (inventory_routes.cpp's
-                 // /fragments/inventory/find/results) and this route's own sibling
-                 // fixes elsewhere in this file.
-                 if (!session->token_scope_service.empty()) {
-                     (void)detail::try_persist_audit(
-                         audit_fn, req, "inventory.software.query", "denied", "Inventory", "fleet",
-                         "fleet-wide software search denied to a service-scoped token; cid=" + cid);
-                     res.status = 403;
-                     res.set_content(
-                         detail::error_json_a4(
-                             403,
-                             "service-scoped tokens may not run a fleet-wide software search",
-                             cid, detail::A4ErrorOpts{.permission = "Inventory:Read"}),
-                         "application/json");
+                 // per-target check even when agent_id is supplied. Blanket deny via the
+                 // file's own shared deny_fleet_wide_service_scoped chokepoint (Gate 8
+                 // hardening review: an earlier round hand-rolled this instead of
+                 // extending it, forking the very pattern the routed-concerns row warns
+                 // against) — matching the dashboard fragment twin
+                 // (inventory_routes.cpp's /fragments/inventory/find/results) and the
+                 // MCP twin (query_installed_software), both target_id="fleet".
+                 // Note: the shared helper mints and sets its OWN X-Correlation-Id on
+                 // the deny path (matching its other call sites) — the outer `cid` set
+                 // above is superseded on this branch, so it is deliberately not baked
+                 // into the audit detail string below (that would record a value the
+                 // response header no longer carries).
+                 if (deny_fleet_wide_service_scoped(
+                         req, res, "inventory.software.query", "Inventory",
+                         "fleet-wide software search denied to a service-scoped token",
+                         "service-scoped tokens may not run a fleet-wide software search", "fleet",
+                         "Inventory:Read"))
                      return;
-                 }
                  // Null-store ONLY (not `!is_open()`): a constructed-but-closed store
                  // deliberately falls through to query_software(), which returns nullopt →
                  // the AUDITED degrade branch below (CC7.2 trail + MCP parity — MCP guards

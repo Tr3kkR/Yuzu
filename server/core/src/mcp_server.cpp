@@ -3284,11 +3284,12 @@ McpServer::HandlerFn McpServer::build_handler(
             // previously didn't).
             auto deny_fleet_wide_service_scoped =
                 [&](const std::string& action, const std::string& target_type,
-                    const std::string& audit_detail, const std::string& message) -> bool {
+                    const std::string& audit_detail, const std::string& message,
+                    const std::string& target_id = "") -> bool {
                 if (session->token_scope_service.empty())
                     return false;
-                (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, "denied",
-                                                              target_type, "", audit_detail);
+                (void)yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, action, "denied", target_type, target_id, audit_detail);
                 res.set_content(a4_error(kPermissionDenied, message), "application/json");
                 return true;
             };
@@ -4485,7 +4486,8 @@ McpServer::HandlerFn McpServer::build_handler(
                         "inventory.software.query", "Inventory",
                         "fleet-wide software search denied to a service-scoped token (MCP "
                         "query_installed_software)",
-                        "service-scoped tokens may not run a fleet-wide software search"))
+                        "service-scoped tokens may not run a fleet-wide software search",
+                        "fleet"))
                     return;
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
