@@ -12971,6 +12971,13 @@ private:
             }
 
             auto id = req.matches[1].str();
+            // Interim deny (schedule_routes.hpp): delete_schedule is
+            // username-owner-scoped below, and a service-scoped token shares
+            // its creating principal's username (ApiToken::principal_id) —
+            // without this it could delete a fleet-wide schedule its own
+            // principal created interactively.
+            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id))
+                return;
             // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
             // deletes only schedules the caller created, not the whole
             // fleet's. auth_routes_->resolve_session, not require_permission's
@@ -13009,6 +13016,14 @@ private:
             // Schedule:Write alone — an operator must be able to kill a
             // runaway schedule even without Execution:Execute.
             if (enabled && !require_permission(req, res, "Execution", "Execute"))
+                return;
+            // Interim deny (schedule_routes.hpp), enable(true) only — a
+            // re-enabled schedule arms unattended fleet-wide dispatch through
+            // ScheduleRunner, the same concern as create. Disabling stays
+            // reachable: it only ever stops a schedule, never arms one, so a
+            // service-scoped token keeps its kill-switch (H-01's own
+            // rationale for gating disable on Schedule:Write alone).
+            if (enabled && deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.enable", id))
                 return;
 
             // M-01 (#1806): owner-scoped enable/disable, same as delete above.

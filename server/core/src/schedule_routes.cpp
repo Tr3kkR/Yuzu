@@ -1,11 +1,35 @@
 #include "schedule_routes.hpp"
 
 #include "auth_routes.hpp"
+#include "rest_a4_envelope.hpp" // detail::error_json_a4, make_correlation_id
 #include "schedule_engine.hpp"
 
 #include <nlohmann/json.hpp>
 
 namespace yuzu::server {
+
+bool deny_service_scoped_schedule(AuthRoutes& auth_routes, const httplib::Request& req,
+                                  httplib::Response& res, const std::string& action,
+                                  const std::string& audit_detail) {
+    auto session = auth_routes.resolve_session(req);
+    if (!session || session->token_scope_service.empty())
+        return false;
+    const auto cid = detail::make_correlation_id();
+    // Write the 403 FIRST, audit after (mirrors PreflightRoutes/DeploymentRoutes'
+    // deny_service_scoped_): a throwing audit_log must not suppress the 403.
+    res.set_header("X-Correlation-Id", cid);
+    res.status = 403;
+    res.set_content(
+        detail::error_json_a4(
+            403, "service-scoped tokens may not create, enable, or delete schedules", cid,
+            detail::A4ErrorOpts{.permission = "Execution:Execute"}),
+        "application/json");
+    // target_type "schedule" (lowercase) matches every existing schedule.*
+    // success-path audit row in this file and server.cpp — a capitalized
+    // "Schedule" would split the SIEM verb's target_type between rows.
+    (void)auth_routes.audit_log(req, action, "denied", "schedule", "", audit_detail);
+    return true;
+}
 
 void handle_create_schedule(AuthRoutes& auth_routes, ScheduleEngine* schedule_engine,
                             const httplib::Request& req, httplib::Response& res) {
@@ -15,6 +39,12 @@ void handle_create_schedule(AuthRoutes& auth_routes, ScheduleEngine* schedule_en
     // see the file header. Every execution-producing route gates
     // Execution:Execute; schedule creation must too.
     if (!auth_routes.require_permission(req, res, "Execution", "Execute"))
+        return;
+    // Interim deny (see schedule_routes.hpp): a service-scoped token passes
+    // both gates above via the ITServiceOwner role, which carries neither
+    // gate's confinement, so it must be stopped before it can arm a
+    // recurring, unconfined-dispatch schedule.
+    if (deny_service_scoped_schedule(auth_routes, req, res, "schedule.create", ""))
         return;
     if (!schedule_engine) {
         res.status = 503;
