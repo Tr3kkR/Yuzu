@@ -2239,6 +2239,12 @@ Delete a tag from an agent.
 }
 ```
 
+**Storage failure (all tag endpoints):** a degraded tag store returns `503 tag store
+unavailable` (A4 envelope) — never an empty tag map, a `404`, or a false success. Tags feed
+scope resolution and dispatch targeting, so a silently-empty answer would mis-resolve
+decisions built on them (ADR-0050); retry a `503` once `/readyz` reports `tag_store` healthy.
+`DELETE` returns `404 tag not found` only after a successful read found no such tag.
+
 ---
 
 ### Definitions

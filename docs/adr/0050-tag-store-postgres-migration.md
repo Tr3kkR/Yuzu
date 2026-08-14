@@ -179,6 +179,15 @@ A row inserted fresh mid-backfill that then loses to a concurrent writer (`PQcmd
 on the guarded insert) also fails closed rather than silently mixing two writers' rows.
 Recovery runbook: `docs/ops-runbooks/tag-store-backfill-recovery.md`.
 
+**Known gap, recorded not hidden:** the release upgrade test
+(`scripts/test/test-upgrade-stack.sh`) asserts backfill survival for the inventory store only
+— no Wave 2 migration (Discovery/Deployment/CustomProperties/Notification included) has added
+a per-store assertion, and this one follows that precedent rather than bolting a one-store
+check onto the script. The right fix is one shared assertion sweep covering every
+`migrate_from_sqlite` store (seed via old-release API → assert via new-release API), filed as
+a follow-up for the wave rather than per-PR. Until it lands, backfill correctness evidence is
+the unit-level decision-tree suite in `test_tag_store.cpp` (`[tag_store][backfill]`).
+
 ### Lifecycle
 
 Constructed at its ORIGINAL `server.cpp` site (inside the `pg_pool_ && !startup_failed_`
