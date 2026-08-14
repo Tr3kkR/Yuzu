@@ -10602,7 +10602,7 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
         // Non-retryable business error: no retry_after_ms hint.
         CHECK(body["error"]["data"]["retry_after_ms"].is_null());
         REQUIRE_FALSE(ts.audit_details.empty());
-        CHECK(ts.audit_details.back().find("agent-dup: device is already quarantined") !=
+        CHECK(ts.audit_details.back().find("agent_id=agent-dup, device is already quarantined") !=
               std::string::npos);
     }
 
@@ -10624,7 +10624,7 @@ TEST_CASE("MCP quarantine_device classifies store failure vs business error "
         // Retryable store failure: A5 requires an honest retry_after_ms.
         CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
         REQUIRE_FALSE(ts.audit_details.empty());
-        CHECK(ts.audit_details.back().find("agent-degraded: ") != std::string::npos);
+        CHECK(ts.audit_details.back().find("agent_id=agent-degraded, ") != std::string::npos);
         CHECK(ts.audit_details.back().find(yuzu::server::kQuarantineDbErrorPrefix) !=
               std::string::npos);
     }

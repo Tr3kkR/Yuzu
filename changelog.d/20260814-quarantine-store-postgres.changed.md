@@ -29,4 +29,8 @@
   rather than silently accepting whichever replica happened to migrate first; the SAME log
   line and refusal also cover a single-replica rollback-then-reupgrade — see
   `docs/user-manual/upgrading.md` and `docs/ops-runbooks/quarantine-store-backfill-recovery.md`
-  for the full list of refusal modes and remediation.
+  for the full list of refusal modes and remediation. Every quarantine failure path — including a
+  store/pool outage discovered before the request could even be attributed to a device — now
+  emits a `quarantine.enable`/`quarantine.disable` audit row (previously silent); REST and MCP
+  both carry `retry_after_ms: 5000` on a genuine store-failure `503`/`-32603` (never on the
+  non-retryable `400`/`-32602` business-error case).

@@ -305,10 +305,15 @@ record-keeping substrate changed.
   a quarantine record is evidence that a specific containment decision was made, by whom, and
   why; deleting that evidence after some retention window would be a REGRESSION for a SOC 2
   security-containment control, not tech debt. This store is therefore **excluded** from #2508's
-  sibling sweep (`response_store`, `guaranteed_state_store`, `result_set_store`, `app_perf_*`,
-  `PreflightRunStore`, `DeploymentRunStore`) by design, not merely not-yet-reached — a future
-  author picking up #2508 should skip `quarantine_records` rather than treat its absence from a
-  prune pass as an oversight to fix. (If a genuine compliance/legal requirement for bounded
+  sweep by design, not merely not-yet-reached — a future author picking up #2508 should skip
+  `quarantine_records` rather than treat its absence from a prune pass as an oversight to fix.
+  (**gov-fix(architect, Gate 8):** `#2508`'s remaining scope, per `.claude/routed-concerns.md`'s
+  "Clock-guarded retention" row as of this writing, is `app_perf_*`/`PreflightRunStore`/
+  `DeploymentRunStore` — `result_set_store`/`guaranteed_state_store`/`response_store` have since
+  become compliant store-by-store on their own Postgres migrations (ADR-0036/0038/0039); naming a
+  fixed store list here would drift out of date as each migrates, so this ADR deliberately doesn't
+  re-enumerate it — see the routed-concerns.md row for the current set.) (If a genuine
+  compliance/legal requirement for bounded
   retention of containment evidence ever emerges, that is a separate, explicit, separately-reviewed
   decision — same standing rule CLAUDE.md's "Clock-guarded retention" invariant states for the
   no-prune stores that DO eventually need one — not a bare `DELETE ... WHERE ts < cutoff` added
@@ -380,3 +385,39 @@ record-keeping substrate changed.
   (`DiscoveryStore`, `DeploymentStore`, etc.) — diverging from it uniquely for quarantine would be
   inconsistent rather than more secure; a systemic tightening (if ever desired) belongs at the
   shared `pg::exec_params`/error-construction layer, not one store's migration.
+
+**Gate 5/6 findings — deferred with reasoning (not fixed in the Gate 5/6 hardening round):**
+gov-fix(sre + enterprise-readiness, Gate 8): the hardening-round commit message claimed this
+reasoning was "recorded in the ADR" for these items — it was not; this subsection closes that gap.
+
+- **S1/F6 (sre/enterprise-readiness, SHOULD): quarantine's backfill/degrade metrics
+  (`yuzu_server_quarantine_backfill_total`, `yuzu_server_quarantine_read_degrade_total`) are not
+  `describe()`'d/pre-seeded unlike sibling stores, and no Prometheus alert rules ship for them.**
+  Deliberately deferred: fixing this correctly is a 4-site lockstep change — pre-seed code in
+  `server.cpp`/wherever the metric family is constructed, `metrics.md`'s existing "Not pre-seeded
+  ... absence is the normal steady state" paragraph (which would need to flip), a matching PromQL
+  comment update, and new alert rules in `docs/prometheus/yuzu-alerts.yml` — and doing only part of
+  it (e.g. pre-seeding without updating the doc that says "absence is normal") would create a NEW
+  doc-contradicts-code finding. Judged out of scope for an already-large hardening round; to be
+  filed as a follow-up in this run's post-merge follow-up batch.
+- **C-6/C-7/C-8 (compliance-officer, NICE): `audit_fn`'s bool return discarded at REST quarantine
+  call sites (unlike MCP's `audit_persisted` surfacing); MCP audit rows key `target_id` on the tool
+  name, not `agent_id` (pre-existing MCP-wide convention, not introduced by this migration); no
+  audit-integrity concern from raw `PQerrorMessage` text in audit rows (see UP-11 above — informational, not
+  a defect).** All three are cross-cutting, pre-existing conventions this single store's migration
+  does not own; correctly left unfixed.
+- **F8 (enterprise-readiness, NICE): `docs/authz-model.md`'s admit-then-filter description is
+  slightly incomplete given the Gate 4 UP-1 widening (the per-record loop now fails closed on any
+  non-403 outcome, not just an explicit deny).** `docs/authz-model.md` is untouched by this
+  migration; correctly left unfixed as an out-of-scope doc owned by a different surface.
+- **N1 (sre, NICE): no backfill duration/heartbeat signal (start-to-finish timing) is emitted.**
+  The new `spdlog::info` completion log (C-5, above) names the row count but not elapsed duration;
+  correctly left unfixed as a nice-to-have observability addition, not a defect.
+- **Gate 8 (quality-engineer + compliance-officer, converged, NICE): the new `is_open()==false`
+  audit rows on REST POST/DELETE and MCP `quarantine_device` (C-2) have no regression test.**
+  `QuarantineRouteHarness`/`McpTestServer` always construct a live, open store — there is no
+  existing seam to force `is_open()==false` at request time without either restructuring the test
+  harness to accept a pre-broken store or adding a store-level test-only override, either of which
+  is disproportionate for one NICE-tier assertion. The audit call itself was empirically verified
+  correct by direct code inspection (Gate 8 security-guardian, compliance-officer) even without a
+  test exercising it; a future harness change that adds this seam should also add the assertion.

@@ -7836,7 +7836,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     // result.error() as a distinct field from the target id;
                     // mcp_audit only has one free-text `detail` slot, so both
                     // go in it rather than dropping the error message.
-                    mcp_audit("failure", agent_id + ": " + quar_res.error());
+                    // gov-fix(consistency-auditor, Gate 8): "agent_id=<id>,
+                    // <message>" matches this handler's other two mcp_audit
+                    // detail strings (is_open()/scope-gate-unwired above) so
+                    // one grep pattern extracts agent_id from every
+                    // quarantine_device audit row.
+                    mcp_audit("failure", "agent_id=" + agent_id + ", " + quar_res.error());
                     // Mirrors the REST twin's 503-vs-400 classification
                     // (is_quarantine_db_error, rest_api_v1.cpp): a genuine
                     // store/pool/query failure is kInternalError, a

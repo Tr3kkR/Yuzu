@@ -87,12 +87,29 @@ already migrated is a case-specific DBA task, not scripted here.
 
 **Cause 2 — single-replica rollback-then-reupgrade.** This server was rolled
 back to a pre-ADR-0047 build **after** the backfill had already completed,
-ran against the legacy `quarantine.db` again under the old code path
-(creating new quarantine/release activity in that file), and is now being
-re-upgraded. The file the old binary was writing to no longer matches what
-was already migrated into Postgres, so this looks identical to Cause 1 to
-the verification check even though only one replica is involved. **This is
-the reachable case if you followed the generic top-level [Rollback](
+and is now being re-upgraded. **Two variants, both sufficient on their own —
+gov-fix(architect, Gate 8):**
+
+- **(2a) Activity happened.** The old binary ran against a restored/backed-up
+  `quarantine.db` (or one it recreated at the vacated original path — see
+  2b) for a while, creating new quarantine/release activity in that file.
+- **(2b) Zero activity is ALSO sufficient — do not assume "nothing happened,
+  so this shouldn't trigger."** The old binary's constructor unconditionally
+  runs `CREATE TABLE IF NOT EXISTS` at the original `quarantine.db` path
+  every boot, regardless of whether any quarantine/release action ever
+  happens. Since the real data was renamed aside during the original
+  migration (`quarantine.db.migrated-<epoch>`), the old binary finds no file
+  there and creates a fresh, EMPTY `quarantine_records` table — and a
+  present-but-empty table fingerprints as real content, not `sourceless`
+  (that sentinel is reserved for a wholly-ABSENT table). Merely booting the
+  old binary against the vacated path is enough to produce a permanent
+  mismatch on re-upgrade, with no restore and no live quarantine/release
+  calls required.
+
+Either way, the file the old binary touched no longer matches what was
+already migrated into Postgres, so this looks identical to Cause 1 to the
+verification check even though only one replica is involved. **This is the
+reachable case if you followed the generic top-level [Rollback](
 ../user-manual/upgrading.md#rollback) procedure** ("restore the backed-up
 `.db` files, start the previous version binary") against a server that had
 already completed this backfill — see the Rollback note in this store's
@@ -136,11 +153,20 @@ listed here only so it isn't mistaken for one of the refusals above.
 
 If the backfill process is interrupted before the marker stamp (crash,
 `SIGKILL`, host loss mid-transaction), the next boot simply finds the marker
-absent and retries the whole migration from scratch — the row-insert loop is
-`ON CONFLICT DO NOTHING` against the same legacy content, so the retry is a
-clean no-op over already-migrated rows. Nothing to abandon by hand. A
-previously-failed move-aside (legacy file still present after a verified,
-already-completed migration) also retries automatically on the next boot.
+absent and retries the whole migration from scratch. **gov-fix(compliance-
+officer + docs-writer, Gate 8):** unlike `RbacStore`/`CustomPropertiesStore`,
+this is NOT per-row `ON CONFLICT` idempotency — `quarantine_records` has no
+natural per-row key (see ADR-0047 "Backfill"), so its INSERT carries no
+`ON CONFLICT` clause at all. What actually makes the retry clean is
+**whole-transaction atomicity**: the row inserts and the `backfill_complete`/
+`backfill_row_count`/`backfill_source_fingerprint` marker stamps all commit
+together in ONE transaction, so an interruption before that commit leaves
+**zero** rows in Postgres from the failed attempt — the next boot doesn't
+skip already-migrated rows via per-row dedup, it redoes the entire migration
+because nothing from the interrupted attempt persisted. Nothing to abandon
+by hand either way. A previously-failed move-aside (legacy file still
+present after a verified, already-completed migration) also retries
+automatically on the next boot.
 
 **Not affected:** `GET`/`POST`/`DELETE /api/v1/quarantine*` and the MCP
 `quarantine_device` tool are unchanged by any of this once the server is up

@@ -4247,7 +4247,13 @@ void RestApiV1::register_routes(
             return;
         if (!quarantine_store || !quarantine_store->is_open()) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            // gov-fix(consistency-auditor, Gate 8): matches this file's own
+            // dominant convention for a bare is_open() 503 (retry_after_ms
+            // present on ~20+ sibling routes) and the MCP quarantine_device
+            // twin's identical retry_after_ms=5000 (F5) — REST was the
+            // outlier.
+            res.set_content(detail::a4_error(res, "service unavailable", {.retry_after_ms = 5000}),
+                            "application/json");
             // gov-fix(compliance-officer C-2): the target agent_id is not yet
             // known at this point (the body hasn't been parsed), so this is
             // the one quarantine failure path that cannot carry a resource
@@ -4291,8 +4297,17 @@ void RestApiV1::register_routes(
 
         auto result = quarantine_store->quarantine_device(agent_id, by, reason, whitelist);
         if (!result) {
-            res.status = is_quarantine_db_error(result.error()) ? 503 : 400;
-            res.set_content(detail::a4_error(res, result.error()), "application/json");
+            const bool db_error = is_quarantine_db_error(result.error());
+            res.status = db_error ? 503 : 400;
+            // gov-fix(consistency-auditor, Gate 8): retryable ONLY on the
+            // genuine store/pool-failure branch, matching MCP's identical
+            // split (F5) — the business-error branch ("already quarantined")
+            // stays non-retryable (null), never a fabricated retry hint on a
+            // permanent state conflict.
+            res.set_content(detail::a4_error(res, result.error(),
+                                             db_error ? detail::A4ErrorOpts{.retry_after_ms = 5000}
+                                                       : detail::A4ErrorOpts{}),
+                            "application/json");
             // gov-fix(security-guardian): the MCP quarantine_device twin
             // already audits this branch (mcp_audit("failure", ...)) — REST
             // was silently skipping it, the only quarantine failure path with
@@ -4319,7 +4334,11 @@ void RestApiV1::register_routes(
             auto agent_id = req.matches[1].str();
             if (!quarantine_store || !quarantine_store->is_open()) {
                 res.status = 503;
-                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                // gov-fix(consistency-auditor, Gate 8): see the POST route's
+                // identical fix above for the rationale.
+                res.set_content(
+                    detail::a4_error(res, "service unavailable", {.retry_after_ms = 5000}),
+                    "application/json");
                 audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
                          "service unavailable — store not open");
                 return;
@@ -4341,8 +4360,14 @@ void RestApiV1::register_routes(
 
             auto result = quarantine_store->release_device(agent_id);
             if (!result) {
-                res.status = is_quarantine_db_error(result.error()) ? 503 : 400;
-                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                const bool db_error = is_quarantine_db_error(result.error());
+                res.status = db_error ? 503 : 400;
+                // gov-fix(consistency-auditor, Gate 8): see POST's identical
+                // fix above — retryable only on the genuine store failure.
+                res.set_content(detail::a4_error(res, result.error(),
+                                                 db_error ? detail::A4ErrorOpts{.retry_after_ms = 5000}
+                                                           : detail::A4ErrorOpts{}),
+                                "application/json");
                 audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
                          result.error());
                 return;
