@@ -195,6 +195,15 @@ public:
     /// `yuzu.guardian_unhealthy_suppressed` so a rule stuck errored is observable
     /// without flooding the health stream. Zero when prefer_spark is off / no runtime.
     [[nodiscard]] std::uint64_t unhealthy_suppressed() const;
+    /// F5 (M1 item a): repeat-Unknown convergence re-evals whose guard.unhealthy WAS
+    /// re-emitted as a minutes-cadence refresh (errored_refresh_ms), sibling to
+    /// unhealthy_suppressed() above. Surfaced as `yuzu.guardian_unhealthy_refreshed`.
+    /// Zero when prefer_spark is off / no runtime.
+    [[nodiscard]] std::uint64_t unhealthy_refreshed() const;
+    /// F5 (M1 item b): rule_ids demoted off the 5s convergence priority lane to their
+    /// normal type-lane cadence. Surfaced as `yuzu.guardian_priority_demoted`. Zero
+    /// when prefer_spark is off / no runtime.
+    [[nodiscard]] std::uint64_t priority_demoted() const;
 
     /// Idempotent shutdown. After stop() returns, dispatch() will
     /// return a transient-failure result rather than touching KV.

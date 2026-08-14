@@ -167,6 +167,54 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   config/reference/audit data survives previous-release-SQLite → new-release-Postgres.
 - **Port the transaction owner**: `SqliteTxn`/`SqliteStmt` → `pool.with_txn` (multi-statement
   invariants) or a single autocommit statement (single-statement mutate-and-return).
+- **Local source absence never creates terminal migration state on its own** (ADR-0040 round 3,
+  Sol's diagnosis, #2697). A process that finds no legacy SQLite file at its configured path
+  cannot distinguish "this is a genuine fresh install" from "this replica just doesn't hold the
+  file — a sibling does." Marking a migration COMPLETE from that observation alone is silently
+  unsound: it forecloses the real migration for whichever host does hold the file, and no
+  amount of guarding on the sourceless side closes the gap, because the sourceless process is
+  telling the truth about what IT knows, not about the fleet. The fix has two parts, and the
+  first alone is insufficient: (1) restrict *which* callers may declare "no source, nothing to
+  migrate" — a one-shot CLI is never trusted to, only a full boot; (2) **on the HOLDER side**, a
+  process that finds the completion marker already set but still holds its own legacy file must
+  not trust that marker blindly — verify the file's content was actually what got migrated
+  (`AuditStore` does this by fingerprint: a durable hash-shaped value written in the SAME
+  transaction as the completion marker, re-derived from the file and compared at every later
+  boot that still finds it) and refuse to serve on a mismatch, rather than silently reporting
+  success over a trail nobody streamed. `ManagementGroupStore` and `ResultSetStore` share the
+  first-generation `if (!legacy_exists) → mark complete` shape this closes; porting the
+  holder-side check to them is tracked, not yet done. `RbacStore` independently discovered and
+  fixed the identical shape (#2703, git-blamed to its original migration commit, not caught by
+  that migration's own governance pass or two rounds of external review — only surfaced by a
+  wider-scope adversarial review) — it is now a SECOND reference implementation, right-sized for
+  a small, non-resumable, single-transaction legacy dataset rather than `AuditStore`'s larger
+  resumable-streaming one. **Trap a future port hits if it works from this paragraph's prose
+  instead of the actual code:** `AuditStore::stamp_complete` has two exemptions this description
+  doesn't spell out and `RbacStore`'s own first port missed both — (1) a **sourceless** writer
+  losing the trust-anchor race is NOT an error (it has no evidence worth protecting, so whichever
+  writer's `"sourceless"` value won is fine); (2) a **real** writer's content that fingerprints as
+  having nothing to protect (an empty/schema-less local file) should trust the marker rather than
+  refuse. Port the REFERENCE CODE (`audit_store.cpp`'s `stamp_complete`, or `rbac_store.cpp`'s
+  post-#2703 version) and diff your port against it line by line — not this summary.
+- **Long-lived migration branches accumulate test-file drift against the pre-migration API —
+  budget for it on every `dev`-merge, not just the first.** Any test file that constructs the
+  store via its old constructor fails to compile once the branch merges current `origin/dev` —
+  whether that file already existed and gained new cases in `dev` while the migration branch was
+  in flight, or is brand new, added by an unrelated, already-merged PR that forked before the
+  migration branch did. The CI merge-ref build fails on all platforms either way; this is not a
+  defect in the migrating branch's own work, and it recurred twice within `AuditStore`'s own
+  migration (#2697): once against an existing file gaining cases in `dev`, once against a
+  brand-new file from an unrelated already-merged PR. The fix is always the same mechanical
+  shape: migrate the test's construction to `PgTestTemplate`/`PgPool` following an established
+  Harness in the same directory, reconcile any call site relying on the old return type (the
+  previous bullet's decision on authoritative-read typing), give the migrated fixture its own
+  explicit `if (pg_admin_dsn_env() == nullptr) SKIP(...)` guard if it has no earlier-constructed
+  PG member to inherit one from (copying a Harness's SKIP-via-earlier-member shape onto a
+  fixture that lacks that earlier member silently turns "skip locally" into "hard-fail
+  locally"), and tag `[pg]` on exactly the `TEST_CASE`s whose bodies construct the migrated
+  fixture — verified per case, never blanket-applied to the file. A branch expected to outlive a
+  single `dev`-sync cycle should re-sync frequently: a smaller delta is easier to triage for
+  which changed test file touches the store's old constructor.
 
 ## Anti-patterns reviewers reject
 
@@ -175,10 +223,110 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
 - Holding a lease across an HTTP call, file I/O, or a second store call (deadlock / starvation).
 - Unqualified runtime table names (works in a migration, breaks on a pooled connection).
 - `sqlite3_changes()`-style mutate-then-count. Use `RETURNING`.
+- Trusting `PQresultStatus() == PGRES_COMMAND_OK` on an `INSERT ... ON CONFLICT DO NOTHING` to mean
+  YOUR value won. It only means the statement executed — true whether the row inserted or silently
+  no-opped on conflict. A "first writer wins" contract (a completion marker, a trust-anchor
+  fingerprint, an idempotency key) needs `PQcmdTuples()` (`"0"` = lost the race) or `RETURNING` +
+  `PQntuples()` to actually answer "did MY write land". `AuditStore::stamp_complete` (ADR-0040,
+  #2697) is the worked example: checking only statement status let a real backfill that lost this
+  exact race report success while a different writer's value sat at the trust anchor — the same
+  silent-discard shape as the `sqlite3_changes()` pitfall above, just on `ON CONFLICT DO NOTHING`
+  rather than a mutate-then-count. **When "first writer wins" is too strict** — some values carry
+  no evidence worth protecting (a sourceless placeholder) or two writers can legitimately agree
+  (identical content from a shared volume) — plain `DO NOTHING` can't express that; use `DO
+  UPDATE ... WHERE <promotable-condition> RETURNING <col>` instead, and read success via
+  `PQntuples() == 1` (the WHERE matched: fresh insert, a promotion, or an already-equal value),
+  never `PQcmdTuples()` on a `DO UPDATE` (it reports rows affected by the WHOLE statement,
+  conflating "this row was promoted" with "this row already held my value" — both fine, but
+  neither is a `DO NOTHING`'s simple insert/no-op binary). `RbacStore::stamp_complete` (#2703) is
+  the worked example: a real fingerprint may promote a stored `"sourceless"` value; a stored real
+  value is never overwritten by anyone; a writer whose value already equals what's stored counts
+  as success rather than a spurious lost-race failure. Verify the exact upsert against a live
+  Postgres instance before shipping it — `ON CONFLICT ... DO UPDATE ... WHERE` semantics are easy
+  to get subtly wrong by reasoning alone.
 - A plaintext secret column. Use `SecretCodec` / verify-only hash.
 - A new server **SQLite** store (ADR-0006 forbids it without an exception ADR).
 - A `CREATE INDEX CONCURRENTLY` / `VACUUM` / `ALTER TYPE ADD VALUE` smuggled into a
   `PgMigration` — it cannot run in the runner's transaction (see below).
+- A **counting aggregate** (`count(*)`, `count(*) FILTER (...)`) where the question is only
+  "does at least one row exist?" (`AuditStore`'s retention probe, ADR-0040). A count with no
+  statement-level `WHERE` visits every row before either count is known, including rows that sit
+  outside a partial index built for the "any?" question — full-scanning the one table designed
+  to grow without bound, on every pass. Use `EXISTS(SELECT 1 FROM t WHERE cond)` (or, when the
+  predicate is a range and the planner's selectivity estimate for that range cannot be trusted —
+  a wide window with real matches sparse and clustered at one end — `ORDER BY <indexed column>
+  LIMIT 1 ... IS NOT NULL`, which is plan-independent: a Seq Scan would need a full sort before
+  applying the `LIMIT`, so the index-ordered path wins regardless of the estimate).
+- A **fixed re-arm interval** on a capped, paced background pass (a retention sweep, a rollup, a
+  reconciliation loop) that never shortens when the cap keeps binding. If a pass hits its cap AND
+  a genuine backlog remains, the NEXT pass should re-arm on a short floor (seconds, not the full
+  interval) and keep doing so until a pass clears the backlog — otherwise the cap silently
+  becomes a permanent drain ceiling far below what the pass could actually sustain (`AuditStore`
+  measured this at ~700x: a docs section that quoted only the full-interval cadence as "the"
+  sustained ceiling was off by roughly three orders of magnitude once the re-arm floor was
+  accounted for). Document BOTH cadences wherever a "ceiling" figure is quoted — the quiet-
+  operation rate and the backlog-recovery rate are different numbers with different meanings,
+  and quoting only the first as a hard limit understates real capacity.
+- Assuming a per-operation `timeout` parameter (a `with_txn_for(kFooTimeout, ...)` call, or any
+  similarly-named constant) bounds **statement execution**. It only bounds the pool-ACQUIRE wait
+  (see "Pool connection setup†" below) — every connection the pool hands out carries the same
+  fixed, pool-wide `statement_timeout` GUC for actual query execution regardless of what the
+  caller's own timeout constant is named or documented to mean. An unqualified long-running query
+  (a full-table scan, an unindexed aggregate) needs its OWN explicit `SET LOCAL statement_timeout
+  = '<ms>'` as the first statement inside a `pool.with_txn`/`with_txn_for` callback — never a bare
+  `SET`, which leaks the widened deadline onto the connection's next, unrelated caller once it's
+  returned to the pool. This mismatch has recurred twice in this codebase without ever being
+  written down here: #2530 (a metrics sampler assuming a bounded-`acquire()` deadline also bounded
+  its query) and `AuditStore::migrate_from_sqlite`'s whole-file reconciliation scan (ADR-0040,
+  #2697 round 3) — the second one initially repeated the first's mistake even while citing it as
+  precedent, and initially hand-rolled `BEGIN`/`SET LOCAL`/`COMMIT`/`ROLLBACK` instead of using the
+  already-available `pool.with_txn` + `pg::PgTxn` RAII guard before a second review round caught
+  it. `SoftwareLicensingStore::count_stale_agents` is the clean reference implementation of the
+  correct shape.
+- A hard `DELETE` to revoke a row that an unconditional reseed pass (a `seed_defaults()`-style
+  step re-run on every construction, `ON CONFLICT DO NOTHING`) can silently reinsert. A deleted
+  row leaves nothing for the reseed's conflict target to match, so the very next restart
+  resurrects the seeded default — the operator's revocation is undone on ordinary
+  restart/redeploy, no attacker required. `RbacStore::remove_permission` (#2703, fjarvis) is the
+  reference case, and it took THREE rounds to land correctly — the wrong two are as instructive as
+  the right one. Round 1 (bare `DELETE`) had exactly this bug. Round 2 upserted an explicit `deny`
+  row instead, on the theory that "the authorization outcome is identical either way (no matching
+  allow → deny)" — **false when the row's table feeds anything beyond a single positive/negative
+  check.** `RbacStore`'s reader applies "deny overrides everything, across ALL of a principal's
+  held roles" (a pre-existing invariant, not new), so a real deny row from the revoked role vetoed
+  an allow the SAME principal held via a DIFFERENT role — an authorization change nobody
+  authorized, on both the global check and a management-group-scoped visibility read. Round 3
+  (shipped): DELETE the row (so the read path sees exactly what the operator authored — absence,
+  same as if the grant never existed) and record the revocation SEPARATELY, in a dedicated
+  bookkeeping table (`revoked_seed_defaults`) consulted ONLY by the reseed step's own grant
+  helper — never by anything that makes an authorization decision. **The general rule: don't
+  represent "suppress the next reseed" as a fact your read path can see.** A tombstone using the
+  same effect/value the read path already interprets is only safe if that value is neutral
+  everywhere it can be read — verify this for every reader (a scoped/confinement path is easy to
+  miss when the store also has a "global" check), not just the one you're staring at. When in
+  doubt, a separate table costs one migration and guarantees it structurally.
+
+  Round 3 shipped a FOURTH bug on top, chaos-tested and closed the same week: `INSERT ... SELECT
+  ... WHERE NOT EXISTS (marker) ... ON CONFLICT DO NOTHING` — a reseed step checking the
+  bookkeeping table above before granting — is **not safe against a concurrent writer of that
+  bookkeeping table** without an explicit lock. A statement's READ COMMITTED snapshot is fixed
+  ONCE, at that statement's start, before any of its own function calls run. If the reseed's
+  snapshot is taken before a concurrent revoke's marker-insert commits, but the reseed's `INSERT`
+  then blocks on the `ON CONFLICT` arbiter waiting for that SAME revoke's uncommitted `DELETE` of
+  the conflicting row, Postgres — once the revoke commits — only re-checks the CONFLICT TARGET
+  (now gone); it does NOT re-evaluate the `WHERE NOT EXISTS` subquery, which is still reading the
+  pre-revoke snapshot. The reseed's already-computed row lands anyway: the marker AND the
+  resurrected row both end up present, permanently — nothing ever re-syncs the data table against
+  the bookkeeping table. Verified empirically (two real connections, one held open uncommitted,
+  the other genuinely blocked and measured). **The lock must be its own statement, in an explicit
+  transaction, strictly BEFORE the statement that checks-and-mutates** — a `pg_advisory_xact_lock`
+  embedded via a CTE in the SAME statement as the check does NOT work, for the identical
+  fixed-snapshot reason: blocking mid-statement never refreshes that statement's snapshot. Fix
+  shape: `BEGIN; SELECT pg_advisory_xact_lock(...); <check-and-mutate>; COMMIT;` in every writer of
+  both the data table and the bookkeeping table, all keyed to the same lock (a fixed/coarse key is
+  fine — this class of write is never a hot path). `RbacStore`'s three writers
+  (`seed_defaults()`'s grant, `remove_permission`, the backfill's revoke block) are the reference
+  case (`kRevokeCoordLockSql`).
 
 ## Non-transactional migrations (the deferred kind)
 
@@ -211,7 +359,19 @@ Design facts every store author inherits (previously recorded only in CLAUDE.md 
 - **Runner guards**: schema-drift guard — a schema at version 0 that already contains tables is
   refused (never blindly re-run migration 1). Concurrent runners (multi-process boot) are
   serialized by a cluster-wide `pg_advisory_xact_lock`. Store/schema names must match
-  `[a-z_][a-z0-9_]{0,62}` and must not be `public`/`information_schema`/`pg_*`.
+  `[a-z_][a-z0-9_]{0,62}` and must not be `public`/`information_schema`/`pg_*`. **Duplicate/
+  non-monotonic version guard (#3013, #2961/#2964):** `run()` checks a store's own
+  `migrations()` vector up front — strictly increasing by `version`, first version `> 0` —
+  and refuses the WHOLE call (nothing applied) on a duplicate, a descending pair, or a
+  non-positive first version, rather than letting the apply loop's `version <= current` skip
+  silently swallow whichever migration collided. This catches a collision baked into the
+  CALLING binary's own vector; it cannot see a version already recorded in `schema_meta` by a
+  DIFFERENT binary that shipped before the guard existed — a second, independent line of
+  defence for that case is a post-migration projection smoke-read at the store's own
+  construction site (a `LIMIT 0` SELECT of every column the store's runtime queries actually
+  select, including any column masked to `''` in read-only projections — see
+  `ApiTokenStore`'s constructor for the reference shape), which fails the store closed
+  (`!is_open()`) rather than surfacing an `undefined column` on whichever request runs first.
 - **Error/RAII hygiene**: malformed-conninfo errors are reported as a fixed string (never
   libpq's token-quoting parse error, which can echo credential fragments); libpq-allocated
   buffers are freed only with `PQfreemem`/`PQconninfoFree`.

@@ -351,6 +351,9 @@ yuzu_server_core_lib = static_library(
    yuzu_viz_host_js_embed, cytoscape_js_embed,
    yuzu_css_embed, inter_embed, content_embed, cpe_map_embed,
   files(
+    'src/config_secret_keys.cpp',
+    'src/runtime_config_store.cpp',
+    'src/runtime_config_view.cpp',
     'src/server.cpp',
     'src/agent_registry.cpp',
     'src/agent_service_impl.cpp',
@@ -404,7 +407,9 @@ yuzu_server_core_lib = static_library(
     'src/result_sets_ui.cpp',
     'src/rbac_store.cpp',
     'src/oidc_provider.cpp',
+    'src/oidc_scim_link.cpp',
     'src/saml_provider.cpp',
+    'src/saml_scim_link.cpp',
     'src/error_codes.cpp',
     'src/result_envelope.cpp',
     'src/concurrency_manager.cpp',
@@ -418,6 +423,7 @@ yuzu_server_core_lib = static_library(
     'src/scim_store.cpp',
     'src/scim_json.cpp',
     'src/scim_routes.cpp',
+    'src/deprovision_revoke.cpp',
     'src/quarantine_store.cpp',
     'src/result_set_store.cpp',
     'src/result_set_matcher.cpp',
@@ -433,7 +439,6 @@ yuzu_server_core_lib = static_library(
     'src/guardian_form_render.cpp',
     'src/dex_alert_router.cpp',
     'src/dex_blast_radius.cpp',
-    'src/runtime_config_store.cpp',
     'src/custom_properties_store.cpp',
     'src/mcp_server.cpp',
     'src/mcp_input_schema.cpp',
@@ -552,7 +557,7 @@ yuzu_server_core_lib = static_library(
     'src/kek_routes.cpp',
     'src/security_headers.cpp',
   )],
-  include_directories: ['include'],
+  include_directories: ['include', '../../common/include'],
   cpp_args: https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
   dependencies: [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                  sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
@@ -562,7 +567,7 @@ yuzu_server_core_lib = static_library(
 
 yuzu_server_core_dep = declare_dependency(
   link_with: yuzu_server_core_lib,
-  include_directories: include_directories('include'),
+  include_directories: [include_directories('include'), include_directories('../../common/include')],
   # CPPHTTPLIB_OPENSSL_SUPPORT gates real data members on httplib::ClientImpl/
   # SSLClient (header-only, inline definitions) — every consumer TU must define
   # it identically to yuzu_server_core_lib's own cpp_args, or the linker folds

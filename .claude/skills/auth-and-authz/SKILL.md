@@ -46,7 +46,7 @@ skill claims anything is "done."
 | Session-cookie auth (HTMX dashboard) | Shipped | `auth_routes.cpp:43,386` (`extract_session_cookie`, `Set-Cookie: yuzu_session=…`) |
 | API tokens — Bearer + `X-Yuzu-Token` | Shipped | `api_token_store.cpp` (store); both header forms parsed at `auth_routes.cpp:108-119` |
 | Owner-scoped token revocation (#222) | Shipped | `rest_api_v1.cpp:1058-1082` (owner-vs-admin check at L1060) |
-| Granular RBAC — 7 roles (adds `Reviewer`, access-review attestation) × **22** securable types × 7 ops (adds `Attest`, gated via the dedicated `AccessReview` securable — NOT `AuditLog`; the rationale lives in **#2324**, the access-reviews PR, not #2225, which is the governance-gate-check PR that ran alongside it) | Shipped (Phase 3) | `rbac_store.cpp:260-295` — types: Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response, ManagementGroup, ApiToken, Security, Policy, DeviceToken, SoftwareDeployment, License, FileRetrieval, GuaranteedState, Inventory, AccessReview, SoftwareLicensing; ops: Read/Write/Execute/Delete/Approve/Push/Attest |
+| Granular RBAC — 7 roles (adds `Reviewer`, access-review attestation) × **23** securable types × **8** ops (adds `Attest`, gated via the dedicated `AccessReview` securable — NOT `AuditLog`; the rationale lives in **#2324**, the access-reviews PR, not #2225, which is the governance-gate-check PR that ran alongside it — and `Rotate`, P2 #11 SOC 2 CC6.3, ApiToken-specific self-service human-token rotation, seeded only to `Administrator`/`ApiTokenManager`, deliberately distinct from `Write`) | Shipped (Phase 3 + P2 #11) | `rbac_store.cpp:260-295,397` — types: Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response, ManagementGroup, ApiToken, Security, Policy, DeviceToken, SoftwareDeployment, License, FileRetrieval, GuaranteedState, Inventory, AccessReview, SoftwareLicensing, EnginePrincipal (#2376 — cut away from the over-broad Security:Read); ops: Read/Write/Execute/Delete/Approve/Push/Attest/Rotate |
 | Self-target principal-destruction guard (#397/#403) | Shipped | `settings_routes.cpp:434,1830,2488-2504` (3 call sites); design in `docs/auth-architecture.md` §self-target |
 | OIDC SSO — full PKCE flow, Entra discovery, JWT validation | Shipped | `oidc_provider.cpp:189` `generate_code_verifier()`, L194 `compute_code_challenge()`, L385 `code_verifier` post, L766 `/.well-known/openid-configuration` discovery, L542/L623 JWKS fetch + JWT signature verify |
 | Directory Sync — AD/Entra users + groups + role mapping via Microsoft Graph v1.0 | Shipped | `directory_sync.cpp:336,509,556,608` calls `https://graph.microsoft.com/v1.0/users`, `/groups`, `/groups/{id}/members`; persisted `directory_group_role_mappings` + `directory_sync_status` tables (`directory_sync.cpp:147`). NOTE: `oidc_provider.cpp:248` only parses the JWT `groups` claim — Graph integration is the separate Directory Sync subsystem. |
@@ -63,6 +63,7 @@ skill claims anything is "done."
 | Account lockout after N failed local-password logins | Shipped (SOC 2 CC6.3) | `auth.db` v3 columns + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins` (`auth_db.cpp`); `POST /login` pre-check + record/clear (`auth_routes.cpp`); admin unlock `POST /api/v1/users/<name>/unlock` (`rest_api_v1.cpp`); `--auth-lockout-threshold`/`--auth-lockout-window-secs` (`main.cpp`). Generic-401 (no enum/oracle), auto-expiring window, audit `auth.lockout.applied`/`.cleared`. Ref: `docs/auth-architecture.md` "Account lockout". |
 | MFA / TOTP — full ladder (enrollment + login challenge + recovery codes; step-up on 11 high-risk surfaces; enforcement modes + OIDC `amr` short-circuit + login-time enrollment bootstrap) | Shipped (v0.12–v0.13, SOC 2 CC6.6) | `server/core/src/totp.{hpp,cpp}` (RFC 6238 + base32); `AuthDB::mfa_*` accessors; `POST /login` 202-branches + `POST /login/mfa`, `/login/mfa/stepup`, `/login/mfa/enroll` at `auth_routes.cpp`; `require_mfa_step_up` + `amr_asserts_mfa` at `mfa_step_up.{hpp,cpp}`; `--mfa-enforcement` at `main.cpp`; Settings panel + self-target disable guard at `settings_routes.cpp`. Remaining: at-rest TOTP-secret encryption — **mechanism decided by ADR-0010** (SecretCodec envelope encryption at the `auth` store's Postgres migration; the `auth_kv` scaffolding will NOT be used). Full reference: `docs/auth-mfa-design.md`. |
 | SCIM v2 provisioning — auto-create/deactivate/reactivate operators from an IdP, plus Groups→role mapping (`/scim/v2/*`, Users and Groups) | Shipped (SOC 2 CC6.2/CC6.7/CC6.8) | `server/core/include/yuzu/server/scim_store.hpp` (storage: `scim_resources`/`scim_tokens` inside `auth.db`, own `"scim"` migration component) + `scim_json.hpp` (JSON codec/discovery) + `scim_routes.{hpp,cpp}` (routes); provenance guard via `AuthDB::set_provisioning_source`/`get_provisioning_source` (`users.provisioning_source`, auth.db migration v7), now also re-checking `role == "user"`. `--scim-admin-group` grants `role=admin` to a SCIM-provisioned user currently in that group (Model A: IdP membership is authoritative, a manual role change is reverted on the next membership recompute). See `docs/auth-architecture.md` "SCIM v2 provisioning". |
+| SCIM ↔ OIDC/SAML identity linkage + credential revoke on deprovision (ADR-2001) | OIDC: Shipped PR1+PR2+PR3 (SOC 2 CC6.8). SAML: Shipped PR4a+PR4b (SOC 2 CC6.8) | Login-time link (`oidc::link_oidc_login_to_scim`, `ScimStore::identity_links`/`--oidc-scim-link-claim`, default `sub`, allow-list `{sub,oid}`) + deprovision-time revoke across slug + every linked `oidc:` principal (`deprovision_revoke.{hpp,cpp}`, `oidc_principal.hpp`), credentials-first, fail-closed on non-persist. D1 (`yuzu_scim_deprovision_role_refused_with_active_link_total` + `scim.user.deprovision_role_refused_with_link` audit, `result=failure` — AuditStore has no severity column, so the ADR's "kCritical audit" language is realized as an *optional* `Severity::kCritical` AnalyticsEvent gated on analytics collection being enabled, never the audit row itself) covers an externally-elevated SCIM admin (#2021 guard still applies; a human must revoke that identity's tokens manually). D2 (`yuzu_scim_deprovision_unlinked_total`) covers a federated user who logged in but no link formed (misconfigured `--oidc-scim-link-claim`, or an IdP whose `externalId` shares no claim with any OIDC token Yuzu trusts — genuinely unrevocable via SCIM in that case); login records BOTH the `sub` and `oid` observation candidates (`oidc_login_observations`, keyed `(iss,sub,claim_name)`), so D2 reliably fires on a misconfigured link-claim (an `externalId` matching the *other*, unconfigured claim is still detected). Revocation is durable within ~60s (`ApiTokenStore` validate-cache TTL), not instant. Two residuals: (a) the migration-v3 partial-unique index on `scim_resources.external_id` is fail-closed — a server carrying a pre-existing duplicate non-empty `external_id` refuses to boot (dedup pre-upgrade, see `docs/user-manual/server-admin.md` Upgrade Notes); (b) a login racing an in-flight deprovision (TOCTOU) — now closed by the shipped PR3 deny-at-login (`ScimStore::linked_resource_active` + `oidc_login_denied_deprovisioned`, `auth.oidc.deprovisioned_denied` audit): re-login after a *completed* deprovision is fully closed, the in-flight microsecond race narrowed (not eliminated) by a post-mint re-check. **SAML (PR4a+PR4b):** the same shape, keyed on the stable `saml:<entity_id>#<NameID>` principal (`saml::saml_principal_id`, `saml_principal.hpp`), a dedicated `saml_identity_links` table (`ScimStore` migration v4, `saml_scim_link.{hpp,cpp}`), and a link forming ONLY for a stable NameID Format (`persistent`/SAML-1.1 `emailAddress` — never `transient`/unspecified, `saml::is_linkable_name_id_format`); since SAML mints no API/MCP tokens, deprovision-revoke for a SAML principal is session-invalidation only. **PR4b (#3066, the SAML analogue of PR3) SHIPPED** — `ScimStore::saml_linked_resource_active` (the SAML analogue of `linked_resource_active`, same LEFT-join/fail-closed/orphan-reprovision tri-state) + `saml::saml_login_denied_deprovisioned`, wired as a primary pre-mint check and a post-mint re-check in `/saml/acs`, exactly mirroring OIDC's two call sites; denies redirect to the byte-identical `/login?error=saml`, audit `auth.saml.deprovisioned_denied`, metric `yuzu_auth_saml_deprovisioned_denied_total`. Same honest scope as OIDC's PR3: re-login after a *completed* SAML deprovision is fully closed; the in-flight microsecond race is narrowed (not eliminated) by the post-mint re-check, and — since SAML mints no tokens — a slipped session is bounded by its own TTL rather than the ~60s token-cache window. See `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision" + "SAML ↔ SCIM identity linkage" and `docs/adr/2001-scim-oidc-identity-linkage.md` (incl. its SAML addendum, item 8). |
 
 ---
 
@@ -81,12 +82,12 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **MFA / 2FA / TOTP — full ladder** (PR 1 enrollment + login challenge; PR 2 step-up on 11 surfaces; PR 3 enforcement modes `admin-only`/`required` + OIDC `amr` short-circuit + login-time enrollment bootstrap; `docs/auth-mfa-design.md`) | "2FA/TOTP for high-risk approvals" | CC6.6 | **SHIPPED — ladder complete; only the at-rest TOTP-secret encryption follow-up remains (mechanism: ADR-0010 SecretCodec, rides the `auth` Postgres migration)** |
 | **Hardened-mode local-password disable** | "Disable local-password fallback in hardened mode" | CC6.3 | **SHIPPED** — `--auth-mode=sso-only` (`Config::auth_mode`) disables local-password login fleet-wide (only OIDC mints a session); boot **fails closed** without OIDC. Gate in `auth_routes.cpp` `POST /login` returns the same generic 401 (no oracle); denial is metric-only (`yuzu_auth_local_disabled_total`). See `docs/auth-architecture.md` "Hardened mode". |
 | **Break-glass account policy** (constrained, audited, rotated) | "or tightly constrain break-glass account policy" | CC6.6 | **SHIPPED** — `--break-glass-user` exempt from sso-only **only while armed** (`users.break_glass_armed_until`, migration v4, auto-expiring `--break-glass-window-secs` default 24h); **mandatory MFA** enforced fail-closed at boot AND forced at login; armed out-of-band via the host CLI `--break-glass-arm` (audited `auth.breakglass.armed`, OS-principal-attributed); use audits `auth.breakglass.login` + metric `yuzu_auth_break_glass_login_total`. |
-| **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **PARTIAL (thin slice + group→role mapping shipped)** — SP-initiated login (HTTP-Redirect binding), assertion-signature validation against a pinned IdP cert, replay-protected (`InResponseTo` single-use), ephemeral session (`auth_source="saml"`, `role=admin` via exact-match IdP-attested group membership — `--saml-group-attribute`/`--saml-admin-group`, mirrors the OIDC `--oidc-admin-group` guard — else `role=user`), Linux/macOS only. Admins are now reachable via SAML without a local account. Deferred: AuthnRequest signing, AttributeStatement parsing beyond the group attribute, Windows support, IdP-metadata auto-fetch, Settings-UI reconfigure. See `docs/auth-architecture.md` "SAML 2.0 SP". |
-| **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.7/6.8 | **SHIPPED (Users + Groups→role mapping)** — `--scim-enable`/`YUZU_SCIM_TOKEN` (preferred over `--scim-token`, which is `ps`-visible; fail-closed: refuses to start without a token, or with `--no-https`); every `/scim/v2/*` route (including discovery) bearer-authed constant-time, its own `scim-service` audit principal. `POST /scim/v2/Users` provisions at the fixed `role=user` (SSO login, discarded local password; reviving a deactivated same-`userName` account rather than `409` — returning-employee reprovision); `PATCH`/`PUT .../{id}` `active:false`/`active:true` deprovisions (soft-delete + session-revoke cascade) / reactivates (lockout cleared, MFA NOT restored). **`userName` must be a slug** (no `@`) — a stock Okta/Entra `userName=email` mapping 400s until remapped. **Provenance guard** (`users.provisioning_source`, auth.db migration v7) makes every deactivate/reactivate/delete/update re-verify `provisioning_source == "scim"` **and** `role == "user"` before mutating, refusing `404` (never `403`) on either mismatch — a locally-created admin, the break-glass account, or a since-promoted former-SCIM account can never be touched by an IdP push. **Groups→role mapping (#2021):** `/scim/v2/Groups` (`POST`/`GET`/`PUT`/`PATCH`/`DELETE`, `displayName`-keyed exact-case match, whitespace-trimmed `--scim-admin-group`, bounded `members[]`, `409` on a `displayName` collision or rename-onto-existing) reuses `resolve_role_from_groups` — a SCIM-provisioned user is `role=admin` **iff** currently a member of `--scim-admin-group`; there is no other field or code path to `role=admin`, so a compromised IdP can elevate only as far as that one configured group. **Model A: IdP membership is authoritative** — a manual dashboard role change on a SCIM account is reverted on the next membership-recomputing event (Group mutation or User reprovision), not on a plain deactivate/restart/flag change; `deprovision_role_ok` is a demote-before-delete ordering gate (blocks deprovisioning a non-`user` account), not a permanent-elevation guarantee. Audit `success`/`failure`/`denied` results incl. new `scim.auth.denied`/`scim.group.*`/`scim.user.role_changed`; metrics `yuzu_scim_requests_total{op,status}` + `yuzu_scim_role_changes_total` + `yuzu_scim_role_change_failures_total` + 3 more (see `docs/auth-architecture.md`). Storage rides `auth.db` (own `"scim"` migration component, a recorded ADR-0006 SQLite exception), not a new store. **Deferred:** native email-`userName` support, `userName` rename, per-route rate-limiting, API-token revocation on user delete/deactivate (pre-existing gap shared with the dashboard's manual disable path), and **not** SCIM-token-at-rest encryption — struck as a non-gap (2026-07-25): `scim_store.cpp:192,243` stores a verify-only SHA-256, the ADR-0010-correct posture for a bearer credential the server only ever compares. Do NOT "fix" it into a SecretCodec envelope. See `docs/auth-architecture.md` "SCIM v2 provisioning" and Section 3 item 7. |
+| **SAML 2.0 SP** (some enterprises require SAML, not OIDC) | implicit ("SSO enforcement") | CC6.1 | **PARTIAL (thin slice + group→role mapping shipped)** — SP-initiated login (HTTP-Redirect binding), assertion-signature validation against a pinned IdP cert, replay-protected (`InResponseTo` single-use), ephemeral session (`auth_source="saml"`, `role=admin` via exact-match IdP-attested group membership — `--saml-group-attribute`/`--saml-admin-group`, mirrors the OIDC `--oidc-admin-group` guard — else `role=user`), Linux/macOS only. Admins are now reachable via SAML without a local account. Deferred: AuthnRequest signing, AttributeStatement parsing beyond the group attribute, Windows support, IdP-metadata auto-fetch, Settings-UI reconfigure. **SCIM linkage + deprovision-revoke has since SHIPPED (ADR-2001 PR4a+PR4b, incl. deny-at-login)** — see the "SCIM ↔ OIDC/SAML identity linkage" row in Section 1 above. See `docs/auth-architecture.md` "SAML 2.0 SP". |
+| **SCIM v2 provisioning** (auto-provision/deprovision from IdP) | "Periodic access reviews" automation | CC6.2/6.7/6.8 | **SHIPPED (Users + Groups→role mapping)** — `--scim-enable`/`YUZU_SCIM_TOKEN` (preferred over `--scim-token`, which is `ps`-visible; fail-closed: refuses to start without a token, or with `--no-https`); every `/scim/v2/*` route (including discovery) bearer-authed constant-time, its own `scim-service` audit principal. `POST /scim/v2/Users` provisions at the fixed `role=user` (SSO login, discarded local password; reviving a deactivated same-`userName` account rather than `409` — returning-employee reprovision); `PATCH`/`PUT .../{id}` `active:false`/`active:true` deprovisions (soft-delete + session-revoke cascade) / reactivates (lockout cleared, MFA NOT restored). **`userName` must be a slug** (no `@`) — a stock Okta/Entra `userName=email` mapping 400s until remapped. **Provenance guard** (`users.provisioning_source`, auth.db migration v7) makes every deactivate/reactivate/delete/update re-verify `provisioning_source == "scim"` **and** `role == "user"` before mutating, refusing `404` (never `403`) on either mismatch — a locally-created admin, the break-glass account, or a since-promoted former-SCIM account can never be touched by an IdP push. **Groups→role mapping (#2021):** `/scim/v2/Groups` (`POST`/`GET`/`PUT`/`PATCH`/`DELETE`, `displayName`-keyed exact-case match, whitespace-trimmed `--scim-admin-group`, bounded `members[]`, `409` on a `displayName` collision or rename-onto-existing) reuses `resolve_role_from_groups` — a SCIM-provisioned user is `role=admin` **iff** currently a member of `--scim-admin-group`; there is no other field or code path to `role=admin`, so a compromised IdP can elevate only as far as that one configured group. **Model A: IdP membership is authoritative** — a manual dashboard role change on a SCIM account is reverted on the next membership-recomputing event (Group mutation or User reprovision), not on a plain deactivate/restart/flag change; `deprovision_role_ok` is a demote-before-delete ordering gate (blocks deprovisioning a non-`user` account), not a permanent-elevation guarantee. Audit `success`/`failure`/`denied` results incl. new `scim.auth.denied`/`scim.group.*`/`scim.user.role_changed`; metrics `yuzu_scim_requests_total{op,status}` + `yuzu_scim_role_changes_total` + `yuzu_scim_role_change_failures_total` + 3 more (see `docs/auth-architecture.md`). Storage rides `auth.db` (own `"scim"` migration component, a recorded ADR-0006 SQLite exception), not a new store. **Deferred:** native email-`userName` support, `userName` rename, per-route rate-limiting, and **not** SCIM-token-at-rest encryption — struck as a non-gap (2026-07-25): `scim_store.cpp:192,243` stores a verify-only SHA-256, the ADR-0010-correct posture for a bearer credential the server only ever compares. Do NOT "fix" it into a SecretCodec envelope. **API-token revocation on user delete/deactivate has since SHIPPED (ADR-2001)** — see the "SCIM ↔ OIDC identity linkage + credential revoke on deprovision" row in Section 1 above for the honest scope (D1/D2 residuals, ~60s window, PR3 deny-at-login not shipped). See `docs/auth-architecture.md` "SCIM v2 provisioning" and Section 3 item 7. |
 | **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **SHIPPED** — `POST /api/v1/elevate` (`--jit-max-elevation-secs`); see priority item 9 below |
 | **Inactivity session timeout** | "inactivity timeout" | CC6.3 | **SHIPPED** — `--session-inactivity-secs` (default 0 = disabled, opt-in). Sliding idle window enforced in `AuthManager::validate_session` on the in-memory `Session` (monotonic `last_activity_at`), under the absolute 8h lifetime; cookie sessions only (API/MCP tokens exempt). Best-effort throttled `auth.db` mirror via `AuthDB::touch_session_activity`. See `docs/auth-architecture.md` "Inactivity session timeout". |
 | **Session revocation REST surface** | "expiration, revocation" | CC6.3 | **SHIPPED** — `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me` (self) in `rest_api_v1.cpp` (audit `session.revoke_all`/`session.revoke_all.self`, step-up, self-target guard), over `AuthDB::invalidate_all_sessions()` |
-| **API token rotation workflow** — pair-of-tokens overlap. | "rotation process" | CC6.3 | **PARTIAL — built for engine credentials, not adopted for human tokens.** `ApiTokenStore::rotate_engine_credential`/`confirm_rotation` (`api_token_store.hpp:254`, `pg_advisory_xact_lock`-serialized per principal) ship the §7 overlap-pair design behind `POST /api/v1/engine-principals/{id}/credentials/rotate` + `.../confirm`. Written credential-generic for later human-token adoption; no human-owned token has a `rotate` entry point yet (create + revoke only). See Section 3 item 11. |
+| **API token rotation workflow** — pair-of-tokens overlap. | "rotation process" | CC6.3 | **SHIPPED for both principal kinds on both REST and MCP.** Engine credentials: `ApiTokenStore::rotate_engine_credential`/`confirm_rotation` (`api_token_store.hpp:254`) behind `POST /api/v1/engine-principals/{id}/credentials/rotate` + `.../confirm` (REST + MCP). Human-owned tokens: `ApiTokenStore::rotate_token`/`confirm_token_rotation` (`api_token_store.hpp:397,417`) behind `POST /api/v1/tokens/{id}/rotate` + `.../confirm` AND the `rotate_api_token`/`confirm_api_token_rotation` MCP twins — a deliberately **token-keyed** state machine (≤2 active per `rotation_group`, not per principal), self-service only, lifetime-neutral, gated on the dedicated `ApiToken:Rotate` operation on both transports. See Section 3 item 11. |
 | **API token inventory + last-used view** — data layer, Settings → API Tokens dashboard fragment (`render_api_tokens_fragment` in `settings_routes.cpp`), and `GET /api/v1/tokens` REST route all shipped, both surfacing owner/created/last-used columns. | "token inventory" | CC6.6 | **SHIPPED** |
 | **Periodic access reviews** (export of role assignments + attestation flow) | "Periodic access reviews with manager/security attestation" | CC6.2 | **SHIPPED** — `GET /api/v1/access-reviews/export?format=json\|csv` (**grant-table-driven**: one row per principal holding a live grant, enumerates `principal_type IN (user, group, engine)` per the engine-principal program, a grant on a principal outside every roster is surfaced as `source="orphan"` rather than dropped (a disabled-but-still-granted user correctly shows `source="user"`, `lifecycle_state="disabled"` instead), CSV formula-injection neutralized, `AccessReview:Read`, self-audited `access_review.exported`, `503` fail-loud never a silent partial export) + `GET /api/v1/access-reviews` (list every campaign, newest-first, capped 500, `AccessReview:Read`, self-audited `access_review.list`) + attestation-campaign lifecycle (`POST /api/v1/access-reviews` freezes the current grant population as `pending` rows; `POST .../{id}/attestations` records `attested`/`flagged_revoke` (UPSERT — overwrites a prior decision) — **flag ≠ revoke, evidence only**; `POST .../{id}/close`; `GET .../{id}` for full state — all `AccessReview:Attest` except the reads). Every route, reads included, structurally denies an engine-classed caller. MCP twins `export_access_review`/`open_access_review`/`record_attestation`/`get_access_review`/`list_access_reviews`/`close_access_review` (JSON only; `record_attestation` is `destructiveHint:true`, the rest `false`). 4 Prometheus metrics (`yuzu_access_review_export_total{format}`, `_export_duration_seconds`, `_campaigns_opened_total`, `_attestations_total{decision}`). Dedicated **`AccessReview` securable** (`Read`+`Attest` ops) + seeded `Reviewer` role (`AccessReview:Read`+`Attest` only) — **round-2 fix**: the first round gated this surface on `AuditLog:Read`/`AuditLog:Attest`, which over-disclosed the full grant population to `Operator`/`PlatformEngineer` (both seeded `AuditLog:Read` for unrelated reasons); the dedicated securable closes that. Born-on-PG `AccessReviewStore` (no prune — evidence persists). Deliberately gated on a **global** `AccessReview:Read`/`Attest`, not the ADR-0017 confinement filter (#2225 — a scoped slice is useless as fleet-wide CC6.2 evidence). Known gap: user rows list direct grants only (group-inherited access is on the group's own row); `last_activity_kind` is `"n/a"` for every user row (`AuthDB` has no last-login read accessor yet). See `docs/auth-architecture.md` "Periodic access reviews" and `docs/security-reviews/access-reviews-2026-07-21.md`. |
 | **Account lockout after N failed logins** | implicit (auth hygiene) | CC6.3 | **SHIPPED** — `auth.db` v3 columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`; `--auth-lockout-threshold`/`--auth-lockout-window-secs`; generic-401 pre-check (no enum/oracle, skips PBKDF2), auto-expiring window w/ fresh budget, admin unlock `POST /api/v1/users/<name>/unlock`; audit `auth.lockout.applied`/`.cleared` + metrics. See `docs/auth-architecture.md` "Account lockout". |
@@ -134,6 +135,37 @@ not by trusting a design doc's status header. Re-stamp this line whenever you
 revise the section; a matrix derived from a stale checkout is worse than no
 matrix (this revision corrected four items that a 571-commit-behind tree had
 reported as unbuilt).
+
+**Item 11 re-verified 2026-08-10, targeted, not wholesale** — against
+`feat/auth-human-token-rotation` @ `e1bf2d86` (a pre-merge integration
+branch off `origin/dev`, not yet on `dev`), by reading
+`api_token_store.{hpp,cpp}`, `rest_api_v1.cpp`, and `mcp_server.cpp`
+directly (the human arm's REST routes exist; `grep`ing `mcp_server.cpp` for
+`rotate_token`/`confirm_token_rotation` **now finds** the `rotate_api_token`
+and `confirm_api_token_rotation` tool handlers calling into the store — the
+MCP twins have merged code, per the SHIPPED status on this surface below).
+Cited by SYMBOL, deliberately not by line number: this stamp has now been
+stale twice — once claiming the grep returned nothing after the twins
+shipped, then once citing line numbers the named grep does not return — and
+a citation that rots on every unrelated edit above it is worse than no
+citation, because it reads as verified. This does **not** re-verify the
+other items in this section — their last wholesale check remains the
+`ef4582be` stamp above.
+
+**Item 7 (SCIM) re-verified 2026-08-12, targeted, not wholesale** — against
+`feat/auth-token-revoke-on-deprovision` @ `f1b9e508` (a pre-merge branch off
+`origin/dev` @ `e458871c`, not yet on `dev`), by reading `scim_routes.cpp`
+(D1/D2 detectors, the new `scim.user.deprovision_role_refused_with_link`
+audit action and `emit_scim_critical_event`), `deprovision_revoke.{hpp,cpp}`,
+`oidc_principal.hpp`, `scim_store.hpp` (`identity_links`,
+`find_unique_active_by_external_id`, `observation_matches`), `auth_routes.cpp`
+(login-time `link_oidc_login_to_scim` call), `settings_routes.cpp` (the
+dashboard-delete revoke seam), and `main.cpp` (`--oidc-scim-link-claim`
+flag/allow-list) directly — the "API-token revocation on user
+delete/deactivate" gap struck from item 7's Remaining list above SHIPPED
+per this read, with the two named residuals (D1/D2) confirmed against the
+code, not assumed from the ADR. This does **not** re-verify the other items
+in this section.
 
 **Two standing cautions, learned from this revision's own review:**
 
@@ -247,6 +279,20 @@ duplicate `10`; the one live cross-reference to the old numbering
    (Section 1). The real absences are narrower — request signing, metadata
    fetch, attributes beyond the group claim, the Settings UI, and **all
    Windows support** (a Windows-hosted server cannot use SAML at all). See `docs/auth-architecture.md` "SAML 2.0 SP".
+   **SCIM linkage + deprovision-revoke has since SHIPPED for SAML too**
+   (ADR-2001 PR4a+PR4b — do NOT list it as a gap): a SAML login now mints its
+   session on a stable `saml:<entity_id>#<NameID>` principal, forms a
+   durable link to a SCIM resource when the NameID's Format is stable
+   (`persistent`/SAML-1.1 `emailAddress` — never `transient`), and a SCIM
+   deprovision now revokes that linked SAML session (SAML has no API tokens
+   to revoke). **PR4b (#3066), the SAML deny-at-login backstop, has since
+   SHIPPED too** — a deprovisioned SAML identity is now refused at
+   `/saml/acs` the same way OIDC's PR3 refuses `/auth/callback`, closing the
+   re-authenticate-and-mint-a-fresh-session window for the completed-
+   deprovision case (the in-flight race is narrowed, not eliminated by
+   construction, exactly as for OIDC). See the "SCIM ↔ OIDC/SAML identity
+   linkage" row above and `docs/auth-architecture.md` "SAML ↔ SCIM identity
+   linkage" for the honest scope.
 7. ~~**SCIM v2 provisioning**~~ **DONE (Users + Groups→role mapping,
    #2021)** — auto-create/deactivate/reactivate users from the IdP over
    `/scim/v2/*` (`--scim-enable`/`--scim-token`, fail-closed without a
@@ -293,13 +339,8 @@ duplicate `10`; the one live cross-reference to the old numbering
    **Remaining:** native email-shaped `userName` support (Yuzu usernames
    are slug-only — a stock Okta/Entra `userName=email` mapping 400s until
    the operator remaps it; this is the **highest-friction** of the four for a
-   real IdP onboarding), `userName` rename via `PUT`, per-route
-   rate-limiting, and **API-token revocation on user delete/deactivate** —
-   `scim_routes.cpp` revokes auth sessions only and makes no
-   `ApiTokenStore` call, so a deprovisioned operator's Bearer tokens keep
-   working. That last one is a **pre-existing gap shared with the dashboard's
-   manual disable path**, not SCIM-specific — fix it at the shared
-   deactivate seam, not inside SCIM. **Struck from this list (2026-07-25):**
+   real IdP onboarding), `userName` rename via `PUT`, and per-route
+   rate-limiting. **Struck from this list (2026-07-25):**
    "SCIM-token-at-rest encryption" — `scim_store.cpp:192,243` stores a
    verify-only `sha256_hex`, which is the ADR-0010-correct posture for a
    bearer credential the server only ever compares. It is not a gap; do NOT
@@ -307,6 +348,47 @@ duplicate `10`; the one live cross-reference to the old numbering
    storage off `auth.db` onto a born-on-PG `ScimStore` (schema
    `scim_store`); the verify-only hash posture is preserved across that move.
    See `docs/auth-architecture.md` "SCIM v2 provisioning".
+   **API-token revocation on user delete/deactivate has since SHIPPED
+   (ADR-2001) — do NOT list it as a gap.** Deprovision now revokes the SCIM
+   slug's tokens AND every OIDC identity durably linked to it at login
+   (`--oidc-scim-link-claim`, default `sub`; Entra needs `oid`), for both
+   the SCIM seam and the dashboard's manual delete. **This is a covered
+   control with two NAMED, monitored residuals, not "complete" flatly:** (1)
+   a SCIM slug elevated to admin outside SCIM still blocks the #2021
+   deprovision guard, so its linked identity's tokens are NOT auto-revoked
+   — `yuzu_scim_deprovision_role_refused_with_active_link_total` +
+   `scim.user.deprovision_role_refused_with_link` (`result=failure`; the
+   *audit* row itself carries no severity — `AuditEvent` has no severity
+   column — the ADR's "kCritical" language is realized only as an optional
+   `AnalyticsEvent` gated on analytics collection being enabled, never as a
+   property of the audit row) — a human must terminate that identity
+   manually; (2) an IdP whose SCIM `externalId` shares no claim value with
+   any OIDC token Yuzu trusts cannot be linked at all — surfaced via
+   `yuzu_scim_deprovision_unlinked_total` (D2), never silently. Revocation
+   is durable within `ApiTokenStore`'s ~60s validate-cache window, not
+   instant. **The OIDC deny-at-login backstop (ADR-2001 §4/PR3) has
+   SHIPPED** — a deprovisioned linked identity is refused at OIDC login
+   (`ScimStore::linked_resource_active` + `oidc_login_denied_deprovisioned`).
+   Read the scope precisely (do NOT flatten to "CC6.8 complete"): re-login
+   against an *already-completed* deprovision is fully closed; a login racing
+   an *in-flight* deprovision is narrowed by a post-mint re-check (not
+   eliminated by construction). See `docs/auth-architecture.md` "SCIM ↔ OIDC
+   identity linkage for deprovision" and `docs/adr/2001-scim-oidc-identity-linkage.md`.
+   **SAML gained the same coverage via PR4a+PR4b** (SAML addendum to the
+   same ADR): a stable `saml:<entity_id>#<NameID>` session principal
+   (`saml_principal.hpp`), a dedicated `saml_identity_links` table (`ScimStore`
+   migration v4), link formation gated on a stable NameID Format only
+   (never `transient`), deprovision-revoke of the linked SAML session (SAML
+   mints no tokens, so there is nothing else to revoke), and **PR4b (#3066)
+   deny-at-login, SHIPPED** — `ScimStore::saml_linked_resource_active` +
+   `saml::saml_login_denied_deprovisioned`, the identical
+   primary-check/post-mint-re-check shape OIDC's PR3 uses, closing the
+   re-authenticate-and-mint-a-fresh-session window for a *completed*
+   deprovision the same way; a login racing an *in-flight* deprovision is
+   narrowed by the post-mint re-check, not eliminated by construction — the
+   same scope statement as the OIDC line above. See
+   `docs/auth-architecture.md` "SAML ↔ SCIM identity linkage" and the ADR's
+   SAML addendum (item 8).
 8. ~~**Inactivity session timeout**~~ **DONE** — `--session-inactivity-secs`
    (`YUZU_SESSION_INACTIVITY_SECS`, `Config::session_inactivity_secs`), **default
    0 = disabled** (opt-in; existing deployments unaffected; recommended 900).
@@ -392,26 +474,39 @@ duplicate `10`; the one live cross-reference to the old numbering
 
 ### Priority 2 — long-tail polish
 
-11. **API token rotation workflow — engine credentials SHIPPED, human tokens
-    NOT ADOPTED.** The overlap-pair state machine designed in
-    `docs/auth-engine-principals-design.md` §7 is built and live:
-    `ApiTokenStore::rotate_engine_credential` / `confirm_rotation`
-    (`api_token_store.hpp:254`), serialized by a `pg_advisory_xact_lock` per
-    principal, surfaced at `POST /api/v1/engine-principals/{id}/credentials/rotate`
-    and `.../confirm`. **Nothing has adopted it for humans:** no `rotate`
-    entry point exists for a human-owned token — only create + revoke.
-
-    Be precise about what is reusable: the **design and state taxonomy** are
-    credential-generic, but the **implementation is engine-only and must be
-    generalized**. `rotate_engine_credential` calls `validate_engine_mint`
-    (`api_token_store.cpp:776`), rejects any active row whose
-    `principal_kind != "engine"` (`:817-825`), and hard-codes empty service
-    scope / readonly MCP tier / `'engine'` in the successor INSERT
-    (`:859-867`); `confirm_rotation` repeats the rejection (`:993-998`). So
-    this is still the cheapest remaining CC6.3 win — the hard part (the
-    concurrency-safe state machine and its replay semantics, hardened by
-    #2384/#2404) is proven in production — but it is a generalization, not a
-    drop-in reuse.
+11. ~~**API token rotation workflow — engine credentials SHIPPED, human
+    tokens NOT ADOPTED.**~~ **HUMAN TOKENS: STORE CORE + REST + MCP ALL
+    SHIPPED (full REST/MCP parity).** Engine-credential
+    rotation was already SHIPPED (`ApiTokenStore::rotate_engine_credential`/
+    `confirm_rotation`, `api_token_store.hpp:254`, `POST
+    /api/v1/engine-principals/{id}/credentials/rotate`/`.../confirm`) — see
+    item 14 below. Human-owned tokens now have their **own**, deliberately
+    different, token-keyed state machine (a principal-keyed copy of the
+    engine arm would have been wrong — a human holds N concurrent unrelated
+    tokens, an engine principal holds one):
+    `ApiTokenStore::rotate_token`/`confirm_token_rotation`
+    (`api_token_store.hpp:397,417`), serialized on the same
+    `pg_advisory_xact_lock(hashtext(principal_id))` the engine arm and the
+    T12 sweep use, enforcing a ≤2-active ceiling **per `rotation_group`**,
+    never per principal. **Shipped:** the store core, `POST
+    /api/v1/tokens/{id}/rotate`/`.../confirm` AND the MCP twins
+    (`rotate_api_token`/`confirm_api_token_rotation`) (self-service only,
+    gated on `ApiToken:Rotate` — a dedicated operation distinct from the
+    `ApiToken:Write` create/list/revoke axis and from `Security:Write` —
+    no admin bypass, wrong-owner indistinguishable from nonexistent,
+    lifetime-neutral with no caller-exposed override), kind-discriminated
+    telemetry (`yuzu_api_token_rotation_*`/`yuzu_api_token_confirm_total`,
+    both surfaces incrementing the same symbol), and a 33-case `[human]`
+    adversarial regression suite. Full design record:
+    `docs/auth-architecture.md` "Human API-token rotation";
+    `docs/mcp-server.md` "Human API-token rotation tools"; evidence chain:
+    `docs/security-reviews/human-token-rotation-2026-08-10.md` (records a
+    caught-in-review, now-shipped-as-adjudicated privilege-escalation
+    finding on the MCP-side RBAC allowance that drove the `ApiToken:Rotate`
+    split, a SEPARATE governance-caught-before-merge authority-inheritance
+    fix on `rotate_token` itself, and three pre-existing follow-up issues
+    it surfaced — `#2943`/`#2944`/`#2945` — none of which are defects in
+    the shipped human-token surface itself).
 12. ~~**API token inventory view.**~~ **DONE** — `render_api_tokens_fragment`
     (Settings → API Tokens, `settings_routes.cpp`) and `GET /api/v1/tokens`
     (`rest_api_v1.cpp`) both surface owner / created / last-used columns from

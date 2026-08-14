@@ -102,11 +102,55 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   successful return, original or replay, is independently audited under
   `engine_principal.credential.reveal`.
 - If the consuming module updates the secret and you never call `confirm`
-  (next step), a **60-second background sweep** auto-revokes the predecessor
-  once the overlap window elapses on its own, and separately warns
-  (an operational signal, not a security alert) if the *successor* looks
-  unused as its own window nears expiry — a sign the new secret was never
-  actually picked up.
+  (next step), a **60-second background sweep** enforces predecessor
+  auto-revoke on your behalf, with this SLA: **a predecessor is revoked
+  within one 60-second tick of its overlap window elapsing; on the first
+  occurrence of a given clock-guard anomaly the tick declines instead and
+  revocation defers to the next tick (roughly 120 seconds total), after
+  which an identical anomaly drains normally on the following tick; every
+  decline is counted and logged — a fresh deployment's first-ever bootstrap
+  decline (no durable clock reading yet) increments
+  `yuzu_rotation_sweep_bootstrap_declines_total`, any other decline (an
+  implausible reading, or a big step since the last accepted tick)
+  increments `yuzu_rotation_sweep_declined_total`; the two are deliberately
+  separate series (see [metrics.md](metrics.md#rotation-sweep-clock-guard-metrics-2964)).**
+  A big-step decline is **not necessarily a clock fault** — the sweep's
+  3600s big-step threshold is crossed just as readily by a multi-tick gap
+  with a perfectly correct clock (a maintenance window, a database
+  failover, an instance left off overnight) as by an actual clock jump.
+  One case is not "eventually" but **never**, by design, until an operator
+  acts: **the successor was never presented at all** — the sweep leaves BOTH
+  credentials active indefinitely rather than revoke your only working
+  credential out from under you (a dropped rotate response, or simply never
+  picking up the new secret, must not end in zero usable credentials). A
+  **sustained clock anomaly is NOT this case**, even though it sounds like
+  it should be: the guard suppresses only a *repeat of the identical*
+  anomaly (the fact-set dedup rule) and drains on the very next tick once it
+  does, so a clock fault that settles on one anomaly shape — even
+  indefinitely — costs at most the one extra declined tick already described
+  above, and revocation then proceeds on schedule against the (still bad)
+  clock reading; do not read this SLA as "credentials are held safe for the
+  duration of a clock incident". The genuinely open-ended never-until-an-
+  operator-acts cases are (a) a clock fault that keeps changing shape tick to
+  tick (each distinct fact set declines fresh, so dedup never gets a repeat
+  to suppress) and (b) a **store-wide-lock fault** — every replica losing the
+  sweep's advisory lock to a wedged holder — neither of which an operator can
+  tell apart from "one declined tick" using this page alone, which is
+  exactly what `docs/ops-runbooks/rotation-sweep-clock-guard.md` and the
+  `YuzuRotationSweepNotRunning` alert exist to surface. The sweep separately
+  warns (an operational signal, not a security alert) whenever the
+  *successor* looks unused — once as its own window nears expiry, and once
+  more on crossing into the elapsed state if it is still unused (that row
+  and its metric fire once per pair per state, process-local — a restart
+  re-emits once; the underlying log line, by contrast, repeats every tick
+  once elapsed) — a sign the new secret was never actually picked up; once
+  that warning has fired for the elapsed state, do not assume the sweep will
+  eventually clean it up (it will not — see the "never presented" case
+  above) — either confirm once the successor genuinely is in use, or revoke
+  the *specific* credential you no longer trust via
+  `DELETE /api/v1/tokens/{token_id}` (never
+  `DELETE /api/v1/engine-principals/{id}` — see step 4's callout below for
+  why).
 
 ### 4. Confirm the rotation (optional but recommended)
 
@@ -127,6 +171,35 @@ rotate call returned 200." The required `token_id` is the successor id the
 rotate response returned: it pins the confirm to that exact rotation, so a
 blind retry of an old confirm can never resolve a **later** rotation early
 (a stale or mismatched id gets a `409` and changes nothing).
+
+`confirm`'s check that you're the same operator who called `rotate` is
+stored durably, not just in memory, so a server restart no longer blocks
+confirming an in-flight rotation. The one exception: a rotation already in
+flight *before* this durability guarantee was deployed has no durable
+record of who initiated it, and a restart still leaves it permanently
+unconfirmable (fails closed rather than accepting just anyone) — confirm
+before restarting during an upgrade if you can.
+
+**If you can't, do nothing — the 60-second background sweep (step 3) still
+resolves the pair on its own, `confirm` or no `confirm`.** Once the
+successor has been presented, the sweep auto-revokes the predecessor at the
+overlap window's end exactly as if you had confirmed; if the successor was
+never presented, the sweep deliberately leaves **both** credentials active
+rather than revoke your only working one. Neither outcome ends at zero
+usable credentials — what's lost by skipping `confirm` here is the
+attestation record, not access.
+
+**Do not run `DELETE /api/v1/engine-principals/{id}`** ("Revoke (terminal)",
+step 6 below) to resolve an unconfirmable pair — that revokes *both* active
+credentials and permanently flips the principal itself to `revoked`,
+destroying the working credential along with the one you meant to discard.
+There is no per-credential revoke among the engine-principal routes above.
+If you must resolve the pair by hand rather than wait for the sweep, revoke
+the *specific* credential you no longer trust instead: an engine credential
+is an ordinary API token row, so `DELETE /api/v1/tokens/{token_id}` (an
+admin caller may revoke any token, not just one they created — see
+`docs/user-manual/rest-api.md` "`DELETE /api/v1/tokens/{token_id}`") works
+on it, then rotate again once you're down to one active credential.
 
 If you replay a `confirm` **after it already succeeded** — a dropped `200`, a
 double-submit, or a client racing the auto-revoke sweep — you get a *terminal*

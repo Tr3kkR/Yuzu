@@ -18,6 +18,82 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## ⚠️ Security: rotate `oidc_client_secret` if it was ever set on this install
+
+**Every release up to and including v0.13.0** emitted the OIDC client secret in the clear to three
+places, and this upgrade closes all three:
+
+- the **server log**, written verbatim by the startup override pass on **every boot**;
+- `GET /api/config`, a route gated only on `Infrastructure:Read`;
+- the `config.update` **audit detail** written by `PUT /api/config/:key`, which is durably retained and
+  readable by every role seeded `AuditLog:Read` - the seeded `Operator` role among them.
+
+**Breaking for automation:** closing the second path changed a response shape.
+`GET /api/config` now reports `"is_set": true|false` for a secret-valued key instead of `value`, so a
+client reading `value` for `oidc_client_secret` gets nothing where it previously got the credential.
+Full shape and the reason it is not a placeholder:
+[`rest-api.md`](rest-api.md#get-apiconfig).
+
+Because the log path fired on every boot, **historical logs** — and anything that ingested them, such
+as journald, a Docker log driver, or a SIEM — may still hold the secret in plaintext. Purge or restrict
+those as your retention policy allows.
+
+Audit rows written before the upgrade are now redacted when read, so the value stops being disclosed
+through that path too. The rows themselves are deliberately left intact: an audit row is compliance
+evidence, and rewriting history to conceal a mistake is a worse posture than declining to disclose it.
+**So the plaintext remains at rest** in those rows, and a direct database read or a restored backup
+still shows it. Do not assume a fixed expiry: `audit_retention_days` defaults to 365, but each prune
+pass is capped, and the retention guard deliberately declines a pass after a clock anomaly or a long
+outage, so rows can outlive the nominal figure. The secret also remains stored in plaintext
+in runtime-config; this fix closes disclosure paths and does not encrypt it at rest (see
+`security-hardening.md`, "Current encryption posture").
+
+**Who this affects:** any install where `oidc_client_secret` was ever set through **Settings -> OIDC**
+or `PUT /api/config/oidc_client_secret` on an affected release. All three paths above read from
+runtime-config, so a secret supplied **only** via `--oidc-client-secret` or `YUZU_OIDC_CLIENT_SECRET`,
+and never written through Settings or the API, was not disclosed by *those three paths*.
+
+**That is not the same as "not disclosed".** A secret passed as `--oidc-client-secret` sits in the
+process command line, world-readable through `ps` or `/proc/<pid>/cmdline`, and it is typically also in
+a systemd unit, a Compose file, or shell history. If you cannot rule those out, rotate anyway.
+`YUZU_OIDC_CLIENT_SECRET` is better against other local users — `/proc/<pid>/environ` is owner-only,
+unlike `cmdline` — but it is *not* better if the value is written into a Compose file or unit, since
+`docker inspect` exposes it to anyone in the `docker` group. Prefer a secrets manager that injects the
+environment variable at runtime.
+
+**Before you begin, check you have a local account you can sign in with** — and on
+`--auth-mode=sso-only`, that it is the configured break-glass account, MFA-enrolled and armable.
+Rotating breaks SSO until Yuzu is re-pointed, and the way back in needs an account that already exists:
+break-glass *names* one rather than creating it. On an install with none, the only fallback
+[`auth-db-recovery.md`](../ops-runbooks/auth-db-recovery.md) documents is destructive.
+
+**What to do: rotate the client secret at your IdP, and delete the old one.** The upgrade closes the
+disclosure paths but **does not change the stored value** — anything that already read it still holds a
+working credential, and only the IdP can invalidate it. Most IdPs let you *add* a second client secret
+without removing the first; adding one is not a rotation, because the disclosed secret keeps working
+until it is deleted.
+
+Deletion does not reach what the secret already bought: access tokens minted with it are signed JWTs
+that stay valid until they expire, and IdP sessions can outlast them. Treat revoking those as part of
+the same job. Yuzu's own sessions are separate — the IdP cannot reach them — and are held in memory for
+at most 8 hours; they end on a restart, or per operator via
+`DELETE /api/v1/sessions?username=<name>` (admin, `UserManagement:Write`). **Neither reaches API
+tokens**: one minted under a session that used the disclosed secret survives every step above. List
+them with `GET /api/v1/tokens` and revoke with `DELETE /api/v1/tokens/{id}`.
+
+Re-pointing Yuzu at the new secret is a configuration task rather than a remediation one: once
+everything above is dealt with, SSO failing until you update it is an outage, not a continuing
+disclosure. It is also configuration-specific and easy to get subtly wrong, so it is being written up as
+a reviewed runbook rather than summarised here. Until that lands, see
+[`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
+configure OIDC.
+
+## Behaviour change: MCP approval-store permanent failures now say don't retry (#2786)
+
+An MCP approval-ticket recall that hits a store fault has always returned `-32603` with a `retry_after_ms` hint. Previously that hint was `5000` (retry after 5 seconds) for every store fault except a never-opened store, including one that was open but failing in a way no amount of retrying clears — SQLite corruption, not-a-database, a read-only filesystem, or a full disk. Those four cases now correctly get `retry_after_ms: null` (the same "escalate to an operator" response a never-opened store gets) instead of the transient retry hint.
+
+**What to do:** if you have automation that blindly retries on `-32603` without checking `retry_after_ms`, it now stops retrying sooner in this specific case — which is the correct behavior (the old retries were futile). If your automation already honors `retry_after_ms` per [invariant A5](../agentic-first-principle.md), no change is needed. See [`mcp.md`](mcp.md) "`-32603`: Approval store unavailable" for the full response-body reference.
+
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 
 Audit rows for the MCP progress bridge (`mcp.bridge.done_reap`, `session_dead`, `arming_reaped`, `pin_acked`, `forced_expire`) were previously stamped `result=success` unconditionally, regardless of what actually happened. They now report the real outcome: `result=failure` when a background teardown could not release one of the resources it owns, or when the terminal-frame publish ladder poisoned the session, threw, or was never reached. The `detail` field names which, and no longer asserts a delivery or a poisoning that did not occur.
@@ -315,17 +391,22 @@ collision check above). At boot, the server now scans for any pre-existing
 it finds one — silently coexisting with (or being shadowed by) a real engine
 principal is not an acceptable outcome, so this fails closed rather than
 booting into an ambiguous state (decision log #3). Before upgrading, run
-against both stores. Note they live on different substrates: local users are in
-Postgres (`auth.users`), while local RBAC groups are still SQLite (`rbac.db`):
+against both stores.
+
+> **Superseded by the RbacStore → PostgreSQL migration (ADR-0041):** the
+> per-node `sqlite3 rbac.db` query below is a HISTORICAL artifact from the era
+> when local RBAC groups were SQLite. RBAC config is now a **single shared
+> PostgreSQL** `rbac_store` schema, so run **one** `psql` query, **not**
+> per-node `sqlite3`. Both queries below target Postgres:
 
 ```bash
 # Local users — Postgres.
 psql "$YUZU_POSTGRES_DSN" -c \
   "SELECT username FROM auth.users WHERE username LIKE 'engine:%';"
 
-# Local RBAC groups — SQLite, per-node. Run on every node.
-sqlite3 /var/lib/yuzu/rbac.db \
-  "SELECT name FROM groups WHERE source = 'local' AND name LIKE 'engine:%';"
+# Local RBAC groups — PostgreSQL (shared; one query, not per-node — ADR-0041).
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT name FROM rbac_store.groups WHERE source = 'local' AND name LIKE 'engine:%';"
 ```
 
 If either query returns rows, rename or remove those users/groups **before**
@@ -467,6 +548,232 @@ What to expect / do:
   — losing the CA key forces a full fleet re-enrollment.
 - Relocate the cert directory with `--ca-dir` (e.g. a dedicated container volume).
 
+## ⚠️ Behaviour change: response history resets on Postgres cutover (ADR-0039)
+
+`ResponseStore` (agentic command/instruction results — the executions drawer
+and TAR read source) moves from the SQLite `responses.db` file to the server's
+PostgreSQL substrate in this release (ADR-0006 Wave 1, schema `response_store`).
+Like the `ApiTokenStore` and AuthDB cutovers, this is a **fresh-start cutover
+with no data migration** — response results are expendable, TTL'd telemetry
+(ADR-0009 skippable backfill), so the legacy `responses.db` is **never read** on
+upgrade.
+
+**What happens on first PG boot:**
+- The server logs a one-time `response history reset on Postgres cutover`
+  warning.
+- Executions-drawer and TAR views for commands issued **before** the cutover
+  are empty; results for commands issued after are unaffected and refill
+  immediately as agents report.
+- No operator action required. To preserve pre-cutover response history,
+  export it from the old `responses.db` before upgrading (see
+  `docs/user-manual/response-store.md` → periodic exports).
+
+**Also in this release:** non-UTF-8 bytes in a plugin's output/error (which
+the old SQLite `TEXT` column tolerated but PostgreSQL `TEXT` rejects) are now
+replaced with the Unicode replacement character (U+FFFD) at ingest — the
+response row is still stored and still renders, defanged, rather than being
+dropped (governance #1593). Retention moved from an hourly background thread
+to a clock-guarded, capped reap on the maintenance tick (no operator-visible
+behaviour change beyond the same 90-day default).
+
+## RBAC store moves to PostgreSQL — config preserved by mandatory backfill (RbacStore → Postgres, ADR-0041)
+
+`RbacStore` — the authorization substrate holding **role definitions,
+role→permission grants, principal→role assignments, RBAC groups + membership,
+and the global `rbac_enabled` flag** — moves from the SQLite `rbac.db` file to
+the server's PostgreSQL substrate in this release (ADR-0041, Wave 2.1), schema
+`rbac_store`. **Unlike the AuthDB/ScimStore cutover below, this is NOT a
+fresh-start reset — your RBAC configuration is preserved by a mandatory
+backfill.** No new flag or environment variable is added (it reuses the shared
+server `PgPool`).
+
+**What happens on first PG boot:**
+
+- A one-time, idempotent, **fail-closed** backfill copies every role, grant,
+  group, and membership out of the legacy `rbac.db` into `rbac_store`. Operator
+  edits to seeded permissions are preserved — including a revoked built-in
+  default (`remove_permission`), which is **deleted** (matching legacy
+  exactly) rather than silently restored. The revocation itself is recorded
+  separately as reseed-suppression bookkeeping, so the deleted row cannot be
+  silently re-seeded on the very next restart, without ever becoming a real
+  authorization fact (never a `deny` row an unrelated role could be vetoed
+  by). This is the same mechanism `remove_permission()` itself uses for a
+  revocation made after upgrading. The
+  backfill reconciles counts (roles + grants + groups + members) and **refuses
+  the completion marker on any shortfall** — if it cannot complete, the server
+  **fails the boot closed** and retries on the next start (it never boots on a
+  partial authorization config).
+- **CRITICAL — the `rbac_enabled` flag is preserved and read-back-verified.** It
+  is migrated first, so an operator who had RBAC **enabled** stays enabled after
+  upgrade. (Losing this flag would silently boot the fleet RBAC-**off**, making
+  every confined operator fleet-wide-authorized — the migration is engineered
+  specifically to prevent that.) An unreadable **or non-canonical** durable
+  flag also refuses boot — a value other than exactly `true`/`false` is
+  rejected both by a schema-level constraint on write and by a strict parse on
+  every read, rather than being silently treated as `false`. That schema-level
+  constraint is itself a migration, so on the (unexpected) case of a
+  non-canonical value already sitting in the row from before this upgrade — a
+  hand-edit or a bug on an old release — the migration's own `ALTER TABLE ...
+  ADD CONSTRAINT` fails validation and the server refuses to boot with a raw
+  Postgres `23514 check_violation` rather than the app's own message. Recovery:
+  connect directly and correct the row (`UPDATE rbac_store.rbac_meta SET value
+  = 'false' WHERE key = 'rbac_enabled'`, or `'true'` if RBAC was genuinely
+  enabled) before restarting.
+- The legacy `rbac.db` file is **moved aside** only after the backfill is
+  verified — but a once-failed move-aside can leave it in place, and in that
+  case it **is** read again: every subsequent boot that still finds it
+  fingerprints its content (a SHA-256 content hash, stamped alongside the
+  completion marker) and re-verifies it against what was actually migrated,
+  refusing to boot rather than silently trust a marker this replica's own
+  file was never proven part of. This closes a multi-replica anti-pattern
+  (a fileless replica could otherwise foreclose migration for a sibling
+  genuinely holding the real file) but means an operator on a mixed-fleet
+  first boot or a retained legacy file may see one of a few distinct
+  refusals — `docs/ops-runbooks/rbac-store-backfill-recovery.md` covers each
+  and how to tell them apart. **On a multi-replica upgrade, boot the replica
+  holding the real, authoritative `rbac.db` first** — this lets the actual
+  migration land before any fileless/stale sibling replica boots and stamps a
+  sourceless marker, avoiding the refusals above entirely rather than having
+  to recover from one. A verified-match boot also retries the
+  move-aside automatically, so a once-failed rename does not need manual
+  cleanup once the underlying problem (e.g. a permissions issue) is fixed.
+  Keep the moved-aside copy until you have confirmed RBAC behaves as
+  expected, then remove it.
+
+**What to expect / do:**
+
+- **Widened startup budget on large RBAC datasets.** A fleet with many custom
+  roles / grants / groups will see a longer first-boot while the backfill
+  runs; this is one-time. Budget for it in the maintenance window and avoid
+  killing the server mid-backfill if you can help it — it is **not** resumable
+  (unlike AuditStore's larger, cursor-resumed migration): a killed boot is
+  data-safe (nothing is left half-migrated), but the next boot restarts the
+  whole backfill from scratch rather than continuing where it left off, so an
+  interruption costs you the full window again.
+- **Routine (not just one-time) boot-time cost, every deployment.** Every
+  server boot's `seed_defaults()` reseed now coordinates its built-in-default
+  grants against any concurrent revoke via a cluster-wide advisory lock
+  (closes a rare Postgres race where a revoked permission could otherwise be
+  silently resurrected mid-boot). This adds a small, ordinarily negligible
+  amount of boot time on every restart, not just first boot — but if you
+  bulk-restart or scale out MANY replicas of the same RBAC-on-Postgres
+  deployment **simultaneously**, their reseed passes serialize against each
+  other and against any in-flight legacy backfill, which can add up at large
+  replica counts. Prefer a rolling (not all-at-once) restart/redeploy
+  strategy for this reason, as you likely already do for other reasons.
+- **Reads now FAIL CLOSED (deny-on-degrade).** A degraded or unreachable
+  `rbac_store` (pool-acquire timeout, query error) now **denies** authorization
+  rather than falling through to an allow — this **closes** the prior
+  "corrupt `rbac.db` fails open" behavior. Watch the new
+  `yuzu_server_rbac_read_degrade_total` metric and the `YuzuRbacReadDegraded`
+  alert after upgrade; a degrade denies authz fleet-wide.
+- **Multi-replica staleness caveat.** If you run multiple server replicas, a
+  role/permission/enabled-flag change on one replica is typically visible on
+  the others within a **~1 s** window under normal conditions (a durable
+  generation token, refreshed at most once per second) — this is a target the
+  refresh loop aims for, not a hard guarantee: a replica whose refresh is
+  genuinely slow (pool saturation, a Postgres blip) can observe staleness
+  beyond the window, now counted via a `stale_beyond_accepted_bound` degrade
+  rather than silently assumed. A revoke is therefore not strictly
+  instantaneous cross-replica — well inside the fleet's existing
+  revocation-latency envelope (heartbeat + session/token TTLs measured in
+  minutes), and an accepted residual risk (`LISTEN/NOTIFY` is the named
+  follow-up).
+- **Bounded stale-serve, then fail-fast deny, under backend degradation —
+  two independent mechanisms.** An already-cached authorization decision
+  keeps answering from cache for up to a **~5 s** bound past the last
+  confirmed-good refresh, regardless of anything else failing (bounded
+  staleness for continuity) — a brief blip does not deny cached decisions
+  immediately. Separately, a fail-fast breaker governs *pool access, not
+  cache validity*: once it sees **2 consecutive** pool-acquire/query
+  failures, any check that is not already a cache hit denies immediately
+  rather than blocking on the acquire budget first, and it stops touching
+  the pool for a ~1 s cooldown between recovery probes. **"How fast" depends
+  on the degradation mode:** pool exhaustion (no connection available) trips
+  the breaker in well under a second (2 × the 250 ms acquire budget); a
+  query blocked on a PostgreSQL-side lock (e.g. a migration touching
+  `rbac_meta`) instead inherits `PgPool`'s `lock_timeout` (10 s default) per
+  attempt — measured ~18.5 s for 2 such attempts against a live held lock
+  (#3016). Both converge on the same fail-closed deny, just not at the same
+  speed. Net effect on a sustained outage: previously-seen decisions keep
+  answering for up to ~5 s regardless of breaker state; new/uncached
+  decisions deny once the breaker trips, at whichever of the two speeds
+  above applies; once the 5 s bound elapses, every check denies until the
+  backend recovers. **Not just a sustained outage — flapping (repeated
+  short degrade/recover cycles, the shape a managed-Postgres failover or a
+  brief network partition actually produces) is arguably the worse case for
+  this mechanism, not a milder one:** the breaker's closed-state failure
+  streak resets to 0 on a single success, so each recovery — even one that
+  lasts only as long as the next probe — reopens the breaker back to FULL
+  concurrency rather than easing back in; a Postgres backend that is
+  flapping rather than cleanly down can therefore see repeated full-
+  concurrency retry bursts instead of a single clean trip-and-stay-open
+  (tracked for a half-open concurrency cap, see #3016). **Blast radius while
+  open is bounded by the shared connection pool, not the breaker itself:**
+  every authz check on this replica denies while the breaker is open —
+  including checks against securable types that have nothing to do with
+  whatever degraded — because the breaker gates pool ACCESS, shared across
+  every `RbacStore` caller on the process, not per-query health. **No
+  operator action is needed for recovery** — the breaker self-heals: once a
+  probe succeeds (the next attempt after its ~1 s cooldown), it closes
+  again automatically and normal service resumes. Watch
+  `yuzu_server_rbac_breaker_open` (gauge) and
+  `yuzu_server_rbac_authz_check_seconds` (histogram) after upgrade.
+- **If you alert on the raw `generation_refresh_failed` reason label,
+  re-baseline after upgrade.** This release splits what was previously a
+  single reason into two: `generation_refresh_failed` (still denying —
+  unchanged meaning) and the new `generation_refresh_failed_within_bound`
+  (a refresh failure that landed inside the bounded ~5 s stale-serve window
+  above and denied nobody). A custom alert or dashboard built against the
+  pre-upgrade single-reason series may see its rate drop after upgrade —
+  that is the intended effect of the split, not a sign the underlying
+  condition stopped occurring. The shipped `YuzuRbacReadDegraded` alert
+  already accounts for this (see `docs/prometheus/yuzu-alerts.yml`); a
+  custom query built directly against `yuzu_server_rbac_read_degrade_total`
+  should be reviewed against the reason list in `metrics.md` before relying
+  on it post-upgrade.
+- **Shutdown grace bounds now stack; raise your orchestrator's termination
+  grace period, but understand what that does and does not buy you.** A
+  graceful `SIGTERM` walks several independently-bounded waits in sequence —
+  up to 30 s draining in-flight executions, up to 5 s waiting on the
+  NVD-sync background thread, up to 15 s waiting on the HTTP listener thread
+  (#2703 Gate 7 item 2), and up to 5 s on the gRPC shutdown deadline — which
+  can stack to **~55 s** in the worst case if more than one is genuinely
+  wedged. Kubernetes' default `terminationGracePeriodSeconds` is **30**, so
+  a pod with slow-draining work in more than one of those stages can be
+  `SIGKILL`ed mid-sequence before the server finishes its own bounded
+  teardown. If you run under Kubernetes (or any orchestrator with a similar
+  default), raise the grace period to comfortably exceed ~55 s rather than
+  relying on the platform default. **Two things a longer grace period does
+  NOT fix:** (1) the 30 s drain window re-queries `execution_tracker_` for
+  `running` executions on each of its one-second iterations — so it also
+  picks up work that starts mid-drain, not just what was already running
+  when `SIGTERM` arrived — but it never stops the HTTP listener from
+  ACCEPTING new requests during that window, so a request that lands late in
+  the drain is not bounded by the ~55 s figure at all; raising the grace
+  period does not close this gap, because the gap is about admission, not
+  about how long the drain itself waits. (2) if the 15 s HTTP-listener bound IS exceeded, the server
+  force-exits (`std::_Exit(1)`) on its OWN internal schedule, independent of
+  whatever grace period the orchestrator was configured with — a longer
+  external grace period only prevents the orchestrator from `SIGKILL`ing
+  the process BEFORE that internal bound fires; it cannot prevent or delay
+  the force-exit itself, and the force-exit skips
+  `offload_target_store_->flush_all()` and any other still-pending teardown
+  the same way a `SIGKILL` would. If the 15 s HTTP-listener bound is
+  exceeded, the diagnostic line is written directly to **stderr** (not
+  through the configured logger) before the process force-exits — an
+  async-signal-safety requirement, since `stop()` runs synchronously inside
+  the SIGTERM handler (see #3007). If you rely on the log file or a
+  structured log sink rather than captured stderr, this one line will not
+  appear there; check container/service stderr capture for it instead.
+- Confirm on first boot: the backfill completion log line, no `RbacStore`
+  open/migrate errors, and that RBAC is still enabled if you had enabled it
+  (Settings → RBAC, or check that confined operators still see only their
+  scoped fleet).
+
+See `docs/auth-architecture.md` § "RbacStore — the authorization substrate" and
+[ADR-0041](../adr/0041-rbac-store-postgres-migration.md) for the full design.
+
 ## ⚠️ Breaking: local accounts + MFA enrolments reset (AuthDB/ScimStore → Postgres, ADR-0006)
 
 `AuthDB` (local user accounts, MFA enrolments, enrollment tokens) and
@@ -532,6 +839,348 @@ for lockout/break-glass recovery — that runbook has been rewritten for this
 cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
 the `auth` schema).
 
+## Audit trail migrates to PostgreSQL — history preserved (AuditStore, ADR-0040)
+
+The audit log (`AuditStore`, the SOC 2 evidence chain) moves from the SQLite
+`audit.db` file to the server's PostgreSQL substrate in this release (ADR-0006
+Wave 1.3), schema `audit_store`. **Unlike the AuthDB/ScimStore and ApiTokenStore
+cutovers above, this is NOT a fresh start — audit history is preserved.** Because
+the audit trail is SOC 2 evidence retained 365 days, pre-cutover rows are
+migrated, not reset.
+
+No new flag or environment variable is introduced: the store reuses the shared
+`--postgres-dsn` / `YUZU_POSTGRES_DSN` connection the rest of the server already
+requires, and (like every server store) it **fails closed** at boot if Postgres
+is unreachable — there is no SQLite fallback.
+
+**What happens on first PG boot:**
+
+- If a legacy `audit.db` is present, the server runs a **one-time, mandatory,
+  streamed backfill** of every audit row (in bounded batches, so a multi-GB table
+  does not exhaust memory) into `audit_store` before serving. The retention
+  horizon (`ttl_expires_at`) and clock-guard state come across too, so retention
+  behaviour is preserved exactly. Row counts are reconciled and logged.
+- The backfill is **idempotent and resumable** (a `backfill_complete` marker
+  gates re-runs; a crash mid-backfill resumes from where it stopped, with no
+  duplication and no loss).
+- **A failed or partial backfill fails the boot** — the server refuses to serve
+  with a knowingly-incomplete evidence chain, logs a loud diagnostic, and
+  **retries on the next start**. It does not silently start with a partial trail.
+  **The boot log is your primary signal here, not a metric.** The backfill runs
+  during server construction, and a failure stops the boot before the HTTP
+  listener starts, so `/metrics` is never served on that path and the
+  `yuzu_server_audit_backfill_total{result="failed"}` sample is never scraped.
+  The metric's `fresh` / `completed` values are observable on a server that came
+  up; the shipped `YuzuAuditBackfillFailing` sample rule therefore alerts on the
+  *absence* of a success outcome (see `docs/prometheus/yuzu-alerts.yml`), and a
+  wedged replica among healthy ones shows up as a down instance rather than on
+  that alert. **Silence that rule for the upgrade window if your legacy
+  `audit.db` is large enough to make the first boot long** — the server does not
+  serve `/metrics` until the backfill finishes, so a healthy multi-hour backfill
+  looks exactly like a wedged one from outside. The boot log is what tells them
+  apart.
+- **The backfill only ever runs against an empty `audit_store` schema or its own
+  interrupted copy.** Before resuming, it checks that the audit rows already in
+  PostgreSQL really are the partial copy of *this* `audit.db`. If they are not —
+  the usual causes are a DSN pointing at a different deployment's database, or a
+  restore that brought back `audit_events` without `audit_retention_meta` (which
+  carries the `backfill_complete` marker) — the server **refuses to start** with
+  `the existing rows are NOT an interrupted copy of …` rather than resuming past
+  rows it cannot account for and reporting a complete migration. Point the server
+  at the right database, or clear `audit_store.audit_events` if those rows are
+  not wanted, then restart.
+- **A server with no `audit.db` of its own will not "complete" someone else's
+  partial backfill.** The completion marker asserts the trail is whole, so a
+  server that finds audit rows already in PostgreSQL, no marker, and no usable
+  legacy file **refuses to start** rather than stamping the marker over rows it
+  cannot account for. The two ways to reach that state are a replica started
+  while another is still streaming (bring up one replica first, below), and a
+  partial backfill whose `audit.db` was moved aside before it finished. Restore
+  the legacy file and let the backfill finish, or use the abandon procedure in
+  [audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md)
+  if it is genuinely unrecoverable.
+- After a verified backfill the legacy `audit.db` is **moved aside, not deleted**
+  — it becomes an operator-managed backup of the pre-cutover trail. Relocating or
+  archiving that file afterward is expected and safe. Its `-wal`/`-shm` sidecars,
+  if the previous server stopped uncleanly and left any, are moved with it: the
+  main file **alone is not a usable copy** when a WAL tail exists, so keep the set
+  together if you relocate it.
+
+**What to expect / do:**
+
+- **Budget for a longer first boot on a large `audit.db`.** A trail with tens of
+  millions of rows (~16 GB) can take meaningfully longer to stream than a normal
+  startup. **Widen your startup budget accordingly:** raise the Kubernetes
+  `startupProbe` (and any liveness) failure/period budget, or the Docker Compose
+  healthcheck `start_period`, so the orchestrator does not kill the server
+  mid-backfill and restart it into the same long boot repeatedly. The backfill is
+  resumable, so a killed boot is not corrupting — but it wastes the window.
+- **Scale-out: bring up the replica that HOLDS `audit.db` first — recommended,
+  not load-bearing for safety.** In a multi-replica deployment, starting that
+  one server first and letting it finish the backfill (the `backfill_complete`
+  marker is stamped in `audit_store`) before the rest avoids a refusal, but a
+  wrong boot order no longer loses evidence: if a replica with no legacy
+  `audit.db` of its own boots first against an empty table, it stamps the
+  completion marker over that emptiness (logging a WARNING naming what it
+  forecloses — routine on a genuine fresh install, the signal you started the
+  wrong host on an upgrade) — but the replica that DOES hold the trail does
+  **not** silently trust that marker. It re-reads its own `audit.db`, proves
+  (by fingerprint) whether that file's content was ever actually migrated, and
+  **refuses to boot** on a mismatch rather than reporting success over an
+  unmigrated trail. The file is left untouched at its original path — nothing
+  is lost, but that host needs an operator to resolve it (see
+  [audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md))
+  before it will serve. Getting the boot order right the
+  first time avoids that operator step; it is no longer the thing standing
+  between you and silent evidence loss. Once the marker is present (and, for
+  every OTHER holder, verified) the remaining replicas start normally;
+  retention afterward is single-swept fleet-wide via an advisory lease (see
+  [Audit Log](audit-log.md#the-retention-clock-guard)).
+- **Reads deny-on-degrade.** After cutover, an audit-store or connection-pool
+  failure makes `GET /api/v1/audit*` return `503` rather than an empty `200`, so
+  an infrastructure blip can never be mistaken for "no audit activity."
+- **The break-glass one-shots run the backfill too.** `--mfa-reset` and
+  `--break-glass-arm` write an audit record without going through boot, so on an
+  upgraded host the first one of them to run performs the same migration a first
+  boot would (streaming the trail, stamping the marker, moving `audit.db` aside)
+  before it writes its record. Budget for that if you use one during the upgrade
+  window; if the backfill cannot complete, the one-shot refuses and changes
+  nothing rather than writing a record that would block every later boot.
+
+**Backfill refused at boot or from a one-shot?** Both refusal shapes — a
+holder-side verification failure (marker already set, this host's file
+unproven) and an unrecoverable legacy trail (marker absent, rows present) —
+including the SQL for the second one, now live in their own runbook:
+[audit-store-backfill-recovery.md](../ops-runbooks/audit-store-backfill-recovery.md).
+Not duplicated here.
+
+**Not affected:** the audit event vocabulary and REST/MCP query surface are
+unchanged; SIEM export recipes keep working. One deliberate behaviour change: on
+a multi-replica deployment an identical-magnitude repeat clock step no longer
+re-emits `yuzu_server_audit_clock_anomaly_skips_total` on every pass (only a
+distinct anomaly does) — if you alerted on that counter's *cadence*, alert on a
+sustained increase instead. See
+[Audit Log](audit-log.md#the-retention-clock-guard).
+## Management-group confinement config migrates to Postgres (mandatory backfill, ADR-0042)
+
+The `ManagementGroupStore` — the confinement hierarchy that backs operator
+scoping and the ADR-0017 `authorize_list_read` gate — moves from the SQLite
+`management-groups.db` file to the server's PostgreSQL substrate in this release
+(ADR-0006 Wave 2.2), schema `management_group_store`. It reuses the existing
+shared connection pool, so **no new connection flag or config is required** —
+the same `--postgres-dsn` / `YUZU_POSTGRES_DSN` that every other server store
+uses.
+
+**This is NOT a fresh-start cutover.** Unlike the AuthDB/ScimStore/API-token
+migrations above (which deliberately reset), a management group's hierarchy,
+static memberships, and group→role assignments are irreducible operator intent —
+losing them would silently widen or narrow confinement. So the migration
+performs a **mandatory one-time backfill** on first Postgres boot:
+
+- **What is preserved:** every group (name, parent, membership type, scope
+  expression), every static membership record, and every group→role assignment
+  carry over exactly. Dynamic memberships re-resolve from their scope expression
+  on the next reconcile, as before.
+- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
+  Postgres write error, unreadable legacy DB, or the safety check below — the
+  server **refuses to boot** rather than come up with an empty or partial
+  confinement hierarchy (which would fail-open, exposing out-of-scope devices).
+  The backfill marker is only stamped on success, so a failed attempt is
+  **retried on the next start** once you have fixed the underlying cause; it
+  never proceeds with partial state.
+- **Legacy file moved aside after a verified backfill.** Once the backfill is
+  confirmed complete, `management-groups.db` is renamed to
+  `management-groups.db.migrated-<epoch>` (the server never reads it again). If
+  you do not see this file appear, the backfill did not run to completion —
+  investigate before assuming confinement is intact. Keep the renamed file until
+  you have confirmed scoping behaves correctly, then treat it as an
+  operator-managed backup and dispose of it per your data-retention policy.
+- **The backfill REFUSES an over-deep or cyclic legacy tree.** If the legacy
+  hierarchy contains a parent cycle or exceeds the maximum depth of 10 levels,
+  the backfill fails closed (and, per above, blocks boot). This can only happen
+  on a legacy DB that was hand-edited or corrupted outside the API (the create
+  path caps depth at 5). **Remediate by repairing the legacy tree** (flatten it
+  below 10 levels / break the cycle) **or moving `management-groups.db` aside
+  yourself** to start fresh — then restart. Do not force-boot around this: a
+  malformed hierarchy is exactly the state confinement must not silently accept.
+- **Widened startup budget.** First boot takes longer than usual while the
+  backfill runs; the server's startup readiness budget is widened to accommodate
+  it. Do not treat a slower-than-normal first boot as a hang.
+
+**Operator-visible behaviour change (fail-closed reads).** After cutover, a
+confinement-feeding read that degrades (store not open, pool-acquire timeout, or
+query error) now returns a distinguishable failure that the caller resolves to
+**DenyAll** — a scoped operator sees a reduced or empty list rather than the
+store silently returning an empty deny-set and **under-restricting** (the old
+fail-open hazard). A re-parent (`PUT /api/v1/management-groups/{id}`) whose
+hierarchy reads degrade now returns **503** rather than a misleading success.
+Watch the new `yuzu_server_mgmt_group_read_degrade_total{reason}` counter — a
+non-zero rate means scoped operators are seeing reduced/empty lists because the
+confinement substrate is degraded, **not** that groups actually shrank (see
+`docs/user-manual/metrics.md` § "Management group metrics" and the shipped
+`YuzuMgmtGroupReadDegraded` alert). `yuzu_server_mgmt_group_backfill_total{result}`
+records the one-time backfill outcome (`completed` / `fresh` / `failed`).
+
+**Not affected:** the confinement hierarchy's semantics, the REST/MCP surface,
+and dynamic-group scope expressions are unchanged — only the storage substrate
+and the fail-closed read posture change.
+
+## Custom properties migrate to Postgres (mandatory backfill, ADR-0045)
+
+The `CustomPropertiesStore` — operator-authored per-agent metadata (properties
+and their optional type/validation schemas) used in scope expressions via
+`props.<key>` — moves from the SQLite `custom-properties.db` file to the
+server's PostgreSQL substrate in this release (ADR-0006 Wave 2), schema
+`custom_properties_store`. It reuses the existing shared connection pool —
+**no new connection flag or config is required**.
+
+**This is NOT a fresh-start cutover.** Custom properties and their schemas are
+irreducible operator-authored asset-tagging data — losing them would silently
+break any `props.<key>`-scoped dispatch, policy, or push rule. The migration
+performs a **mandatory one-time backfill** on first Postgres boot:
+
+- **What is preserved:** every property (agent, key, value, type) and every
+  property schema (key, display name, type, description, validation regex)
+  carry over exactly.
+- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
+  Postgres write error, an unreadable legacy DB, or a holder-side
+  fingerprint-verification refusal (see below) — the server **refuses to
+  boot** rather than come up with partial data. The backfill marker is only
+  stamped on success, so a failed attempt is **retried on the next start**
+  once you have fixed the underlying cause.
+- **Legacy file moved aside after a verified backfill.** Once the backfill is
+  confirmed complete, `custom-properties.db` is renamed to
+  `custom-properties.db.migrated-<epoch>` (the server never reads it again).
+  If you do not see this file appear, the backfill did not run to completion.
+  Keep the renamed file until you have confirmed properties/schemas look
+  correct, then treat it as an operator-managed backup and dispose of it per
+  your data-retention policy.
+- **Multi-replica deployments: boot the replica holding the authoritative
+  `custom-properties.db` FIRST.** Unlike this store's SQLite era, a
+  multi-replica Postgres deployment shares ONE `custom_properties_store`
+  schema — the first replica to complete the backfill wins, and every other
+  replica's boot verifies its own local legacy file against what actually
+  landed rather than trusting the shared completion marker blindly. If two
+  replicas hold genuinely different legacy content (an unusual topology for
+  this store — `custom-properties.db` is ordinarily a single server's local
+  file, not something expected to diverge across replicas of the same
+  logical deployment), the second replica to boot refuses with a
+  **HOLDER-SIDE VERIFICATION FAILED** error rather than silently accepting
+  or silently overwriting the winner's data — see
+  `docs/ops-runbooks/custom-properties-store-backfill-recovery.md` for the
+  recovery procedure.
+- **Budget for a longer first boot.** First boot takes longer than usual while
+  the backfill runs; a large `custom-properties.db` (many agents/properties)
+  extends this further. **Widen your own orchestrator's startup budget
+  accordingly** (Kubernetes `startupProbe` failure/period budget, or the
+  Docker Compose healthcheck `start_period`) so it does not kill the server
+  mid-backfill and restart it into the same long boot repeatedly — do not
+  treat a slower-than-normal first boot as a hang.
+
+**Operator-visible behaviour change (fail-closed reads).** After cutover, a
+`props.<key>`-feeding read that degrades (store not open, pool-acquire
+timeout, or query error) now aborts the whole scope evaluation rather than
+silently resolving the property as absent — a `props.<key>`-scoped
+dispatch/policy/push rule now matches **nobody** while degraded, instead of
+(under a `NOT`/`!=` scope) silently matching **everybody**. `GET
+/api/agents/:id/properties` now returns **503** on a degraded read rather
+than an empty list. Watch the new
+`yuzu_server_custom_properties_read_degrade_total{reason}` counter — a
+non-zero rate means `props.<key>`-scoped rules may be silently matching
+nobody, not that operators removed the properties (see `docs/user-manual/
+metrics.md` and the shipped `YuzuCustomPropertiesReadDegraded` alert).
+`yuzu_server_custom_properties_backfill_total{result}` records the one-time
+backfill outcome.
+
+**Not affected:** the `props.<key>` scope-DSL syntax, the REST API request/
+response shapes, and property/schema semantics are unchanged — only the
+storage substrate and the fail-closed read posture change.
+
+## Network-discovered device data migrates to Postgres (mandatory backfill, DiscoveryStore, ADR-0044)
+
+The `DiscoveryStore` — the network-discovered devices behind `POST /api/discovery/scan`
+and `GET /api/discovery/results` — moves from the SQLite `discovery.db` file to the
+server's PostgreSQL substrate in this release (ADR-0006 Wave 2), schema
+`discovery_store`. It reuses the existing shared connection pool — no new connection
+flag or config is required.
+
+**This is NOT a fresh-start cutover.** The `managed` flag an operator has set on a
+discovered device (confirming "this is my enrolled agent") is real, non-regenerable
+operator intent, so the migration performs a **mandatory one-time backfill** on first
+Postgres boot:
+
+- **What is preserved:** every discovered device — IP/MAC/hostname, the `managed`
+  flag and its associated `agent_id`, and first-seen (`discovered_at`/`discovered_by`)
+  provenance — carries over (any field containing invalid UTF-8 or an embedded NUL
+  is scrubbed to U+FFFD on write, matching every other field in this store).
+- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
+  Postgres write error, an unreadable legacy DB, or a fingerprint mismatch (below) —
+  the server **refuses to boot** rather than come up with an empty or partial
+  discovered-device inventory. The backfill marker is only stamped on success, so a
+  failed attempt is **retried on the next start** once the underlying cause is fixed.
+- **Fingerprint-verified, not marker-only.** Unlike a plain "did the marker get
+  stamped" check, the backfill records a fingerprint of the migrated content
+  alongside the completion marker. On a multi-replica deployment sharing one
+  Postgres database, this lets a later-booting replica tell apart "this is the same
+  content I already migrated" from "a different replica's data was migrated, not
+  mine" — the latter fails closed rather than silently accepting a completion this
+  replica's own discovered devices were never part of. If you see a "HOLDER-SIDE
+  VERIFICATION FAILED" log line, do not force-boot around it: this indicates two
+  replicas each hold `discovery.db` files with genuinely different content, and an
+  operator needs to decide which is authoritative before either can proceed.
+- **A 0-byte `discovery.db` is refused, not treated as a fresh install.** SQLite
+  opens a 0-byte file as a valid empty database, which looks identical to "this
+  legacy store was created but never used" — but a genuine fresh install never has
+  a `discovery.db` file at all. If you see a log line saying this is "NOT a fresh
+  install... a truncated/corrupted real database", either delete the empty file and
+  retry (if the legacy store genuinely was never used) or restore `discovery.db`
+  from backup before retrying (if it held real data that got truncated).
+- **A conflict during backfill can also refuse the boot, not just a fingerprint
+  mismatch.** On a multi-replica deployment, if a live scan (or a `mark_managed`
+  call through a sibling replica) lands a row for an IP before this replica's own
+  backfill reaches it, and that legacy row was `managed=true` or had an
+  `agent_id` assigned, the backfill verifies the row already in Postgres carries
+  the same values before trusting the migration — refusing (with a
+  "reconciliation FAILED" log line naming the IP) rather than silently dropping
+  or misattributing an operator's managed-device assignment. **This does NOT
+  resolve itself on its own** — the legacy data is frozen and a retry
+  conflict-skips against the same mismatched row every time, so this replica
+  restart-loops until an operator manually reconciles: check
+  `discovery_store.discovered_devices` for the named IP to see which value is
+  actually correct, then either accept the value already in Postgres (delete the
+  legacy file and let this replica take the sourceless-skip path) or correct the
+  row via `mark_managed` before retrying.
+- **Legacy file moved aside after a verified backfill.** Once the backfill is
+  confirmed complete, `discovery.db` is renamed to
+  `discovery.db.migrated-<epoch>` (the server never reads it again). Keep the
+  renamed file until you have confirmed discovery data looks correct, then dispose
+  of it per your data-retention policy.
+
+**Operator-visible behaviour change (fail-closed reads).** `GET /api/discovery/results`
+now returns **503** on a degraded read (store not open, pool-acquire timeout, or query
+error) instead of silently rendering an empty device list — previously, a local SQLite
+read essentially never failed short of file corruption, so this failure mode was not
+practically reachable. Watch the new `yuzu_server_discovery_read_degrade_total{reason}`
+counter — a non-zero rate means the discovery view is degraded, **not** that no devices
+were found. `yuzu_server_discovery_backfill_total{result}` records the one-time
+backfill outcome (`completed` / `fresh` / `failed`).
+
+**Breaking — `POST /api/discovery/scan`'s response contract changed.** The endpoint no
+longer always returns `200 {"status":"ok",...}`: the response gains a `devices_failed`
+count, `status` is `"partial"` when some but not all devices in a batch persisted, and
+the endpoint returns **503** when every attempted device failed to persist (previously
+this was silently reported as `200`/`"ok"`, with the `discovery.scan` audit row always
+saying `"success"` regardless of outcome — the audit outcome is now
+`"success"`/`"partial"`/`"failure"`). A caller that asserts a bare `status == "ok"`, or
+that treats any 5xx from this endpoint as a hard failure needing operator escalation,
+should account for the new value and status code. Re-sending the exact same request body
+is safe — `upsert_device` is idempotent per `ip_address`, so a byte-identical retry cannot
+double-count or corrupt already-stored devices — but a fresh re-scan is not the same
+thing: `mac_address`/`subnet` overwrite unconditionally on every upsert, so a re-scan that
+fails to resolve a device's MAC this time will blank a previously known-good value rather
+than simply retry the earlier failure. See the REST API reference's Network Discovery
+section for the full response shapes.
+
 ## Upgrade Order
 
 Always upgrade in this order:
@@ -550,6 +1199,14 @@ Before upgrading any component:
   - `yuzu-server.cfg`, `enrollment-tokens.cfg`, `pending-agents.cfg`
   - All `.db` files (response store, audit, policies, **auth.db**, etc.) — use `sqlite3 <path> ".backup ..."` rather than `cp` against live WAL databases
   - The **PostgreSQL database**, once your deployment carries one (ADR-0006 — bundled in the composes; provisioned natively by `install-server-postgres.sh`) — use `pg_dump --format=custom`; see [Server Administration § PostgreSQL Substrate](server-admin.md#postgresql-substrate) for the full backup/restore procedure and the ADR-0010 restore-pairing invariant (DB and `KeyProvider` keys-dir backups restore **together**)
+- [ ] **Verify the server's clock before upgrading** (`timedatectl status` or
+  `chronyc tracking`; under Docker it is the host's clock that matters). Rows
+  already stamped cannot be protected retroactively by any setting, and a server
+  upgraded to schema v3 while its clock was skewed FORWARD could delete expired
+  audit rows unremarked on its first guarded pass - see [Retention clock
+  guards](#retention-clock-guards-2360-server-audit-store-2361-tar-agent-warehouse)
+  below and #2579. Fixed forward: that pass now declines instead, so the risk is
+  to servers upgrading FROM an affected version with a wrong clock.
 - [ ] Check the [CHANGELOG](../../CHANGELOG.md) for breaking changes
 - [ ] Verify disk space (at least 500 MB free for migration)
 - [ ] Note current version: `yuzu-server --version` / `yuzu-agent --version`
@@ -854,8 +1511,8 @@ replaced, but the failure is logged as an error.
 **No manual migration steps are required.** Just replace the binary (or pull the new image and `up -d`) and start the server. Migration progress is logged at `info` level as:
 
 ```
-[info] MigrationRunner: audit_store migrated to v1
 [info] MigrationRunner: rbac_store migrated to v1
+[info] MigrationRunner: response_store migrated to v1
 ...
 ```
 
@@ -864,23 +1521,38 @@ replaced, but the failure is logged as an error.
 **Verifying migration state after startup**, query the per-store audit trail directly:
 
 ```bash
-docker exec -i yuzu-server sqlite3 /var/lib/yuzu/audit.db \
+docker exec -i yuzu-server sqlite3 /var/lib/yuzu/rbac.db \
   "SELECT store, version, datetime(upgraded_at, 'unixepoch') FROM schema_meta ORDER BY upgraded_at;"
 ```
 
 Every store that has ever run through the migration runner has a row here with its current version and the wall-clock timestamp of the last stamp. This is the operator-side audit trail for schema evolution.
 
+**The Postgres-backed stores are not in that file.** Stores migrated onto the PostgreSQL
+substrate — `audit_store` among them (ADR-0040) — run through `PgMigrationRunner`, log
+`PgMigrationRunner: <store> migrated to v<N>`, and stamp `public.schema_meta` **in
+PostgreSQL**. Query those there instead:
+
+```bash
+psql "$YUZU_POSTGRES_DSN" -c \
+  "SELECT store, version, to_timestamp(upgraded_at) FROM public.schema_meta ORDER BY upgraded_at;"
+```
+
+For `audit_store` specifically, the legacy `audit.db` also **stops existing at its old path**
+after the one-time backfill: it is renamed to `audit.db.migrated-<epoch>` (with any
+`-wal`/`-shm` sidecars). A `sqlite3 /var/lib/yuzu/audit.db` command therefore fails with
+`unable to open database file` on a migrated server, and that is expected, not a fault.
+
 If a migration fails:
 
 1. Check the log for `MigrationRunner: migration v<N> failed for <store>: <sqlite error>` and note both the store name and the SQLite error.
 2. The server will have **closed the failing store's database handle**, so `/readyz` returns 503 with the failed store name in the `failed_stores` body field — the probe accurately reflects degraded state. Don't rely on `/livez` for readiness; it only checks process liveness, not schema integrity.
-3. Stop the server and restore the **affected** database file from backup — not the whole data directory. Restoring all databases to fix one broken store wipes in-flight approvals, pending agents, and enrollment tokens.
+3. Stop the server and restore the **affected** database file from backup — not the whole data directory. Restoring all databases to fix one broken store wipes in-flight approvals, pending agents, and enrollment tokens. **This step does not apply to a Postgres-backed store** such as `audit_store`: there is no per-store file to restore, so use the Postgres dump procedure under "Rollback if a migration fails" above.
 4. Start the previous server version against the restored data.
 5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
 ## Upgrade notes by release
 
-### Retention clock guards (#2360 server audit store, #2361 TAR agent warehouse)
+### Retention clock guards (#2360 server audit store, #2361 TAR agent warehouse, #2964 rotation sweep)
 
 Both retention paths used to issue an unbounded `DELETE` driven by the local wall
 clock, so one forward clock step could wipe a store in a single statement. They
@@ -891,15 +1563,81 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
   rows, so a large backlog ages out over hours rather than in one statement.
   Watch `yuzu_server_audit_retention_cap_reached_total` alongside
   `yuzu_server_audit_rows_deleted_total` to see whether a backlog is draining.
-  That cap is a fixed drain rate, which implies a sustained ceiling of roughly
-  6.9 audit events/second - compare it against your own event rate before
-  deploying at scale. Note that changing `--audit-retention-days` never re-dates
+  The cap paces at two different cadences depending on whether a backlog is
+  forming — see [Audit Log § Capacity](audit-log.md#capacity) for both
+  figures; comparing your event rate against only the quiet-operation one is
+  overly conservative by roughly three orders of magnitude. Note that
+  changing `--audit-retention-days` never re-dates
   existing rows (`ttl_expires_at` is stamped at INSERT), so a reduction does not
   reclaim disk retroactively. Operator triage when the guard declines a pass:
   [audit-log.md § The retention clock guard](audit-log.md#the-retention-clock-guard).
 - **`audit_store` gains schema v3** (a small `audit_retention_meta` key/value
   table holding the durable clock reading - one row, instant) plus the
   best-effort index build described under Schema Migrations above.
+- **`YuzuAuditRetentionNotRunning` now fires for a crash-looping server
+  (#2553, redesigned by #2854 rung D), and there is a new
+  `YuzuAuditRetentionNeverRan` alert to route.** The old rule's young-server
+  grace keyed on uptime, so a process restarting more often than the 3-hour
+  alert window never accumulated enough uptime to leave the grace and was
+  excused on every evaluation - silently, and for one of the leading causes of
+  the exact condition the rule detects. The grace is now the restart-surviving
+  last-pass stamp (`yuzu_server_audit_retention_last_pass_unixtime`, seeded
+  from the durable anchor at startup): the rule excuses only a database no
+  retention pass has EVER run against, fires at every restart cadence on an
+  anchored one, and stays firing while the reaper stays dead. The excused
+  never-ran state gets its own alert, `YuzuAuditRetentionNeverRan` (stamp
+  still `0` after 3 hours) - **a new alertname: give it an Alertmanager route**.
+  **If you re-apply this rules file and have a crash-looping server, expect a
+  new-to-you firing** that reflects a pre-existing condition rather than a new
+  fault - including on crash loops faster than the 60-minute first-pass sleep,
+  a true positive the old grace hid. The rules file is a copy you apply
+  yourself; the server does not upgrade it for you, and a stack that does not
+  re-apply it keeps the old blind rule and never gains the new alert. In a
+  staged rollout apply SERVERS first, rules second: an old, not-yet-upgraded
+  server restarting under the new rules reads a `0` stamp even on an anchored
+  database and pages `YuzuAuditRetentionNeverRan` with a fresh-install story
+  that is false for it (see the runbook's rollout note). The same
+  re-apply also removes an `on(instance)` join from the liveness rule, so a
+  server that was being silenced by an unrelated series sharing its `instance`
+  value (a canary, an HA pair, a federated series) can now correctly fire too -
+  the same new-to-you-firing shape as the crash-loop fix, for the same reason.
+- **You must ADD a new rule by hand: `YuzuAuditRetentionMetricMissing` (#2553).**
+  `YuzuAuditRetentionNotRunning` cannot detect its own input going missing -
+  `increase()` over a metric with no series is an empty vector, so the rule selects
+  nothing and never fires. A Prometheus holding these rules against a server that
+  does not export `yuzu_server_audit_retention_passes_total` therefore reports
+  healthy forever while the audit reaper is entirely unmonitored, which is exactly
+  the state you are in if you apply this rules file ahead of upgrading your
+  servers. The new rule keys on `absent(...)` and fires after 15m. It is
+  **fleet-wide by construction**: it cannot see one server among many going quiet.
+  **A `up`-based target-down alert does NOT close that gap** — a server that is
+  running an older build is alive and scraped, so its `up` is 1; it simply does
+  not export this counter. Measured (#2553): in a fleet where one server exports
+  the counter and another does not, *neither* retention rule fires, for either
+  server, indefinitely. During a staged upgrade the practical mitigation is to
+  confirm coverage directly rather than to rely on an alert —
+  `count(yuzu_server_audit_retention_passes_total)` against your expected server
+  count — until every server is upgraded. A per-target rule for this is tracked
+  separately.
+- **The first guarded pass now declines when it has no stored reading and rows
+  are already expired (#2579).** The stored clock reading (the anchor) is new in
+  schema v3, so every database starts its first guarded pass without one. An
+  ABSENT reading is not a statement about the clock - it is the ordinary
+  fresh-install case - which previously left one shape unguarded: a host already
+  skewed FORWARD, where rows written after the skew were still inside the window,
+  so the would-expire-everything test did not fire either, and the pass deleted up
+  to the 25,000-row cap unremarked. Such a pass now declines ONCE, warns, and
+  anchors the reading; the next pass proceeds normally, paced by the cap. A fresh
+  install with nothing expired does not decline at all. **Expect at most one such
+  decline per server on this upgrade**, counted by the new
+  `yuzu_server_audit_retention_bootstrap_declines_total` and NOT by
+  `yuzu_server_audit_clock_anomaly_skips_total` - so it does not fire
+  `YuzuAuditRetentionClockAnomaly`, and you should not stand that alert down for
+  it. Servers upgrading FROM an affected version with a wrong clock may already
+  have lost rows; there is no reliable retrospective test, and the loss is not
+  recoverable without a backup predating it. Detail:
+  [audit-log.md § The retention clock
+  guard](audit-log.md#the-retention-clock-guard).
 - **Expect a first-pass retention decline on the AGENT, and only conditionally on
   the server.** The two guards differ here and the difference matters:
   - **TAR declines on a missing anchor, by design.** It checks per warehouse
@@ -931,13 +1669,34 @@ are now guarded and capped. Two operator-visible consequences on upgrade:
 - **TAR row-count retention is now paced.** Its ceiling semantics are unchanged,
   but a large excess (after a long disable, or an upgrade backlog) drains over
   several 900 s rollup ticks rather than in one statement.
+- **`ApiTokenStore` gains a THIRD, independent clock guard (#2964) — the
+  rotation sweep that auto-revokes rotation predecessors.** Same shape as the
+  audit store's, same schema-migration pattern (a new `rotation_retention_meta`
+  key/value table holding the durable anchor), same bootstrap-decline
+  consequence, but a much shorter cadence: this sweep ticks every 60 seconds,
+  not hourly. **If you are upgrading a populated store that already has
+  elapsed, not-yet-swept rotation pairs** — a predecessor whose overlap
+  window has already ended, sitting there because nothing has run the guard
+  against it before — **expect the sweep's first tick after the migration to
+  decline once**, the same "no durable anchor yet, and there is already
+  something eligible" bootstrap case #2579 describes for the audit store.
+  Both credentials in every affected pair simply stay active for that one
+  tick; the very next tick has an anchor and proceeds normally, so at a
+  60-second cadence this resolves in roughly two minutes, not the audit
+  store's next-hourly-pass timescale. Nothing is lost or at risk here (an
+  auto-revoke deferred by one tick is the intended failure mode, not the
+  audit store's deletion-risk case) — this is a heads-up so the log line and
+  the one-off decline are not mistaken for something wrong with the upgrade.
+  See `docs/user-manual/metrics.md` "Rotation-sweep clock guard metrics" and
+  `docs/ops-runbooks/rotation-sweep-clock-guard.md`.
 
-Five new Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`. The
-declined-pass and failed-pass counters must be alerted on separately: both leave
-rows undeleted, so an audit table that never shrinks looks identical either way.
-One rule, `YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the
-state in which none of the other counter-driven rules can fire, because they all
-key on a counter rising.
+New Prometheus alert rules ship in `docs/prometheus/yuzu-alerts.yml`, which is the
+current set. The declined-pass and failed-pass
+counters must be alerted on separately: both leave rows undeleted, so an audit
+table that never shrinks looks identical either way. One rule,
+`YuzuAuditRetentionNotRunning`, fires on the reaper NOT running - the state in
+which none of the other counter-driven rules can fire, because they all key on a
+counter rising.
 
 ### SLE — the `SoftwareLicensing` securable auto-grants on upgrade (ADR-0024)
 
@@ -1345,9 +2104,9 @@ Manual remediation until the auto-migration in issue #485 lands. **Run each step
 
 Safe on fresh installs (no matching rows). If you are upgrading **from** a v0.11.x release directly **to** v0.12.0 or later, skip this entire sub-section — your RBAC database never carried the stale grants.
 
-**Retention changes take effect on restart, not on runtime PUT.** BL-2 wired `--guardian-event-retention-days` (default 30) through `RuntimeConfigStore` + `PUT /api/v1/config/guardian_event_retention_days`, matching the existing `response_retention_days` and `audit_retention_days` pattern. However, all three retention-bearing stores (`AuditStore`, `ResponseStore`, `GuaranteedStateStore`) capture their retention value at construction time and never re-read it — the runtime PUT mutates `cfg_` and `RuntimeConfigStore` but the running reaper continues using the startup value. An operator who PUTs a new retention value sees `200 {"applied": true}` but the store behaviour does not change until the next server restart. This is a systemic limitation shared across all three stores, not a Guardian-specific bug; it is tracked as issue #483.
+**Retention changes take effect on restart, not on runtime PUT.** BL-2 wired `--guardian-event-retention-days` (default 30) through `RuntimeConfigStore` + `PUT /api/config/guardian_event_retention_days`, matching the existing `response_retention_days` and `audit_retention_days` pattern. However, all three retention-bearing stores (`AuditStore`, `ResponseStore`, `GuaranteedStateStore`) capture their retention value at construction time and never re-read it — the runtime PUT mutates `cfg_` and `RuntimeConfigStore` but the running reaper continues using the startup value. An operator who PUTs a new retention value sees `200 {"applied": true}` but the store behaviour does not change until the next server restart. This is a systemic limitation shared across all three stores, not a Guardian-specific bug; it is tracked as issue #483.
 
-**Runtime config PUT now rejects non-numeric and negative integer values with HTTP 400.** Hardening round 4 (UP-R5) added `std::from_chars` validation to `PUT /api/v1/config/<key>` for `heartbeat_timeout`, `response_retention_days`, `audit_retention_days`, and `guardian_event_retention_days`. The previous handler silently wrote invalid strings to `RuntimeConfigStore` and swallowed the `stoi` error, leaving `cfg_` unchanged. If your automation relied on setting retention to a **negative** value (e.g., `"-1"`) to disable retention — which the store then treated as "never reap" via the `<= 0` sentinel — that automation will now receive `400 {"error":{"code":400,"message":"value must be a non-negative integer"}}`. Use `"0"` instead; it preserves the same disable-retention semantic and passes validation. Automation that previously set non-numeric strings (anything other than a base-10 integer) was silently a no-op before this release — the 400 now surfaces the configuration error that had been hidden.
+**Runtime config PUT now rejects non-numeric and negative integer values with HTTP 400.** Hardening round 4 (UP-R5) added `std::from_chars` validation to `PUT /api/config/<key>` for `heartbeat_timeout`, `response_retention_days`, `audit_retention_days`, and `guardian_event_retention_days`. The previous handler silently wrote invalid strings to `RuntimeConfigStore` and swallowed the `stoi` error, leaving `cfg_` unchanged. If your automation relied on setting retention to a **negative** value (e.g., `"-1"`) to disable retention — which the store then treated as "never reap" via the `<= 0` sentinel — that automation will now receive `400 {"error":{"code":400,"message":"value must be a non-negative integer"}}`. Use `"0"` instead **only for `guardian_event_retention_days`**, where it preserves the disable-retention semantic and passes validation. For `heartbeat_timeout`, `response_retention_days` and `audit_retention_days` the store applies its own `> 0` check *after* the route's, so `"0"` is also rejected - with a different, bare-shaped body, `{"error":"value must be a positive integer"}`. There is no supported way to disable retention for those three through this endpoint. Automation that previously set non-numeric strings (anything other than a base-10 integer) was silently a no-op before this release — the 400 now surfaces the configuration error that had been hidden.
 
 ### v0.12.0 — A3 UX ladder (#620, #622, #624)
 

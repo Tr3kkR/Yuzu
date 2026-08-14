@@ -34,6 +34,7 @@ struct Config;
 class RbacStore;
 class AccessReviewStore;
 class DirectorySync;
+class ScimStore;
 
 /// Settings page routes — all /settings, /fragments/settings/*, /api/settings/* routes.
 class SettingsRoutes {
@@ -96,6 +97,15 @@ public:
     /// `owner_or_email` field, never fails the export). Same deferred-wiring
     /// pattern as the setters above.
     void set_access_review_directory_sync(DirectorySync* dirsync) { directory_sync_ = dirsync; }
+
+    /// Inject ScimStore (nullable, same deferred-wiring pattern as the
+    /// setters above). ADR-2001 §§1,3: `DELETE /api/settings/users/
+    /// {username}` resolves the deleted username's SCIM slug -> linked-OIDC
+    /// principal set through this pointer before revoking credentials.
+    /// While unset (or not open), the resolver degrades to the slug-only
+    /// set rather than failing closed — see `deprovision_revoke.hpp`'s
+    /// `resolve_deprovision_principals_for_username` doc comment.
+    void set_scim_store(ScimStore* store) { scim_store_ = store; }
 
     /// Register all settings-related routes on the given server.
     /// Production callers use this overload; internally it constructs an
@@ -256,6 +266,9 @@ private:
     RbacStore* rbac_store_{nullptr};
     AccessReviewStore* access_review_store_{nullptr};
     DirectorySync* directory_sync_{nullptr};
+    // Nullable — see set_scim_store(). Non-owning; lifetime is server.cpp's,
+    // which outlives this object.
+    ScimStore* scim_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{};
     TagStore* tag_store_{};
     UpdateRegistry* update_registry_{};

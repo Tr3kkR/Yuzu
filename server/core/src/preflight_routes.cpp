@@ -420,28 +420,13 @@ std::string PreflightRoutes::render_run(const PreflightRunRow& run, int attempt)
 
     std::vector<preflight::PreflightDeviceResult> grid;
     bool any_pending = false;
-    if (running) {
-        const auto applicable = preflight::applicable_checks(cfg);
-        const auto targets = run_store_ ? run_store_->get_targets(run.run_id)
-                                        : std::vector<preflight::PreflightTarget>{};
-        auto checks = collect_fn_ ? collect_fn_(run.run_id, applicable)
-                                  : std::vector<preflight::PreflightCheckResponses>{};
-        grid = preflight::compute_device_results(targets, checks, cfg, &any_pending);
-        // Persist the live grid on EVERY self-poll (not just at completion) so the
-        // stored go-cohort is always current — the Deploy stage can then act on the
-        // devices cleared SO FAR, mid-run, without waiting for the run to finish. The
-        // same helper completes the run the moment its cohort settles (or the window
-        // closes), so completion is also event-driven (no up-to-60s runner lag) — on
-        // whichever path notices first, this poll or the runner tick. No
-        // PreflightRunStore lease is held here (get_targets/collect already released);
-        // the helper takes its own.
-        const std::int64_t t = now_ms();
-        const bool past_deadline = t >= run.deadline_at_ms;
-        if (run_store_ && preflight::persist_and_maybe_complete(*run_store_, run.run_id, grid, t,
-                                                                past_deadline, any_pending))
-            running = false; // settled/closed this pass → render Complete, stop polling
-    } else {
-        // Stored grid (durable revisit, survives ResponseStore pruning).
+    bool degraded = false;
+
+    // Stored grid (durable revisit, survives ResponseStore pruning) — also the
+    // #2691 finding-10 fallback for a RUNNING run whose live read degraded.
+    auto read_stored_grid = [&] {
+        grid.clear();
+        if (!run_store_) return;
         for (const auto& r : run_store_->get_devices(run.run_id)) {
             preflight::PreflightDeviceResult dr;
             dr.agent_id = r.agent_id;
@@ -451,6 +436,43 @@ std::string PreflightRoutes::render_run(const PreflightRunRow& run, int attempt)
             dr.checks = preflight::checks_from_json(r.checks_json);
             grid.push_back(std::move(dr));
         }
+    };
+
+    if (running) {
+        const auto applicable = preflight::applicable_checks(cfg);
+        const auto targets = run_store_ ? run_store_->get_targets(run.run_id)
+                                        : std::vector<preflight::PreflightTarget>{};
+        auto checks = collect_fn_ ? collect_fn_(run.run_id, applicable)
+                                  : std::vector<preflight::PreflightCheckResponses>{};
+        degraded = preflight::any_check_degraded(checks);
+        if (degraded) {
+            // #2691 finding 10: this poll's read degraded (Postgres pool/query
+            // failure). Computing a grid from it would read every device as
+            // Incomplete and persisting that would silently overwrite an
+            // already-good stored verdict — render the last known-good stored
+            // grid instead and skip persist_and_maybe_complete entirely this
+            // poll. The run stays running; the next self-poll retries.
+            read_stored_grid();
+            any_pending = true; // keep the repoll wrapper live below
+        } else {
+            grid = preflight::compute_device_results(targets, checks, cfg, &any_pending);
+            // Persist the live grid on EVERY self-poll (not just at completion) so
+            // the stored go-cohort is always current — the Deploy stage can then
+            // act on the devices cleared SO FAR, mid-run, without waiting for the
+            // run to finish. The same helper completes the run the moment its
+            // cohort settles (or the window closes), so completion is also
+            // event-driven (no up-to-60s runner lag) — on whichever path notices
+            // first, this poll or the runner tick. No PreflightRunStore lease is
+            // held here (get_targets/collect already released); the helper takes
+            // its own.
+            const std::int64_t t = now_ms();
+            const bool past_deadline = t >= run.deadline_at_ms;
+            if (run_store_ && preflight::persist_and_maybe_complete(*run_store_, run.run_id, grid, t,
+                                                                    past_deadline, any_pending))
+                running = false; // settled/closed this pass → render Complete, stop polling
+        }
+    } else {
+        read_stored_grid();
     }
 
     std::string repoll;
@@ -458,8 +480,13 @@ std::string PreflightRoutes::render_run(const PreflightRunRow& run, int attempt)
         repoll = "/fragments/auto/result?run=" + url_encode(run.run_id) + "&n=" +
                  std::to_string(attempt + 1);
 
+    std::string degrade_note;
+    if (degraded)
+        degrade_note = "Live results temporarily unavailable (response store degraded) — "
+                       "showing the last known state. Retrying automatically.";
+
     return render_auto_results(grid, config_summary(cfg), run.scope_label, repoll,
-                               /*run_complete=*/!running, run.run_id);
+                               /*run_complete=*/!running, run.run_id, degrade_note);
 }
 
 } // namespace yuzu::server

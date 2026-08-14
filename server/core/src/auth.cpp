@@ -2,6 +2,9 @@
 #include <yuzu/server/auth_db.hpp>
 #include <yuzu/metrics.hpp>
 
+#include "oidc_principal.hpp" // oidc_principal_id — ADR-2001 §5 single principal-string builder
+#include "saml_principal.hpp" // saml_principal_id — ADR-2001 PR4a single principal-string builder
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -1049,7 +1052,10 @@ std::string AuthManager::create_oidc_session(const std::string& display_name,
     // share — keying on it let two same-named users collide onto one
     // principal, which #1832's RBAC reconcile then makes destructive
     // (one user's login can delete the other's group memberships).
-    const std::string stable_username = "oidc:" + iss + "#" + oidc_sub;
+    // ADR-2001 §5 — built through the single shared helper (never hand-built
+    // here) so a future deprovision-time resolver reconstructing this same
+    // string cannot silently drift from the mint site.
+    const std::string stable_username = yuzu::server::oidc::oidc_principal_id(iss, oidc_sub);
     const std::string resolved_display = display_name.empty() ? email : display_name;
 
     auto token = generate_session_token();
@@ -1102,19 +1108,32 @@ void AuthManager::provision_sso_identity(const std::string& principal, const std
 // ── SAML session creation ───────────────────────────────────────────────────
 
 std::string AuthManager::create_saml_session(const std::string& name_id,
+                                             const std::string& entity_id,
                                              const std::vector<std::string>& groups,
                                              const std::string& admin_group) {
     std::unique_lock lock(mu_);
 
-    // #1837 fast-follow: key SAML on entity_id#NameID (SAML doesn't sync to
-    // rbac_store yet, so its display-name-collision principal risk is
-    // dormant — see docs/auth-architecture.md "Stable principal vs. display
-    // name"). `username` stays the raw NameID; only `display_name` changes.
+    // ADR-2001 PR4a — the STABLE authorization principal is
+    // `saml_principal_id(entity_id, name_id)`, mirroring #1837's OIDC split
+    // exactly (`oidc_principal_id(iss, sub)`): a NameID is only guaranteed
+    // unique per-IdP, so a bare NameID is unsafe as the durable RBAC/session
+    // key (SAML doesn't sync to rbac_store yet, so the display-name-
+    // collision risk #1837 closes for OIDC is still dormant here — see
+    // docs/auth-architecture.md "Stable principal vs. display name" — but
+    // the cross-IdP NameID-reuse risk this closes is live from PR4a
+    // onward). `username` becomes the stable principal; `display_name`
+    // stays the raw NameID (human-readable rendering only). Built through
+    // the single shared builder (saml_principal.hpp) — never hand-built
+    // here — so a future deprovision-time resolver reconstructing this same
+    // string cannot silently drift from this mint site
+    // (deprovision_revoke.cpp).
     Role role = resolve_role_from_groups(groups, admin_group);
+
+    const std::string stable_username = yuzu::server::saml::saml_principal_id(entity_id, name_id);
 
     auto token = generate_session_token();
     Session s;
-    s.username                   = name_id;
+    s.username                   = stable_username;
     s.display_name               = name_id;
     s.role                       = role;
     s.expires_at                 = std::chrono::steady_clock::now() + kSessionDuration;
@@ -1123,7 +1142,8 @@ std::string AuthManager::create_saml_session(const std::string& name_id,
     s.last_activity_persisted_at = s.last_activity_at;
     sessions_[token]             = std::move(s);
 
-    spdlog::info("SAML session created for '{}' (role={})", name_id, role_to_string(role));
+    spdlog::info("SAML session created for '{}' (display={}, role={})", stable_username, name_id,
+                role_to_string(role));
     return token;
 }
 

@@ -6,8 +6,10 @@
 
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
+#include "config_secret_keys.hpp" // is_exactly_redaction_placeholder in the OIDC handler
 #include "dex_alert_router.hpp" // F1: parse_routed_types / routed_types_to_json
 #include "dex_blast_radius.hpp" // F1: BlastRadiusConfig defaults for the threshold form
+#include "deprovision_revoke.hpp" // ADR-2001 §§1,3: dashboard user DELETE revoke seam
 #include "dex_routes.hpp"       // F1: dex_signal_groups / dex_signal_label
 #include "directory_sync.hpp"   // access-review read-model optional email enrichment
 #include "http_route_sink.hpp"
@@ -19,6 +21,7 @@
 #include "web_utils.hpp"
 #include <yuzu/server/server.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include <yuzu/server/scim_store.hpp> // ScimStore::is_open (deprovision resolver, ADR-2001)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -919,8 +922,11 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
             // "credentials_revoked=N[; superseded_by=X]" — NOT an
             // operator-supplied free-text reason (the route has no such
             // field; an earlier draft of this fragment assumed one).
-            // Degrades honestly to "(not recorded)" if that audit row is
-            // absent or pruned.
+            // Two DIFFERENT outcomes, distinguished: "(not recorded)" when the
+            // store answered and had no such row, "(unavailable)" when it could
+            // not answer at all. Collapsing them would state an absence the read
+            // never established — the revocation facts beside it come from the
+            // principal store and are unaffected either way.
             std::string revocation_cell = "—";
             if (!active) {
                 std::string linkage =
@@ -934,9 +940,14 @@ std::string SettingsRoutes::render_engine_principals_fragment() {
                     q.target_id = p.principal_id;
                     q.action_prefixes = {"engine_principal.revoke"};
                     q.limit = 1;
+                    // Best-effort HTML cell (not an evidence endpoint): on a
+                    // degrade (nullopt, ADR-0040) say so rather than 503-ing the
+                    // whole settings page.
                     auto events = audit_store_->query(q);
-                    if (!events.empty() && !events.front().detail.empty())
-                        audit_detail = events.front().detail;
+                    if (!events)
+                        audit_detail = "(unavailable)";
+                    else if (!events->empty() && !events->front().detail.empty())
+                        audit_detail = events->front().detail;
                 }
                 revocation_cell = linkage +
                                   "<br><span style=\"font-size:0.7rem;color:"
@@ -3917,6 +3928,26 @@ void SettingsRoutes::register_routes(
             return;
         }
 
+        // The redaction placeholder is not a credential. It reaches this handler when an
+        // operator copies it out of the startup log or a config.update audit detail -- the
+        // two surfaces that emit it. GET /api/config is NOT one of them: it omits a
+        // secret's value rather than substituting a placeholder. So an exact one is treated
+        // like a blank field, meaning "leave the stored secret alone". Without that the
+        // store still refuses it further down -- but by then cfg_ and the live provider
+        // have already been updated, so the two would diverge behind a "saved" toast.
+        //
+        // The predicate here and the one at the sink are deliberately DIFFERENT, and both
+        // are needed. This one is EXACT: only the bare placeholder means "unchanged" (the
+        // form renders the field with `value=""` unconditionally, so the literal never
+        // originates here -- only the greyed placeholder ATTRIBUTE varies with whether a
+        // secret is stored, and an attribute is never submitted). A secret that merely
+        // CONTAINS the token falls through on purpose -- the sink refuses it and the
+        // failure branch below tells the operator. Clearing it here instead discarded a
+        // real credential and reported SAVED, the same false-success this change exists to
+        // remove (found by four reviewers). The sink's predicate is the broad CONTAINMENT
+        // one, and it covers every other caller (PUT /api/config included).
+        if (is_exactly_redaction_placeholder(client_secret))
+            client_secret.clear();
         auto effective_secret = client_secret.empty() ? cfg_->oidc_client_secret : client_secret;
         bool skip_tls = (skip_tls_verify == "true");
 
@@ -3929,6 +3960,14 @@ void SettingsRoutes::register_routes(
             oidc_cfg.redirect_uri = redirect_uri;
             oidc_cfg.admin_group_id = admin_group;
             oidc_cfg.skip_tls_verify = skip_tls;
+            // ADR-2001 §1 gap (Task 2 follow-up): this hot-reload path builds its
+            // own local OidcConfig and previously left scim_link_claim at its
+            // struct default ("sub"), silently reverting an operator's
+            // `--oidc-scim-link-claim oid` (Entra) to `sub` the moment they saved
+            // ANY OIDC setting via this form — until the next process restart
+            // re-read the flag. Mirrors server.cpp's boot-time wiring
+            // (`oidc_cfg.scim_link_claim = cfg_.oidc_scim_link_claim;`).
+            oidc_cfg.scim_link_claim = cfg_->oidc_scim_link_claim;
             if (skip_tls)
                 spdlog::warn(
                     "OIDC TLS certificate verification DISABLED — do not use in production");
@@ -3972,18 +4011,66 @@ void SettingsRoutes::register_routes(
         }
         spdlog::info("OIDC provider reinitialized via Settings UI (issuer={})", issuer);
 
-        if (runtime_config_store_ && runtime_config_store_->is_open()) {
+        std::vector<std::string> persist_errors;
+        // NO silent else. Guarding the whole persist block on is_open() and falling
+        // through to the success toast is the same false-success this fold exists to
+        // remove -- a degraded store would report "saved" for a save that never
+        // happened. A null store is recorded as an error here; a store that is merely
+        // not open reports itself, because every set() below returns "store not open"
+        // and the failure branch renders it (the DEX siblings at :3300/:3351 already
+        // rely on that and carry no is_open() guard).
+        if (!runtime_config_store_) {
+            persist_errors.emplace_back("store: runtime configuration store unavailable");
+        } else {
             auto who = std::string("admin");
             auto session = auth_fn_(req, res);
             if (session)
                 who = session->username;
-            runtime_config_store_->set("oidc_issuer", issuer, who);
-            runtime_config_store_->set("oidc_client_id", client_id, who);
+            // Every result is observed. `set()` is [[nodiscard]] for this reason: a
+            // discarded rejection reported "saved" for a write the store refused.
+            auto note = [&](const char* k, std::expected<void, std::string> r) {
+                if (!r)
+                    persist_errors.push_back(std::string(k) + ": " + r.error());
+            };
+            note("oidc_issuer", runtime_config_store_->set("oidc_issuer", issuer, who));
+            note("oidc_client_id", runtime_config_store_->set("oidc_client_id", client_id, who));
             if (!client_secret.empty())
-                runtime_config_store_->set("oidc_client_secret", client_secret, who);
-            runtime_config_store_->set("oidc_redirect_uri", redirect_uri, who);
-            runtime_config_store_->set("oidc_admin_group", admin_group, who);
-            runtime_config_store_->set("oidc_skip_tls_verify", skip_tls ? "true" : "false", who);
+                note("oidc_client_secret",
+                     runtime_config_store_->set("oidc_client_secret", client_secret, who));
+            note("oidc_redirect_uri",
+                 runtime_config_store_->set("oidc_redirect_uri", redirect_uri, who));
+            note("oidc_admin_group",
+                 runtime_config_store_->set("oidc_admin_group", admin_group, who));
+            note("oidc_skip_tls_verify",
+                 runtime_config_store_->set("oidc_skip_tls_verify", skip_tls ? "true" : "false", who));
+        }
+
+        if (!persist_errors.empty()) {
+            // The live provider is already swapped in, but the store refused part of the
+            // write, so the running config and the persisted config disagree and a restart
+            // would silently revert. Say so instead of reporting success.
+            // Every component is a hardcoded key plus a fixed error literal -- no value
+            // is ever in here -- so there is no disclosure reason to collapse the list,
+            // and collapsing it discarded WHICH key failed from the one audit row that
+            // documents a partial persist.
+            std::string joined;
+            for (const auto& e : persist_errors) {
+                if (!joined.empty())
+                    joined += ", ";
+                joined += e;
+            }
+            audit_fn_(req, "oidc.configure", "failure", "OidcConfig", issuer,
+                      "persist failed: " + joined);
+            auto html = render_directory_fragment() +
+                        "<div id=\"oidc-feedback\" class=\"feedback feedback-error\" "
+                        "hx-swap-oob=\"true\">OIDC applied to the running server, but these "
+                        "settings could NOT be saved: " +
+                        html_escape(joined) +
+                        ". Any other settings in this form WERE saved, so the stored "
+                        "configuration is now inconsistent with the running server. Fix the "
+                        "cause and save again.</div>";
+            res.set_content(html, "text/html; charset=utf-8");
+            return;
         }
 
         audit_fn_(req, "oidc.configure", "success", "OidcConfig", issuer, "");
@@ -4315,12 +4402,111 @@ void SettingsRoutes::register_routes(
                 return;
             }
         }
+        // ADR-2001 §§1,3 — credentials-FIRST revoke across the resolved
+        // principal set (the deleted username + every OIDC identity linked
+        // to it via SCIM, if any) BEFORE the account is removed. Mirrors
+        // the SCIM deprovision seams' ordering and fail-closed posture:
+        // `resolve_deprovision_principals_for_username` fails closed
+        // (nullopt) only on a genuine link-lookup failure for a KNOWN SCIM
+        // user — never on "not a SCIM user"/"SCIM store unwired", which
+        // degrade to the slug-only set (see its doc comment).
+        std::string revoke_detail;
+        if (api_token_store_) {
+            auto principals = resolve_deprovision_principals_for_username(scim_store_, username);
+            if (!principals.has_value()) {
+                spdlog::error("DELETE /api/settings/users: identity-link resolution failed for "
+                             "'{}' — refusing to delete (a store blip must not read as \"no "
+                             "linked identities to revoke\")",
+                             username);
+                audit_fn_(req, "user.delete", "failure", "User", username,
+                         "identity_link_resolution_failed");
+                res.status = 500;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Failed to resolve linked identities — try )"
+                    R"(again","level":"error"}})");
+                res.set_content(render_users_fragment(session->username),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            if (!api_token_store_->is_open()) {
+                spdlog::error("DELETE /api/settings/users: ApiTokenStore unavailable — "
+                             "refusing to delete '{}' without being able to revoke its "
+                             "credentials",
+                             username);
+                audit_fn_(req, "user.delete", "failure", "User", username,
+                         "api_token_store_unavailable");
+                res.status = 503;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Credential store unavailable — try )"
+                    R"(again","level":"error"}})");
+                res.set_content(render_users_fragment(session->username),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            auto revoke_result =
+                revoke_deprovision_credentials(*api_token_store_, *auth_mgr_, *principals);
+            revoke_detail =
+                "api_tokens_revoked=" + std::to_string(revoke_result.api_tokens_revoked) +
+                " sessions_revoked=" + std::to_string(revoke_result.sessions_revoked) +
+                " principals=" + std::to_string(principals->size()) +
+                // Governance Gate 7 SHOULD fix (UP-5): enumerate the actual
+                // principal strings, not just the count — mirrors the SCIM
+                // seam's `revoke_linked_credentials_or_fail`.
+                enumerate_principals_for_audit(*principals);
+            if (!revoke_result.api_tokens_persisted) {
+                revoke_detail += " api_tokens_db_error=true";
+                spdlog::error("DELETE /api/settings/users: revoke_for_principal did not "
+                             "persist for one or more principals linked to '{}' — refusing to "
+                             "report a clean delete (ADR-2001 §3 fail-closed)",
+                             username);
+                audit_fn_(req, "user.delete", "partial", "User", username, revoke_detail);
+                res.status = 500;
+                res.set_header(
+                    "HX-Trigger",
+                    R"({"showToast":{"message":"Failed to revoke API tokens for one or more )"
+                    R"(linked identities — try again","level":"error"}})");
+                res.set_content(render_users_fragment(session->username),
+                                "text/html; charset=utf-8");
+                return;
+            }
+        } else {
+            // Governance Gate 7 BLOCKING fix (UP-7): FAIL CLOSED here —
+            // mirror the SCIM seam's `revoke_linked_credentials_or_fail`
+            // (scim_routes.cpp), which 503s + audits
+            // "api_token_store_unavailable" rather than skip-and-proceed
+            // when its token_store is null/not open. A null ApiTokenStore
+            // means credentials CANNOT be revoked, and proceeding to
+            // `remove_user` below anyway would silently leave every linked
+            // principal's API tokens live — exactly the CC6.8 gap ADR-2001
+            // exists to close. server.cpp constructs ApiTokenStore
+            // unconditionally whenever pg_pool_ is set and fails the whole
+            // boot otherwise, so a live server NEVER reaches this handler
+            // with a null store — this branch is test-harness-only
+            // (SettingsRoutesHarness/SettingsOwnerDeleteHarness, which
+            // predate ADR-2001) and every wired-store outcome is covered by
+            // SettingsAdr2001Harness's PG-backed tests.
+            spdlog::error("DELETE /api/settings/users: no ApiTokenStore wired — refusing to "
+                         "delete '{}' without being able to revoke its credentials (ADR-2001)",
+                         username);
+            audit_fn_(req, "user.delete", "failure", "User", username,
+                     "api_token_store_unavailable");
+            res.status = 503;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Credential store unavailable — try )"
+                R"(again","level":"error"}})");
+            res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
+            return;
+        }
+
         if (auth_mgr_->remove_user(username)) {
             if (!auth_mgr_->save_config()) {
                 spdlog::error("Failed to save config after user removal");
             }
             spdlog::info("User '{}' removed", username);
-            audit_fn_(req, "user.delete", "success", "User", username, "");
+            audit_fn_(req, "user.delete", "success", "User", username, revoke_detail);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
         } else {

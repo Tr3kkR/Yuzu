@@ -82,8 +82,7 @@ static int param_int(const httplib::Request& req, const char* name, int def) {
 }
 
 // -- Helper: column index by name (case-insensitive, excl. Agent col) ---------
-static int col_index_for_name(const std::string& plugin, const std::string& name) {
-    auto& cols = columns_for_plugin(plugin);
+static int col_index_for_name(const std::vector<std::string>& cols, const std::string& name) {
     // cols[0] is "Agent" — field indices are 0-based starting after Agent
     for (size_t i = 1; i < cols.size(); ++i) {
         auto& c = cols[i];
@@ -163,14 +162,15 @@ void DashboardRoutes::register_routes(httplib::Server& svr,
                                        detail::EventBus* event_bus,
                                        AgentsJsonFn agents_json_fn,
                                        DispatchFn dispatch_fn,
+                                       ExecVisibleFn exec_visible_fn,
                                        ResolveFn resolve_fn,
                                        yuzu::MetricsRegistry* metrics,
                                        InstructionStore* instruction_store) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     response_store, mgmt_group_store, registry, tag_store, event_bus,
-                    std::move(agents_json_fn), std::move(dispatch_fn), std::move(resolve_fn),
-                    metrics, instruction_store);
+                    std::move(agents_json_fn), std::move(dispatch_fn), std::move(exec_visible_fn),
+                    std::move(resolve_fn), metrics, instruction_store);
 }
 
 void DashboardRoutes::register_routes(HttpRouteSink& sink,
@@ -181,6 +181,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                                        detail::EventBus* event_bus,
                                        AgentsJsonFn agents_json_fn,
                                        DispatchFn dispatch_fn,
+                                       ExecVisibleFn exec_visible_fn,
                                        ResolveFn resolve_fn,
                                        yuzu::MetricsRegistry* metrics,
                                        InstructionStore* instruction_store) {
@@ -194,6 +195,7 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
     event_bus_ = event_bus;
     agents_json_fn_ = std::move(agents_json_fn);
     dispatch_fn_ = std::move(dispatch_fn);
+    exec_visible_fn_ = std::move(exec_visible_fn);
     resolve_fn_ = std::move(resolve_fn);
     metrics_ = metrics;
     instruction_store_ = instruction_store;
@@ -319,9 +321,10 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                         // honoured by REST consumers but not auto-applied
                         // by the dashboard for now.
                         if (!filters_explicit) {
+                            auto render_cols = resolve_render_columns(plugin, definition_id);
                             for (const auto& tf : resolved.filters) {
                                 if (tf.op != "equals") continue;
-                                int col_idx = col_index_for_name(plugin, tf.column);
+                                int col_idx = col_index_for_name(render_cols, tf.column);
                                 if (col_idx < 0) continue;
                                 FacetFilter f;
                                 f.col_idx = col_idx;
@@ -452,9 +455,16 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                 auto plugin = req.get_param_value("plugin");
                 auto filters = parse_filters(req, plugin);
 
-                int64_t agent_count = 0;
+                // nullopt (unwired store, or filters.empty() with no store
+                // call attempted) renders the same as a genuine store
+                // degrade — #2691 finding #7 is specifically that a REAL
+                // degrade must not render as "0 agents", not that the
+                // no-store/no-filter cases need a NEW distinction from it.
+                std::optional<int64_t> agent_count;
                 if (response_store_ && !filters.empty())
                     agent_count = response_store_->facet_agent_count(command_id, filters);
+                else if (filters.empty())
+                    agent_count = 0; // genuine: no filter → no scoped count
 
                 auto html = render_create_group_form(command_id, plugin, filters,
                                                       agent_count);
@@ -492,8 +502,23 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
-                 // Get matching agent IDs from faceted index
-                 auto agent_ids = response_store_->facet_agent_ids(command_id, filters);
+                 // Get matching agent IDs from faceted index. #2691 (Doomgoose
+                 // finding #7): a degraded read must not read as "no agents
+                 // match" — that's a wrong-result-presented-as-correct claim on
+                 // a write-adjacent action (it would tell the operator their
+                 // filters are bad when the store just couldn't be read).
+                 auto agent_ids_opt = response_store_->facet_agent_ids(command_id, filters);
+                 if (!agent_ids_opt.has_value()) {
+                     res.status = 503;
+                     res.set_header("HX-Retarget", "#group-form-slot");
+                     res.set_content(
+                         "<span class=\"feedback-error\">"
+                         "Agent count unavailable — the response store could not be read. "
+                         "Retry shortly.</span>",
+                         "text/html; charset=utf-8");
+                     return;
+                 }
+                 auto& agent_ids = *agent_ids_opt;
                  if (agent_ids.empty()) {
                      res.status = 422;
                      res.set_header("HX-Retarget", "#group-form-slot");
@@ -560,7 +585,21 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  if (!perm_fn_(req, res, "Execution", "Execute")) return;
 
                  auto instruction = extract_form_value(req.body, "instruction");
-                 auto scope = extract_form_value(req.body, "scope");
+
+                 // CDX-P1-01: read the DECODED param first (httplib percent-decodes
+                 // both keys and values when it parses an
+                 // application/x-www-form-urlencoded body into req.params), falling
+                 // back to the raw-body helper only for a non-form Content-Type
+                 // httplib does not parse into req.params (UP-10). A raw-byte scan
+                 // alone (the prior form of this line) cannot see a percent-encoded
+                 // field NAME — e.g. `sc%6fpe=` decodes to `scope` in req.params but
+                 // never matches the literal `scope=` needle `extract_form_value`
+                 // scans for — so encoding the key name reopened exactly the
+                 // supplied-vs-omitted collapse CDX-R8-01 closed. Mirrors
+                 // tar-execute's identical fix below.
+                 auto scope = req.get_param_value("scope");
+                 if (scope.empty())
+                     scope = extract_form_value(req.body, "scope");
 
                  if (instruction.empty()) {
                      res.set_content(
@@ -644,9 +683,20 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  }
 
                  // Issue #587: reverse-lookup an InstructionDefinition that
-                 // matches (plugin, action) AND has a spec.visualization.
-                 // When found, propagate the definition_id through the
-                 // result-render flow so the chart deck renders inline.
+                 // matches (plugin, action) AND either has a
+                 // spec.visualization OR a non-empty result_schema. When
+                 // found, propagate the definition_id through the
+                 // result-render flow so the chart deck renders inline
+                 // (visualization match) and/or render_results resolves
+                 // per-action columns via resolve_render_columns
+                 // (result_schema match, PR1.7 remediation) instead of
+                 // falling back to columns_for_plugin's fixed per-plugin
+                 // schema — the fix for actions like registry's
+                 // list_profiles, whose column shape columns_for_plugin
+                 // does not know at all. A result_schema-only match still
+                 // resolves an empty chart deck (VisualizationEngine::count
+                 // is 0 without a visualization_spec), so this is a no-op
+                 // for every definition that doesn't also declare charts.
                  //
                  // Closes governance CP-1 / sec-F1 / ER-NEW-2: gate the
                  // reverse-lookup on `InstructionDefinition:Read` so a
@@ -669,25 +719,53 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      q.limit = 50;
                      for (const auto& d : instruction_store_->query_definitions(q)) {
                          if (d.action != action) continue;
-                         if (!VisualizationEngine::has_visualization(d.visualization_spec))
+                         if (!VisualizationEngine::has_visualization(d.visualization_spec) &&
+                             d.result_schema.empty())
                              continue;
                          def_id = d.id;
                          break;
                      }
                  }
 
-                 // Resolve scope → agent_ids or scope expression
+                 // Resolve scope → agent_ids or scope expression.
+                 //
+                 // CDX-R8-01: a SUPPLIED `scope=` that resolves to nothing is an
+                 // ERROR, not a fleet broadcast — `extract_form_value` returns ""
+                 // for an absent key and an empty one alike, so the two must be
+                 // told apart HERE or they collapse into the same request
+                 // (dispatch_target_shape.hpp:14-16). `__all__` is passed THROUGH
+                 // as a named broadcast rather than stripped to empty+empty, so
+                 // the fleet is reached by NAME, never inferred from emptiness.
                  std::vector<std::string> agent_ids;
                  std::string scope_expr;
                  if (!scope.empty() && scope.starts_with("group:")) {
                      scope_expr = scope;
                  } else if (!scope.empty() && scope != yuzu::server::kBroadcastScope) {
                      agent_ids.push_back(scope);
+                 } else if (scope == yuzu::server::kBroadcastScope) {
+                     scope_expr = std::string(yuzu::server::kBroadcastScope);
+                 } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
+                     res.set_content(
+                         "<span id=\"result-context\" hx-swap-oob=\"true\""
+                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         "No target selected. Choose agents, or pick All agents "
+                         "to reach the fleet.</span>",
+                         "text/html; charset=utf-8");
+                     return;
                  }
-                 // scope == "__all__" or empty → broadcast (empty agent_ids + empty scope)
+                 // scope omitted entirely → the legacy UI contract: the whole fleet
+                 // (still narrowed to the operator's visible set by the seam).
 
-                 // Dispatch with inline CLI parameters
-                 auto [command_id, sent] = dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params);
+                 // Dispatch with inline CLI parameters. CDX-R7-02: narrow to the
+                 // operator's Execution:Execute visible set via the shared
+                 // dispatch_confined seam (same confinement as /api/command +
+                 // MCP). An UNWIRED derivation fails CLOSED (present-empty set →
+                 // reaches nobody), never nullopt/unfiltered.
+                 yuzu::server::authz::VisibleSet exec_visible =
+                     exec_visible_fn_ ? exec_visible_fn_(req)
+                                      : yuzu::server::authz::deny_all();
+                 auto [command_id, sent] =
+                     dispatch_fn_(plugin, action, agent_ids, scope_expr, inline_params, exec_visible);
                  if (sent == 0) {
                      res.set_content(
                          "<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -697,8 +775,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      return;
                  }
 
-                 // Success: return OOB swaps for the results area
-                 auto& col_names = columns_for_plugin(plugin);
+                 // Success: return OOB swaps for the results area. Uses the
+                 // same schema-aware resolution as render_results (PR1.7
+                 // remediation) so a schema-only action's initial thead
+                 // matches what the 2s-later chart-deck-host refresh
+                 // renders, instead of flashing columns_for_plugin's
+                 // fallback shape first.
+                 auto col_names = resolve_render_columns(plugin, def_id);
 
                  std::string html;
                  html.reserve(4096);
@@ -836,18 +919,48 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      }
                  }
 
+                 // CDX-R8-01, the TAR sibling of the execute route above: tell a
+                 // SUPPLIED-but-empty `scope=` apart from an omitted one, and pass
+                 // `__all__` through by NAME instead of stripping it to empty+empty.
+                 //
+                 // UP-10: req.has_param()/get_param_value() only see the query
+                 // string or a body httplib parsed into req.params — which happens
+                 // ONLY for an `application/x-www-form-urlencoded` Content-Type. A
+                 // non-form POST leaves a body-supplied `scope=` invisible to both,
+                 // so the refusal below was silently skippable by sending any other
+                 // Content-Type. Fall back to reading the raw body directly (the
+                 // same form_value_supplied/extract_form_value the execute route
+                 // above uses), which is Content-Type-independent.
                  auto scope = req.get_param_value("scope");
+                 if (scope.empty())
+                     scope = extract_form_value(req.body, "scope");
                  std::vector<std::string> agent_ids;
                  std::string scope_expr;
                  if (!scope.empty() && scope.starts_with("group:")) {
                      scope_expr = scope;
                  } else if (!scope.empty() && scope != yuzu::server::kBroadcastScope) {
                      agent_ids.push_back(scope);
+                 } else if (scope == yuzu::server::kBroadcastScope) {
+                     scope_expr = std::string(yuzu::server::kBroadcastScope);
+                 } else if (req.has_param("scope") || form_value_supplied(req.body, "scope")) {
+                     res.set_content(
+                         "<span id=\"result-context\" hx-swap-oob=\"true\""
+                         " style=\"font-size:0.75rem;color:#f85149\">"
+                         "No target selected. Choose agents, or pick All agents "
+                         "to reach the fleet.</span>",
+                         "text/html; charset=utf-8");
+                     return;
                  }
 
                  std::unordered_map<std::string, std::string> params;
                  params["sql"] = sql;
-                 auto [command_id, sent] = dispatch_fn_("tar", "sql", agent_ids, scope_expr, params);
+                 // CDX-R7-02: same confinement as /api/dashboard/execute — narrow
+                 // to the operator's visible set, fail CLOSED if unwired.
+                 yuzu::server::authz::VisibleSet exec_visible =
+                     exec_visible_fn_ ? exec_visible_fn_(req)
+                                      : yuzu::server::authz::deny_all();
+                 auto [command_id, sent] =
+                     dispatch_fn_("tar", "sql", agent_ids, scope_expr, params, exec_visible);
 
                  if (sent == 0) {
                      res.set_content("<span id=\"result-context\" hx-swap-oob=\"true\""
@@ -1025,10 +1138,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // Scope dispatch to the operator's visible agents only —
                  // never fan out to devices the operator cannot see.
                  // Empty visible set = nobody to scan; return early.
+                 // ADR-0042: get_visible_agents is degrade-distinguishable —
+                 // nullopt (store degraded) is treated as an empty visible set
+                 // (fail-closed: scan nobody rather than fan out un-scoped).
                  std::vector<std::string> agent_ids;
                  if (mgmt_group_store_) {
-                     agent_ids = mgmt_group_store_->get_visible_agents(
-                         session->username);
+                     if (auto vis = mgmt_group_store_->get_visible_agents(session->username))
+                         agent_ids = std::move(*vis);
                  }
                  if (agent_ids.empty()) {
                      res.set_content(
@@ -1044,8 +1160,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  }
 
                  std::unordered_map<std::string, std::string> params;
+                 // CDX-R7-02: this TAR scan already narrows `agent_ids` by
+                 // management-group (username) visibility above; ALSO narrow to
+                 // the caller's Execution:Execute visible set via the shared
+                 // dispatch_confined seam, so a service-scoped token cannot scan
+                 // an out-of-service device its username visibility would admit.
+                 // Fail CLOSED (present-empty) if the derivation is unwired.
+                 yuzu::server::authz::VisibleSet exec_visible =
+                     exec_visible_fn_ ? exec_visible_fn_(req)
+                                      : yuzu::server::authz::deny_all();
                  auto [command_id, sent] = dispatch_fn_(
-                     "tar", "status", agent_ids, /*scope_expr=*/"", params);
+                     "tar", "status", agent_ids, /*scope_expr=*/"", params, exec_visible);
 
                  {
                      std::lock_guard<std::mutex> lk(tar_scan_mu_);
@@ -1221,10 +1346,12 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // Audit detail records the real reason on the server side.
                  bool visible = false;
                  if (mgmt_group_store_) {
-                     auto visible_ids = mgmt_group_store_->get_visible_agents(
-                         session->username);
-                     for (const auto& vid : visible_ids) {
-                         if (vid == device_id) { visible = true; break; }
+                     // ADR-0042: nullopt (store degraded) → not visible (fail-closed).
+                     if (auto visible_ids = mgmt_group_store_->get_visible_agents(
+                             session->username)) {
+                         for (const auto& vid : *visible_ids) {
+                             if (vid == device_id) { visible = true; break; }
+                         }
                      }
                  }
 
@@ -1246,9 +1373,17 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  std::unordered_map<std::string, std::string> params;
                  params[std::format("{}_enabled", source)] = "true";
+                 // CDX-R7-02: reaches a single visibility-gated device_id — ALSO
+                 // narrow to the caller's Execution:Execute visible set (the Ids
+                 // arm of dispatch_confined drops an out-of-scope device_id), so
+                 // a service-scoped token cannot re-enable capture on a device
+                 // outside its service. Fail CLOSED if the derivation is unwired.
+                 yuzu::server::authz::VisibleSet exec_visible =
+                     exec_visible_fn_ ? exec_visible_fn_(req)
+                                      : yuzu::server::authz::deny_all();
                  auto [command_id, sent] = dispatch_fn_(
                      "tar", "configure", {device_id}, /*scope_expr=*/"",
-                     params);
+                     params, exec_visible);
 
                  if (sent == 0) {
                      audit_fn_(req, "tar.source.reenable", "failure",
@@ -1378,11 +1513,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                  // response cannot enumerate device existence; real reason audited).
                  bool visible = false;
                  if (mgmt_group_store_) {
-                     auto visible_ids = mgmt_group_store_->get_visible_agents(session->username);
-                     for (const auto& vid : visible_ids) {
-                         if (vid == device_id) {
-                             visible = true;
-                             break;
+                     // ADR-0042: nullopt (store degraded) → not visible (fail-closed).
+                     if (auto visible_ids = mgmt_group_store_->get_visible_agents(session->username)) {
+                         for (const auto& vid : *visible_ids) {
+                             if (vid == device_id) {
+                                 visible = true;
+                                 break;
+                             }
                          }
                      }
                  }
@@ -1402,8 +1539,18 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
 
                  std::unordered_map<std::string, std::string> params;
                  params["source"] = source;
+                 // CDX-R7-02: purge_source is DESTRUCTIVE (drops a device's TAR
+                 // data), so narrowing to the caller's Execution:Execute visible
+                 // set matters most here — a service-scoped token must not purge
+                 // a device outside its service even if username visibility would
+                 // admit it. The Ids arm of dispatch_confined drops an
+                 // out-of-scope device_id; fail CLOSED if the derivation is unwired.
+                 yuzu::server::authz::VisibleSet exec_visible =
+                     exec_visible_fn_ ? exec_visible_fn_(req)
+                                      : yuzu::server::authz::deny_all();
                  auto [command_id, sent] =
-                     dispatch_fn_("tar", "purge_source", {device_id}, /*scope_expr=*/"", params);
+                     dispatch_fn_("tar", "purge_source", {device_id}, /*scope_expr=*/"", params,
+                                  exec_visible);
 
                  if (sent == 0) {
                      audit_fn_(req, "tar.source.purge", "failure", "command", "",
@@ -1475,6 +1622,27 @@ std::vector<FacetFilter> DashboardRoutes::parse_filters(const httplib::Request& 
 }
 
 // ---------------------------------------------------------------------------
+// resolve_render_columns
+// ---------------------------------------------------------------------------
+
+std::vector<std::string> DashboardRoutes::resolve_render_columns(
+    const std::string& plugin, const std::string& definition_id) const {
+    if (!definition_id.empty() && instruction_store_ && instruction_store_->is_open()) {
+        if (auto def = instruction_store_->get_definition(definition_id);
+            def && !def->result_schema.empty()) {
+            ResponseTemplatesEngine engine;
+            auto tmpl = engine.synthesise_default(def->result_schema, plugin);
+            if (!tmpl.columns.empty()) {
+                std::vector<std::string> cols{"Agent"};
+                cols.insert(cols.end(), tmpl.columns.begin(), tmpl.columns.end());
+                return cols;
+            }
+        }
+    }
+    return columns_for_plugin(plugin);
+}
+
+// ---------------------------------------------------------------------------
 // render_results
 // ---------------------------------------------------------------------------
 
@@ -1493,7 +1661,7 @@ std::string DashboardRoutes::render_results(
                "Response store not available.</td></tr></tbody>";
     }
 
-    auto& col_names = columns_for_plugin(plugin);
+    auto col_names = resolve_render_columns(plugin, definition_id);
 
     // Issue #254 (Phase 8.2): when a template specified a visible-column
     // subset, build the set of plugin column indices to render. Index 0
@@ -1527,17 +1695,34 @@ std::string DashboardRoutes::render_results(
     std::vector<StoredResponse> responses;
     int64_t total_agent_count = 0;
 
+    // #2691 (Doomgoose finding #7): the render still degrades to empty (ADR-0039
+    // deny-or-benign — a read failure is not a target/enforce decision here), but
+    // `store_degraded` keeps that fact distinguishable through to the two render
+    // sites below (tbody empty-state, #result-summary) so an operator sees "store
+    // degraded, not zero matches" rather than a silently wrong "no results".
+    bool store_degraded = false;
     if (filters.empty()) {
         // No filters — load all responses for this instruction
         ResponseQuery q;
         q.limit = 10000; // upper bound
-        responses = response_store_->query(command_id, q);
+        auto responses_opt = response_store_->query(command_id, q);
+        store_degraded = !responses_opt.has_value();
+        responses = responses_opt.value_or(std::vector<StoredResponse>{});
         total_agent_count = static_cast<int64_t>(responses.size());
     } else {
         // Use faceted index to get matching response IDs, then load them
-        auto resp_ids = response_store_->facet_response_ids(command_id, filters, 10000, 0);
-        responses = response_store_->query_by_ids(resp_ids);
-        total_agent_count = response_store_->facet_agent_count(command_id, filters);
+        auto resp_ids_opt = response_store_->facet_response_ids(command_id, filters, 10000, 0);
+        store_degraded = !resp_ids_opt.has_value();
+        auto resp_ids = resp_ids_opt.value_or(std::vector<int64_t>{});
+        auto responses_opt = response_store_->query_by_ids(resp_ids);
+        store_degraded = store_degraded || !responses_opt.has_value();
+        responses = responses_opt.value_or(std::vector<StoredResponse>{});
+        // facet_agent_count is degrade-distinguishable too — a degraded count
+        // also hides the "Create Group" button below, the safer default for a
+        // write-adjacent action on an uncertain count.
+        auto count_opt = response_store_->facet_agent_count(command_id, filters);
+        store_degraded = store_degraded || !count_opt.has_value();
+        total_agent_count = count_opt.value_or(0);
     }
 
     // Phase 2: parse output lines, apply per-line filters and text search
@@ -1584,7 +1769,7 @@ std::string DashboardRoutes::render_results(
     // Phase 3: sort
     int sort_idx = -1; // -1 = sort by agent name
     if (sort_col != "agent") {
-        sort_idx = col_index_for_name(plugin, sort_col);
+        sort_idx = col_index_for_name(col_names, sort_col);
     }
     bool ascending = (sort_dir == "asc");
 
@@ -1648,7 +1833,14 @@ std::string DashboardRoutes::render_results(
 
     // Primary: tbody rows
     html += "<tbody id=\"results-tbody\">";
-    if (all_lines.empty()) {
+    if (store_degraded) {
+        // #2691 (Doomgoose finding #7): distinguishable from a genuine
+        // zero-match answer — the response store could not be read.
+        html += "<tr><td colspan=\"" + std::to_string(visible_col_count) +
+                "\" class=\"empty-state result-degrade-banner\"><b>Results unavailable.</b> "
+                "The response store could not be read (Postgres pool/query degraded). "
+                "This is <b>not</b> \"no results\" — retry shortly.</td></tr>";
+    } else if (all_lines.empty()) {
         html += "<tr><td colspan=\"" + std::to_string(visible_col_count) +
                 "\" class=\"empty-state\">No results match your filters.</td></tr>";
     } else {
@@ -1745,7 +1937,9 @@ std::string DashboardRoutes::render_results(
 
     // OOB: summary with group-creation affordance
     html += "<div id=\"result-summary\" hx-swap-oob=\"true\">";
-    if (total_lines > 0) {
+    if (store_degraded) {
+        html += "<span class=\"result-degrade-banner\">store degraded — count unavailable</span>";
+    } else if (total_lines > 0) {
         html += std::to_string(total_lines) + " result" +
                 (total_lines != 1 ? "s" : "") + " across " +
                 std::to_string(total_agent_count) + " agent" +
@@ -1883,12 +2077,25 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
         // Get distinct facet values for this column
         int col_idx = static_cast<int>(i - 1);
         std::vector<FacetValue> facet_vals;
-        if (response_store_)
-            facet_vals = response_store_->facet_values(command_id, col_idx);
+        bool facet_degraded = false;
+        if (response_store_) {
+            auto facet_opt = response_store_->facet_values(command_id, col_idx);
+            facet_degraded = !facet_opt.has_value();
+            facet_vals = std::move(facet_opt).value_or(std::vector<FacetValue>{});
+        }
 
         html += "<label>" + html_escape(cols[i]) + "</label>";
 
-        if (facet_vals.size() <= 20) {
+        // #2691 (Gate 4 consistency-auditor): a degraded read must not render
+        // as an empty "All" dropdown — that's indistinguishable from "this
+        // column genuinely has no other values", right next to a results
+        // table that correctly banners the same degrade. Disable the control
+        // instead of silently offering a filter that can't be trusted.
+        if (facet_degraded) {
+            html += "<select name=\"" + param_name + "\" disabled title=\"Filter values "
+                    "unavailable — response store degraded\">"
+                    "<option value=\"\">(unavailable)</option></select>";
+        } else if (facet_vals.size() <= 20) {
             // Dropdown for small cardinality
             html += "<select name=\"" + param_name + "\""
                     " hx-get=\"/fragments/results\" hx-target=\"#results-tbody\""
@@ -1930,7 +2137,7 @@ std::string DashboardRoutes::render_filter_bar(const std::string& command_id,
 
 std::string DashboardRoutes::render_create_group_form(
     const std::string& command_id, const std::string& plugin,
-    const std::vector<FacetFilter>& filters, int64_t agent_count) {
+    const std::vector<FacetFilter>& filters, std::optional<int64_t> agent_count) {
 
     auto& col_names = columns_for_plugin(plugin);
 
@@ -1956,12 +2163,21 @@ std::string DashboardRoutes::render_create_group_form(
         }
     }
 
+    std::string count_hint;
+    if (agent_count.has_value()) {
+        count_hint = std::to_string(*agent_count) + " agent" + (*agent_count != 1 ? "s" : "") +
+                    " will be added";
+    } else {
+        // #2691 (Doomgoose finding #7): the store read degraded — say so,
+        // never silently claim "0 agents" (a materially different, wrong
+        // answer the operator could act on by submitting an empty group).
+        count_hint = "agent count unavailable (store degraded) — submitting now will add "
+                     "whichever agents match at write time";
+    }
     html += "<input name=\"group_name\" type=\"text\" placeholder=\"Group name\""
             " required maxlength=\"128\" autofocus>"
             " <button type=\"submit\">Create Static Group</button>"
-            " <span class=\"form-hint\">" + std::to_string(agent_count) +
-            " agent" + (agent_count != 1 ? "s" : "") +
-            " will be added</span></form>";
+            " <span class=\"form-hint\">" + count_hint + "</span></form>";
 
     return html;
 }
@@ -2101,17 +2317,27 @@ std::string DashboardRoutes::render_tar_retention_paused(
     // dispatch already scoped to visible agents, a separate operator who
     // shares the command_id (no longer possible after per-user state but
     // kept for layered safety) still cannot see out-of-scope data.
+    // ADR-0042: nullopt (store degraded) → empty visible set (fail-closed: the
+    // filter admits nothing rather than the un-scoped raw stream).
     std::unordered_set<std::string> visible_set;
     if (mgmt_group_store_) {
-        auto visible_ids = mgmt_group_store_->get_visible_agents(username);
-        visible_set.reserve(visible_ids.size());
-        for (auto& v : visible_ids) visible_set.insert(std::move(v));
+        if (auto visible_ids = mgmt_group_store_->get_visible_agents(username)) {
+            visible_set.reserve(visible_ids->size());
+            for (auto& v : *visible_ids) visible_set.insert(std::move(v));
+        }
     }
 
-    // Pull every response stored for the scan command_id.
+    // Pull every response stored for the scan command_id. #2691 (Doomgoose
+    // finding #7): still degrades to empty for the row-building logic below
+    // (ADR-0039 deny-or-benign), but `store_degraded` is threaded to the
+    // empty-state render so "store couldn't be read" doesn't get reported as
+    // "every collector is running normally" — the operator-facing claim this
+    // view exists to make.
     ResponseQuery q;
     q.limit = 10000;
-    auto responses = response_store_->query(scan_id, q);
+    auto responses_opt = response_store_->query(scan_id, q);
+    bool store_degraded = !responses_opt.has_value();
+    auto responses = responses_opt.value_or(std::vector<StoredResponse>{});
 
     // Each response is from one agent. Parse each line for
     //   config|<source>_enabled|<value>
@@ -2267,11 +2493,18 @@ std::string DashboardRoutes::render_tar_retention_paused(
     html += "</div>";
 
     if (rows.empty()) {
-        // Distinguish "scan still in progress" from "scan complete and clean."
-        // Without this branch the empty-state always nudges Refresh, which is
-        // factually wrong once every agent has answered (Gate 4 happy-path
-        // SHOULD-1).
-        if (agents_responded < scan_count) {
+        // Distinguish "scan still in progress" from "scan complete and clean"
+        // from "the store couldn't be read" — conflating the last with either
+        // of the first two tells the operator every collector is fine (or
+        // just slow) when the truth is the read failed.
+        if (store_degraded) {
+            html += "<div class=\"empty-state result-degrade-banner\">"
+                    "<b>Retention state unavailable.</b> The response store "
+                    "could not be read (Postgres pool/query degraded). This is "
+                    "<b>not</b> confirmation every collector is running — "
+                    "retry shortly."
+                    "</div>";
+        } else if (agents_responded < scan_count) {
             html += "<div class=\"empty-state\">"
                     "<strong>No paused sources detected yet.</strong> The "
                     "scan is still in progress — click "

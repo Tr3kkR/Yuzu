@@ -280,7 +280,8 @@ public:
     // agents not in the live registry) drop silently.
     //
     // Returns std::nullopt (ADR-0036 + 2026-07-26 B2 fail-closed contract,
-    // widened per governance H1 2026-07-29) in THREE cases, all load-bearing:
+    // widened per governance H1 2026-07-29, and again per ADR-0045) in FIVE
+    // cases, all load-bearing:
     //   1. The from_result_set: membership preload hits a Postgres error
     //      mid-scan — NEVER a partial/degraded membership map.
     //   2. The expression references a from_result_set: atom but `principal`
@@ -292,14 +293,21 @@ public:
     //      (Previously this case silently evaluated the atom false; under a
     //      NOT combinator that inverted to a fleet-wide match — for a
     //      Guardian rule arming an enforcing guard, a fleet-wide arm.)
-    // All three are the same fail-open shape: under a NOT combinator, an atom
+    //   4. The expression references a props.<key> atom but `props_store`
+    //      is null (ADR-0045) — same "cannot resolve at all here" shape as
+    //      case 3.
+    //   5. The expression references a props.<key> atom and the bulk
+    //      get_values_for_keys preload hits a Postgres error (ADR-0045) —
+    //      same shape as case 1, for CustomPropertiesStore instead of
+    //      ResultSetStore.
+    // All five are the same fail-open shape: under a NOT combinator, an atom
     // that resolves "no match" silently INVERTS to "matches every agent" — a
     // fleet-wide dispatch/arm, not a theoretical hardening gap. Every caller
     // that dispatches/enforces/targets on this result MUST treat nullopt as
     // "abort — do not proceed" (dispatch paths) or "match nothing" (push
     // paths, where arming nothing is the safe direction). NARROW: a scope
-    // with NO from_result_set: atom is completely unaffected — value_or({})
-    // is safe there.
+    // with NEITHER a from_result_set: NOR a props.<key> atom is completely
+    // unaffected — value_or({}) is safe there.
     std::optional<std::vector<std::string>>
     evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
                    const CustomPropertiesStore* props_store = nullptr,

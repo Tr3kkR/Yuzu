@@ -1,6 +1,9 @@
 #include "discovery_routes.hpp"
 
+#include "http_route_sink.hpp"
+
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <chrono>
@@ -9,7 +12,39 @@
 
 namespace yuzu::server {
 
+namespace {
+
+// DeploymentStore error classifier — mirrors rest_api_v1.cpp's
+// access_review_error_status (AccessReviewStore's `"not_found: "` idiom),
+// inverted: here the MAJORITY of a route's `unexpected` values are
+// caller-input validation or not-found/wrong-state business errors (400/404
+// territory), so DeploymentStore prefixes the MINORITY — genuine DB/lease
+// failures — with `kDeploymentDbErrorPrefix` rather than the other way
+// around. Any error NOT carrying that prefix is a 400 here (adversarial-
+// review MEDIUM hardening round, 2026-08-12 — the write routes previously
+// collapsed every failure, including genuine outages, to 400). Keys off the
+// SHARED constant (deployment_store.hpp), never a local copy of the literal
+// — a future rename of the prefix in the store must not silently regress
+// every classified 503 back to 400 (gov F3).
+bool is_deployment_db_error(const std::string& err) {
+    return err.starts_with(kDeploymentDbErrorPrefix);
+}
+
+} // namespace
+
 void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
+                                      AuditFn audit_fn, DirectorySync* directory_sync,
+                                      PatchManager* patch_manager,
+                                      DeploymentStore* deployment_store,
+                                      DiscoveryStore* discovery_store) {
+    // Production adapter: wrap the httplib server in the route-sink seam and
+    // delegate to the testable overload (mirrors DexRoutes/GuardianRoutes).
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    directory_sync, patch_manager, deployment_store, discovery_store);
+}
+
+void DiscoveryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                       AuditFn audit_fn, DirectorySync* directory_sync,
                                       PatchManager* patch_manager,
                                       DeploymentStore* deployment_store,
@@ -17,7 +52,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
     // ── Directory Sync API (Phase 7: AD/Entra integration) ──────────────
 
     // POST /api/directory/sync — trigger directory sync
-    svr.Post("/api/directory/sync",
+    sink.Post("/api/directory/sync",
              [auth_fn, perm_fn, audit_fn, directory_sync](const httplib::Request& req,
                                                            httplib::Response& res) {
                  if (!perm_fn(req, res, "Directory", "Write"))
@@ -104,7 +139,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
              });
 
     // GET /api/directory/users — list synced users
-    svr.Get("/api/directory/users",
+    sink.Get("/api/directory/users",
             [perm_fn, directory_sync](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Directory", "Read"))
                     return;
@@ -141,7 +176,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
             });
 
     // GET /api/directory/status — sync status
-    svr.Get("/api/directory/status",
+    sink.Get("/api/directory/status",
             [perm_fn, directory_sync](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Directory", "Read"))
                     return;
@@ -178,7 +213,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
             });
 
     // PUT /api/directory/group-mappings — configure group-to-role mappings
-    svr.Put("/api/directory/group-mappings",
+    sink.Put("/api/directory/group-mappings",
             [auth_fn, perm_fn, audit_fn, directory_sync](const httplib::Request& req,
                                                           httplib::Response& res) {
                 if (!perm_fn(req, res, "Directory", "Write"))
@@ -243,7 +278,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
     // ── Patch Management API (Phase 7: Patch Deployment Workflow) ────────
 
     // GET /api/patches — list patches across fleet
-    svr.Get("/api/patches",
+    sink.Get("/api/patches",
             [perm_fn, patch_manager](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Patch", "Read"))
                     return;
@@ -299,7 +334,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
             });
 
     // POST /api/patches/deploy — deploy a patch to agents
-    svr.Post("/api/patches/deploy",
+    sink.Post("/api/patches/deploy",
              [auth_fn, perm_fn, audit_fn, patch_manager](const httplib::Request& req,
                                                           httplib::Response& res) {
                  if (!perm_fn(req, res, "Patch", "Write"))
@@ -392,7 +427,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
              });
 
     // GET /api/patches/deployments/:id — deployment status
-    svr.Get(R"(/api/patches/deployments/([a-f0-9]+))",
+    sink.Get(R"(/api/patches/deployments/([a-f0-9]+))",
             [perm_fn, patch_manager](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Patch", "Read"))
                     return;
@@ -442,7 +477,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
             });
 
     // GET /api/patches/deployments — list all deployments
-    svr.Get("/api/patches/deployments",
+    sink.Get("/api/patches/deployments",
             [perm_fn, patch_manager](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Patch", "Read"))
                     return;
@@ -484,7 +519,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
             });
 
     // POST /api/patches/deployments/:id/cancel — cancel a deployment
-    svr.Post(R"(/api/patches/deployments/([a-f0-9]+)/cancel)",
+    sink.Post(R"(/api/patches/deployments/([a-f0-9]+)/cancel)",
              [perm_fn, audit_fn, patch_manager](const httplib::Request& req,
                                                  httplib::Response& res) {
                  if (!perm_fn(req, res, "Patch", "Write"))
@@ -516,7 +551,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
     // ── Deployment Jobs API (Issue 7.7) ─────────────────────────────────
 
     // GET /api/deployment-jobs — list all deployment jobs
-    svr.Get("/api/deployment-jobs",
+    sink.Get("/api/deployment-jobs",
             [perm_fn, deployment_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
@@ -528,8 +563,16 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                     return;
                 }
                 auto jobs = deployment_store->list_jobs();
+                if (!jobs) {
+                    spdlog::error("GET /api/deployment-jobs: {}", jobs.error());
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& j : jobs) {
+                for (const auto& j : *jobs) {
                     arr.push_back({{"id", j.id},
                                    {"target_host", j.target_host},
                                    {"os", j.os},
@@ -545,7 +588,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
             });
 
     // POST /api/deployment-jobs — create a new deployment job
-    svr.Post("/api/deployment-jobs",
+    sink.Post("/api/deployment-jobs",
              [auth_fn, perm_fn, audit_fn, deployment_store](const httplib::Request& req,
                                                              httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Write"))
@@ -568,6 +611,14 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                  auto method = body.value("method", "manual");
                  auto result = deployment_store->create_job(target, os, method);
                  if (!result) {
+                     if (is_deployment_db_error(result.error())) {
+                         spdlog::error("POST /api/deployment-jobs: {}", result.error());
+                         res.status = 503;
+                         res.set_content(
+                             R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                             "application/json");
+                         return;
+                     }
                      res.status = 400;
                      res.set_content(
                          nlohmann::json({{"error", result.error()}}).dump(),
@@ -602,7 +653,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
              });
 
     // GET /api/deployment-jobs/:id — get job status
-    svr.Get(R"(/api/deployment-jobs/([a-f0-9]+))",
+    sink.Get(R"(/api/deployment-jobs/([a-f0-9]+))",
             [perm_fn, deployment_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
@@ -616,26 +667,34 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                 auto id = req.matches[1].str();
                 auto job = deployment_store->get_job(id);
                 if (!job) {
+                    spdlog::error("GET /api/deployment-jobs/{}: {}", id, job.error());
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
+                if (!*job) {
                     res.status = 404;
                     res.set_content(R"({"error":"job not found"})", "application/json");
                     return;
                 }
                 res.set_content(
-                    nlohmann::json({{"id", job->id},
-                                    {"target_host", job->target_host},
-                                    {"os", job->os},
-                                    {"method", job->method},
-                                    {"status", job->status},
-                                    {"created_at", job->created_at},
-                                    {"started_at", job->started_at},
-                                    {"completed_at", job->completed_at},
-                                    {"error", job->error}})
+                    nlohmann::json({{"id", (*job)->id},
+                                    {"target_host", (*job)->target_host},
+                                    {"os", (*job)->os},
+                                    {"method", (*job)->method},
+                                    {"status", (*job)->status},
+                                    {"created_at", (*job)->created_at},
+                                    {"started_at", (*job)->started_at},
+                                    {"completed_at", (*job)->completed_at},
+                                    {"error", (*job)->error}})
                         .dump(),
                     "application/json");
             });
 
     // DELETE /api/deployment-jobs/:id — cancel a pending/running job
-    svr.Delete(R"(/api/deployment-jobs/([a-f0-9]+))",
+    sink.Delete(R"(/api/deployment-jobs/([a-f0-9]+))",
                [perm_fn, audit_fn, deployment_store](const httplib::Request& req,
                                                       httplib::Response& res) {
                    if (!perm_fn(req, res, "Infrastructure", "Write"))
@@ -650,6 +709,14 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                    auto id = req.matches[1].str();
                    auto result = deployment_store->cancel_job(id);
                    if (!result) {
+                       if (is_deployment_db_error(result.error())) {
+                           spdlog::error("DELETE /api/deployment-jobs/{}: {}", id, result.error());
+                           res.status = 503;
+                           res.set_content(
+                               R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
+                               "application/json");
+                           return;
+                       }
                        res.status = 400;
                        res.set_content(
                            nlohmann::json({{"error", result.error()}}).dump(),
@@ -663,12 +730,12 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
     // ── Discovery API (Issue 7.18) ──────────────────────────────────────
 
     // POST /api/discovery/scan — store discovery scan results from agents
-    svr.Post("/api/discovery/scan",
+    sink.Post("/api/discovery/scan",
              [perm_fn, audit_fn, discovery_store](const httplib::Request& req,
                                                    httplib::Response& res) {
                  if (!perm_fn(req, res, "Infrastructure", "Write"))
                      return;
-                 if (!discovery_store) {
+                 if (!discovery_store || !discovery_store->is_open()) {
                      res.status = 503;
                      res.set_content(
                          R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
@@ -685,6 +752,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                  auto subnet = body.value("subnet", "");
                  auto discovered_by = body.value("discovered_by", "");
                  int upserted = 0;
+                 int failed = 0;
 
                  if (body.contains("devices") && body["devices"].is_array()) {
                      for (const auto& dev : body["devices"]) {
@@ -698,27 +766,62 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                              auto r = discovery_store->upsert_device(d);
                              if (r)
                                  ++upserted;
+                             else
+                                 ++failed;
                          }
                      }
                  }
 
-                 audit_fn(req, "discovery.scan", "success", "Discovery", subnet,
-                          std::to_string(upserted) + " devices");
+                 // gov fjarvis BLOCKING (PR #3064 re-review): a dropped
+                 // upsert_device failure used to be invisible — the loop had
+                 // no else branch, the audit row unconditionally said
+                 // "success", and the response unconditionally said
+                 // "status":"ok". Under the pre-migration SQLite store this
+                 // was a rare local-disk error; under the shared Postgres
+                 // pool it also fires on an ordinary acquire-timeout under
+                 // load, so the trigger rate rose materially with this PR.
+                 // Discovery inventory feeds rogue/unmanaged-device
+                 // detection, so a scan that silently stored nothing must
+                 // never be indistinguishable from one that stored
+                 // everything. Mirrors the GET route's authoritative-store
+                 // posture (ADR-0012 §1) and the established "partial" audit
+                 // outcome this codebase already uses for the identical
+                 // some-succeeded-some-failed shape (api_token.rotate,
+                 // session.revoke_all, user.delete, sle.agent.decommission,
+                 // scim identity-link resolution) — not
+                 // BundleOrchestrator::dispatch's ok/no_agents/partial set,
+                 // which is a Prometheus metric label, not an audit outcome.
+                 const bool any_failed = failed > 0;
+                 const bool total_failure = any_failed && upserted == 0;
+                 const char* audit_outcome =
+                     !any_failed ? "success" : (upserted > 0 ? "partial" : "failure");
+                 audit_fn(req, "discovery.scan", audit_outcome, "Discovery", subnet,
+                          std::to_string(upserted) + "/" + std::to_string(upserted + failed) +
+                              " devices stored");
+
+                 if (total_failure) {
+                     res.status = 503;
+                     res.set_content(
+                         R"({"error":{"code":503,"message":"discovery scan storage degraded"},"meta":{"api_version":"v1"}})",
+                         "application/json");
+                     return;
+                 }
 
                  res.status = 200;
                  res.set_content(
-                     nlohmann::json({{"status", "ok"},
-                                     {"devices_stored", upserted}})
+                     nlohmann::json({{"status", any_failed ? "partial" : "ok"},
+                                     {"devices_stored", upserted},
+                                     {"devices_failed", failed}})
                          .dump(),
                      "application/json");
              });
 
     // GET /api/discovery/results — list discovered devices
-    svr.Get("/api/discovery/results",
+    sink.Get("/api/discovery/results",
             [perm_fn, discovery_store](const httplib::Request& req, httplib::Response& res) {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                if (!discovery_store) {
+                if (!discovery_store || !discovery_store->is_open()) {
                     res.status = 503;
                     res.set_content(
                         R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
@@ -727,8 +830,17 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                 }
                 auto subnet = req.get_param_value("subnet");
                 auto devices = discovery_store->list_devices(subnet);
+                if (!devices) {
+                    // Authoritative store (ADR-0012 §1): a query/pool failure
+                    // must surface, never render as an empty fleet.
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"discovery read degraded"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& d : devices) {
+                for (const auto& d : *devices) {
                     arr.push_back({{"id", d.id},
                                    {"ip_address", d.ip_address},
                                    {"mac_address", d.mac_address},
@@ -742,7 +854,7 @@ void DiscoveryRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                 }
                 res.set_content(
                     nlohmann::json({{"devices", arr},
-                                    {"total", static_cast<int64_t>(devices.size())}})
+                                    {"total", static_cast<int64_t>(devices->size())}})
                         .dump(),
                     "application/json");
             });

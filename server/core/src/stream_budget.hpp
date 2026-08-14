@@ -17,6 +17,7 @@
 /// with) — small enough that a separate TU adds no value, and directly
 /// unit-testable.
 
+#include <atomic>
 #include <cstddef>
 #include <mutex>
 #include <string>
@@ -31,9 +32,10 @@ namespace yuzu::server::detail {
 /// execution plan Decision 15(h); chaos CH-6).
 ///
 /// This is a real reserve, not an aspiration: EVERY surface that holds a response open
-/// leases from the one budget below — MCP's GET channel, `GET /api/v1/events`, the
-/// dashboard executions drawer, and the legacy `/events` stream. A surface that held a
-/// worker without a lease would make the arithmetic here a fiction.
+/// leases from the one budget below — MCP's GET channel, MCP streamed POST, `GET
+/// /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream.
+/// A surface that held a worker without a lease would make the arithmetic here a
+/// fiction.
 inline constexpr std::size_t kPlainRestReserveDefault = 8;
 
 /// Workers a single permitted stream can pin at once. A stream is normally one provider on
@@ -94,9 +96,10 @@ inline constexpr std::size_t kMaxHttpWorkerThreads = 2048;
 /// `kPlainRestReserveDefault` — so `derive_stream_budget(8, 8, N)` computed `(8-8)/2 == 0`
 /// and the floor sat inside its own dead zone: any `--http-worker-threads` in [1,9] clamped
 /// the budget to 0, and a 0 cap rejects unconditionally (`total_ >= global_cap` is
-/// `0 >= 0`). That silently 429'd EVERY streaming surface server-wide — MCP GET,
-/// /api/v1/events, the dashboard drawer and legacy /events — from behind a knob that reads
-/// like a tuning parameter, which is the exact failure this constant exists to prevent.
+/// `0 >= 0`). That silently 429'd EVERY streaming surface server-wide as they stood at
+/// the time — MCP GET, /api/v1/events, the dashboard drawer and legacy /events — from
+/// behind a knob that reads like a tuning parameter, which is the exact failure this
+/// constant exists to prevent.
 inline constexpr std::size_t kMinHttpWorkerThreads =
     derive_worker_pool(1, kPlainRestReserveDefault);
 
@@ -331,8 +334,41 @@ public:
 
     Config config() const { return cfg_; }
 
+    /// #2703 Gate 7 merge-slice item 2: server shutdown's close-signal for
+    /// every held-open stream that shares this budget. Every SSE content
+    /// provider on the simpler surfaces (`/events`, `/api/v1/events`, the
+    /// dashboard executions drawer) already re-checks its wait predicate at
+    /// least every 3s (the keep-alive tick) — adding this to that SAME
+    /// predicate closes an idle stream within one tick, with no new
+    /// cv-plumbing. NOT wired into the MCP GET/streamed-POST surfaces
+    /// (`McpStreamPump`'s teardown is driven by `session_alive_`/session-
+    /// registry revalidation, a materially different mechanism) — an open
+    /// MCP stream still relies on the bounded web-thread join + escalation
+    /// in `ServerImpl::stop()` as its backstop. Tracked as a named follow-up
+    /// (#2371 comment, 2026-08-11), not silently left uncovered.
+    void begin_closing() { closing_.store(true, std::memory_order_release); }
+    bool closing() const { return closing_.load(std::memory_order_acquire); }
+
 private:
-    void release_slot(const Key& key) {
+    /// CONTAINED AT THE SOURCE, and it has to be here rather than at any call site:
+    /// this is reached from ~Lease -> an httplib content-provider releaser ->
+    /// ~Response, and a destructor is implicitly noexcept, so a throwing lock_guard
+    /// would std::terminate INSIDE the destructor, before unwinding could reach any
+    /// caller's try/catch. A guard at the call site is decorative (#2037 class).
+    /// `PrincipalQuota::release` states the same reasoning for the same shape, and
+    /// `sse_resource_release`'s header comment already ASSERTED this function
+    /// behaved this way - it did not until now.
+    ///
+    /// Leaking one slot beats aborting the process, and a mutex that cannot be
+    /// locked means the accounting is already unreliable.
+    void release_slot(const Key& key) noexcept {
+        try {
+            release_slot_locked(key);
+        } catch (...) { // NOLINT(bugprone-empty-catch)
+        }
+    }
+
+    void release_slot_locked(const Key& key) {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = per_principal_.find(key);
         if (it == per_principal_.end()) {
@@ -352,6 +388,7 @@ private:
     Config cfg_;
     std::size_t total_ = 0;
     std::unordered_map<Key, std::size_t, KeyHash> per_principal_;
+    std::atomic<bool> closing_{false};
 };
 
 }  // namespace yuzu::server::detail

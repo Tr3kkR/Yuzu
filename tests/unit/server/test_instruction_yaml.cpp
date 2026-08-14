@@ -13,6 +13,7 @@
  */
 
 #include "instruction_yaml.hpp"
+#include "reserved_definition_id.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -282,6 +283,19 @@ TEST_CASE("instruction_yaml: explicit metadata.id charset/length gate matches Sa
     SECTION("a 128-byte id and canonical dotted ids validate") {
         CHECK(validate_definition_yaml(with_id(std::string(128, 'a'))).empty());
         CHECK(validate_definition_yaml(with_id("system.os.info-1_beta")).empty());
+    }
+    SECTION("the reserved mcp. namespace is rejected here too") {
+        // #2442 added a THIRD rule the store applies to an explicit id. The
+        // first cut of it landed only in the store, which broke the same
+        // validate-implies-save contract for the third time (#1993, #2010,
+        // then this) — hence the shared predicate both sides now call.
+        auto errors = validate_definition_yaml(with_id("mcp.quarantine_device"));
+        REQUIRE(errors.size() == 1);
+        CHECK(errors[0] == std::string(yuzu::server::kReservedDefinitionIdError));
+    }
+    SECTION("only the exact prefix is reserved") {
+        CHECK(validate_definition_yaml(with_id("mcpx.thing")).empty());
+        CHECK(validate_definition_yaml(with_id("a.mcp.thing")).empty());
     }
 }
 

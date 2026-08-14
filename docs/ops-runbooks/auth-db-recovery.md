@@ -315,14 +315,29 @@ sudo -u _yuzu yuzu-server \
 ```
 
 - `--postgres-dsn` is **required** — without it the one-shot exits non-zero
-  with "requires the Postgres auth store". `--data-dir` no longer governs the
-  *auth* store.
-- `--data-dir` is still required for the **audit** store: the mandatory audit
-  row is written to `<data-dir>/audit.db`. Pass the same directory the running
-  service uses. If you omit it the path resolves relative to your current
-  working directory and SQLite silently *creates* a fresh `./audit.db` — the
-  command still prints `{"status":"ok"}`, but the evidence row is orphaned
-  outside the real audit trail (SOC 2 CC6.6).
+  with "requires the Postgres auth store". The mandatory audit row is written
+  through the SAME `--postgres-dsn` (ADR-0040: audit is Postgres-backed,
+  schema `audit_store`) — there is no `<data-dir>/audit.db` write path
+  anymore. Point `--postgres-dsn` at the real production database or the row
+  lands somewhere nobody is looking (SOC 2 CC6.6), same risk as before, wrong
+  flag.
+- `--data-dir` is still required, but for a narrower reason than it used to
+  be: it is where this one-shot looks for a **legacy** `audit.db` to migrate
+  from (`<data-dir>/audit.db`), not where it writes to. Pass the same
+  directory the running service uses so the one-shot sees the same legacy
+  file (or its absence) that a real boot would.
+- **One-shot lockout on a never-booted host.** This command refuses — it does
+  NOT silently skip the check — if the mandatory legacy backfill has not
+  completed on `--postgres-dsn` yet (no `backfill_complete` marker in
+  `audit_store.audit_retention_meta`). A one-shot is deliberately not trusted
+  to declare "no legacy trail exists" on its own (ADR-0040: only a server
+  boot may do that), so on a database that has never seen a successful server
+  boot, `--mfa-reset` and `--break-glass-arm` both fail with "refusing to
+  declare the backfill complete from this entry point... Start the server
+  once, then retry." That IS the remediation: start `yuzu-server` normally
+  once (it completes the backfill — real migration or fresh-install stamp —
+  on its own boot path, which this one-shot deliberately cannot do), stop it,
+  then re-run the one-shot command.
 - `--ca-dir` is required whenever the KEK is not in the platform default
   location, because the command builds the full auth stack (pool → key
   provider → codec → AuthDB) exactly as the server does.
@@ -408,9 +423,11 @@ arming nothing.
 
 Arming is fail-closed on audit: the store is checked writable *before* the
 mutate, and if the row fails to persist afterwards the arm is rolled back
-(the account ends up NOT armed). That makes the `--data-dir` note above load-
-bearing here too — point it at the real audit store, or you will arm the glass
-and record it somewhere nobody is looking.
+(the account ends up NOT armed). That makes the `--postgres-dsn` note above
+load-bearing here too — point it at the real production database, or you
+will arm the glass and record it somewhere nobody is looking. The one-shot
+lockout note above applies here identically: `--break-glass-arm` refuses on
+a never-booted host the same way `--mfa-reset` does, for the same reason.
 
 Same flag requirements and the same threat model as `--mfa-reset` above. The
 arm is audited at `kCritical` as `auth.breakglass.armed`, attributed to the OS

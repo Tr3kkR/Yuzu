@@ -19,10 +19,26 @@
  *
  * `McpTestServer` in test_mcp_server.cpp dispatches the MCP handler in-process
  * with a hand-built `httplib::Request` and never constructs an
- * `httplib::Server`, so none of the above is observable there. This fixture
- * replicates the production wiring (the same `mcp_body_exceeds_cap` call the
- * pre-routing lambda in server.cpp makes) against a real server; the one line
- * that installs it in `ServerImpl` remains review-only.
+ * `httplib::Server`, so none of the above is observable there.
+ *
+ * CORRECTED CLAIM (#2407 R5, 2026-08-07): this fixture's `mcp_body_exceeds_cap`
+ * / `mcp_body_unmeasurable` call below is NOT "the same call the pre-routing
+ * lambda in server.cpp makes" — it never was after the #2407 unification, and
+ * a comment here claiming otherwise is exactly the kind of unverified parity
+ * claim that let the R1 CRITICAL bypass ship. Production's pre-routing
+ * handler resolves through `resolve_body_cap` + `body_unmeasurable` +
+ * `has_non_identity_content_encoding` (server.cpp), NOT these two functions —
+ * they are PRODUCTION-DEAD (no call site outside tests). They are kept, and
+ * this fixture still uses them, for two reasons unrelated to production
+ * parity: (1) `test_web_utils.cpp` pins their own pure-function behaviour
+ * independently, and (2) THIS fixture still proves items 1-3 above — the
+ * wire-level, httplib-specific properties (body never read off the socket,
+ * sibling surfaces uncapped) — against a REAL `httplib::Server`, which no
+ * pure-function test can reach, using these two functions purely as a
+ * stand-in decision to drive that wire behaviour. Whether to delete them is
+ * an open question this file's owner cannot resolve alone: doing so would
+ * also require removing `test_web_utils.cpp`'s coverage of them, which is
+ * outside this file's scope — left as a follow-up rather than done here.
  *
  * SKIPPED UNDER ThreadSanitizer (#438), for the same reason as the
  * test_security_headers.cpp integration block: this deliberately exercises
@@ -87,10 +103,17 @@ struct BodyCapTestServer {
             other_handler_calls.fetch_add(1);
             res.set_content(R"({"ok":true})", "application/json");
         });
-        // Mirrors the production branch's REFUSAL DECISION (both arms).
-        // Production additionally emits the metric, the throttled warn and the
-        // whole-branch try/catch, and distinguishes 411 from 413; none of that
-        // is replicated here, so this fixture proves the decision reaches the
+        // A STAND-IN refusal decision using two now-production-dead pure
+        // functions (see this file's header comment, #2407 R5) — NOT the
+        // production branch's actual expression, which resolves through
+        // `resolve_body_cap`/`body_unmeasurable`/`has_non_identity_content_
+        // encoding` in server.cpp instead. Effectively equivalent in
+        // OUTCOME for this fixture's cases (refuse an over-cap or
+        // unmeasurable /mcp/ body), which is all items 1-3 above need; not
+        // a claim of implementation identity. Production additionally
+        // emits the metric, the throttled warn and the whole-branch
+        // try/catch, and distinguishes 411 from 413/415; none of that is
+        // replicated here, so this fixture proves the decision reaches the
         // wire, not the response taxonomy.
         svr.set_pre_routing_handler([](const httplib::Request& req, httplib::Response& res)
                                         -> httplib::Server::HandlerResponse {

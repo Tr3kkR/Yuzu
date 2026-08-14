@@ -16,11 +16,13 @@
  */
 
 #include "auth_routes.hpp"
+#include "saml_principal.hpp"
 #include "saml_provider.hpp"
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
 #include <yuzu/metrics.hpp>
@@ -37,7 +39,9 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 
 // ── Signing fixture headers (success-path test only, non-Windows) ─────────────
@@ -69,6 +73,15 @@ using namespace yuzu::server::saml;
 
 namespace {
 
+// AuditStore migrated to Postgres (ADR-0006) — the fixture below clones this
+// pre-migrated template instead of opening a SQLite path.
+yuzu::test::PgTestTemplate saml_audit_tpl{"samlaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("samlaudit template: store failed to migrate");
+}};
+
 /// Fixture — stores + AuthRoutes wired against an in-process TestRouteSink.
 /// Accepts an optional (non-owning) SamlProvider pointer so tests can supply
 /// a pre-configured provider without transferring ownership.
@@ -82,6 +95,13 @@ struct SamlRoutesFixture {
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
     // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
     // below — embedding the PG fixture only made every case skip without a DSN.
+    // AuditStore ported to Postgres (ADR-0006): a template-cloned ephemeral
+    // database + pool. This fixture has no other PG-backed member, so it
+    // self-skips explicitly (mirrors yuzu::test::AuthDbPg's own posture) —
+    // SKIPs the enclosing TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset,
+    // FAILs when set but broken.
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool>   audit_pool;
     std::unique_ptr<AuditStore>             audit_store;
     std::unique_ptr<AnalyticsEventStore>    analytics;
     std::shared_mutex                       oidc_mu;
@@ -95,7 +115,15 @@ struct SamlRoutesFixture {
         // fixture's comma-operator trick, but explicit is clearer here).
         fs::create_directories(tmp.path);
         auth_mgr.set_metrics_registry(&metrics);
-        audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
+
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        audit_db.emplace(saml_audit_tpl);
+        INFO("[SamlRoutesFixture] audit db status (blank == ok): " << audit_db->error());
+        REQUIRE(audit_db->available());
+        audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
+        audit_store = std::make_unique<AuditStore>(*audit_pool);
         analytics   = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
         REQUIRE(audit_store->is_open());
         REQUIRE(analytics->is_open());
@@ -117,7 +145,9 @@ struct SamlRoutesFixture {
     std::vector<AuditEvent> audit_events(std::size_t limit = 10) const {
         AuditQuery q;
         q.limit = static_cast<int>(limit);
-        return audit_store->query(q);
+        auto rows = audit_store->query(q);
+        REQUIRE(rows.has_value());
+        return *rows;
     }
 
     /// Read a metric counter value. The label set must match the production
@@ -589,6 +619,16 @@ static std::string extract_authn_request_id(const std::string& url) {
 static std::string run_saml_acs_flow(SamlRoutesFixture& fix, const SamlTestFixture& f,
                                      const std::string& name_id,
                                      const std::vector<std::string>& groups) {
+    // ADR-2001 PR4a — the ACS handler reads cfg_.saml_idp_entity_id (a
+    // SEPARATE field from the SamlProvider's own SamlConfig::idp_entity_id,
+    // which `f.make_config()` sets) to build the stable SAML principal and
+    // gate its sanitation; production wires the same value into both (see
+    // server.cpp's saml_cfg.idp_entity_id = cfg_.saml_idp_entity_id), so
+    // tests must keep them in sync here too — an unset cfg.saml_idp_entity_id
+    // (empty by default) would fail the sanitation gate and every login below
+    // would 302 to /login?error=saml instead of minting a session.
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id;
+
     auto start_res = fix.sink.Get("/auth/saml/start");
     if (!start_res || start_res->status != 302) return {};
     const auto redirect_location = start_res->get_header_value("Location");
@@ -683,7 +723,7 @@ TEST_CASE("extract_form_value — key absent returns empty", "[saml][auth_routes
 // GET /auth/saml/start — provider not configured (null pointer)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML start — returns 404 when provider is null", "[saml][auth_routes]") {
+TEST_CASE("SAML start — returns 404 when provider is null", "[pg][saml][auth_routes]") {
     SamlRoutesFixture fix; // saml_provider defaults to nullptr
     auto res = fix.sink.Get("/auth/saml/start");
     REQUIRE(res != nullptr);
@@ -710,7 +750,7 @@ TEST_CASE("SAML start — returns 404 when provider is null", "[saml][auth_route
 // POST /saml/acs — provider not configured
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — returns 404 when provider is null", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — returns 404 when provider is null", "[pg][saml][auth_routes]") {
     SamlRoutesFixture fix;
     auto res = fix.sink.Post("/saml/acs",
                              "SAMLResponse=garbage&RelayState=%2Fdashboard",
@@ -742,7 +782,7 @@ TEST_CASE("SAML ACS — returns 404 when provider is null", "[saml][auth_routes]
 // Platform-independent: the empty-field check runs before validate_response.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — missing SAMLResponse redirects to login error", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — missing SAMLResponse redirects to login error", "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     // On Windows the provider stub makes is_enabled()=false, so the route 404s
     // before the field-check. Skip the redirect assertion on Windows.
@@ -783,7 +823,7 @@ TEST_CASE("SAML ACS — missing SAMLResponse redirects to login error", "[saml][
 // POST /saml/acs — malformed SAMLResponse (validate_response returns error)
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — malformed SAMLResponse redirects to login error", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — malformed SAMLResponse redirects to login error", "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -820,7 +860,7 @@ TEST_CASE("SAML ACS — malformed SAMLResponse redirects to login error", "[saml
 // GET /auth/saml/start — provider enabled → redirects to IdP
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML start — redirects when provider is enabled", "[saml][auth_routes]") {
+TEST_CASE("SAML start — redirects when provider is enabled", "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -851,7 +891,7 @@ TEST_CASE("SAML start — redirects when provider is enabled", "[saml][auth_rout
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — RelayState open-redirect: absolute URL falls back to /",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -909,7 +949,7 @@ TEST_CASE("SAML ACS — RelayState open-redirect: absolute URL falls back to /",
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_source=saml",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -923,6 +963,9 @@ TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_sour
 
     // provider must outlive fix (SamlRoutesFixture holds a non-owning pointer).
     SamlRoutesFixture fix(&provider);
+    // ADR-2001 PR4a — see run_saml_acs_flow's comment: keep in sync with
+    // the SamlProvider's own idp_entity_id (f.make_config() above).
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id;
 
     // ── Step 1: GET /auth/saml/start to register a solicited request ID ──────
     // validate_response rejects unsolicited responses: InResponseTo must match
@@ -1038,7 +1081,11 @@ TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_sour
     const auto& sess = maybe_session.value();
     CHECK(sess.auth_source == "saml");
     CHECK(sess.role == auth::Role::user);
-    CHECK(sess.username == name_id);
+    // ADR-2001 PR4a — the session's stable authorization principal is
+    // saml:<entity_id>#<name_id>, NOT the raw NameID; display_name stays
+    // the raw NameID for human-readable rendering.
+    CHECK(sess.username == saml::saml_principal_id(f.idp_entity_id, name_id));
+    CHECK(sess.display_name == name_id);
 
     // ── Step 8: Verify the audit record ───────────────────────────────────────
     // audit_log_for_principal is called on success with action="auth.saml_login"
@@ -1058,8 +1105,184 @@ TEST_CASE("SAML ACS — valid signed SAMLResponse creates session with auth_sour
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// ADR-2001 PR4a — NameID sanitation gate, WIRED at the ACS handler
+// (quality-engineer MEDIUM: is_valid_saml_component's own unit tests
+// (test_saml_principal.cpp) only exercise the pure function — this pins
+// that the ACS handler actually calls it and fails closed on the wire).
+//
+// Mirrors run_saml_acs_flow's own start -> binding-cookie -> build-response
+// -> dispatch sequence (same fixture, same InResponseTo/binding-cookie
+// dance) but keeps the httplib::Response so the redirect target, the
+// audit row, and the metric can all be asserted directly — run_saml_acs_flow
+// deliberately returns only the session token (or "") for its five simpler
+// callers below, which is not enough to assert the specific failure shape
+// this test needs.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("SAML ACS — a NameID exceeding 255 bytes fails the sanitation gate: redirects to "
+          "/login?error=saml, records auth.saml_login_failed, and mints NO session",
+          "[pg][saml][auth_routes][2001]") {
+#if defined(_WIN32)
+    SKIP("SamlProvider always disabled on Windows (N4)");
+#else
+    const auto& f = saml_test_fixture();
+    auto saml_cfg = f.make_config();
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+    SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
+
+    auto start_res = fix.sink.Get("/auth/saml/start");
+    REQUIRE(start_res != nullptr);
+    REQUIRE(start_res->status == 302);
+    const auto redirect_location = start_res->get_header_value("Location");
+    REQUIRE_FALSE(redirect_location.empty());
+
+    std::string binding_secret;
+    {
+        const auto sc = start_res->get_header_value("Set-Cookie");
+        REQUIRE(sc.find("__Host-yuzu_saml_bind=") != std::string::npos);
+        const std::string pfx = "__Host-yuzu_saml_bind=";
+        const auto val_start = sc.find(pfx) + pfx.size();
+        const auto val_end   = sc.find(';', val_start);
+        binding_secret = sc.substr(val_start,
+            val_end == std::string::npos ? std::string::npos : val_end - val_start);
+    }
+    REQUIRE(binding_secret.size() == 64);
+
+    const auto request_id = extract_authn_request_id(redirect_location);
+    REQUIRE_FALSE(request_id.empty());
+
+    // 300 bytes of plain ASCII — well-formed XML text content (so
+    // validate_response accepts it: non-empty, no XSW/signature concerns),
+    // but exceeds is_valid_saml_component's 255-byte cap.
+    const std::string oversized_name_id(300, 'a');
+    REQUIRE(oversized_name_id.size() > 255);
+    const auto response_b64 = f.make_response(request_id, oversized_name_id);
+
+    std::string encoded_response;
+    encoded_response.reserve(response_b64.size() + 16);
+    for (unsigned char c : response_b64) {
+        if (c == '+') {
+            encoded_response += "%2B";
+        } else {
+            encoded_response += static_cast<char>(c);
+        }
+    }
+    const auto form_body = "SAMLResponse=" + encoded_response + "&RelayState=%2F";
+
+    auto acs_res = fix.sink.dispatch(
+        "POST", "/saml/acs", form_body, "application/x-www-form-urlencoded",
+        {{"Cookie", "__Host-yuzu_saml_bind=" + binding_secret}});
+    REQUIRE(acs_res != nullptr);
+
+    // Fail-closed redirect, never a minted session.
+    CHECK(acs_res->status == 302);
+    CHECK(acs_res->get_header_value("Location") == "/login?error=saml");
+    {
+        bool found_session_cookie = false;
+        for (std::size_t i = 0; ; ++i) {
+            const auto sc = acs_res->get_header_value("Set-Cookie", "", i);
+            if (sc.empty()) break;
+            if (sc.find("yuzu_session=") != std::string::npos) found_session_cookie = true;
+        }
+        CHECK_FALSE(found_session_cookie);
+    }
+
+    // Audit row: auth.saml_login_failed, never auth.saml_login.
+    const auto events = fix.audit_events();
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.saml_login_failed");
+    CHECK(events.front().result == "error");
+
+    // Metric: the error-result counter, never the ok-result one.
+    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
+    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "ok"}, {"role", "user"}}) == 0.0);
+#endif
+}
+
+TEST_CASE("SAML ACS — an entity_id containing a control byte fails the sanitation gate the "
+          "same way (redirect + audit.saml_login_failed + no session)",
+          "[pg][saml][auth_routes][2001]") {
+#if defined(_WIN32)
+    SKIP("SamlProvider always disabled on Windows (N4)");
+#else
+    const auto& f = saml_test_fixture();
+    auto saml_cfg = f.make_config();
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+    SamlRoutesFixture fix(&provider);
+    // Deliberately DIVERGE cfg.saml_idp_entity_id from the SamlProvider's
+    // own idp_entity_id (which must still match for Issuer verification to
+    // pass) — a control byte here models an operator-side misconfiguration/
+    // corruption reaching cfg_.saml_idp_entity_id at the ACS handler, which
+    // must reject exactly like a malformed NameID (both flow through the
+    // same is_valid_saml_component gate, auth_routes.cpp).
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id + "\x01";
+
+    auto start_res = fix.sink.Get("/auth/saml/start");
+    REQUIRE(start_res != nullptr);
+    REQUIRE(start_res->status == 302);
+    const auto redirect_location = start_res->get_header_value("Location");
+    REQUIRE_FALSE(redirect_location.empty());
+
+    std::string binding_secret;
+    {
+        const auto sc = start_res->get_header_value("Set-Cookie");
+        REQUIRE(sc.find("__Host-yuzu_saml_bind=") != std::string::npos);
+        const std::string pfx = "__Host-yuzu_saml_bind=";
+        const auto val_start = sc.find(pfx) + pfx.size();
+        const auto val_end   = sc.find(';', val_start);
+        binding_secret = sc.substr(val_start,
+            val_end == std::string::npos ? std::string::npos : val_end - val_start);
+    }
+    REQUIRE(binding_secret.size() == 64);
+
+    const auto request_id = extract_authn_request_id(redirect_location);
+    REQUIRE_FALSE(request_id.empty());
+
+    // A perfectly valid NameID — only entity_id is malformed.
+    const auto response_b64 = f.make_response(request_id, "control_byte_entity@example.test");
+
+    std::string encoded_response;
+    encoded_response.reserve(response_b64.size() + 16);
+    for (unsigned char c : response_b64) {
+        if (c == '+') {
+            encoded_response += "%2B";
+        } else {
+            encoded_response += static_cast<char>(c);
+        }
+    }
+    const auto form_body = "SAMLResponse=" + encoded_response + "&RelayState=%2F";
+
+    auto acs_res = fix.sink.dispatch(
+        "POST", "/saml/acs", form_body, "application/x-www-form-urlencoded",
+        {{"Cookie", "__Host-yuzu_saml_bind=" + binding_secret}});
+    REQUIRE(acs_res != nullptr);
+
+    CHECK(acs_res->status == 302);
+    CHECK(acs_res->get_header_value("Location") == "/login?error=saml");
+    {
+        bool found_session_cookie = false;
+        for (std::size_t i = 0; ; ++i) {
+            const auto sc = acs_res->get_header_value("Set-Cookie", "", i);
+            if (sc.empty()) break;
+            if (sc.find("yuzu_session=") != std::string::npos) found_session_cookie = true;
+        }
+        CHECK_FALSE(found_session_cookie);
+    }
+
+    const auto events = fix.audit_events();
+    REQUIRE_FALSE(events.empty());
+    CHECK(events.front().action == "auth.saml_login_failed");
+    CHECK(events.front().result == "error");
+#endif
+}
+
 TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an admin session",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1072,6 +1295,7 @@ TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an a
 
     SamlRoutesFixture fix(&provider);
     fix.cfg.saml_admin_group = "admins";
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     auto start_res = fix.sink.Get("/auth/saml/start");
     REQUIRE(start_res != nullptr);
@@ -1136,7 +1360,10 @@ TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an a
     auto maybe_session = fix.auth_mgr.validate_session(session_token);
     REQUIRE(maybe_session.has_value());
     CHECK(maybe_session->role == auth::Role::admin);
-    CHECK(maybe_session->username == name_id);
+    // ADR-2001 PR4a — stable principal, not the raw NameID (see the first
+    // success-path test's comment above for the full rationale).
+    CHECK(maybe_session->username == saml::saml_principal_id(f.idp_entity_id, name_id));
+    CHECK(maybe_session->display_name == name_id);
 
     // Audit must reflect the RESOLVED admin role, not a hard-coded "user".
     const auto events = fix.audit_events();
@@ -1153,7 +1380,7 @@ TEST_CASE("SAML ACS — assertion groups containing --saml-admin-group mint an a
 }
 
 TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint a user session",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1166,6 +1393,7 @@ TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint 
 
     SamlRoutesFixture fix(&provider);
     fix.cfg.saml_admin_group = "admins";
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     auto start_res = fix.sink.Get("/auth/saml/start");
     REQUIRE(start_res != nullptr);
@@ -1232,7 +1460,9 @@ TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint 
     auto maybe_session = fix.auth_mgr.validate_session(session_token);
     REQUIRE(maybe_session.has_value());
     CHECK(maybe_session->role == auth::Role::user);
-    CHECK(maybe_session->username == name_id);
+    // ADR-2001 PR4a — stable principal, not the raw NameID.
+    CHECK(maybe_session->username == saml::saml_principal_id(f.idp_entity_id, name_id));
+    CHECK(maybe_session->display_name == name_id);
 
     const auto events = fix.audit_events();
     REQUIRE_FALSE(events.empty());
@@ -1241,7 +1471,7 @@ TEST_CASE("SAML ACS — assertion groups not containing --saml-admin-group mint 
 }
 
 TEST_CASE("SAML ACS — a near-miss group value does not mint admin (qa-S1)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1266,7 +1496,7 @@ TEST_CASE("SAML ACS — a near-miss group value does not mint admin (qa-S1)",
 }
 
 TEST_CASE("SAML ACS — a case-differing group value does not mint admin (qa-S1)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1291,7 +1521,7 @@ TEST_CASE("SAML ACS — a case-differing group value does not mint admin (qa-S1)
 }
 
 TEST_CASE("SAML ACS — an admin-group match beyond the 64-value cap does not mint admin (qa-S2)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1328,7 +1558,7 @@ TEST_CASE("SAML ACS — an admin-group match beyond the 64-value cap does not mi
 
 TEST_CASE("SAML ACS — exactly kMaxGroupValues values does not trip the cap-truncation counter "
           "(#1828.3 boundary)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1356,7 +1586,7 @@ TEST_CASE("SAML ACS — exactly kMaxGroupValues values does not trip the cap-tru
 }
 
 TEST_CASE("SAML ACS — a trailing space in --saml-admin-group still matches after trim (UP-4)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1397,7 +1627,7 @@ TEST_CASE("trim_ascii_whitespace — trims leading/trailing space/tab/CR/LF, "
 
 TEST_CASE("SAML ACS — assertion with no AttributeStatement mints a user session even when "
           "--saml-admin-group is configured",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1412,6 +1642,7 @@ TEST_CASE("SAML ACS — assertion with no AttributeStatement mints a user sessio
 
     SamlRoutesFixture fix(&provider);
     fix.cfg.saml_admin_group = "admins";
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     auto start_res = fix.sink.Get("/auth/saml/start");
     REQUIRE(start_res != nullptr);
@@ -1490,7 +1721,7 @@ TEST_CASE("SAML ACS — assertion with no AttributeStatement mints a user sessio
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — unsafe RelayState values fall back to /",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1499,6 +1730,7 @@ TEST_CASE("SAML ACS — unsafe RelayState values fall back to /",
     SamlProvider provider(std::move(saml_cfg));
     REQUIRE(provider.is_enabled());
     SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     // Each unsafe relay state: {description, url-encoded form value}.
     // The form body is application/x-www-form-urlencoded; extract_form_value
@@ -1565,7 +1797,7 @@ TEST_CASE("SAML ACS — unsafe RelayState values fall back to /",
 // Browser-binding CSRF tests
 // ---------------------------------------------------------------------------
 
-TEST_CASE("SAML ACS — missing binding cookie is rejected", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — missing binding cookie is rejected", "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1619,7 +1851,7 @@ TEST_CASE("SAML ACS — missing binding cookie is rejected", "[saml][auth_routes
 #endif
 }
 
-TEST_CASE("SAML ACS — wrong binding cookie value is rejected", "[saml][auth_routes]") {
+TEST_CASE("SAML ACS — wrong binding cookie value is rejected", "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1686,7 +1918,7 @@ TEST_CASE("SAML ACS — wrong binding cookie value is rejected", "[saml][auth_ro
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — shadow-prefix cookie does not shadow real binding cookie (H-B)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1695,6 +1927,7 @@ TEST_CASE("SAML ACS — shadow-prefix cookie does not shadow real binding cookie
     SamlProvider provider(std::move(saml_cfg));
     REQUIRE(provider.is_enabled());
     SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     // Register a solicited request.
     auto start_res = fix.sink.Get("/auth/saml/start");
@@ -1753,7 +1986,7 @@ TEST_CASE("SAML ACS — shadow-prefix cookie does not shadow real binding cookie
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SAML ACS — RelayState with path traversal (..) falls back to / (H-D)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1762,6 +1995,7 @@ TEST_CASE("SAML ACS — RelayState with path traversal (..) falls back to / (H-D
     SamlProvider provider(std::move(saml_cfg));
     REQUIRE(provider.is_enabled());
     SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     // Cases: {description, url-encoded RelayState value for the form body}
     // url_decode runs inside extract_form_value before is_safe_relay_state.
@@ -1813,7 +2047,7 @@ TEST_CASE("SAML ACS — RelayState with path traversal (..) falls back to / (H-D
 }
 
 TEST_CASE("SAML ACS — valid RelayState /dashboard is accepted (H-D)",
-          "[saml][auth_routes]") {
+          "[pg][saml][auth_routes]") {
 #if defined(_WIN32)
     SKIP("SamlProvider always disabled on Windows (N4)");
 #else
@@ -1822,6 +2056,7 @@ TEST_CASE("SAML ACS — valid RelayState /dashboard is accepted (H-D)",
     SamlProvider provider(std::move(saml_cfg));
     REQUIRE(provider.is_enabled());
     SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_idp_entity_id = f.idp_entity_id; // ADR-2001 PR4a — see run_saml_acs_flow's comment
 
     auto start = fix.sink.Get("/auth/saml/start");
     REQUIRE(start != nullptr);

@@ -28,6 +28,8 @@
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
+#include "saml_principal.hpp" // saml_principal_id — ADR-2001 PR4a
 #include "test_route_sink.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include <yuzu/server/auth.hpp>
@@ -40,13 +42,29 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
 using yuzu::server::auth::Role;
+
+namespace {
+// AuditStore migrated to Postgres (ADR-0006) — the harness below now clones
+// this pre-migrated template instead of opening a SQLite path. Self-contained
+// (mirrors yuzu::test::AuthDbPg, already embedded in this harness): SKIPs the
+// enclosing TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset (via auth_db's own
+// ctor, constructed first), FAILs when set but broken.
+yuzu::test::PgTestTemplate sso_audit_tpl{"ssoaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("ssoaudit template: store failed to migrate");
+}};
+} // namespace
 
 // ── AuthDB::upsert_sso_identity ─────────────────────────────────────────────
 
@@ -165,6 +183,12 @@ struct SsoJitHarness {
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
     // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
     // below — embedding the PG fixture only made every case skip without a DSN.
+    // AuditStore ported to Postgres (ADR-0006): a template-cloned ephemeral
+    // database + pool, mirroring auth_db's own self-contained skip/fail
+    // posture above (auth_db constructs first, so an unset DSN never reaches
+    // this member at all).
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool> audit_pool;
     std::unique_ptr<AuditStore> audit_store;
     std::unique_ptr<AnalyticsEventStore> analytics_store;
     std::shared_mutex oidc_mu;
@@ -180,7 +204,11 @@ struct SsoJitHarness {
         auth_mgr.load_config(cfg.auth_config_path);
         auth_mgr.set_auth_db(auth_db.get());
 
-        audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
+        audit_db.emplace(sso_audit_tpl);
+        INFO("[SsoJitHarness] audit db status (blank == ok): " << audit_db->error());
+        REQUIRE(audit_db->available());
+        audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
+        audit_store = std::make_unique<AuditStore>(*audit_pool);
         analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
         auth_routes = std::make_unique<AuthRoutes>(cfg, auth_mgr, /*rbac_store=*/nullptr,
                                                    /*api_token_store=*/nullptr, audit_store.get(), nullptr,
@@ -336,28 +364,36 @@ TEST_CASE("POST /api/v1/elevate: an OIDC session cannot borrow a legacy identity
     CHECK_FALSE(auth::is_elevated(*s));
 }
 
-TEST_CASE("POST /api/v1/elevate: a SAML session whose NameID collides with a provisioned OIDC "
-          "principal is denied (identity-source mismatch, not just the no-amr gate)",
+TEST_CASE("POST /api/v1/elevate: a SAML session whose stable principal collides with a "
+          "provisioned OIDC-sourced row is denied (identity-source mismatch, not just the "
+          "no-amr gate)",
           "[pg][sso][jit][routes][saml]") {
     SsoJitHarness h;
-    // The other half of cons-N2: a crafted SAML NameID equal to a real,
-    // eligible OIDC principal string. SAML sessions already fail closed at
-    // the amr-proof / MFA gates further down this handler (SAML carries no
-    // amr claim), but this pins that the identity-source guard denies it
-    // FIRST and independently — so a future SAML-MFA workstream that adds
-    // an amr-equivalent for SAML cannot accidentally reopen this specific
-    // cross-protocol collision.
-    const std::string iss = "https://idp.example.com/";
-    const std::string sub = "sub-mallory-saml";
-    const std::string principal = "oidc:" + iss + "#" + sub;
+    // ADR-2001 PR4a re-key: a SAML session's stable principal is now
+    // `saml:<entity_id>#<name_id>` (saml_principal.hpp), so a crafted raw
+    // NameID can no longer collide with an `oidc:<iss>#<sub>` row at the
+    // STRING level — the "saml:" prefix makes the two principal spaces
+    // disjoint by construction (a strictly stronger guarantee than the
+    // guard this test originally pinned). This test instead seeds an
+    // AuthDB row keyed on the SAML session's OWN stable principal but
+    // sourced as `identity_source="oidc"` (modelling a row that could
+    // otherwise exist), so the request still reaches the
+    // identity-source-MISMATCH branch specifically (never the amr/no-such-
+    // row branches) — SAML sessions already fail closed at the amr-proof/
+    // MFA gates further down this handler (SAML carries no amr claim), but
+    // this pins that the identity-source guard denies it FIRST and
+    // independently.
+    const std::string entity_id = "https://idp.example.com/";
+    const std::string name_id = "mallory@example.com";
+    const std::string principal = saml::saml_principal_id(entity_id, name_id);
 
-    REQUIRE(h.auth_db->upsert_sso_identity(principal, iss, sub, "Real OIDC User", "oidc")
+    REQUIRE(h.auth_db
+                ->upsert_sso_identity(principal, "https://other-idp.example.com/", "sub-x",
+                                      "Real OIDC User", "oidc")
                 .has_value());
     REQUIRE(h.auth_db->set_elevation_eligible(principal, true).has_value());
 
-    // A SAML session whose NameID is crafted to equal the OIDC principal
-    // string verbatim.
-    auto token = h.auth_mgr.create_saml_session(principal);
+    auto token = h.auth_mgr.create_saml_session(name_id, entity_id);
 
     auto res = h.post("/api/v1/elevate", token, R"({"justification":"x"})");
     REQUIRE(res);

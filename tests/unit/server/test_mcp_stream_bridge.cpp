@@ -13,6 +13,7 @@
 #include "../../../server/core/src/mcp_jsonrpc.hpp"
 #include "../../../server/core/src/mcp_session.hpp"
 #include "../../../server/core/src/mcp_stream.hpp"
+#include <yuzu/server/auth.hpp>  // CredentialCheck is only forward-declared by mcp_stream.hpp
 #include "../../../server/core/src/execution_tracker.hpp"
 #include "../../../server/core/src/mcp_stream_bridge.hpp"
 #include "../test_helpers.hpp"
@@ -23,7 +24,10 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>  // std::find over the closed cancel-outcome label set
 #include <atomic>
+#include <condition_variable>
+#include <set>
 #include <chrono>
 #include <future>
 #include <memory>
@@ -151,22 +155,28 @@ struct Fx {
         std::string action;
         std::string detail;
         std::string result;
+        std::string actor;  ///< empty = the bridge's own background work ("system")
     };
     std::vector<AuditRow> audits;
     std::optional<Bridge> bridge;                             // optional: dtor-order tests
 
-    explicit Fx(Bridge::Config cfg = {})
-        : sessions(mcp::McpSessionRegistry::Config{},
+    /// `scfg` defaults to the production session config, so every existing test is
+    /// unaffected; a chaos test that needs the replay ring to WRAP passes a small
+    /// ring_cap rather than publishing 500 frames to get there.
+    explicit Fx(Bridge::Config cfg = {}, mcp::McpSessionRegistry::Config scfg = {})
+        : sessions(scfg,
                    [b = base, c = clock_s] { return b + std::chrono::seconds(c->load()); }, &reg) {
         bridge.emplace(&bus, &sessions, &reg,
                        [this](const std::string& action, const std::string&,
                               const std::string& detail,
-                              mcp::McpStreamBridge::AuditResult result) {
+                              mcp::McpStreamBridge::AuditResult result,
+                              const std::string& actor) {
                            std::lock_guard<std::mutex> lk(audit_mu);
                            audits.push_back(
                                {action, detail,
                                 result == mcp::McpStreamBridge::AuditResult::kFailure ? "failure"
-                                                                                      : "success"});
+                                                                                      : "success",
+                                actor});
                        },
                        cfg);
     }
@@ -247,6 +257,19 @@ std::size_t count_error_code(const std::vector<mcp::sse_bus::SseEvent>& frames,
         }
     }
     return n;
+}
+
+/// Poll take_post_batch until it yields something. The projector is asynchronous
+/// and a streamed record is pump-owned, so the first tick after a publish can
+/// legitimately be empty.
+inline mcp::McpStreamBridge::PostBatch poll_batch(mcp::McpStreamBridge& bridge,
+                                                  const std::string& key) {
+    mcp::McpStreamBridge::PostBatch batch;
+    poll_until([&] {
+        batch = bridge.take_post_batch(key, /*cap_expired=*/false);
+        return !batch.progress.empty() || batch.final_frame.has_value();
+    });
+    return batch;
 }
 
 const std::string kProgress13 = R"({"agents_responded":1,"agents_targeted":3})";
@@ -400,8 +423,12 @@ TEST_CASE("bridge parked terminal - one pinned final, result_base merged, final 
           "[mcp][bridge][2f]") {
     Fx fx;
     auto s = fx.make_session();
+    // #2712: base now carries structuredContent too (as real execute_instruction
+    // responses do since batch 3) - the merge below must preserve it untouched
+    // alongside the top-level additions, not just the legacy content array.
     const std::string base =
-        R"({"content":[{"type":"text","text":"{\"execution_id\":\"exec-p\"}"}]})";
+        R"({"content":[{"type":"text","text":"{\"execution_id\":\"exec-p\"}"}],)"
+        R"("structuredContent":{"execution_id":"exec-p"}})";
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(9), json("tok"), true).ok);
     REQUIRE(fx.bridge->subscribe(s.id, json(9), "exec-p"));
     REQUIRE(fx.bridge->arm(s.id, json(9), Bridge::ArmMode::kStreaming, base) ==
@@ -424,6 +451,13 @@ TEST_CASE("bridge parked terminal - one pinned final, result_base merged, final 
     CHECK(fin["result"]["agents_success"] == 3);
     CHECK(fin["result"]["agents_failure"] == 0);
     CHECK_FALSE(fin["result"]["content"][0].contains("status"));
+    // #2712: structuredContent is a THIRD top-level result sibling (alongside
+    // content and the status/agents_* additions) that must survive the merge
+    // completely unchanged - a deliberate, pinned decision (mcp_server.cpp's
+    // execute_instruction handler comment), not an accident of construction
+    // order.
+    REQUIRE(fin["result"].contains("structuredContent"));
+    CHECK(fin["result"]["structuredContent"] == json{{"execution_id", "exec-p"}});
 
     // A7: post-terminal progress (a real publisher sequence) is dropped.
     const auto frames_before = frames.size();
@@ -547,8 +581,13 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
         REQUIRE(poll_until(
             [&, i] { return s.stream->pinned_count() == static_cast<std::size_t>(i); }));
     }
-    CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).reject_reason) ==
-          "pin_slots");
+    // No pre-resume reserve probe here any more. These four records are parked
+    // with COMMITTED, UNDELIVERED finals - exactly the state #2740's admission
+    // displacement now reclaims a slot from - so a fifth reserve at this point
+    // would succeed by unpinning one of them and perturb the very pin set this
+    // test is about. Lockout-versus-displacement is asserted in the #2740 case;
+    // what THIS test owns is that a resume ack frees admission on its own, which
+    // the displacement counter below pins.
 
     // Find the SMALLEST pinned id and consume exactly it via a resume cursor
     // (Last-Event-ID >= pinned_id is the consumption proof).
@@ -574,6 +613,11 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
     CHECK_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());
     CHECK(fx.bridge->phase_for(s.id, json(2)).has_value());
     CHECK(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+    // ...and it was admitted by the ACK, not by #2740's displacement: with three
+    // pins against a cap of four the admission sum is already under water, so no
+    // pin was released to make room. Without this the assertion above would pass
+    // even if the resume path had stopped freeing anything at all.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value() == 0.0);
     CHECK(fx.audit_count("mcp.bridge.pin_acked") == 1);
     // #2487: teardown owns THREE things - the map entry, the streamed charge, and
     // the bus subscription. The two lines above cover the first two; without this
@@ -585,6 +629,201 @@ TEST_CASE("bridge pin-ack sweep - resume consumption frees streamed admission",
     CHECK(fx.bus.subscriber_count("exec-pin-2") == 1);  // siblings untouched
     CHECK(fx.bus.subscriber_count("exec-pin-3") == 1);
     CHECK(fx.bus.subscriber_count("exec-pin-4") == 1);
+}
+
+TEST_CASE("bridge admission - client-gone finals never lock a session out of streaming (#2740)",
+          "[mcp][bridge][2f][ch24]") {
+    // A streamed POST whose peer dies before the final is written leaves that
+    // final PINNED: the prompt release (on_final_written) is reached only after
+    // write_all succeeds, and the remaining routes - a GET resume acking past the
+    // pinned id, or session death - both need a channel a POST-only client does
+    // not have. Four such calls used to exhaust the session's four slots forever,
+    // answering 429 with "wait for one to finish" while nothing was in flight and
+    // every conforming 30s retry slid the session TTL so it never idled out.
+    //
+    // The helper builds exactly that state: park the record (peer gone), THEN let
+    // the terminal land, so the final is committed and pinned with no wire to
+    // take it.
+    Fx fx;
+    auto s = fx.make_session();
+    const auto park_with_undelivered_final = [&](int id) {
+        const std::string exec = "exec-gone-" + std::to_string(id);
+        // Retry a pin_slots reject rather than REQUIREing the first attempt: the
+        // admission sum transiently reads one settling record as two slots (the
+        // pin commits before the charge clears, both inside one projection
+        // claim), and reserve fails CLOSED on that reading by design. A real
+        // client does exactly this on its Retry-After. Without the retry this
+        // setup is flaky for a reason that has nothing to do with what the
+        // sections below assert.
+        REQUIRE(poll_until([&] { return fx.bridge->reserve(s.id, "alice", json(id),
+                                                           json("t"), true).ok; }));
+        REQUIRE(fx.bridge->subscribe(s.id, json(id), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(id), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(id)));  // peer gone, no final written
+        fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
+        // Settle before the next reserve, so each park contributes exactly one
+        // slot when the next one is admitted.
+        REQUIRE(poll_until([&] {
+            return s.stream->pinned_count() == static_cast<std::size_t>(id);
+        }));
+    };
+    const auto displaced_count = [&] {
+        return fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+    };
+
+    SECTION("four client-gone calls leave a fifth admissible") {
+        for (int i = 1; i <= 4; ++i) {
+            park_with_undelivered_final(i);
+        }
+        // the helper already settled each park; nothing further to wait for
+        auto fifth = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
+        CHECK(fifth.ok);
+        CHECK(displaced_count() == 1.0);
+        CHECK(fx.audit_count("mcp.bridge.pin_displaced_for_admission") == 1);
+        // The OLDEST parked record yields - its resume window is the one most
+        // likely already gone - and the result stays fetchable by execution_id.
+        CHECK(s.stream->pinned_count() == 3);
+        // The lockout is gone for good, not merely deferred by one: each further
+        // client-gone call displaces the next-oldest rather than refusing.
+        for (int i = 6; i <= 8; ++i) {
+            auto rr = fx.bridge->reserve(s.id, "alice", json(i), json("t"), true);
+            INFO("reserve " << i << " reject="
+                            << (rr.reject_reason == nullptr ? "none" : rr.reject_reason)
+                            << " pinned=" << s.stream->pinned_count());
+            CHECK(rr.ok);
+        }
+    }
+
+    SECTION("a displaced final is unpinned, NOT erased - a resume can still collect it") {
+        for (int i = 1; i <= 4; ++i) {
+            park_with_undelivered_final(i);
+        }
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 4; }));
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+        // Displacement removes the eviction EXEMPTION, nothing more: the frame is
+        // still in the ring, so a resume from before it still replays it. This is
+        // the whole reason displacement is acceptable rather than data loss.
+        CHECK(count_results(ring_frames(*s.stream, "alice")) == 4);
+    }
+
+    SECTION("live streamed calls are never displaced - the concurrency limit still bites") {
+        // Four records still kStreaming with their finals in flight: no pin here
+        // belongs to an abandoned response, so the fifth must be REFUSED, and the
+        // refusal must say so in terms that are true.
+        for (int i = 1; i <= 4; ++i) {
+            const std::string exec = "exec-live-" + std::to_string(i);
+            REQUIRE(fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok);
+            REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
+            REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
+                    Bridge::ArmOutcome::kArmed);
+        }
+        auto fifth = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
+        CHECK_FALSE(fifth.ok);
+        CHECK(std::string(fifth.reject_reason == nullptr ? "" : fifth.reject_reason) ==
+              "pin_slots");
+        // Charges outstanding, so "wait for one to finish" is the true advice.
+        CHECK(fifth.pin_slots_held == Bridge::PinSlotsHeld::kCharges);
+        CHECK(displaced_count() == 0.0);
+    }
+
+    SECTION("a mixed set displaces only the parked pin and leaves a live one alone") {
+        for (int i = 1; i <= 3; ++i) {
+            park_with_undelivered_final(i);
+        }
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 3; }));
+        // A fourth call that is genuinely LIVE: armed, streaming, no terminal yet,
+        // so it holds a charge rather than a pin. Three pins plus this one charge
+        // is the cap, which is what puts admission on the reject path at all.
+        const std::string live = "exec-live-4";
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(4), live));
+        REQUIRE(fx.bridge->arm(s.id, json(4), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+
+        // Capture the parked pins BEFORE admission so the survivor set is checked
+        // by id rather than by count.
+        std::vector<std::uint64_t> parked;
+        for (std::uint64_t id = 1; id < s.stream->next_event_id(); ++id) {
+            if (s.stream->is_pinned(id)) {
+                parked.push_back(id);
+            }
+        }
+        REQUIRE(parked.size() == 3);  // the live call holds a charge, not a pin
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+        CHECK(displaced_count() == 1.0);
+        CHECK_FALSE(s.stream->is_pinned(parked.front()));  // oldest parked displaced
+        CHECK(s.stream->is_pinned(parked[1]));             // the others untouched
+        CHECK(s.stream->is_pinned(parked[2]));
+        // The live call is not a candidate at any point: it is still streaming and
+        // its final has not been committed, let alone abandoned.
+        CHECK(fx.bridge->phase_for(s.id, json(4)) == Bridge::Phase::kStreaming);
+    }
+
+    SECTION("a late on_final_written for a displaced record is a no-op, and the sweep reaps it") {
+        for (int i = 1; i <= 4; ++i) {
+            park_with_undelivered_final(i);
+        }
+        auto victim_key = fx.bridge->record_key(s.id, json(1));
+        REQUIRE(victim_key.has_value());
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+
+        // A pump that comes back from the dead after its record was displaced must
+        // not resurrect anything: the unpin is id-targeted and the id is already
+        // released, so this is a no-op, and the record is then reapable by the
+        // sweep's pin-ack arm (final_published, pin gone) exactly as if a resume
+        // had acked it. This is what makes displacement self-cleaning.
+        CHECK(fx.bridge->on_final_written(*victim_key));
+        fx.bridge->sweep();
+        CHECK_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());
+        CHECK(fx.bridge->phase_for(s.id, json(2)).has_value());  // siblings untouched
+    }
+}
+
+TEST_CASE("bridge admission - ORPHAN pins are reclaimed too (governance UP-1)",
+          "[mcp][bridge][2f][ch24]") {
+    // The lockout shape a RECORD scan can never see. Teardown erases a record
+    // without unpinning, so its committed final stays pinned with nothing left
+    // that could ever release it: the sweep's pin-ack arm needs a record,
+    // on_final_written needs a record, and a cursor-less GET resume releases
+    // nothing (rule 1b only unpins for a cursor at or above the pinned id). Four
+    // of these lock the session out of streamed POST permanently - and unlike the
+    // parked-record case, the session stays alive, so even session death does not
+    // clear it. `ring_only_pressure_cap = 0` makes the sweep tear a parked record
+    // down on sight, which is the production path (pressure) that produces these.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    const auto displaced_total = [&] {
+        return fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+    };
+
+    for (int i = 1; i <= 4; ++i) {
+        const std::string exec = "exec-orphan-" + std::to_string(i);
+        REQUIRE(poll_until([&] {
+            return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+        }));
+        REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(i)));  // peer gone, no final written
+        fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
+        REQUIRE(poll_until([&] {
+            return s.stream->pinned_count() == static_cast<std::size_t>(i);
+        }));
+        // The pressure teardown erases the record and leaves the pin behind.
+        REQUIRE(poll_until([&] {
+            fx.bridge->sweep();
+            return !fx.bridge->phase_for(s.id, json(i)).has_value();
+        }));
+    }
+    REQUIRE(s.stream->pinned_count() == 4);   // four pins...
+    REQUIRE(fx.bridge->record_count() == 0);  // ...and not one record to find them by
+
+    // Admission must reclaim one anyway.
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(9), json("t"), true).ok);
+    CHECK(displaced_total() == 1.0);
+    CHECK(s.stream->pinned_count() == 3);
+    CHECK(fx.audit_count("mcp.bridge.pin_displaced_for_admission") == 1);
 }
 
 TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final is never lost",
@@ -657,6 +896,10 @@ TEST_CASE("bridge pressure - oldest without a terminal gets -32014; a real final
         CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);  // no synthesis
         CHECK(count_results(frames) == 1);
         CHECK(s.stream->is_pinned(final_id));  // truth stays in the ring
+        // sre-N1 (#2489): the "client lost nothing" disposition, counted as such -
+        // the label set is closed, so it must be reachable at its real producer.
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total", {{"disposition", "none"}})
+                  .value() == 1.0);
     }
     SECTION("terminal racing the pressure sweep: the real result always wins") {
         // The terminal is LATCHED before the sweeper starts (the listener runs
@@ -790,6 +1033,12 @@ TEST_CASE("bridge pressure - kTerminalKnownLost publishes the fallback final, ne
         }
         CHECK(ok);
     }
+    // sre-N1 (#2489): and it is now countable, which the audit row is not. This is
+    // the disposition an operator most needs to watch - a rising rate means records
+    // are parking for longer than the bus buffer holds their terminal.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total",
+                         {{"disposition", "fallback_final"}})
+              .value() == 1.0);
     // Charge released: teardown_claimed already released the streamed charge
     // synchronously when it reaped record 1 (streamed_unpinned_ back to 0); the pinned
     // fallback still holds one slot, which the resume cursor below consumes. With BOTH
@@ -845,6 +1094,340 @@ TEST_CASE("bridge pressure - a visitor copy-OOM defers and keeps the listener (#
     CHECK(count_results(frames) == 1);  // the real final, after the fault healed
 }
 
+namespace {
+
+/// A + B parked into one session, A first so it owns the lower parked_seq and is
+/// therefore the victim pass 3 picks first. A's verdict is kTerminalBuffered (a
+/// terminal-flagged progress the listener does not latch); B never reaches a
+/// terminal at all, so its visit is an unambiguous claim. Paired with a PERSISTENT
+/// visitor copy fault this is a deterministic "oldest defers forever, newer is
+/// reapable" shape - the only one that tells the two #2489 pressure defects apart.
+void park_deferring_a_and_claimable_b(Fx& fx, Fx::Session& s) {
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-a"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(2), "exec-b"));
+    REQUIRE(fx.bridge->arm(s.id, json(2), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(2)));
+    fx.bus.publish("exec-a", "execution-progress",
+                   R"({"status":"succeeded","agents_success":1,"agents_failure":0})",
+                   /*is_terminal=*/true);
+    // PERSISTENT: while it fires, A's terminal copy never latches, so A can never be
+    // claimed however many sweeps run. That is the self-validating half of both
+    // tests below - any reap they observe is necessarily B's.
+    fx.bridge->inject_visit_copy_fault_for_test(/*times=*/100);
+}
+
+}  // namespace
+
+TEST_CASE("bridge pressure - a deferred victim no longer blocks relief for the newer ones "
+          "(#2489 UP-5)",
+          "[mcp][bridge][2f][2489]") {
+    // Pass 3 used to wake-and-RETURN on any defer, and it always picks the OLDEST
+    // victim first - so one record caught perpetually mid-projection held the escape
+    // hatch shut for every newer victim behind it. Per record the defer is bounded;
+    // in aggregate, sustained pressure got no relief at all.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    park_deferring_a_and_claimable_b(fx, s);
+
+    fx.bridge->sweep();
+
+    // B reaped THROUGH the deferring A, in ONE sweep. Before UP-5: 2, forever.
+    CHECK(fx.bridge->record_count() == 1);
+    CHECK(fx.bridge->phase_for(s.id, json(1)).has_value());        // A survives...
+    CHECK_FALSE(fx.bridge->phase_for(s.id, json(2)).has_value());  // ...B does not
+    CHECK(count_error_code(ring_frames(*s.stream, "alice"), mcp::kMcpTerminalUnavailable) == 1);
+    // sre-N1 (#2489): which disposition it was is now readable from metrics, not
+    // only from an audit row nothing scrapes.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total",
+                         {{"disposition", "synthesize_unavailable"}})
+              .value() == 1.0);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total", {{"disposition", "none"}})
+              .value() == 0.0);
+
+    // A is genuinely unreapable while the fault fires, which is what makes the reap
+    // above attributable to the advance rather than to A settling early.
+    for (int i = 0; i < 10; ++i) {
+        fx.bridge->sweep();
+    }
+    CHECK(fx.bridge->record_count() == 1);
+}
+
+TEST_CASE("bridge pressure - a mark does not outlive the pressure that raised it (#2489 UP-4)",
+          "[mcp][bridge][2f][2489]") {
+    // pressure_requested tells the projector to start no NEW progress batch for a
+    // victim. Nothing cleared it, so a victim that was marked and then survived -
+    // because the cap went back under water before its turn came round - had its
+    // progress frozen for the REST of its execution. The terminal still settles
+    // (want_terminal is ungated), which is precisely why the freeze is silent: a
+    // parked GET-resume client watching a long run simply stops seeing movement.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    park_deferring_a_and_claimable_b(fx, s);
+
+    fx.bridge->sweep();  // A marked and deferred; B reaped -> cap back under water
+    REQUIRE(fx.bridge->record_count() == 1);
+    REQUIRE(fx.bridge->phase_for(s.id, json(1)).has_value());
+
+    // A strictly-higher progress value than anything published so far. Monotonic
+    // suppression (H1) means a frame carrying 2 can ONLY have come from this
+    // publish, so the assertion cannot be satisfied by a frame the projector had
+    // already emitted before the sweep - no ordering assumption needed.
+    fx.bus.publish("exec-a", "execution-progress", prog(2, 3));
+    CHECK(poll_until([&] {
+        for (const auto& f : ring_frames(*s.stream, "alice")) {
+            auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+            if (j.is_object() && j.value("method", "") == "notifications/progress" &&
+                j["params"].value("progress", 0) == 2) {
+                return true;
+            }
+        }
+        return false;
+    }));
+}
+
+TEST_CASE("bridge pressure - one sweep expires exactly down to the cap, no further "
+          "(Doomgoose, PR #2781 review)",
+          "[mcp][bridge][2f][2489]") {
+    // The single-scan-and-sort refactor removes the per-victim cap re-check the
+    // previous rescan-per-victim shape had; this pins that the replacement (a
+    // pass-local live count, decremented per teardown THIS pass commits) still
+    // stops at exactly the cap rather than draining every eligible candidate. No
+    // prior test caught this - the existing pressure tests all use cap 0 or 1,
+    // where "stop at the cap" and "reap everything eligible" are indistinguishable.
+    //
+    // 6 claimable (unambiguously reapable - no bus publish, so the verdict is
+    // kNeverTerminal -> synthesize_unavailable on first visit) records parked
+    // oldest-first across two sessions (streamed admission caps at 4 pin slots
+    // PER SESSION, so 6 in one session is not constructible). Cap 2: exactly 4
+    // must be reaped, 2 - the two parked LAST, since sweep visits oldest-first -
+    // must survive this single sweep.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 2}};
+    auto s1 = fx.make_session();
+    auto s2 = fx.make_session();
+    struct Victim {
+        Fx::Session* s;
+        nlohmann::json id;
+    };
+    const std::vector<Victim> victims = {
+        {&s1, json(1)}, {&s1, json(2)}, {&s1, json(3)},
+        {&s2, json(1)}, {&s2, json(2)}, {&s2, json(3)},
+    };
+    int n = 0;
+    for (const auto& v : victims) {
+        const std::string exec_id = "exec-cap-" + std::to_string(++n);
+        REQUIRE(fx.bridge->reserve(v.s->id, "alice", v.id, json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(v.s->id, v.id, exec_id));
+        REQUIRE(fx.bridge->arm(v.s->id, v.id, Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+    }
+    // Park in the SAME order as the reserve loop above, so parked_seq matches
+    // victims[] order exactly - the first four are the ones sweep must reap.
+    for (const auto& v : victims) {
+        REQUIRE(fx.bridge->on_post_closed(v.s->id, v.id));
+    }
+    REQUIRE(fx.bridge->record_count() == 6);
+
+    fx.bridge->sweep();
+
+    CHECK(fx.bridge->record_count() == 2);
+    CHECK_FALSE(fx.bridge->phase_for(s1.id, json(1)).has_value());  // reaped (1st parked)
+    CHECK_FALSE(fx.bridge->phase_for(s1.id, json(2)).has_value());  // reaped (2nd parked)
+    CHECK_FALSE(fx.bridge->phase_for(s1.id, json(3)).has_value());  // reaped (3rd parked)
+    CHECK_FALSE(fx.bridge->phase_for(s2.id, json(1)).has_value());  // reaped (4th parked)
+    CHECK(fx.bridge->phase_for(s2.id, json(2)) == Bridge::Phase::kRingOnly);  // survives (5th)
+    CHECK(fx.bridge->phase_for(s2.id, json(3)) == Bridge::Phase::kRingOnly);  // survives (6th)
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total",
+                         {{"disposition", "synthesize_unavailable"}})
+              .value() == 4.0);
+    // The hatch stopped BECAUSE the cap was satisfied, not because it ran out of
+    // budget or candidates with the cap still exceeded - the exhausted counter
+    // must NOT fire.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() == 0.0);
+}
+
+TEST_CASE("bridge pressure - deferred victims consume visit budget without decrementing "
+          "live, so a defer-heavy pass still reports budget-exhausted "
+          "(quality-engineer + unhappy-path UP-3, wave 4)",
+          "[mcp][bridge][2f][2489]") {
+    // The down-to-cap test above (and the population-bound TSan test below) both use
+    // an all-claimable population, so `live` (decremented only by a teardown THIS
+    // pass commits) and `visit_budget` (decremented on every visit, claimed or
+    // deferred alike) move in lockstep and neither test can tell them apart - flagged
+    // independently by quality-engineer and unhappy-path's UP-3 in the same wave-4
+    // review. This one can, and specifically because all 3 defers are parked - and
+    // therefore visited - before either claim: a candidate that goes UNVISITED stays
+    // parked exactly like one that was visited and then deferred (nothing touches an
+    // unvisited candidate), so the two orderings are indistinguishable UNLESS a
+    // miscounted `live` causes the loop to exit before every candidate is reached -
+    // which can only strand a claim if the claims sit AFTER the point of that early
+    // exit. Mutation-verified (governance.d/2f-pr3b-dormant.e331oX.jsonl, W4-1): an
+    // unconditional extra `live` decrement per visit made this test fail exactly as
+    // predicted (record_count 4 instead of 3, the second claim left in kRingOnly,
+    // forced_expire{synthesize_unavailable} 1.0 instead of 2.0) before the mutation
+    // was reverted.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s1 = fx.make_session();
+    auto s2 = fx.make_session();
+
+    auto park_deferring = [&](Fx::Session& s, const std::string& exec, int slot) {
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(slot), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(slot), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(slot), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(slot)));
+        fx.bus.publish(exec, "execution-progress",
+                       R"({"status":"succeeded","agents_success":1,"agents_failure":0})",
+                       /*is_terminal=*/true);
+    };
+    auto park_claimable = [&](Fx::Session& s, const std::string& exec, int slot) {
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(slot), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(slot), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(slot), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(slot)));
+        // No publish: bus verdict is kNeverTerminal -> synthesize_unavailable, an
+        // unambiguous claim on first visit.
+    };
+    // Parked (and therefore visited, oldest-first) in this exact order: all 3
+    // defers, THEN both claims.
+    park_deferring(s1, "exec-def-1", 1);
+    park_deferring(s1, "exec-def-2", 2);
+    park_deferring(s2, "exec-def-3", 1);
+    park_claimable(s1, "exec-claim-1", 3);
+    park_claimable(s1, "exec-claim-2", 4);
+    // PERSISTENT: while it fires, none of the 3 deferring records' terminal copies
+    // ever latch, so none can be claimed however many sweeps run - the same
+    // self-validating fault this file uses for every other defer scenario.
+    fx.bridge->inject_visit_copy_fault_for_test(/*times=*/100);
+    REQUIRE(fx.bridge->record_count() == 5);
+
+    fx.bridge->sweep();
+
+    // Both claimable records reaped; all 3 deferring records survive - visited (and
+    // marked) but never claimed, exhausting visit_budget rather than satisfying live.
+    CHECK(fx.bridge->record_count() == 3);
+    CHECK(fx.bridge->phase_for(s1.id, json(1)) == Bridge::Phase::kRingOnly);
+    CHECK(fx.bridge->phase_for(s1.id, json(2)) == Bridge::Phase::kRingOnly);
+    CHECK(fx.bridge->phase_for(s2.id, json(1)) == Bridge::Phase::kRingOnly);
+    CHECK_FALSE(fx.bridge->phase_for(s1.id, json(3)).has_value());
+    CHECK_FALSE(fx.bridge->phase_for(s1.id, json(4)).has_value());
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_forced_expire_total",
+                         {{"disposition", "synthesize_unavailable"}})
+              .value() == 2.0);
+    // The hatch disengaged with the cap STILL exceeded (3 > 1) - budget/candidates
+    // exhausted on a population `live` alone would have under-reported as satisfied
+    // only once every defer resolves, which this fault deliberately never does.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() == 1.0);
+}
+
+TEST_CASE("bridge pressure - one sweep is bounded by the population it started with "
+          "(#2489 review, TSan)",
+          "[mcp][bridge][2f][2489]") {
+    // The parked_seq floor bounds a pass against the records it STARTED with, but a
+    // record that parks mid-pass gets a HIGHER parked_seq, so it lands above the
+    // floor and stays eligible. Under sustained parking the cap never falls back
+    // under water and the pass would keep finding fresh victims - one maintenance
+    // tick doing unbounded teardown + audit work, starving the session GC that
+    // shares that thread. The victim budget captured at entry is what bounds it, and
+    // stopping on that budget is COUNTED rather than silent.
+    //
+    // This also puts the mark/clear pair under real contention for TSan: stage 1
+    // marks under bridge_mu_ -> rec->mu, the clearing walk takes the same pair, and
+    // the producer mutates records_ throughout.
+    //
+    // The assertion needs at least one record to arrive DURING a sweep. That is
+    // near-certain with a tight producer against a sweep doing 32 teardowns, but it
+    // is a race, so the scenario gets a few attempts and passes on the first that
+    // lands. It cannot false-RED into a wrong conclusion: without the budget the
+    // sweep drains until the producer stops, and the counter can never move at all.
+    // Streamed admission is capped at 4 per SESSION (pin slots), so a population of
+    // this size needs a session pool. Every session is minted on THIS thread up
+    // front - make_session carries Catch2 assertions, which are not valid off the
+    // main thread - and the producer only ever touches its own slice.
+    constexpr int kPerSession = 4;
+    constexpr int kMainSessions = 8;   // 32 records parked before the sweep
+    constexpr int kProdSessions = 40;  // up to 160 arrivals during it
+    bool observed = false;
+    for (int attempt = 0; attempt < 12 && !observed; ++attempt) {
+        // The per-principal SESSION cap (8, Decision 15(d)) would otherwise bound the
+        // pool to 32 records - exactly the pre-sweep population, leaving the producer
+        // nothing to add. Raised here only to reach a population big enough for the
+        // budget to bite; nothing in this test depends on the production value.
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0},
+              mcp::McpSessionRegistry::Config{.per_principal_cap = 64}};
+        std::vector<Fx::Session> pool;
+        pool.reserve(kMainSessions + kProdSessions);
+        for (int i = 0; i < kMainSessions + kProdSessions; ++i) {
+            pool.push_back(fx.make_session());
+        }
+        auto park = [&](const Fx::Session& s, int slot) {
+            const auto j = json(slot);
+            if (!fx.bridge->reserve(s.id, "alice", j, json("t"), true).ok) {
+                return false;
+            }
+            if (!fx.bridge->subscribe(s.id, j, s.id + "-exec-" + std::to_string(slot))) {
+                return false;
+            }
+            if (fx.bridge->arm(s.id, j, Bridge::ArmMode::kStreaming) !=
+                Bridge::ArmOutcome::kArmed) {
+                return false;
+            }
+            return fx.bridge->on_post_closed(s.id, j);
+        };
+        for (int i = 0; i < kMainSessions; ++i) {
+            for (int slot = 0; slot < kPerSession; ++slot) {
+                REQUIRE(park(pool[static_cast<std::size_t>(i)], slot));
+            }
+        }
+
+        std::atomic<bool> stop{false};
+        auto producer = std::async(std::launch::async, [&] {
+            for (int i = kMainSessions; i < kMainSessions + kProdSessions; ++i) {
+                for (int slot = 0; slot < kPerSession; ++slot) {
+                    if (stop.load(std::memory_order_relaxed)) {
+                        return;
+                    }
+                    (void)park(pool[static_cast<std::size_t>(i)], slot);
+                }
+            }
+        });
+
+        fx.bridge->sweep();  // MUST return without waiting for the producer to stop
+        stop.store(true, std::memory_order_relaxed);
+        producer.get();
+
+        // THE COUNTER IS THE CONDITION, not a proxy for it. An earlier version
+        // gated on a producer-side arrival count and then hard-CHECKed the
+        // counter - but that count also included parks completing AFTER sweep()
+        // returned, because `stop` is only stored post-sweep and the producer
+        // re-reads it per slot. So a run where nothing arrived DURING the sweep
+        // still entered the
+        // branch, found the budget legitimately unexhausted, and failed. It went red
+        // 2 of 3 times at 1.5x CPU oversubscription - which is the ordinary state of
+        // both self-hosted pools, four runner agents to a box - while passing 8/8
+        // unloaded. The in-file claim that it "cannot false-RED into a wrong
+        // conclusion" was simply wrong, and measuring only on an idle machine is
+        // what hid it.
+        //
+        // Reading the counter directly is sound in both directions: it is written
+        // ONLY in the budget-exhausted branch, so it can never move without the fix,
+        // and a run where the producer did not interleave just retries instead of
+        // asserting something it did not establish.
+        if (fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() > 0.0) {
+            observed = true;
+        }
+    }
+    // Honest failure, not a silent pass: if the producer never interleaved in any
+    // attempt the scenario was never exercised, and that is a result worth seeing.
+    CHECK(observed);
+}
+
 TEST_CASE("bridge pressure - two concurrent sweeps reap a victim exactly once (#2409 qa-S5, TSan)",
           "[mcp][bridge][2f][2409]") {
     Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
@@ -892,7 +1475,124 @@ TEST_CASE("bridge pressure - a sweep claim racing shutdown reaps once, no double
     fx.bridge->shutdown();
     sweeper.get();
     CHECK(fx.bridge->record_count() == 0);
-    CHECK(fx.audit_count("mcp.bridge.forced_expire") <= 1);  // 0 (shutdown) or 1 (sweep), never 2
+    // Each family is individually bounded to at most one row: this is ONE record,
+    // so at most one teardown_claimed call can ever run for it (forced_expire), and
+    // shutdown() runs its whole cleanup exactly once, so its aggregate row fires at
+    // most once regardless of how many records it poisoned (shutdown_reap). NOT
+    // asserted as mutually exclusive: shutdown()'s own comment above (see the
+    // should_poison computation) documents the accepted overlap - a concurrent
+    // sweep() mid-teardown_claimed, past its own shutdown_started_ recheck but not
+    // yet through Step 1, can have shutdown's walk poison the same record before
+    // teardown_claimed's Step 1 sets teardown_terminal_handled, so BOTH rows can
+    // fire for one record in that narrow window. Harmless per that comment
+    // (poisoning is idempotent, the audit rows are individually accurate), but a
+    // real interleaving this test's threading can produce - not eliminated here.
+    const std::size_t forced = fx.audit_count("mcp.bridge.forced_expire");
+    const std::size_t reaped = fx.audit_count("mcp.bridge.shutdown_reap");
+    CHECK(forced <= 1);
+    CHECK(reaped <= 1);
+
+    auto attached = s.stream->attach_and_replay(0, nullptr, "alice");
+    if (reaped == 1) {
+        // shutdown's walk poisons an abandoned claim unconditionally (#2517).
+        CHECK(attached.status == mcp::McpStreamState::AttachStatus::kPoisoned);
+    } else if (forced == 0) {
+        // Neither reclaimer touched the record - it was never claimed, so it was
+        // never poisoned either.
+        CHECK(attached.status != mcp::McpStreamState::AttachStatus::kPoisoned);
+    }
+    // forced == 1 alone does not pin poisoned-vs-not: the sweep's own ladder may
+    // have settled on kPrimary/kFallback/kPoisoned - that's the existing coverage
+    // on publish_terminal_ladder, not this race.
+}
+
+TEST_CASE("bridge shutdown poisons a claimed-but-terminal-unresolved record and "
+          "evidences the reap (#2517, #2489 comp-S1)",
+          "[mcp][bridge][2f]") {
+    // Forces teardown_claimed PAST the claim but INTO a Step-1 build failure (so
+    // teardown_terminal_handled stays false) and then a Step-4 erase failure (so the
+    // record is retained in records_ rather than erased) - deterministically
+    // reproducing the shape a shutdown race against sweep() produces non-deterministically
+    // in the qa-B2 test above.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-reap-a"));
+    REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-reap-b"));
+    REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+    fx.bus.publish("exec-reap-b", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+    // "a" is now the pressure victim: terminal-less, decision kSynthesizeUnavailable.
+
+    fx.bridge->inject_terminal_build_fault_for_test(1);  // Step 1 build fails
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
+    REQUIRE_NOTHROW(fx.bridge->sweep());
+    // "b" is untouched (its final already pinned); "a" is claimed, torn_down, and
+    // retained (erase failed).
+    REQUIRE(fx.bridge->record_count() == 2);
+    // This is the mechanical-incomplete row from the erase failure itself - a
+    // DIFFERENT fact (a resource leaked) from what shutdown's reap will evidence
+    // (the terminal was never resolved). Both are correct and both fire.
+    CHECK(fx.audit_count("mcp.bridge.forced_expire") == 1);
+
+    fx.bridge->shutdown();
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 1);
+    {
+        std::lock_guard<std::mutex> lk(fx.audit_mu);
+        bool saw_reap = false;
+        for (const auto& row : fx.audits) {
+            if (row.action == "mcp.bridge.shutdown_reap") {
+                saw_reap = true;
+                CHECK(row.detail.find("poisoned 1 claimed") != std::string::npos);
+                CHECK(row.detail.find("execution_id") != std::string::npos);
+                CHECK(row.result == "success");
+            }
+        }
+        CHECK(saw_reap);
+    }
+    CHECK(s.stream->attach_and_replay(0, nullptr, "alice").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+}
+
+TEST_CASE("bridge shutdown does NOT reap a record whose terminal Step 1 already "
+          "resolved, even if a later step failed (#2517)",
+          "[mcp][bridge][2f]") {
+    // The negative case the flag exists to get right: Step 1 PUBLISHES successfully
+    // (teardown_terminal_handled becomes true) and only Step 2 fails afterward. The
+    // record is retained (same as the positive test above), but its terminal is
+    // already resolved, so shutdown must leave it alone.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-noreap-a"));
+    REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-noreap-b"));
+    REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+    fx.bus.publish("exec-noreap-b", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe,
+                                                            1000));
+    REQUIRE_NOTHROW(fx.bridge->sweep());
+    // "b" is untouched; "a" is claimed, torn_down, and retained (unsubscribe failed).
+    REQUIRE(fx.bridge->record_count() == 2);
+    CHECK(fx.audit_count("mcp.bridge.forced_expire") == 1);  // Step 1 published fine
+
+    fx.bridge->shutdown();
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 0);
+    CHECK(s.stream->attach_and_replay(0, nullptr, "alice").status !=
+          mcp::McpStreamState::AttachStatus::kPoisoned);
 }
 
 TEST_CASE("bridge session-death sweep - non-touching exists, registry untouched",
@@ -938,8 +1638,8 @@ TEST_CASE("bridge teardown - a failed unsubscribe retains the record, never orph
     REQUIRE(fx.bus.subscriber_count("exec-2487") == 1);
 
     fx.clock_s->store(1801);  // session death: the pass-2 teardown this exercises
-    fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe,
-                                                  1000);  // persistent
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe,
+                                                            1000));  // persistent
     REQUIRE_NOTHROW(fx.bridge->sweep());  // the whole point - no escape to the thread
 
     // SELF-VALIDATING: with the fault reduced to a no-op the record is torn down and
@@ -973,7 +1673,7 @@ TEST_CASE("bridge teardown - a failed unsubscribe retains the record, never orph
     // The claim is one-way ON PURPOSE (re-opening it is a change to the exactly-once
     // teardown protocol, not a containment fix), so healing the fault does NOT make a
     // later sweep retry. This is the honest bound the metric exists to surface.
-    fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 0);
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 0));
     fx.bridge->sweep();
     CHECK(fx.bridge->record_count() == 1);
     CHECK(fx.bus.subscriber_count("exec-2487") == 1);
@@ -1035,7 +1735,7 @@ TEST_CASE("bridge subscribe() is an exactly-once state-checked transition (#2487
         auto s = fx.make_session();
         REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
         offset->store(101);  // past the reaper threshold, still pre-subscribe
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
         fx.bridge->sweep();  // claims the orphan, then fails to erase it
         REQUIRE(fx.bridge->record_count() == 1);  // claimed, torn_down, still resolvable
 
@@ -1121,7 +1821,8 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         Fx fx;
         auto s = fx.make_session();
         park_one(fx, s);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge,
+                                                                1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
         // Distinct from the unsubscribe stage: teardown CONTINUES past this failure.
         CHECK(fx.bridge->record_count() == 0);
@@ -1143,7 +1844,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         Fx fx;
         auto s = fx.make_session();
         park_one(fx, s);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
         CHECK(fx.bridge->record_count() == 1);              // retained
         CHECK(fx.bus.subscriber_count("exec-stage") == 0);  // but already unsubscribed
@@ -1163,7 +1864,8 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         park_pair(fx, s, "pub");
 
         // The synthesis publishes normally; only the charge release fails.
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge,
+                                                                1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
@@ -1186,7 +1888,8 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
 
         // Both publish rungs fail -> poison; and the charge release fails too.
         s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge,
+                                                                1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
@@ -1202,7 +1905,8 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         auto s = fx.make_session();
         park_pair(fx, s, "up");
         s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe,
+                                                                1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
@@ -1221,7 +1925,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         park_pair(fx, s, "ep");
 
         s.stream->inject_publish_fault_for_test(mcp::McpStreamState::PublishFault::kPreCommit, 2);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
@@ -1239,8 +1943,9 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         Fx fx;
         auto s = fx.make_session();
         park_one(fx, s);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge, 1000);
-        fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge,
+                                                                1000));
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
         CHECK(fx.bridge->record_count() == 1);
         CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total",
@@ -1256,6 +1961,29 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         CHECK(row.detail.find("charge was not released") != std::string::npos);
         CHECK(row.detail.find("were settled") == std::string::npos);
     }
+}
+
+TEST_CASE("bridge teardown fault injector fails loudly on an out-of-range stage (#2523)",
+          "[mcp][bridge][2f]") {
+    // A mistyped stage used to no-op silently, so the test that armed it passed
+    // vacuously against an unfaulted teardown. It must now be loud at the call site
+    // instead of vacuously green at the assertion site.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-oob"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    fx.clock_s->store(1801);  // session death drives the pass-2 teardown
+
+    CHECK_FALSE(fx.bridge->inject_teardown_step_fault_for_test(
+        static_cast<Bridge::TeardownStage>(3), 1000));
+
+    // Nothing armed: the teardown this drives proceeds unfaulted.
+    REQUIRE_NOTHROW(fx.bridge->sweep());
+    CHECK(fx.bridge->record_count() == 0);
+    CHECK(fx.bus.subscriber_count("exec-oob") == 0);
 }
 
 TEST_CASE("bridge pressure - the decided terminal is published even if teardown then fails "
@@ -1282,7 +2010,7 @@ TEST_CASE("bridge pressure - the decided terminal is published even if teardown 
     fx.bus.publish("exec-drop-b", "execution-completed", kCompleted, /*is_terminal=*/true);
     REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
 
-    fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1000);
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1000));
     REQUIRE_NOTHROW(fx.bridge->sweep());
 
     // The victim's terminal reached the ring despite the teardown failing after it.
@@ -1804,13 +2532,217 @@ TEST_CASE("bridge sweep races the projector on a charged (streamed) record (TSan
     CHECK(s.stream->pinned_count() == 1);     // its pin survives the torn-down record (spec E3)
     // Charge released EXACTLY ONCE. Admission = pinned_count() + streamed_unpinned:
     // the 1 orphan pin holds one slot, so EXACTLY 3 fresh streamed reserves fit
-    // (1 + 3 == cap 4) and the 4th is rejected. If the charge had leaked (stuck
-    // held) only 2 would fit; if double-released, the accounting would be wrong.
+    // (1 + 3 == cap 4) WITHOUT reclaiming anything. If the charge had leaked
+    // (stuck held) only 2 would fit. MEASURED (governance Gate 8, quality-engineer):
+    // the double-release direction is NOT detected by this test at single-site
+    // granularity - decrement_streamed_locked's own missing-entry floor absorbs one
+    // redundant call, so only breaking BOTH that floor and release_charge's
+    // exactly-once flag reddens it. Two independent guards is the intended defence;
+    // this test measures the leak direction, and the redundancy is what covers the
+    // other.
+    const auto displaced_total = [&] {
+        return fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+    };
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok);
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
-    CHECK(std::string(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).reject_reason) ==
-          "pin_slots");
+    CHECK(displaced_total() == 0.0);  // all three fit in the free slots
+    // The FOURTH is the cap probe. It used to be refused outright, which is the
+    // #2740 lockout this branch removes: the slot is held by an ORPHAN pin whose
+    // record the sweep above tore down, so nothing else will ever release it.
+    // Admission now reclaims exactly that, which still proves the cap bit here -
+    // a leaked charge would have made this the FOURTH occupant rather than a
+    // reclaim. (See the note above for what this does NOT catch: a single-site
+    // double-release is absorbed by the ledger's own floor.)
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+    CHECK(displaced_total() == 1.0);
+    CHECK(s.stream->pinned_count() == 0);  // the orphan yielded its slot
+}
+
+// #2791: the admission reclaim's staleness argument (select under bridge_mu_, release
+// at commit time, against three unpin routes that take only McpStreamState::mu_ - see
+// select_displaceable_pin_locked's header contract) had no concurrent test. The two
+// cases below race reserve()'s own commit-time release against each of two of those
+// routes for real, under TSan; the third (teardown_claimed's synthesize-and-pin) is not
+// a release race and is out of scope here. Both assert at JOIN, not mid-race: the
+// displacement counter and its audit row are emitted sequentially outside bridge_mu_
+// (reserve()'s own comment says so), so a mid-race observer can legally see one ahead
+// of the other without anything being wrong - the invariant that must hold is over the
+// FINAL state, once every racer has returned.
+TEST_CASE("bridge reserve races on_final_written releasing the pin it would reclaim (TSan) (#2791)",
+          "[mcp][bridge][2f][ch27]") {
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    // Fill all four pin slots with parked, undelivered finals - the state in which the
+    // next admission must reclaim rather than refuse (same setup as CH-26). Waits for
+    // the FULL settle (pinned==i AND unpinned==0), not just the ring pin becoming
+    // visible: pinned_count() reflects publish_terminal_ladder's ring commit before
+    // project_record reaches its own stall-check line, so a pinned_count()-only wait
+    // does not prove record i's projection has fully finished (#2791 UP-4).
+    for (int i = 1; i <= 4; ++i) {
+        const std::string exec = "exec-r1-" + std::to_string(i);
+        REQUIRE(poll_until([&] {
+            return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+        }));
+        REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(i)));  // -> kRingOnly, charged
+        fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
+        REQUIRE(poll_until([&] {
+            const auto snap = fx.bridge->accounting_snapshot_for_test(s.id, s.stream);
+            return snap.pinned == static_cast<std::size_t>(i) && snap.unpinned == 0;
+        }));
+    }
+    REQUIRE(s.stream->pinned_count() == 4);
+
+    // Race: on_final_written releasing record 1's pin (rule-a, McpStreamState::mu_
+    // only - no bridge_mu_) against a burst of admissions, each of which may select
+    // record 1 as the reclaim victim (oldest parked_seq wins) and try to release it
+    // itself at commit time. Idempotent and safe to flood: once the pin is gone,
+    // further calls on the same key are harmless no-ops (mcp_stream_bridge.cpp:1191-1196).
+    const auto key1 = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key1.has_value());
+
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> racer_iterations{0};
+    auto releaser = std::async(std::launch::async, [&] {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!stop.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < until) {
+            fx.bridge->on_final_written(*key1);
+            racer_iterations.fetch_add(1, std::memory_order_relaxed);
+            std::this_thread::yield();
+        }
+    });
+
+    // Every original pin is reclaimable exactly once - regardless of which side
+    // (this loop's own commit-time release, or the concurrent releaser) actually
+    // clears record 1's slot, the total capacity freed across the run is bounded by
+    // the ring's fixed 4-wide array. So the admitted count is deterministic even
+    // though which specific record backs each admission is not.
+    int admitted = 0;
+    int next_id = 100;
+    for (int i = 0; i < 200; ++i) {
+        if (fx.bridge->reserve(s.id, "alice", json(next_id++), json("t"), true).ok) {
+            ++admitted;
+        }
+    }
+    stop.store(true, std::memory_order_release);
+    releaser.get();
+    // Diagnostic only, never a hard assert: a starved racer thread on a loaded CI box
+    // is a real, non-buggy outcome (the admitted==4 invariant below holds regardless -
+    // reserve()'s own commit-time release alone can reclaim all four pins), but zero
+    // iterations means this run gave zero ACTUAL concurrent coverage, which is worth
+    // knowing about without failing the build over it (#2791 Gate 5 UP-3).
+    if (racer_iterations.load(std::memory_order_relaxed) == 0) {
+        WARN("on_final_written racer thread never ran an iteration - this pass exercised "
+             "no actual concurrency, only the deterministic admitted==4 outcome");
+    }
+
+    CHECK(admitted == 4);
+    const auto displaced =
+        fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+    CHECK(displaced == static_cast<double>(fx.audit_count("mcp.bridge.pin_displaced_for_admission")));
+    CHECK(displaced <= 4.0);
+    const auto snap = fx.bridge->accounting_snapshot_for_test(s.id, s.stream);
+    // Deterministic end state: all four originals consumed, four fresh charges in
+    // their place, nothing left to reclaim.
+    CHECK(snap.pinned == 0);
+    CHECK(snap.unpinned == 4);
+    // A ninth attempt (past the 200 already run) must decline cleanly - not crash,
+    // not double-admit.
+    const auto over = fx.bridge->reserve(s.id, "alice", json(9999), json("t"), true);
+    CHECK_FALSE(over.ok);
+    CHECK(std::string(over.reject_reason) == "pin_slots");
+}
+
+TEST_CASE("bridge reserve races a GET resume ack clearing every pin at or below cursor "
+          "(TSan) (#2791)",
+          "[mcp][bridge][2f][ch27]") {
+    // attach_and_replay's rule-(b) ack (mcp_stream.cpp) clears EVERY pin at or below
+    // the cursor with no record lookup at all - unlike on_final_written, it is not
+    // scoped to one record, so this races reserve() against a bulk clear rather than
+    // a single-id release.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    for (int i = 1; i <= 4; ++i) {
+        const std::string exec = "exec-r2-" + std::to_string(i);
+        REQUIRE(poll_until([&] {
+            return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+        }));
+        REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(i)));
+        fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
+        // Full settle, not just the ring pin - see the matching comment on the
+        // sibling on_final_written racer test above (#2791 UP-4).
+        REQUIRE(poll_until([&] {
+            const auto snap = fx.bridge->accounting_snapshot_for_test(s.id, s.stream);
+            return snap.pinned == static_cast<std::size_t>(i) && snap.unpinned == 0;
+        }));
+    }
+    REQUIRE(s.stream->pinned_count() == 4);
+
+    // Captured ONCE, before the race, not recomputed per iteration: nothing published
+    // during the race (the 200 reserve() calls below only ever create kArming records,
+    // which never call stream->publish(...)), so next_event_id() is constant for the
+    // whole run. A cursor equal to the LIVE next_event_id() is never resumable
+    // (attach_and_replay's gate requires last_event_id < next_id_, strictly) - using it
+    // directly made every attach_and_replay call in this test return kGap and skip the
+    // rule-(b) unpin block entirely, so the racer thread raced nothing (#2791 Gate 4
+    // happy-path finding). `next_event_id() - 1` is the highest id already ASSIGNED -
+    // resumable, and >= every one of the four pins set up above, so rule-(b) clears all
+    // four the first time this cursor is used.
+    const std::uint64_t cursor = s.stream->next_event_id() - 1;
+
+    std::atomic<bool> stop{false};
+    // Counts kAttached OUTCOMES, not raw loop passes: a raw pass counter would stay
+    // nonzero even if the cursor regressed back to always-kGap (the loop still spins
+    // and yields regardless of attach outcome), silently defeating this diagnostic's
+    // whole purpose - the exact bug this test exists to catch. Gate 8 happy-path
+    // finding (#2791): the instrumentation that proved the original fix (a temporary
+    // counter showing 1124 successful attaches) was removed after verification instead
+    // of being kept as a permanent, low-cost regression guard - this IS that guard.
+    std::atomic<std::uint64_t> attached_count{0};
+    auto acker = std::async(std::launch::async, [&] {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!stop.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < until) {
+            auto att = s.stream->attach_and_replay(cursor, nullptr, "alice");
+            if (att.status == mcp::McpStreamState::AttachStatus::kAttached) {
+                attached_count.fetch_add(1, std::memory_order_relaxed);
+                s.stream->detach(att.sink);
+            }
+            std::this_thread::yield();
+        }
+    });
+
+    int admitted = 0;
+    int next_id = 100;
+    for (int i = 0; i < 200; ++i) {
+        if (fx.bridge->reserve(s.id, "alice", json(next_id++), json("t"), true).ok) {
+            ++admitted;
+        }
+    }
+    stop.store(true, std::memory_order_release);
+    acker.get();
+    if (attached_count.load(std::memory_order_relaxed) == 0) {
+        WARN("attach_and_replay racer thread never successfully attached - either a starved "
+             "thread gave this pass zero actual concurrency, or the cursor is wrong again and "
+             "rule-(b) never ran (the exact #2791 regression this counter exists to catch)");
+    }
+
+    CHECK(admitted == 4);
+    const auto displaced =
+        fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+    CHECK(displaced == static_cast<double>(fx.audit_count("mcp.bridge.pin_displaced_for_admission")));
+    CHECK(displaced <= 4.0);
+    const auto snap = fx.bridge->accounting_snapshot_for_test(s.id, s.stream);
+    CHECK(snap.pinned == 0);
+    CHECK(snap.unpinned == 4);
+    const auto over = fx.bridge->reserve(s.id, "alice", json(9999), json("t"), true);
+    CHECK_FALSE(over.ok);
+    CHECK(std::string(over.reject_reason) == "pin_slots");
 }
 
 TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL ExecutionTracker "
@@ -1928,5 +2860,1888 @@ TEST_CASE("bridge real final - the terminal payload contract is pinned by a REAL
         CHECK((*terminal_progress)["status"] == "completed");
         CHECK((*terminal_progress)["agents_success"] == 1);
         CHECK((*terminal_progress)["agents_failure"] == 1);
+    }
+}
+
+// ── McpPostPump ──────────────────────────────────────────────────────────────
+//
+// The pump lives beside McpStreamPump in mcp_stream.cpp (it needs that file's
+// anonymous-namespace write_all / count_stream_close), but its tests live HERE
+// because every interesting case needs a real bridge behind take_post_batch.
+
+namespace {
+
+/// The GET pump's test wire, reused verbatim - both pumps share the WriteFn type.
+struct PostWire {
+    std::string out;
+    bool alive = true;
+    mcp::McpPostPump::WriteFn writer() {
+        return [this](const char* p, std::size_t n) {
+            if (!alive) {
+                return false;
+            }
+            out.append(p, n);
+            return true;
+        };
+    }
+    bool contains(std::string_view needle) const { return out.find(needle) != std::string::npos; }
+    std::size_t count(std::string_view needle) const {
+        std::size_t n = 0;
+        for (std::size_t i = out.find(needle); i != std::string::npos;
+             i = out.find(needle, i + needle.size())) {
+            ++n;
+        }
+        return n;
+    }
+};
+
+mcp::McpPostPump::Config fast_post_cfg() {
+    mcp::McpPostPump::Config cfg;
+    cfg.tick = std::chrono::milliseconds(10);  // never sleep a real tick in a unit test
+    return cfg;
+}
+
+/// A `WriteFn` that can be made to BLOCK mid-write, which is the whole point.
+///
+/// The in-process handler fixture never runs a content provider (no socket, #438),
+/// so until this existed nothing anywhere exercised the pump CONCURRENTLY with the
+/// projector, the sweep, or a cancel. That gap is not incidental - it is the reason
+/// a held-lock-across-socket-write, an inert wake channel and an incomplete
+/// close-window fix all survived TSan-clean-3x, three adversarial review rounds and
+/// 89k assertions (governance 2026-07-27, Gate 5). A harness that cannot block the
+/// writer re-verifies a fix with the same instrument that missed the bug.
+struct BlockingWire {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::string out;
+    bool blocked = false;   ///< writer parks until released
+    bool in_write = false;  ///< a writer is parked right now
+    bool alive = true;
+
+    mcp::McpPostPump::WriteFn writer() {
+        return [this](const char* p, std::size_t n) {
+            std::unique_lock<std::mutex> lk(mu);
+            if (blocked) {
+                in_write = true;
+                cv.notify_all();
+                cv.wait(lk, [this] { return !blocked; });
+                in_write = false;
+            }
+            if (!alive) {
+                return false;
+            }
+            out.append(p, n);
+            return true;
+        };
+    }
+    void block() {
+        std::lock_guard<std::mutex> lk(mu);
+        blocked = true;
+    }
+    /// Waits until a writer is actually parked inside the write - the handshake
+    /// that makes "the peer stopped reading" deterministic instead of timing-based.
+    bool await_parked(std::chrono::milliseconds d = std::chrono::seconds(5)) {
+        std::unique_lock<std::mutex> lk(mu);
+        return cv.wait_for(lk, d, [this] { return in_write; });
+    }
+    void release() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            blocked = false;
+        }
+        cv.notify_all();
+    }
+    std::string snapshot() {
+        std::lock_guard<std::mutex> lk(mu);
+        return out;
+    }
+};
+
+}  // namespace
+
+TEST_CASE("McpPostPump: progress frames, then the final LAST, then EOF (C7)",
+          "[mcp][bridge][2f]") {
+    // The whole point of the rung: spec progress-before-response, which the 3a
+    // GET-after-response shape could not provide.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-pump"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    bool final_written = false;
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+        [&] { final_written = fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(),
+        {}, nullptr, "cid-1", "exec-pump");
+
+    PostWire wire;
+    fx.bus.publish("exec-pump", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        pump.pump_once(wire.writer());
+        return wire.contains("notifications/progress");
+    }));
+
+    fx.bus.publish("exec-pump", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return !pump.pump_once(wire.writer()); }));  // final ends the response
+
+    CHECK(final_written);
+    const auto prog_at = wire.out.find("notifications/progress");
+    const auto final_at = wire.out.find(R"("result")");
+    REQUIRE(final_at != std::string::npos);
+    CHECK(prog_at < final_at);  // progress BEFORE the response
+    // A successful final EOFs; a close frame after it would be a contradictory
+    // second terminal on a stream that already answered.
+    CHECK_FALSE(wire.contains("notifications/yuzu.stream_closed"));
+}
+
+TEST_CASE("McpPostPump: the cap closes the response but never the execution (C7)",
+          "[mcp][bridge][2f]") {
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cap2"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    auto cfg = fast_post_cfg();
+    cfg.cap = std::chrono::milliseconds(0);  // already expired on the first tick
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); }, {}, {}, {}, cfg,
+        {}, nullptr, "cid-2", "exec-cap2");
+
+    PostWire wire;
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(wire.contains("notifications/yuzu.stream_closed"));
+    CHECK(wire.contains("cap_expired"));
+    // Only the BRIDGE may declare a cap close, and it does so inside the
+    // projection claim. Let the pump decide it from its own expired deadline and
+    // this next case breaks: work that was already latched gets discarded by a
+    // close instead of delivered.
+    {
+        Fx fx2;
+        auto s2 = fx2.make_session();
+        REQUIRE(fx2.bridge->reserve(s2.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx2.bridge->subscribe(s2.id, json(1), "exec-cap3"));
+        REQUIRE(fx2.bridge->arm(s2.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        auto sink2 = std::make_shared<mcp::sse_bus::SseSinkState>();
+        auto key2 = fx2.bridge->bind_post_sink(s2.id, json(1), sink2);
+        REQUIRE(key2.has_value());
+        auto cfg2 = fast_post_cfg();
+        cfg2.cap = std::chrono::milliseconds(0);  // expired from the very first tick
+        mcp::McpPostPump pump2(
+            sink2, [&](bool cap) { return fx2.bridge->take_post_batch(*key2, cap); }, {}, {}, {},
+            cfg2, {}, nullptr, "cid-2b", "exec-cap3");
+        fx2.bus.publish("exec-cap3", "execution-progress", prog(1, 3));
+        PostWire wire2;
+        REQUIRE(poll_until([&] {
+            const bool open = pump2.pump_once(wire2.writer());
+            return wire2.contains("notifications/progress") && open;
+        }));
+        // Latched progress was DELIVERED despite the expired cap, and the
+        // response stayed open to do it.
+        CHECK_FALSE(wire2.contains("cap_expired"));
+    }
+    // The durable handle must ride the close frame - it is the whole recovery
+    // path for a client whose response was bounded out from under it.
+    CHECK(wire.contains("exec-cap2"));
+
+    // The execution is NOT cancelled: the record parks and its real terminal
+    // still reaches the ring for GET resume.
+    REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+    fx.bus.publish("exec-cap2", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return count_results(ring_frames(*s.stream, "alice")) == 1; }));
+}
+
+TEST_CASE("McpPostPump: a dead peer closes as client_gone, never as cap_expired (C7)",
+          "[mcp][bridge][2f]") {
+    // A write failure must not masquerade as a cap close: that would poison the
+    // reason taxonomy and hand the client a retry schedule for something that
+    // never happened.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-dead"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); }, {}, {}, {},
+        fast_post_cfg(), {}, nullptr, "cid-3", "exec-dead");
+    PostWire wire;
+    wire.alive = false;  // the peer is gone; even the heartbeat fails
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK_FALSE(wire.contains("cap_expired"));
+}
+
+TEST_CASE("McpPostPump: revocation and session death close the response (C7)",
+          "[mcp][bridge][2f]") {
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-rev"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+    auto take = [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); };
+
+    SECTION("a revoked credential closes on the first tick") {
+        mcp::McpPostPump pump(
+            sink, take, {}, [] { return mcp::StreamRevalidate::kRevoked; }, {}, fast_post_cfg(),
+            {}, nullptr, "cid-4", "exec-rev");
+        PostWire wire;
+        CHECK_FALSE(pump.pump_once(wire.writer()));
+        CHECK(wire.contains("credential_revoked"));
+    }
+    SECTION("a dead session closes the response") {
+        mcp::McpPostPump pump(
+            sink, take, {}, std::function<mcp::StreamRevalidate()>{}, [] { return false; },
+            fast_post_cfg(), {}, nullptr, "cid-5", "exec-rev");
+        PostWire wire;
+        CHECK_FALSE(pump.pump_once(wire.writer()));
+        CHECK(wire.contains("session_terminated"));
+    }
+    SECTION("a closed sink ends the response as cancelled") {
+        sink->closed.store(true);
+        mcp::McpPostPump pump(sink, take, {}, {}, {}, fast_post_cfg(), {}, nullptr, "cid-6",
+                              "exec-rev");
+        PostWire wire;
+        CHECK_FALSE(pump.pump_once(wire.writer()));
+        CHECK(wire.contains("cancelled"));
+    }
+}
+
+TEST_CASE("McpPostPump: record_gone closes the response instead of heartbeating (C7)",
+          "[mcp][bridge][2f]") {
+    // The pump's own half of the fix, tested against a fake take_batch with no
+    // live bridge behind it — the seam TakeBatchFn exists for. Before this check
+    // existed, a record_gone batch fell through to the unconditional heartbeat at
+    // the bottom of pump_once_impl and looped forever. Mutation check: deleting
+    // the `if (batch.record_gone)` block in mcp_stream.cpp leaves this red — the
+    // pump keeps the response open and writes a heartbeat instead of closing.
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto take = [](bool /*cap*/) {
+        mcp::McpStreamBridge::PostBatch out;
+        out.record_gone = true;
+        return out;
+    };
+    mcp::McpPostPump pump(sink, take, {}, {}, {}, fast_post_cfg(), {}, nullptr, "cid-7",
+                          "exec-gone");
+    PostWire wire;
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(wire.contains("record_gone"));
+    CHECK_FALSE(wire.contains("cap_expired"));
+    CHECK_FALSE(wire.contains("heartbeat"));
+}
+
+TEST_CASE("McpPostPump: a throwing credit step still closes kCompleted, not internal_error (C7)",
+          "[mcp][bridge][2f]") {
+    // Doomgoose (PR #2781 review): on_final_written_() is called
+    // with no exception containment right after write_all() of the final already
+    // succeeded - so the client has a correct result by the time this runs. A
+    // throw here (this codebase's own modelled fault class for a lock acquisition;
+    // see mcp_stream_bridge.cpp's inject_claim_lock_fault_for_test) used to
+    // propagate to pump_once's outer catch, which stamped kInternalError - a
+    // misreport, since the client's own experience was success - while the
+    // bridge's credit step (final_written + unpin) never ran, silently retaining
+    // the session's pin. Fixed: the true reason is noted before the log/counter
+    // run (first-wins beats pump_once's catch), and a dedicated counter makes the
+    // failure operator-visible instead of folding into the generic fault metric.
+    yuzu::MetricsRegistry reg;
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto take = [](bool /*cap*/) {
+        mcp::McpStreamBridge::PostBatch out;
+        out.final_frame = mcp::McpStreamBridge::PostBatch::PostFrame{
+            R"({"jsonrpc":"2.0","id":1,"result":{"status":"completed"}})", 0};
+        return out;
+    };
+    auto throwing_credit = [] { throw std::runtime_error("lock acquisition failed"); };
+    mcp::McpPostPump pump(sink, take, throwing_credit, {}, {}, fast_post_cfg(), {}, &reg,
+                          "cid-credit-throw", "exec-credit-throw");
+    PostWire wire;
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(pump.close_reason() == mcp::McpStreamClose::kCompleted);
+    CHECK(wire.contains(R"("status":"completed")"));  // the client got its real result
+    CHECK_FALSE(wire.contains("internal_error"));
+    CHECK_FALSE(wire.contains("notifications/yuzu.stream_closed"));  // kCompleted writes no close frame
+    CHECK(reg.counter("yuzu_mcp_stream_final_credit_failed_total").value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_stream_closes_total", {{"reason", "internal_error"}}).value() ==
+          0.0);
+    CHECK(reg.counter("yuzu_mcp_stream_closes_total", {{"reason", "completed"}}).value() == 1.0);
+}
+
+TEST_CASE("McpPostPump: the credit step's own success path is unaffected by the try/catch (C7)",
+          "[mcp][bridge][2f]") {
+    // The happy path must still unpin - the containment in the prior test must not
+    // swallow a SUCCESSFUL call too.
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto take = [](bool /*cap*/) {
+        mcp::McpStreamBridge::PostBatch out;
+        out.final_frame = mcp::McpStreamBridge::PostBatch::PostFrame{
+            R"({"jsonrpc":"2.0","id":1,"result":{"status":"completed"}})", 0};
+        return out;
+    };
+    bool credited = false;
+    mcp::McpPostPump pump(sink, take, [&] { credited = true; }, {}, {}, fast_post_cfg(), {},
+                          nullptr, "cid-credit-ok", "exec-credit-ok");
+    PostWire wire;
+    CHECK_FALSE(pump.pump_once(wire.writer()));
+    CHECK(credited);
+    CHECK(pump.close_reason() == mcp::McpStreamClose::kCompleted);
+}
+
+TEST_CASE("McpPostPump: the wait is bounded by the next credential check, not a fresh tick "
+          "(CH-22)",
+          "[mcp][bridge][2f][ch22]") {
+    // THE DEFECT THIS PINS. Gating revalidate behind `next_check_` stopped a
+    // poke-driven pump from scaling auth load with the progress-frame rate - but the
+    // WAIT stayed a fresh FULL tick measured from each WAKE. A poke landing just
+    // before the boundary therefore woke the pump, found the check not yet due, and
+    // waited another whole tick, pushing the credential re-check out to nearly TWO
+    // ticks after the previous one. That silently doubles the one-tick revocation
+    // bound promised by Decision 15(c) / CH-4, by mcp_stream.hpp, and by
+    // docs/mcp-server.md - a security bound weakened by a performance fix.
+    //
+    // WHY NOTHING CAUGHT IT. Every other revocation test closes on tick ONE, where
+    // the default-constructed `next_check_` is the epoch and the check is always due.
+    // The defect lives strictly on the SECOND tick, and no test drove one. Note the
+    // direction is counter-intuitive: FREQUENT pokes are harmless, because each wake
+    // re-tests the gate. The bad case is ONE poke just before the boundary, then
+    // silence - which is what a command that emits a burst and then runs quiet does.
+    //
+    // DETERMINISTIC BY CONSTRUCTION, not by timing luck. The injected clock is FROZEN
+    // 50ms short of the next check, so the correct wait is 50ms while the pre-fix
+    // wait is the full 5s tick. The 1500ms ceiling sits 30x above the correct value
+    // and 3x below the buggy one, which is what keeps it safe on a loaded shared CI
+    // runner where a wall-clock assertion would otherwise be a flake generator.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-bound"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump::Config cfg;
+    cfg.tick = std::chrono::seconds(5);  // deliberately LONG, so the two cases diverge
+    const auto base = std::chrono::steady_clock::now();
+    // Single-threaded: pump_once is called directly on this thread, so the fake clock
+    // needs no synchronisation and TSan has nothing to see.
+    auto fake = base;
+    int revalidations = 0;
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); }, {},
+        [&] {
+            ++revalidations;
+            return mcp::StreamRevalidate::kValid;
+        },
+        {}, cfg, [&] { return fake; }, nullptr, "cid-bound", "exec-bound");
+    PostWire wire;
+
+    // Tick one: `next_check_` is the epoch, so the check is due immediately and the
+    // wait budget is zero. This is the tick every existing test stops at.
+    REQUIRE(pump.pump_once(wire.writer()));
+    REQUIRE(revalidations == 1);
+
+    // Freeze 50ms short of the next check, then take the second tick. The pump must
+    // wake in time FOR that check rather than restarting a full tick.
+    fake = base + cfg.tick - std::chrono::milliseconds(50);
+    const auto started = std::chrono::steady_clock::now();
+    REQUIRE(pump.pump_once(wire.writer()));
+    const auto waited = std::chrono::steady_clock::now() - started;
+
+    CHECK(waited < std::chrono::milliseconds(1500));
+
+    // AND the check must then actually HAPPEN. The assertion above alone proves
+    // only that the pump stopped waiting sooner - it would stay green against an
+    // implementation that woke early and then skipped the credential check, which
+    // is the very regression this test exists to prevent. Both adversarial
+    // reviewers reached this gap independently, and one proved it by adding this
+    // line and watching it fail 1 == 2.
+    //
+    // The clock must be advanced to the boundary to see it: while `fake` is frozen
+    // 50ms short, the post-wait sample is still short too, so the gate is
+    // correctly closed and `revalidations` correctly stays 1.
+    fake = base + cfg.tick;
+    REQUIRE(pump.pump_once(wire.writer()));
+    CHECK(revalidations == 2);
+
+    // The sub-millisecond floor, which is the OTHER way this wait can go wrong. A
+    // remainder under 1ms must not round DOWN to a zero budget: that returns
+    // instantly, falls through to the unconditional heartbeat write at the bottom
+    // of the pass, and lets the caller re-enter in a tight spin that emits
+    // heartbeat frames at the client until real time crosses the boundary. `ceil`
+    // is what turns that spin back into a wait.
+    //
+    // Asserted as a LOWER bound, because that is the only direction that separates
+    // a real 1ms wait from an instant return; the upper bound is already covered
+    // above. 2x margin on a wait a condition variable will not cut short.
+    fake = base + 2 * cfg.tick - std::chrono::microseconds(500);
+    const auto spin_start = std::chrono::steady_clock::now();
+    REQUIRE(pump.pump_once(wire.writer()));
+    CHECK(std::chrono::steady_clock::now() - spin_start >= std::chrono::microseconds(500));
+}
+
+TEST_CASE("bridge take_post_batch - ring-commits and hands the same frames to the wire (C7)",
+          "[mcp][bridge][2f]") {
+    // The ring copy is the durable one (GET resume); the returned frames are the
+    // live one. Both come from ONE projection pass, so they cannot disagree.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-tb"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+
+    SECTION("progress frames") {
+        fx.bus.publish("exec-tb", "execution-progress", prog(1, 3));
+        // The projector must NOT drain a kStreaming record - it is pump-owned.
+        auto batch = poll_batch(*fx.bridge, *key);
+        REQUIRE(batch.progress.size() == 1);
+        CHECK(batch.progress[0].data.find("notifications/progress") != std::string::npos);
+        CHECK_FALSE(batch.final_frame.has_value());
+        // ...and the same frame is replayable.
+        CHECK(count_method(ring_frames(*s.stream, "alice"), "notifications/progress") == 1);
+    }
+    SECTION("the final comes back separately so the pump can write it LAST") {
+        fx.bus.publish("exec-tb", "execution-completed", kCompleted);
+        Bridge::PostBatch batch;
+        REQUIRE(poll_until([&] {
+            batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/false);
+            return batch.final_frame.has_value();
+        }));
+        auto j = json::parse(batch.final_frame->data, nullptr, /*allow_exceptions=*/false);
+        REQUIRE(j.is_object());
+        CHECK(j["result"]["status"] == "completed");
+        CHECK(j["result"]["execution_id"] == "exec-tb");
+        CHECK(count_results(ring_frames(*s.stream, "alice")) == 1);  // pinned for resume
+    }
+    SECTION("an idle record yields nothing and settles nothing") {
+        auto batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/false);
+        CHECK(batch.progress.empty());
+        CHECK_FALSE(batch.final_frame.has_value());
+        CHECK_FALSE(batch.cap_settled);
+        CHECK_FALSE(batch.deferred);
+    }
+    SECTION("an unknown key is an empty tick, never a throw") {
+        auto batch = fx.bridge->take_post_batch("no-such-key", /*cap_expired=*/true);
+        CHECK(batch.progress.empty());
+        CHECK_FALSE(batch.cap_settled);  // nothing to settle - the record is gone
+    }
+}
+
+TEST_CASE("bridge take_post_batch - a terminal beats an expired cap (C7)",
+          "[mcp][bridge][2f]") {
+    // The cap is decided INSIDE the projection claim precisely so a terminal that
+    // landed in the same instant still wins. Closing with kCapExpired while a real
+    // result sat latched would tell the client to go poll for an answer the server
+    // was holding.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cap"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+
+    SECTION("cap expires with nothing latched - the pump may close") {
+        auto batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        CHECK(batch.cap_settled);
+        CHECK_FALSE(batch.final_frame.has_value());
+    }
+    SECTION("cap expires WITH a terminal latched - the terminal wins") {
+        fx.bus.publish("exec-cap", "execution-completed", kCompleted);
+        Bridge::PostBatch batch;
+        REQUIRE(poll_until([&] {
+            batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+            return batch.final_frame.has_value();
+        }));
+        CHECK_FALSE(batch.cap_settled);  // NOT a cap close - deliver the result
+        auto j = json::parse(batch.final_frame->data, nullptr, /*allow_exceptions=*/false);
+        CHECK(j["result"]["status"] == "completed");
+    }
+}
+
+TEST_CASE("bridge take_post_batch - an expired cap settles one drain pass later, "
+          "never at execution pace (#2739)",
+          "[mcp][bridge][2f][ch23]") {
+    // Before this fix, cap arbitration was reached only on a pass with neither
+    // progress nor terminal pending - so a mailbox that refilled every tick held
+    // the response open for the WHOLE execution, and every operator statement
+    // derived from the 120 s cap was wrong. The contract that killed the naive
+    // fix still holds: the drain pass DELIVERS latched work and stays open; only
+    // the pass after it settles.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-drain"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+
+    SECTION("continuous progress cannot hold the response open past the drain pass") {
+        // publish() fans out to the bridge listener synchronously (under
+        // Channel::mu), so every take below sees exactly the mailbox its
+        // preceding publish latched - no polling needed on this path.
+        fx.bus.publish("exec-drain", "execution-progress", prog(1, 5));
+        auto drain = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        REQUIRE(drain.progress.size() == 1);  // latched work is DELIVERED (C7)...
+        CHECK_FALSE(drain.cap_settled);       // ...and this pass stays open to do it
+        // The execution keeps producing - the exact shape that used to keep the
+        // response open indefinitely.
+        fx.bus.publish("exec-drain", "execution-progress", prog(2, 5));
+        auto settle = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        CHECK(settle.cap_settled);       // one drain pass, then the cap wins
+        CHECK(settle.progress.empty());  // held back on the cap path...
+        // ...and NOT lost: the record parks and the projector flushes the held
+        // frame to the ring, so a GET resume still replays it.
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        REQUIRE(poll_until([&] {
+            return count_method(ring_frames(*s.stream, "alice"), "notifications/progress") == 2;
+        }));
+    }
+
+    SECTION("a terminal latched after the drain pass bypasses the suppression - "
+            "held progress rides the same pass, ahead of the final") {
+        fx.bus.publish("exec-drain", "execution-progress", prog(1, 5));
+        auto drain = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        REQUIRE(drain.progress.size() == 1);
+        fx.bus.publish("exec-drain", "execution-progress", prog(2, 5));
+        fx.bus.publish("exec-drain", "execution-completed", kCompleted);
+        auto fin = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        REQUIRE(fin.final_frame.has_value());
+        CHECK_FALSE(fin.cap_settled);  // a real result is never masked as a cap close
+        // The intervening frame is delivered on the terminal pass rather than
+        // stranded in a record about to settle kDone; the pump writes progress
+        // first and the final last, preserving progress-before-final ordering.
+        REQUIRE(fin.progress.size() == 1);
+        CHECK(fin.progress[0].data.find("notifications/progress") != std::string::npos);
+    }
+
+    SECTION("the drain pass pokes the bound sink - the settle pass needs no "
+            "further event or tick to wake") {
+        auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+        REQUIRE(fx.bridge->bind_post_sink(s.id, json(1), sink).has_value());
+        fx.bus.publish("exec-drain", "execution-progress", prog(1, 5));
+        // Let the projector's own wake-forwarding poke for this publish land
+        // first, then shed it so the assertion isolates the drain pass's poke.
+        REQUIRE(poll_until([&] { return sink->poked.load(std::memory_order_acquire); }));
+        sink->poked.store(false, std::memory_order_release);
+        auto drain = fx.bridge->take_post_batch(*key, /*cap_expired=*/true);
+        REQUIRE(drain.progress.size() == 1);
+        CHECK(sink->poked.load(std::memory_order_acquire));
+    }
+}
+
+TEST_CASE("McpPostPump: wire frames carry the replay-ring event id (#2785)",
+          "[mcp][bridge][2f][ch25]") {
+    // The replay ring commits every streamed-POST frame under a real,
+    // monotonically-increasing event id - but until this fix the pump wrote
+    // every frame with the 2-arg SseEvent (id 0, "no id"), so a client that
+    // only ever saw the POST connection had no id to hand back as
+    // `Last-Event-ID` and the documented resume contract was unreachable from
+    // this surface. Asserted against the WIRE TEXT and the ring only, so this
+    // test compiles unchanged on the unfixed tree - where it fails.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-wireid"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); }, {}, {}, {},
+        fast_post_cfg(), {}, nullptr, "cid-wireid", "exec-wireid");
+
+    PostWire wire;
+    fx.bus.publish("exec-wireid", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        return pump.pump_once(wire.writer()) && wire.contains("notifications/progress");
+    }));
+    fx.bus.publish("exec-wireid", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return !pump.pump_once(wire.writer()); }));
+    REQUIRE(wire.contains(R"("status":"completed")"));
+
+    // Every ring-committed progress/result frame's id must appear as an SSE
+    // `id:` line on the POST wire - the ring id is the only resume cursor a
+    // POST-only client can ever learn. (Heartbeats carry none by design.)
+    auto frames = ring_frames(*s.stream, "alice");
+    std::size_t matched = 0;
+    for (const auto& f : frames) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        const bool relevant = j.is_object() && (j.value("method", "") == "notifications/progress" ||
+                                                j.contains("result"));
+        if (!relevant) {
+            continue;
+        }
+        REQUIRE(f.id != 0);
+        CHECK(wire.contains("id: " + std::to_string(f.id) + "\n"));
+        ++matched;
+    }
+    CHECK(matched >= 2);  // at least the one progress frame and the final
+}
+
+TEST_CASE("bridge bind_post_sink - gates on kStreaming and hands off latched work (C7)",
+          "[mcp][bridge][2f]") {
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-bind"));
+
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    // kArming is not a live wire.
+    CHECK_FALSE(fx.bridge->bind_post_sink(s.id, json(1), sink).has_value());
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+    CHECK_FALSE(fx.bridge->bind_post_sink(s.id, json(99), sink).has_value());  // unknown
+    CHECK_FALSE(fx.bridge->bind_post_sink(s.id, json(1), nullptr).has_value());  // null sink
+
+    SECTION("the projector wakes the bound sink, and does so as a handoff") {
+        // A streamed record's frames are ring-only (deliver_live=false), so the
+        // publish path never notifies this sink - the projector is the ONLY thing
+        // that can, and the record stays pump-owned meanwhile.
+        //
+        // SCOPE OF THIS TEST, stated honestly: it proves the record stays
+        // PUMP-OWNED - the projector does not drain it behind the pump's back, and
+        // the work is there for take_post_batch to collect.
+        //
+        // It does NOT test the wake itself. An earlier version held the sink mutex
+        // across the publish to try to force the lost-wakeup window; that proved
+        // nothing (mutation showed removing poke_post_sink's sink-mutex
+        // acquisition left it green, because the poke only arrives after the bus
+        // listener, the projector wake and a thread switch) AND it inverted the
+        // lock order - the bus listener takes the record mutex, so holding the
+        // sink mutex across a publish builds sink->record against the projector's
+        // sanctioned record->sink, which TSan correctly flagged as a potential
+        // deadlock. The wake discipline is recorded as uncovered at its source.
+        fx.bus.publish("exec-bind", "execution-progress", prog(1, 3));
+        auto batch = poll_batch(*fx.bridge, *key);
+        CHECK(batch.progress.size() == 1);
+    }
+    SECTION("the sink is released when the wire goes away") {
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+        // Parked: the projector owns it again and drains it to the ring itself.
+        fx.bus.publish("exec-bind", "execution-completed", kCompleted);
+        REQUIRE(poll_until([&] { return count_results(ring_frames(*s.stream, "alice")) == 1; }));
+    }
+}
+
+TEST_CASE("bridge streamed-POST close is allocation-free and keyed (C6c)",
+          "[mcp][bridge][2f]") {
+    // The pump's releaser runs inside ~Response, so it must not build the record
+    // key itself - that is a bad_alloc site in a destructor. record_key() pays
+    // that cost up front and the releaser closes with the string it returned.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-k"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+    CHECK_FALSE(fx.bridge->record_key(s.id, json(99)).has_value());  // unknown record
+
+    SECTION("no final written - the record parks for GET resume") {
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+        CHECK_FALSE(fx.bridge->on_post_closed_keyed(*key));  // exactly once
+    }
+    SECTION("final already on the wire - the record is DONE, not parked") {
+        REQUIRE(fx.bridge->on_final_written(*key));
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        // Parking here would hold a resume window open for an answer the client
+        // already has.
+        auto ph = fx.bridge->phase_for(s.id, json(1));
+        CHECK((!ph.has_value() || ph == Bridge::Phase::kDone));  // kDone, or already reaped
+    }
+    SECTION("a parked record still credits a final its pump actually wrote") {
+        // The sweep's stale-arm backstop can flip kStreaming -> kRingOnly while
+        // the pump is mid-tick; on_final_written must still accept the final that
+        // pump goes on to write, or the session's pin leaks.
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));  // -> kRingOnly
+        CHECK(fx.bridge->on_final_written(*key));
+    }
+}
+
+TEST_CASE("on_final_written rejects a phase that never held a streamed wire (C6c)",
+          "[mcp][bridge][2f]") {
+    // The invariant that survives widening on_final_written to accept kRingOnly:
+    // a record armed GET-only was never a streamed wire, so a final for it is
+    // rejected. Mutation check: deleting the phase check entirely leaves this
+    // green too unless this test exists — it is the coverage commit 97fd6379's
+    // duplicate SECTION (same file, both asserting accept) claimed to have and
+    // did not.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-getonly"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+    CHECK_FALSE(fx.bridge->on_final_written(*key));
+}
+
+TEST_CASE("take_post_batch reports record_gone, not a silent empty tick (C6c)",
+          "[mcp][bridge][2f]") {
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-rg"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+
+    SECTION("an unknown key reports record_gone") {
+        auto batch = fx.bridge->take_post_batch("no-such-key", /*cap_expired=*/false);
+        CHECK(batch.record_gone);
+        CHECK_FALSE(batch.cap_settled);
+    }
+    SECTION("a key that existed before shutdown() reports record_gone") {
+        fx.bridge->shutdown();
+        auto batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/false);
+        CHECK(batch.record_gone);
+        CHECK_FALSE(batch.cap_settled);
+    }
+}
+
+TEST_CASE("take_post_batch reports record_gone for a record settled kDone but not yet reaped (C6c)",
+          "[mcp][bridge][2f]") {
+    // Gate 8 wave 2 (cpp-safety): on_post_closed_keyed's own kDone transition
+    // deliberately does NOT erase the record - "settle kDone and let sweep reap
+    // it" - so a record can sit in records_ with phase kDone for an arbitrary
+    // stretch before a later sweep pass claims and erases it. If a pump is still
+    // ticking on that key in that window (the sweep's stranded-kStreaming
+    // backstop having parked it earlier, or a slow releaser), take_post_batch
+    // still finds the record and hands it to project_record, whose own
+    // kArming/kDone/kAborted early return is the third record_gone gap the
+    // first two fixed sites in take_post_batch did not cover.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-settled"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto key = fx.bridge->record_key(s.id, json(1));
+    REQUIRE(key.has_value());
+
+    REQUIRE(fx.bridge->on_final_written(*key));
+    REQUIRE(fx.bridge->on_post_closed_keyed(*key));  // final_written -> kDone, not erased
+    REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kDone);
+
+    auto batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/false);
+    CHECK(batch.record_gone);
+    CHECK_FALSE(batch.cap_settled);
+    CHECK_FALSE(batch.final_frame.has_value());
+}
+
+TEST_CASE("bridge sweep backstop PARKS a stranded kStreaming record, never reaps it (C6c)",
+          "[mcp][bridge][2f]") {
+    // No sweep pass claims kStreaming, so a record whose releaser never ran is
+    // invisible to all of them - including session death - and leaks for the life
+    // of the process. The backstop must PARK it: a reap would unsubscribe, unpin
+    // and erase a result the client can still legitimately collect.
+    Fx fx{Bridge::Config{.global_record_cap = 256,
+                         .ring_only_pressure_cap = 64,
+                         .streaming_park_after = std::chrono::seconds(0)}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-strand"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    // The releaser never runs - exactly the stranding this backstop exists for.
+    fx.bridge->sweep();
+
+    REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);  // PARKED
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_streaming_backstop_total").value() == 1.0);
+
+    // Parked, not torn down: the subscription survived, so the real terminal
+    // still reaches the ring for GET resume. A reap would have destroyed it.
+    fx.bus.publish("exec-strand", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return count_results(ring_frames(*s.stream, "alice")) == 1; }));
+    for (const auto& f : ring_frames(*s.stream, "alice")) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && j.contains("result")) {
+            CHECK(j["result"]["status"] == "completed");
+            CHECK(j["result"]["execution_id"] == "exec-strand");
+        }
+    }
+}
+
+TEST_CASE("bridge sweep backstop leaves a healthy kStreaming record alone (C6c)",
+          "[mcp][bridge][2f]") {
+    // The mirror of the test above: with a live session and the normal threshold
+    // the sweep must NOT park a stream out from under its own pump.
+    Fx fx;  // default streaming_park_after = 600s
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-live"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    fx.bridge->sweep();
+    CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kStreaming);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_streaming_backstop_total").value() == 0.0);
+}
+
+TEST_CASE("bridge park_after_dispatch_failure - parks, keeps the subscription, publishes the real final (C6b)",
+          "[mcp][bridge][2f]") {
+    // A post-dispatch failure means the work IS running, so the record must keep
+    // its listener and stay able to publish the real terminal for GET resume.
+    // abandon() would unsubscribe and discard a result the client can still
+    // legitimately collect - that is the whole distinction this transition exists
+    // to make.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-park"));
+    REQUIRE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));
+    REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+
+    // The subscription survived: a terminal published AFTER the park still
+    // reaches the record and is projected as a pinned real final.
+    fx.bus.publish("exec-park", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return count_results(ring_frames(*s.stream, "alice")) == 1; }));
+    for (const auto& f : ring_frames(*s.stream, "alice")) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && j.contains("result")) {
+            CHECK(j["result"]["status"] == "completed");        // the REAL terminal
+            CHECK(j["result"]["execution_id"] == "exec-park");  // durable handle
+        }
+    }
+    CHECK(fx.audit_count("mcp.bridge.dispatch_failure") == 1);
+}
+
+TEST_CASE("bridge park_after_dispatch_failure - arbitration and the prebuilt fallback (C6b)",
+          "[mcp][bridge][2f]") {
+    SECTION("only kArming parks; a second call loses") {
+        Fx fx;
+        auto s = fx.make_session();
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-1"));
+        REQUIRE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));
+        CHECK_FALSE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));  // no longer kArming
+        CHECK(fx.audit_count("mcp.bridge.dispatch_failure") == 1);           // exactly once
+    }
+    SECTION("an armed record cannot be parked - arm won the arbitration") {
+        Fx fx;
+        auto s = fx.make_session();
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        CHECK_FALSE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));
+    }
+    SECTION("an unknown record is a no-op, never a throw") {
+        Fx fx;
+        auto s = fx.make_session();
+        CHECK_FALSE(fx.bridge->park_after_dispatch_failure(s.id, json(99)));
+    }
+    SECTION("a record parked BEFORE arm still has a non-empty fallback final") {
+        // subscribe() prebuilds it; without that, a parked-before-arm record whose
+        // real-final build fails would publish an EMPTY frame, because arm() -
+        // the only other place that fills fallback_final - never ran.
+        Fx fx;
+        auto s = fx.make_session();
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-fb"));
+        REQUIRE(fx.bridge->park_after_dispatch_failure(s.id, json(1)));
+        // Fail the REAL final build so the projector publishes the prebuilt
+        // fallback. An un-prebuilt record publishes an empty frame here, which
+        // parses as no result at all - which is what the count below catches.
+        fx.bridge->inject_projection_build_fault_for_test(1);
+        fx.bus.publish("exec-fb", "execution-completed", kCompleted);
+        REQUIRE(poll_until([&] { return count_results(ring_frames(*s.stream, "alice")) == 1; }));
+        auto frames = ring_frames(*s.stream, "alice");
+        REQUIRE(count_results(frames) == 1);
+        for (const auto& f : frames) {
+            auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+            if (j.is_object() && j.contains("result")) {
+                CHECK(j["result"]["execution_id"] == "exec-fb");
+                CHECK(j["result"]["status"] == "unknown");  // the prebuilt fallback shape
+            }
+        }
+    }
+}
+
+TEST_CASE("bridge reserve - the streamed charge and the record commit together (C6a)",
+          "[mcp][bridge][2f]") {
+    // The ledger bump and the map insert BOTH allocate, so either can throw with
+    // the other already applied. A bump that survives a failed insert is a phantom
+    // charge: nothing will ever release it, so the session's streamed admissions
+    // reject pin_slots forever.
+    Fx fx;
+    auto s = fx.make_session();
+    fx.bridge->inject_reserve_commit_fault_for_test();
+    REQUIRE_THROWS_AS(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true),
+                      std::bad_alloc);
+    CHECK_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());  // no orphan record
+
+    // The load-bearing half: the ledger is invisible from outside, so the only
+    // way to prove it rolled back is to spend every slot. kMaxStreamedPostsPerSession
+    // is 4 - if the failed reserve leaked a charge, the FOURTH of these rejects.
+    CHECK(fx.bridge->reserve(s.id, "alice", json(2), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, "alice", json(4), json("t"), true).ok);
+    CHECK(fx.bridge->reserve(s.id, "alice", json(5), json("t"), true).ok);
+    // ...and the cap itself still bites, so the test cannot pass by the ledger
+    // simply never counting.
+    auto over = fx.bridge->reserve(s.id, "alice", json(6), json("t"), true);
+    CHECK_FALSE(over.ok);
+    CHECK(std::string(over.reject_reason == nullptr ? "" : over.reject_reason) == "pin_slots");
+}
+
+// ── #2528: ~ClaimGuard must release the claim even when it cannot take mu ──────
+//
+// The claim used to be cleared INSIDE the try whose first act was the record-lock
+// acquisition, so a lock failure left it set forever. All four consumers then skip
+// the record; under the defer-ends-the-pass behaviour that predated UP-5 (#2489)
+// one such victim also stalled ring-only pressure relief bridge-wide, and it now
+// wedges only itself.
+//
+// Coverage note (deliberate, not an omission): the degraded path's third arm -
+// storing terminal_projected when the frame was ALREADY published - needs the
+// kRingOnly settle block (bridge_mu_ + mu) to fail as well as the guard's own
+// lock, and no seam models that second failure. It is one relaxed store that can
+// only help, so it stays as documented-uncovered defence-in-depth rather than
+// getting a test that proves something weaker than it claims.
+
+TEST_CASE("bridge #2528 - a ClaimGuard lock failure still releases the claim",
+          "[mcp][bridge][2f][2528]") {
+    // Progress-only batch: nothing was owed to the settle, so releasing the claim
+    // is a COMPLETE recovery. The load-bearing assertion is the SECOND batch - it
+    // can only project if the claim was released, and under the pre-fix code it
+    // never appeared.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-cg"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kGetOnly) == Bridge::ArmOutcome::kArmed);
+
+    fx.bridge->inject_claim_lock_fault_for_test(1);
+    fx.bus.publish("exec-cg", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        return count_method(ring_frames(*s.stream, "alice"), "notifications/progress") == 1;
+    }));
+    // The claim was taken for that batch and its guard hit the injected lock
+    // failure, so the degraded release is what frees it - ~ClaimGuard is the other
+    // releaser and it is precisely the one the injected failure disabled.
+    REQUIRE(poll_until(
+        [&] { return fx.reg.counter("yuzu_mcp_bridge_projection_degraded_total").value() == 1.0; }));
+
+    fx.bus.publish("exec-cg", "execution-progress", prog(2, 3));
+    REQUIRE(poll_until([&] {
+        return count_method(ring_frames(*s.stream, "alice"), "notifications/progress") == 2;
+    }));
+    // Healed: the second batch's guard took mu normally, so nothing further degraded.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_projection_degraded_total").value() == 1.0);
+}
+
+TEST_CASE("bridge #2528 - a terminal lost to the degraded settle publishes the fallback, never -32014",
+          "[mcp][bridge][2f][2528]") {
+    // The one path that leaves a terminal extracted-but-unpublished is the double
+    // build failure, whose documented recovery is "restore and let the next wake
+    // retry". If the guard cannot retake mu, that restore is impossible and the
+    // payload is gone for good - terminal_slot is empty and sticky
+    // terminal_accepted stops any listener refill, so NO retry exists and a
+    // consumer that merely defers would defer forever.
+    //
+    // The honest disposition is therefore the same as kTerminalKnownLost: a
+    // terminal demonstrably happened, so publish the success-shaped fallback -
+    // never -32014 (which would deny a terminal that did occur) and never a silent
+    // kNone (which would answer the client nothing at all).
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-pl"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));  // -> kRingOnly
+
+    fx.bridge->inject_projection_build_fault_for_test(1);     // real final throws
+    fx.bridge->inject_projection_fallback_fault_for_test(1);  // ...and so does the fallback
+    fx.bridge->inject_claim_lock_fault_for_test(1);
+    fx.bus.publish("exec-pl", "execution-completed", kCompleted);
+
+    // Sweep converges: before the projector runs, the visitor sees a latched but
+    // unprojected terminal and defers (it must NOT steal it); once the degraded
+    // settle marks the payload lost, the next sweep claims and publishes.
+    REQUIRE(poll_until([&] {
+        fx.bridge->sweep();
+        return !fx.bridge->phase_for(s.id, json(1)).has_value();
+    }));
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_projection_degraded_total").value() == 1.0);
+
+    auto frames = ring_frames(*s.stream, "alice");
+    CHECK(count_error_code(frames, mcp::kMcpTerminalUnavailable) == 0);  // NEVER -32014
+    REQUIRE(count_results(frames) == 1);                                 // exactly one final
+    for (const auto& f : frames) {
+        auto j = json::parse(f.data, nullptr, /*allow_exceptions=*/false);
+        if (j.is_object() && j.contains("result")) {
+            CHECK(j["result"]["execution_id"] == "exec-pl");  // durable handle present
+            CHECK(j["result"]["status"] == "unknown");        // fallback shape
+        }
+    }
+    {  // audited as a published fallback, not as a silent expiry
+        std::lock_guard<std::mutex> lk(fx.audit_mu);
+        bool ok = false;
+        for (const auto& row : fx.audits) {
+            if (row.action == "mcp.bridge.forced_expire" &&
+                row.detail == "the fallback final was published") {
+                ok = true;
+            }
+        }
+        CHECK(ok);
+    }
+}
+
+// ── #2529: arm()'s cancel-degrade must return the charge both-or-neither ───────
+//
+// The degrade used to clear streamed_charge_held inside arm()'s flip hold and take
+// bridge_mu_ afterwards. That acquisition is the sole throw site, so a failure left
+// the record reading "not held" while streamed_unpinned_[session] still counted it:
+// exactly-once release is keyed on the flag, so EVERY later release path - the
+// projector settle, teardown_claimed - then found nothing to do and the session's
+// admission slot was spent for good. Routing the release through release_charge,
+// which takes both locks before mutating either half, makes the failure a DEFERRAL
+// instead: the record and the ledger still agree, so the record's own teardown
+// reclaims the slot.
+//
+// C8 is what makes this reachable at all - ArmMode::kStreaming has no production
+// caller before it, so kDegradedGetOnly cannot happen today.
+TEST_CASE("bridge #2529 - a charge-release lock failure defers, never strands, the admission slot",
+          "[mcp][bridge][2f][2529]") {
+    Fx fx;
+    auto s = fx.make_session();
+    // Record 1 is the degrade victim; 2-4 spend the remaining pin slots so the cap
+    // is exactly consumed and a further reserve becomes the ledger probe (the
+    // ledger is invisible from outside - spending the cap is the only way to read it).
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2529"));
+    for (int i = 2; i <= 4; ++i) {
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok);
+    }
+
+    // A cancel that lands BEFORE arm is the one path that returns a charge outside
+    // teardown: arm consumes the intent and degrades the streamed record to GET-only.
+    REQUIRE(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kAcceptedPending);
+    fx.bridge->inject_charge_lock_fault_for_test(1);
+    // CONTAINED, and the outcome is still the true one: the flip already succeeded,
+    // so throwing here would lose a completed arm over a bookkeeping failure.
+    CHECK(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming, "{}") ==
+          Bridge::ArmOutcome::kDegradedGetOnly);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_charge_release_deferred_total").value() == 1.0);
+
+    // The charge was NOT returned and the ledger still counts it - they AGREE, so
+    // the cap correctly still bites. This is NOT the load-bearing assertion: the
+    // pre-fix code also rejected here (for the opposite, broken reason).
+    auto pin_reject3 = fx.bridge->reserve(s.id, "alice", json(5), json("t"), true);
+    // Null-guarded like the sibling at the C6a test: if the cap ever fails to
+    // bite, std::string(nullptr) is UB and kills the whole binary instead of
+    // failing this assertion cleanly.
+    CHECK(std::string(pin_reject3.reject_reason == nullptr ? ""
+                                                           : pin_reject3.reject_reason) ==
+          "pin_slots");
+
+    // THE LOAD-BEARING HALF. The record still reads "charge held", so the next
+    // release path repairs it. For a degraded record that path is its teardown: the
+    // GET-only terminal branch settles to kDone without touching the charge (a
+    // GET-only record normally holds none), and the sweep's reap releases it.
+    // Pre-fix the flag was already clear, so this teardown released nothing and the
+    // slot stayed spent for the life of the session.
+    fx.bus.publish("exec-2529", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kDone; }));
+    fx.bridge->sweep();
+    REQUIRE_FALSE(fx.bridge->phase_for(s.id, json(1)).has_value());  // reaped
+    CHECK(s.stream->pinned_count() == 0);  // GET-only never pins, so this reads the ledger alone
+    CHECK(fx.bridge->reserve(s.id, "alice", json(6), json("t"), true).ok);
+}
+
+// ── C10: chaos P0 endpoint reproductions (docs/mcp-streamable-http-chaos-design.md) ──
+
+TEST_CASE("CH-2: a parked streamed record survives a ring wrap - the pinned final is "
+          "replayed exactly once, and an evicted cursor is a GAP not a silent skip",
+          "[mcp][bridge][2f][chaos][ch2]") {
+    // The re-run the chaos design defers to this rung: the final-frame eviction
+    // exemption only exists once the bridge does. Shape in both halves: stream
+    // progress, lose the client mid-stream, let the execution finish while nobody
+    // is listening, then resume. The halves differ only in whether the client's
+    // cursor outlived the ring - which is exactly the distinction CH-2 is about.
+    const auto drive = [](Fx& fx, Fx::Session& s, const char* exec,
+                          std::shared_ptr<mcp::sse_bus::SseSinkState>& sink,
+                          std::optional<std::string>& key) {
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+        key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+        REQUIRE(key.has_value());
+    };
+
+    SECTION("in-window resume replays the missed frames AND the final, exactly once") {
+        Fx fx{Bridge::Config{}, mcp::McpSessionRegistry::Config{.ring_cap = 64}};
+        auto s = fx.make_session();
+        std::shared_ptr<mcp::sse_bus::SseSinkState> sink;
+        std::optional<std::string> key;
+        drive(fx, s, "exec-ch2a", sink, key);
+
+        mcp::McpPostPump pump(
+            sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+            [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {},
+            nullptr, "cid-ch2a", "exec-ch2a");
+        PostWire wire;
+
+        fx.bus.publish("exec-ch2a", "execution-progress", prog(1, 9));
+        REQUIRE(poll_until([&] {
+            pump.pump_once(wire.writer());
+            return wire.count("notifications/progress") == 1;
+        }));
+        // What the client would send back as Last-Event-ID.
+        const auto cursor = s.stream->next_event_id() - 1;
+
+        // Client gone mid-stream. The record PARKS - subscription and any terminal
+        // it later latches survive, which is what makes a resume meaningful.
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kRingOnly);
+
+        // Execution carries on with nobody listening, then finishes.
+        for (int i = 2; i <= 5; ++i) {
+            fx.bus.publish("exec-ch2a", "execution-progress", prog(i, 9));
+        }
+        fx.bus.publish("exec-ch2a", "execution-completed", kCompleted);
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+        auto replayed = ring_frames(*s.stream, "alice", cursor);
+        CHECK(count_method(replayed, "notifications/progress") > 0); // the missed frames
+        CHECK(count_results(replayed) == 1); // the answer, exactly once
+    }
+
+    SECTION("a cursor the ring outran is a GAP - but the ANSWER still survives the wrap") {
+        Fx fx{Bridge::Config{}, mcp::McpSessionRegistry::Config{.ring_cap = 6}};
+        auto s = fx.make_session();
+        std::shared_ptr<mcp::sse_bus::SseSinkState> sink;
+        std::optional<std::string> key;
+        drive(fx, s, "exec-ch2b", sink, key);
+
+        mcp::McpPostPump pump(
+            sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+            [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {},
+            nullptr, "cid-ch2b", "exec-ch2b");
+        PostWire wire;
+
+        fx.bus.publish("exec-ch2b", "execution-progress", prog(1, 20));
+        REQUIRE(poll_until([&] {
+            pump.pump_once(wire.writer());
+            return wire.count("notifications/progress") == 1;
+        }));
+        const auto stale_cursor = s.stream->next_event_id() - 1;
+
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+        // Comfortably more frames than the ring holds, so the cursor is outrun.
+        for (int i = 2; i <= 16; ++i) {
+            fx.bus.publish("exec-ch2b", "execution-progress", prog(i, 20));
+        }
+        fx.bus.publish("exec-ch2b", "execution-completed", kCompleted);
+        REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+        // Refused as a GAP rather than served a hole: a silently-short replay is
+        // worse than an error, because the client would believe it had the lot.
+        auto att = s.stream->attach_and_replay(stale_cursor, nullptr, "alice");
+        CHECK(att.status == mcp::McpStreamState::AttachStatus::kGap);
+
+        // The history is gone; the RESULT is not. The final was pinned, so the
+        // wrap could not evict it, and a re-initialising client still collects it.
+        CHECK(s.stream->pinned_count() == 1);
+        CHECK(count_results(ring_frames(*s.stream, "alice")) == 1);
+    }
+}
+
+TEST_CASE("CH-12: a duplicate cancel is a no-op - the detach is audited exactly once",
+          "[mcp][bridge][2f][chaos][ch12]") {
+    // The gap the re-review found: both cancel tests sent exactly ONE cancel, so
+    // they passed while a second cancel could close again and audit again. A
+    // retried notification is ordinary client behaviour - the interlock has to be
+    // the close TRANSITION, because the phase does not change until the pump's
+    // releaser parks the record, which is later than the duplicate arrives.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-dup"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    // First cancel wins the transition.
+    CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kDetached);
+    // Second arrives before the releaser has parked anything: same phase, same live
+    // sink, and it must NOT claim a detach it did not perform.
+    CHECK(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kStreaming);
+    CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kNoOp);
+    CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kNoOp);
+    CHECK(fx.audit_count("mcp.bridge.cancel") == 1);
+}
+
+TEST_CASE("CH-12: a cancel arriving after the pump already ended the response is a no-op",
+          "[mcp][bridge][2f][chaos][ch12]") {
+    // The window round 3 found: the pump ends the response (here by delivering the
+    // final), but httplib has not yet run the releaser that parks the record. The
+    // record therefore still LOOKS cancellable - kStreaming, sink still bound - and
+    // before the fix a cancel would win the flag and audit "detached the streamed
+    // response" for a response that had already completed. An audit row that
+    // overstates an outcome is worse than a missing one, so the pump now publishes
+    // liveness into the same flag the cancel interlock reads.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-late"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+        [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {}, nullptr,
+        "cid-late", "exec-late");
+    PostWire wire;
+
+    // Drive the pump to its natural end - the final is delivered and it returns
+    // false. The releaser has NOT run: the record is still kStreaming.
+    fx.bus.publish("exec-late", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return !pump.pump_once(wire.writer()); }));
+    REQUIRE(fx.bridge->phase_for(s.id, json(1)) == Bridge::Phase::kStreaming);
+
+    // A cancel landing in that window must NOT claim a detach it did not perform.
+    CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kNoOp);
+    CHECK(fx.audit_count("mcp.bridge.cancel") == 0);
+}
+
+TEST_CASE("every CancelOutcome has a label, and every label is one the server pre-seeds",
+          "[mcp][bridge][2f]") {
+    // Both-or-neither, same shape as the kTeardownStageNames cross-check. `detached`
+    // shipped emitted-but-unseeded precisely because the label lived at the emit
+    // site and the seed list was hand-written somewhere else; this walks the enum so
+    // a new outcome cannot repeat that.
+    for (auto o : {Bridge::CancelOutcome::kAcceptedPending, Bridge::CancelOutcome::kDetached,
+                   Bridge::CancelOutcome::kNoOp}) {
+        const std::string label = Bridge::cancel_outcome_label(o);
+        CHECK_FALSE(label.empty());
+        CHECK(std::find(Bridge::kCancelOutcomeLabels.begin(),
+                        Bridge::kCancelOutcomeLabels.end(),
+                        label) != Bridge::kCancelOutcomeLabels.end());
+    }
+    // Distinct labels: two outcomes collapsing onto one string would silently make
+    // the metric unable to tell a real detach from a no-op.
+    std::set<std::string> uniq(Bridge::kCancelOutcomeLabels.begin(),
+                               Bridge::kCancelOutcomeLabels.end());
+    CHECK(uniq.size() == Bridge::kCancelOutcomeLabels.size());
+}
+
+TEST_CASE("CH-12: cancel mid-execution detaches the response but never the execution",
+          "[mcp][bridge][2f][chaos][ch12]") {
+    // "Cancelled != cancelled": MCP cancellation is about the CLIENT'S interest in
+    // a response, not about the work. A dispatched command keeps running on real
+    // agents and its result stays durably fetchable - anything else would let a
+    // client believe it had stopped a fleet-wide change it had not.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch12"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+        [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {}, nullptr,
+        "cid-ch12", "exec-ch12");
+    PostWire wire;
+
+    fx.bus.publish("exec-ch12", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        pump.pump_once(wire.writer());
+        return wire.contains("notifications/progress");
+    }));
+
+    // The client cancels, through the REAL production entry point. This used to
+    // set `sink->closed` by hand, which is why the adversarial review found the
+    // whole path missing: simulating the trigger proved the pump's half and
+    // silently assumed the bridge half existed. It did not - request_cancel
+    // no-oped for anything past kArming, so a live streamed POST could not be
+    // cancelled at all. Drive the seam a `notifications/cancelled` actually
+    // reaches, or this test proves nothing about cancellation.
+    REQUIRE(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kDetached);
+    REQUIRE_FALSE(pump.pump_once(wire.writer())); // provider ends
+    CHECK(fx.audit_count("mcp.bridge.cancel") == 1); // audited exactly once (CH-12)
+
+    // The close frame must SAY the execution continues, and name the handle that
+    // reaches it - a client that is told nothing has no way back to its result.
+    REQUIRE(wire.contains("notifications/yuzu.stream_closed"));
+    CHECK(wire.contains(R"("execution_id":"exec-ch12")"));
+    CHECK(wire.contains(R"("partial":true)"));
+
+    // THE POINT: the execution was never touched. Its terminal still publishes,
+    // still pins, and is still replayable by a client that comes back for it.
+    REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+    fx.bus.publish("exec-ch12", "execution-completed", kCompleted);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+    CHECK(count_results(ring_frames(*s.stream, "alice")) == 1);
+}
+
+// ── Governance 2026-07-27 Gate 3/4 blockers: the concurrency set (CH-14) ──────
+
+TEST_CASE("CH-14: a stalled socket write must never block a publisher",
+          "[mcp][bridge][2f][chaos][ch14]") {
+    // safe-B1, asserted at its ROOT LINK. `finish()` writes the close frame to the
+    // socket; if that runs while the pump still holds `sink_->mu`, every other
+    // thread that needs that sink blocks for as long as the peer refuses to read
+    // (bounded only by the 30s socket write timeout in production).
+    //
+    // The downstream cascade is what makes it a bridge-wide outage - the
+    // projector's poke_post_sink wants sink-mu WHILE HOLDING rec-mu, the sweep then
+    // wants rec-mu WHILE HOLDING bridge_mu_, and reserve() on any other session
+    // queues behind that. Every link is in the sanctioned lock order, which is why
+    // TSan sees no cycle. This test pins the root link deterministically rather
+    // than racing the projector and sweep into position: fix the root and the
+    // cascade cannot form.
+    //
+    // The GET pump has always unlocked before finish, with the comment "a stalled
+    // socket write must never block a publisher". The POST pump did not.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch14"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+        [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {}, nullptr,
+        "cid-ch14", "exec-ch14");
+    BlockingWire wire;
+    wire.block();
+
+    // Cancel, so the pump wakes and enters finish(kCancelled); the peer then
+    // refuses to read, parking the pump inside the close-frame write.
+    REQUIRE(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kDetached);
+    auto pumping = std::async(std::launch::async, [&] { return pump.pump_once(wire.writer()); });
+    REQUIRE(wire.await_parked());
+
+    // A retried cancel is ordinary client behaviour (the bridge says so itself),
+    // and it needs rec-mu then sink-mu. It must not wait on a stranger's socket.
+    auto second = std::async(std::launch::async,
+                             [&] { return fx.bridge->request_cancel(s.id, json(1)); });
+    const bool completed = second.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    CHECK(completed);  // pre-fix: still parked behind the blocked write
+
+    wire.release();
+    if (completed) {
+        CHECK(second.get() == Bridge::CancelOutcome::kNoOp);  // exactly-once holds
+    } else {
+        second.wait();  // do not leave the future dangling into teardown
+    }
+    CHECK_FALSE(pumping.get());  // the provider ended
+}
+
+TEST_CASE("CH-16: progress reaches the wire on publication, not on the tick",
+          "[mcp][bridge][2f][chaos][ch16]") {
+    // UP-1. The rung's headline claim is progress-before-the-response, delivered as
+    // it happens. The pump waits on a PREDICATED wait_for, so a bare notify_one
+    // re-evaluates the predicate and keeps sleeping; unless the predicate can see
+    // that the BRIDGE has work, the projector's wake-forwarding and bind_post_sink's
+    // handshake are both dead code and progress arrives on a fixed tick grid.
+    //
+    // A deliberately huge tick makes that unambiguous: if the timeout is what wakes
+    // this pump - rather than the bus notify under test - the test waits 30s and
+    // fails. It also explains
+    // why C7's mutant 8 survived - removing the sink-mutex acquisition from an inert
+    // function changes nothing, and that was mistaken for a timing subtlety.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch16"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    mcp::McpPostPump::Config slow{};
+    slow.tick = std::chrono::seconds(30);  // only a real wake can beat this
+    mcp::McpPostPump pump(
+        sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+        [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, slow, {}, nullptr, "cid-ch16",
+        "exec-ch16");
+    PostWire wire;
+
+    // CLEAR THE RESIDUAL BIND POKE FIRST. bind_post_sink pokes the sink as part of
+    // its handshake, so the pump's predicate is already satisfied before it ever
+    // parks: the first pass returns immediately having drained nothing, and asserting
+    // on that single pass reads a heartbeat and no progress frame. This failed 3 of 3
+    // at 1.5x CPU oversubscription for exactly that reason while passing 8/8
+    // unloaded - and oversubscription is the ordinary state of both self-hosted
+    // pools, four runner agents to a box. Clearing under the sink mutex, the same
+    // lock poke_post_sink and the wait predicate both take, makes the publication the
+    // only thing that can wake this pump.
+    {
+        std::lock_guard<std::mutex> lk(sink->mu);
+        sink->poked.store(false, std::memory_order_release);
+    }
+
+    std::atomic<bool> about_to_pump{false};
+    auto pumping = std::async(std::launch::async, [&] {
+        about_to_pump.store(true, std::memory_order_release);
+        // LOOP, bounded by the wire content. `about_to_pump` proves only that this
+        // thread entered the lambda, never that the pump is parked in wait_for, and
+        // the wake is forwarded by the PROJECTOR thread - so on a contended box a
+        // pass can still return before the frame is latched. A pass with nothing to
+        // do blocks the full 30 s tick, so this cannot spin, and the elapsed-time
+        // assertion below is still what proves a publication rather than a timeout
+        // delivered the frame.
+        for (;;) {
+            if (!pump.pump_once(wire.writer())) {
+                return false;  // stream ended without ever carrying progress
+            }
+            if (wire.contains("notifications/progress")) {
+                return true;
+            }
+        }
+    });
+    while (!about_to_pump.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    fx.bus.publish("exec-ch16", "execution-progress", prog(1, 3));
+    CHECK(pumping.get());  // returns only once the pump actually carried the frame
+    const auto waited = std::chrono::steady_clock::now() - t0;
+
+    CHECK(wire.contains("notifications/progress"));
+    // Well under the tick: proves a publication woke it, not the timeout.
+    CHECK(waited < std::chrono::seconds(5));
+}
+
+TEST_CASE("CH-15: pin slots are a concurrency limit, never a lifetime quota",
+          "[mcp][bridge][2f][chaos][ch15]") {
+    // arch-A1 / UP-2. `mcp_stream.hpp` documents TWO unpin rules: (b) a GET resume
+    // whose cursor passed the final, and (a) "the final was written on the POST
+    // wire" - which is THIS rung's job and was never wired, so `unpin()` had zero
+    // callers. Admission counts `pinned_count() + streamed_unpinned_`, so four
+    // SUCCESSFUL streamed calls exhausted a session forever, answering 429 with
+    // remediation telling the client to wait for calls that had already finished.
+    //
+    // No fault injection: pure sequencing. That is why it is cheap to test and why
+    // it was missed - the existing pin-slot test drove the CHARGE path (parked
+    // records, no finals published) where pinned_count() is always 0.
+    Fx fx;
+    auto s = fx.make_session();
+
+    for (int i = 1; i <= 12; ++i) {  // 3x the cap, sequentially
+        const std::string exec = "exec-ch15-" + std::to_string(i);
+        auto rr = fx.bridge->reserve(s.id, "alice", json(i), json("t"), true);
+        INFO("sequential completed streamed call #" << i
+             << " reject=" << (rr.reject_reason == nullptr ? "" : rr.reject_reason));
+        REQUIRE(rr.ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+        auto key = fx.bridge->bind_post_sink(s.id, json(i), sink);
+        REQUIRE(key.has_value());
+
+        mcp::McpPostPump pump(
+            sink, [&](bool cap) { return fx.bridge->take_post_batch(*key, cap); },
+            [&] { (void)fx.bridge->on_final_written(*key); }, {}, {}, fast_post_cfg(), {},
+            nullptr, "cid-ch15", exec);
+        PostWire wire;
+
+        // Complete it properly: terminal published, final written to the wire, then
+        // the response closes exactly as the releaser would.
+        fx.bus.publish(exec, "execution-completed", kCompleted);
+        REQUIRE(poll_until([&] { return !pump.pump_once(wire.writer()); }));
+        REQUIRE(wire.contains(R"("result")"));
+        REQUIRE(fx.bridge->on_post_closed_keyed(*key));
+
+        // The pin for a final the client has ALREADY received must not linger.
+        CHECK(s.stream->pinned_count() == 0);
+    }
+}
+
+TEST_CASE("CH-14b: a cancel racing a completing tick must not claim a detach",
+          "[mcp][bridge][2f][chaos][ch14]") {
+    // Gate 8. The exactly-once interlock is the `closed` flip, so WHERE it happens
+    // decides what a mid-tick cancel is told. Flipping it at finish() left the whole
+    // rest of the tick exposed - revalidate is a store round trip, then
+    // session_alive, then every progress write and the final write - so a cancel
+    // landing in there won the exchange and audited "detached the streamed
+    // response" while the client received progress, its result and EOF, and the
+    // close audit recorded reason=completed. Two contradictory compliance rows for
+    // one exchange.
+    //
+    // The bridge now flips `closed` at the DECISION: the moment it hands back a
+    // final, the response IS ending and there is nothing left to detach.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-ch14b"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    // Take the batch WITHOUT running the pump's write half - this is precisely the
+    // mid-tick instant the old code left open, reproduced deterministically rather
+    // than raced.
+    fx.bus.publish("exec-ch14b", "execution-completed", kCompleted);
+    Bridge::PostBatch batch;
+    REQUIRE(poll_until([&] {
+        batch = fx.bridge->take_post_batch(*key, /*cap_expired=*/false);
+        return batch.final_frame.has_value();
+    }));
+
+    // The client's result is in hand and the response is committed to ending, so a
+    // cancel arriving now has nothing to detach - and must not say otherwise.
+    CHECK(fx.bridge->request_cancel(s.id, json(1)) == Bridge::CancelOutcome::kNoOp);
+    CHECK(fx.audit_count("mcp.bridge.cancel") == 0);
+}
+
+TEST_CASE("a client-driven bridge audit carries the caller, not \"system\"",
+          "[mcp][bridge][2f][audit]") {
+    // Decision 15(j) non-repudiation, and the fix for it was untested (Gate 8:
+    // both the compliance and cpp-safety re-reviews flagged that the fixture
+    // captured the actor but nothing asserted on it). An investigator has to be
+    // able to tell WHICH client detached a live response - a row stamped "system"
+    // is indistinguishable from the bridge's own housekeeping.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-actor"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    auto key = fx.bridge->bind_post_sink(s.id, json(1), sink);
+    REQUIRE(key.has_value());
+
+    REQUIRE(fx.bridge->request_cancel(s.id, json(1), "alice") == Bridge::CancelOutcome::kDetached);
+
+    std::lock_guard<std::mutex> lk(fx.audit_mu);
+    bool found = false;
+    for (const auto& row : fx.audits) {
+        if (row.action == "mcp.bridge.cancel") {
+            found = true;
+            CHECK(row.actor == "alice");  // NOT empty, which the sink maps to "system"
+        }
+    }
+    CHECK(found);
+}
+
+// #2740's admission reclaim has two accepted residuals, and BOTH were untestable and one
+// was also UNCOUNTED until this round. That combination is why they matter more than their
+// severity suggests: a runbook shipped telling operators to rule the raced case out by
+// checking two counters, and the raced case moved neither, so the procedure concluded
+// "genuine accounting drift" for precisely the residual it was written to excuse.
+//
+// The seam (`UnpinFault`) exists to make both reachable from one thread. What each arm
+// pins here is the same three-part contract: the admission STANDS (the residual is an
+// over-admission, not a refusal), the pin is NOT credited as displaced (we did not release
+// it, so attributing a loss to the admitting principal would be false), and the arm's OWN
+// counter moves so an operator can tell which residual they are looking at.
+TEST_CASE("#2795/#2805: a failed pin release still admits, and each arm counts separately",
+          "[mcp][bridge][pins][ch26]") {
+    const auto drive = [](mcp::McpStreamState::UnpinFault fault) {
+        struct Out {
+            bool admitted{};
+            double raced{};
+            double failed{};
+            double displaced{};
+            double ring_displaced{};
+            std::size_t audits{};
+            std::size_t still_pinned{};
+        };
+        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+        auto s = fx.make_session();
+
+        // Fill every pin slot with a parked, undelivered final - the state in which the
+        // next admission must reclaim rather than refuse.
+        for (int i = 1; i <= 4; ++i) {
+            const std::string exec = "exec-residual-" + std::to_string(i);
+            REQUIRE(poll_until([&] {
+                return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+            }));
+            REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
+            REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
+                    Bridge::ArmOutcome::kArmed);
+            REQUIRE(fx.bridge->on_post_closed(s.id, json(i)));  // peer gone before the final
+            fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
+            REQUIRE(poll_until([&] {
+                return s.stream->pinned_count() == static_cast<std::size_t>(i);
+            }));
+        }
+        REQUIRE(s.stream->pinned_count() == 4);
+
+        // Arm the residual, then make the admission that triggers the reclaim.
+        s.stream->inject_unpin_fault_for_test(fault);
+        Out out;
+        out.admitted = fx.bridge->reserve(s.id, "alice", json(99), json("t"), true).ok;
+        out.raced = fx.reg.counter("yuzu_mcp_bridge_pin_release_raced_total").value();
+        out.failed = fx.reg.counter("yuzu_mcp_bridge_pin_release_failed_total").value();
+        out.displaced =
+            fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value();
+        // The pin-slot array's own LRU-displacement counter (mcp_stream.cpp,
+        // kMetricPinDisplaced) - a distinct metric from the bridge-level
+        // admission-reclaim one above, and NOT the replay ring's own frame-
+        // eviction counter (kMetricRingEvictions /
+        // yuzu_mcp_stream_replay_ring_evictions_total) despite the "ring"-
+        // adjacent name: this one only strips a pinned terminal's eviction
+        // EXEMPTION, it never evicts a frame from the ring itself. This
+        // residual's admission-time reclaim never touches it: selecting and
+        // releasing a pin for the ADMISSION side is a separate code path from
+        // publish()'s pin-slot-full LRU branch, which is what actually
+        // increments this counter (#2795's acceptance criteria named this
+        // assertion explicitly). Not a claim that this branch can never fire
+        // from a LATER event on this same session (docs/mcp-server.md's
+        // "Terminal durability" prose says it can) - only that THIS reclaim,
+        // here, does not reach it.
+        out.ring_displaced = fx.reg.counter("yuzu_mcp_stream_pin_displaced_total").value();
+        out.audits = fx.audit_count("mcp.bridge.pin_displaced_for_admission");
+        // POSITIVELY confirm the over-admission rather than inferring it from the absence
+        // of the displaced counter: the pin the reclaim selected is still HELD, so the
+        // session is genuinely one call over its cap. Without this the assertions above
+        // cannot distinguish "the release failed" from "the release worked and some other
+        // bookkeeping step went wrong".
+        out.still_pinned = s.stream->pinned_count();
+        return out;
+    };
+
+    SECTION("the release loses a race (#2795): counted as raced, never as displaced") {
+        const auto out = drive(mcp::McpStreamState::UnpinFault::kRaceLost);
+        CHECK(out.admitted);      // the admission stands - this is the over-admission
+        CHECK(out.raced == 1.0);  // ...and it is now VISIBLE, which was the whole defect
+        CHECK(out.failed == 0.0);
+        // Not credited as a displacement, and not audited: no exemption was released by
+        // us, so attributing that loss to the admitting principal would be a false record.
+        CHECK(out.displaced == 0.0);
+        CHECK(out.ring_displaced == 0.0);  // the pin-slot LRU displacement never fires either
+        CHECK(out.audits == 0);
+        CHECK(out.still_pinned == 4);  // the pin was NOT released - the session is over cap
+    }
+
+    SECTION("the release throws (#2805): counted as failed, never as displaced") {
+        const auto out = drive(mcp::McpStreamState::UnpinFault::kThrow);
+        CHECK(out.admitted);
+        CHECK(out.failed == 1.0);
+        CHECK(out.raced == 0.0);  // the two arms are distinct, not aliases
+        CHECK(out.displaced == 0.0);
+        CHECK(out.ring_displaced == 0.0);
+        CHECK(out.audits == 0);
+        CHECK(out.still_pinned == 4);  // the pin was NOT released - the session is over cap
+    }
+}
+
+// #2791's other unasserted branch: admission declines rather than reclaiming while a
+// candidate is mid-projection. The guard (select_displaceable_pin_locked,
+// mcp_stream_bridge.cpp:645-653/684-686) aborts the WHOLE scan the instant ANY of a
+// session's records reads projection_in_flight - not "every candidate", which is what
+// the issue text says but not what the code does: a perfectly good, individually-
+// reclaimable victim sits right next to the one mid-projection record below, and the
+// scan discards it anyway.
+//
+// Exactly TWO settled records, not three or four - this count is load-bearing, not
+// arbitrary. The record being projected double-counts itself while stalled (its final
+// is already pinned in the RING by publish_terminal_ladder before this window, but its
+// charge is not yet cleared - the exact "one settling record as two slots" the header
+// contract names), so a session with N settled + 1 mid-projection reads as pinned=N+1,
+// unpinned=1 the instant the first read fires. For the guard's presence to be the thing
+// deciding the outcome (not just arithmetic saturation a reclaim couldn't fix regardless
+// of the guard), a SINGLE granted reclaim must be enough to clear the cap:
+// (N+1-1)+1 < 4  =>  N < 3. N=2 is the largest count where that holds, so it is the one
+// value that makes disabling the guard observably flip this test - anything higher
+// declines either way and would leave the guard's necessity unproven.
+//
+// No existing seam reaches this deterministically: `projection_in_flight` is set and
+// cleared entirely inside one project_record call via a function-local ClaimGuard, and
+// every throw path in this file already clears it before returning (#2528) - a fault
+// injected anywhere in the claim window still lets the next scan see it cleared. Hence
+// the new stall seam (mcp_stream_bridge.{hpp,cpp}, #2791), parked in the one window the
+// header contract calls out by name: after the ladder commits the frame, before
+// `pinned_event_id` is stamped.
+//
+// RED-PROOF (see PR body for the full trace): commenting out the
+// `if (projection_in_flight) { return std::nullopt; }` return at :684-686 turns this
+// red, and not narrowly - the record being projected is, at that exact moment, marked
+// `continue`d out of the loop BEFORE `pin_referenced` is set for it (:645-648, ahead of
+// :654-662), so its own live-but-uncommitted pin reads as unreferenced and the ORPHAN
+// scan (:698-707) claims it instead of the settled victim. `res.ok` flips true, and
+// BOTH the displaced counter and the audit row fire for a pin that was never released
+// (the id it "reclaimed" is the mid-projection record's own) - three assertions below
+// go red together, not one, which is why this is the "live call's pin looks like an
+// orphan" hazard the header contract names, observed directly rather than reasoned about.
+TEST_CASE("bridge admission declines rather than reclaiming while a candidate is "
+          "mid-projection, even with another valid candidate present (#2791)",
+          "[mcp][bridge][2f][ch27]") {
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0}};
+    auto s = fx.make_session();
+
+    // Two fully-settled, individually reclaimable parked finals. Full settle wait
+    // (pinned==i AND unpinned==0), not just the ring pin - see the matching comment
+    // on the on_final_written racer test above (#2791 UP-4): waiting on pinned_count()
+    // alone does not prove record i's projection has moved past its own (unarmed, so
+    // harmless to IT, but relevant to whichever record gets stalled next) check line.
+    for (int i = 1; i <= 2; ++i) {
+        const std::string exec = "exec-decline-" + std::to_string(i);
+        REQUIRE(poll_until([&] {
+            return fx.bridge->reserve(s.id, "alice", json(i), json("t"), true).ok;
+        }));
+        REQUIRE(fx.bridge->subscribe(s.id, json(i), exec));
+        REQUIRE(fx.bridge->arm(s.id, json(i), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(i)));
+        fx.bus.publish(exec, "execution-completed", kCompleted, /*is_terminal=*/true);
+        REQUIRE(poll_until([&] {
+            const auto snap = fx.bridge->accounting_snapshot_for_test(s.id, s.stream);
+            return snap.pinned == static_cast<std::size_t>(i) && snap.unpinned == 0;
+        }));
+    }
+    REQUIRE(s.stream->pinned_count() == 2);
+
+    // The third is the one parked mid-projection: charged, closed, its terminal
+    // latched, then stalled after the ladder commits the frame (ring pin now live) and
+    // before pinned_event_id is stamped - the phantom-double-count window.
+    REQUIRE(poll_until([&] {
+        return fx.bridge->reserve(s.id, "alice", json(3), json("t"), true).ok;
+    }));
+    REQUIRE(fx.bridge->subscribe(s.id, json(3), "exec-decline-3"));
+    REQUIRE(fx.bridge->arm(s.id, json(3), Bridge::ArmMode::kStreaming) == Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(3)));  // -> kRingOnly, charged
+
+    // Guards the arm/release pair against a fatal REQUIRE between them: if any REQUIRE
+    // below throws before the intentional release() call further down runs, this
+    // destructs first (declared after the arm, so it unwinds before `fx` per reverse
+    // declaration order) and releases the parked projector thread itself, rather than
+    // leaving it to the 10s internal backstop. release_projection_stall_for_test() is
+    // documented idempotent, so running it again here after the intentional release
+    // below is a harmless no-op, not a double-release bug (#2791, cpp-safety floor -
+    // this mirrors the file's existing UnsubGuard idiom above, "built to survive fatal
+    // REQUIREs below").
+    struct StallGuard {
+        Bridge& bridge;
+        explicit StallGuard(Bridge& b) : bridge(b) {}
+        StallGuard(const StallGuard&) = delete;
+        StallGuard& operator=(const StallGuard&) = delete;
+        ~StallGuard() { bridge.release_projection_stall_for_test(); }
+    };
+    fx.bridge->arm_projection_stall_for_test();
+    StallGuard stall_guard{*fx.bridge};
+    fx.bus.publish("exec-decline-3", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(fx.bridge->wait_projection_stall_reached_for_test());
+    // Confirms the phantom double-count is live: the ring already shows the
+    // not-yet-attributed pin (3), while the charge it also still holds is not yet
+    // cleared (unpinned 1) - reading 4 total against a cap of 4 is exactly why the
+    // FIRST admission check below even reaches selection.
+    REQUIRE(fx.bridge->accounting_snapshot_for_test(s.id, s.stream).pinned == 3);
+
+    const auto res = fx.bridge->reserve(s.id, "alice", json(99), json("t"), true);
+    CHECK_FALSE(res.ok);
+    CHECK(std::string(res.reject_reason) == "pin_slots");
+    // No false credit for a release that did not happen: nothing was released, so
+    // nothing is counted or audited as a displacement.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_pin_displaced_for_admission_total").value() == 0.0);
+    CHECK(fx.audit_count("mcp.bridge.pin_displaced_for_admission") == 0);
+
+    fx.bridge->release_projection_stall_for_test();
+    // Wait for the settle, not just the ring pin (which was already visible before
+    // release - see the comment block above): the charge clear and the
+    // projection_in_flight clear both happen AFTER this window, inside the locked block
+    // the stall sits just before. `unpinned == 0` is sufficient proof of full settle
+    // ONLY because N=2: the post-settle admission below (pinned=3, unpinned=0, sum=3)
+    // never re-enters the cap branch, so it can't observe a not-yet-cleared flag either.
+    // A test that needed the RECLAIM path post-settle would have to wait on the flag
+    // too, not just the charge.
+    REQUIRE(poll_until(
+        [&] { return fx.bridge->accounting_snapshot_for_test(s.id, s.stream).unpinned == 0; }));
+
+    // Once record 3 settles, the SAME admission that just declined succeeds - proving
+    // the decline was about the window, not a permanent lockout, and that this session
+    // is not left wedged by the seam.
+    CHECK(fx.bridge->reserve(s.id, "alice", json(100), json("t"), true).ok);
+}
+
+// QA-1: the UnpinFault seam's own one-shot/disarm contract, tested directly on a bare
+// McpStreamState with no bridge involved.
+//
+// This exists because a governance reviewer built the whole server suite against a
+// mutation that moved the throw ABOVE the decrement in unpin()'s seam - which would leave
+// a kThrow fault armed forever instead of firing `times` times - and all 235k assertions
+// stayed green. Nothing anywhere guarded the contract that the Resource Ledger asserts.
+// The sibling PublishFault seam has both a direct state-level test and several times=2
+// uses; this one had neither.
+TEST_CASE("UnpinFault: `times` fires exactly N times and then disarms",
+          "[mcp][stream][pins][ch26]") {
+    yuzu::MetricsRegistry reg;
+    mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
+
+    SECTION("kThrow with times=2 throws twice, then resumes normal service") {
+        const std::uint64_t id = state.publish_final("execution-completed", "{}");
+        REQUIRE(id != 0);
+        REQUIRE(state.pinned_count() == 1);
+
+        state.inject_unpin_fault_for_test(mcp::McpStreamState::UnpinFault::kThrow, 2);
+        CHECK_THROWS(state.unpin(id));
+        CHECK_THROWS(state.unpin(id));
+        // Disarmed: the third call does real work. If the decrement ran AFTER the throw
+        // this line would throw instead, and the pin would never clear.
+        CHECK(state.unpin(id));
+        CHECK(state.pinned_count() == 0);
+    }
+
+    SECTION("kRaceLost reports failure without clearing, then the next call clears") {
+        const std::uint64_t id = state.publish_final("execution-completed", "{}");
+        REQUIRE(id != 0);
+        REQUIRE(state.pinned_count() == 1);
+
+        state.inject_unpin_fault_for_test(mcp::McpStreamState::UnpinFault::kRaceLost);
+        CHECK_FALSE(state.unpin(id));
+        // The distinguishing assertion: a raced release must leave the pin ALONE. A seam
+        // that returned false while still clearing the slot would model the residual
+        // wrongly and every test built on it would be quietly meaningless.
+        CHECK(state.pinned_count() == 1);
+
+        CHECK(state.unpin(id));  // fault consumed
+        CHECK(state.pinned_count() == 0);
     }
 }
