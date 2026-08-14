@@ -22,9 +22,11 @@
 #include "baseline_store.hpp"
 #include "dex_app_perf_model.hpp" // AppPerfProviders (slice-2 app-perf read seams)
 #include "guaranteed_state_store.hpp"
+#include "management_group_store.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
@@ -37,6 +39,7 @@
 #include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
+#include "test_mgmt_group_pg_helper.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -118,6 +121,18 @@ struct RestGsHarness {
     // BaselineStore for the baseline-anchored per-device status route.
     yuzu::test::TempDbFile bl_db_file{"yuzu_test_rest_gs_bl-"};
     std::unique_ptr<BaselineStore> baseline_store;
+
+    // ADR-0017 authorize_list_read confinement for the fleet /guaranteed-state/status
+    // route. `rbac_` is a FRESH in-memory store with RBAC left disabled (the
+    // constructor default, never toggled unless a test calls set_rbac_enabled(true)) —
+    // rbac_enforcement_in_effect() then reads legacy-open, so authorize_list_read
+    // unconditionally returns AdmitAll and every EXISTING test's happy-path behavior is
+    // unchanged by this pair existing. mgmt_bundle_ is PG-backed (ADR-0042) but this
+    // harness already unconditionally requires Postgres for GuaranteedStateStore (the
+    // ctor's own SKIP check above), so adding it introduces no new skip condition.
+    RbacStore rbac_{":memory:"};
+    yuzu::test::ManagementGroupStorePg mgmt_bundle_;
+    ManagementGroupStore& mgmt_ = *mgmt_bundle_;
 
     std::string session_user{"alice"};
     auth::Role session_role{auth::Role::admin};
@@ -354,8 +369,8 @@ struct RestGsHarness {
         }
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
-                            /*rbac_store=*/nullptr,
-                            /*mgmt_store=*/nullptr,
+                            /*rbac_store=*/&rbac_,
+                            /*mgmt_store=*/&mgmt_,
                             /*token_store=*/nullptr,
                             /*quarantine_store=*/nullptr,
                             resp_store.get(), // null unless wire_live_deps && a pool was supplied
@@ -1211,6 +1226,120 @@ TEST_CASE("REST gs.status: a service-scoped token is denied outright (World-A / 
     CHECK(h.audit_log[0].action == "guaranteed_state.status.denied");
     CHECK(h.audit_log[0].result == "denied");
     CHECK(h.audit_log[0].detail.find("printers") != std::string::npos);
+}
+
+// ── ADR-0017 authorize_list_read confinement on the fleet route (adversarial-
+// review + second-opinion finding: this was previously a bare perm_fn gate, a
+// policy-floor violation of the routed-concern MUST/never clause, independent
+// of exploitability — CLAUDE.md severity rule 2). ────────────────────────────
+
+TEST_CASE("REST gs.status: no GuaranteedState:Read grant anywhere denies with 403 (DenyAll)",
+          "[pg][rest][guaranteed_state][status][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true); // enforcement in effect; no roles/grants created
+    h.session_user = "nobody";
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("errored_rules") == std::string::npos);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.status.denied");
+    CHECK(h.audit_log[0].result == "denied");
+}
+
+TEST_CASE("REST gs.status: a global GuaranteedState:Read grant sees the unfiltered fleet count "
+          "(AdmitAll)",
+          "[pg][rest][guaranteed_state][status][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac_.assign_role({"user", "alice", "GsReader"}).has_value()); // GLOBAL grant
+    h.session_user = "alice";
+
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r2", "rule-2"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-2", "r2", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    // A global grant is unfiltered fleet-wide - both agents' errored rules count.
+    CHECK(j["data"]["errored_rules"].get<int>() == 2);
+    CHECK(j["data"]["total_rules"].get<int>() == 2);
+}
+
+TEST_CASE("REST gs.status: a management-group-confined grant scopes errored_rules to visible "
+          "agents only (AdmitScoped)",
+          "[pg][rest][guaranteed_state][status][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value()); // WS-1 visible; WS-2 is not
+    // Group-SCOPED grant, deliberately NOT a global RbacStore::assign_role - carol
+    // can see only what RegionA can see.
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
+    h.session_user = "carol";
+
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r2", "rule-2"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z"); // visible
+    h.seed_status("e2", "WS-2", "r2", "guard.unhealthy", "2026-06-20T10:00:00Z"); // NOT visible
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    // Only r1 (reported by the visible agent WS-1) counts - WS-2's r2 is out of scope.
+    CHECK(j["data"]["errored_rules"].get<int>() == 1);
+    // total_rules is NEVER confined - it is the global rule-catalogue size, which has
+    // no agent/management-group dimension (a rule isn't owned by a group).
+    CHECK(j["data"]["total_rules"].get<int>() == 2);
+}
+
+TEST_CASE("REST gs.status: AdmitScoped with zero visible agents contributes nothing (INV-2)",
+          "[pg][rest][guaranteed_state][status][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    ManagementGroup g;
+    g.name = "EmptyRegion";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    // No members added - dana's group is real and her grant is real, but it contains
+    // no agents.
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "dana", "GsReader"}).has_value());
+    h.session_user = "dana";
+
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    REQUIRE(res);
+    // AdmitScoped with an empty visible set is 200 + zero, not a 403 - the caller has a
+    // real grant, it simply resolves to no visible agents (INV-2).
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["errored_rules"].get<int>() == 0);
+    CHECK(j["data"]["total_rules"].get<int>() == 1); // unaffected - global catalogue size
 }
 
 // ── #2298 item 6d: per-agent status route (previously untested at REST level) ──

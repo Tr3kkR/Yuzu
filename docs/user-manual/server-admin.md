@@ -1039,6 +1039,22 @@ pending full status ingest, tracked separately.
   not apply a service-scoped token's own service-tag confinement (it only
   checks a role grant), so admitting it here would have let a token scoped
   to one service read a fleet-wide count.
+- **`403`**, and a **narrower `errored_rules` count**, on the fleet route
+  for a management-group-**confined** (not global) `GuaranteedState:Read`
+  grant — new. This route moved from a bare global permission check (any
+  authenticated `GuaranteedState:Read` holder got the unfiltered
+  fleet-wide count) to `RbacStore::authorize_list_read` (ADR-0017
+  admit-then-filter). A caller with no `GuaranteedState:Read` grant at all
+  (global or via any management group) now gets `403` instead of `200`. A
+  caller whose grant is confined to specific management groups now sees
+  `errored_rules` scoped to their **visible agents only**, not the whole
+  fleet — including `0` if their groups contain no agents at all, which is
+  still `200`, not `403` (a real grant that resolves to an empty visible
+  set is a legitimate answer, not a denial). `total_rules` is unaffected
+  by this change on either route: it counts the rule *catalogue*, which
+  has no agent dimension to confine. A global (non-group-confined) grant
+  is unaffected on the fleet route too — it still sees the full fleet
+  count, same as before.
 - **`403`** on the per-agent route (`/status/{agent_id}`) — new. This route
   moved from a bare global permission check (any authenticated
   `GuaranteedState:Read` holder got `200`, even with a management-group
@@ -1074,13 +1090,18 @@ management-group-**confined**
 (not global) `GuaranteedState:Read` grant and polls `/status/{agent_id}`
 for a device outside that scope — that call now gets `403` where it
 previously got `200` with placeholder data, the same confinement
-`/guaranteed-state/device-compliance` has always enforced; or (c) treats
-every response as `200` — both routes can now return `403`/`503` and a
-client that does not already retry on `5xx` (standard practice for every
-other Guaranteed State route) should add that handling. No change for a
-global-permission, non-service-scoped caller on the happy path beyond
-`errored_rules` becoming a real, changing number instead of a constant
-`0`.
+`/guaranteed-state/device-compliance` has always enforced; (c) holds a
+management-group-**confined** grant and polls the **fleet** route
+(`/status`) — that call still gets `200`, but `errored_rules` now reflects
+only the caller's visible agents rather than the whole fleet, and a caller
+whose confinement resolves to zero visible agents anywhere now gets `403`
+where they previously got `200` with the unfiltered fleet count; or (d)
+treats every response as `200` — both routes can now return `403`/`503`
+and a client that does not already retry on `5xx` (standard practice for
+every other Guaranteed State route) should add that handling. No change
+for a global-permission, non-service-scoped caller on the happy path
+beyond `errored_rules` becoming a real, changing number instead of a
+constant `0`.
 
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 

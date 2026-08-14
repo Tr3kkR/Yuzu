@@ -5585,15 +5585,17 @@ behind the dashboard's Unhealthy Guards card, not the (reaped, 30-day) event log
 `compliant_rules` and `drifted_rules` stay `0` deliberately — full status ingest
 (`action=="status"`) lands in a later rung. A **service-scoped API token is denied
 (`403`) outright**: this route aggregates across every agent's census, and a token
-scoped to one service must not read the fleet-wide count. **Unlike the per-agent
-route below, this route is NOT management-group-confined** — a non-service-scoped
-caller holding a `GuaranteedState:Read` grant sees the unfiltered fleet-wide count
-regardless of any management-group scope restriction on their role; tracked as
-[#3038](https://github.com/Tr3kkR/Yuzu/issues/3038).
+scoped to one service must not read the fleet-wide count. For every other caller,
+the route is **management-group-confined** via the ADR-0017 admit-then-filter
+`authorize_list_read` chokepoint: a global `GuaranteedState:Read` grant sees the
+fleet-wide count, a management-group-confined grant sees `errored_rules` scoped to
+that operator's visible agents only, and a caller with no grant anywhere is refused
+with `403`. `total_rules` is never confined — it is the size of the global rule
+catalogue, which has no agent or management-group dimension.
 
-- **Permission:** `GuaranteedState:Read` (non-service-scoped only — see above; management-group confinement not yet enforced, #3038)
+- **Permission:** `GuaranteedState:Read` (non-service-scoped; management-group confined via ADR-0017)
 - **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
-- **5xx:** `503` if the Guaranteed State store is unavailable or degraded — never a silent `0`.
+- **4xx/5xx:** `403` for a service-scoped token or a caller with no `GuaranteedState:Read` grant anywhere; `503` if the Guaranteed State store, RBAC store, or list-read resolver is unavailable or degraded — never a silent `0`.
 
 #### `GET /api/v1/guaranteed-state/status/{agent_id}`
 
