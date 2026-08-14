@@ -334,6 +334,8 @@ Yuzu supports SAML 2.0 SP-initiated single sign-on against a single, statically-
 
 > **MFA step-up:** MFA step-up is not supported for SAML sessions in this release. A SAML session hitting any of the 11 step-up-gated endpoints (token mint/revoke, session revoke, Guardian rule write, software deploy, user management) receives a `403` regardless of `--mfa-enforcement` mode. Use `--mfa-enforcement=optional` and rely on your IdP to enforce MFA at login time. Do not use `--mfa-enforcement=required` for SAML deployments — it denies SAML users at all step-up gates.
 
+> **SCIM linkage and force-logout:** if SCIM provisioning is also enabled, a SAML login whose NameID resolves to a SCIM resource forms a durable link, and SCIM deprovisioning that resource revokes the linked SAML session automatically. A SAML session is also individually force-loggable by an admin via `DELETE /api/v1/sessions?username=saml:<entity_id>#<NameID>`. See [SCIM ↔ SAML identity linkage](scim-provisioning.md#scim--saml-identity-linkage-federated-session-revocation) for the NameID-Format contract this depends on.
+
 ### Registering the SP with Your IdP
 
 Before configuring the server, register Yuzu as a Service Provider with your identity provider:
@@ -610,6 +612,216 @@ Returns `200 OK` with:
 
 Returns `404` if the token ID is not found. Returns `503 service unavailable` if the server's token store database failed to open at startup — a storage outage is never reported as `404` (see the API Tokens section of the [REST API reference](rest-api.md)).
 
+### Rotating a Token
+
+Rotation replaces a token's secret without a hard cutover, using the same
+**overlap-pair** model as engine-principal credential rotation (see
+[Engine Principals](engine-principals.md) "Rotate the credential"): a
+**successor** token is minted while the existing (**predecessor**) token
+stays valid for an overlap window, so whatever consumes the old secret has
+time to pick up the new one.
+
+Requires `ApiToken:Rotate` RBAC permission — a dedicated operation, distinct
+from `ApiToken:Write` (which gates creating/listing/revoking a token; see
+[Creating a Token](#creating-a-token) and [Revoking a Token](#revoking-a-token)
+above). `{token_id}` is the **predecessor's** id:
+
+```bash
+curl -s -b cookies.txt -X POST \
+  http://localhost:8080/api/v1/tokens/a1b2c3d4e5f6/rotate \
+  -H "Content-Type: application/json" \
+  -d '{ "overlap_secs": 604800 }'
+```
+
+```json
+{
+  "data": {
+    "token": "yuzu_Nm7pQ2z...",
+    "token_id": "f6e5d4c3b2a1",
+    "expires_at": 1750185000,
+    "overlap_expires_at": 1742990600
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+The raw successor secret is returned exactly once, the same as at creation.
+`overlap_secs` defaults to 7 days if omitted (24-hour floor, 10-year
+ceiling). Once the new secret is installed wherever it's consumed, close
+the loop explicitly instead of waiting on the auto-revoke sweep — `{token_id}`
+here is the **successor's** id, from the `rotate` response above:
+
+```bash
+curl -s -b cookies.txt -X POST \
+  http://localhost:8080/api/v1/tokens/f6e5d4c3b2a1/confirm
+```
+
+`confirm` revokes the predecessor immediately and promotes the successor to
+the token's sole active credential. If you skip it, a 60-second background
+sweep does it for you, with this SLA: **a predecessor is revoked within one
+60-second tick of its overlap window elapsing; on the first occurrence of a
+given clock-guard anomaly the tick declines instead and revocation defers to
+the next tick (roughly 120 seconds total), after which an identical anomaly
+drains normally on the following tick; every decline is counted and
+logged — a fresh deployment's first-ever bootstrap decline (no durable
+clock reading yet) increments `yuzu_rotation_sweep_bootstrap_declines_total`,
+any other decline (an implausible reading, or a big step since the last
+accepted tick) increments `yuzu_rotation_sweep_declined_total`; the two are
+deliberately separate series (see
+[metrics.md](metrics.md#rotation-sweep-clock-guard-metrics-2964)).** A
+big-step decline is **not necessarily a clock fault** — the sweep's 3600s
+big-step threshold is crossed just as readily by a multi-tick gap with a
+perfectly correct clock (a maintenance window, a database failover, an
+instance left off overnight) as by an actual clock jump; see
+[metrics.md](metrics.md#rotation-sweep-clock-guard-metrics-2964) for the
+full caveat. One case
+is not "eventually" but **never**, by design, until an operator acts: **the
+successor was never presented at all** — the sweep leaves BOTH credentials
+active indefinitely rather than revoke your only working token out from
+under you (a dropped rotate response, or simply never picking up the new
+secret, must not end in zero usable credentials). A **sustained clock
+anomaly is NOT this case**, even though it sounds like it should be: the
+guard suppresses only a *repeat of the identical* anomaly (the fact-set
+dedup rule) and drains on the very next tick once it does, so a clock fault
+that settles on one anomaly shape — even indefinitely — costs at most the
+one extra declined tick already described above, and revocation then
+proceeds on schedule against the (still bad) clock reading; do not read this
+SLA as "credentials are held safe for the duration of a clock incident". The
+genuinely open-ended **never**-until-an-operator-acts case on this axis is a
+clock fault that keeps changing shape tick to tick (each distinct fact set
+declines fresh, so dedup never gets a repeat to suppress) — indistinguishable
+from a sustained fault using the counters above alone, which is exactly why
+`docs/ops-runbooks/rotation-sweep-clock-guard.md` exists. The other
+genuinely open-ended case is a **store-wide-lock fault** — every replica
+losing the sweep's advisory lock to a wedged holder — which the same runbook
+and the `YuzuRotationSweepNotRunning` alert exist to surface.
+
+**That safeguard covers the automatic sweep only — it does not cover an
+explicit `confirm`.** `confirm` is your attestation that you received and
+retained the successor secret, and it revokes the predecessor straight away.
+If the rotate response was lost, do NOT look the successor's `token_id` up
+and confirm it: that revokes the credential you still hold in favour of one
+you never received. Revoke the unknown successor instead — that keeps the
+predecessor working — and start a new rotation.
+
+`confirm`'s check that you're the same operator who called `rotate` is
+stored durably, not just in memory, so a server restart no longer blocks
+confirming an in-flight rotation. The one exception is a rotation already
+in flight *before* this durability guarantee was deployed to your server —
+that pair has no durable record of who initiated it, and a restart still
+leaves it permanently unconfirmable (it fails closed rather than accepting
+just anyone). If you're mid-rotation during an upgrade, confirm before
+restarting if you can. If you can't, the 60-second background sweep still
+resolves the pair on its own timer — **provided the successor was
+presented at least once** (the same carve-out described above): if so, no
+action is required. If the successor was never presented at all, the sweep
+never resolves this pair — both credentials stay active until you act. To
+resolve it by hand — either because the successor was never presented, or
+because you'd rather not wait — revoke whichever side (predecessor or
+successor) you no longer trust with `DELETE /api/v1/tokens/{token_id}`
+(see above), rather than retrying `confirm`.
+
+**MFA step-up is required on every call, if you have MFA enrolled — and
+that includes a repeat call.** Unlike most session activity, `rotate` and
+`confirm` re-validate a *fresh* step-up proof **every time**, including a
+same-caller retry that just re-serves the same successor secret within the
+grace window — a repeat `rotate` is not treated as "already proved" just
+because the first call succeeded. If your last MFA proof is stale (or you
+haven't stepped up this session yet), you get a `401`:
+
+```json
+{
+  "error": {
+    "code": 401,
+    "message": "MFA step-up required",
+    "correlation_id": "req-..."
+  },
+  "meta": {
+    "api_version": "v1",
+    "mfa_step_up_required": true,
+    "challenge_url": "/login/mfa/stepup"
+  }
+}
+```
+
+Follow `challenge_url` to present a fresh TOTP code (or recovery code) —
+`/login/mfa/stepup` for a local session, `/auth/oidc/start` for an OIDC
+session — then retry the `rotate`/`confirm` call. This only applies to the
+interactive (cookie) session these examples use; a caller authenticated
+with a bearer API/MCP token is exempt, since minting that token already
+required MFA. See [Multi-Factor Authentication (TOTP)](#multi-factor-authentication-totp)
+for enrollment and the step-up window.
+
+**Self-service only — no admin override, and no delegate.** You can rotate
+or confirm only a token **you own**; there is no admin bypass (a human
+token's raw successor secret authenticates *as its owner*, so an admin
+completing someone else's rotation would be identity takeover, not an
+administrative convenience — an admin who needs to act on someone else's
+token has [revoke](#revoking-a-token) instead). Rotating/confirming a token
+you don't own returns the same `404 token not found` as a token that
+doesn't exist. **Under RBAC-on, this composes to effectively admin-only**:
+`ApiToken:Rotate` is granted only to the `Administrator` and
+`ApiTokenManager` roles, so an `Operator`- or `Viewer`-role user who owns a
+token has no path to rotate it themselves under RBAC-on, and no admin can
+do it for them either — the same pre-existing property already applies to
+creating a token ([`ApiToken:Write`](#creating-a-token)) and to
+[deleting one](#revoking-a-token) (the sibling `ApiToken:Delete`
+operation) — all three operations are held by the same two roles and no
+others; rotation does not change it.
+
+**Lifetime-neutral by design.** The successor token always inherits the
+predecessor's expiry exactly — a non-expiring token stays non-expiring, a
+30-day token stays a 30-day token from its *original* grant. There is no
+request field to extend it; rotating a credential is a lateral swap, never
+a way to renew a grant. If you need a longer-lived replacement, create a
+new token instead.
+
+**Rotate is not approval-gated the way Delete is.** The caller's own
+`mcp_tier`/`scope_service` must equal the predecessor's own values (the
+authority-inheritance guard above), so rotation can never mint a token with
+*more* authority than the caller already holds. That equality closes the
+privilege-escalation direction, but it does not make `rotate`/`confirm`
+approval-equivalent to `revoke`/`delete` — MCP's approval policy has no
+`ApiToken` rule for `Rotate`, so at the `supervised` tier a `Delete` call
+requires the approval workflow and a `Rotate`/`confirm` pair does not. A
+same-principal, equal-tier sibling token — for example two MCP agents both
+minted at `operator` for one human — can therefore be rotated and confirmed
+(destroying the sibling's predecessor and revealing a fresh successor
+secret to the caller) with neither an `ApiToken:Delete` grant nor a
+supervised-tier approval. There is no privilege gain here — the caller
+never exceeds their own authority — but the residual is availability (the
+sibling's predecessor is destroyed) plus cross-consumer credential capture
+(the caller sees the sibling's new raw secret) within one principal's own
+tokens.
+
+**The de-escalating direction is blocked too — this is a real capability
+gap, not a bug.** The guard is EQUALITY, not "no broader than": a cookie
+(dashboard) or JIT-elevated interactive session carries an empty
+`mcp_tier`/`scope_service`, same as an untiered token — but it therefore
+does **not** match a token that itself carries an `mcp_tier` or
+`scope_service`. The practical effect: **you cannot rotate or confirm your
+own MCP-tiered or service-scoped token from the dashboard or a cookie
+session at all** — only a caller presenting that token's own credential (or
+an equally-tiered one) can. This is backwards precisely when you suspect
+the token's secret, which is the main reason anyone rotates a credential;
+there is currently no dashboard-driven remediation for a suspected
+MCP-tiered token short of [revoking](#revoking-a-token) it outright.
+Whether to widen the guard to admit a higher-authority session rotating a
+narrower token is an open product decision, not yet made.
+
+**The `400` rejection text is misleading for this case.** Both the
+ownership mismatch and the authority-inheritance mismatch above return the
+identical `"no such token to rotate"` / `"no such token to confirm"`
+wording (by design — see "Self-service only" above for why this is not an
+enumeration oracle), so if you own the token and it genuinely exists, that
+message does not mean what it says; it means your current session's
+authority doesn't match the token's own. This wording is deliberate and is
+not being changed to disambiguate the two cases, since doing so would
+reopen the oracle it exists to close.
+
+See the [REST API reference](rest-api.md) `POST /api/v1/tokens/{token_id}/rotate`
+and `.../confirm` for the full error matrix.
+
 ## JIT Admin Elevation
 
 To reduce **standing** privilege (SOC 2 CC6.3/CC6.6), an operator can hold a non-admin role day-to-day and **activate** admin **just-in-time** for a short, justified window — so a compromised everyday session is not a standing admin session. Two steps:
@@ -802,6 +1014,8 @@ HTTP status codes:
 | `POST` | `/api/v1/tokens` | RBAC `ApiToken:Write` | Create a new API token |
 | `GET` | `/api/v1/tokens` | RBAC `ApiToken:Read` | List tokens owned by the authenticated user |
 | `DELETE` | `/api/v1/tokens/{id}` | RBAC `ApiToken:Delete` | Revoke (soft-delete) an API token |
+| `POST` | `/api/v1/tokens/{id}/rotate` | RBAC `ApiToken:Rotate`, self-service | Mint an overlap-pair successor for a token you own (see [Rotating a Token](#rotating-a-token)) |
+| `POST` | `/api/v1/tokens/{id}/confirm` | RBAC `ApiToken:Rotate`, self-service | Maker-checker confirmation closing an in-flight rotation |
 | `POST` | `/mcp/v1/` | Bearer token with MCP tier | MCP JSON-RPC 2.0 endpoint (22 read-only tools, 3 resources, 4 prompts) |
 
 ## Planned Features

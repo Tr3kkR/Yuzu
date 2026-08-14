@@ -57,6 +57,7 @@ std::string sanitize_detail_value(std::string_view v);
 
 struct Config;
 class EnginePrincipalStore;
+class ScimStore;
 
 /// Extracted auth helpers and route handlers (Phase 2 of god-object decomposition).
 ///
@@ -147,6 +148,13 @@ public:
     void set_engine_principal_store(EnginePrincipalStore* store) {
         engine_principal_store_ = store;
     }
+
+    /// Inject the ScimStore identity-link store (nullable — ADR-2001 §2 link
+    /// formation at OIDC login is fail-OPEN by design, so a null store here
+    /// simply skips the link/observation writes rather than failing the
+    /// login). Setter rather than a ctor param for the same low-risk
+    /// stacked-wiring reason as set_engine_principal_store.
+    void set_scim_store(ScimStore* store) { scim_store_ = store; }
 
     /// Cookie attribute string: "; Path=/; HttpOnly; SameSite=Lax; Max-Age=28800" + optional ";
     /// Secure".
@@ -254,6 +262,11 @@ private:
     // Nullable — see set_engine_principal_store(). Non-owning; lifetime is
     // guaranteed by ServerImpl (T8 wiring), which outlives AuthRoutes.
     EnginePrincipalStore* engine_principal_store_{nullptr};
+    // Nullable — see set_scim_store(). Non-owning; lifetime is guaranteed by
+    // ServerImpl (constructed well before AuthRoutes), which outlives
+    // AuthRoutes. Used ONLY at the OIDC login site (ADR-2001 §2/§D2) to form
+    // an identity link and record the login observation, both fail-OPEN.
+    ScimStore* scim_store_{nullptr};
     AuditStore* audit_store_;
     ManagementGroupStore* mgmt_group_store_;
     TagStore* tag_store_;

@@ -154,6 +154,56 @@ by declaring the newly undeclared plugin(s) so the ratchet count stops
 growing — `check-capability-matrix.sh`'s own header spells out the
 three drifts it catches and the ratchet-baseline mechanics.
 
+### Pin-displacement claim gate (`pin-displacement-claim-gate.yml`, #2740)
+
+A per-PR check asserting that every surface stating what CAUSES an MCP replay-ring pin
+displacement agrees on the cause set. `scripts/ci/check-pin-displacement-claim-set.sh`
+carries the invariant and its derivation pointer; the surfaces are one array in that
+script, and every check that iterates surfaces (all but the alert-expr check, which is
+alert-specific by construction) derives from it.
+
+It exists because that claim lives as an independent paraphrase in seven files, #2740
+falsified it, and successive review passes each fixed a different subset — a convention
+did not hold. It checks the machine-comparable part (which counters each surface names as
+a cause) and deliberately NOT the derivation prose, which is where the parked lexical-gate
+approach walls.
+
+Three properties worth knowing before editing it:
+
+- **It self-tests first.** The workflow runs `--selftest` (fixture cases proving each
+  defect shape reddens) before the real check, on the `plugin-spawn-gate.yml` precedent —
+  a gate nobody has watched fail is an assertion, not a check. Several of those cases exist
+  because a review proved the gate was false-green for surfaces its own header claimed to
+  protect, or false-green on a stale claim masked by a sibling occurrence; add a case
+  whenever you add a surface. Its case count is not restated here - run it.
+- **Add surfaces to `STATING_SURFACES`, not to a loop.** The two holes review found were
+  both a divergence between two hand-maintained lists. There is now one.
+- **The cause-set check is region-scoped, not whole-file (#2827).** On four surfaces a
+  counter identifier legitimately occurs more than once (a metrics registration, a
+  pre-seed, a sibling alert rule, a sibling table row), so a whole-file presence grep let a
+  stale claim hide behind an unrelated sibling occurrence and stayed green on exactly the
+  drift the gate exists to catch. `claim_region()` in the script extracts each surface's
+  own bounded claim text and tests membership only there; a surface with no
+  `claim_region()` arm, or whose anchor is missing or ambiguous, is reported as DRIFT
+  rather than silently skipped. A narrower, best-effort fourth check catches a claim
+  restated on an unregistered line elsewhere in a surface.
+- **Two region-boundary shapes, chosen per surface, not one.** ALERTS/HELP/RUNBOOK/HOME_HDR
+  scan multiple lines to a terminator anchored in syntax external to this gate (YAML
+  alerting-rule structure, a C++ string literal, a markdown table's leading `|`, a Doxygen
+  `///` prefix) — each fails DRIFT if the terminator is lost, or if the scan runs past
+  `MAX_REGION_LINES` without ever confirming one. MANUAL/MCP_SERVER_DOC/ADR_DOC are
+  single-line captures instead: their real claims have always been one physical line, and
+  two rounds of governance review each defeated a broadened multi-line stop pattern with a
+  different plausible reformat the prior round hadn't anticipated (a bare-emphasis-style
+  sibling, then a lettered/decimal/em-dash sibling) — see the `claim_region()` ADR_DOC arm's
+  comment for the fuller history. Single-line capture sidesteps guessing at prose format
+  entirely rather than trying to broaden the pattern a third time.
+
+A failing check is **merge-blocking** — the job exits non-zero and the workflow has no
+`continue-on-error`. No build, no `paths:` filter (nothing expensive to skip, and no filter
+means it always reports — see the trap noted for `docker-healthcheck-invariants.yml`
+below).
+
 ### Docker healthcheck invariants (`docker-healthcheck-invariants.yml`, #751)
 
 The five Yuzu **application** images' compose healthchecks depend on a tool baked

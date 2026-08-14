@@ -48,7 +48,7 @@ GuardianSparkRuntime::GuardianSparkRuntime(std::shared_ptr<IStateReader> reader,
     : reader_(std::move(reader)), backend_(std::move(backend)),
       clock_(clock ? std::move(clock)
                    : RuntimeClock{[] { return std::chrono::steady_clock::now(); }}),
-      boot_nonce_(make_boot_nonce()), index_(std::make_unique<SparkKeyRuleIndex>()),
+      cfg_(cfg), boot_nonce_(make_boot_nonce()), index_(std::make_unique<SparkKeyRuleIndex>()),
       outbox_(std::max(kMinOutboxCapacity, cfg.outbox_capacity)),
       // The LIFECYCLE window must be able to hold at least one maximum-size journal batch.
       // Paging is all-or-nothing per batch, so a window smaller than kMaxJournalEntriesPerBatch
@@ -89,6 +89,12 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     std::function<void()> waker;
     std::function<void()> outbox_waker;
     std::uint64_t new_gen = 0;
+    // Snapshot BEFORE taking registry_mu_ (same outside-lock pattern evaluate_key uses
+    // for its own now-snapshot): this is PendingState::first_seen, the M1 item (b)
+    // elapsed-time demotion clock. A fresh attach always starts un-demoted regardless
+    // of how long a PRIOR generation on this rule_id sat pending (detach_rule_locked
+    // below drops that generation's PendingState entirely).
+    const auto attach_now = clock_();
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
         if (stopping_)
@@ -128,10 +134,16 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         // assignment after the arm) leaked the subscription and left a ghost index entry
         // that corrupted a future sibling attach. Every undo is a safe no-op if its
         // mutation never ran, and GuardianRollback's destructor is terminate-safe.
-        // SCOPE LIMIT (Sol B4): if backend_->arm() itself THROWS after partially mutating
-        // SparkEngine (a bad_alloc inside arm_impl, no subscription returned), armed_here
-        // stays false and this rollback cannot clean the engine's partial state - that is
-        // a SparkEngine strong-guarantee gap tracked separately as a PR-2 flip blocker.
+        // If backend_->arm() itself THROWS (a bad_alloc inside arm_impl, no subscription
+        // returned), armed_here stays false and this rollback undoes only the
+        // Guardian-side mutations. That is sufficient for the engine's OWN bookkeeping:
+        // as of #2270 a bad_alloc can escape arm_impl only from its pre-commit/in-lock
+        // phase, which restores armed_/sub_keys_ exactly, so there is no partial armed_
+        // entry left for anyone to clean (arm_impl enumerates the residuals; they are
+        // not duplicated here). It does NOT make a failed arm
+        // invisible - a watch that fails to arm still fails for every rule sharing that spark key
+        // (#2270 UP-9, unchanged and pre-existing), and Guardian learns of it through
+        // the returned error, not through this rollback.
         // (Fable rung-7.7b M3; extends Sol rung-7.5 finding 1.)
         std::shared_ptr<PerKey> pk;
         std::uint64_t sub = 0;
@@ -166,7 +178,7 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         }
 
         rules_.insert_or_assign(rule_id, std::move(rg));
-        pk->pending_initial.insert(rule_id);
+        pk->pending_initial.insert_or_assign(rule_id, PendingState{attach_now, 0, false});
         // Copy the wakers (throwing std::function copies) BEFORE the lifecycle enqueue so
         // a throw here rolls back with NO audit entry yet. The lifecycle log is
         // append-only and never purged (guardian_outbox.hpp), so a phantom "armed"
@@ -264,7 +276,7 @@ void GuardianSparkRuntime::on_event(const SparkEvent& ev) {
     evaluate_key(ev.key, EvalReason::Event);
 }
 
-void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*reason*/) {
+void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reason) {
     std::shared_ptr<PerKey> pk;
     SparkSpec spec;
     {
@@ -368,7 +380,19 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
                           is_file ? &file_read : nullptr, is_reg ? &reg_read : nullptr,
                           is_svc ? &svc_read : nullptr);
 
-            std::vector<OutboxEntry> entries = build_entries(*rg, out, agent_id);
+            // M1 item (a): a committed repeat Unknown (edge already fired earlier in this
+            // errored episode) is due a REFRESH once errored_refresh_ms has elapsed since
+            // the last emission (edge or refresh) - a lost/coalesced edge must not leave
+            // the server's errored view stale forever now that the edge is the sole
+            // primary emission. `scratch.last_unhealthy_emit` reflects the LAST COMMITTED
+            // emission (untouched by eval_rule); errored_refresh_ms == 0 disables refresh
+            // entirely (edge-only, pre-F5 behaviour).
+            const bool refresh_due = out.status == EvalStatus::Unhealthy && !out.unhealthy_edge &&
+                                     cfg_.errored_refresh_ms > 0 &&
+                                     (now - scratch.last_unhealthy_emit) >=
+                                         std::chrono::milliseconds(cfg_.errored_refresh_ms);
+
+            std::vector<OutboxEntry> entries = build_entries(*rg, out, agent_id, refresh_due);
             const bool had_entries = !entries.empty(); // captured BEFORE the move below
             bool accepted = true;
             if (had_entries) {
@@ -380,16 +404,47 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason /*rea
             if (had_entries)
                 enqueued_any = true;
 
+            // Stamp the emission clock in the SAME scratch that is about to commit, so a
+            // rejected enqueue (continue above) leaves it untouched and the refresh is
+            // retried, not lost, on the next sweep - the same transactional guarantee
+            // copy-eval-enqueue-commit already gives every other field here.
+            if (out.status == EvalStatus::Unhealthy && (out.unhealthy_edge || refresh_due))
+                scratch.last_unhealthy_emit = now;
+
             rg->eval = std::move(scratch); // COMMIT
-            // M1: a committed repeat Unknown (already errored, so build_entries emitted
-            // nothing) is counted here so the edge-suppression is observable, never silent
-            // (Option-A: every loss/suppression channel is a counted metric).
-            if (out.status == EvalStatus::Unhealthy && !out.unhealthy_edge)
-                unhealthy_suppressed_.fetch_add(1, std::memory_order_relaxed);
+            // M1: every committed repeat Unknown is counted on exactly one of these two
+            // channels - REFRESHED (put on the wire) or SUPPRESSED (not) - so the
+            // edge/refresh split is observable, never silent (Option-A: every loss/
+            // suppression/resource-shedding channel is a counted metric).
+            if (out.status == EvalStatus::Unhealthy && !out.unhealthy_edge) {
+                if (refresh_due)
+                    unhealthy_refreshed_.fetch_add(1, std::memory_order_relaxed);
+                else
+                    unhealthy_suppressed_.fetch_add(1, std::memory_order_relaxed);
+            }
             // A Known verdict (Emit or steady-Silent) satisfies the initial eval; an
             // Unknown does not (it still owes a real verdict).
-            if (out.status != EvalStatus::Unhealthy)
+            if (out.status != EvalStatus::Unhealthy) {
                 pk->pending_initial.erase(rg->assertion.rule_id);
+            } else if (reason == EvalReason::Convergence) {
+                // M1 item (b): only a COMMITTED Convergence-reason Unknown advances the
+                // demotion clock - an Event-reason eval (an OS-level change notification,
+                // not a poll) must not fast-demote a rule that is merely noisy, and a
+                // rejected-enqueue pass (continue above) never reaches here at all.
+                const auto pit = pk->pending_initial.find(rg->assertion.rule_id);
+                if (pit != pk->pending_initial.end() && !pit->second.demoted) {
+                    ++pit->second.unknown_sweeps;
+                    const bool sweep_due = cfg_.pending_demote_sweeps > 0 &&
+                                          pit->second.unknown_sweeps >= cfg_.pending_demote_sweeps;
+                    const bool time_due = cfg_.pending_demote_ms > 0 &&
+                                          (now - pit->second.first_seen) >=
+                                              std::chrono::milliseconds(cfg_.pending_demote_ms);
+                    if (sweep_due || time_due) {
+                        pit->second.demoted = true;
+                        priority_demoted_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
         }
         if (enqueued_any)
             outbox_waker = outbox_enqueue_waker_; // copy; call after releasing registry_mu_
@@ -424,7 +479,8 @@ EvalOutcome GuardianSparkRuntime::eval_rule(const SparkSpec& /*spec*/, const Rul
 
 std::vector<OutboxEntry> GuardianSparkRuntime::build_entries(const RuleGeneration& gen,
                                                             const EvalOutcome& out,
-                                                            const std::string& agent_id) {
+                                                            const std::string& agent_id,
+                                                            bool refresh) {
     // Wall clock for the wire timestamp + id (the steady clock used for debounce has
     // an arbitrary epoch and is not a valid observation time; system_clock::now
     // captures nothing, so it is detach-safe). registry_mu_ is held. agent_id was
@@ -444,14 +500,17 @@ std::vector<OutboxEntry> GuardianSparkRuntime::build_entries(const RuleGeneratio
     if (out.status == EvalStatus::Emit)
         v.push_back(OutboxEntry::compliance(rid, gen.generation, make_event_id(rid, ms, agent_id),
                                             ns, out.drift));
-    else if (out.status == EvalStatus::Unhealthy && out.unhealthy_edge)
-        // EDGE ONLY (M1): the first Unknown of an errored episode mints one guard.unhealthy.
-        // A repeat Unknown while already errored produces NO entry here (the caller counts it
-        // via unhealthy_suppressed_) - convergence re-evaluates a stuck rule every ~5s to catch
-        // recovery, but must not re-mint a fresh health event each tick (fleet ingest flood).
-        // NOTE: the emitted health_detail is this episode's FIRST read-error string; a reason
-        // that changes across suppressed re-evals while still Unknown (EACCES -> ENODEV) is not
-        // re-surfaced until recovery starts a new episode. Accepted trade for the flood fix.
+    else if (out.status == EvalStatus::Unhealthy && (out.unhealthy_edge || refresh))
+        // EDGE + REFRESH (M1): the first Unknown of an errored episode mints one
+        // guard.unhealthy; the caller (evaluate_key) additionally sets `refresh` at
+        // errored_refresh_ms cadence so a lost/coalesced edge cannot leave the server's
+        // errored view stale forever - the edge is the primary emission, refresh is the
+        // backstop. A repeat Unknown that is NEITHER produces NO entry here (the caller
+        // counts it via unhealthy_suppressed_ instead of unhealthy_refreshed_).
+        // out.health_detail is this eval's CURRENT read-error string (eval_rule refreshes
+        // it on every Unknown, not just the edge), so a refresh - unlike a merely-
+        // suppressed tick - re-surfaces a changed reason (EACCES -> ENODEV) on the wire at
+        // errored_refresh_ms cadence, retiring the prior edge-only staleness trade.
         v.push_back(OutboxEntry::health(rid, gen.generation, make_event_id(rid, ms, agent_id), ns,
                                         /*healthy=*/false, out.health_detail, gtype, rname));
     // Silent, a suppressed repeat-Unknown, + !recovered -> empty (nothing to publish).
@@ -971,7 +1030,24 @@ std::vector<std::string> GuardianSparkRuntime::pending_initial(const std::string
     const auto kit = keys_.find(key);
     if (kit == keys_.end())
         return {};
-    return {kit->second->pending_initial.begin(), kit->second->pending_initial.end()};
+    std::vector<std::string> out;
+    out.reserve(kit->second->pending_initial.size());
+    for (const auto& [rule_id, state] : kit->second->pending_initial)
+        out.push_back(rule_id); // membership means "never Known" - includes demoted rules
+    return out;
+}
+
+std::vector<std::string>
+GuardianSparkRuntime::pending_demoted_for_test(const std::string& key) const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto kit = keys_.find(key);
+    if (kit == keys_.end())
+        return {};
+    std::vector<std::string> out;
+    for (const auto& [rule_id, state] : kit->second->pending_initial)
+        if (state.demoted)
+            out.push_back(rule_id);
+    return out;
 }
 bool GuardianSparkRuntime::stopping() const {
     std::lock_guard<std::mutex> lk{registry_mu_};
@@ -990,9 +1066,17 @@ std::vector<std::string> GuardianSparkRuntime::keys_for_type(SparkType type) con
 std::vector<std::string> GuardianSparkRuntime::keys_with_pending_initial() const {
     std::lock_guard<std::mutex> lk{registry_mu_};
     std::vector<std::string> out;
-    for (const auto& [key, pk] : keys_)
-        if (!pk->pending_initial.empty())
+    for (const auto& [key, pk] : keys_) {
+        // M1 item (b): a key leaves the priority worklist only once EVERY pending rule
+        // on it is demoted - a key with a mixed demoted/non-demoted pending set already
+        // pays the per-key read cost for its non-demoted sibling, so excluding it would
+        // silently starve that sibling's priority-lane cadence for free.
+        const bool has_active_pending =
+            std::any_of(pk->pending_initial.begin(), pk->pending_initial.end(),
+                       [](const auto& entry) { return !entry.second.demoted; });
+        if (has_active_pending)
             out.push_back(key);
+    }
     return out;
 }
 

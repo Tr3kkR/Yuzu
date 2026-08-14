@@ -12,8 +12,18 @@
 /// succeeds while every other connection gets 409 (gov unhappy-path UP-1).
 /// Governance cpp-safety flagged that this had zero test coverage; it now has
 /// a [pg] test that takes two real connections.
+///
+/// `KekOpLockGuard`'s release protocol is `pg::PgSessionAdvisoryLockGuard`
+/// (`pg/pg_session_advisory_lock.hpp`) — the ONE reusable session-advisory-
+/// lock release guard in this codebase; a second store needing a
+/// session-scoped lock (e.g. the T12 rotation sweep's store-wide sweep lock,
+/// `api_token_store.cpp`) reuses it rather than hand-rolling its own, exactly
+/// the drift `dispatch_confined_arms`/`authz_topology_floor` exist to prevent
+/// for their own chokepoints. See that header's own doc comment for the
+/// aborted-transaction wedge this design closes.
 
 #include "pg/pg_raii.hpp"
+#include "pg/pg_session_advisory_lock.hpp"
 
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
@@ -26,10 +36,18 @@
 namespace yuzu::server::detail {
 
 constexpr std::chrono::milliseconds kKekOpAcquireTimeout{5000};
-constexpr const char* kKekOpTryLockSql =
-    "SELECT pg_try_advisory_lock(2037545589, hashtext('secrets_kek_op'))";
-constexpr const char* kKekOpUnlockSql =
-    "SELECT pg_advisory_unlock(2037545589, hashtext('secrets_kek_op'))";
+
+// ONE definition of the `secrets_kek_op` lock's key, generating matching
+// try-lock/unlock SQL (`pg::PgAdvisoryLockKey`, #2964 round 3 review finding
+// 3) — replaces the former hand-written `kKekOpTryLockSql`/`kKekOpUnlockSql`
+// pair of string constants, which could drift (a drift unlocks a key never
+// locked; Postgres reports `false`, and the release guard treats `false` as
+// "released" — a silent leak of the key actually held).
+inline const pg::PgAdvisoryLockKey& kek_op_lock_key() {
+    static const pg::PgAdvisoryLockKey key =
+        pg::PgAdvisoryLockKey::pair("2037545589", "hashtext('secrets_kek_op')");
+    return key;
+}
 
 enum class KekOpLockAttempt { kAcquired, kConflict, kError };
 
@@ -39,7 +57,8 @@ enum class KekOpLockAttempt { kAcquired, kConflict, kError };
 /// Conflict immediately (rule from #2395: KEK ops never queue behind each
 /// other).
 [[nodiscard]] inline KekOpLockAttempt try_lock_kek_op(PGconn* conn) {
-    pg::PgResult res{PQexec(conn, kKekOpTryLockSql)};
+    const std::string try_lock_sql = kek_op_lock_key().try_lock_sql();
+    pg::PgResult res{PQexec(conn, try_lock_sql.c_str())};
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("KEK op: advisory-lock attempt failed: {}", PQerrorMessage(conn));
         return KekOpLockAttempt::kError;
@@ -65,58 +84,29 @@ enum class KekOpLockAttempt { kAcquired, kConflict, kError };
 /// (releases) BEFORE the lease returns the connection to the pool — a
 /// session advisory lock outlives the statement, so releasing it is not
 /// optional cleanup, it is the only way to unlock at all.
+///
+/// Thin, KEK-specific wrapper around the reusable
+/// `pg::PgSessionAdvisoryLockGuard` (`pg/pg_session_advisory_lock.hpp`) —
+/// this class's whole job is pinning `kek_op_lock_key()` and a log label so
+/// every existing call site (`explicit KekOpLockGuard{conn}`) keeps working
+/// unchanged. See the generic guard's own doc comment for the release
+/// protocol (dead-connection vs live-connection discrimination, rollback +
+/// retry, backend self-termination as the last resort on a live-connection
+/// failure that recovery could not fix).
 class KekOpLockGuard {
 public:
-    explicit KekOpLockGuard(PGconn* conn) noexcept : conn_(conn) {}
-    ~KekOpLockGuard() {
-        // Implicitly noexcept: a throwing log sink here would std::terminate on
-        // the exact path that already signals trouble. Everything is wrapped.
-        try {
-            pg::PgResult res{PQexec(conn_, kKekOpUnlockSql)};
-            if (res.ok())
-                return;
+    // Deliberately NOT `noexcept` — see `PgSessionAdvisoryLockGuard`'s own
+    // constructor doc comment (`pg/pg_session_advisory_lock.hpp`) for why:
+    // `inner_`'s mem-initializer heap-allocates a fresh unlock-SQL string.
+    explicit KekOpLockGuard(PGconn* conn) : inner_(conn, kek_op_lock_key(), "KEK op") {}
 
-            // The unlock failed. Two very different worlds (gov cpp-safety
-            // BLOCKING / unhappy-path UP-1):
-            //
-            //  - Connection already dead => the SESSION is gone, and a
-            //    session-scoped advisory lock dies with its session. Nothing
-            //    leaked; the pool discards the connection on release.
-            //  - Connection still HEALTHY => the lock is genuinely still held,
-            //    and PgPool::release would hand this connection back to the
-            //    pool still holding it. Session advisory locks are re-entrant
-            //    per backend, so the wedge is worse than it looks: whichever
-            //    request next draws THIS connection succeeds while every other
-            //    connection 409s indefinitely.
-            //
-            // For the second case, end the session deliberately. Terminating
-            // our own backend releases every session lock it holds and marks
-            // the connection bad, so PgPool::release discards it instead of
-            // recycling a poisoned one. Killing one pooled connection is
-            // strictly better than wedging KEK rotation cluster-wide until the
-            // next process restart.
-            if (PQstatus(conn_) != CONNECTION_OK) {
-                spdlog::warn("KEK op: advisory-lock release failed on an already-dead "
-                             "connection — the session (and its locks) are gone; nothing leaked");
-                return;
-            }
-            spdlog::critical("KEK op: could not release the 'secrets_kek_op' advisory lock on a "
-                             "live connection: {} — terminating this backend to guarantee the "
-                             "lock is released",
-                             PQerrorMessage(conn_));
-            pg::PgResult kill{PQexec(conn_, "SELECT pg_terminate_backend(pg_backend_pid())")};
-            (void)kill; // best-effort; the connection is discarded either way
-        } catch (...) {
-            // Nothing safe left to do during unwind.
-        }
-    }
     KekOpLockGuard(const KekOpLockGuard&) = delete;
     KekOpLockGuard& operator=(const KekOpLockGuard&) = delete;
     KekOpLockGuard(KekOpLockGuard&&) = delete;
     KekOpLockGuard& operator=(KekOpLockGuard&&) = delete;
 
 private:
-    PGconn* conn_;
+    pg::PgSessionAdvisoryLockGuard inner_;
 };
 
 /// #2530 B6 — diagnostic-only observer of the `secrets_kek_op` advisory

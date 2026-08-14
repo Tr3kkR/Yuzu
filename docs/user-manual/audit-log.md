@@ -24,13 +24,27 @@ Elastic.
 
 ## Storage
 
-Audit events are persisted in a dedicated SQLite database using WAL
-(Write-Ahead Logging) mode for high write throughput without blocking readers.
+Audit events are persisted in the server's PostgreSQL substrate under the
+dedicated schema `audit_store` (ADR-0006/0040) — the same database that backs the
+rest of the server's stores, not a separate file. There is **no SQLite
+fallback**: if the substrate is unreachable at boot the server fails closed and
+refuses to start.
+
+Because the audit log is the SOC 2 evidence chain, its write and read paths have
+deliberately asymmetric failure postures:
+
+- **Writes fail hard.** A persistence failure is never silently dropped — the
+  write returns an error to the caller. Behavioural-PII REST routes turn that
+  into `503` + `Sec-Audit-Failed: true` and serve **no** data, so evidence-less
+  PII is never recorded as audited.
+- **Reads degrade to DENY.** A store or connection-pool failure on a query
+  returns `503`, never a false-empty `200`. A reviewer or SIEM can never mistake
+  an infrastructure blip for "no audit activity."
 
 | Setting | Default | Description |
 |---|---|---|
 | Retention period | 365 days | Events older than this are deleted by background cleanup |
-| Cleanup interval | 1 hour | How often the background thread prunes expired events |
+| Cleanup interval | 1 hour | How often the sweeper prunes expired events (fleet-wide, single-sweeper — see [The retention clock guard](#the-retention-clock-guard)) |
 
 ## Event structure
 
@@ -78,7 +92,7 @@ required.
 > high-frequency, pre-handler operational event — an engine principal running
 > hot against its own cap, expected under normal steady-state load — not a
 > forensically interesting action against a resource. Auditing every
-> rejection would flood `audit.db` under a busy or misconfigured engine
+> rejection would flood the audit store under a busy or misconfigured engine
 > principal with no compliance benefit; the counter (SIEM-routable,
 > `absent()`-safe pre-seeded series) is the intended observability surface.
 > Compare with `yuzu_onbehalf_rejected_total` and `yuzu_auth_lockout_blocked_
@@ -99,7 +113,7 @@ required.
 | `auth.login_failed` | Session | Failed login attempt |
 | `auth.oidc_login` | User | An OIDC/Entra login completed via `GET /auth/callback`. Explicit-principal row (the request lands with no session cookie yet) — `principal`/`target_id` is the resolved display name, `principal_role` is the RESOLVED session role (group-mapping may have promoted the login to admin), `result=ok`. `detail=auth_source=oidc;amr_mfa_asserted=<true\|false>` — the CC6.6 evidence of whether the IdP's `amr` claim attested MFA — with `;admin_group=<value>` appended when the login resolved to admin, naming the granting `--oidc-admin-group` value. |
 | `auth.oidc_login_failed` | User | An OIDC login attempt at `/auth/callback` failed. `result=error` on early rejections (IdP returned an `error` param, missing `code`/`state`) with `detail` naming the reason; `result=failure` on the pre-existing `handle_callback` failure branch (token exchange / claim validation) with `detail` = the provider's error string. |
-| `auth.saml_login` | User | A SAML login completed via `POST /saml/acs`. Explicit-principal row (same rationale as `auth.oidc_login` above) — `principal`/`target_id` is the assertion's `NameID`, `principal_role` is the RESOLVED session role, `result=ok`. `detail=auth_source=saml` with `;admin_group=<value>` appended when the login resolved to admin, naming the granting `--saml-admin-group` value. |
+| `auth.saml_login` | User | A SAML login completed via `POST /saml/acs`. Explicit-principal row (same rationale as `auth.oidc_login` above) — since ADR-2001 PR4a, `principal`/`target_id` is the **stable** `saml:<entity_id>#<NameID>` principal (`saml_principal_id`), not the raw NameID; `principal_role` is the RESOLVED session role, `result=ok`. `detail=auth_source=saml;name_id=<sanitized NameID>` (the raw NameID, run through `sanitize_detail_value` since it is untrusted IdP-supplied input carried in a `detail` field — same rationale as OIDC's `display`/`email` handling), with `;admin_group=<value>` appended when the login resolved to admin, naming the granting `--saml-admin-group` value. |
 | `auth.saml_login_failed` | User | A SAML login attempt at `/saml/acs` failed — missing browser-binding cookie (forced-login/CSRF guard), oversized POST body, missing `SAMLResponse` field, signature/assertion validation failure, or an internal exception during validation/session creation. `result=error`, `detail` names the specific rejection reason. |
 | `auth.sso_group_provision` | User | The OIDC `/auth/callback` handler reconciled the IdP-asserted `claims.groups` into the RBAC store (`RbacStore::reconcile_idp_memberships`, `source="entra"`) — #1832, hardened per the follow-up round below. `result=ok`: reconciliation committed AND actually changed something (`added+removed>0`); `detail=source=entra;added=<N>;removed=<M>`. A no-op login (the asserted set exactly matches what's already on record — the common steady-state case) writes **no** row for this action at all. `result=skipped`: the IdP omitted the `groups` claim, or replaced it with an Entra group-overage indirection pointer (`_claim_names`/`_claim_sources`, asserted once a user is in more groups than fit in the token) — reconciliation is **not run**, existing memberships are left untouched, and the **login still proceeds** (fail-open on membership, never on authentication); `detail=reason=groups_overage|groups_absent;source=entra`. `result=error`: the login was **denied** (no session minted) because either the asserted group count exceeded `RbacStore::kMaxIdpGroupsPerLogin` (`detail=reason=group_count_exceeded;count=<N>;source=entra`) or the reconcile transaction itself failed (`detail=reason=<store error>;source=entra`) — a provisioning failure never falls through to a session with stale/unreconciled roles (fail-closed); an `error` result also emits a paired `auth.oidc_login_failed` row + analytics event so a SIEM query on that action doesn't miss a provisioning-denied login. Groups are stored **namespaced** (`entra:<gid>`), which is also the confused-deputy fix: a locally-created group can never collide with a same-named IdP group, and the reconcile itself verifies a namespaced row's `source` before joining a membership to it (a pre-existing differently-sourced row is never joined). Paired with the metric `yuzu_auth_sso_group_provision_total{source,result}` (`result` ∈ `ok`/`skipped`/`error`). See `docs/auth-architecture.md` "RBAC group provisioning (#1832)". |
 | `auth.breakglass.login` | User | The configured break-glass account (`--break-glass-user`) passed the password gate under `--auth-mode=sso-only` while **armed**. `result=ok` means the **password** was accepted — `detail` is explicit that no session is minted yet (the mandatory TOTP challenge still runs). Emitted at `Severity::kCritical`; paired with the metric `yuzu_auth_break_glass_login_total`. SOC 2 CC6.6. (Note: the sso-only denial of a *non*-break-glass local login is **not** audited per-attempt — it is the metric `yuzu_auth_local_disabled_total` only, to avoid audit-flood under credential spray; the boot-posture log is the activation evidence.) |
@@ -130,9 +144,12 @@ required.
 | `management_group.unassign_role` | ManagementGroup | A role is unassigned from a principal on a management group |
 | `api_token.create` | ApiToken | An API token is generated |
 | `api_token.revoke` | ApiToken | An API token is revoked |
+| `api_token.rotate` | ApiToken | A human token's self-service overlap-pair rotation was initiated (`POST /api/v1/tokens/{id}/rotate` or the `rotate_api_token` MCP twin, P2 #11, SOC 2 CC6.3) — the human twin of `engine_principal.credential.rotate`, self-service rather than admin-gated (`ApiToken:Rotate`, owner-vs-nonexistent 404 belt: the caller must own `{id}`). `target_id` is the **predecessor's** token id — the token being rotated, not the successor it mints. `result=denied` when `{id}` exists but is owned by a different principal (`detail=owner=<principal_id>`, same body as a genuine 404 so the route is not an ownership-enumeration oracle); `result=failure` when the store rejects the rotation (e.g. below the 24h overlap floor, or a different operator touching an in-flight rotation; `detail` is the store error). `result=partial` is a THIRD, distinct outcome (UP-11): `rotate_token` already committed and minted a live successor row, but reading its secret back to hand to the caller failed — the mint happened, only the reveal did not, so this is never folded into `failure` (which a CC6.3 reviewer would read as "no credential exists" when one plainly does). `result=success` is **not** emitted by this route — a successful rotation's evidence is the `api_token.reveal` row below, fired once the successor is confirmed findable. |
+| `api_token.reveal` | ApiToken | The raw successor secret was returned to the caller by a human self-service rotate call — the human twin of `engine_principal.credential.reveal`, emitted on **every** successful reveal, including a same-caller grace-window re-serve of the same bytes. `target_id` is the **predecessor's** token id — the token that was rotated, NOT the successor whose secret this row records revealing; `api_token.confirm` stamps the successor's id instead, so the two ends of one rotation share no correlation key (#2970 C); `detail` is the literal string `rotate`. This row, not a `api_token.rotate` success row, is the audit evidence that a rotation actually delivered a secret. |
+| `api_token.confirm` | ApiToken | A human self-service maker-checker confirmation that a rotation's successor secret was received/installed (`POST /api/v1/tokens/{id}/confirm` or the `confirm_api_token_rotation` MCP twin) — the human twin of `engine_principal.credential.confirm`; `{id}` is the successor token id the rotate response returned. `target_id` is the token id. `result=denied` when `{id}` exists but is owned by a different principal (`detail=owner=<principal_id>`, same 404-shaped body as rotate's denied case); `result=failure` when the store rejects the confirm (e.g. a replay after the rotation already resolved — `detail` carries the store's terminal message); `result=success` on confirm (`detail=confirmed`), which revokes the predecessor immediately and promotes the successor to the token's sole active credential. |
 | `engine_principal.role.assigned` | EnginePrincipal | A fleet-wide RBAC role was assigned to an engine principal via `POST /api/v1/engine-principals/{id}/roles` or the MCP `assign_engine_role` twin (PR 4.2, design §4.1). `target_id` is the full `engine:<slug>` principal id. `result=success` with `detail=<role_name>`; `result=denied` (target is not a live engine principal, the role is unknown, or `validate_assignment` rejects an admin/built-in/wildcard target — design §4.2 "no admin, ever") with `detail=<role_name>: <reason>`. Permission gate: `Security:Write`, plus admin + MFA step-up. |
 | `engine_principal.role.unassigned` | EnginePrincipal | A fleet-wide RBAC role was removed from an engine principal via `DELETE /api/v1/engine-principals/{id}/roles/{role}` or the MCP `unassign_engine_role` twin. `target_id` is the full `engine:<slug>` principal id; `detail=<role_name>`. `result=success` only — the unassign is **idempotent** (matching the management-group sibling): removing a role the principal never held still returns `200` and still writes a `success` row, so a success row does not by itself prove a grant existed. A `503` (store unavailable) writes no row. Permission gate: `Security:Write`, plus admin + MFA step-up. |
-| `engine_principal.role.listed` | EnginePrincipal | The fleet-wide RBAC roles assigned to an engine principal were enumerated via `GET /api/v1/engine-principals/{id}/roles` or the MCP `list_engine_roles` twin. `target_id` is the full `engine:<slug>` principal id; `result=success`. Audited because privilege enumeration is a security-sensitive read (SOC 2 CC7.2), even though it is a read. Permission gate: `Security:Read`. |
+| `engine_principal.role.listed` | EnginePrincipal | The fleet-wide RBAC roles assigned to an engine principal were enumerated via `GET /api/v1/engine-principals/{id}/roles` or the MCP `list_engine_roles` twin. `target_id` is the full `engine:<slug>` principal id; `result=success`. Audited because privilege enumeration is a security-sensitive read (SOC 2 CC7.2), even though it is a read. Permission gate: `EnginePrincipal:Read`. |
 | `engine_principal.create` | EnginePrincipal | A new engine-principal identity is minted via `POST /api/v1/engine-principals` or the `create_engine_principal` MCP tool. `detail` carries `owner=<username>; classification=<internal\|external>` on both REST and MCP. |
 | `engine_principal.list` | EnginePrincipal | The engine-principal list surface (`GET /api/v1/engine-principals`) was enumerated. Emitted on every successful call, including by a read-only auditor role — an admit-then-audit read, not a mutation. **REST-only** — the `list_engine_principals` MCP tool does not emit this verb; its call is recorded only under the generic `mcp.list_engine_principals` tool-call audit action (`target_type=mcp_tool`), not this domain-specific verb. |
 | `engine_principal.get` | EnginePrincipal | A single engine principal's identity row was read (`GET /api/v1/engine-principals/{id}`). **REST-only**, same caveat as `engine_principal.list` above — the `get_engine_principal` MCP tool records only the generic `mcp.get_engine_principal` tool-call audit action. |
@@ -143,8 +160,10 @@ required.
 | `engine_principal.credential.confirm` | EnginePrincipal | A rotation's successor secret was explicitly confirmed received/installed by its consumer (`POST /api/v1/engine-principals/{id}/credentials/confirm` or `confirm_engine_rotation`), closing the overlap window early and revoking the predecessor. A separate attestation from the reveal — never inferred from a successful rotate call. `target_id` is the engine principal id; on success `detail` carries `token_id=<confirmed successor id>` on both REST and MCP (#2384 — server-verified against the pending pair, never a raw secret), binding the attestation to the exact credential confirmed. A **replay after the rotation already resolved** writes a `failure` row here whose `detail` is the terminal store message (`rotation already confirmed ...` / `no rotation in flight ...` / `the rotation was resolved ...`, #2404) — the forensic evidence that a client kept confirming a resolved rotation, paired with the `yuzu_engine_principal_confirm_total{result="conflict"}` signal. (Audit-persist failure on this row is REST-silent but MCP-signaled via `audit_persisted:false` — the engine-principal REST family's uniform posture.) |
 | `engine_principal.transfer_owner` | EnginePrincipal | An engine principal's named responsible owner was reassigned (`POST /api/v1/engine-principals/{id}/transfer-owner` or `transfer_engine_principal_owner`). Admin-forced — does not depend on the outgoing owner's cooperation. **REST:** `detail` carries `old_owner=<username>; new_owner=<username>`. **MCP:** `detail` carries only `new_owner=<username>` — the outgoing owner is not named in the MCP audit row. |
 | `engine_principal.audit.no_admin` | AuditLog | The independent "no admin, ever" auditor ran (`GET /api/v1/engine-principals/audit/no-admin` or `audit_engine_no_admin`). `target_id` is the literal string `no-admin`; `detail` carries `violations=<N>`. `result=failure` (not `denied`) when the run could not verify (RBAC reference data unresolvable) — that outcome must never be read as "clean". |
-| `engine_principal.rotation.auto_revoke` | ApiToken | The 60-second background overlap-rotation sweep auto-revoked a predecessor credential whose overlap window elapsed without an explicit `confirm`. `principal="system"`; `detail` carries `principal_id=<engine principal> reason=overlap_window_elapsed`. |
-| `engine_principal.rotation.successor_unused` | ApiToken | The same background sweep's operational health signal: a rotation's successor credential is nearing its predecessor's overlap-expiry with no recorded use. **Operational, not security** — `result=warning`, deliberately not folded into `event="security"`. De-duplicated per rotation attempt (process-local, forgotten on restart). `detail` carries `principal_id=<...> predecessor_token_id=<...> overlap_expires_at=<epoch>`. |
+| `engine_principal.rotation.auto_revoke` | ApiToken | The 60-second background overlap-rotation sweep auto-revoked a predecessor credential whose overlap window elapsed without an explicit `confirm`. `principal="system"`; `detail` carries `principal_id=<engine principal> reason=overlap_window_elapsed`. **Governance UP-5:** the sweep withholds this auto-revoke (writes no row) when the successor was never presented at all (`last_used_at == 0`) — a dropped/lost successor secret must never leave the principal at zero usable credentials; the pair stays fully active and `.successor_unused` below is raised instead (see that row for its cadence — the audit row fires once per pair per state, not per tick). Also capped per tick (`kMaxAutoRevokesPerTick`) — a clock jump drains over several ticks rather than auto-revoking the whole eligible set in one; a capped tick logs and increments `yuzu_rotation_sweep_capped_total` (deliberately kind-neutral — shared across engine and human rotation pairs) but writes no distinct audit row of its own. |
+| `engine_principal.rotation.successor_unused` | ApiToken | The same background sweep's operational health signal: a rotation's successor credential is nearing its predecessor's overlap-expiry with no recorded use. **Operational, not security** — `result=warning`, deliberately not folded into `event="security"`. Fires once per rotation attempt pre-elapse, then once more on crossing into the elapsed state (the pair the `.auto_revoke` carve-out above is now deliberately leaving alone) — the audit row and its metric are de-duplicated **once per pair per state**, process-local (a restart re-emits once). The underlying log line, by contrast, repeats every tick once the window has elapsed, so a stuck-open rotation is never silent even though the audit row and metric fire only once per state. `detail` carries `principal_id=<...> predecessor_token_id=<...> overlap_expires_at=<epoch>`, plus `status=elapsed_unrevoked_successor_unused` once past the window. |
+| `api_token.rotation.auto_revoke` | ApiToken | The human-owned twin of `engine_principal.rotation.auto_revoke` above (P2 #11, SOC 2 CC6.3) — the SAME 60-second background overlap-rotation sweep auto-revoked a HUMAN predecessor token whose overlap window elapsed without an explicit confirm. Routed here instead of the engine action by the swept row's own `principal_kind` (the single chokepoint `rotation_sweep_names_for_kind`, `rotation_sweep_naming.hpp`), never by which endpoint minted the pair. `principal="system"`; `detail` carries `principal_id=<username> reason=overlap_window_elapsed`. Same UP-5 never-used-successor carve-out and per-tick cap as the engine row above. |
+| `api_token.rotation.successor_unused` | ApiToken | The human-owned twin of `engine_principal.rotation.successor_unused` above (P2 #11) — same background sweep's operational health signal for a HUMAN rotation pair: the successor token is nearing its predecessor's overlap-expiry with no recorded use. **Operational, not security** — `result=warning`. Fires once per rotation attempt pre-elapse, then once more on crossing into the elapsed state (same UP-5 behavior as the engine row above) — the audit row and its metric are de-duplicated once per pair per state, process-local (a restart re-emits once); the underlying log line repeats every tick once elapsed. `detail` carries `principal_id=<...> predecessor_token_id=<...> overlap_expires_at=<epoch>`, plus `status=elapsed_unrevoked_successor_unused` once past the window. |
 | `engine_principal.owner_deprovisioned` | EnginePrincipal | A SCIM deprovision (deactivate/delete) removed a user who still owned active engine principals. The deprovision itself **always succeeds** (a CC6.8 termination is never blocked) — this is a *detective*, not preventive, control: it also increments `yuzu_engine_principal_owner_deprovisioned_total` so an admin can reassign ownership out of band. `target_id` is the departing username; `detail` carries `orphaned_active_engine_principals=<N>` or `engine_ownership_unverifiable`. Never fires on a SCIM undo/rollback. The interactive dashboard delete uses the preventive form instead (blocked with `409`). |
 | `quarantine.enable` | Security | A device is placed in quarantine |
 | `quarantine.disable` | Security | A device is released from quarantine |
@@ -157,6 +176,7 @@ required.
 | `deployment.create` | SoftwareDeployment | An operator deployed an installer to a pre-flight run's go-cohort via `POST /fragments/auto/deploy/run`. `target_id` is the new `deployment_id`; `detail` carries `run=<source_run_id> file=<filename> sha256=<hash> url=<url> devices=<N>` — the **SHA-256 is the content identity of the binary executed on the fleet**. `result=success` (deployment created + first advance), `resumed` (an in-flight deployment for this run already existed — re-attached, not re-created, so the installer is not run twice; `target_id` is the existing deployment), or `no_devices` (the go-cohort was empty after re-intersecting with the operator's current visible set — a no-op). Permission gates: `Infrastructure:Read` + `SoftwareDeployment:Execute`. |
 | `deployment.advance` | SoftwareDeployment | The deployment engine was ticked via the result-poll `GET /fragments/auto/deploy/result`. Emitted on **every poll tick** while the page is open (up to ~600 ticks before the page stops self-polling); `result=success`. `target_id` is the `deployment_id`. SIEM: a burst of these rows with one `deployment_id` is a single open-page session, not repeated operator intent (auditing only ticks that actually dispatch is a tracked follow-up). Permission gates: `SoftwareDeployment:Read` + `SoftwareDeployment:Execute`. |
 | `deployment.delete` | SoftwareDeployment | An operator deleted a deployment via `POST /fragments/auto/deploy/delete?dep=<id>`. `target_id` is the `deployment_id`. `result=success` when an owned row was removed, `noop` when the id was unknown or not owner-visible (prevents cross-owner enumeration — same posture as `preflight.run.delete`). Permission gate: `SoftwareDeployment:Execute`; owner-scoped at the store seam. |
+| `discovery.scan` | Discovery | An agent reported network-discovery scan results via `POST /api/discovery/scan` (`discovery_store`, ADR-0044). `target_id` is the scanned `subnet`; `detail=<stored>/<attempted> devices stored` (an entry skipped for an empty `ip_address` is not counted as attempted). `result=success` when every attempted device persisted, `partial` when some but not all did (the same "some succeeded, some failed" outcome `session.revoke_all`/`api_token.rotate` use `partial` for — never folded into `failure`, which would misreport devices that DID persist), `failure` when every attempted device failed to persist (the request also returns `503`). |
 | `cert.reload` | TlsCertificate | Certificate hot-reload attempted; detail contains outcome (success or failure reason) |
 | `guaranteed_state.rule.create` | GuaranteedState | A Guaranteed State rule is created. On 400 (missing required fields), 409 (rule_id/name conflict), or RBAC rejection, emits `result=denied` with the store error in `detail`. |
 | `guaranteed_state.rule.update` | GuaranteedState | A Guaranteed State rule is updated (version is incremented on every successful update). On 404 (rule not found), 400 (invalid JSON body — `detail` is the literal string `"invalid JSON body"`), 409 (name conflict), or RBAC rejection, emits `result=denied`. |
@@ -170,8 +190,8 @@ required.
 | `dex.observation.view` | Agent | An operator clicked a **single signal-history row** on a DEX device drill-down, loading the **per-event observation detail panel** (every captured projection field for that one event: subject / reason / symbolic / component / metric / platform / exact timestamp / event ID). Emitted by `GET /fragments/dex/observation?agent_id=<agent_id>&event_id=<event_id>`; the `event_id` is bound to the scoped `agent_id`, so a guessed or foreign event ID returns an **opaque 200 placeholder** (byte-identical to "no such event" — the route returns 200 not 404 so the dashboard's htmx swap:false-on-4xx still renders it) and reveals nothing. `target_id` is the `agent_id`; permission gate `GuaranteedState:Read`. The `detail` records the opened event's **obs_type and bound event_id**, so usage-class opens (e.g. `process.crashed` / `process.hung` — what a person ran) stay **separately countable** from machine-class opens for works-council access-audit purposes (same rationale as `dex.device.procperf.query`). Behavioral PII — reveals which specific application event a person's device generated at a given moment. As an HTML dashboard fragment it is **set-and-proceed** (not fail-closed like the REST per-device endpoints): if the audit row cannot persist the response carries `Sec-Audit-Failed: true` and the panel **still renders** (#1647 — the emit routes through the shared `emit_behavioral_audit` chokepoint, which also catches a throwing audit sink). |
 | `guardian.device.view` | Agent | An operator opened the **Guardian lens** on the shared device page (`GET /fragments/device/guardian?id=<agent_id>`) — per-guard compliance state for that device. `target_id` is the `agent_id`; permission gate `GuaranteedState:Read`. |
 | `device.live.uptime` | Agent | An operator clicked **Get live info** on a device page and the uptime panel dispatched a live `os_info/uptime` instruction to the device. Execute-gated (`Execution:Execute`, beyond `GuaranteedState:Read`); `target_id` is the `agent_id`, `detail` records the agent count reached and the `command_id`. Machine-health telemetry. **Two emitters, by design:** the dashboard panel audits **post-dispatch** (`result=dispatched`/`no_agents`); the REST endpoint (`POST /api/v1/dex/devices/{id}/live?kind=uptime`) audits **pre-dispatch** (`result=requested`, `detail` carries `cid=<correlation_id>`) and fails closed (`503` + `Sec-Audit-Failed`, no dispatch) if the row cannot persist. The dashboard live + lens sites also set `Sec-Audit-Failed` on a persist failure (#1585). Aligning the dashboard emitter to pre-dispatch is a tracked follow-up. **Known gap (Stream B):** the `device.live.*` REST incarnation (`POST /api/v1/dex/devices/{id}/live` in `rest_api_v1.cpp`) is the last behavioural-PII audit site not yet migrated to the shared `emit_behavioral_audit` chokepoint — it fails closed before dispatch on a `false` return (no PII without audit), but an audit sink that **throws** escapes to an httplib 500 instead of the documented `503` + `Sec-Audit-Failed`. Also note the throw path emits no `yuzu_server_audit_emit_failed_total` metric (catch-arm `spdlog::warn` only) — for set-and-proceed routes alert on the `Sec-Audit-Failed` header/log, not the counter (#1703). |
-| `device.live.processes` | Agent | An operator clicked **Get live info** and the running-process panel dispatched a live `processes/list_hashed` instruction (PID, name, and the SHA-256 of each on-disk executable image). **Usage-class behavioral telemetry** — reveals which programs a person is running. Deliberately a **separate verb** from `device.live.uptime` so usage-class reads stay separately countable for works-council access-audit purposes (same rationale as `dex.device.procperf.query`). Execute-gated; `target_id` is the `agent_id`, `detail` records the agent count and `command_id`. No hash/process data leaves the device until an operator explicitly dispatches this panel. **Persistence:** the dispatched result (process names, paths, SHA-256) is stored in `responses.db` for `response_retention_days` like any command result, so it is also a DSAR/data-inventory source and is retrievable via the standard response-store API under `Execution:Read` — the works-council "separately countable" guarantee covers the *dispatch* (this verb), not a later read-back of the persisted row. **Note:** the dashboard's Get-live-info Processes card now dispatches `process_tree` (parent PID + SHA-256 + connection join) instead; `device.live.processes` (flat `processes/list_hashed`) remains valid for REST/scripted callers dispatching that action directly. **SIEM / works-council migration:** a query previously keyed on `device.live.processes` to count dashboard process reads should add `device.live.process_tree`, or dashboard process reads will be silently undercounted from this release onward. **Two emitters** (same as `device.live.uptime`): the dashboard panel audits post-dispatch; the REST endpoint audits pre-dispatch (`result=requested`) and fails closed (`503` + `Sec-Audit-Failed`) on a persist failure. |
-| `device.live.process_tree` | Agent | **Get live info** Processes card — dispatched `processes/list_tree` (PID, parent PID, name, SHA-256) **plus** `network_diag/connections` (joined to the tree by PID), reconstructed into a parent→child tree with per-process network endpoints. **Usage-class behavioral telemetry** (reveals what a person runs + where it connects); a separate verb from `device.live.uptime`. Execute-gated; `target_id` is the `agent_id`. The tree + connection results persist in `responses.db` like any command result (same DSAR/read-back note as `device.live.processes`). **Currently one emitter** — the dashboard `/run` route, post-dispatch (`result=dispatched`/`no_agents`); a `process_tree` card is dashboard-only until the REST/JSON A1 backfill (#1649), at which point a second pre-dispatch (`result=requested`) emitter will be added to match `device.live.uptime`. |
+| `device.live.processes` | Agent | An operator clicked **Get live info** and the running-process panel dispatched a live `processes/list_hashed` instruction (PID, name, and the SHA-256 of each on-disk executable image). **Usage-class behavioral telemetry** — reveals which programs a person is running. Deliberately a **separate verb** from `device.live.uptime` so usage-class reads stay separately countable for works-council access-audit purposes (same rationale as `dex.device.procperf.query`). Execute-gated; `target_id` is the `agent_id`, `detail` records the agent count and `command_id`. No hash/process data leaves the device until an operator explicitly dispatches this panel. **Persistence:** the dispatched result (process names, paths, SHA-256) is stored in the response store (PostgreSQL schema `response_store`) for `response_retention_days` like any command result, so it is also a DSAR/data-inventory source and is retrievable via the standard response-store API under `Execution:Read` — the works-council "separately countable" guarantee covers the *dispatch* (this verb), not a later read-back of the persisted row. **Note:** the dashboard's Get-live-info Processes card now dispatches `process_tree` (parent PID + SHA-256 + connection join) instead; `device.live.processes` (flat `processes/list_hashed`) remains valid for REST/scripted callers dispatching that action directly. **SIEM / works-council migration:** a query previously keyed on `device.live.processes` to count dashboard process reads should add `device.live.process_tree`, or dashboard process reads will be silently undercounted from this release onward. **Two emitters** (same as `device.live.uptime`): the dashboard panel audits post-dispatch; the REST endpoint audits pre-dispatch (`result=requested`) and fails closed (`503` + `Sec-Audit-Failed`) on a persist failure. |
+| `device.live.process_tree` | Agent | **Get live info** Processes card — dispatched `processes/list_tree` (PID, parent PID, name, SHA-256) **plus** `network_diag/connections` (joined to the tree by PID), reconstructed into a parent→child tree with per-process network endpoints. **Usage-class behavioral telemetry** (reveals what a person runs + where it connects); a separate verb from `device.live.uptime`. Execute-gated; `target_id` is the `agent_id`. The tree + connection results persist in the response store (PostgreSQL schema `response_store`) like any command result (same DSAR/read-back note as `device.live.processes`). **Currently one emitter** — the dashboard `/run` route, post-dispatch (`result=dispatched`/`no_agents`); a `process_tree` card is dashboard-only until the REST/JSON A1 backfill (#1649), at which point a second pre-dispatch (`result=requested`) emitter will be added to match `device.live.uptime`. |
 | `device.live.services` | Agent | **Get live info** Services card — dispatched `services/list` (service run state). Machine-health telemetry. Execute-gated; `target_id` is the `agent_id`. |
 | `device.live.netconfig` | Agent | **Get live info** Adapters & IP card — dispatched `network_config/ip_addresses`. Machine-health telemetry. Execute-gated. |
 | `device.live.arp` | Agent | **Get live info** ARP card — dispatched `network_config/arp` (host ARP / IPv6 neighbour table; Windows-only). Machine-health telemetry. Execute-gated. |
@@ -218,7 +238,8 @@ required.
 | `server.unsigned_packs_allowed` | ProductPack | Emitted ONCE at server startup when `--allow-unsigned-packs` / `YUZU_ALLOW_UNSIGNED_PACKS=1` is set (#802 / W7.4). `principal=system`, `target_id=signature_enforcement`, `detail` describes the flag source, `result=success`. Pairs with the `[SECURITY] product pack signature enforcement DISABLED by configuration` warn line in operator logs. SIEM rules can detect a server running with the relaxed posture even on deployments with no pack-install traffic. |
 | `server.unsigned_definitions_allowed` | InstructionDefinition | Sibling of `server.unsigned_packs_allowed`, emitted ONCE at server startup when `--allow-unsigned-definitions` / `YUZU_ALLOW_UNSIGNED_DEFINITIONS=1` is set (#1073 / W7.4 sibling-gap closure). `principal=system`, `target_id=signature_enforcement`, `detail` describes the flag source, `result=success`. Pairs with the `InstructionStore: signature enforcement DISABLED by configuration` warn line in operator logs. Same SIEM use case: identifies servers running with the relaxed instruction-import posture. |
 | `config.admin_group_set` | AuthConfig | Emitted ONCE per configured flag at server startup when `--oidc-admin-group` and/or `--saml-admin-group` is non-empty (#1829). `principal=system`, `target_id` is `oidc` or `saml` (one row per configured provider — up to two rows on a server with both wired), `detail=provider=<oidc\|saml>;admin_group=<value>` (the already-trimmed group value — a group identifier, not a secret), `result=success`. Makes the standing "which group grants admin via SSO" posture recoverable from the audit store even on a deployment with no SSO logins yet. |
-| `mcp.bridge.*` | Execution | Server-side lifecycle events of the MCP progress bridge (track 2f PR 3a), NOT operator actions - emitted from the background sweep/projector (and, for the two arbitration verbs `mcp.bridge.cancel` and `mcp.bridge.dispatch_failure`, from the request thread that lost or unwound), so `principal=system` for the bridge's own background work (sweep/projector) - **except** the two client-driven verbs, EVERY `mcp.bridge.cancel` row (whether the cancel detached a live streamed response or was consumed at `arm()` - as of the SSE-on-`POST` rung both carry the canceller; the session gate binds the record's principal to the authenticated caller, so the two cannot diverge) and `mcp.bridge.dispatch_failure`, which carry the authenticated caller as `principal` so a cancel is attributable to the client that asked for it (Decision 15(j) non-repudiation) - and `target_id` is the `execution_id` - **except** for a record reaped by the arming reaper before `subscribe()` assigned an execution id, where `target_id` is empty (that row is therefore not joinable to an execution; the `detail` still identifies the disposition). `result` is normally `success`, but every verb that routes through the claimed-teardown path (all of them except `mcp.bridge.cancel` and `mcp.bridge.dispatch_failure`, which are transitions rather than teardowns) emits **`result=failure`** when the teardown could not settle one of the three resources it owns (`detail` begins `teardown incomplete: ...` and names what is retained - see `yuzu_mcp_bridge_teardown_incomplete_total{reason}` and `docs/ops-runbooks/mcp-bridge-teardown-recovery.md`), or when the terminal-frame publish ladder poisoned the session, threw, or was never reached (`detail` states which, and never asserts a delivery or a poisoning that did not happen - #2506). **Upgrade note:** before v0.13.0 these rows were unconditionally stamped `result=success` regardless of outcome; a SIEM rule that assumed the constant needs updating. The verb family: `mcp.bridge.done_reap` (a settled GET-only record was reaped), `mcp.bridge.session_dead` (a record torn down because its session idle-expired), `mcp.bridge.arming_reaped` (an orphaned reserved-but-never-armed record was reclaimed by the age reaper), `mcp.bridge.cancel` (a cancel took effect - either consumed at arm, or detaching a LIVE streamed response), `mcp.bridge.dispatch_failure` (a request failed AFTER its work was dispatched, so its record was PARKED rather than abandoned - the execution keeps running and its result stays fetchable by `execution_id`; unlike the pre-dispatch failure paths this deliberately does NOT cancel the execution), `mcp.bridge.pin_acked` and `mcp.bridge.forced_expire` (parked-result teardown). All of these are LIVE as of the SSE-on-`POST` rung (2f PR 3b), which wired their callers. The operator action that *starts* progress streaming (`execute_instruction`) is separately audited under its own `mcp.execute_instruction` verb with the real principal - the bridge does not replace it. |
+| `mcp.session.*` | McpSession | MCP Streamable HTTP session lifecycle (track 2f PR 1/2/3b) — `initialize`, `GET`/`DELETE /mcp/v1/`, and the streamed-POST admission path all funnel through this one action family. No RBAC permission gate — this is a transport-level pre-auth/session check, not an authorized operation. `mcp.session.open`: a session was minted on a successful `initialize`; `target_id` is the new session id's first 8 characters, `detail` empty (the principal is derived from `req` by the audit layer, not stamped from the minted id — the session-id prefix in `target_id` is what correlates an `open` row to its later `close`/`reject` rows, governance CONS-N2). `mcp.session.close`, `result=success`: either an explicit `DELETE /mcp/v1/` (`target_id`=session-id prefix, `detail` empty), or the server force-terminating the session because a `GET` resume's `Last-Event-ID` cursor fell outside the replay window (`detail=reason=replay_window_exceeded cid=<cid>`, #2793) — **`result=success` here describes the close itself succeeding, not the triggering request**, which still answers `404` to the client. `mcp.session.reject`, `result=failure`: every denial across all three methods and both the pre-admission and streamed-POST-internal admission checks — `Origin` not allowed, unsupported `MCP-Protocol-Version`, a missing or presented-but-invalid `Mcp-Session-Id` (unknown, expired, or another principal's — one answer for all three, no cross-principal existence oracle, Decision 15(a)/CH-8), a concurrency cap — on `initialize` (`per_principal_cap`/`global_cap`/`id_generation`, `McpSessionRegistry`'s own session-mint tracking) or on `GET`'s stream attach (`per_principal_stream_cap`/`global_stream_cap`, the shared cross-surface `StreamBudget` — a distinct reason vocabulary from the mint-time cap despite the similar names), `GET`-specific causes (`not_acceptable`, `stream_handover_pending`, `terminal_poisoned`), and the streamed-POST admission denials (`--mcp-enable-streamed-post`, 2f PR 3b) — `post_per_principal_cap`/`post_global_cap`/`post_pin_slots`/`post_duplicate_request_id`/`post_unknown_session`, whose `detail` additionally carries `surface=post dispatched=false` since a streamed-POST denial happens before any execution row exists. `target_id` is empty on every cause that rejects before a session is read at all — `Origin`, protocol version, `missing_session_header` (there is no header to reflect), and the `initialize` mint-cap family (rejection happens before `initialize` even looks for one) — and carries the sanitized session-id prefix on every other cause: `unknown_session` (any method — the presented, not-yet-validated id), and, on `GET` specifically, `not_acceptable`/`stream_handover_pending`/`terminal_poisoned`/the stream-attach cap pair and the streamed-POST denials (all reached only once `validate_and_touch` has already confirmed a real, live session, so the id is never empty there). `detail=reason=<X> cid=<correlation_id>` for every cause. The full closed `reason=` set (and which values are `mcp.session.close` vs `mcp.session.reject`) is in `docs/observability-conventions.md`. Every *presented* session-id prefix reaching any of these three verbs is sanitized (`sanitize_detail_value`) at every call site that reads one from the `Mcp-Session-Id` header, since it is attacker-controlled until it validates — raw bytes could otherwise inject the `;`/`=` field separators a `k=v;k=v` `detail` string relies on (#2917 closed the one remaining unsanitized site, on `POST`'s presented-session check). `mcp.session.open`'s `target_id` is the exception: it is the server's own freshly-minted id, not attacker input, so it is stamped unsanitized. |
+| `mcp.bridge.*` | Execution | Server-side lifecycle events of the MCP progress bridge (track 2f PR 3a), NOT operator actions - emitted from the background sweep/projector (and, for the three client-driven verbs `mcp.bridge.cancel`, `mcp.bridge.dispatch_failure` and `mcp.bridge.pin_displaced_for_admission`, from the request thread that lost, unwound, or was admitted), so `principal=system` for the bridge's own background work (sweep/projector) - **except** the three client-driven verbs, EVERY `mcp.bridge.cancel` row (whether the cancel detached a live streamed response or was consumed at `arm()` - as of the SSE-on-`POST` rung both carry the canceller; the session gate binds the record's principal to the authenticated caller, so the two cannot diverge) `mcp.bridge.dispatch_failure`, and `mcp.bridge.pin_displaced_for_admission` (#2740 — a streamed admission reclaimed a session slot from an already-committed final no wire took delivery of: either a parked record's, or an ORPHAN pin whose owning record a teardown erased without unpinning. `target_id` is the displaced final's `execution_id`, empty for an orphan because no record survives to name it, and the `detail` says which case it was), which carry the authenticated caller as `principal` so a cancel is attributable to the client that asked for it (Decision 15(j) non-repudiation) - and `target_id` is the `execution_id` - **except** in two cases where `target_id` is empty: a record reaped by the arming reaper before `subscribe()` assigned an execution id, and a `pin_displaced_for_admission` row for an ORPHAN pin, whose owning record no longer exists to name one — that row carries `released ring event_id=<n>` in its `detail` instead, which is per-session and so must be read together with the row's own session context (that row is therefore not joinable to an execution; the `detail` still identifies the disposition). `result` is normally `success`, but every verb that routes through the claimed-teardown path (all of them except `mcp.bridge.cancel`, `mcp.bridge.dispatch_failure` and `mcp.bridge.pin_displaced_for_admission`, which are transitions rather than teardowns) emits **`result=failure`** when the teardown could not settle one of the three resources it owns (`detail` begins `teardown incomplete: ...` and names what is retained - see `yuzu_mcp_bridge_teardown_incomplete_total{reason}` and `docs/ops-runbooks/mcp-bridge-teardown-recovery.md`), or when the terminal-frame publish ladder poisoned the session, threw, or was never reached (`detail` states which, and never asserts a delivery or a poisoning that did not happen - #2506). **Upgrade note:** before v0.13.0 these rows were unconditionally stamped `result=success` regardless of outcome; a SIEM rule that assumed the constant needs updating. The verb family: `mcp.bridge.done_reap` (a settled GET-only record was reaped), `mcp.bridge.session_dead` (a record torn down because its session idle-expired), `mcp.bridge.arming_reaped` (an orphaned reserved-but-never-armed record was reclaimed by the age reaper), `mcp.bridge.cancel` (a cancel took effect - either consumed at arm, or detaching a LIVE streamed response), `mcp.bridge.dispatch_failure` (a request failed AFTER its work was dispatched, so its record was PARKED rather than abandoned - the execution keeps running and its result stays fetchable by `execution_id`; unlike the pre-dispatch failure paths this deliberately does NOT cancel the execution), `mcp.bridge.pin_acked` and `mcp.bridge.forced_expire` (parked-result teardown), and `mcp.bridge.pin_displaced_for_admission` (#2740 — a streamed admission reclaimed a session slot; carries the admitting principal). **Correlate the last two:** since #2740 a released pin is no longer proof a client consumed anything, so a `pin_acked` row that follows a `pin_displaced_for_admission` row for the same execution records a reclaim, NOT an ack — the action name predates the reclaim and is kept for taxonomy stability. `mcp.bridge.shutdown_reap` (#2517) is the one AGGREGATE exception to the per-execution shape above: emitted at most once per process shutdown, with `target_id`/`execution_id` empty and `detail` naming the COUNT of records reclaimed (`"poisoned N claimed-but-unpublished record(s) at shutdown..."`) — a claimed-but-unresolved teardown `shutdown()`'s own walk found abandoned by a raced sweep, rather than a per-record row (which would re-enter the teardown's exactly-once arbitration). Always `result=success`, `principal=system`. No metric backs it (the process is exiting before any scrape); a shutdown-time reclaim that WAS already resolved gets no row at all (the ordinary silent-reclaim case, `docs/observability-conventions.md`'s comp-S1 bullet). All of these are LIVE as of the SSE-on-`POST` rung (2f PR 3b), which wired their callers. The operator action that *starts* progress streaming (`execute_instruction`) is separately audited under its own `mcp.execute_instruction` verb with the real principal - the bridge does not replace it. |
 
 **Result vocabulary.** `result` is predominantly `success` or `denied`, with `failure` for a failure the handler audits itself. The set is not closed in practice - `ok`, `error`, `warning` and `skipped` also appear on specific verbs. `denied` is the usual token for an authorization or validation rejection with a real principal behind it, but that is a convention rather than an invariant: `enrollment.token_consumed` and `engine_principal.credential.rotate` both use `failure` for what are really rejections, and `instruction.scope_resolution_failed` was emitting a self-audited `failure` before the `mcp.bridge.*` family existed. **So a SIEM rule that surfaces failure branches by filtering on `denied` alone will miss several families, including every background-actor row.** Filter on `result != "success"` when you want all of them. Note `GET /api/v1/audit` does not currently expose a `result` query parameter, so that filter has to be applied by the SIEM after export rather than server-side. `denied` is used for RBAC rejections and for every 400/404/409 branch where the handler explicitly audits the failure — including Guardian `rule.create` (400 missing fields, 409 conflict), `rule.update` (400 invalid body, 404 not found, 409 conflict), `rule.delete` (404 not found), `push` (400 non-object body), and the Phase 8.3 `offload_target.create` (400 validation_failed) / `offload_target.delete` (404 not_found) handlers. SIEM rules that filter on `result == "success"` will match every completed mutation including `guaranteed_state.push` (which returns 202 rather than 201/200 because agent fan-out is asynchronous). To surface probe/fuzz traffic on the REST surface, filter on `result == "denied"` scoped to the actions you care about — every mutating branch produces a row.
 
@@ -269,15 +290,28 @@ curl -s -b cookies.txt \
     }
   ],
   "pagination": {
-    "total": 150,
+    "total": 20,
     "start": 0,
-    "page_size": 20
+    "page_size": 50
   },
   "meta": {
     "api_version": "v1"
   }
 }
 ```
+
+**`total` is the number of rows returned in this response, not the number of
+rows that matched** — the route caps at `limit` (max 1000) with no `offset`
+support, so a response at exactly `limit` rows can mean there are older
+matches you have not seen, not that you have everything. `page_size` is
+likewise always `50`, independent of the `limit` you actually passed
+([#2881](https://github.com/Tr3kkR/Yuzu/issues/2881)). If you hit the cap,
+narrow with `principal=`/`action=`, or use the legacy `GET /api/audit`
+endpoint, which also accepts `offset`. `since`/`until` alone only bounds the
+time window — it does not by itself guarantee completeness inside that
+window if more rows matched than one call returns. The reliable recipe is
+both together: freeze a bounded window with `since`/`until` first, then page
+through it with `offset`.
 
 **Example --- filter by principal and action:**
 
@@ -351,22 +385,52 @@ below).
 
 ### The retention clock guard
 
-**Which alert sent you here?** Five point at this section and only one of them is
-about a decline.
+**Which alert sent you here?** Find it in the table below — they report different
+conditions and the triage differs. The current rule set is
+`docs/prometheus/yuzu-alerts.yml`.
 
 | Alert | What it means | Go to |
 |---|---|---|
+| `YuzuServerRestartLoop` | The server has restarted more than 3 times in the last 3 hours --- a process-health signal, not itself an audit-store fault, but a common CAUSE of the retention alerts below. | [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuserverrestartloop). |
 | `YuzuAuditRetentionClockAnomaly` | A pass declined. Nothing was deleted. | Read on. |
 | `YuzuAuditRetentionFailing` | The pass is **erroring**, not declining. | `yuzu_server_audit_cleanup_failed_total` in the metric table below. |
-| `YuzuAuditRetentionNotRunning` | The reaper is not running at all --- retention is unenforced and `audit.db` grows without bound. | `yuzu_server_audit_retention_passes_total` in the metric table below. |
+| `YuzuAuditRetentionNotRunning` | The reaper is not running on a database that has run before --- retention is unenforced and the audit store grows without bound. Fires at every restart cadence and stays firing while the reaper is dead (the #2854 rung D redesign closed the old grace's blind band; coverage is machine-checked against [`prometheus/blind-band-measurement.md`](../prometheus/blind-band-measurement.md)'s committed manifest on every PR). | Triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionnotrunning) --- **start there**: it opens with the routine, self-clearing causes (a Prometheus restart false-pages for ~45 minutes) before the real diagnosis. Then `yuzu_server_audit_retention_passes_total` in the metric table below. |
+| `YuzuAuditRetentionNeverRan` | NO retention pass has EVER run against this database --- not "not recently": the seeded stamp still reads 0 after three hours. Almost always a store that failed to open at boot, or a fresh install crash-looping before its first pass. | [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionneverran). |
+| `YuzuAuditRetentionMetricMissing` | The liveness metric is not being scraped **at all**, so `YuzuAuditRetentionNotRunning` cannot fire for anyone. **Check `up` for the Yuzu target first** — if it is down, or the target has left service discovery, this is an outage rather than just a monitoring gap, and on a single-server Prometheus this may be the only rule firing. | The three-state triage is in [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionmetricmissing) — start there; then `yuzu_server_audit_retention_passes_total` in the metric table below. |
 | `YuzuAuditRetentionStateNotPersisting` | The durable clock reading cannot be written, so detection will not survive a restart. | `yuzu_server_audit_retention_persist_failed_total` in the metric table below. |
 | `YuzuAuditRetentionCapBinding` | Expiry is outrunning the drain. | [Capacity](#capacity). |
+| `YuzuAuditRetentionAnchorNotSurviving` | The durable clock reading keeps being lost, so the guard re-bootstraps instead of comparing. Nothing was deleted by those passes. | [`ops-runbooks/audit-store-clock-guard.md`](../ops-runbooks/audit-store-clock-guard.md#yuzuauditretentionanchornotsurviving). |
 
 Retention is driven by the server's wall clock. A cleanup pass that looks like it
 would destroy the audit trail declines instead of deleting: it logs a warning and
 adds one to `yuzu_server_audit_clock_anomaly_skips_total`. **A decline deletes
 nothing.** It is the protection working, not evidence lost. The rest of this
 section is about declines.
+
+**Retention sweeps fleet-wide from a single process.** On the PostgreSQL
+substrate every replica runs the cleanup thread, but each pass first tries to
+take an advisory lease (`pg_try_advisory_xact_lock('audit_store:reap')`); only
+the lease winner sweeps, so exactly one process prunes per tick across the whole
+fleet. The 25,000-rows-per-pass cap therefore stays calibrated as a single
+drain rate — it can never become "N replicas × 25,000." The clock guard's dedup
+state now lives durably in the `audit_retention_meta` table (the previous pass's
+serialized fact-set, alongside the last clock reading), so a condition reported
+by one replica is not re-reported by another, and the state survives a restart
+or a failover to a different replica. (Previously, on the single SQLite server,
+this dedup state was an in-process member — correct for one writer, but it does
+not port to a multi-replica store.)
+
+**Dedup-semantics change (multi-replica correctness).** Because the dedup state
+is now shared across replicas, an identical-magnitude clock step that repeats
+with the *same* fact-set is reported **once** and then stands down, rather than
+re-incrementing `yuzu_server_audit_clock_anomaly_skips_total` on every pass as
+the single-process guard did. A genuinely *different* anomaly (for example a
+dead-CMOS boot followed by an NTP correction — a distinct fact-set) still
+reports; the catastrophic whole-window-wipe protection is fully preserved. Only
+a *second identical* clock step re-emitting the counter is lost. If you
+previously alerted on the *cadence* of that counter (a fresh increment every
+pass), alert on a sustained non-zero increase over several consecutive passes
+instead — see "Is retention actually stalled?" below.
 
 **Start with the log line.** Every decline logs an `AuditStore:` warning naming
 which condition fired, and for an elapsed-time decline it prints the actual gap
@@ -420,8 +484,8 @@ the state you are testing for.
 
 Whether that stall *matters* is a separate question, and there is no metric for
 it --- confirm a backlog exists by querying for events older than the retention
-window (see Protecting evidence below), or by watching `audit.db` grow on disk. A
-store with nothing to delete shows the same two counters.
+window (see Protecting evidence below), or by watching the `audit_store` schema
+grow in PostgreSQL. A store with nothing to delete shows the same two counters.
 
 If skips and `yuzu_server_audit_rows_deleted_total` are **both** flat, retention
 is not declining --- it is failing or not running at all; check
@@ -482,12 +546,19 @@ since-process-start and make skips smaller than passes on any healthy store.
 The drain resumes on its own within a pass or two of the readings becoming
 stable, paced at the cap, and nothing needs to be deleted by hand.
 
-**Do not delete rows yourself, and do not move `audit.db` aside**, however large
-it has grown. Over-retention is the SAFE direction here and it is deliberate:
+**Do not delete rows yourself** from the live store, however large it has grown.
+Over-retention is the SAFE direction here and it is deliberate:
 retention is a floor, not a ceiling, and the guard errs toward keeping evidence
 longer than configured because this is an evidence store. Rows older than the
 configured window are the guard working, not a fault. If disk is the immediate
 problem, treat it as a capacity incident (see below) rather than an audit one.
+
+This is distinct from the one-time **legacy `audit.db` SQLite file** the Postgres
+migration moves aside after a verified backfill (see
+`docs/user-manual/upgrading.md`): that file is a completed, operator-managed
+backup of the pre-cutover trail, so relocating or archiving it is expected, not
+forbidden. The prohibition above is about the *live* `audit_store` schema in
+PostgreSQL — there is no live SQLite file to move.
 
 Safe for *evidence*, which is not the same as safe for *privacy*: audit rows
 carry `principal`, `source_ip` and `user_agent`. If you are under a retention
@@ -547,7 +618,7 @@ fix --- not hand-deletion.
   the stated window (#2510).
 
 **Where the rule lives.** The decision rule is `classify()` in
-`server/core/src/audit_retention_rules.hpp` together with the fact construction in
+`common/include/yuzu/audit_retention_rules.hpp` together with the fact construction in
 `AuditStore::cleanup_once`, pinned by an exhaustive truth table in
 `tests/unit/server/test_audit_retention_rules.cpp` and store-level cases in
 `tests/unit/server/test_audit_store.cpp`. This page deliberately does not restate
@@ -556,23 +627,26 @@ Five correction rounds here produced only transcription errors between the code
 and prose paraphrases of it; the paraphrases have been removed rather than
 sharpened.
 
-Seven metrics report on the retention guard. All but
-`yuzu_server_audit_rows_deleted_total` and
-`yuzu_server_audit_retention_last_pass_unixtime` ship with an alert rule in
-`docs/prometheus/yuzu-alerts.yml`; those two are read alongside the others
-(is the backlog moving? when did the reaper last run?) rather than alerted on
-directly. Do not collapse the first two:
+Eight metrics report on the retention guard. All but
+`yuzu_server_audit_rows_deleted_total` ship with an alert rule in
+`docs/prometheus/yuzu-alerts.yml` — since #2854 rung D that includes
+`yuzu_server_audit_retention_last_pass_unixtime`, which is an operand of BOTH
+liveness rules (`YuzuAuditRetentionNotRunning`'s grace and the whole of
+`YuzuAuditRetentionNeverRan`), so a relabel rule dropping it changes what
+pages (see the rules file's "WHAT WOULD BREAK THE ASSUMPTION" block).
+`rows_deleted_total` is read alongside the others (is the backlog moving?)
+rather than alerted on directly. Do not collapse the first two:
 
 | Metric | Meaning |
 |---|---|
 | `yuzu_server_audit_clock_anomaly_skips_total` | A pass declined to delete; nothing was deleted, and each declined pass adds exactly 1. Triggers: it would have expired every datable row; the gap since the previous pass exceeded a fixed 7 days; or the stored reading was not usable -- ahead of the clock, negative, present but not an integer, or unreadable. Reducing `audit_retention_days` can also cause a decline by design. For triage, see [The retention clock guard](#the-retention-clock-guard) above. |
-| `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. **One site fires after a SUCCESSFUL delete** (the post-delete backlog probe), so read this as "retention is not fully healthy", not "nothing was deleted". |
-| `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and `audit.db` is growing without bound. |
+| `yuzu_server_audit_cleanup_failed_total` | A pass did not fully do its job: an unreadable probe, a failed delete, a refused implausible clock, a closed store, or an exception caught at the thread boundary. Every site INSIDE the pass's transaction rolls the whole pass back, INCLUDING the post-delete backlog probe: a probe failure after the delete undoes the delete too. The thread-boundary catch is the one exception — it wraps the post-commit bookkeeping (counters, the summary log line) too, so an exception thrown there counts a pass that DID delete rows as failed. Read a rise as "retention is not fully healthy", not as proof nothing was removed. (On the retired SQLite store the backlog probe was a warning after a committed delete, and this row said so; the substrate change inverted the in-transaction case but not the thread-boundary one.) |
+| `yuzu_server_audit_retention_cap_reached_total` | A pass hit the per-pass delete cap, so a backlog remains. Sustained growth means expiry is outrunning the drain and the audit store is growing without bound. |
 | `yuzu_server_audit_rows_deleted_total` | Rows deleted by retention. Read alongside the cap counter to tell a draining backlog from a stuck one. |
 | `yuzu_server_audit_retention_bootstrap_declines_total` | A pass declined because it had NO stored clock reading while rows were already expired (#2579); nothing was deleted. Counted apart from the clock-anomaly series on purpose - it claims only that nothing can yet rule out a wrong clock, not that the clock moved, so it must not fire an alert that says otherwise. Expect 0 or 1 per database; a climbing value means the anchor is not surviving, so read it with `..._retention_persist_failed_total`. |
 | `yuzu_server_audit_retention_persist_failed_total` | The durable clock reading could not be written. Detection will not survive a restart while this is rising. |
 | `yuzu_server_audit_retention_passes_total` | Passes **attempted**, including declined and failed ones. The one signal that catches a reaper which is not running at all - in that state the other six counters here stay flat at 0, which looks exactly like a quiet, healthy store. Alert on it NOT increasing. |
-| `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass with a USABLE clock reading ran; `0` if none has in this process. A pass refused for an implausible `now` counts as a pass but does not stamp this gauge, and a restart resets it to `0` for up to one cleanup interval even though the durable reading survives. |
+| `yuzu_server_audit_retention_last_pass_unixtime` | When the most recent pass with a USABLE clock reading ran; `0` if no pass has ever run on this **database** (seeded from the durable `audit_retention_meta` anchor at startup and after the legacy backfill, #2854 - survives a restart, including the first PostgreSQL boot). A pass refused for an implausible `now` counts as a pass but does not stamp this gauge. A value of `-9223372036854775808` (`INT64_MIN`) means the durable anchor could not be read or trusted as a plausible integer - a distinct anomaly, not a genuine timestamp; it self-corrects at the next pass whose own clock reading is plausible - even if that pass then declines or fails for an unrelated reason - consistent with the "refused for an implausible `now`" case above, which is the one pass that does NOT self-correct it. |
 
 The first two both leave rows undeleted, so an audit table that never shrinks
 looks identical either way --- only the pair distinguishes "the guard is
@@ -581,32 +655,68 @@ cap itself introduces, which neither of the first two would show.
 
 ### Capacity
 
-**The drain is a fixed 25,000 rows per hourly pass** -- about 600,000 rows/day, or
-a sustained ceiling of roughly **6.9 audit events/second**. Above that, expiry
-outruns deletion and `audit.db` grows without bound;
-`yuzu_server_audit_retention_cap_reached_total` is the signal. Compare that figure
-against your own audit-event rate before deploying at scale. The cap is a
-compile-time constant today, so exceeding it needs an engineering change rather
-than configuration.
+**Two different cadences, not one.** A pass that does NOT hit the per-pass
+25,000-row cap re-arms after the full `cleanup_interval_min` (default 60
+minutes). A pass that DOES hit the cap AND leaves a genuine remainder
+re-arms after `kAuditBacklogRearmSec` (5 seconds) instead — `audit_next_wait_s`
+in `audit_store.hpp` — and keeps doing so every subsequent pass until a pass
+clears the backlog. An earlier revision of this section quoted only the first
+cadence as if it were the hard ceiling; it is not — it is the QUIET
+threshold, the rate below which `cap_reached_total` never moves at all.
 
-The **file-size** ceiling is likely to bind first, though this is an estimate
-rather than a measurement: sustaining 6.9 events/second for a 365-day retention
-window means roughly 219M rows. At an assumed ~200 bytes/row that is on the order
-of 44 GB plus a comparable index footprint in a single SQLite file -- but row size
-varies with `principal`, `action`, `detail`, `target` and `user_agent`, so treat
-the byte figure as an order of magnitude, not a threshold. A deployment
-approaching the drain-rate ceiling has a storage problem before it has a
-retention-pacing problem. Audit rows are emitted per REQUEST rather than per
-device, but not only for operator requests: agent enrolment, fleet-topology pushes
-and rejections, and background schedule execution all write rows too, so fleet
-size does influence the rate. Measure your own `yuzu_server_audit_events_total`
-rate rather than assuming an operator-only workload.
+- **Quiet-operation threshold: ~6.9 audit events/second** (25,000 rows /
+  hourly pass, ~600,000 rows/day). Stay under this and the guard never
+  enters backlog mode — `yuzu_server_audit_retention_cap_reached_total`
+  stays at 0.
+- **The actual drain ceiling is far higher**, because backlog mode
+  self-accelerates: once `cap_reached_total` starts moving, passes run every
+  5 seconds instead of every hour, each still capped at 25,000 rows — up to
+  **~5,000 rows/second** if the DELETE itself stays fast relative to the
+  5-second floor. Measured this session (not a promise for every
+  environment — DELETE cost scales with backlog size, hardware, and
+  concurrent load): a 25,000-row capped delete against a 200,000-row backlog
+  took 44 ms, and against a 5,000,000-row backlog took 570 ms — both
+  comfortably inside the 5-second floor, so the achieved cadence there is
+  genuinely bound by the 5-second sleep, not by DELETE execution time.
+  Exceeding ~6.9 events/second is normal, expected, and self-corrects; the
+  store only grows WITHOUT BOUND if the sustained write rate exceeds the
+  backlog-recovery ceiling itself, which is roughly three orders of
+  magnitude higher than the quiet-operation figure this section used to
+  present as the ceiling.
+- **`yuzu_server_audit_retention_cap_reached_total` rising is not itself a
+  problem** — it means backlog mode engaged, which is the system doing its
+  job faster, not falling behind. Falling behind is `cap_reached_total`
+  rising and STAYING elevated for a sustained period with
+  `yuzu_server_audit_rows_deleted_total` not keeping pace — see
+  `YuzuAuditRetentionCapBinding` (`docs/prometheus/yuzu-alerts.yml`), which
+  alerts on sustained capping, not on a single capped pass.
 
-**The cap also bounds peak WAL.** The old unguarded delete cleared its whole
-backlog in one uncheckpointable transaction: measured at 152 MB of WAL for a
-337k-row backlog, extrapolating to about 2 GB at 4.5M. A capped pass writes about
-51 MB for its 25,000 rows and checkpoints between passes, so disk high-water is
-bounded too, not just lock-hold time.
+The cap (25,000 rows/pass) and the re-arm floor (5 seconds) are both
+compile-time constants today, so raising either needs an engineering change
+rather than configuration.
+
+The **file-size** ceiling is likely to bind before the drain-rate ceiling
+does, though this is an estimate rather than a measurement: sustaining even
+the QUIET threshold of 6.9 events/second for a 365-day retention window
+means roughly 219M rows. At an assumed ~200 bytes/row that is on the order
+of 44 GB plus a comparable index footprint in the `audit_store.audit_events`
+table -- but row size varies with `principal`, `action`, `detail`, `target`
+and `user_agent`, so treat the byte figure as an order of magnitude, not a
+threshold. Audit rows are emitted per REQUEST rather than per device, but
+not only for operator requests: agent enrolment, fleet-topology pushes and
+rejections, and background schedule execution all write rows too, so fleet
+size does influence the rate. Measure your own
+`yuzu_server_audit_events_total` rate rather than assuming an operator-only
+workload.
+
+**The cap also bounds each pass's transaction size.** The old unguarded delete
+cleared its whole backlog in one transaction; capping the pass at 25,000 rows
+keeps each retention transaction bounded, so it commits and lets PostgreSQL
+recycle write-ahead log between passes rather than accumulating unbounded WAL for
+one giant delete. (On the legacy SQLite store this was measured at 152 MB of WAL
+for a 337k-row backlog — extrapolating to about 2 GB at 4.5M — versus about
+51 MB for a capped 25,000-row pass; the bound is the same principle on the
+PostgreSQL substrate.)
 
 
 ## Integration patterns

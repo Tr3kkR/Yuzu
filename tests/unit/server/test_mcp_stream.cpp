@@ -1611,10 +1611,10 @@ TEST_CASE("McpStreamState: a pinned final survives a full ring wrap (CH-2, Decis
 
 TEST_CASE("McpStreamState: pin slots are a bounded LRU, not first-come-permanent",
           "[mcp][stream][pins]") {
-    // WHAT THIS PINS. Exhausting the four pin slots means admission accounting has already
-    // drifted - `publish_final` runs only for a kRingOnly record, and the bridge admits
-    // streamed records against `pinned_count() + unpinned` with the array sized to exactly
-    // that cap. So this is the DEGRADED path, not an ordinary one.
+    // WHAT THIS PINS. What exhausting the four pin slots MEANS is defined once - see
+    // McpStreamState's "What a FULL PIN-SLOT SET means" block in mcp_stream.hpp. Since
+    // #2740 it no longer implies drift on its own, so this is a degradation path that
+    // is genuinely REACHABLE, which is why it is worth pinning behaviourally here.
     //
     // The old fallback sacrificed the wrong frame: it committed the NEWEST terminal
     // unpinned. A pin exists so a terminal survives a ring wrap and a late resume can
@@ -1713,11 +1713,16 @@ TEST_CASE("McpStreamState: unpin makes a former final evictable again", "[mcp][s
     for (int i = 0; i < 5; ++i) state.publish("message", "x");
     REQUIRE(state.is_pinned(1)); // survived while pinned
 
-    state.unpin(1);
+    // The RETURN distinguishes "this call released it" from "it was already gone",
+    // which is what the bridge's admission reclaim credits a freed slot on (#2740):
+    // crediting a no-op would admit one call over the per-session cap.
+    CHECK(state.unpin(1));
     CHECK_FALSE(state.is_pinned(1));
     CHECK(state.pinned_count() == 0);
-    state.unpin(1); // idempotent - a second unpin is a no-op
+    CHECK_FALSE(state.unpin(1)); // idempotent - a second unpin is a no-op, and says so
     CHECK(state.pinned_count() == 0);
+    CHECK_FALSE(state.unpin(0));        // the empty-slot sentinel is never a release
+    CHECK_FALSE(state.unpin(999999));   // an id this ring never pinned
 
     for (int i = 0; i < 5; ++i) state.publish("message", "y"); // now id 1 can be evicted
     // Cursor 0 replays the surviving window; id 1 is gone (no longer protected).
@@ -1763,6 +1768,81 @@ TEST_CASE("McpStreamState: poison_terminal fails every future attach with kPoiso
           mcp::McpStreamState::AttachStatus::kPoisoned);
 }
 
+TEST_CASE("McpStreamState: a poison-time close failure is contained and counted, not thrown "
+          "(#2531)",
+          "[mcp][stream]") {
+    // Live registry so the real counter path runs, not the nullptr short-circuit.
+    yuzu::MetricsRegistry reg;
+    auto state = std::make_shared<mcp::McpStreamState>(mcp::kMcpRingCapDefault, &reg);
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->inject_poison_close_fault_for_test(1);
+    CHECK_NOTHROW(state->poison_terminal());
+    CHECK(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 1.0);
+    // The close itself failed, so alice's sink is left heart-beating rather than closed -
+    // exactly the silent-loss shape #2531 exists to close. Checked BEFORE any further
+    // attach, because an attach on a poisoned session is ITSELF a retry attempt (see the
+    // next test) and would close it.
+    CHECK_FALSE(attached.sink->sse->closed.load());
+
+    // The flag is durable regardless of what happened to the close - every future attach
+    // still fast-fails.
+    CHECK(state->attach_and_replay(0, nullptr, "bob").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+}
+
+TEST_CASE("McpStreamState: a later attach retries and closes a sink the poison-time close "
+          "missed (#2531)",
+          "[mcp][stream]") {
+    yuzu::MetricsRegistry reg;
+    auto state = std::make_shared<mcp::McpStreamState>(mcp::kMcpRingCapDefault, &reg);
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->inject_poison_close_fault_for_test(1); // one-shot: only the poison-time close fails
+    state->poison_terminal();
+    REQUIRE(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 1.0);
+    REQUIRE_FALSE(attached.sink->sse->closed.load()); // missed, per the previous test
+
+    // Poisoning is sticky and idempotent, so THIS attach's retry gets a clean shot at the
+    // same stale sink - the seam is exhausted, so the retry succeeds.
+    CHECK(state->attach_and_replay(0, nullptr, "bob").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+    CHECK(attached.sink->sse->closed.load());
+    // No second failure counted - the retry succeeded.
+    CHECK(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 1.0);
+}
+
+TEST_CASE("McpStreamState: a poison-time close failure AND its attach retry failure are both "
+          "contained (#2531)",
+          "[mcp][stream]") {
+    yuzu::MetricsRegistry reg;
+    auto state = std::make_shared<mcp::McpStreamState>(mcp::kMcpRingCapDefault, &reg);
+    auto attached = state->attach_and_replay(0, nullptr, "alice");
+    REQUIRE(attached.status == mcp::McpStreamState::AttachStatus::kAttached);
+
+    state->inject_poison_close_fault_for_test(2); // covers both the poison close AND the retry
+    CHECK_NOTHROW(state->poison_terminal());
+    CHECK(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 1.0);
+    CHECK_FALSE(attached.sink->sse->closed.load());
+
+    mcp::McpStreamState::AttachResult retry;
+    CHECK_NOTHROW(retry = state->attach_and_replay(0, nullptr, "bob"));
+    CHECK(retry.status == mcp::McpStreamState::AttachStatus::kPoisoned);
+    // The retry ALSO failed and was ALSO contained - two failures, still no escape, and
+    // alice's sink is still open - the seam is now exhausted, so a THIRD attach
+    // gets a clean shot and actually closes it.
+    CHECK(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 2.0);
+    CHECK_FALSE(attached.sink->sse->closed.load());
+
+    CHECK(state->attach_and_replay(0, nullptr, "carol").status ==
+          mcp::McpStreamState::AttachStatus::kPoisoned);
+    CHECK(attached.sink->sse->closed.load());
+    // No third failure - the seam was armed for exactly 2.
+    CHECK(reg.counter("yuzu_mcp_stream_poison_close_failures_total").value() == 2.0);
+}
+
 TEST_CASE("McpStreamState: a pre-commit publish_final failure writes no pin and consumes no id",
           "[mcp][stream]") {
     mcp::McpStreamState state;
@@ -1775,12 +1855,15 @@ TEST_CASE("McpStreamState: a pre-commit publish_final failure writes no pin and 
 TEST_CASE("McpStreamState: a final past the pin bound displaces the OLDEST pin",
           "[mcp][stream][pins]") {
     // REPLACES an earlier test that asserted the overflow final commits UNPINNED. Its
-    // premise - that reaching this state means admission accounting drifted - is CORRECT and
-    // is preserved here; what it got wrong was which frame to sacrifice. Committing the
+    // premise - that reaching this state means admission accounting drifted - was correct
+    // WHEN WRITTEN and #2740 has since falsified it (three paths now reach a full set
+    // legitimately; see mcp_stream.hpp's "What a FULL PIN-SLOT SET means"). What the old
+    // test got wrong, and what this one fixes, was which frame to sacrifice - and that
+    // part is independent of why the slots are full. Committing the
     // newest terminal unprotected leaves the request most likely still waiting for its
     // answer as the evictable one, while the oldest pin, almost certainly consumed already,
-    // keeps its exemption. The slots now degrade as an LRU, and the drift is still reported
-    // (via `pin_displaced_total`, which is alertable) rather than silently absorbed.
+    // keeps its exemption. The slots now degrade as an LRU, and the displacement is still
+    // reported (via `pin_displaced_total`) rather than silently absorbed.
     yuzu::MetricsRegistry reg;
     mcp::McpStreamState state{mcp::kMcpRingCapDefault, &reg};
     std::vector<std::uint64_t> ids;
@@ -1818,12 +1901,14 @@ TEST_CASE("McpStreamState: unpin of a displaced id no-ops - it cannot release th
     const auto overflow_id = state.publish_final("message", "one-too-many");
     REQUIRE_FALSE(state.is_pinned(ids[0])); // displaced by the overflow
 
-    state.unpin(ids[0]); // the stale release the bridge will eventually issue
+    // The stale release the bridge will eventually issue - and it now SAYS it
+    // released nothing, which is what stops the reclaim crediting a phantom slot.
+    CHECK_FALSE(state.unpin(ids[0]));
     CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession); // nothing released
     CHECK(state.is_pinned(overflow_id));                             // the usurper kept its slot
     CHECK(state.is_pinned(ids[1]));
 
-    state.unpin(overflow_id); // a REAL release still works after the stale one no-op'd
+    CHECK(state.unpin(overflow_id)); // a REAL release still works after the stale one no-op'd
     CHECK_FALSE(state.is_pinned(overflow_id));
     CHECK(state.pinned_count() == mcp::kMaxStreamedPostsPerSession - 1);
 }

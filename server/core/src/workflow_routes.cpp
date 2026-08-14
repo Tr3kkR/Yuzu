@@ -552,9 +552,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // server upgrade). Once an admin runs the backfill CLI
                 // (PR 2.1 follow-up) and audits show 100% coverage, the
                 // fallback can be removed.
-                auto responses = response_store->query_by_execution(exec.id, rq);
+                // #2691 (Doomgoose finding #7): still falls through to the
+                // legacy-window attempt on empty exactly as an engaged-empty
+                // result would (ADR-0039 deny-or-benign — this is an
+                // informational drawer, not a gate), but `store_degraded`
+                // stays distinguishable through to the render below so a
+                // failed read doesn't print "No responses recorded."
+                auto primary_opt = response_store->query_by_execution(exec.id, rq);
+                bool store_degraded = !primary_opt.has_value();
+                auto responses = primary_opt.value_or(std::vector<StoredResponse>{});
                 if (responses.empty()) {
-                    auto legacy = response_store->query(exec.definition_id, rq);
+                    auto legacy_opt = response_store->query(exec.definition_id, rq);
+                    store_degraded = store_degraded || !legacy_opt.has_value();
+                    auto legacy = legacy_opt.value_or(std::vector<StoredResponse>{});
                     // Filter to agents that appear in this execution's
                     // status set, mirroring the pre-PR-2 best-effort join.
                     std::unordered_map<std::string, bool> in_set;
@@ -575,7 +585,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 html += std::format("<details class=\"per-agent-responses\">"
                                     "<summary>Show responses ({})</summary>",
                                     filtered.size());
-                if (filtered.empty()) {
+                if (store_degraded) {
+                    html += "<div class=\"empty-state result-degrade-banner\">"
+                            "<b>Responses unavailable.</b> The response store could "
+                            "not be read (Postgres pool/query degraded). This is "
+                            "<b>not</b> \"no responses\" — retry shortly.</div>";
+                } else if (filtered.empty()) {
                     html += "<div class=\"empty-state\">No responses recorded.</div>";
                 } else {
                     html += "<table class=\"per-agent-responses-table\"><thead><tr>"
@@ -806,17 +821,22 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                  // adopt_quota_slot_into_stream in principal_quota_gate.hpp).
                  res.set_chunked_content_provider(
                      "text/event-stream",
-                     [sink_state](size_t offset, httplib::DataSink& s) -> bool {
+                     [sink_state, stream_budget](size_t offset, httplib::DataSink& s) -> bool {
                          // Re-implement the existing sse_content_provider in-line
                          // with id-aware framing. We can't reuse `format_sse`
                          // verbatim because it doesn't emit `id:`; the prefixed
                          // `<id>\n<data>` payload we queued above carries the id
                          // we need to peel off here.
                          std::unique_lock<std::mutex> lk(sink_state->mu);
+                         // #2703 Gate 7 item 2: shutdown close-signal, same
+                         // predicate shape as the /events and /api/v1/events
+                         // siblings — see StreamBudget::closing()'s doc comment.
                          sink_state->cv.wait_for(lk, std::chrono::seconds(3), [&] {
-                             return !sink_state->queue.empty() || sink_state->closed.load();
+                             return !sink_state->queue.empty() || sink_state->closed.load() ||
+                                    (stream_budget && stream_budget->closing());
                          });
-                         if (sink_state->closed.load())
+                         if (sink_state->closed.load() ||
+                             (stream_budget && stream_budget->closing()))
                              return false;
                          while (!sink_state->queue.empty()) {
                              auto ev = std::move(sink_state->queue.front());
@@ -1548,10 +1568,19 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
 
             if (needs_approval) {
-                // Declaring the origin (#2442) is what bars this path from
-                // minting into the reserved `mcp.` ticket namespace: def_id is
-                // caller-influenced and scope_expr is caller-supplied verbatim,
-                // and the MCP recall matches on exactly that pair.
+                // Declaring the origin (#2442) is what makes a ticket minted
+                // here REFUSABLE at the MCP recall: def_id is caller-influenced
+                // and scope_expr is caller-supplied verbatim, and the MCP recall
+                // matches on exactly that pair.
+                //
+                // It does NOT bar this path from minting into the reserved
+                // namespace — nothing does, deliberately. So this argument is
+                // load-bearing rather than decorative: `submit()`'s `origin`
+                // parameter is no longer defaulted (#2442's closing half), so
+                // dropping it is a compile error today, not a silent
+                // `kUnspecified` — but get it wrong (e.g. pass kMcp for a
+                // non-MCP mint) and the ticket is falsely refusable or, worse,
+                // falsely exempt.
                 auto result = approval_manager->submit(def_id, session->username, scope_expr, "",
                                                        ApprovalOrigin::kInstruction);
                 if (!result) {

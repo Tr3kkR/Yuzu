@@ -13,7 +13,7 @@
  * one row.
  */
 
-#include "audit_retention_rules.hpp"
+#include <yuzu/audit_retention_rules.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 

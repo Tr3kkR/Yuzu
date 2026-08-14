@@ -72,6 +72,15 @@ invalid_name_fixture_plugin = shared_library(
   install: false,
 )
 
+# PLAN-08: test_native_raii.cpp (PR1.3) includes <IOKit/IOKitLib.h> and
+# <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors;
+# agents/core links no IOKit on darwin, so the test exe must pull the frameworks
+# itself. Darwin-only; empty elsewhere.
+agent_test_native_deps = []
+if host_machine.system() == 'darwin'
+  agent_test_native_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'])
+endif
+
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
 # A genuine old-layout plugin compiled against the FROZEN tests/fixtures/abi3/
 # plugin_abi3.h (quoted include, resolved next to the .cpp) — deliberately NOT
@@ -249,6 +258,7 @@ agent_test_exe = executable(
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
     'unit/test_subprocess_runner.cpp',        # #2273: agent-core bounded subprocess runner (POSIX deadline/reap)
+    'unit/test_native_raii.cpp',              # PR1.3: ScopedCFRef/ScopedIOObject/ScopedFd RAII
     'unit/test_subprocess_launch_spec.cpp',   # PR1.2: host-agnostic pure launch-spec tests (run on Windows too)
     'unit/test_capability_descriptor.cpp',    # PR1.1: ABI4 descriptor + plugin->host result seam + declared-vs-observable honesty
     'unit/test_filesystem_macos_sig.cpp',     # #2273/1.14: pure codesign/plutil classifiers
@@ -294,7 +304,7 @@ agent_test_exe = executable(
   # only way to exercise KvStore's fallible-read branches end to end rather than through
   # an injected stand-in. Already a transitive dep of yuzu_agent_core; naming it here is
   # what puts sqlite3.h on the test TU's include path (same shape as tar_test_deps).
-  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep],
+  dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, nlohmann_dep, catch2_nomain_dep, agent_test_openssl_dep, spdlog_dep, sqlite3_dep] + agent_test_native_deps,
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp / test_capability_descriptor.cpp find them
   # under MESON_BUILD_ROOT/tests/.
@@ -315,6 +325,35 @@ agent_test_exe = executable(
 # budget is tracked in #2373 (split/redesign), not papered over with a wall-clock cap here -
 # that route introduced its own flakiness (a busy main thread starving the workers it waited on)
 # and was backed out.
+# ── #2270 allocation-budget probe (separate binary, deliberately) ────────────
+# test_spark_alloc_budget.cpp REPLACES the global operator new/delete to count
+# allocations, which is process-wide and cannot be scoped to one test. Two
+# reasons it is not a source of yuzu_agent_tests:
+#   * a sanitizer owns the allocator, so the replacement must be ABSENT from
+#     those binaries, not merely disabled inside them;
+#   * a global allocator replacement has no business in the 1500-case agent
+#     binary that gates every push.
+# Executable-side interposition for libyuzu_agent_core.so is an ELF/libstdc++
+# property (measured on Linux, and it does hold) — not a portable contract, so
+# the target is Linux-only and the cross-platform pin stays with the fault seams
+# in test_spark_mechanism.cpp. See the file header.
+if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
+  spark_alloc_budget_exe = executable(
+    'yuzu_spark_alloc_budget_tests',
+    files('unit/test_spark_alloc_budget.cpp'),
+    include_directories: [include_directories('../agents/core/src')],
+    cpp_args: test_partial_init_args + agent_platform_args,
+    dependencies: [yuzu_agent_core_dep, yuzu_sdk_dep, agent_test_proto_dep, catch2_dep,
+                   spdlog_dep],
+  )
+  test(
+    'spark allocation budget',
+    spark_alloc_budget_exe,
+    suite: 'agent',
+    timeout: 60,
+  )
+endif
+
 agent_test_args = (get_option('b_sanitize') == 'none') ? ['~[tsan-heavy]'] : []
 test(
   'agent unit tests',
@@ -463,6 +502,8 @@ if build_server
       'unit/server/test_preflight_parse.cpp',
       'unit/server/test_preflight_eval.cpp',
       'unit/server/test_preflight_run_store.cpp',
+      'unit/server/test_preflight_runner.cpp',
+      'unit/server/test_preflight_routes.cpp',
       'unit/server/test_deployment_parse.cpp',
       'unit/server/test_deployment_run_store.cpp',
       'unit/server/test_deployment_engine.cpp',
@@ -495,10 +536,14 @@ if build_server
       'unit/server/test_rbac_store.cpp',
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_oidc_principal_key.cpp',
+      'unit/server/test_oidc_principal.cpp',
       'unit/server/test_oidc_provider.cpp',
+      'unit/server/test_oidc_scim_link.cpp',
       'unit/server/test_oidc_routes.cpp',
+      'unit/server/test_saml_principal.cpp',
       'unit/server/test_saml_provider.cpp',
       'unit/server/test_saml_routes.cpp',
+      'unit/server/test_saml_scim_link.cpp',
       'unit/server/test_error_codes.cpp',
       'unit/server/test_result_envelope.cpp',
       'unit/server/test_concurrency_manager.cpp',
@@ -510,6 +555,8 @@ if build_server
       'unit/server/test_route_sink_harness.cpp',
       'unit/server/test_rest_tar_purge.cpp',
       'unit/server/test_api_token_store.cpp',
+      'unit/server/test_rotation_sweep_naming.cpp', # P2 #11: sweep-driver metric/audit family discrimination by principal_kind
+      'unit/server/test_rotation_warn_dedup.cpp', # P2 #11: successor-unused log/count/audit cadence (audit is once per state, never per tick)
       'unit/server/test_engine_principal_store.cpp',
       'unit/server/test_engine_principal_integration.cpp',
       # #2367: test-only definition of EngineLivenessTestAccess::revalidate,
@@ -583,6 +630,7 @@ if build_server
       'unit/server/test_compliance_eval.cpp',
       'unit/server/test_cel_eval.cpp',
       'unit/server/test_custom_properties_store.cpp',
+      'unit/server/test_props_scope_authz.cpp',
       'unit/server/test_notification_store.cpp',
       'unit/server/test_webhook_store.cpp',
       'unit/server/test_migration_runner.cpp',
@@ -593,10 +641,15 @@ if build_server
       'unit/server/test_ca_routes.cpp',
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
       'unit/server/test_kek_op_lock_holder.cpp', # #2530 B6 — advisory-lock holder query
+      'unit/server/test_pg_session_advisory_lock.cpp', # #2964 round 3 — PgAdvisoryLockKey + aborted-txn unlock recovery
       'unit/server/test_kek_rotate_control.cpp', # #2530 B3/B4 — rotate control-flow ordering + half-commit classification
       'unit/server/test_secret_column_registration_tripwire.cpp', # #2530 C3 — registered-column trip-wire
       'unit/server/test_key_provider.cpp',
+      'unit/server/test_rest_mgmt_group_roles_floor.cpp', # #2376: the mgmt-group role graph needs the floored UserManagement:Read
       'unit/server/test_authz_model.cpp', # PR1.4: registry-independent authz model + #1788 per-device visibility (all four arms)
+      'unit/server/test_authz_topology_floor.cpp', # #2376: the RBAC-off legacy-fallback topology floor (AccessReview/UserManagement/EnginePrincipal Read)
+      'unit/server/test_body_cap_policy.cpp', # #2407: pre-auth request-body cap policy table (method+segment-boundary path -> cap/requires_measurable/metric label)
+      'unit/server/test_body_cap_route_inventory.cpp', # #2407: architect-mandated route-inventory coverage — every ACTUALLY REGISTERED POST/PUT/PATCH route resolves to a deliberate class, mechanically scanned from server/core/src at test run time
       'unit/server/test_dispatch_confined_arms.cpp', # PR1.4: the production per-arm intersection, bound by exact-send-set assertions
       'unit/server/test_default_certs.cpp',
       'unit/server/test_mcp_server.cpp',
@@ -616,6 +669,8 @@ if build_server
       'unit/server/test_license_store.cpp',
       'unit/server/test_rest_api_t2.cpp',
       'unit/server/test_rest_api_tokens.cpp',
+      'unit/server/test_rest_api_tokens_rotation.cpp',   # P2 #11: human token-keyed rotate/confirm REST surface
+      'unit/server/test_token_rotation_lookup.cpp',   # P2 #11: derive_rotation_successor, DB-free unit coverage
       'unit/server/test_rest_tag_routes.cpp',   # K-05: REST tag-route authz wiring (CDX-03/CDX-R4-02/B4)
       'unit/server/test_rest_quarantine_routes.cpp',   # CDX-P1-02: REST quarantine-route authz wiring
       'unit/server/test_rest_api_events.cpp',
@@ -623,6 +678,7 @@ if build_server
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_sessions.cpp',
       'unit/server/test_rest_guaranteed_state.cpp',
+      'unit/server/test_deployment_store.cpp', # ADR-0043: deployment_jobs Postgres migration
       'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
       'unit/server/test_security_headers.cpp',
       'unit/server/test_on_behalf_guard.cpp', # ADR-1005 PR 1.1 reserved-key guard
@@ -674,6 +730,8 @@ if build_server
       'unit/server/test_scim_store_pg.cpp',
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
+      'unit/server/test_discovery_store.cpp',
+      'unit/server/test_discovery_scan_route.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
@@ -730,7 +788,22 @@ if build_server
     # MSVC's C1128 limit is a hard 65,279 - so the gap is a build-time cliff on one
     # platform only, with no runtime component. Free on every other compiler.
     cpp_args: https_cpp_args + test_partial_init_args +
-              ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG'] +
+              ['-DCPPHTTPLIB_LISTEN_BACKLOG=128', '-DYUZU_TEST_ENABLE_PG',
+               # #2407 route-inventory test (test_body_cap_route_inventory.cpp):
+               # mechanically scans the real server/core/src tree at test run
+               # time rather than hand-copying a route list that would go
+               # stale exactly like the thing it's testing.
+               '-DYUZU_SERVER_SRC_DIR="' +
+               # Backslashes MUST be normalised before this lands in a C string
+               # literal. On Windows meson.project_source_root() is a native path
+               # (D:\ci\work-0\...), and `\c`/`\w` are invalid escape sequences —
+               # the TU either fails to compile or, worse, compiles to a MANGLED
+               # path, scans zero files and the inventory passes vacuously. The
+               # REQUIRE_FALSE(files.empty()) floor in the test catches the second
+               # case, but there is no reason to rely on it. std::filesystem and
+               # the Win32 API both accept forward slashes.
+               (meson.project_source_root() / 'server' / 'core' / 'src').replace('\\', '/') +
+               '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
@@ -817,10 +890,19 @@ if build_server
        args: ['~[pg][auth],~[pg][mcp]'], suite: 'server', timeout: 600)
   test('server unit tests shard B', server_test_exe,
        args: ['~[pg]~[auth]~[mcp]'], suite: 'server', timeout: 600)
+  # [audit_store] is in shard A's OR-list because ADR-0040 moved that whole file
+  # onto PG in one change: without it, every one of its cases lands in B, which
+  # is the heavier half already. MEASURED on Linux at that change's head, same
+  # box, live PG: A 89.7s -> 95.8s, B 116.0s -> 113.4s. That is a ~3% shift, not
+  # a rescue — the ~1.9x case-count drift between these two halves PREDATES this
+  # change and is not addressed here. The partition is preserved
+  # (N([pg]) == N(A) + N(B)); if you add a tag to one side, exclude it on the
+  # other in the same edit.
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token]'], suite: 'server', timeout: 600)
+       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store]'],
+       suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]'], suite: 'server', timeout: 600)
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]'], suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
@@ -846,6 +928,65 @@ test('changelog order',
 test('capability catalogue completeness',
   _python3_test,
   args: [files('test_capability_catalogue_complete.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Prometheus alert-rule unit tests (#2553). The same script the docs-lint
+# workflow runs, so self-hosted legs and /test exercise the same code path CI
+# does -- WHEREVER A USABLE PROMTOOL IS PRESENT. No CI leg sets the opt-in below
+# and none is documented as carrying a 3.x promtool, so the realistic outcome on
+# all three is SKIP; the authoritative run is the workflow job. Rationale for the
+# tests themselves: tests/prometheus/run_promtool_tests.py.
+#
+# DOES NOT PULL A CONTAINER unless you opt in. `scripts/ci/flake-retry.py` runs
+# `meson test` with NO --suite filter on three REQUIRED build legs, so a
+# docker-dependent test registered here puts a container registry on all three;
+# an earlier version of this wiring did exactly that and was reverted. Without
+# YUZU_TEST_ENABLE_PROMTOOL_DOCKER the harness needs a native promtool of the
+# pinned major and skips (77) otherwise. Timeout matches the workflow's own
+# 10-minute budget for the same work: under the opt-in this pulls a ~110 MB
+# image before it runs anything.
+test('prometheus alert rules',
+  _python3_test,
+  args: [files('prometheus/run_promtool_tests.py')],
+  suite: 'docs',
+  timeout: 600,
+)
+
+# Pure-logic selftest for the harness above (version-banner parsing, docker argv
+# construction, the pin's own shape). No promtool, no docker, no network, so it
+# runs everywhere -- mirroring the flake-retry and plugin-spawn selftests below.
+test('prometheus harness selftest',
+  _python3_test,
+  args: [files('prometheus/run_promtool_tests.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# Audit-retention alert coverage manifest gate (#2854 rung B). Same
+# SKIP-vs-FAIL contract as the entry above -- no CI leg here sets
+# YUZU_TEST_ENABLE_PROMTOOL_DOCKER and none carries a 3.x native promtool, so
+# the realistic local/CI-matrix outcome is SKIP (77); the authoritative run is
+# the docs-lint.yml `prometheus-rules` job, which does set the opt-in.
+# Timeout sized to the sweep's own worst-case ceiling, not typical runtime:
+# with both scenarios' alerts shipped (#2854 rung D) all 6 (scenario,
+# interval) measure() calls run for real -- pull ladder ~195s plus 6 x
+# (30s check + 90s test) = ~915s -- so 1200 keeps a real margin over that.
+# A third sweep scenario adds another ~360s: re-derive, don't inherit.
+test('audit retention alert coverage manifest',
+  _python3_test,
+  args: [files('prometheus/blind_band_sweep.py'), '--check'],
+  suite: 'docs',
+  timeout: 1200,
+)
+
+# Pure-logic selftest for the sweep (cycles_for, the seconds-resolution grid,
+# extract()'s present/absent handling, the manifest compare()). No promtool,
+# no docker, no network.
+test('audit retention coverage sweep selftest',
+  _python3_test,
+  args: [files('prometheus/blind_band_sweep.py'), '--selftest'],
   suite: 'docs',
   timeout: 30,
 )

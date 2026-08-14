@@ -5,25 +5,36 @@
 
 // The reserved `mcp.` definition-id namespace (#2442).
 //
-// MCP approval tickets are minted under `mcp.<tool>`, and the MCP recall matches
-// a ticket on (definition_id, scope_expression) WITHOUT binding the submitter.
-// So a definition id under that prefix, reachable from any other surface, is a
-// ticket the MCP gate would accept. The rule lives here, once, because it has
-// to hold at three unrelated places that would otherwise each carry a copy:
+// MCP approval tickets are minted under `mcp.<tool>`, and the MCP recall matched
+// a ticket on (definition_id, scope_expression) alone, without binding the
+// minting surface or the submitter. So a definition id under that prefix,
+// reachable from any other surface, was a ticket the MCP gate would accept.
+// Both gaps are closed at REDEMPTION now, not here: `consume_ticket` refuses a
+// ticket whose recorded origin isn't MCP, and separately refuses one whose
+// `submitted_by` doesn't match the recalling principal (see
+// `ApprovalManager::consume_ticket`'s doc comment). This header is about the
+// definition-id NAMESPACE, a narrower, mint-time-adjacent concern: it stops a
+// definition from being authored under `mcp.` in the first place. The rule
+// lives here, once, because it has to hold at two unrelated places that would
+// otherwise each carry a copy:
 //
-//   * ApprovalManager::submit          — a mint declaring a non-MCP origin
 //   * InstructionStore::create_definition_impl — authoring (create + import)
 //   * validate_instruction_yaml        — the YAML validator, which MUST agree
 //     with the store or the "YAML that validates always saves" contract breaks
 //     (#1993, re-broken by #2010 and again by the first cut of #2442 — three
 //     times, which is why the predicate is no longer copied)
 //
-// A fourth site would be a fourth chance to diverge: call `is_reserved_definition_id`
+// (`ApprovalManager::submit` was a third site and enforced this at MINT time.
+// That refusal was removed deliberately — it permanently stopped schedules on
+// pre-existing `mcp.`-prefixed definitions — and #2442 is now defended at
+// redemption instead. The store RECORDS the minting surface; it does not police
+// the namespace.)
+//
+// A third site would be a third chance to diverge: call `is_reserved_definition_id`
 // and report `kReservedDefinitionIdError` rather than re-implementing either.
-// One place still writes the prefix as a literal — mcp_server.cpp builds
-// `"mcp." + tool_name` at the MINTING site the reservation exists to protect —
-// because that file is frozen for a parallel rebase. It is tracked, and it is
-// the reason this rule is stated here rather than assumed.
+// mcp_server.cpp is the fourth call site of `kMcpDefinitionPrefix` (it builds
+// the definition id at the MCP mint) but not of the predicate above — it has
+// no authoring decision to gate, only a literal to share.
 namespace yuzu::server {
 
 /// Definition-id prefix reserved for MCP-minted approval tickets.

@@ -8,33 +8,102 @@
 
 #include "management_group_store.hpp"
 #include "mcp_server_testonly.hpp" // rbac_ops/securables_for_test (#2383 mirror binding)
-#include "migration_runner.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "rbac_generation_rules.hpp"
 #include "rbac_store.hpp"
+#include "sqlite_raii.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <sqlite3.h>
+#include <yuzu/metrics.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <optional>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 using namespace yuzu::server;
+namespace pg = yuzu::server::pg;
+using yuzu::server::pg::PgPool;
+
+namespace yuzu::server {
+
+// #2703 Gate 7 item 3 — friend seam (rbac_store.hpp) for exercising
+// user_rbac_group_names/role_effects_for directly; same shape as
+// PreflightRoutesTestAccess (test_preflight_routes.cpp) /
+// DashboardResultsColumnsTestAccess. See the friend declaration's comment for
+// why authorize_list_read() alone can't reach role_effects_for's own sites.
+struct RbacStoreTestAccess {
+    RbacStore& store;
+    auto user_rbac_group_names(const std::string& username) {
+        return store.user_rbac_group_names(username);
+    }
+    auto role_effects_for(const std::string& securable_type, const std::string& operation) {
+        return store.role_effects_for(securable_type, operation);
+    }
+};
+
+} // namespace yuzu::server
+
+namespace {
+// Pre-migrated + seeded template (RbacStore construction runs the migration AND
+// seed_defaults). Every store-behaviour case clones this instead of
+// re-migrating/re-seeding per test (docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate rbac_tpl{"rbacstore", [](const std::string& dsn) {
+                                        PgPool pool{{.conninfo = dsn, .size = 1}};
+                                        RbacStore store{pool};
+                                        if (!store.is_open())
+                                            throw std::runtime_error(
+                                                "rbac template: store failed to migrate/seed");
+                                    }};
+
+// Seed a group row DIRECTLY (bypassing create_group's reserved-prefix guard) to
+// reproduce a legacy artifact that predates the guard. `source` is written
+// verbatim, so a local group literally named `entra:x` can be planted.
+void seed_group_raw(PgPool& pool, const std::string& name, const std::string& description,
+                    const std::string& source, const std::string& external_id) {
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(
+        lease.get(),
+        "INSERT INTO rbac_store.groups (name, description, source, external_id, created_at) "
+        "VALUES ($1, $2, $3, $4, 0)",
+        std::vector<std::string>{name, description, source, external_id});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+} // namespace
+
+// Fixture: a fresh cloned PG database, a pool, and an open RbacStore. Expands to
+// statements (includes the SKIP-if-no-DSN guard), so it must lead a block. The
+// db/pool must outlive `store_var`; declaring all three here keeps that order.
+#define RBAC_STORE(store_var)                                                                      \
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_fx_, rbac_tpl);                                                  \
+    PgPool rbac_pool_fx_{{.conninfo = rbac_db_fx_.dsn(), .size = 4}};                               \
+    REQUIRE(rbac_pool_fx_.valid());                                                                 \
+    RbacStore store_var{rbac_pool_fx_};                                                             \
+    REQUIRE(store_var.is_open())
 
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
-TEST_CASE("RbacStore: open in-memory", "[rbac_store][db]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: open in-memory", "[rbac_store][db][pg]") {
+    RBAC_STORE(store);
     REQUIRE(store.is_open());
 }
 
-TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto roles = store.list_roles();
 
     auto find = [&](const std::string& name) {
@@ -52,12 +121,13 @@ TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store]") {
     CHECK(find("Viewer")->is_system);
 }
 
-TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: seed data — securable types", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto types = store.list_securable_types();
-    // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2) +PluginConfig +PluginSecret
-    // +UploadGrant (PR1.9a, peer finding PLAN-001) = 25.
-    REQUIRE(types.size() == 25);
+    // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2) +EnginePrincipal
+    // (#2376, cut away from Security:Read) +PluginConfig +PluginSecret
+    // +UploadGrant (PR1.9a, peer finding PLAN-001) = 26.
+    REQUIRE(types.size() == 26);
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -81,15 +151,19 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     CHECK(has("PluginConfig")); // PR1.9a: plugin kill-switch config
     CHECK(has("PluginSecret")); // PR1.9a: plugin secret material
     CHECK(has("UploadGrant"));  // PR1.9a: upload-grant mint/revoke lifecycle
+    CHECK(has("EnginePrincipal")); // Engine-principal inventory + grant-graph reads (#2376),
+                                   // cut away from the over-broad Security:Read
 }
 
-TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: seed data — operations", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto ops = store.list_operations();
     // Read, Write, Execute, Delete, Approve, Push (Push added for Guardian
     // distribute-rules-to-fleet operation; design v1.1 §9.2), Attest (added
-    // for Periodic Access Reviews, SOC 2 CC6.2 — AccessReview:Attest sign-off).
-    REQUIRE(ops.size() == 7);
+    // for Periodic Access Reviews, SOC 2 CC6.2 — AccessReview:Attest sign-off),
+    // Rotate (added for human API-token self-service rotation, P2 #11, SOC 2
+    // CC6.3 — ApiToken:Rotate, deliberately distinct from ApiToken:Write).
+    REQUIRE(ops.size() == 8);
 }
 
 // #2383 (governance C-3/UP-6): the MCP C8 boot validator carries closed-catalogue
@@ -98,8 +172,8 @@ TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
 // both directions, so adding/removing an operation or securable in one place
 // without the other fails here instead of drifting silently.
 TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
-          "[rbac_store][mcp][2g]") {
-    RbacStore store(":memory:");
+          "[rbac_store][mcp][2g][pg]") {
+    RBAC_STORE(store);
 
     auto sorted = [](std::vector<std::string> v) {
         std::sort(v.begin(), v.end());
@@ -110,17 +184,19 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
           sorted(yuzu::server::mcp::rbac_securables_for_test()));
 }
 
-TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
-    // 25 types * 5 CRUD ops = 125 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 126), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2) = 127 permissions total. Push and Attest
-    // are deliberately NOT cross-seeded on other securables — see the rationale
-    // in rbac_store.cpp seed_defaults(). (22nd type: AccessReview, SOC 2 CC6.2;
-    // 21st: SoftwareLicensing, ADR-0024; 23rd-25th: PluginConfig/PluginSecret/
-    // UploadGrant, PR1.9a peer finding PLAN-001.)
-    CHECK(perms.size() == 127);
+    // 26 types * 5 CRUD ops = 130 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 131), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 132), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 133 permissions total. Push, Attest, and
+    // Rotate are deliberately NOT cross-seeded on other securables — see the
+    // rationale in rbac_store.cpp seed_defaults(). (26th-24th: UploadGrant/
+    // PluginSecret/PluginConfig, PR1.9a peer finding PLAN-001; 23rd:
+    // EnginePrincipal, #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st:
+    // SoftwareLicensing, ADR-0024.)
+    CHECK(perms.size() == 133);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -133,14 +209,26 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
         }
     }
     CHECK(push_count == 1);
+
+    // Confirm the Rotate grant (P2 #11) exists exactly once, and only on
+    // ApiToken — a cross-seeded Rotate on any other securable would be
+    // exactly the kind of silent widening the round-3 finding was about.
+    size_t rotate_count = 0;
+    for (const auto& p : perms) {
+        if (p.operation == "Rotate") {
+            ++rotate_count;
+            CHECK(p.securable_type == "ApiToken");
+        }
+    }
+    CHECK(rotate_count == 1);
 }
 
-TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto perms = store.get_role_permissions("Viewer");
-    // 20 types * Read only (everything except Infrastructure; incl. Inventory +
-    // SoftwareLicensing, ADR-0024)
-    CHECK(perms.size() == 20);
+    // 21 types * Read only (everything except Infrastructure; incl. Inventory +
+    // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376)
+    CHECK(perms.size() == 21);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
@@ -209,13 +297,13 @@ TEST_CASE("RbacStore: seed data — Operator has Read on PluginConfig and Upload
 
 // ── RBAC toggle ──────────────────────────────────────────────────────────────
 
-TEST_CASE("RbacStore: RBAC disabled by default", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: RBAC disabled by default", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     CHECK_FALSE(store.is_rbac_enabled());
 }
 
-TEST_CASE("RbacStore: enable and disable RBAC", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: enable and disable RBAC", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.set_rbac_enabled(true);
     CHECK(store.is_rbac_enabled());
     store.set_rbac_enabled(false);
@@ -228,48 +316,45 @@ TEST_CASE("RbacStore: enable and disable RBAC", "[rbac_store]") {
 // ManagementGroupStore is exactly rbac_enforcement_in_effect(rbac_store_.get()),
 // so this exercises the real predicate, not a stand-in lambda.
 TEST_CASE("rbac_enforcement_in_effect fails closed on null / load-failed store",
-          "[rbac_store][visibility]") {
+          "[rbac_store][visibility][pg]") {
     SECTION("null store → enforcement in effect (fail closed)") {
         CHECK(rbac_enforcement_in_effect(nullptr));
     }
 
     SECTION("load-failed store (is_open()==false) → fail closed, not full-fleet") {
-        // A db path whose PARENT directory does not exist: sqlite3_open_v2 with
-        // SQLITE_OPEN_CREATE creates the file but never the parent, so the open
-        // fails and db_ is left null — the same state an open/migration failure
-        // produces, and indistinguishable by the enabled flag alone.
-        const auto bogus = yuzu::test::unique_temp_path("rbac-loadfail-") / "rbac.db";
-        RbacStore broken(bogus);
+        // The PG analogue of the SQLite load-failed store (ADR-0041 fail-closed
+        // construction test): a pool whose DSN never connects leaves the store's
+        // construction lease empty, so migration never runs and is_open()==false
+        // — the same state a corrupt/unreachable rbac substrate produces, and
+        // indistinguishable by the enabled flag alone.
+        PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
+                    .size = 1}};
+        RbacStore broken{bad};
         REQUIRE_FALSE(broken.is_open());
         CHECK(rbac_enforcement_in_effect(&broken)); // must fail closed
     }
 
-    SECTION("corrupt file (migration fails) → fail closed, not full-fleet") {
-        // The constructor's OTHER failure path (#2104): sqlite3_open_v2
-        // succeeds on the garbage file, then the schema migration hits
-        // SQLITE_NOTADB and create_tables closes db_ — the literal #1717
-        // corrupt-but-openable rbac.db. The garbage must be NON-empty:
-        // SQLite treats a zero-byte file as a valid fresh database.
-        yuzu::test::TempDbFile db{"yuzu_test_rbac_corrupt-"};
-        {
-            std::ofstream f(db.path, std::ios::binary | std::ios::trunc);
-            REQUIRE(f.is_open());
-            f << "not a valid sqlite database";
-        }
-        RbacStore broken(db.path);
+    SECTION("unreachable-substrate store (open/migration failed) → fail closed") {
+        // The constructor's failure path when the substrate is unreachable — a
+        // second unroutable DSN (distinct host) exercising the same fail-closed
+        // is_open()==false outcome that #1717's corrupt-but-openable rbac.db
+        // produced on SQLite.
+        PgPool bad{{.conninfo = "host=192.0.2.1 port=5432 dbname=x user=x connect_timeout=1",
+                    .size = 1}};
+        RbacStore broken{bad};
         REQUIRE_FALSE(broken.is_open());
         CHECK(rbac_enforcement_in_effect(&broken)); // must fail closed
     }
 
     SECTION("loaded + explicitly disabled → full-fleet fallback permitted") {
-        RbacStore store(":memory:");
+        RBAC_STORE(store);
         REQUIRE(store.is_open());
         REQUIRE_FALSE(store.is_rbac_enabled()); // disabled by default
         CHECK_FALSE(rbac_enforcement_in_effect(&store));
     }
 
     SECTION("loaded + enabled → enforcement in effect (role-scoped path)") {
-        RbacStore store(":memory:");
+        RBAC_STORE(store);
         store.set_rbac_enabled(true);
         REQUIRE(store.is_rbac_enabled());
         CHECK(rbac_enforcement_in_effect(&store));
@@ -278,8 +363,8 @@ TEST_CASE("rbac_enforcement_in_effect fails closed on null / load-failed store",
 
 // ── Role CRUD ────────────────────────────────────────────────────────────────
 
-TEST_CASE("RbacStore: create custom role", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: create custom role", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto result = store.create_role({"SOC Analyst", "Security operations read access", false, 0});
     REQUIRE(result.has_value());
 
@@ -291,36 +376,36 @@ TEST_CASE("RbacStore: create custom role", "[rbac_store]") {
     CHECK(role->created_at > 0);
 }
 
-TEST_CASE("RbacStore: create duplicate role fails", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: create duplicate role fails", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_role({"MyRole", "", false, 0});
     auto result = store.create_role({"MyRole", "", false, 0});
     CHECK_FALSE(result.has_value());
 }
 
-TEST_CASE("RbacStore: create role with empty name fails", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: create role with empty name fails", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto result = store.create_role({"", "desc", false, 0});
     CHECK_FALSE(result.has_value());
 }
 
-TEST_CASE("RbacStore: delete custom role succeeds", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: delete custom role succeeds", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_role({"Temp", "temporary", false, 0});
     auto result = store.delete_role("Temp");
     REQUIRE(result.has_value());
     CHECK_FALSE(store.get_role("Temp").has_value());
 }
 
-TEST_CASE("RbacStore: delete system role fails", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: delete system role fails", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto result = store.delete_role("Administrator");
     CHECK_FALSE(result.has_value());
     CHECK(store.get_role("Administrator").has_value());
 }
 
-TEST_CASE("RbacStore: update role description", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: update role description", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_role({"MyRole", "old desc", false, 0});
     auto result = store.update_role("MyRole", "new desc");
     REQUIRE(result.has_value());
@@ -329,8 +414,8 @@ TEST_CASE("RbacStore: update role description", "[rbac_store]") {
 
 // ── Permission CRUD ──────────────────────────────────────────────────────────
 
-TEST_CASE("RbacStore: set and get permission", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: set and get permission", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_role({"TestRole", "", false, 0});
 
     auto result = store.set_permission({"TestRole", "Execution", "Execute", "allow"});
@@ -343,20 +428,179 @@ TEST_CASE("RbacStore: set and get permission", "[rbac_store]") {
     CHECK(perms[0].effect == "allow");
 }
 
-TEST_CASE("RbacStore: remove permission", "[rbac_store]") {
-    RbacStore store(":memory:");
-    store.create_role({"TestRole", "", false, 0});
-    store.set_permission({"TestRole", "Tag", "Read", "allow"});
-    store.set_permission({"TestRole", "Tag", "Write", "allow"});
+// fable (Gate 4, #2703, HIGH — REVISED from an earlier deny-tombstone fix):
+// remove_permission() DELETEs the role_permissions row (restoring the exact
+// legacy contract — absence, not a 'deny' row) and separately records the
+// revocation in revoked_seed_defaults, bookkeeping consulted ONLY by
+// seed_defaults()'s grant(). An earlier fix upserted an explicit 'deny' row
+// instead, on the theory the authorization OUTCOME was identical either
+// way — false: check_permission()/check_scoped_permission() apply "deny
+// overrides everything, across ALL of a principal's held roles", so a deny
+// row from THIS role would veto an allow the SAME principal holds via a
+// DIFFERENT role (see the dual-role divergence test below). The marker
+// table fixes the resurrection bug without creating that authorization
+// fact.
+TEST_CASE("RbacStore: remove permission deletes the row and survives a reseed",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    // Operator's AuditLog:Read is a real seed_defaults() default.
+    REQUIRE(store.check_role_has_permission("Operator", "AuditLog", "Read"));
 
-    store.remove_permission("TestRole", "Tag", "Write");
-    auto perms = store.get_role_permissions("TestRole");
-    REQUIRE(perms.size() == 1);
-    CHECK(perms[0].operation == "Read");
+    REQUIRE(store.remove_permission("Operator", "AuditLog", "Read").has_value());
+    // THE FIX: the row is genuinely gone — absent, not tombstoned.
+    for (const auto& p : store.get_role_permissions("Operator"))
+        CHECK_FALSE((p.securable_type == "AuditLog" && p.operation == "Read"));
+    CHECK_FALSE(store.check_role_has_permission("Operator", "AuditLog", "Read"));
+
+    // THE REGRESSION THIS CLOSES: a second construction against the SAME
+    // pool runs the REAL seed_defaults() (unconditional on every boot,
+    // ON CONFLICT DO NOTHING) — its grant() now consults
+    // revoked_seed_defaults and skips re-inserting the revoked row.
+    RbacStore reopened{rbac_pool_fx_};
+    CHECK_FALSE(reopened.check_role_has_permission("Operator", "AuditLog", "Read"));
 }
 
-TEST_CASE("RbacStore: deleting role cascades permissions", "[rbac_store]") {
-    RbacStore store(":memory:");
+// chaos-injector (Gate 5, #2703, HIGH — CHAOS-1, verified against live PG):
+// grant()'s `INSERT ... SELECT ... WHERE NOT EXISTS (marker) ... ON CONFLICT
+// DO NOTHING` takes its READ COMMITTED snapshot once, at statement start. If
+// that snapshot is taken BEFORE a concurrent revoke's marker-insert commits,
+// but grant() then blocks on the ON CONFLICT arbiter waiting for that same
+// revoke's uncommitted DELETE, Postgres — once the revoke commits — only
+// re-checks the CONFLICT TARGET (now gone), never re-evaluates the WHERE NOT
+// EXISTS subquery. So grant()'s already-computed INSERT lands anyway: the
+// marker AND the resurrected row both end up present, permanently (nothing
+// ever re-syncs role_permissions against revoked_seed_defaults). Fixed by a
+// pg_advisory_xact_lock, acquired in its OWN statement strictly before the
+// check-and-mutate statement, in every writer (grant(), remove_permission(),
+// the backfill's F1 block) — see kRevokeCoordLockSql in rbac_store.cpp.
+TEST_CASE("RbacStore: seed_defaults()'s grant() cannot resurrect a permission mid-revoke "
+          "(CHAOS-1)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.check_role_has_permission("Operator", "AuditLog", "Read"));
+
+    // Connection A: open a revoke transaction (lock + marker insert + DELETE)
+    // and hold it UNCOMMITTED — simulating remove_permission()'s in-flight
+    // write racing a concurrent seed_defaults() boot on another connection.
+    auto lease_a = rbac_pool_fx_.acquire();
+    REQUIRE(lease_a);
+    REQUIRE(pg::exec_params(lease_a.get(), "BEGIN", std::vector<std::string>{}).ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "SELECT pg_advisory_xact_lock(2037545589, "
+                            "hashtext('rbac_store:revoke_coordination'))",
+                            std::vector<std::string>{})
+                .ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "INSERT INTO rbac_store.revoked_seed_defaults (role_name, "
+                            "securable_type, operation) VALUES ('Operator','AuditLog','Read') "
+                            "ON CONFLICT DO NOTHING",
+                            std::vector<std::string>{})
+                .ok());
+    REQUIRE(pg::exec_params(lease_a.get(),
+                            "DELETE FROM rbac_store.role_permissions WHERE role_name='Operator' "
+                            "AND securable_type='AuditLog' AND operation='Read'",
+                            std::vector<std::string>{})
+                .ok());
+
+    // Connection B, on a separate thread: a SECOND RbacStore construction
+    // against the SAME pool — a genuine replica boot, exercising the REAL
+    // (production) seed_defaults()/grant() code, not a hand-copy of its SQL.
+    // Its grant() call for Operator/AuditLog/Read must BLOCK on connection
+    // A's held lock, and once unblocked, must see the marker and insert
+    // NOTHING. No REQUIRE/CHECK runs on this background thread — a Catch2
+    // assertion macro throwing off the main thread has no handler and calls
+    // std::terminate() immediately; the outcome is captured in a plain
+    // atomic and asserted on the main thread after join() instead.
+    std::atomic<bool> b_started{false};
+    std::atomic<bool> b_done{false};
+    std::atomic<bool> b_open{false};
+    std::thread grant_thread([&] {
+        b_started = true;
+        RbacStore reopened{rbac_pool_fx_};
+        b_open = reopened.is_open();
+        b_done = true;
+    });
+    // cpp-safety (Gate 8, #2703, BLOCKING): join-on-unwind guard. A REQUIRE
+    // between thread construction and the explicit .join() below throws on
+    // failure, and a joinable std::thread destroyed mid-unwind calls
+    // std::terminate() (test_approval_manager.cpp:888-954 hit this same
+    // hazard class). Detaching instead of joining would NOT be safe here
+    // (unlike that file's case): this lambda captures rbac_pool_fx_/
+    // b_started/b_done/b_open BY REFERENCE — stack locals of this
+    // TEST_CASE — so a detached thread outliving them would be a
+    // use-after-free, not a fix. The background thread's only blocking
+    // wait is the advisory lock, server-side bounded by the pool's
+    // lock_timeout, so join() here cannot hang indefinitely.
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() {
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{grant_thread};
+
+    // Give the grant thread time to start and genuinely block on connection
+    // A's held lock — proves this is a real blocked-then-unblocked
+    // interleaving, not a lucky race.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(b_started.load());
+    CHECK_FALSE(b_done.load());
+
+    const bool commit_ok =
+        pg::exec_params(lease_a.get(), "COMMIT", std::vector<std::string>{}).ok();
+    lease_a.reset();
+    grant_thread.join();
+    CHECK(commit_ok);
+    CHECK(b_done.load());
+    CHECK(b_open.load());
+
+    // THE FIX: the permission must stay revoked.
+    CHECK_FALSE(store.check_role_has_permission("Operator", "AuditLog", "Read"));
+}
+
+// fable (Gate 4, #2703, HIGH): a principal holding BOTH a role whose default
+// was revoked AND a different role that independently grants the same
+// (securable_type, operation) must still be granted — matching legacy,
+// where the revoked role's row was simply absent and never vetoed the other
+// role's independent allow. This is the scenario the deny-tombstone fix
+// silently broke (verified empirically before the marker-table fix landed:
+// the same setup denied dualuser under the tombstone).
+TEST_CASE("RbacStore: revoking one role's default does not veto a different role's "
+          "independent grant (dual-role)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    // PlatformEngineer and Operator both seed AuditLog:Read by default.
+    REQUIRE(store.check_role_has_permission("PlatformEngineer", "AuditLog", "Read"));
+    REQUIRE(store.check_role_has_permission("Operator", "AuditLog", "Read"));
+    store.assign_role({"user", "dualuser", "PlatformEngineer"});
+    store.assign_role({"user", "dualuser", "Operator"});
+    REQUIRE(store.check_permission("dualuser", "AuditLog", "Read"));
+
+    REQUIRE(store.remove_permission("PlatformEngineer", "AuditLog", "Read").has_value());
+    CHECK_FALSE(store.check_role_has_permission("PlatformEngineer", "AuditLog", "Read"));
+    // Operator's independent grant is untouched...
+    CHECK(store.check_role_has_permission("Operator", "AuditLog", "Read"));
+    // ...and dualuser, holding both roles, is STILL granted — Operator's
+    // allow controls, matching legacy (an absent row from PlatformEngineer
+    // is neutral, not a veto).
+    CHECK(store.check_permission("dualuser", "AuditLog", "Read"));
+}
+
+// quality-engineer (#2703): remove_permission() still validates all three
+// columns (role_permissions AND revoked_seed_defaults both REFERENCE the
+// same catalogue tables) — an unrecognized triple must fail, not silently
+// "succeed".
+TEST_CASE("RbacStore: remove permission on an unrecognized triple fails", "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    CHECK_FALSE(store.remove_permission("NoSuchRole", "Tag", "Read").has_value());
+
+    store.create_role({"TestRole", "", false, 0});
+    CHECK_FALSE(store.remove_permission("TestRole", "NoSuchType", "Read").has_value());
+    CHECK_FALSE(store.remove_permission("TestRole", "Tag", "NoSuchOp").has_value());
+}
+
+TEST_CASE("RbacStore: deleting role cascades permissions", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_role({"Cascade", "", false, 0});
     store.set_permission({"Cascade", "Tag", "Read", "allow"});
     store.delete_role("Cascade");
@@ -367,8 +611,8 @@ TEST_CASE("RbacStore: deleting role cascades permissions", "[rbac_store]") {
 
 // ── Principal-role assignments ───────────────────────────────────────────────
 
-TEST_CASE("RbacStore: assign and list principal roles", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: assign and list principal roles", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.assign_role({"user", "alice", "Administrator"});
     store.assign_role({"user", "alice", "Viewer"});
 
@@ -376,8 +620,8 @@ TEST_CASE("RbacStore: assign and list principal roles", "[rbac_store]") {
     REQUIRE(roles.size() == 2);
 }
 
-TEST_CASE("RbacStore: duplicate assignment is idempotent", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: duplicate assignment is idempotent", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.assign_role({"user", "bob", "Viewer"});
     store.assign_role({"user", "bob", "Viewer"});
 
@@ -385,8 +629,8 @@ TEST_CASE("RbacStore: duplicate assignment is idempotent", "[rbac_store]") {
     CHECK(roles.size() == 1);
 }
 
-TEST_CASE("RbacStore: unassign role", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: unassign role", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.assign_role({"user", "carol", "Operator"});
     store.unassign_role("user", "carol", "Operator");
 
@@ -394,8 +638,8 @@ TEST_CASE("RbacStore: unassign role", "[rbac_store]") {
     CHECK(roles.empty());
 }
 
-TEST_CASE("RbacStore: get role members", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: get role members", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.assign_role({"user", "alice", "Operator"});
     store.assign_role({"user", "bob", "Operator"});
 
@@ -403,8 +647,8 @@ TEST_CASE("RbacStore: get role members", "[rbac_store]") {
     REQUIRE(members.size() == 2);
 }
 
-TEST_CASE("RbacStore: deleting role cascades assignments", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: deleting role cascades assignments", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_role({"Temp", "", false, 0});
     store.assign_role({"user", "alice", "Temp"});
     store.delete_role("Temp");
@@ -415,8 +659,8 @@ TEST_CASE("RbacStore: deleting role cascades assignments", "[rbac_store]") {
 
 // ── check_permission ─────────────────────────────────────────────────────────
 
-TEST_CASE("RbacStore: check_permission with direct role", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: check_permission with direct role", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.assign_role({"user", "alice", "Administrator"});
 
     CHECK(store.check_permission("alice", "Infrastructure", "Write"));
@@ -424,13 +668,13 @@ TEST_CASE("RbacStore: check_permission with direct role", "[rbac_store]") {
     CHECK(store.check_permission("alice", "AuditLog", "Read"));
 }
 
-TEST_CASE("RbacStore: check_permission denied when no role", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: check_permission denied when no role", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     CHECK_FALSE(store.check_permission("nobody", "Execution", "Execute"));
 }
 
-TEST_CASE("RbacStore: Viewer cannot write", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: Viewer cannot write", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.assign_role({"user", "bob", "Viewer"});
 
     CHECK(store.check_permission("bob", "Execution", "Read"));
@@ -439,8 +683,8 @@ TEST_CASE("RbacStore: Viewer cannot write", "[rbac_store]") {
     CHECK_FALSE(store.check_permission("bob", "Infrastructure", "Read"));
 }
 
-TEST_CASE("RbacStore: check_permission via group membership", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: check_permission via group membership", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_group({"soc-team", "Security Operations", "local", "", 0});
     store.add_group_member("soc-team", "carol");
     store.assign_role({"group", "soc-team", "Operator"});
@@ -450,8 +694,8 @@ TEST_CASE("RbacStore: check_permission via group membership", "[rbac_store]") {
     CHECK_FALSE(store.check_permission("carol", "Infrastructure", "Write"));
 }
 
-TEST_CASE("RbacStore: deny overrides allow", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: deny overrides allow", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_role({"NoPatch", "No patching allowed", false, 0});
     store.set_permission({"NoPatch", "Execution", "Execute", "deny"});
 
@@ -464,8 +708,8 @@ TEST_CASE("RbacStore: deny overrides allow", "[rbac_store]") {
     CHECK(store.check_permission("alice", "Execution", "Read"));
 }
 
-TEST_CASE("RbacStore: multiple roles combine permissions", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: multiple roles combine permissions", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_role({"AuditReader", "Read audit logs", false, 0});
     store.set_permission({"AuditReader", "AuditLog", "Read", "allow"});
 
@@ -480,8 +724,8 @@ TEST_CASE("RbacStore: multiple roles combine permissions", "[rbac_store]") {
 
 // ── Effective permissions ────────────────────────────────────────────────────
 
-TEST_CASE("RbacStore: get_effective_permissions", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: get_effective_permissions", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.assign_role({"user", "alice", "Viewer"});
 
     auto perms = store.get_effective_permissions("alice");
@@ -490,16 +734,16 @@ TEST_CASE("RbacStore: get_effective_permissions", "[rbac_store]") {
         CHECK(p.effect == "allow");
 }
 
-TEST_CASE("RbacStore: effective permissions empty for unassigned user", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: effective permissions empty for unassigned user", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto perms = store.get_effective_permissions("nobody");
     CHECK(perms.empty());
 }
 
 // ── Group CRUD ───────────────────────────────────────────────────────────────
 
-TEST_CASE("RbacStore: create and list groups", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: create and list groups", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_group({"dev-team", "Development", "local", "", 0});
     store.create_group({"ops-team", "Operations", "local", "", 0});
 
@@ -507,8 +751,8 @@ TEST_CASE("RbacStore: create and list groups", "[rbac_store]") {
     REQUIRE(groups.size() == 2);
 }
 
-TEST_CASE("RbacStore: group membership", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: group membership", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_group({"team", "Test team", "local", "", 0});
     store.add_group_member("team", "alice");
     store.add_group_member("team", "bob");
@@ -522,8 +766,8 @@ TEST_CASE("RbacStore: group membership", "[rbac_store]") {
     CHECK(members[0] == "alice");
 }
 
-TEST_CASE("RbacStore: deleting group cascades members", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: deleting group cascades members", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_group({"temp", "", "local", "", 0});
     store.add_group_member("temp", "alice");
     store.delete_group("temp");
@@ -535,34 +779,15 @@ TEST_CASE("RbacStore: deleting group cascades members", "[rbac_store]") {
 // ── find_local_groups_with_prefix (T8 namespace-collision preflight) ───────
 
 TEST_CASE("RbacStore: find_local_groups_with_prefix matches local-source groups by prefix",
-          "[rbac_store]") {
+          "[rbac_store][pg]") {
     // create_group() rejects a new local group named inside the reserved
-    // 'engine:' prefix (see the "local group create inside 'engine:' is
-    // rejected" test in test_engine_principal_integration.cpp), so a
-    // colliding row can only exist as one that predates that guard — seed it
-    // via a raw connection the same way test_engine_principal_integration.cpp
-    // does, then reopen through RbacStore (closed first, required on
-    // Windows).
-    auto rbac_path = yuzu::test::unique_temp_path("yuzu_test_rbac_prefix_match-");
-    {
-        RbacStore seed(rbac_path); // runs migrations + seed_defaults, then closes
-        REQUIRE(seed.is_open());
-    }
-    {
-        sqlite3* raw = nullptr;
-        REQUIRE(sqlite3_open_v2(rbac_path.string().c_str(), &raw,
-                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr) ==
-               SQLITE_OK);
-        char* err = nullptr;
-        REQUIRE(sqlite3_exec(raw,
-                             "INSERT INTO groups (name, description, source, external_id, "
-                             "created_at) VALUES ('engine:foo', '', 'local', '', 0), "
-                             "('engine:bar', '', 'local', '', 0), ('other', '', 'local', '', 0)",
-                             nullptr, nullptr, &err) == SQLITE_OK);
-        sqlite3_close(raw);
-    }
-    RbacStore store(rbac_path);
-    REQUIRE(store.is_open());
+    // 'engine:' prefix, so a colliding row can only exist as one that predates
+    // that guard — seed it directly (bypassing the app layer), the same way a
+    // real pre-upgrade deployment's data would appear.
+    RBAC_STORE(store);
+    seed_group_raw(rbac_pool_fx_, "engine:foo", "", "local", "");
+    seed_group_raw(rbac_pool_fx_, "engine:bar", "", "local", "");
+    seed_group_raw(rbac_pool_fx_, "other", "", "local", "");
     // An IdP-sourced group asserting the same prefixed name is disambiguated
     // by principal_type at the resolution site, not this scan (§3.3) — must
     // not appear in the result.
@@ -576,8 +801,8 @@ TEST_CASE("RbacStore: find_local_groups_with_prefix matches local-source groups 
 
 TEST_CASE("RbacStore: find_local_groups_with_prefix returns empty engaged optional "
           "when nothing matches",
-          "[rbac_store]") {
-    RbacStore store(":memory:");
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
     store.create_group({"other", "", "local", "", 0});
 
     auto result = store.find_local_groups_with_prefix("engine:");
@@ -587,16 +812,17 @@ TEST_CASE("RbacStore: find_local_groups_with_prefix returns empty engaged option
 
 TEST_CASE("RbacStore: find_local_groups_with_prefix returns nullopt (not an engaged "
           "empty optional) on a closed/load-failed store",
-          "[rbac_store][visibility]") {
+          "[rbac_store][visibility][pg]") {
     // Mirrors the load-failed construction used by the
-    // rbac_enforcement_in_effect fail-closed tests above: a db path whose
-    // parent directory does not exist leaves db_ null. The bug this guards
-    // (Blocker 2 / PR #2202 review): the T8 preflight in server.cpp treats
-    // nullopt as "scan failed, fail closed" and an engaged empty vector as
-    // "scan completed, nothing colliding" — a !db_ store must return the
-    // former, not silently report a clean scan.
-    const auto bogus = yuzu::test::unique_temp_path("yuzu_test_rbac_loadfail-") / "rbac.db";
-    RbacStore broken(bogus);
+    // rbac_enforcement_in_effect fail-closed tests above: an unroutable DSN
+    // leaves the store unopened. The bug this guards (Blocker 2 / PR #2202
+    // review): the T8 preflight in server.cpp treats nullopt as "scan failed,
+    // fail closed" and an engaged empty vector as "scan completed, nothing
+    // colliding" — an unopened store must return the former, not silently
+    // report a clean scan.
+    PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
+                .size = 1}};
+    RbacStore broken{bad};
     REQUIRE_FALSE(broken.is_open());
 
     auto result = broken.find_local_groups_with_prefix("engine:");
@@ -605,7 +831,7 @@ TEST_CASE("RbacStore: find_local_groups_with_prefix returns nullopt (not an enga
 
 // ── IdP membership reconciliation (#1832) ───────────────────────────────────
 
-TEST_CASE("RbacStore: namespaced_group_name", "[rbac_store]") {
+TEST_CASE("RbacStore: namespaced_group_name", "[rbac_store][pg]") {
     CHECK(namespaced_group_name("entra", "abc-123") == "entra:abc-123");
     CHECK(namespaced_group_name("saml", "g1") == "saml:g1");
     // 'local' is NOT namespaced.
@@ -613,8 +839,8 @@ TEST_CASE("RbacStore: namespaced_group_name", "[rbac_store]") {
 }
 
 TEST_CASE("RbacStore: reconcile_idp_memberships namespacing prevents confused deputy",
-         "[rbac_store]") {
-    RbacStore store(":memory:");
+         "[rbac_store][pg]") {
+    RBAC_STORE(store);
 
     // A LOCAL group named "admins" already carries a role.
     store.create_group({"admins", "Local admins", "local", "", 0});
@@ -640,8 +866,8 @@ TEST_CASE("RbacStore: reconcile_idp_memberships namespacing prevents confused de
     CHECK(store.check_permission("carol", "Execution", "Execute"));
 }
 
-TEST_CASE("RbacStore: reconcile_idp_memberships add/remove diff", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: reconcile_idp_memberships add/remove diff", "[rbac_store][pg]") {
+    RBAC_STORE(store);
 
     REQUIRE(store.reconcile_idp_memberships("dave", "entra", {{"A", "A"}, {"B", "B"}})
                 .has_value());
@@ -660,8 +886,8 @@ TEST_CASE("RbacStore: reconcile_idp_memberships add/remove diff", "[rbac_store]"
 }
 
 TEST_CASE("RbacStore: reconcile_idp_memberships empty asserted removes only that source",
-         "[rbac_store]") {
-    RbacStore store(":memory:");
+         "[rbac_store][pg]") {
+    RBAC_STORE(store);
 
     REQUIRE(store.reconcile_idp_memberships("erin", "entra", {{"A", "A"}}).has_value());
     REQUIRE(store.reconcile_idp_memberships("erin", "saml", {{"S1", "S1"}}).has_value());
@@ -687,8 +913,8 @@ TEST_CASE("RbacStore: reconcile_idp_memberships empty asserted removes only that
 // WHERE source = ?)` clause) even if row-presence checks were accidentally
 // preserved.
 TEST_CASE("RbacStore: empty-asserted reconcile cannot strip a local role grant",
-         "[rbac_store]") {
-    RbacStore store(":memory:");
+         "[rbac_store][pg]") {
+    RBAC_STORE(store);
 
     store.create_group({"local-crew", "", "local", "", 0});
     store.add_group_member("local-crew", "erin");
@@ -710,8 +936,8 @@ TEST_CASE("RbacStore: empty-asserted reconcile cannot strip a local role grant",
     CHECK_FALSE(store.check_permission("erin", "Infrastructure", "Write"));
 }
 
-TEST_CASE("RbacStore: reconcile_idp_memberships enforces the group-count cap", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: reconcile_idp_memberships enforces the group-count cap", "[rbac_store][pg]") {
+    RBAC_STORE(store);
 
     std::vector<std::pair<std::string, std::string>> asserted;
     asserted.reserve(RbacStore::kMaxIdpGroupsPerLogin + 1);
@@ -730,8 +956,8 @@ TEST_CASE("RbacStore: reconcile_idp_memberships enforces the group-count cap", "
 // qa-S3: exactly the cap boundary succeeds — only `> kMaxIdpGroupsPerLogin`
 // is rejected, not `==`.
 TEST_CASE("RbacStore: reconcile_idp_memberships accepts exactly the group-count cap",
-         "[rbac_store]") {
-    RbacStore store(":memory:");
+         "[rbac_store][pg]") {
+    RBAC_STORE(store);
 
     std::vector<std::pair<std::string, std::string>> asserted;
     asserted.reserve(RbacStore::kMaxIdpGroupsPerLogin);
@@ -744,8 +970,8 @@ TEST_CASE("RbacStore: reconcile_idp_memberships accepts exactly the group-count 
     CHECK(store.get_group_members("entra:g0") == std::vector<std::string>{"frank2"});
 }
 
-TEST_CASE("RbacStore: reconcile_idp_memberships is idempotent", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: reconcile_idp_memberships is idempotent", "[rbac_store][pg]") {
+    RBAC_STORE(store);
 
     std::vector<std::pair<std::string, std::string>> asserted = {{"A", "A"}, {"B", "B"}};
     REQUIRE(store.reconcile_idp_memberships("gina", "entra", asserted).has_value());
@@ -759,8 +985,8 @@ TEST_CASE("RbacStore: reconcile_idp_memberships is idempotent", "[rbac_store]") 
 // comp-S2/cons-S3: the {added, removed} counts a caller uses to decide
 // whether to write a provisioning audit row.
 TEST_CASE("RbacStore: reconcile_idp_memberships reports added/removed counts",
-         "[rbac_store]") {
-    RbacStore store(":memory:");
+         "[rbac_store][pg]") {
+    RBAC_STORE(store);
 
     auto first = store.reconcile_idp_memberships("hank", "entra", {{"A", "A"}, {"B", "B"}});
     REQUIRE(first.has_value());
@@ -784,8 +1010,8 @@ TEST_CASE("RbacStore: reconcile_idp_memberships reports added/removed counts",
 // string) as `source` — the stale-membership DELETE it runs is scoped to
 // `groups.source = ?` and is only safe for an IdP source. A miswired call
 // with "local" would mass-delete local group memberships fleet-wide.
-TEST_CASE("RbacStore: reconcile_idp_memberships rejects source=='local'", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: reconcile_idp_memberships rejects source=='local'", "[rbac_store][pg]") {
+    RBAC_STORE(store);
 
     store.create_group({"crew", "", "local", "", 0});
     store.add_group_member("crew", "ivan");
@@ -800,8 +1026,8 @@ TEST_CASE("RbacStore: reconcile_idp_memberships rejects source=='local'", "[rbac
     CHECK(store.check_permission("ivan", "Execution", "Execute"));
 }
 
-TEST_CASE("RbacStore: reconcile_idp_memberships rejects an empty source", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: reconcile_idp_memberships rejects an empty source", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto result = store.reconcile_idp_memberships("ivan", "", {{"g", "g"}});
     REQUIRE_FALSE(result.has_value());
 }
@@ -813,8 +1039,8 @@ TEST_CASE("RbacStore: reconcile_idp_memberships rejects an empty source", "[rbac
 // has_reserved_idp_prefix or the create_group collision scan, since it's a
 // raw upsert into `groups`, not a call through create_group.
 TEST_CASE("RbacStore: reconcile_idp_memberships rejects an unrecognized source (e.g. 'engine')",
-          "[rbac_store]") {
-    RbacStore store(":memory:");
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto result =
         store.reconcile_idp_memberships("ivan", "engine", {{"vuln", "engine:vuln"}});
     REQUIRE_FALSE(result.has_value());
@@ -835,55 +1061,32 @@ TEST_CASE("RbacStore: reconcile_idp_memberships rejects an unrecognized source (
 // granted to the pre-existing group to the IdP-authenticated user.
 TEST_CASE("RbacStore: reconcile_idp_memberships does not join a pre-existing "
          "differently-sourced group",
-         "[rbac_store]") {
+         "[rbac_store][pg]") {
     // The `create_group` reserved-prefix guard means a source='local' create
     // named "entra:x" can no longer be made through the public API — which
     // is exactly the point of this scenario: a row like this can only exist
     // as a LEGACY artifact from before the guard shipped (or direct DB
     // manipulation). Seed it by bypassing the app layer, the same way a real
     // pre-upgrade deployment's data would.
-    const auto path = yuzu::test::unique_temp_path("rbac-secl1-");
-    {
-        RbacStore seed(path); // creates schema + seed_defaults
-        REQUIRE(seed.is_open());
-    }
-    {
-        sqlite3* db = nullptr;
-        REQUIRE(sqlite3_open_v2(path.string().c_str(), &db, SQLITE_OPEN_READWRITE, nullptr) ==
-                SQLITE_OK);
-        REQUIRE(sqlite3_exec(db,
-                             "INSERT INTO groups (name, description, source, external_id, "
-                             "created_at) VALUES ('entra:x', 'Local admins', 'local', '', 100);",
-                             nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_close(db);
-    }
+    RBAC_STORE(store);
+    seed_group_raw(rbac_pool_fx_, "entra:x", "Local admins", "local", "");
 
-    {
-        RbacStore store(path);
-        REQUIRE(store.is_open());
-        REQUIRE(store.assign_role({"group", "entra:x", "Administrator"}).has_value());
+    REQUIRE(store.assign_role({"group", "entra:x", "Administrator"}).has_value());
 
-        auto reconciled = store.reconcile_idp_memberships("judy", "entra", {{"x", "x"}});
-        REQUIRE(reconciled.has_value());
-        CHECK(reconciled->added == 0); // the join was skipped, not counted as added
+    auto reconciled = store.reconcile_idp_memberships("judy", "entra", {{"x", "x"}});
+    REQUIRE(reconciled.has_value());
+    CHECK(reconciled->added == 0); // the join was skipped, not counted as added
 
-        // judy must NOT be a member of the pre-existing local group, and must
-        // NOT inherit its Administrator role.
-        CHECK(store.get_group_members("entra:x").empty());
-        CHECK_FALSE(store.check_permission("judy", "Infrastructure", "Write"));
-    } // close `store` before deleting the file — Windows cannot remove an open
-      // file (Linux unlinks it lazily), and the throwing remove() overload would
-      // otherwise fail this test on MSVC. Use the non-throwing overload for cleanup.
-    std::error_code ec;
-    std::filesystem::remove(path, ec);
-    std::filesystem::remove(std::filesystem::path(path.string() + "-wal"), ec);
-    std::filesystem::remove(std::filesystem::path(path.string() + "-shm"), ec);
+    // judy must NOT be a member of the pre-existing local group, and must
+    // NOT inherit its Administrator role.
+    CHECK(store.get_group_members("entra:x").empty());
+    CHECK_FALSE(store.check_permission("judy", "Infrastructure", "Write"));
 }
 
 // UP-9: an asserted entry with a blank/whitespace-only external_id must be
 // skipped, never turned into a garbage `entra:` / `entra:   ` group.
-TEST_CASE("RbacStore: reconcile_idp_memberships skips blank external_id", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: reconcile_idp_memberships skips blank external_id", "[rbac_store][pg]") {
+    RBAC_STORE(store);
 
     auto reconciled =
         store.reconcile_idp_memberships("karen", "entra", {{"", "Empty"}, {"   ", "Blank"},
@@ -900,8 +1103,8 @@ TEST_CASE("RbacStore: reconcile_idp_memberships skips blank external_id", "[rbac
 }
 
 TEST_CASE("RbacStore: create_group rejects a local group with a reserved IdP prefix",
-         "[rbac_store]") {
-    RbacStore store(":memory:");
+         "[rbac_store][pg]") {
+    RBAC_STORE(store);
 
     auto local_collision = store.create_group({"entra:x", "", "local", "", 0});
     REQUIRE_FALSE(local_collision.has_value());
@@ -920,305 +1123,10 @@ TEST_CASE("RbacStore: create_group rejects a local group with a reserved IdP pre
     CHECK(store.create_group({"my-entra:team", "", "local", "", 0}).has_value());
 }
 
-// qa-S2: a store on disk at schema v1 (pre-#1832) migrates cleanly to v2 —
-// idx_groups_source + idx_group_members_username get created and existing
-// rows survive. Mirrors the `test_migration_runner.cpp` adoption-scenario
-// pattern: seed a v1-only schema directly with the runner, insert data,
-// close, then reopen through the real RbacStore constructor (which always
-// runs the FULL migration list) and check both the schema and the data.
-namespace {
-bool index_exists(sqlite3* db, const char* name) {
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?;", -1,
-                           &stmt, nullptr) != SQLITE_OK)
-        return false;
-    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
-    bool found = sqlite3_step(stmt) == SQLITE_ROW;
-    sqlite3_finalize(stmt);
-    return found;
-}
-} // namespace
-
-TEST_CASE("RbacStore: v1 -> v2 migration adds indices without data loss",
-         "[rbac_store][migration]") {
-    const auto path = yuzu::test::unique_temp_path("rbac-migration-");
-
-    // v1-only migration list — exactly rbac_store's historical v1 schema,
-    // duplicated here (not `#include`d from rbac_store.cpp) so this test
-    // fails loudly if a future edit changes v1's shape without updating
-    // this fixture, rather than silently drifting.
-    static const std::vector<yuzu::server::Migration> kV1Only = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS securable_types (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS operations (
-                id          TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS roles (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0,
-                created_at  INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS role_permissions (
-                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
-                securable_type  TEXT NOT NULL REFERENCES securable_types(name),
-                operation       TEXT NOT NULL REFERENCES operations(id),
-                effect          TEXT NOT NULL DEFAULT 'allow',
-                PRIMARY KEY (role_name, securable_type, operation)
-            );
-            CREATE TABLE IF NOT EXISTS principal_roles (
-                principal_type  TEXT NOT NULL,
-                principal_id    TEXT NOT NULL,
-                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
-                PRIMARY KEY (principal_type, principal_id, role_name)
-            );
-            CREATE INDEX IF NOT EXISTS idx_principal_roles_lookup
-                ON principal_roles(principal_type, principal_id);
-            CREATE TABLE IF NOT EXISTS groups (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                source      TEXT NOT NULL DEFAULT 'local',
-                external_id TEXT,
-                created_at  INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS group_members (
-                group_name  TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
-                username    TEXT NOT NULL,
-                PRIMARY KEY (group_name, username)
-            );
-            CREATE TABLE IF NOT EXISTS rbac_config (
-                key     TEXT PRIMARY KEY,
-                value   TEXT NOT NULL
-            );
-        )"},
-    };
-
-    {
-        sqlite3* db = nullptr;
-        REQUIRE(sqlite3_open_v2(path.string().c_str(), &db,
-                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                                nullptr) == SQLITE_OK);
-        REQUIRE(yuzu::server::MigrationRunner::run(db, "rbac_store", kV1Only));
-        REQUIRE(yuzu::server::MigrationRunner::current_version(db, "rbac_store") == 1);
-        REQUIRE_FALSE(index_exists(db, "idx_groups_source"));
-        REQUIRE_FALSE(index_exists(db, "idx_group_members_username"));
-
-        // Seed data that must survive the upgrade. Deliberately a LOCAL
-        // group/membership, not an IdP-sourced one (#1837 v3 legitimately
-        // purges IdP-sourced group_members — that behavior is covered by
-        // its own dedicated migration test in test_oidc_principal_key.cpp;
-        // this test's purpose is unrelated generic data survival across the
-        // rest of the migration ladder).
-        sqlite3_exec(db,
-                    "INSERT INTO groups (name, description, source, external_id, created_at) "
-                    "VALUES ('seed-team', 'seed', 'local', '', 100);"
-                    "INSERT INTO group_members (group_name, username) VALUES ('seed-team', 'leo');"
-                    "INSERT INTO roles (name, description, is_system, created_at) "
-                    "VALUES ('Custom', 'seed role', 0, 100);",
-                    nullptr, nullptr, nullptr);
-        sqlite3_close(db);
-    }
-
-    // Reopen through the production constructor — runs the FULL migration
-    // list (v1 adoption no-op + v2 index creation + v3 no-op for local
-    // groups) and seed_defaults().
-    {
-        RbacStore store(path);
-        REQUIRE(store.is_open());
-
-        // Pre-existing data preserved.
-        auto groups = store.list_groups();
-        auto found = std::find_if(groups.begin(), groups.end(),
-                                  [](const RbacGroup& g) { return g.name == "seed-team"; });
-        REQUIRE(found != groups.end());
-        CHECK(found->source == "local");
-        CHECK(store.get_group_members("seed-team") == std::vector<std::string>{"leo"});
-        CHECK(store.get_role("Custom").has_value());
-
-        // v2 index creation — the store's own connection isn't reachable
-        // from the test, so open a second raw connection on the same file
-        // to inspect sqlite_master (WAL-mode readers see committed schema
-        // changes from another connection on the same file).
-        sqlite3* verify_db = nullptr;
-        REQUIRE(sqlite3_open_v2(path.string().c_str(), &verify_db, SQLITE_OPEN_READONLY,
-                                nullptr) == SQLITE_OK);
-        CHECK(index_exists(verify_db, "idx_groups_source"));
-        CHECK(index_exists(verify_db, "idx_group_members_username"));
-        sqlite3_close(verify_db);
-    }
-
-    std::filesystem::remove(path);
-    std::filesystem::remove(std::filesystem::path(path.string() + "-wal"));
-    std::filesystem::remove(std::filesystem::path(path.string() + "-shm"));
-}
-
-// qa/governance hardening round (#2324): a dev/UAT rbac.db seeded under the
-// PRE-FIX access-review scheme (AuditLog:Read/AuditLog:Attest gating, before
-// the dedicated AccessReview securable) still carries the three now-retired
-// grants forever — `seed_defaults()`'s `INSERT OR IGNORE` only ever ADDS
-// rows. Migration v4 DELETEs exactly those three. Mirrors the v1->v2 test's
-// pattern: seed a v3-only schema directly with the runner (rbac_store's
-// historical shape immediately before v4 was introduced), insert data that
-// simulates the pre-fix grants, close, then reopen through the real
-// RbacStore constructor (which always runs the FULL migration list +
-// seed_defaults()) and check the retired rows are gone while everything
-// else survives.
-TEST_CASE("RbacStore: v3 -> v4 migration retires the pre-fix AuditLog access-review grants "
-         "without touching anything else",
-         "[rbac_store][migration]") {
-    const auto path = yuzu::test::unique_temp_path("rbac-migration-v4-");
-
-    // v1-through-v3-only migration list — exactly rbac_store's historical
-    // shape immediately before v4 (duplicated here, not #include'd, for the
-    // same drift-detection reason as kV1Only above).
-    static const std::vector<yuzu::server::Migration> kThroughV3 = {
-        {1, R"(
-            CREATE TABLE IF NOT EXISTS securable_types (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS operations (
-                id          TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS roles (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                is_system   INTEGER NOT NULL DEFAULT 0,
-                created_at  INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS role_permissions (
-                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
-                securable_type  TEXT NOT NULL REFERENCES securable_types(name),
-                operation       TEXT NOT NULL REFERENCES operations(id),
-                effect          TEXT NOT NULL DEFAULT 'allow',
-                PRIMARY KEY (role_name, securable_type, operation)
-            );
-            CREATE TABLE IF NOT EXISTS principal_roles (
-                principal_type  TEXT NOT NULL,
-                principal_id    TEXT NOT NULL,
-                role_name       TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
-                PRIMARY KEY (principal_type, principal_id, role_name)
-            );
-            CREATE INDEX IF NOT EXISTS idx_principal_roles_lookup
-                ON principal_roles(principal_type, principal_id);
-            CREATE TABLE IF NOT EXISTS groups (
-                name        TEXT PRIMARY KEY,
-                description TEXT NOT NULL DEFAULT '',
-                source      TEXT NOT NULL DEFAULT 'local',
-                external_id TEXT,
-                created_at  INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS group_members (
-                group_name  TEXT NOT NULL REFERENCES groups(name) ON DELETE CASCADE,
-                username    TEXT NOT NULL,
-                PRIMARY KEY (group_name, username)
-            );
-            CREATE TABLE IF NOT EXISTS rbac_config (
-                key     TEXT PRIMARY KEY,
-                value   TEXT NOT NULL
-            );
-        )"},
-        {2, R"(
-            CREATE INDEX IF NOT EXISTS idx_groups_source ON groups(source);
-            CREATE INDEX IF NOT EXISTS idx_group_members_username ON group_members(username);
-        )"},
-        {3, R"(
-            DELETE FROM group_members
-            WHERE group_name IN (SELECT name FROM groups WHERE source != 'local');
-        )"},
-    };
-
-    {
-        sqlite3* db = nullptr;
-        REQUIRE(sqlite3_open_v2(path.string().c_str(), &db,
-                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                                nullptr) == SQLITE_OK);
-        REQUIRE(yuzu::server::MigrationRunner::run(db, "rbac_store", kThroughV3));
-        REQUIRE(yuzu::server::MigrationRunner::current_version(db, "rbac_store") == 3);
-
-        // Seed the parent rows + grants a pre-fix rbac.db would carry: the
-        // three retired AuditLog access-review grants, PLUS neighbours that
-        // must survive untouched — Administrator's other AuditLog ops,
-        // Operator's unrelated AuditLog:Read (auth-sample etc.).
-        sqlite3_exec(db,
-                    "INSERT INTO roles (name, description, is_system, created_at) VALUES "
-                    "('Administrator', 'd', 1, 0), ('Reviewer', 'd', 1, 0), ('Operator', 'd', 1, 0);"
-                    "INSERT INTO securable_types (name, description, is_system) VALUES "
-                    "('AuditLog', 'd', 1);"
-                    "INSERT INTO operations (id, description, is_system) VALUES "
-                    "('Read', 'd', 1), ('Write', 'd', 1), ('Attest', 'd', 1);"
-                    "INSERT INTO role_permissions (role_name, securable_type, operation, effect) "
-                    "VALUES "
-                    // The three retired grants (migration v4 must delete exactly these).
-                    "('Administrator', 'AuditLog', 'Attest', 'allow'),"
-                    "('Reviewer', 'AuditLog', 'Read', 'allow'),"
-                    "('Reviewer', 'AuditLog', 'Attest', 'allow'),"
-                    // Neighbours that must survive: Administrator's other AuditLog
-                    // ops, and Operator's unrelated AuditLog:Read.
-                    "('Administrator', 'AuditLog', 'Read', 'allow'),"
-                    "('Administrator', 'AuditLog', 'Write', 'allow'),"
-                    "('Operator', 'AuditLog', 'Read', 'allow');",
-                    nullptr, nullptr, nullptr);
-        sqlite3_close(db);
-    }
-
-    // Reopen through the production constructor — runs the FULL migration
-    // list (v4 retires the three grants) + seed_defaults() (adds the fresh
-    // AccessReview:Read/Attest grants).
-    {
-        RbacStore store(path);
-        REQUIRE(store.is_open());
-
-        auto admin_perms = store.get_role_permissions("Administrator");
-        auto reviewer_perms = store.get_role_permissions("Reviewer");
-        auto operator_perms = store.get_role_permissions("Operator");
-
-        auto has = [](const std::vector<Permission>& perms, const std::string& type,
-                     const std::string& op) {
-            for (auto& p : perms)
-                if (p.securable_type == type && p.operation == op)
-                    return true;
-            return false;
-        };
-
-        // The three retired grants are GONE.
-        CHECK_FALSE(has(admin_perms, "AuditLog", "Attest"));
-        CHECK_FALSE(has(reviewer_perms, "AuditLog", "Read"));
-        CHECK_FALSE(has(reviewer_perms, "AuditLog", "Attest"));
-
-        // Administrator's other AuditLog ops survive untouched.
-        CHECK(has(admin_perms, "AuditLog", "Read"));
-        CHECK(has(admin_perms, "AuditLog", "Write"));
-
-        // Operator's unrelated AuditLog:Read survives untouched.
-        CHECK(has(operator_perms, "AuditLog", "Read"));
-
-        // seed_defaults() converges the pre-fix DB onto the fresh-install
-        // AccessReview grant set — same shape a brand-new rbac.db gets.
-        CHECK(has(admin_perms, "AccessReview", "Attest"));
-        CHECK(has(admin_perms, "AccessReview", "Read")); // via the CRUD-types loop
-        CHECK(has(reviewer_perms, "AccessReview", "Read"));
-        CHECK(has(reviewer_perms, "AccessReview", "Attest"));
-    }
-
-    std::filesystem::remove(path);
-    std::filesystem::remove(std::filesystem::path(path.string() + "-wal"));
-    std::filesystem::remove(std::filesystem::path(path.string() + "-shm"));
-}
-
 // ── ITServiceOwner role ──────────────────────────────────────────────────────
 
-TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rbac_store]") {
-    RbacStore store(":memory:");
+TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rbac_store][pg]") {
+    RBAC_STORE(store);
     auto role = store.get_role("ITServiceOwner");
     REQUIRE(role.has_value());
     CHECK(role->is_system);
@@ -1260,22 +1168,21 @@ yuzu::test::PgTestTemplate scoped_mgmt_tpl{"rbacscopedmgmt", [](const std::strin
 }};
 } // namespace
 
-TEST_CASE("RbacStore: check_scoped_permission global allow bypasses scoping",
-          "[pg][rbac_store]") {
+TEST_CASE("RbacStore: check_scoped_permission global allow bypasses scoping", "[rbac_store][pg]") {
+    RBAC_STORE(rbac);
     YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ManagementGroupStore mgmt{pool};
-    RbacStore rbac(":memory:");
 
     rbac.assign_role({"user", "admin_user", "Administrator"});
     CHECK(rbac.check_scoped_permission("admin_user", "Tag", "Write", "agent-1", &mgmt));
 }
 
-TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[pg][rbac_store]") {
+TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[rbac_store][pg]") {
+    RBAC_STORE(rbac);
     YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ManagementGroupStore mgmt{pool};
-    RbacStore rbac(":memory:");
 
     // Create a management group and add agent to it
     ManagementGroup g;
@@ -1298,11 +1205,11 @@ TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[pg][rbac_st
     CHECK(rbac.check_scoped_permission("alice", "Execution", "Execute", "agent-crm-1", &mgmt));
 }
 
-TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[pg][rbac_store]") {
+TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[rbac_store][pg]") {
+    RBAC_STORE(rbac);
     YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     ManagementGroupStore mgmt{pool};
-    RbacStore rbac(":memory:");
 
     // alice has ITServiceOwner on CRM group, but agent-other is not in it
     ManagementGroup g;
@@ -1321,4 +1228,1405 @@ TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[pg][rbac_
 
     // agent-other is NOT in the CRM group
     CHECK_FALSE(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-other", &mgmt));
+}
+
+// fable (Gate 4, #2703, HIGH): the scoped/confinement path has the SAME
+// dual-role hazard as the global one above — role_effects_for() maps a
+// role's effect for (type,op) into resolve_perm_groups()'s deny_groups,
+// which check_scoped_permission()/authorize_list_read() then treat as a
+// hard veto (and expand_visible_set() subtracts whole agent subtrees for).
+// A revoked-default role must stay NEUTRAL in that resolution — never a
+// deny_group — so a principal's independent grant via a DIFFERENT role
+// scoped to the SAME management group still controls.
+TEST_CASE("RbacStore: revoking one role's default does not create a scoped deny_group "
+          "vetoing a different role's independent grant",
+          "[rbac_store][pg]") {
+    RBAC_STORE(rbac);
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
+
+    // Both ITServiceOwner and Operator seed Tag:Write by default.
+    REQUIRE(rbac.check_role_has_permission("ITServiceOwner", "Tag", "Write"));
+    REQUIRE(rbac.check_role_has_permission("Operator", "Tag", "Write"));
+    REQUIRE(rbac.remove_permission("ITServiceOwner", "Tag", "Write").has_value());
+    CHECK_FALSE(rbac.check_role_has_permission("ITServiceOwner", "Tag", "Write"));
+
+    ManagementGroup g;
+    g.name = "Service: CRM";
+    g.membership_type = "static";
+    auto group_id = mgmt.create_group(g);
+    REQUIRE(group_id.has_value());
+    mgmt.add_member(*group_id, "agent-crm-1");
+
+    // alice holds BOTH roles scoped to the SAME group: ITServiceOwner
+    // (revoked default) and Operator (independent, unrevoked grant).
+    GroupRoleAssignment a_ito;
+    a_ito.group_id = *group_id;
+    a_ito.principal_type = "user";
+    a_ito.principal_id = "alice";
+    a_ito.role_name = "ITServiceOwner";
+    mgmt.assign_role(a_ito);
+    GroupRoleAssignment a_op;
+    a_op.group_id = *group_id;
+    a_op.principal_type = "user";
+    a_op.principal_id = "alice";
+    a_op.role_name = "Operator";
+    mgmt.assign_role(a_op);
+
+    // If the revoked role's absence were (wrongly) treated as a deny_group,
+    // this would come back false. It must not — the revoked role is
+    // neutral, exactly as if alice never held it for this (type,op).
+    CHECK(rbac.check_scoped_permission("alice", "Tag", "Write", "agent-crm-1", &mgmt));
+}
+
+// ── Backfill (ADR-0009/0041 MANDATORY class) ─────────────────────────────────
+
+namespace {
+// Build a legacy (SQLite) rbac.db with the pre-migration schema + a known custom
+// fixture: one custom role with a grant, a direct user assignment, a local group
+// with a member, and the rbac_config('enabled') row set to `enabled`.
+void make_legacy_rbac_db(const std::filesystem::path& path, bool enabled) {
+    // adversarial-review (PR #2703, BLOCKER): raw sqlite3* with manual cleanup
+    // leaked the handle on a REQUIRE failure between open and the final
+    // sqlite3_close below — the same pattern already fixed elsewhere in this
+    // file (e.g. the R2/F1 tests above) via SqliteDb RAII, missed here.
+    SqliteDb db;
+    REQUIRE(sqlite3_open_v2(path.string().c_str(), db.addr(),
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+    const char* ddl =
+        "CREATE TABLE securable_types (name TEXT PRIMARY KEY, description TEXT, is_system INTEGER);"
+        "CREATE TABLE operations (id TEXT PRIMARY KEY, description TEXT, is_system INTEGER);"
+        "CREATE TABLE roles (name TEXT PRIMARY KEY, description TEXT, is_system INTEGER, created_at "
+        "INTEGER);"
+        "CREATE TABLE role_permissions (role_name TEXT, securable_type TEXT, operation TEXT, effect "
+        "TEXT);"
+        "CREATE TABLE principal_roles (principal_type TEXT, principal_id TEXT, role_name TEXT);"
+        "CREATE TABLE groups (name TEXT PRIMARY KEY, description TEXT, source TEXT, external_id "
+        "TEXT, created_at INTEGER);"
+        "CREATE TABLE group_members (group_name TEXT, username TEXT);"
+        "CREATE TABLE rbac_config (key TEXT PRIMARY KEY, value TEXT);"
+        // Custom operator-authored config that CANNOT be re-derived from seeds.
+        "INSERT INTO roles VALUES ('CustomRole', 'operator authored', 0, 42);"
+        "INSERT INTO role_permissions VALUES ('CustomRole', 'Tag', 'Read', 'allow');"
+        "INSERT INTO principal_roles VALUES ('user', 'alice', 'CustomRole');"
+        "INSERT INTO groups VALUES ('team-a', 'a local team', 'local', '', 7);"
+        "INSERT INTO group_members VALUES ('team-a', 'bob');";
+    SqliteErrMsg err;
+    REQUIRE(sqlite3_exec(db.get(), ddl, nullptr, nullptr, err.addr()) == SQLITE_OK);
+    std::string cfg = std::string("INSERT INTO rbac_config VALUES ('enabled', '") +
+                      (enabled ? "true" : "false") + "');";
+    REQUIRE(sqlite3_exec(db.get(), cfg.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+}
+
+// Doomgoose (PR #2703 review, blocking item 2): a legacy rbac.db carrying
+// exactly the two patterns migrations v3/v4 exist to remove — an IdP-sourced
+// group with a stale, display-name-keyed membership row, and one of the
+// three role_permissions tuples v4 retires — at a caller-chosen schema_meta
+// version (nullopt = no schema_meta table at all, matching a file that
+// predates MigrationRunner's adoption in this store, #339, entirely).
+// migrate_from_sqlite never runs MigrationRunner against this path, so
+// these rows only get cleaned up if migrate_from_sqlite's own inline v3/v4
+// filtering does it.
+void make_legacy_rbac_db_pre_cleanup(const std::filesystem::path& path,
+                                     std::optional<int> schema_version) {
+    SqliteDb db;
+    REQUIRE(sqlite3_open_v2(path.string().c_str(), db.addr(),
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+    const char* ddl =
+        "CREATE TABLE securable_types (name TEXT PRIMARY KEY, description TEXT, is_system INTEGER);"
+        "CREATE TABLE operations (id TEXT PRIMARY KEY, description TEXT, is_system INTEGER);"
+        "CREATE TABLE roles (name TEXT PRIMARY KEY, description TEXT, is_system INTEGER, created_at "
+        "INTEGER);"
+        "CREATE TABLE role_permissions (role_name TEXT, securable_type TEXT, operation TEXT, effect "
+        "TEXT);"
+        "CREATE TABLE principal_roles (principal_type TEXT, principal_id TEXT, role_name TEXT);"
+        "CREATE TABLE groups (name TEXT PRIMARY KEY, description TEXT, source TEXT, external_id "
+        "TEXT, created_at INTEGER);"
+        "CREATE TABLE group_members (group_name TEXT, username TEXT);"
+        "CREATE TABLE rbac_config (key TEXT PRIMARY KEY, value TEXT);"
+        // v3 hazard: an IdP-sourced group with a membership row keyed on a
+        // mutable display name a later LOCAL user could share.
+        "INSERT INTO groups VALUES ('stale-idp-team', 'old IdP group', 'entra', 'ext-1', 7);"
+        "INSERT INTO group_members VALUES ('stale-idp-team', 'jdoe');"
+        // v4 hazard: one of the three specifically-retired grant tuples — a
+        // fresh-install Reviewer never gets this (seed_defaults() doesn't
+        // grant it), so its post-migration presence is attributable ONLY to
+        // this row surviving unfiltered.
+        "INSERT INTO role_permissions VALUES ('Reviewer', 'AuditLog', 'Read', 'allow');"
+        "INSERT INTO rbac_config VALUES ('enabled', 'false');";
+    SqliteErrMsg err;
+    REQUIRE(sqlite3_exec(db.get(), ddl, nullptr, nullptr, err.addr()) == SQLITE_OK);
+    if (schema_version) {
+        const std::string meta =
+            "CREATE TABLE schema_meta (store TEXT PRIMARY KEY, version INTEGER NOT NULL, "
+            "upgraded_at INTEGER NOT NULL);"
+            "INSERT INTO schema_meta VALUES ('rbac_store', " + std::to_string(*schema_version) +
+            ", 0);";
+        REQUIRE(sqlite3_exec(db.get(), meta.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+}
+
+// governance re-review (PR #2703, BLOCKING — canonicalization collision):
+// minimal legacy DB with exactly ONE role, whose name/description are the
+// caller's choice — lets a test craft two field splits that would collide
+// under an unescaped delimiter join (e.g. name="a|b",desc="c" vs
+// name="a",desc="b|c") but must NOT collide under the length-prefixed
+// encoding this fix ships.
+void make_legacy_rbac_db_one_role(const std::filesystem::path& path, const std::string& role_name,
+                                  const std::string& role_desc) {
+    SqliteDb db;
+    REQUIRE(sqlite3_open_v2(path.string().c_str(), db.addr(),
+                            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+    const char* ddl =
+        "CREATE TABLE roles (name TEXT PRIMARY KEY, description TEXT, is_system INTEGER, created_at "
+        "INTEGER);"
+        "CREATE TABLE role_permissions (role_name TEXT, securable_type TEXT, operation TEXT, effect "
+        "TEXT);"
+        "CREATE TABLE principal_roles (principal_type TEXT, principal_id TEXT, role_name TEXT);";
+    SqliteErrMsg err;
+    REQUIRE(sqlite3_exec(db.get(), ddl, nullptr, nullptr, err.addr()) == SQLITE_OK);
+    SqliteStmt s;
+    REQUIRE(sqlite3_prepare_v2(db.get(),
+                               "INSERT INTO roles (name, description, is_system, created_at) "
+                               "VALUES (?, ?, 0, 5)",
+                               -1, s.addr(), nullptr) == SQLITE_OK);
+    sqlite3_bind_text(s.get(), 1, role_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(s.get(), 2, role_desc.c_str(), -1, SQLITE_TRANSIENT);
+    REQUIRE(sqlite3_step(s.get()) == SQLITE_DONE);
+}
+} // namespace
+
+TEST_CASE("RbacStore: migrate_from_sqlite's fingerprint does not collide on a delimiter-crafted "
+          "field split (governance re-review, PR #2703)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy_a{"yuzu_test_rbac_collide_a-"};
+    std::filesystem::remove(legacy_a.path);
+    make_legacy_rbac_db_one_role(legacy_a.path, "a|b", "c");
+    REQUIRE(store.migrate_from_sqlite(legacy_a.path));
+
+    // Same shared marker (stamped for A's content above); replica B holds a
+    // DIFFERENT legacy file whose fields split the same raw bytes across the
+    // name/description boundary differently ("a" / "b|c" vs "a|b" / "c"). An
+    // unescaped '|' join would canonicalize both to the identical preimage —
+    // this must now be correctly detected as a MISMATCH, not silently waved
+    // through as "already migrated, matches".
+    RbacStore replica_b{rbac_pool_fx_};
+    REQUIRE(replica_b.is_open());
+    yuzu::test::TempDbFile legacy_b{"yuzu_test_rbac_collide_b-"};
+    std::filesystem::remove(legacy_b.path);
+    make_legacy_rbac_db_one_role(legacy_b.path, "a", "b|c");
+
+    CHECK_FALSE(replica_b.migrate_from_sqlite(legacy_b.path));
+    CHECK(std::filesystem::exists(legacy_b.path)); // refused, never moved aside
+}
+
+// governance re-review (PR #2703, HIGH — chaos-injector/unhappy-path,
+// independently): the race stamp_complete's fingerprint upsert resolves is
+// only reachable through genuine concurrency between two migrate_from_sqlite
+// callers (a fileless replica's marker-absent check racing a real replica's
+// slower migration) — the public API's own step-2 idempotency check makes a
+// SEQUENTIAL two-call repro of the full end-to-end race impossible (whichever
+// call completes first makes the second see "marker already present" and
+// take the verify branch, never reaching stamp_complete at all). A fixed
+// timing-dependent thread race, forcing the exact interleaving, would need a
+// test-only pause hook inside migrate_from_sqlite — exactly the
+// disproportionate-for-this-round complexity advisor input flagged when this
+// fix was scoped.
+//
+// DISCLOSED LIMITATION: this test therefore verifies the upsert's SQL
+// semantics directly against Postgres (the same three cases checked by hand
+// before this was shipped) using a COPY of stamp_complete's fingerprint
+// query, not a call into stamp_complete itself (a private lambda with no
+// external call site). The copy is NOT auto-synced — if stamp_complete's
+// fingerprint UPSERT in rbac_store.cpp ever changes, this copy must be
+// updated to match or this test silently stops covering the real code.
+TEST_CASE("RbacStore: backfill_source_fingerprint upsert promotes sourceless, protects a real "
+          "value, and accepts a matching value (governance re-review, PR #2703)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE(store.migrate_from_sqlite("/nonexistent/path/rbac.db")); // seeds 'sourceless'
+
+    const auto stamp = [&](const std::string& value) -> int {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "INSERT INTO rbac_store.rbac_meta (key, value) VALUES "
+            "('backfill_source_fingerprint', $1) ON CONFLICT (key) DO UPDATE SET "
+            "value = EXCLUDED.value WHERE rbac_store.rbac_meta.value = 'sourceless' OR "
+            "rbac_store.rbac_meta.value = EXCLUDED.value RETURNING value",
+            std::vector<std::string>{value});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        return PQntuples(r.get());
+    };
+    const auto stored_value = [&]() -> std::string {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "SELECT value FROM rbac_store.rbac_meta WHERE key = 'backfill_source_fingerprint'",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(r.get()) == 1);
+        return PQgetvalue(r.get(), 0, 0);
+    };
+    REQUIRE(stored_value() == "sourceless");
+
+    // A real fingerprint promotes a stored sourceless placeholder — 1 row.
+    CHECK(stamp("v2:real_A") == 1);
+    CHECK(stored_value() == "v2:real_A");
+
+    // A DIFFERENT real fingerprint may not overwrite the now-real value — 0
+    // rows, and the stored value is untouched.
+    CHECK(stamp("v2:real_B") == 0);
+    CHECK(stored_value() == "v2:real_A");
+
+    // The SAME real fingerprint writing again (two replicas sharing storage,
+    // both migrating identical content, one loses only the INSERT race, not
+    // the content race) counts as success, not a lost race — 1 row.
+    CHECK(stamp("v2:real_A") == 1);
+    CHECK(stored_value() == "v2:real_A");
+
+    // A sourceless writer never overwrites an established real value — 0
+    // rows (non-error for the sourceless caller per stamp_complete's own
+    // exemption, exercised at the migrate_from_sqlite level elsewhere).
+    CHECK(stamp("sourceless") == 0);
+    CHECK(stored_value() == "v2:real_A");
+}
+
+TEST_CASE("RbacStore: migrate_from_sqlite returns false on an unopened store", "[rbac_store][pg]") {
+    PgPool bad{{.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1",
+                .size = 1}};
+    RbacStore broken{bad};
+    REQUIRE_FALSE(broken.is_open());
+    CHECK_FALSE(broken.migrate_from_sqlite("/nonexistent/path/rbac.db"));
+}
+
+TEST_CASE("RbacStore: migrate_from_sqlite with no legacy file is a clean idempotent no-op",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    CHECK(store.migrate_from_sqlite("/nonexistent/path/rbac.db")); // fresh install
+    CHECK(store.migrate_from_sqlite("/nonexistent/path/rbac.db")); // marker present → no-op
+    // A fresh install stays RBAC-disabled by default (the seeded value).
+    CHECK_FALSE(store.is_rbac_enabled());
+}
+
+TEST_CASE("RbacStore: migrate_from_sqlite backfills operator config, idempotently",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_legacy-"};
+    std::filesystem::remove(legacy.path); // make_legacy_rbac_db creates it fresh
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    // Custom role + grant carried across.
+    CHECK(store.get_role("CustomRole").has_value());
+    CHECK(store.check_role_has_permission("CustomRole", "Tag", "Read"));
+    // Direct assignment carried across → alice resolves the custom grant.
+    CHECK(store.check_permission("alice", "Tag", "Read"));
+    // Group + membership carried across.
+    CHECK(store.get_group_members("team-a") == std::vector<std::string>{"bob"});
+
+    // Legacy file moved aside after a verified backfill.
+    CHECK_FALSE(std::filesystem::exists(legacy.path));
+
+    // Idempotent: a second call (marker present) is a no-op success.
+    CHECK(store.migrate_from_sqlite(legacy.path));
+    // No duplicate assignment rows.
+    auto pr = store.get_principal_roles("user", "alice");
+    CHECK(pr.size() == 1);
+}
+
+// adversarial-review (PR #2703, BLOCKER, both Kimi and Codex independently):
+// docs/postgres-store-playbook.md "Local source absence never creates
+// terminal migration state on its own" (#2697). A replica with no local
+// legacy file stamping the SHARED backfill_complete marker must not let a
+// SIBLING replica that genuinely holds the legacy file silently skip its
+// own migration — the fix is holder-side fingerprint verification, and this
+// is the regression test for the exact scenario both reviewers described.
+TEST_CASE("RbacStore: migrate_from_sqlite refuses a sourceless sibling's marker on a later boot "
+          "even though this replica genuinely holds the legacy file (adversarial-review #2703, "
+          "REVERTED by governance re-review round 2 back to refusal — see the code comment at "
+          "the sourceless branch)",
+          "[rbac_store][pg]") {
+    // governance re-review round 2 (unhappy-path, HIGH): this test previously
+    // asserted a fall-through-and-promote here, which this replica's own
+    // round-2 re-review found unsafe — a fileless sibling's sourceless stamp
+    // makes rbac_store operational (seeded defaults only), and a live IdP
+    // login in the interim can run reconcile_idp_memberships, which this
+    // replica's later fall-through migration could silently clobber (delete-
+    // then-resurrect a group_members row). Promotion stays safe ONLY at
+    // STAMP TIME, inside a replica's OWN migration (see the separate
+    // "backfill_source_fingerprint upsert promotes sourceless" test above,
+    // which exercises exactly that path and is unaffected by this revert). A
+    // LATER boot that merely FINDS the marker already sourceless must refuse.
+    RBAC_STORE(store);
+    // "Replica A" — no local legacy file, stamps the shared marker with the
+    // sourceless sentinel fingerprint.
+    CHECK(store.migrate_from_sqlite("/nonexistent/path/rbac.db"));
+
+    // "Replica B" — same shared Postgres (rbac_pool_fx_), but this one
+    // genuinely holds a legacy file with real, non-empty operator content,
+    // and boots AFTER the marker was already stamped sourceless.
+    RbacStore replica_b{rbac_pool_fx_};
+    REQUIRE(replica_b.is_open());
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_sourceless_race-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/true);
+
+    // Refused, not silently accepted OR silently re-migrated — the file must
+    // survive untouched, and no operator config it holds must land in PG.
+    CHECK_FALSE(replica_b.migrate_from_sqlite(legacy.path));
+    CHECK(std::filesystem::exists(legacy.path));
+    CHECK_FALSE(replica_b.is_rbac_enabled());
+    auto pr = replica_b.get_principal_roles("user", "alice");
+    CHECK(pr.empty());
+}
+
+// The positive counterpart: a replica whose OWN legacy file is still present
+// after ITS OWN completed migration (e.g. the move-aside rename failed) must
+// verify as a MATCH and skip re-migrating, not refuse.
+TEST_CASE("RbacStore: migrate_from_sqlite verifies a matching fingerprint when this replica's "
+          "own already-migrated legacy file is still present (adversarial-review #2703)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_fp_match-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+    CHECK_FALSE(std::filesystem::exists(legacy.path)); // moved aside as usual
+
+    // Recreate a file with IDENTICAL logical content at the same path —
+    // simulating a failed move-aside on a real restart, where the original
+    // file is still sitting there holding the SAME content already migrated.
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    RbacStore reopened{rbac_pool_fx_};
+    REQUIRE(reopened.is_open());
+    CHECK(reopened.migrate_from_sqlite(legacy.path));
+    // Verified, not re-migrated: no duplicate assignment rows.
+    auto pr = reopened.get_principal_roles("user", "alice");
+    CHECK(pr.size() == 1);
+    // cpp-safety (governance re-review round 2): the matched-fingerprint
+    // branch retries move_legacy_aside — machine-check that it actually
+    // ran, not just that migrate_from_sqlite returned true.
+    CHECK_FALSE(std::filesystem::exists(legacy.path));
+}
+
+// Doomgoose (PR #2703 review, BLOCKING item 2): a legacy rbac.db with no
+// schema_meta table at all (the maximally-unmigrated case) carries the two
+// patterns migrations v3/v4 exist to clean up. migrate_from_sqlite must
+// apply the same predicates inline rather than blindly copying stale rows
+// forward — a stale IdP group membership becomes a resurrected confused-
+// deputy hazard (a later LOCAL user sharing the old display name silently
+// inherits the group's roles), and the retired role_permissions tuple
+// becomes a stale grant a fresh install would never have.
+TEST_CASE("RbacStore: migrate_from_sqlite applies v3/v4 legacy cleanup predicates inline for a "
+          "pre-migration legacy db (Doomgoose PR #2703 review, blocking item 2)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_precleanup_v0-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db_pre_cleanup(legacy.path, /*schema_version=*/std::nullopt);
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    // v3 hazard: the stale IdP-sourced membership must NOT have carried
+    // forward — a LOCAL user later named "jdoe" must not silently inherit
+    // stale-idp-team's roles via this row.
+    CHECK(store.get_group_members("stale-idp-team").empty());
+
+    // v4 hazard: the retired Reviewer/AuditLog/Read grant must NOT have
+    // carried forward. A fresh-install Reviewer never gets this permission
+    // (superseded by the dedicated AccessReview securable) — its presence
+    // here would be attributable only to the unfiltered legacy row.
+    REQUIRE(store.assign_role({"user", "carol", "Reviewer"}).has_value());
+    CHECK_FALSE(store.check_permission("carol", "AuditLog", "Read"));
+}
+
+// The control counterpart: a legacy db that already ran migrations v3/v4
+// (schema_meta version 4) must NOT have its content filtered — the v3/v4
+// predicates apply only to a legacy file that itself never ran them. Proves
+// the version check gates correctly in both directions, not just that
+// filtering happens at all.
+TEST_CASE("RbacStore: migrate_from_sqlite does NOT filter a legacy db that already ran "
+          "migrations v3/v4 (control for Doomgoose PR #2703 review, blocking item 2)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_precleanup_v4-"};
+    std::filesystem::remove(legacy.path);
+    // Same content as the hazard fixture, but stamped as already having run
+    // v4 -- a real post-v4 legacy file would never actually carry this
+    // content (the migrations would have deleted it on that release's own
+    // boot), but using the identical rows here isolates the version-gate
+    // logic itself from the fixture's own content, matching this file's
+    // established practice of testing one variable at a time.
+    make_legacy_rbac_db_pre_cleanup(legacy.path, /*schema_version=*/4);
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    CHECK(store.get_group_members("stale-idp-team") == std::vector<std::string>{"jdoe"});
+    REQUIRE(store.assign_role({"user", "carol", "Reviewer"}).has_value());
+    CHECK(store.check_permission("carol", "AuditLog", "Read"));
+}
+
+// Doomgoose (PR #2703 review, BLOCKING item 3): an orphaned group_members row
+// (group_name with no corresponding groups row -- SQLite never enforces this
+// FK by default, so an operator deleting a group via a raw sqlite3
+// UPDATE/DELETE can leave one behind with nothing to catch it in the legacy
+// file) must not abort the WHOLE backfill. rbac_store.group_members.group_name
+// is a real FK in Postgres (REFERENCES groups(name) ON DELETE CASCADE) --
+// pre-fix, the single-transaction INSERT loop aborted entirely on this one
+// bad row, rolling back every legitimate role/grant/membership in the same
+// legacy file and leaving the completion marker unstamped, so every restart
+// repeated the failure (a permanent boot loop).
+TEST_CASE("RbacStore: migrate_from_sqlite skips (not aborts on) an orphaned legacy "
+          "group_members row via a per-row savepoint (Doomgoose PR #2703 review, blocking "
+          "item 3)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_orphan_member-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    // Add an orphaned membership row directly -- group_name "ghost-team" has
+    // no corresponding row in `groups`, matching exactly what a raw sqlite3
+    // DELETE FROM groups (foreign_keys=OFF, SQLite's default) would leave
+    // behind.
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(db.get(),
+                             "INSERT INTO group_members VALUES ('ghost-team', 'ghost-user');",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+
+    // Must succeed overall -- the orphaned row is skipped, not fatal.
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    // The orphaned row itself did not (and could not, given no group exists
+    // for it to attach to) migrate.
+    CHECK(store.get_group_members("ghost-team").empty());
+
+    // Everything ELSE in the same legacy file -- the fixture's own
+    // operator-authored role, grant, principal assignment, and its one
+    // legitimate group membership -- migrated intact. This is the actual
+    // point of the fix: one bad row must not take the rest down with it.
+    auto pr = store.get_principal_roles("user", "alice");
+    CHECK(pr.size() == 1);
+    CHECK(store.check_permission("alice", "Tag", "Read"));
+    CHECK(store.get_group_members("team-a") == std::vector<std::string>{"bob"});
+}
+
+// governance re-review (PR #2703, HIGH — unhappy-path, EMPIRICALLY reproduced
+// against a live Postgres before this fix): a marker stamped by the
+// pre-fingerprint-mechanism code (backfill_complete present, NO
+// backfill_source_fingerprint row at all) must NOT be silently trusted or
+// silently re-migrated — unlike the sourceless case, a real migration DID
+// happen under the old scheme, so this replica may hold live post-cutover
+// operator changes a fresh re-migration would clobber. Making this permanent
+// per the original scratch repro (built, run red, reverted).
+TEST_CASE("RbacStore: migrate_from_sqlite refuses (not silently trusts, not silently "
+          "re-migrates) a pre-fingerprint-mechanism marker when this replica holds real legacy "
+          "content (governance re-review, PR #2703)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    // Simulate a marker stamped by the pre-31273f288 code: `backfill_complete`
+    // present, no `backfill_source_fingerprint` row.
+    {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        pg::PgResult r = pg::exec_params(
+            lease.get(),
+            "INSERT INTO rbac_store.rbac_meta (key, value) VALUES ('backfill_complete', '1') "
+            "ON CONFLICT (key) DO NOTHING",
+            std::vector<std::string>{});
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    }
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_prefingerprint_upgrade-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/true);
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
+    // Refused, not silently accepted OR silently re-migrated — the file must
+    // survive untouched either way.
+    CHECK(std::filesystem::exists(legacy.path));
+    CHECK_FALSE(store.is_rbac_enabled());
+}
+
+// THE CRITICAL CLAUSE (ADR-0041): losing the rbac_enabled flag silently reverts
+// the fleet to RBAC-off = catastrophic fail-open. An ENABLED legacy DB must come
+// up ENABLED even though the fresh PG store seeds the default 'false' first.
+TEST_CASE("RbacStore: migrate_from_sqlite preserves an ENABLED rbac_enabled flag",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    REQUIRE_FALSE(store.is_rbac_enabled()); // seeded default before backfill
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_legacy_on-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/true);
+
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    // The flag was migrated first + read-back-verified — the store is now ENABLED
+    // and enforcement is in effect (never silently reverted to RBAC-off).
+    CHECK(store.is_rbac_enabled());
+    CHECK(rbac_enforcement_in_effect(&store));
+}
+
+TEST_CASE("RbacStore: migrate_from_sqlite fails closed on an unreadable legacy file",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile corrupt{"yuzu_test_rbac_corrupt-"};
+    {
+        std::ofstream f(corrupt.path, std::ios::binary | std::ios::trunc);
+        REQUIRE(f.is_open());
+        f << "not a valid sqlite database at all";
+    }
+    // A non-empty non-SQLite file cannot be opened read-only → fail closed
+    // (boot refuses), never a silent skip that would drop operator config.
+    CHECK_FALSE(store.migrate_from_sqlite(corrupt.path));
+    // No marker stamped → a later boot with a repaired/absent file retries and
+    // can still complete (proves the failure did not stamp the completion marker).
+    CHECK(store.migrate_from_sqlite("/nonexistent/rbac.db"));
+}
+
+// governance re-review (PR #2703 round 2, cpp-expert HIGH): read_legacy_snapshot's
+// rbac_config.enabled read previously had NO failure accounting at all, unlike
+// every other row-category read — a genuine SQLite read error there (not
+// "table/row absent") silently kept the "false" default, which nothing
+// downstream (read-back verify, reconciliation, the fingerprint) could catch
+// because they all derive from the same already-poisoned snapshot. This
+// forces exactly that error (rbac_config exists with the WRONG schema, so
+// the SELECT fails to PREPARE) and proves the backfill now refuses instead
+// of silently proceeding with rbac_enabled=false.
+TEST_CASE("RbacStore: migrate_from_sqlite fails closed when legacy rbac_config.enabled cannot "
+          "be read due to a genuine schema error, not silently defaulted to false",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_config_read_error-"};
+    std::filesystem::remove(legacy.path);
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open_v2(legacy.path.string().c_str(), db.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        const char* ddl =
+            "CREATE TABLE roles (name TEXT PRIMARY KEY, description TEXT, is_system INTEGER, "
+            "created_at INTEGER);"
+            "CREATE TABLE role_permissions (role_name TEXT, securable_type TEXT, operation TEXT, "
+            "effect TEXT);"
+            "CREATE TABLE principal_roles (principal_type TEXT, principal_id TEXT, role_name "
+            "TEXT);"
+            // rbac_config EXISTS but WITHOUT a `value` column, so the SELECT
+            // that reads rbac_enabled fails to PREPARE — a genuine read
+            // error, not "table/row absent".
+            "CREATE TABLE rbac_config (key TEXT PRIMARY KEY);"
+            "INSERT INTO roles VALUES ('CustomRole', 'operator authored', 0, 42);";
+        SqliteErrMsg err;
+        REQUIRE(sqlite3_exec(db.get(), ddl, nullptr, nullptr, err.addr()) == SQLITE_OK);
+    }
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
+    // Refused, not silently accepted with rbac_enabled defaulted to false —
+    // the file must survive untouched.
+    CHECK(std::filesystem::exists(legacy.path));
+}
+
+// The load-bearing ADR-0041 invariant (Gate 3 QE BLOCKING): every authz read
+// on a degraded/unopened store must DENY, never fail open. This is the whole
+// reason the migration preserves deny-on-error on the bool paths.
+TEST_CASE("RbacStore: every authz read fails closed (DENY) on a broken store",
+          "[rbac_store][pg]") {
+    PgPool bad{{.conninfo = "host=192.0.2.1 port=1 dbname=x user=x connect_timeout=1", .size = 1}};
+    RbacStore broken{bad};
+    REQUIRE_FALSE(broken.is_open());
+    CHECK_FALSE(broken.check_permission("alice", "Execution", "Execute"));
+    CHECK_FALSE(broken.check_scoped_permission("alice", "Execution", "Execute", "agent-1", nullptr));
+    CHECK_FALSE(broken.holds_permission_via_any_group("alice", "Execution", "Execute", nullptr));
+    CHECK_FALSE(broken.check_role_has_permission("Administrator", "Execution", "Execute"));
+    // Tri-state read degrades distinguishably (unexpected), never an engaged allow.
+    CHECK_FALSE(broken.get_principal_roles_checked("user", "alice").has_value());
+    // The list-read chokepoint denies-all on a degraded store (never AdmitAll).
+    CHECK(broken.authorize_list_read("alice", "Agent", "Read", nullptr).decision ==
+          ListReadDecision::DenyAll);
+}
+
+// The generation-token cache must not serve a stale ALLOW after a revoke on the
+// same instance (Gate 3 QE BLOCKING): a mutation bumps the durable generation
+// in-txn and clears the local cache, so the next check re-reads and denies.
+TEST_CASE("RbacStore: a revoke invalidates a cached allow (generation token)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    store.assign_role({"user", "cacheuser", "Administrator"}); // Administrator = allow-all
+    // Warm perm_cache_ with an ALLOW verdict.
+    CHECK(store.check_permission("cacheuser", "Execution", "Execute"));
+    // Revoke — bumps write_generation in the same txn + clears the local cache.
+    REQUIRE(store.unassign_role("user", "cacheuser", "Administrator").has_value());
+    // The previously-cached allow must NOT be served; the check re-reads → DENY.
+    CHECK_FALSE(store.check_permission("cacheuser", "Execution", "Execute"));
+}
+
+// adversarial-review round (PR #2703): both external reviewers (Kimi, Codex)
+// independently found that maybe_refresh_generation()'s "never touch
+// rbac_enabled_ on a read error" contract only reasons about the true->false
+// fail-open direction -- a replica that has never itself observed a remote
+// enable stays cached false (enforcement NOT in effect, i.e. AdmitAll)
+// indefinitely through an outage, even after the durable flag has genuinely
+// flipped true elsewhere. Reproduces the real production code path: replica
+// A durably enables RBAC (bumping write_generation); replica B (a SEPARATE
+// store+pool against the SAME database) never observes that write because
+// its own size-1 pool is starved for its next refresh attempt, which
+// genuinely times out and lands in the !durable_gen branch.
+TEST_CASE("RbacStore: rbac_enforcement_in_effect fails closed when a generation refresh fails "
+          "PAST the bounded stale-serve window, while another replica has durably enabled "
+          "RBAC (adversarial-review round, #2703; bounded stale-serve, #2703 Gate 7)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    REQUIRE_FALSE(replica_a.is_rbac_enabled()); // fresh install default
+
+    // "Replica B": a separate store + size-1 pool against the SAME database,
+    // so it can be starved independently of replica_a's own pool.
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    REQUIRE_FALSE(replica_b.is_rbac_enabled());
+    // Baseline this test's failure branch must diverge from: genuinely
+    // fresh + disabled correctly reports enforcement NOT in effect.
+    REQUIRE_FALSE(rbac_enforcement_in_effect(&replica_b));
+
+    // Replica A durably enables RBAC -- bumps write_generation in the same
+    // txn (ADR-0041 contract).
+    replica_a.set_rbac_enabled(true);
+    REQUIRE(replica_a.is_rbac_enabled());
+
+    // Clear replica_b's refresh gate so its next read genuinely attempts a
+    // durable re-read rather than serving its just-constructed cache.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // Starve replica_b's own pool for the rest of the test: every subsequent
+    // maybe_refresh_generation() call on replica_b cannot acquire a
+    // connection and must time out. That acquire now uses the short
+    // kAuthzAcquireTimeout (250ms, #2703 Gate 7 merge-slice item 1 commit A —
+    // bounds how long a saturated pool can pin an HTTP worker on the authz
+    // hot path), not the wider kReadTimeout, so a failed attempt's OWN
+    // blocking time is no longer large enough to reliably carry the clock
+    // across kRbacStaleServeBoundMs (5000ms) the way it could when the acquire
+    // itself took ~2s. This test now advances wall time with explicit sleeps
+    // instead of relying on that blocking duration.
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    // Bounded stale-serve (#2703 Gate 7, operator-adjudicated): this FIRST
+    // failed refresh attempt lands at roughly construction + 1.1s (the sleep
+    // above) + <=0.25s (this call's own blocking kAuthzAcquireTimeout) — well
+    // inside kRbacStaleServeBoundMs (5000ms) of replica_b's last confirmed-
+    // good refresh (its own construction). This is the whole point of the
+    // tolerance: a short blip must NOT immediately widen a genuinely-
+    // disabled fleet to enforce. is_open() stays true throughout (no
+    // store-level degrade), only the generation view is briefly unconfirmed.
+    CHECK_FALSE(rbac_enforcement_in_effect(&replica_b));
+
+    // Push past the bound with an explicit sleep — comfortably clears both
+    // the 1s stampede gate (so the next call genuinely attempts a fresh
+    // refresh rather than serving the gated fast path) and, combined with
+    // the ~1.1-1.35s already elapsed, pushes total elapsed time since
+    // construction past kRbacStaleServeBoundMs (5000ms) with margin.
+    std::this_thread::sleep_for(std::chrono::milliseconds(4200));
+
+    // Pre-fix (adversarial-review round): is_rbac_enabled() correctly stayed
+    // false (the existing contract), but rbac_enforcement_in_effect() ALSO
+    // returned false, wrongly admitting the full fleet. Post-fix, and now
+    // past the stale-serve bound: enforcement is in effect because the view
+    // is genuinely degraded, not merely aging within tolerance.
+    CHECK(rbac_enforcement_in_effect(&replica_b));
+}
+
+// G11-CPPEXPERT-B2 (#2703 Gate 8, fixed): the sibling test above proves
+// rbac_enforcement_in_effect() fails closed once SOME refresh attempt
+// actually completes and finds itself past the bound. This test proves the
+// narrower, previously-open gap: elapsed time alone must degrade the view
+// even when NO refresh attempt is ever made at all -- e.g. every caller in
+// the window took the gated fast-return path, or is itself still blocked
+// inside a stuck query (PG-side lock contention, #3016, can block a single
+// query for the whole ~10s lock_timeout). Pre-fix, rbac_enabled_view_degraded()
+// was `!generation_valid_` only, which nothing in this scenario ever flips --
+// generation_valid_ stays true, untouched, indefinitely. No pool starving
+// here deliberately: the point is that this must degrade with ZERO refresh
+// attempts, successful or failed, so the test makes none.
+TEST_CASE("RbacStore: rbac_enabled_view_degraded fails closed on elapsed time alone, "
+          "with no refresh attempt ever completing (#2703 Gate 8, G11-CPPEXPERT-B2)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    REQUIRE_FALSE(replica_a.is_rbac_enabled()); // fresh install default
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 4}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+
+    // Fresh construction is a genuine completed refresh (the header's own
+    // "construction counts as one" contract) -- not degraded yet.
+    REQUIRE_FALSE(replica_b.rbac_enabled_view_degraded());
+
+    // Advance wall time past kRbacStaleServeBoundMs (5000ms) WITHOUT calling
+    // is_rbac_enabled()/check_permission()/anything that reaches
+    // maybe_refresh_generation() -- replica_b's pool is left healthy and
+    // untouched throughout, so if the old `!generation_valid_`-only check
+    // were still in place, nothing in this test would ever flip it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+
+    // Called directly (bypassing maybe_refresh_generation() entirely, unlike
+    // is_rbac_enabled()/rbac_enforcement_in_effect() which always trigger a
+    // fresh attempt first): elapsed time alone must now report degraded,
+    // even though generation_valid_ was never touched by a completed refresh
+    // attempt of any kind.
+    CHECK(replica_b.rbac_enabled_view_degraded());
+
+    // rbac_enforcement_in_effect() itself is NOT re-checked here for
+    // degraded=true: replica_b's pool is deliberately left healthy (no lock
+    // held, no starving), so is_rbac_enabled()'s own maybe_refresh_generation()
+    // call succeeds instantly and self-heals the view before
+    // rbac_enabled_view_degraded() would even be consulted -- correct
+    // behavior once nothing is actually blocking a fresh read, not a gap.
+    // The genuinely-stuck-query scenario this fix targets (a real held
+    // PG-side row lock, #3016) needs a second connection actively holding
+    // that lock to reproduce end-to-end; the direct check above is the
+    // precise unit-level proof that this fix's own code path is reachable
+    // and correct independent of that heavier live-lock harness.
+    CHECK_FALSE(rbac_enforcement_in_effect(&replica_b));
+}
+
+// #2703 Gate 7 (operator-adjudicated bounded stale-serve): a refresh failure
+// that lands INSIDE the tolerance window must not clear a warm perm_cache_ --
+// that's the entire point of tolerating it (avoid a fleet-wide cache-miss
+// storm on a short blip). Verified via a genuinely warm cache (a real granted
+// permission, actually served from cache), not just the generation flag.
+TEST_CASE("RbacStore: a warm permission cache survives a generation-refresh "
+          "failure inside the stale-serve bound (#2703 Gate 7)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    replica_a.set_rbac_enabled(true);
+    REQUIRE(replica_a.assign_role({"user", "bob", "Administrator"}).has_value());
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+
+    // Clear the refresh gate, let replica_b observe the durable enable +
+    // grant, and genuinely populate perm_cache_ with an ALLOW.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
+
+    // Starve the pool and force one failed refresh attempt inside the bound.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    // Still inside kRbacStaleServeBoundMs of the successful refresh above --
+    // the cached ALLOW must still be served, not silently dropped to a
+    // DB-round-trip (which would itself fail while the pool is starved).
+    CHECK(replica_b.check_permission("bob", "Infrastructure", "Read"));
+}
+
+// cpp-safety (#2703 Gate 8, second re-review): the sibling test above proves
+// the within-bound side of check_permission()'s own trust decision (the
+// exact site that read generation_valid_ directly pre-fix, see 67df7e49d).
+// This proves the past-the-bound side end to end. Caveat, stated honestly:
+// starving the pool here means maybe_refresh_generation()'s OWN pre-existing
+// flip-on-detect path (unconditionally called at the top of
+// check_permission(), unrelated to this fix) also fires and flips
+// generation_valid_ false BEFORE check_permission()'s own trust check ever
+// runs -- so this does not, by itself, isolate the NEW check_permission()-
+// level substitution from the pre-existing mechanism the way the
+// rbac_enabled_view_degraded() test isolates its own fix (that one calls the
+// accessor directly, bypassing maybe_refresh_generation() entirely; nothing
+// analogous exists for check_permission(), which always refreshes first).
+// What this DOES prove: check_permission() correctly denies rather than
+// serving a stale cached ALLOW once past the bound, end to end -- real
+// regression coverage for a previously-untested boundary, even though the
+// genuinely-stuck-refresh scenario this fix specifically targets stays
+// covered only by the deferred live-lock harness, #3031.
+TEST_CASE("RbacStore: a warm permission cache is NOT served once the "
+          "generation refresh has genuinely failed PAST the stale-serve "
+          "bound (#2703 Gate 8, check_permission cache-trust fix)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    replica_a.set_rbac_enabled(true);
+    REQUIRE(replica_a.assign_role({"user", "bob", "Administrator"}).has_value());
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+
+    // Clear the refresh gate, let replica_b observe the durable enable +
+    // grant, and genuinely populate perm_cache_ with an ALLOW.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
+
+    // Starve the pool, then push wall time past kRbacStaleServeBoundMs
+    // (5000ms) with an explicit sleep before the next call. Unlike the
+    // sibling rbac_enforcement_in_effect fail-closed test above (whose
+    // 4200ms works because its baseline is CONSTRUCTION, never updated since
+    // every refresh attempt after it fails), this test's baseline is the
+    // SUCCESSFUL warming call just above -- last_successful_refresh_ms_ was
+    // genuinely updated to ~now there, so the sleep alone must exceed the
+    // 5000ms bound, not merely combine with an earlier one to reach it.
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+    std::this_thread::sleep_for(std::chrono::milliseconds(5200));
+
+    // Past the bound, with the pool starved: the previously-cached ALLOW
+    // must NOT be served. check_permission()'s own internal
+    // maybe_refresh_generation() call fails (pool starved), the fallback
+    // pool acquire inside check_permission() itself also fails (same starved
+    // pool) -- both directions fail closed, landing on DENY.
+    CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "Read"));
+}
+
+// #2703 Gate 7 merge-slice item 1 commit B (operator-adjudicated: trip fast,
+// 2 consecutive failures), extended in commit C with the
+// yuzu_server_rbac_breaker_open gauge as PRIMARY evidence — a wall-clock
+// assertion alone is exactly the flake class "Green on BigColin != CI" warns
+// about (a descheduled thread on a contended CI runner can blow a timing
+// budget on otherwise-correct code); the gauge transition is asserted
+// directly and does not depend on scheduling. The elapsed-time check is kept
+// as SECONDARY evidence only. A cache MISS on every call (a unique operation
+// string each time) forces every call through the real pool-fallback path
+// so neither measurement is confounded by stale-serve.
+TEST_CASE("RbacStore: fail-fast breaker denies without a pool touch once "
+          "consecutive failures reach the trip threshold, then half-opens "
+          "on the next probe (#2703 Gate 7 item 1 commits B+C)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    replica_a.set_rbac_enabled(true);
+    REQUIRE(replica_a.assign_role({"user", "bob", "Administrator"}).has_value());
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics); // wired AFTER construction — construction's
+                                     // own read (if any) cannot touch the gauge
+
+    // Clear the refresh gate opened at construction so the first starved
+    // call below genuinely attempts a fresh refresh rather than serving the
+    // gated fast path.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    // First call: maybe_refresh_generation's own attempt fails (streak 0->1,
+    // still under the threshold of 2 — no gauge transition yet) -> falls
+    // through to a genuine cache MISS ("probe1" was never checked) ->
+    // check_permission's OWN pool-fallback attempt ALSO fails (streak 1->2,
+    // NOW at the threshold — this IS a closed->open transition, so the gauge
+    // goes to 1 within this same call). Denies fail-closed either way.
+    CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "probe1"));
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+
+    // Second call, immediately after (well inside kRbacGenerationRefreshMs
+    // of both the refresh gate AND the breaker's cooldown): maybe_refresh_
+    // generation is gated (no pool touch, no breaker interaction) and
+    // check_permission's own breaker_admit() now sees streak >= threshold
+    // AND the cooldown ungated-since check fails too -> denies WITHOUT any
+    // pool touch, and breaker_note_result is never called (no transition,
+    // gauge stays 1). Wall-clock is secondary evidence: no acquire attempt
+    // means this completes in low single-digit ms, versus the >=250ms
+    // (kAuthzAcquireTimeout) a real attempt would cost.
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "probe2"));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+    CHECK(elapsed < std::chrono::milliseconds(150));
+
+    // Clear both the refresh gate and the breaker cooldown, then release
+    // the starved connection so the next attempt (the half-open probe) can
+    // genuinely succeed and reset the streak to 0 — an open->closed
+    // transition, so the gauge goes back to 0.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    held.reset();
+    CHECK(replica_b.check_permission("bob", "Infrastructure", "Read"));
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 0.0);
+
+    // The latency histogram (commit C) observes on every check_permission
+    // exit regardless of outcome — three calls above (probe1, probe2, Read),
+    // all counted whether denied or successful.
+    CHECK(metrics.serialize().find("yuzu_server_rbac_authz_check_seconds_count 3") !=
+          std::string::npos);
+}
+
+// #2703 Gate 7 item 3 (BLOCKING, consistency-auditor Gate 4 + compliance-officer
+// Gate 6): user_rbac_group_names and role_effects_for share check_permission's
+// 3 degrade exits (breaker-denied, pool-acquire-timeout, query-error) but,
+// before this fix, never called note_read_degrade() on any of them — a
+// degrade on the ADR-0017 admit-then-filter chokepoint (authorize_list_read,
+// which both feed) was invisible to yuzu_server_rbac_read_degrade_total and
+// the YuzuRbacReadDegraded alert. Reproduces the pool-acquire-timeout path
+// (first two calls, one per sibling) and the breaker-denied fast path (calls
+// 3 and 4, once the first two have tripped the breaker) ON EACH sibling's OWN
+// code site — quality-engineer (Gate 8) found an earlier version of this
+// test exercised user_rbac_group_names' breaker-denied branch but not
+// role_effects_for's own (structurally identical, but a distinct site);
+// call 4 closes that. Query-error is intentionally NOT covered here (a
+// pre-existing, file-wide gap — check_permission's own query-error path has
+// never had a counter-asserting test either); asserts the counter directly,
+// not merely that the calls return an error.
+TEST_CASE("RbacStore: user_rbac_group_names and role_effects_for record "
+          "read-degrade on pool-acquire-timeout and breaker-denied "
+          "(#2703 Gate 7 item 3)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    (void)replica_a;
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    RbacStoreTestAccess acc{replica_b};
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics); // wired AFTER construction, same as the
+                                     // breaker test — construction's own read
+                                     // (if any) must not touch the counter.
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // clear the refresh gate
+
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+
+    // Call 1 (user_rbac_group_names): breaker still closed (streak 0) ->
+    // genuine pool-acquire attempt -> times out -> streak 0->1, denying,
+    // reason=pool_acquire_timeout.
+    auto r1 = acc.user_rbac_group_names("bob");
+    REQUIRE_FALSE(r1.has_value());
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "pool_acquire_timeout"}})
+              .value() == 1.0);
+
+    // Call 2 (role_effects_for): breaker still closed (streak 1 < threshold
+    // 2) -> genuine pool-acquire attempt -> times out -> streak 1->2, a
+    // closed->open transition, reason=pool_acquire_timeout again.
+    auto r2 = acc.role_effects_for("Infrastructure", "Read");
+    REQUIRE_FALSE(r2.has_value());
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "pool_acquire_timeout"}})
+              .value() == 2.0);
+    CHECK(metrics.gauge("yuzu_server_rbac_breaker_open").value() == 1.0);
+
+    // Call 3 (user_rbac_group_names again): breaker now OPEN and within its
+    // cooldown -> denies WITHOUT a pool touch, via each sibling's own
+    // breaker-denied branch (the other half of this fix — that branch was
+    // ALSO silent pre-fix). Reason is still pool_acquire_timeout (breaker-
+    // denied is recorded under the same label as check_permission's own
+    // breaker-denied branch, not a distinct reason — see the HELP text).
+    auto r3 = acc.user_rbac_group_names("bob");
+    REQUIRE_FALSE(r3.has_value());
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "pool_acquire_timeout"}})
+              .value() == 3.0);
+
+    // Call 4 (role_effects_for, breaker-denied): quality-engineer (Gate 8) —
+    // call 3 above only exercised user_rbac_group_names' OWN breaker-denied
+    // branch; role_effects_for's own breaker-denied early return
+    // (structurally identical, but a distinct code site) was never directly
+    // hit. Still within the cooldown from call 2/3, so this denies WITHOUT a
+    // pool touch too.
+    auto r4 = acc.role_effects_for("Infrastructure", "Read");
+    REQUIRE_FALSE(r4.has_value());
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "pool_acquire_timeout"}})
+              .value() == 4.0);
+}
+
+// #2703 Gate 7 item Commit C (quality-engineer + consistency-auditor, Gate 3:
+// zero test coverage for the generation_refresh_failed /
+// generation_refresh_failed_within_bound reason split — the exact
+// false-green-shaped gap this session already hit once with the sibling-
+// method omission above). Asserts the COUNTER + its reason label directly,
+// not just the behavioural side effect (a warm/dropped cache) the two
+// existing generation tests already cover.
+TEST_CASE("RbacStore: generation-refresh-failed degrade records the correct "
+          "reason label inside vs. past the bounded stale-serve window "
+          "(#2703 Gate 7 item Commit C)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    replica_a.set_rbac_enabled(true);
+    REQUIRE(replica_a.assign_role({"user", "bob", "Administrator"}).has_value());
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 1}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics);
+
+    // Genuinely populate replica_b's cache with a confirmed-good refresh.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    REQUIRE(replica_b.check_permission("bob", "Infrastructure", "Read"));
+    // check_permission's own success path never fires a degrade — sanity
+    // check that this test starts from a clean counter before starving.
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed_within_bound"}})
+              .value() == 0.0);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed"}})
+              .value() == 0.0);
+
+    // Starve the pool and force one failed refresh attempt INSIDE the bound.
+    // check_permission() is the trigger (maybe_refresh_generation() is
+    // private) — same technique as the pre-existing generation tests above.
+    // The cache stays warm through this call (within-bound keeps
+    // perm_cache_), so it's served from cache and never reaches
+    // check_permission's OWN pool-fallback branch — only
+    // maybe_refresh_generation()'s degrade fires.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    auto held = pool_b.acquire();
+    REQUIRE(held);
+    CHECK(replica_b.check_permission("bob", "Infrastructure", "Read")); // served from cache
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed_within_bound"}})
+              .value() == 1.0);
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed"}})
+              .value() == 0.0); // the denying reason must NOT fire while still tolerated
+
+    // Push past the bound with an explicit sleep (mirrors the existing
+    // rbac_enforcement_in_effect fail-closed test's technique). This second
+    // failed refresh drops the cache, so THIS call also falls through to
+    // check_permission's own (still-starved) pool-fallback branch — that
+    // fires its own pool_acquire_timeout degrade too, a different reason
+    // label from the two asserted below, so it doesn't affect them.
+    std::this_thread::sleep_for(std::chrono::milliseconds(4200));
+    CHECK_FALSE(replica_b.check_permission("bob", "Infrastructure", "Read"));
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed"}})
+              .value() == 1.0); // now denying — the cache was actually dropped
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "generation_refresh_failed_within_bound"}})
+              .value() == 1.0); // unchanged — that call's reason was the other one
+}
+
+// quality-engineer (#2703): the F3 staleness predicate, pinned with synthetic
+// timestamps — no DB, no real clock. rbac_generation_rules.hpp.
+TEST_CASE("rbac_generation::is_stale_beyond_bound", "[rbac_store]") {
+    using yuzu::server::rbac_generation::is_stale_beyond_bound;
+
+    // Fresh: last success just now, bound not yet reached.
+    CHECK_FALSE(is_stale_beyond_bound(/*now_ms=*/1000, /*last_successful_refresh_ms=*/1000,
+                                       /*bound_ms=*/1000));
+    CHECK_FALSE(is_stale_beyond_bound(1500, 1000, 1000));
+    // Exactly at the bound counts as stale (>=, not >).
+    CHECK(is_stale_beyond_bound(2000, 1000, 1000));
+    // Past the bound.
+    CHECK(is_stale_beyond_bound(5000, 1000, 1000));
+    // A refresh that has never succeeded (last_successful_refresh_ms_ still at
+    // its zero-init) is stale from the first ms once the bound has elapsed.
+    CHECK(is_stale_beyond_bound(1000, 0, 1000));
+    CHECK_FALSE(is_stale_beyond_bound(999, 0, 1000));
+}
+
+// R2 (Gate 4 unhappy, CONFIRMED fail-open): the backfill must preserve an
+// operator's edit to a SEEDED system-role permission (e.g. flipping a default
+// 'allow' to 'deny'), which collides on the (role,type,op) key with the seed.
+// DO NOTHING would drop the operator's deny (resurrecting a revoked permission);
+// DO UPDATE preserves it.
+TEST_CASE("RbacStore: backfill preserves an operator's deny-override on a seeded role",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    // Seeded Viewer has AuditLog/Read = allow.
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_r2-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    // The operator had revoked Viewer's AuditLog/Read in the legacy DB (deny).
+    {
+        // cpp-safety (Gate 3, #2703): RAII throughout — see the F1 test below
+        // for the same fix and rationale.
+        SqliteDb db;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), db.addr()) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(db.get(),
+                             "INSERT INTO role_permissions VALUES "
+                             "('Viewer','AuditLog','Read','deny');",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+    // The legacy 'deny' must win over the seeded 'allow' (DO UPDATE, not DO NOTHING).
+    const auto perms = store.get_role_permissions("Viewer");
+    std::string effect;
+    for (const auto& p : perms)
+        if (p.securable_type == "AuditLog" && p.operation == "Read")
+            effect = p.effect;
+    CHECK(effect == "deny");
+}
+
+// fjarvis F1 (#2703, HIGH) — the mirror image of R2 above. R2 is "legacy has
+// an explicit deny that collides with the seed" (DO UPDATE preserves it). F1
+// is "legacy has NOTHING for a seeded default" (no row to collide with): the
+// backfill's perms loop only iterates rows PRESENT in legacy, so a default
+// permission the operator explicitly removed via remove_permission() before
+// upgrading has no positive row to upsert against. seed_defaults() (which
+// runs in the constructor, before this backfill) already re-added it, and
+// nothing touched it. The row-count reconciliation can't catch this either
+// (PG always holds >= legacy counts by design — a missing-in-legacy row is
+// invisible to a count check). The fix scopes a DELETE + revoked_seed_defaults
+// marker to (role,type) pairs legacy's OWN catalogue actually knew about, so
+// it never touches a securable a LATER seed_defaults() adds — e.g.
+// EnginePrincipal, #2376 — asserted explicitly below alongside the surgical
+// role/type scoping. (Two earlier versions of this fix each reintroduced a
+// hazard: a plain DELETE resurrects on the next restart — the same disease
+// remove_permission() was fixed to avoid, asserted below; an UPDATE-to-deny
+// tombstone avoids that but silently changes the authorization OUTCOME for a
+// dual-role principal — see the dedicated dual-role test above.)
+TEST_CASE("RbacStore: backfill removes a seeded default permission the operator explicitly "
+          "removed in legacy, and it survives a reseed",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_f1-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    {
+        // cpp-safety (Gate 3, #2703): RAII throughout, matching production
+        // migrate_from_sqlite's own SqliteDb usage — a REQUIRE failure
+        // between open and close must not leak the handle.
+        SqliteDb db;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), db.addr()) == SQLITE_OK);
+        // Legacy KNOWS about role "Viewer", securable_type "AuditLog", AND
+        // operation "Read" (all three existed pre-upgrade -- fjarvis
+        // re-review, blocking C1: the operations catalogue row is what
+        // scopes the delete to an operation legacy could actually have had
+        // an opinion about, the same reasoning already applied to role and
+        // type; omitting it here made this fixture indistinguishable from
+        // "legacy never heard of Read at all", under which C1's fix
+        // correctly does NOT delete -- masking the very revocation this
+        // test exists to prove). Deliberately NO ('Viewer','AuditLog','Read')
+        // row in role_permissions: the operator called remove_permission()
+        // to revoke it before upgrading.
+        REQUIRE(sqlite3_exec(db.get(),
+                             "INSERT INTO roles VALUES ('Viewer', 'seeded', 1, 0);"
+                             "INSERT INTO securable_types VALUES ('AuditLog', '', 1);"
+                             "INSERT INTO operations VALUES ('Read', '', 1);",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    // THE FIX: the revoked default does not come back.
+    CHECK_FALSE(store.check_role_has_permission("Viewer", "AuditLog", "Read"));
+    // Surgical, not wholesale: an UNRELATED seeded default for the SAME role
+    // survives — its securable_type ("Response") is not in legacy's
+    // securable_types, so the type-filter excludes it from the deny.
+    CHECK(store.check_role_has_permission("Viewer", "Response", "Read"));
+    // A DIFFERENT role's grant on the SAME securable_type ("AuditLog")
+    // survives — "Administrator" is not in legacy's roles table, so the
+    // role-filter excludes it regardless of the type match.
+    CHECK(store.check_role_has_permission("Administrator", "AuditLog", "Read"));
+    // A securable that never existed in legacy at all — EnginePrincipal,
+    // #2376 — is never touched by this deny for either role: its type is
+    // absent from legacy's securable_types, so the type-filter excludes it
+    // outright. This is the assertion that would fail if the fix's scoping
+    // were loosened to "deny anything absent from legacy's perms".
+    CHECK(store.check_role_has_permission("Administrator", "EnginePrincipal", "Read"));
+    CHECK(store.check_role_has_permission("Viewer", "EnginePrincipal", "Read"));
+
+    // happy-path (Gate 4, #2703, HIGH) — THE REGRESSION THIS CLOSES: a hard
+    // DELETE with no accompanying marker has nothing for seed_defaults()'s
+    // ON CONFLICT DO NOTHING to conflict with, so the very next ordinary
+    // restart after this one-time backfill silently reinserts the seeded
+    // 'allow' and undoes the operator's pre-cutover revocation — reproduced
+    // empirically by constructing a second RbacStore against the same pool
+    // (simulating a restart) and observing the revoked permission come
+    // back. Fixed by recording the revocation in revoked_seed_defaults
+    // alongside the DELETE, mirroring remove_permission()'s own fix for the
+    // identical hazard post-cutover — grant()'s WHERE NOT EXISTS against
+    // that table is what makes this assertion hold.
+    RbacStore reopened{rbac_pool_fx_};
+    CHECK_FALSE(reopened.check_role_has_permission("Viewer", "AuditLog", "Read"));
+}
+
+// fjarvis (PR #2703 re-review, blocking C1, reproduced against live
+// Postgres) — the mirror image of the F1 test above, on the third
+// dimension. F1 proves a brand-new securable TYPE (EnginePrincipal) added
+// after the legacy schema was frozen survives the revoked-permission
+// cleanup untouched. This proves the identical property for a brand-new
+// OPERATION (Rotate) added to a PRE-EXISTING role+type pair -- exactly the
+// shape this PR's own dev merge (ApiToken:Rotate, P2 #11) introduced, and
+// exactly the shape the two-dimension (role, type) scoping could not tell
+// apart from a genuine operator revocation: legacy knows about
+// Administrator/ApiTokenManager and ApiToken, but (being older than the
+// Rotate operation) never had a role_permissions row granting Rotate to
+// either -- indistinguishable from "explicitly revoked" without the
+// operation dimension. A genuine revocation of an operation legacy DID
+// know about (Read, here) is still caught in the SAME backfill, proving
+// the fix doesn't just widen to "never revoke anything".
+TEST_CASE("RbacStore: backfill preserves a newly-added default operation on a pre-existing "
+          "role+type pair, and still catches a genuine revocation of a known operation "
+          "(fjarvis re-review, blocking C1)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    yuzu::test::TempDbFile legacy{"yuzu_test_rbac_c1_rotate-"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_rbac_db(legacy.path, /*enabled=*/false);
+    {
+        SqliteDb db;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), db.addr()) == SQLITE_OK);
+        // Legacy KNOWS about Administrator/ApiTokenManager and ApiToken, and
+        // KNOWS about "Read" (but never Rotate -- this legacy catalogue
+        // pre-dates that operation entirely, matching every real deployment
+        // upgrading from a release before P2 #11). Deliberately no
+        // ('*','ApiToken','Rotate') row anywhere -- legacy never had an
+        // opinion on an operation it didn't know existed. Also revokes
+        // Administrator's Read on ApiToken explicitly, to prove a genuine
+        // revocation of a KNOWN operation still works in the same pass.
+        REQUIRE(sqlite3_exec(db.get(),
+                             "INSERT INTO roles VALUES ('Administrator', 'seeded', 1, 0);"
+                             "INSERT INTO roles VALUES ('ApiTokenManager', 'seeded', 1, 0);"
+                             "INSERT INTO securable_types VALUES ('ApiToken', '', 1);"
+                             "INSERT INTO operations VALUES ('Read', '', 1);"
+                             "INSERT INTO operations VALUES ('Write', '', 1);"
+                             "INSERT INTO role_permissions VALUES "
+                             "('ApiTokenManager', 'ApiToken', 'Read', 'allow');"
+                             "INSERT INTO role_permissions VALUES "
+                             "('ApiTokenManager', 'ApiToken', 'Write', 'allow');",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+    REQUIRE(store.migrate_from_sqlite(legacy.path));
+
+    // THE FIX: Rotate on both roles survives -- legacy never knew the
+    // operation existed, so it's excluded from the revoked-permission scan
+    // entirely, exactly like a brand-new securable type would be.
+    CHECK(store.check_role_has_permission("Administrator", "ApiToken", "Rotate"));
+    CHECK(store.check_role_has_permission("ApiTokenManager", "ApiToken", "Rotate"));
+    // Genuine revocation still caught: legacy knew about Read on this exact
+    // role+type but has no row granting it to Administrator.
+    CHECK_FALSE(store.check_role_has_permission("Administrator", "ApiToken", "Read"));
+    // And survives a reseed, same as the F1 test -- recorded in
+    // revoked_seed_defaults, not just a one-time DELETE.
+    RbacStore reopened{rbac_pool_fx_};
+    CHECK(reopened.check_role_has_permission("Administrator", "ApiToken", "Rotate"));
+    CHECK(reopened.check_role_has_permission("ApiTokenManager", "ApiToken", "Rotate"));
+    CHECK_FALSE(reopened.check_role_has_permission("Administrator", "ApiToken", "Read"));
+}
+
+// fjarvis F2 (#2703, HIGH), schema-level layer: `rbac_meta.value` for
+// key='rbac_enabled' is now constrained to exactly "true"/"false" (migration
+// v2). A write attempting anything else — a hand-edit, a future bug writing
+// a different boolean convention — must be rejected outright at write time,
+// not land silently and wait to be discovered on the next boot/refresh.
+TEST_CASE("RbacStore: rbac_meta rejects a non-canonical rbac_enabled value at write time",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    auto lease = rbac_pool_fx_.acquire();
+    REQUIRE(lease);
+    pg::PgResult r = pg::exec_params(
+        lease.get(), "UPDATE rbac_store.rbac_meta SET value = 'TRUE' WHERE key = 'rbac_enabled'",
+        std::vector<std::string>{});
+    CHECK(r.status() == PGRES_FATAL_ERROR);
+    // 23514 = check_violation (SQLSTATE) — confirms it's the new constraint
+    // firing, not some unrelated failure.
+    const char* sqlstate = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE);
+    REQUIRE(sqlstate != nullptr);
+    CHECK(std::string(sqlstate) == "23514");
+}
+
+// fjarvis F2 (#2703, HIGH), application-level layer (defense in depth): even
+// with the schema-level guard bypassed — as an older un-migrated deployment
+// would be, or a maintenance script run with elevated privilege — a
+// non-canonical value already sitting in the row must not silently coerce to
+// "false" (RBAC-off) on the next boot. `load_enabled_flag()` must refuse.
+TEST_CASE("RbacStore: refuses to start on a non-canonical rbac_enabled value already in the row",
+          "[rbac_store][pg]") {
+    RBAC_STORE(store);
+    {
+        auto lease = rbac_pool_fx_.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "ALTER TABLE rbac_store.rbac_meta DROP CONSTRAINT "
+                                "rbac_meta_enabled_canonical",
+                                std::vector<std::string>{})
+                    .ok());
+        REQUIRE(pg::exec_params(lease.get(),
+                                "UPDATE rbac_store.rbac_meta SET value = 'TRUE' WHERE key = "
+                                "'rbac_enabled'",
+                                std::vector<std::string>{})
+                    .ok());
+    }
+    // A fresh construction against the SAME (now-corrupted) database must
+    // refuse to open, not silently boot RBAC-off. seed_defaults()'s
+    // rbac_enabled INSERT is ON CONFLICT DO NOTHING, so it does not clobber
+    // the hand-set value before load_enabled_flag() reads it.
+    RbacStore reopened{rbac_pool_fx_};
+    CHECK_FALSE(reopened.is_open());
+}
+
+// fjarvis (PR #2703 re-review, MEDIUM, residual in the F2 fix) — a DIFFERENT
+// moment than the two tests above: not initial boot (load_enabled_flag()),
+// but a later REFRESH (maybe_refresh_generation()) that finds
+// write_generation readable but rbac_enabled's row entirely ABSENT (as
+// opposed to present-but-non-canonical, already counted). Pre-fix this had
+// no counter, no log, AND kept advancing last_successful_refresh_ms_ as if
+// the round had fully succeeded -- the generation view reported itself
+// "fresh" indefinitely even though rbac_enabled specifically was never
+// re-confirmed. The dangerous direction: a replica cached at
+// rbac_enabled_=false would keep rbac_enforcement_in_effect() returning
+// false (legacy-open) forever instead of degrading after
+// kRbacStaleServeBoundMs.
+TEST_CASE("RbacStore: a refresh finding rbac_enabled's row absent (write_generation still "
+          "readable) degrades the view past the bound instead of reporting fresh forever "
+          "(fjarvis re-review, MEDIUM)",
+          "[rbac_store][pg]") {
+    RBAC_STORE(replica_a);
+    REQUIRE_FALSE(replica_a.is_rbac_enabled()); // fresh install default
+
+    PgPool pool_b{{.conninfo = rbac_db_fx_.dsn(), .size = 4}};
+    REQUIRE(pool_b.valid());
+    RbacStore replica_b{pool_b};
+    REQUIRE(replica_b.is_open());
+    yuzu::MetricsRegistry metrics;
+    replica_b.set_metrics(&metrics);
+
+    // Delete rbac_enabled's row directly -- write_generation stays readable,
+    // isolating exactly the asymmetry this fix closes (not a general
+    // refresh failure, which the existing !durable_gen path already
+    // handles correctly).
+    {
+        auto lease = pool_b.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "DELETE FROM rbac_store.rbac_meta WHERE key = 'rbac_enabled'",
+                                std::vector<std::string>{})
+                    .ok());
+    }
+
+    // Clear the 1s stampede gate so the next check genuinely attempts a
+    // refresh rather than serving the gated fast path, then trigger one.
+    // Construction already counted as a genuine completed refresh, so
+    // replica_b is not degraded yet at this point.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    REQUIRE_FALSE(replica_b.rbac_enabled_view_degraded());
+    (void)replica_b.is_rbac_enabled(); // triggers maybe_refresh_generation()
+
+    // THE FIX: the absent row is now counted (pre-fix: silently uncounted).
+    CHECK(metrics.counter("yuzu_server_rbac_read_degrade_total",
+                          {{"reason", "rbac_enabled_non_canonical"}})
+              .value() == 1.0);
+
+    // Push wall time past kRbacStaleServeBoundMs (5000ms) from that SAME
+    // refresh attempt, with the row still absent throughout -- no
+    // subsequent round can ever confirm rbac_enabled either. Each call
+    // below re-triggers maybe_refresh_generation() (past its own 1s gate),
+    // finding the same absent row every time.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    (void)replica_b.is_rbac_enabled();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    (void)replica_b.is_rbac_enabled();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    (void)replica_b.is_rbac_enabled();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+
+    // THE FIX: the view is now degraded -- pre-fix, last_successful_refresh_ms_
+    // kept advancing on every one of the calls above despite rbac_enabled
+    // never being confirmed, so this would have stayed false forever.
+    CHECK(replica_b.rbac_enabled_view_degraded());
+    CHECK(rbac_enforcement_in_effect(&replica_b));
 }

@@ -5,6 +5,7 @@
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"      // access-review read-model optional email enrichment
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
+#include "token_rotation_lookup.hpp"    // shared REST/MCP human-token rotation successor lookup (P2 #11)
 #include "baseline_store.hpp" // baseline-anchored per-device Guardian status route
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
@@ -24,6 +25,7 @@
 #include "rest_a4_envelope.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
 #include "response_templates_engine.hpp"
 #include "software_inventory_store.hpp" // ADR-0016: typed installed-software fleet read
@@ -277,6 +279,34 @@ static int engine_store_error_status(const std::string& err) {
         return 503;
     }
     return 503; // unreachable — all enum cases return above
+}
+
+// #2961 round-2 finding (item 4): the store's own error string for the
+// resolve_rotation_initiator failure — "rotation confirmation unavailable —
+// fall back to revoke" — is the ONLY guidance a machine client (agentic
+// worker over REST/MCP) ever sees for this state, and "revoke" alone reads
+// as the terminal `DELETE /api/v1/engine-principals/{id}` route, which
+// destroys BOTH credentials plus the principal. There is no MCP twin of
+// `DELETE /api/v1/tokens/{token_id}` — the actual safe remedy is
+// per-credential revoke on the SPECIFIC untrusted token. Named here, once,
+// as a structured `remediation` field rather than folded into the message
+// string itself, so a client that reads `remediation` gets the safe route
+// without string-parsing the error message.
+constexpr std::string_view kRotationConfirmUnavailableRemediation =
+    "revoke the specific untrusted credential via DELETE /api/v1/tokens/{token_id} "
+    "(there is no per-credential revoke via the MCP engine-principal tools) — "
+    "never DELETE /api/v1/engine-principals/{id}, which is terminal and destroys "
+    "both credentials plus the principal";
+
+// Remediation text for a store confirm-rotation error, or empty for every
+// other error class (those already carry an actionable message on their
+// own). Shared by both confirm routes (engine + human arm) so the two
+// transports can never diverge on wording, same rationale as
+// classify_engine_store_error's own single-chokepoint contract.
+static std::string_view confirm_rotation_error_remediation(const std::string& err) {
+    if (err.find("rotation confirmation unavailable") != std::string::npos)
+        return kRotationConfirmUnavailableRemediation;
+    return {};
 }
 
 // AccessReviewStore (Periodic Access Reviews, SOC 2 CC6.2) error mapping —
@@ -674,7 +704,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Unassign a role from a management group", "tags": ["Management Groups"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Role unassigned"}}}
     },
     "/engine-principals/{id}/roles": {
-      "get": {"summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments"}, "403": {"description": "Requires Security:Read"}, "503": {"description": "RBAC store unavailable"}}},
+      "get": {"summary": "List fleet-wide RBAC roles assigned to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "responses": {"200": {"description": "List of role assignments"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "RBAC store unavailable"}}},
       "post": {"summary": "Assign a fleet-wide RBAC role to an engine principal", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Engine principal slug (without the engine: prefix)"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["role"], "properties": {"role": {"type": "string"}}}}}}, "responses": {"201": {"description": "Role assigned"}, "400": {"description": "Bad JSON / missing role / unknown role / admin-or-built-in role rejected (design §4.2)"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No active engine principal with that id"}, "503": {"description": "RBAC or engine-principal store unavailable"}}}
     },
     "/engine-principals/{id}/roles/{role}": {
@@ -686,10 +716,10 @@ const std::string& openapi_spec() {
         R"json(,
     "/engine-principals": {
       "post": {"summary": "Create a new engine-principal identity", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["slug", "display_name", "owner_username", "justification", "classification"], "properties": {"slug": {"type": "string", "description": "Reserved 'engine:<slug>' namespace suffix — lowercase letters, digits, '.', '_', '-' only, max 128 chars"}, "display_name": {"type": "string"}, "owner_username": {"type": "string", "description": "Must reference an existing user (owner-FK)"}, "justification": {"type": "string"}, "classification": {"type": "string", "enum": ["internal", "external"]}}}}}}, "responses": {"201": {"description": "Created; {principal_id}"}, "400": {"description": "Bad JSON, invalid/duplicate slug, missing justification, unknown owner_username, or invalid classification"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "503": {"description": "Engine-principal store, or owner-lookup, unavailable"}}},
-      "get": {"summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count"}, "403": {"description": "Requires Security:Read"}, "503": {"description": "Engine-principal store unavailable"}}}
+      "get": {"summary": "List every engine principal", "tags": ["Security"], "responses": {"200": {"description": "List of engine principals with active_credential_count"}, "403": {"description": "Requires EnginePrincipal:Read"}, "503": {"description": "Engine-principal store unavailable"}}}
     },
     "/engine-principals/{id}": {
-      "get": {"summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked)"}, "403": {"description": "Requires Security:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable"}}},
+      "get": {"summary": "Get one engine principal and its active credentials", "tags": ["Security"], "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "responses": {"200": {"description": "Engine principal detail + active_credentials[] (secrets masked)"}, "403": {"description": "Requires EnginePrincipal:Read"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal store unavailable"}}},
       "delete": {"summary": "Revoke an engine principal (terminal) and its active credentials", "tags": ["Security"], "description": "Cross-store ordering invariant: credentials are revoked FIRST (ApiTokenStore::revoke_for_principal), the identity SECOND — never the reverse.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "Full engine principal id including the engine: prefix, e.g. engine:vuln"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"superseded_by": {"type": "string"}}}}}}, "responses": {"200": {"description": "Revoked (idempotent — success even if already revoked); {revoked, credentials_revoked}"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires Security:Write"}, "404": {"description": "No engine principal with that id"}, "503": {"description": "Engine-principal or credential store unavailable"}}}
     },
     "/engine-principals/{id}/credentials": {
@@ -713,11 +743,17 @@ const std::string& openapi_spec() {
         // unsplit form.
         R"json(,
     "/tokens": {
-      "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "responses": {"200": {"description": "List of API tokens"}, "503": {"description": "Token store unavailable (service unavailable)"}}},
+      "get": {"summary": "List API tokens for current user", "tags": ["API Tokens"], "description": "Owner-scoped to the caller. An item includes rotation_group/supersedes_token_id/overlap_expires_at/confirmed_at only while a rotation is (or was) in flight for that token.", "responses": {"200": {"description": "List of API tokens"}, "503": {"description": "Token store unavailable (service unavailable)"}}},
       "post": {"summary": "Create a new API token", "tags": ["API Tokens"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"name": {"type": "string"}, "expires_at": {"type": "integer"}, "scope_service": {"type": "string"}}}}}}, "responses": {"201": {"description": "Token created, includes plaintext token (shown once)"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
     },
     "/tokens/{token_id}": {
       "delete": {"summary": "Revoke an API token", "tags": ["API Tokens"], "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Token revoked"}, "503": {"description": "Token store unavailable (service unavailable)"}}}
+    },
+    "/tokens/{token_id}/rotate": {
+      "post": {"summary": "Self-service overlap-pair rotation of a human-owned API token (P2 #11, SOC 2 CC6.3)", "tags": ["API Tokens"], "description": "Mints a successor token alongside the still-valid predecessor for the overlap window; requires ApiToken:Rotate and step-up on EVERY call (including an idempotent re-serve within the grace window). Self-service only — the caller must own the token; no admin override. The successor always inherits the predecessor's expires_at verbatim (rotation is lifetime-neutral).", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The token_id of the token being rotated (the predecessor)"}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"overlap_secs": {"type": "integer", "description": "24h floor, 10-year ceiling; default 7 days"}}}}}}, "responses": {"200": {"description": "{token, token_id, expires_at, overlap_expires_at} — token/token_id/expires_at describe the successor (found structurally, scoped to THIS predecessor's token_id); overlap_expires_at describes the PREDECESSOR (echoed for convenience — the epoch it is auto-revoked). token is the raw successor secret (Cache-Control: no-store)"}, "400": {"description": "overlap_secs present but not an integer, overlap_secs outside the 24h-10y bounds, or more than 2 active credentials in an unrecognized shape"}, "401": {"description": "MFA step-up required (re-validated on every call, including an idempotent re-serve)"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Rotation grace window elapsed, or in progress by a different operator"}, "503": {"description": "Store unavailable, rotation lock could not be acquired, no active credential to rotate (ambiguous with a transient store read failure — retry, or mint a new token if genuinely absent), or the rotation succeeded but the successor could not be read back for the response (fails closed rather than return an uncorrelatable secret)"}}}
+    },
+    "/tokens/{token_id}/confirm": {
+      "post": {"summary": "Confirm receipt of a rotated API token's successor secret (P2 #11 maker-checker)", "tags": ["API Tokens"], "description": "token_id in the path is the SUCCESSOR token_id the rotate response returned — no request body. Requires ApiToken:Rotate and step-up. Self-service only.", "parameters": [{"name": "token_id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "The successor token_id returned by the rotate call"}], "responses": {"200": {"description": "Confirmed; predecessor token revoked"}, "400": {"description": "Terminal client-state conditions the store classifies ClientValidation: the caller's (mcp_tier, scope_service) does not equal the predecessor's, more than two active credentials share the rotation_group, or the token is not a human-owned credential"}, "401": {"description": "MFA step-up required"}, "403": {"description": "Requires ApiToken:Rotate"}, "404": {"description": "No such token, or the caller does not own it (identical body — not an enumeration oracle)"}, "409": {"description": "Replay or resolved-rotation conflict (do not blindly retry)"}, "503": {"description": "Retryable: store unavailable, advisory-lock contention, or the deliberately-ambiguous no-in-flight-rotation read (a swallowed query failure and a genuinely empty active set are indistinguishable, so it stays retryable). A MALFORMED pair found after a positive two-row read is terminal 409, not this (#2943)."}}}
     },
     "/ca/root": {
       "get": {"summary": "Internal CA root certificate (PEM, public)", "tags": ["Security"], "responses": {"200": {"description": "PEM CA certificate", "content": {"application/x-pem-file": {}}}, "404": {"description": "No CA root"}}}
@@ -789,7 +825,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "List instruction definitions", "tags": ["Instructions"], "responses": {"200": {"description": "List of instruction definitions"}}}
     },
     "/audit": {
-      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}}}
+      "get": {"summary": "Query audit log", "tags": ["Audit"], "parameters": [{"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "minimum": 1, "maximum": 1000}}, {"name": "principal", "in": "query", "schema": {"type": "string"}}, {"name": "action", "in": "query", "schema": {"type": "string"}}], "responses": {"200": {"description": "List of audit events"}, "400": {"description": "limit below 1 (a client error, deliberately NOT reported as a store degrade)"}, "503": {"description": "Audit store or connection pool unavailable — deny-on-degrade, never a false-empty 200"}}}
     },
     "/audit/auth-sample": {
       "get": {"summary": "Sampled authentication-log evidence export (SOC 2 CC7.2)", "tags": ["Audit"], "description": "Pseudo-random sample of authentication-surface audit events (action prefixes auth./mfa./session.) over an optional [from,to] window. Requires AuditLog:Read. The export is itself audited as audit.auth_sample.exported. SAMPLING NOTE: the sample is drawn from at most the 10000 most-recent matching events in the window; when the window holds more than that, the sample is recency-biased (NOT uniform over the full window). The response `sampling` object reports `candidates_considered`, `scan_cap`, and `recency_capped` so evidence consumers can detect this. Samples are non-reproducible (no seed); the audited `audit.auth_sample.exported` row is the chain-of-custody record.", "parameters": [{"name": "from", "in": "query", "schema": {"type": "integer"}, "description": "Window start, epoch seconds (optional, digits only)"}, {"name": "to", "in": "query", "schema": {"type": "integer"}, "description": "Window end, epoch seconds (optional, digits only)"}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Sampled list of auth audit events; envelope adds a `sampling` object (candidates_considered, scan_cap, recency_capped)"}, "400": {"description": "from/to not non-negative digits, from>to, or non-integer limit"}, "503": {"description": "Audit store unavailable"}}}
@@ -1760,6 +1796,21 @@ void RestApiV1::register_routes(
                  const auto id = req.matches[1].str();
                  auto agg = bundle_orch->collate(id, principal, is_admin);
                  if (!agg) {
+                     // #2691 (Doomgoose finding #3): kDegraded is a real store
+                     // read failure on a bundle that WAS found and owned — a
+                     // retryable 503, never the same terminal 404 (or the
+                     // same false "denied" audit row) a genuinely-absent/
+                     // not-owned bundle gets.
+                     if (agg.error() == CollateError::kDegraded) {
+                         audit_fn(req, "bundle.collate", "failure", "Execution", id,
+                                  "response store degraded");
+                         res.status = 503;
+                         res.set_content(
+                             detail::a4_error(res, "response store degraded",
+                                              {.retry_after_ms = 5000}),
+                             "application/json");
+                         return;
+                     }
                      // not-found and not-owned return the same 404 so existence
                      // isn't an enumeration oracle; the real reason is audited.
                      audit_fn(req, "bundle.collate", "denied", "Execution", id,
@@ -2040,7 +2091,7 @@ void RestApiV1::register_routes(
     // ── Management Group Roles (/api/v1/management-groups/:id/roles) ────
 
     sink.Get(R"(/api/v1/management-groups/([a-f0-9]+)/roles)",
-             [perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
+             [auth_fn, perm_fn, mgmt_store](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "ManagementGroup", "Read"))
                      return;
                  if (!mgmt_store) {
@@ -2050,6 +2101,46 @@ void RestApiV1::register_routes(
                  }
 
                  auto group_id = req.matches[1].str();
+
+                 // #2376 — this response is ENTIRELY authorization topology: every row
+                 // is {principal_type, principal_id, role_name}, i.e. who holds what
+                 // role in this group. `ManagementGroup:Read` is deliberately NOT in the
+                 // topology floor (it gates ordinary group metadata and member lists, and
+                 // flooring it would be the too-coarse mistake the floor avoids with
+                 // Security:Read), so on an RBAC-off install the legacy Read-allow handed
+                 // this graph to any authenticated session. Third instance of that shape
+                 // in this change — the floor SET is derived from the DATA a route emits,
+                 // never from the securable it happens to be gated on.
+                 //
+                 // Authorized by EITHER the floored `UserManagement:Read` (the fleet-wide
+                 // right, which already gates /api/v1/rbac/roles) OR being an
+                 // `ITServiceOwner` OF THIS GROUP — the group-scoped admin. The second arm
+                 // is not a weakening: it mirrors the ITServiceOwner fallback the POST and
+                 // DELETE handlers on this same path already use, and without it a group
+                 // admin could WRITE role assignments it may not READ, which is both a
+                 // broken workflow and an incoherent posture. It is a DATA check
+                 // (assignment rows), so it holds with RBAC off, and it is scoped to the
+                 // one group rather than the fleet.
+                 httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+                 bool authorized = perm_fn(req, probe, "UserManagement", "Read");
+                 if (!authorized) {
+                     auto session = auth_fn(req, res);
+                     if (!session)
+                         return;
+                     for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
+                         if (gr.principal_type == "user" && gr.principal_id == session->username &&
+                             gr.role_name == "ITServiceOwner") {
+                             authorized = true;
+                             break;
+                         }
+                     }
+                 }
+                 if (!authorized) {
+                     res.status = 403;
+                     res.set_content(detail::a4_error(res, "forbidden"), "application/json");
+                     return;
+                 }
+
                  auto roles = mgmt_store->get_group_roles(group_id);
                  JArr arr;
                  for (const auto& r : roles) {
@@ -2201,7 +2292,7 @@ void RestApiV1::register_routes(
     // in the current global model).
     sink.Get(R"(/api/v1/engine-principals/([a-z0-9._-]+)/roles)",
              [perm_fn, audit_fn, rbac_store](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Security", "Read"))
+                 if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                      return;
                  // is_open() distinguishes "no roles" from "rbac.db down": a
                  // closed store must 503, never return [] implying the
@@ -2417,6 +2508,18 @@ void RestApiV1::register_routes(
                      // now, so it must be readable back).
                      if (!t.mcp_tier.empty())
                          item.add("mcp_tier", t.mcp_tier);
+                     // P2 #11: surface an in-flight rotation so it isn't
+                     // invisible from this list — omitted entirely for a
+                     // token that has never participated in one (empty/0 is
+                     // the store's own "never rotated" sentinel).
+                     if (!t.rotation_group.empty())
+                         item.add("rotation_group", t.rotation_group);
+                     if (!t.supersedes_token_id.empty())
+                         item.add("supersedes_token_id", t.supersedes_token_id);
+                     if (t.overlap_expires_at != 0)
+                         item.add("overlap_expires_at", t.overlap_expires_at);
+                     if (t.confirmed_at != 0)
+                         item.add("confirmed_at", t.confirmed_at);
                      arr.add(item);
                  }
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens->size())),
@@ -2708,6 +2811,301 @@ void RestApiV1::register_routes(
         res.set_content(ok_json(JObj().add("revoked", true).str()), "application/json");
     });
 
+    // POST /api/v1/tokens/{id}/rotate — human self-service overlap-pair
+    // rotation for a token the caller owns (P2 #11, SOC 2 CC6.3). Mirrors the
+    // engine arm's `/engine-principals/{id}/credentials/rotate` route (design
+    // §7 gate belt + reveal-audit discipline) but on the HUMAN permission
+    // axis. Gated on `ApiToken:Rotate`, a DISTINCT operation from
+    // `ApiToken:Write` (round-3 security finding): giving the MCP twin's
+    // operator-tier allowance the SAME op as `ApiToken:Write` would also
+    // admit an operator-tier MCP token to `POST /api/v1/tokens` (mint, with
+    // a caller-chosen `mcp_tier`) and the settings twin — a privilege
+    // escalation, not a REST/MCP parity fix (see `mcp_policy.hpp`'s
+    // `tier_allows()` operator-tier comment for the full analysis). Not
+    // `Security:Write` either — this is self-service, not an admin
+    // operation — with an owner-vs-nonexistent 404 belt (mirrors the DELETE
+    // route above) instead of the engine route's admin gate.
+    // `successor_expires_at` is deliberately NOT accepted from the request
+    // body — SENIOR RULING: rotation must read as lifetime-neutral in CC6.3
+    // evidence, so the successor always inherits the predecessor's expiry
+    // verbatim (ApiTokenStore::rotate_token's default, std::nullopt below).
+    sink.Post(
+        R"(/api/v1/tokens/([^/]+)/rotate)",
+        [perm_fn, auth_fn, audit_fn, step_up_fn, token_store](const httplib::Request& req,
+                                                               httplib::Response& res) {
+            if (!perm_fn(req, res, "ApiToken", "Rotate"))
+                return;
+            if (!token_store || !token_store->is_open()) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "api_token.rotate", "ApiToken"))
+                return;
+            // CRITICAL (mirrors the engine route): step-up is re-validated on
+            // EVERY call, including an idempotent re-serve within the grace
+            // window — never skipped just because the same secret comes back.
+            if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/tokens/{id}/rotate"))
+                return;
+
+            auto token_id = req.matches[1].str();
+
+            // Owner-vs-nonexistent 404 belt (mirrors DELETE /api/v1/tokens/{id}
+            // above): identical body for both cases so the endpoint is not an
+            // enumeration oracle. SELF-SERVICE ONLY — unlike DELETE, admin
+            // JIT elevation does NOT bypass this: ApiTokenStore::rotate_token
+            // itself rejects any requesting_user other than the resolved
+            // row's own principal_id, so an admin override here would just
+            // fail one layer down with an indistinguishable store error;
+            // checking it here keeps the 404 shape uniform and audited.
+            auto existing = token_store->get_token(token_id);
+            if (!existing.has_value()) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res, "token store unavailable — try again"),
+                                "application/json");
+                return;
+            }
+            auto& tok = *existing; // std::optional<ApiToken>
+            bool denied = tok && tok->principal_id != session->username;
+            if (!tok || denied) {
+                if (denied) {
+                    audit_fn(req, "api_token.rotate", "denied", "ApiToken", token_id,
+                             "owner=" + tok->principal_id);
+                }
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "token not found"), "application/json");
+                return;
+            }
+
+            // Parsed AFTER the whole gate belt (perm/store/auth/deny/step-up/
+            // owner) so body validation can never become an unauthenticated
+            // or ownership-enumeration oracle. Defensive against a type
+            // mismatch — `body.value<int64_t>("overlap_secs", ...)` THROWS
+            // json::type_error.302 on e.g. `{"overlap_secs":"7d"}`, and this
+            // route has no exception handler installed, so an unguarded
+            // `.value()` call would surface as a bare httplib 500 with no A4
+            // envelope on a route whose OpenAPI promises 400 (round-3 review
+            // finding).
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            int64_t overlap_secs = 7 * 24 * 3600; // 7-day default overlap window
+            if (!body.is_discarded() && body.is_object() && body.contains("overlap_secs")) {
+                if (!body["overlap_secs"].is_number_integer()) {
+                    res.status = 400;
+                    res.set_content(
+                        detail::a4_error(res, "overlap_secs must be an integer (seconds)"),
+                        "application/json");
+                    return;
+                }
+                overlap_secs = body["overlap_secs"].get<int64_t>();
+            }
+
+            const int64_t now = static_cast<int64_t>(std::time(nullptr));
+            // requesting_user is the AUTHENTICATED session's own username —
+            // never a body/query field (security crux, task spec: the
+            // store-level self-service ownership gate is only as strong as
+            // this). successor_expires_at is deliberately left at its
+            // std::nullopt default per the SENIOR RULING above — this route
+            // never overrides it. caller_mcp_tier/caller_scope_service are
+            // the session's OWN server-synthesized authority
+            // (synthesize_token_session, auth_routes.cpp — never
+            // client-controllable) — threaded through so the store's
+            // authority-inheritance guard can refuse a rotation that would
+            // mint authority the caller does not already hold (governance
+            // Gate 7 CRITICAL fix; REQUIRED params since Gate 8 — see
+            // `rotate_token`'s own doc comment).
+            auto result = token_store->rotate_token(token_id, overlap_secs, now,
+                                                     session->username, session->mcp_tier,
+                                                     session->token_scope_service);
+            if (!result) {
+                res.status = engine_store_error_status(result.error());
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                (void)audit_fn(req, "api_token.rotate", "failure", "ApiToken", token_id,
+                               result.error());
+                return;
+            }
+
+            // Locate the successor via the SHARED, DB-free lookup
+            // (token_rotation_lookup.hpp) — scoped exactly to THIS
+            // predecessor, never "any linked row of this principal"
+            // (round-3 BLOCKING finding: a human principal routinely holds N
+            // unrelated active tokens, so an unscoped match can return a
+            // DIFFERENT in-flight rotation's successor — its raw secret
+            // paired with the wrong token_id, so confirming that id revokes
+            // the WRONG predecessor). One shared helper, not an inline loop,
+            // so the MCP twin of this route calls the SAME derivation rather
+            // than re-deriving its own copy — a second copy of this exact
+            // loop is how the bug happened the first time (copied from the
+            // engine rotate route, whose OWN per-principal <=2-active
+            // ceiling licensed the loop shape that is unsound here). The
+            // route owns the store read (round-4: the helper takes a plain
+            // vector so its derivation logic is unit-testable without Postgres).
+            auto active_after = token_store->list_active_for_principal(tok->principal_id);
+            auto successor =
+                yuzu::server::detail::derive_rotation_successor(active_after, token_id);
+            if (!successor.found) {
+                // rotate_token above already succeeded — a real successor
+                // row exists in the database and `result` holds its live raw
+                // secret — but the underlying list_active_for_principal read
+                // is best-effort and swallows a lease/query failure into an
+                // empty vector rather than propagating (api_token_store.hpp),
+                // so a successor genuinely minted moments ago failing to
+                // show up here is never a legitimate "no rotation" case,
+                // only an ambiguous read failure. Fail CLOSED rather than
+                // hand the caller a one-time secret with no token_id to ever
+                // confirm it against — this is the ROTATE-side meaning of
+                // `found == false` documented in token_rotation_lookup.hpp;
+                // it does NOT apply after a successful confirm (round-4
+                // clarification): 503, and never place the secret in the
+                // response body.
+                //
+                // UP-11: the audit outcome is "partial", never "failure" —
+                // rotate_token above already succeeded and committed. A
+                // successor row exists with a live secret in `*result`; what
+                // failed is reading it back to hand to the caller, not the
+                // mint itself. An audit row reading `api_token.rotate
+                // failure` here would tell a CC6.3 reviewer no credential
+                // exists when one plainly does — the worst direction for a
+                // credential-minting event's compliance record to diverge
+                // from the database. "partial" mirrors the convention the
+                // session-revoke routes use above for "the mutation
+                // committed but a downstream step of it did not". The
+                // caller-facing 503 is unchanged — this is about the audit
+                // row matching the database, not the response.
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(
+                    detail::a4_error(res, "rotation succeeded but the successor could not be "
+                                          "read back — retry, or check GET /api/v1/tokens"),
+                    "application/json");
+                (void)audit_fn(req, "api_token.rotate", "partial", "ApiToken", token_id,
+                               "successor minted but its secret could not be read back for "
+                               "delivery — retry, or check GET /api/v1/tokens");
+                return;
+            }
+            // The reveal IS the success audit for this route (mirrors the
+            // engine rotate route) — one row per reveal, mint or re-serve,
+            // never folded into a generic "rotation succeeded" event. Fired
+            // only once the successor is confirmed findable, so a 503 above
+            // is never ALSO recorded as a success.
+            (void)audit_fn(req, "api_token.reveal", "success", "ApiToken", token_id, "rotate");
+
+            // G5 (secret hygiene) — same no-store contract as the engine
+            // mint/rotate routes: the response body carries a raw one-time
+            // credential. `overlap_expires_at` is the PREDECESSOR's own
+            // stamp (see token_rotation_lookup.hpp) — the successor row
+            // never carries one.
+            res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+            res.set_header("Pragma", "no-cache");
+            res.set_content(ok_json(JObj()
+                                        .add("token", *result)
+                                        .add("token_id", successor.successor_token_id)
+                                        .add("expires_at", successor.successor_expires_at)
+                                        .add("overlap_expires_at",
+                                             successor.predecessor_overlap_expires_at)
+                                        .str()),
+                            "application/json");
+        });
+
+    // POST /api/v1/tokens/{id}/confirm — human self-service maker-checker
+    // confirmation that a rotation's successor secret has been received (P2
+    // #11 / SOC 2 CC6.3). {id} is the SUCCESSOR token_id the rotate response
+    // returned — ApiTokenStore::confirm_token_rotation resolves the
+    // principal and rotation group from that row, so no request body is
+    // needed at all.
+    sink.Post(
+        R"(/api/v1/tokens/([^/]+)/confirm)",
+        [perm_fn, auth_fn, audit_fn, step_up_fn, token_store, metrics_registry](
+            const httplib::Request& req, httplib::Response& res) {
+            // Human twin of yuzu_engine_principal_confirm_total (#2404) —
+            // SAME name discipline: `surface` is "rest" here (an MCP twin
+            // lands separately and will use "mcp"), `result` follows the
+            // engine's value set via the shared confirm_result_label
+            // classifier. Scope contract identical to the engine route:
+            // store-reaching calls only (the store-open guard below, or a
+            // real confirm_token_rotation result) — never a permission,
+            // step-up, or owner-check early-out. Incremented BEFORE the
+            // audit emission so an audit-store failure cannot suppress it.
+            const auto confirm_metric = [metrics_registry](const char* result) {
+                if (metrics_registry)
+                    metrics_registry
+                        ->counter(kApiTokenConfirmTotalMetric,
+                                  {{"surface", "rest"}, {"result", result}})
+                        .increment();
+            };
+            // ApiToken:Rotate, not ApiToken:Write — same reasoning as the
+            // rotate route above (round-3 security finding).
+            if (!perm_fn(req, res, "ApiToken", "Rotate"))
+                return;
+            if (!token_store || !token_store->is_open()) {
+                confirm_metric("transient"); // store unavailable at the open guard
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto session = auth_fn(req, res);
+            if (!session)
+                return;
+            if (deny_engine_session(*session, req, res, audit_fn, "api_token.confirm", "ApiToken"))
+                return;
+            if (step_up_fn && !step_up_fn(req, res, *session, "POST /api/v1/tokens/{id}/confirm"))
+                return;
+
+            auto token_id = req.matches[1].str();
+
+            // Owner-vs-nonexistent 404 belt, same self-service-only posture
+            // as rotate above — no admin bypass, identical body for both
+            // missing-id and not-owner. NOT a store-reaching confirm call
+            // (deliberately excluded from the metric's scope, same as the
+            // engine route's pre-store denials).
+            auto existing = token_store->get_token(token_id);
+            if (!existing.has_value()) {
+                res.status = 503;
+                res.set_header("Retry-After", "2");
+                res.set_content(detail::a4_error(res, "token store unavailable — try again"),
+                                "application/json");
+                return;
+            }
+            auto& tok = *existing; // std::optional<ApiToken>
+            bool denied = tok && tok->principal_id != session->username;
+            if (!tok || denied) {
+                if (denied) {
+                    audit_fn(req, "api_token.confirm", "denied", "ApiToken", token_id,
+                             "owner=" + tok->principal_id);
+                }
+                res.status = 404;
+                res.set_content(detail::a4_error(res, "token not found"), "application/json");
+                return;
+            }
+
+            // caller_mcp_tier/caller_scope_service threaded for the SAME
+            // reason as the rotate route above — defence-in-depth re-check
+            // of the authority-inheritance guard (governance Gate 7).
+            auto confirmed = token_store->confirm_token_rotation(
+                token_id, session->username, session->mcp_tier, session->token_scope_service);
+            if (!confirmed) {
+                // Increment BEFORE the audit emission so an audit-store
+                // failure cannot suppress the operational counter (#2404).
+                confirm_metric(yuzu::server::detail::confirm_result_label(
+                    yuzu::server::detail::classify_engine_store_error(confirmed.error())));
+                res.status = engine_store_error_status(confirmed.error());
+                res.set_content(detail::a4_error(
+                                    res, confirmed.error(),
+                                    {.remediation =
+                                         confirm_rotation_error_remediation(confirmed.error())}),
+                                "application/json");
+                (void)audit_fn(req, "api_token.confirm", "failure", "ApiToken", token_id,
+                               confirmed.error());
+                return;
+            }
+            confirm_metric("success");
+            (void)audit_fn(req, "api_token.confirm", "success", "ApiToken", token_id, "confirmed");
+            res.set_content(ok_json(JObj().add("confirmed", true).str()), "application/json");
+        });
+
     // ── Engine Principals (/api/v1/engine-principals) — PR 4.3 ────────────
     //
     // Lifecycle surface for engine-principal identities (the durable identity
@@ -2805,7 +3203,7 @@ void RestApiV1::register_routes(
     sink.Get("/api/v1/engine-principals",
              [perm_fn, auth_fn, audit_fn, eps, token_store](
                  const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Security", "Read"))
+                 if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                      return;
                  if (!eps || !eps->is_open()) {
                      res.status = 503;
@@ -2850,7 +3248,7 @@ void RestApiV1::register_routes(
     sink.Get(R"(/api/v1/engine-principals/([^/]+))",
              [perm_fn, auth_fn, audit_fn, eps, token_store](
                  const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "Security", "Read"))
+                 if (!perm_fn(req, res, "EnginePrincipal", "Read"))
                      return;
                  if (!eps || !eps->is_open()) {
                      res.status = 503;
@@ -3297,7 +3695,11 @@ void RestApiV1::register_routes(
                 confirm_metric(yuzu::server::detail::confirm_result_label(
                     yuzu::server::detail::classify_engine_store_error(confirmed.error())));
                 res.status = engine_store_error_status(confirmed.error());
-                res.set_content(detail::a4_error(res, confirmed.error()), "application/json");
+                res.set_content(detail::a4_error(
+                                    res, confirmed.error(),
+                                    {.remediation =
+                                         confirm_rotation_error_remediation(confirmed.error())}),
+                                "application/json");
                 (void)audit_fn(req, "engine_principal.credential.confirm", "failure",
                                "EnginePrincipal", principal_id, confirmed.error());
                 return;
@@ -4661,13 +5063,31 @@ void RestApiV1::register_routes(
                  }
                  if (q.limit > 1000)
                      q.limit = 1000;
+                 // A negative limit is a client error, not a store degrade: left
+                 // alone it reaches PG as `LIMIT -1`, errors, and reports as an
+                 // audit-availability incident (Gate 2 security).
+                 if (q.limit < 1) {
+                     res.status = 400;
+                     res.set_content(detail::a4_error(res, "limit must be >= 1"),
+                                     "application/json");
+                     return;
+                 }
                  q.principal = req.get_param_value("principal");
                  q.action = req.get_param_value("action");
 
+                 // ADR-0040: degrade-distinguishable read — nullopt on a
+                 // store/pool failure. Surface 503, never a false-empty 200 (an
+                 // audit blip must not read as "no activity" — evidence integrity).
                  auto events = audit_store->query(q);
+                 if (!events) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "audit store degraded"),
+                                     "application/json");
+                     return;
+                 }
                  JArr arr;
-                 for (size_t i = 0; i < events.size(); ++i) {
-                     const auto& e = events[i];
+                 for (size_t i = 0; i < events->size(); ++i) {
+                     const auto& e = (*events)[i];
                      arr.add(JObj()
                                  .add("timestamp", e.timestamp)
                                  .add("principal", e.principal)
@@ -4677,7 +5097,7 @@ void RestApiV1::register_routes(
                                  .add("target_id", e.target_id)
                                  .add("detail", e.detail));
                  }
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events.size())),
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(events->size())),
                                  "application/json");
              });
 
@@ -4791,7 +5211,20 @@ void RestApiV1::register_routes(
                 q.limit = 1;
 
             std::size_t pool_size = 0;
-            auto events = audit_store->query(q, &pool_size);
+            // ADR-0040: degrade-distinguishable read — nullopt on a store/pool
+            // failure. 503, never a false-empty sample (evidence integrity; the
+            // is_open() guard above only catches a closed store, not a runtime blip).
+            auto events_opt = audit_store->query(q, &pool_size);
+            if (!events_opt) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "audit store degraded", cid,
+                                                      /*retry_after_ms=*/5000,
+                                                      "the audit store is temporarily unavailable; "
+                                                      "retry shortly"),
+                                "application/json");
+                return;
+            }
+            const auto& events = *events_opt;
             // recency_capped: the window held at least the scan cap, so the sample
             // was drawn only from the most-recent kAuditSampleScanCap events and is
             // NOT a uniform sample of the full window. Surfaced in the response so an
@@ -6027,7 +6460,17 @@ void RestApiV1::register_routes(
             // governance C-2 row-cap drift.
             static constexpr int kRowCap = 10000;
             q.limit = kRowCap;
-            auto responses = response_store->query(execution_id, q);
+            auto responses_opt = response_store->query(execution_id, q);
+            if (!responses_opt) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "response store degraded",
+                                                 {.retry_after_ms = 5000}),
+                                "application/json");
+                audit_fn(req, "execution.visualization.fetch", "failure", "execution", execution_id,
+                         definition_id + " reason=response_store_degraded");
+                return;
+            }
+            auto responses = std::move(*responses_opt);
             // rows_capped is computed on the RAW (pre-scope-filter) result, so it
             // still signals "more rows existed past the 10000 cap" independent of
             // the scope drop below (#1634 keyset follow-up). NOTE (#1634): the scope
@@ -7720,11 +8163,19 @@ void RestApiV1::register_routes(
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
                  }
+                 // list_rules is now type-distinguishable (ADR-0038 catastrophic-read
+                 // set): a degraded read must never render as an empty list.
                  auto rows = guaranteed_state_store->list_rules();
+                 if (!rows) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "guaranteed-state store degraded"),
+                                     "application/json");
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& r : rows)
+                 for (const auto& r : *rows)
                      arr.add(rule_to_jobj(r));
-                 res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size())),
+                 res.set_content(list_json(arr.str(), static_cast<int64_t>(rows->size())),
                                  "application/json");
              });
 
@@ -7885,13 +8336,21 @@ void RestApiV1::register_routes(
                      return;
                  }
                  auto id = req.matches[1].str();
+                 // get_rule is now three-state (ADR-0038): found / genuinely absent /
+                 // degraded — a degrade must render 503, never collapse into 404.
                  auto row = guaranteed_state_store->get_rule(id);
                  if (!row) {
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "guaranteed-state store degraded"),
+                                     "application/json");
+                     return;
+                 }
+                 if (!*row) {
                      res.status = 404;
                      res.set_content(detail::a4_error(res, "rule not found"), "application/json");
                      return;
                  }
-                 res.set_content(ok_json(rule_to_jobj(*row).str()), "application/json");
+                 res.set_content(ok_json(rule_to_jobj(**row).str()), "application/json");
              });
 
     sink.Put(R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))",
@@ -7916,13 +8375,23 @@ void RestApiV1::register_routes(
                      return;
                  }
                  auto id = req.matches[1].str();
+                 // get_rule is now three-state (ADR-0038): found / genuinely absent /
+                 // degraded — a degrade must render 503, never collapse into 404.
                  auto existing = guaranteed_state_store->get_rule(id);
                  if (!existing) {
+                     res.status = 503;
+                     res.set_content(
+                         detail::error_json_a4(503, "guaranteed-state store degraded", cid),
+                         "application/json");
+                     return;
+                 }
+                 if (!*existing) {
                      res.status = 404;
                      res.set_content(detail::error_json_a4(404, "rule not found", cid),
                                      "application/json");
                      return;
                  }
+                 const GuaranteedStateRuleRow& existing_rule = **existing;
                  auto body = nlohmann::json::parse(req.body, nullptr, false);
                  if (body.is_discarded() || !body.is_object()) {
                      res.status = 400;
@@ -7938,7 +8407,7 @@ void RestApiV1::register_routes(
                               "invalid JSON body");
                      return;
                  }
-                 auto updated = *existing;
+                 auto updated = existing_rule;
                  // Use body.value<T>(k, default) rather than body["k"].get<T>()
                  // so a type-mismatched JSON field (e.g. {"enabled": "yes"})
                  // falls back to the existing value rather than throwing
@@ -7955,8 +8424,8 @@ void RestApiV1::register_routes(
                  // full-object PUT may echo the current mode, but changing it is a
                  // 400, not a silent flip: the operator must author a new Guard.
                  if (body.contains("enforcement_mode") &&
-                     body.value("enforcement_mode", existing->enforcement_mode) !=
-                         existing->enforcement_mode) {
+                     body.value("enforcement_mode", existing_rule.enforcement_mode) !=
+                         existing_rule.enforcement_mode) {
                      res.status = 400;
                      res.set_content(
                          detail::error_json_a4(
@@ -7968,11 +8437,11 @@ void RestApiV1::register_routes(
                               "attempt to change immutable enforcement_mode");
                      return;
                  }
-                 updated.enforcement_mode = existing->enforcement_mode;  // unchanged
+                 updated.enforcement_mode = existing_rule.enforcement_mode;  // unchanged
                  updated.severity = body.value("severity", updated.severity);
                  updated.os_target = body.value("os_target", updated.os_target);
                  updated.scope_expr = body.value("scope_expr", updated.scope_expr);
-                 updated.version = existing->version + 1;
+                 updated.version = existing_rule.version + 1;
 
                  // A structured body re-authors the Guard (contract §8): re-derive the
                  // canonical spec + yaml_source and re-validate the resilience policy
@@ -8157,6 +8626,17 @@ void RestApiV1::register_routes(
         int pushed = 0;
         if (guardian_push_fn) {
             pushed = guardian_push_fn(scope, full_sync);
+            // -2 is the ADR-0038 degraded-store sentinel (distinct from -1's
+            // "unparseable scope") — a guaranteed-state read degrade must render
+            // 503, never the misleading 400 "invalid scope expression".
+            if (pushed == -2) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "guaranteed-state store degraded"),
+                                "application/json");
+                audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
+                         "store degraded scope=\"" + sanitize_audit_string(scope) + "\"");
+                return;
+            }
             if (pushed < 0) {
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "invalid scope expression"), "application/json");
@@ -8646,7 +9126,9 @@ void RestApiV1::register_routes(
                 std::string output, error_detail;
                 int terminal = -1;
                 bool have_output = false;
-                for (const auto& r : response_store->query(command_id)) {
+                // Degrade → empty this iteration; the bounded poll loop retries
+                // (deny-or-benign, ADR-0039).
+                for (const auto& r : response_store->query(command_id).value_or(std::vector<StoredResponse>{})) {
                     if (r.agent_id != agent_id)
                         continue; // never render another agent's row
                     if (!r.output.empty()) {
@@ -9901,11 +10383,25 @@ void RestApiV1::register_routes(
             // catalogue — this is per-request on the fleet-polled device-compliance
             // path. Falls back to the rule_id when a snapshot member Guard has since
             // been deleted (absent from the map).
-            const auto rule_names = guaranteed_state_store->rule_names_for(guard_ids);
+            // rule_names_for / agent_rule_statuses_for_agent are now type-distinguishable
+            // (ADR-0038 catastrophic-read set — this route's compliance counts are an
+            // enforce-gate/census consumer): a degrade must render 503, never a silent
+            // "0 guards reported" that would misreport the device as compliant.
+            auto rule_names_result = guaranteed_state_store->rule_names_for(guard_ids);
+            auto statuses_result = guaranteed_state_store->agent_rule_statuses_for_agent(agent_id);
+            if (!rule_names_result || !statuses_result) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
+                                "application/json");
+                spdlog::warn("guardian.device.view store degraded (503) cid={} agent_id={}", cid,
+                             agent_id);
+                return;
+            }
+            const auto& rule_names = *rule_names_result;
 
             // rule_id -> last reported verdict for THIS device.
             std::unordered_map<std::string, GuardianAgentRuleStatus> dev;
-            for (auto& st : guaranteed_state_store->agent_rule_statuses_for_agent(agent_id))
+            for (auto& st : *statuses_result)
                 dev[st.rule_id] = std::move(st);
 
             int64_t compliant = 0, drifted = 0, errored = 0;
@@ -10358,18 +10854,21 @@ void RestApiV1::register_routes(
         // in principal_quota_gate.hpp).
         res.set_chunked_content_provider(
             "text/event-stream",
-            [sink_state, exec_id_for_capture, metrics_registry](size_t /*offset*/,
-                                                                httplib::DataSink& s) -> bool {
+            [sink_state, exec_id_for_capture, metrics_registry, stream_budget](
+                size_t /*offset*/, httplib::DataSink& s) -> bool {
                 std::unique_lock<std::mutex> lk(sink_state->mu);
                 // Wait condition includes pre_emit so the provider wakes
                 // immediately if the handler stashed a synthetic (the
                 // handler-thread path may pre-attach a pre_emit before
-                // the first publish notify lands).
+                // the first publish notify lands). #2703 Gate 7 item 2:
+                // also includes the shutdown close-signal — see
+                // StreamBudget::closing()'s doc comment.
                 sink_state->cv.wait_for(lk, std::chrono::seconds(3), [&] {
                     return !sink_state->queue.empty() || sink_state->closed.load() ||
-                           sink_state->pre_emit.has_value();
+                           sink_state->pre_emit.has_value() ||
+                           (stream_budget && stream_budget->closing());
                 });
-                if (sink_state->closed.load())
+                if (sink_state->closed.load() || (stream_budget && stream_budget->closing()))
                     return false;
 
                 // Pre-emit synthetic — drained FIRST and out-of-band of

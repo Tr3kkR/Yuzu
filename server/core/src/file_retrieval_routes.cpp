@@ -1,5 +1,6 @@
 #include "file_retrieval_routes.hpp"
 
+#include "body_cap_policy.hpp" // kBodyCapTable binding assert below
 #include "http_route_sink.hpp"
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "upload_grant_parsers.hpp"
@@ -24,6 +25,20 @@
 #include <vector>
 
 namespace yuzu::server {
+
+// The pre-auth body cap for this surface lives in `kBodyCapTable`
+// (body_cap_policy.hpp, the single per-route chokepoint — routed-concern
+// #2407) — never a parallel pre-routing branch here. This assert binds the
+// table row's cap to the protocol's own per-chunk maximum so the two cannot
+// drift: a chunk the protocol admits must never be refused at the transport,
+// and a body the transport admits must never exceed what the handler allows.
+static_assert([] {
+    for (const auto& e : kBodyCapTable)
+        if (e.path_class == std::string_view{"upload_session"})
+            return e.max_body_bytes ==
+                   static_cast<std::size_t>(upload_grant::kDefaultChunkMaxBytes);
+    return false; // no upload_session row at all — also a drift
+}(), "kBodyCapTable's upload_session cap must equal upload_grant::kDefaultChunkMaxBytes");
 
 namespace {
 

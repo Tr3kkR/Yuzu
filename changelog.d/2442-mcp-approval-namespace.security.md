@@ -4,9 +4,11 @@
   — so an approval raised through the REST instruction gate, where both of those are
   caller-influenced, could line up with an MCP tool's canonical arguments. Any such consume still had
   to pass the schema check, the tier gate, per-handler RBAC and a human approval, so this was
-  namespace hygiene rather than an open escalation. Both halves are now closed: a mint that declares a
-  non-MCP origin is refused the prefix, and an instruction definition can no longer be authored under
-  it.
+  namespace hygiene rather than an open escalation. The authoring half is closed: an instruction definition
+  can no longer be authored under the prefix. The redemption half is closed separately, and at
+  redemption rather than at mint — see the cross-surface binding entry. The approval store
+  deliberately does NOT refuse a prefixed mint: doing so permanently stopped schedules on
+  definitions that already carried such an id.
 
   **What breaks:** creating or importing a definition whose id starts `mcp.` is now refused with a
   400 on every authoring route that accepts an explicit id (`POST /api/instructions`,
@@ -17,6 +19,11 @@
   editor is stricter and refuses it on every save. Rename such a definition before upgrading — see
   the upgrade note in `docs/user-manual/server-admin.md` for a query that finds them.
 
-  The minting surface is recorded with each approval; rows predating the column are left unlabelled
-  rather than assigned a surface they may not have come from, and the MCP mint itself is unlabelled
-  until its own follow-up lands. Nothing reads the column yet.
+  The minting surface is recorded with each approval. Left alone, an unlabelled MCP mint would
+  stay redeemable — that exemption is what would otherwise be needed to keep the MCP gate
+  working — but this same release closes it: the MCP mint declares its own surface explicitly
+  (see the "MCP mint now declares its own surface" entry), so no unlabelled ticket exists going
+  forward. Rows predating the column are NOT left unlabelled: unlabelled is the value that would
+  grant, so they are back-filled to a sentinel that claims no surface and fails closed. The
+  column is read at redemption — see the
+  cross-surface binding entry.

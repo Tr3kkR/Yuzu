@@ -68,6 +68,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--oidc-redirect-uri` | *(auto)* | OIDC redirect URI. If omitted, auto-computed from the web address and port. Must match the registered redirect in your identity provider. Env: `YUZU_OIDC_REDIRECT_URI`. |
 | `--oidc-admin-group` | *(none)* | Entra ID group object ID that maps to the admin role. Users in this group are granted admin access on OIDC login. Env: `YUZU_OIDC_ADMIN_GROUP`. (Value is trimmed automatically, same as `--saml-admin-group` — #1830.) |
 | `--oidc-skip-tls-verify` | off | Disable TLS certificate verification for OIDC endpoints. **Insecure — dev only.** Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
+| `--oidc-scim-link-claim` | `sub` | ADR-2001 (SCIM↔OIDC identity linkage, CC6.8). Which validated ID-token claim is compared against a SCIM resource's `externalId` to form the durable link a SCIM deprovision revokes API/MCP tokens across. Only `sub` and `oid` are accepted — the server **refuses to start** on any other value. Okta: leave as the default `sub`. Microsoft Entra ID: set `oid` — Entra's SCIM `externalId` rides the ID token as the `oid` claim, not `sub`. See `docs/user-manual/scim-provisioning.md` "SCIM ↔ OIDC identity linkage". Env: `YUZU_OIDC_SCIM_LINK_CLAIM`. |
 | `--saml-idp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI of the IdP (must match what the IdP uses in its assertions). Required and validated at startup — omitting it (along with the other four `--saml-*` flags) leaves SAML disabled. Env: `YUZU_SAML_IDP_ENTITY_ID`. |
 | `--saml-idp-sso-url` | *(none)* | **SAML 2.0 SP.** IdP's HTTP-Redirect SSO endpoint URL. Env: `YUZU_SAML_IDP_SSO_URL`. |
 | `--saml-idp-cert` | *(none)* | **SAML 2.0 SP.** Filesystem path to the IdP's assertion-signing certificate (PEM, max 64 KiB). The cert at this path is the **sole** trusted signing authority — in-document `<KeyInfo>` values are ignored. Env: `YUZU_SAML_IDP_CERT`. |
@@ -76,7 +77,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 | `--mcp-no-streaming` | off | Disable the MCP **Streamable HTTP** transport (ADR-1005 Decision 15): no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` return `405`, and only plain JSON-RPC POST is served. The spec-required `202` status on notification POSTs still applies. Use where a buffering reverse proxy interferes with streaming. Env: `YUZU_MCP_NO_STREAMING`. |
-| `--mcp-enable-streamed-post` | off | Enable **SSE-on-POST** (streamed POST) for `execute_instruction` callers that supply a `progressToken`. **Ships OFF.** The transport machinery is complete and reviewed, but two bounds defects are open against it: #2739 (the 120 s response cap does not fire while progress keeps arriving, so a response can stay open for the whole execution) and #2740 (a committed-but-undelivered final holds one of the session's four streamed slots, and four dropped connections lock that session out of streaming until it is deleted, restarted, resumed past, or left idle). Both are fixed in the follow-up PR, which turns this on by default. Enabling it today is supported but you own the two defects — size shutdown grace against your longest execution, not against the cap. Distinct from `--mcp-no-streaming`, which disables the whole transport including the session lifecycle and GET channel. |
+| `--mcp-enable-streamed-post` / `--no-mcp-streamed-post` | on | Enable **SSE-on-POST** (streamed POST) for `execute_instruction` callers that supply a `progressToken`. **Ships ON** — the transport machinery is complete and reviewed, and the four defects that previously gated the on-by-default flip are fixed: #2739 (the 120 s response cap is now enforced on a busy execution — after it expires the bridge delivers one final drain of already-latched progress and then settles, bounding the response at the cap plus at most two ~3 s pump ticks plus one mailbox drain), #2740 (a committed-but-undelivered final no longer locks a session out of streaming — admission reclaims the slot and audits it), #2785 (streamed-POST frames now carry the replay-ring event id, so a POST-only client can build a `Last-Event-ID` resume cursor) and #2789 (end-to-end coverage of the per-principal admission reject). Pass `--no-mcp-streamed-post` to opt out. Distinct from `--mcp-no-streaming`, which disables the whole transport including the session lifecycle and GET channel. |
 | `--mcp-allowed-origin` | *(none)* | **Repeatable.** An allowed `Origin` header value (`scheme://host:port`, exact match) for `/mcp/v1/` DNS-rebinding defence. An **absent** `Origin` is always allowed (the endpoint requires a credential); an **empty allowlist rejects any *present* Origin** (secure default) — browser-based MCP clients must be listed explicitly, non-browser clients need no configuration. Env: `YUZU_MCP_ALLOWED_ORIGINS`. |
 | `--max-sse-streams` | `128` | **Concurrent held-open SSE responses this server is sized for, across EVERY streaming surface** — `GET /mcp/v1/`, MCP streamed POST, `GET /api/v1/events`, the dashboard executions drawer, and the legacy `/events` stream. The HTTP worker pool is derived *from* this number: cpp-httplib is thread-per-connection, so each held-open response pins one worker for its whole life. That thread burns no CPU, and its resident cost is a fraction of a stack reservation that is virtual and platform-dependent (8 MB on Linux/glibc, 1 MB on Windows, 512 KB for macOS secondary threads). The resident fraction itself is **not yet measured** on our platforms (ADR-0034), so treat the default as a starting point rather than a sizing guarantee until a per-platform baseline exists. Utilisation is `yuzu_http_held_open_responses / yuzu_http_held_open_capacity`. The ceiling is thread-count; see ADR-0034. Env: `YUZU_MAX_SSE_STREAMS`. |
 | `--mcp-max-streams-per-principal` | `4` | Max concurrent MCP SSE streams for one principal. An **anti-monopoly policy, not a capacity limit** — capacity is `--max-sse-streams`. Stops a single agentic token taking the channel; does not ration the fleet. Env: `YUZU_MCP_MAX_STREAMS_PER_PRINCIPAL`. |
@@ -194,18 +195,277 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — a duplicate SCIM `externalId` now refuses to boot (ADR-2001, CC6.8) (breaking)
+
+**What changed.** This release adds a partial unique index, `scim_resources_external_id_uniq ON scim_resources (external_id) WHERE external_id IS NOT NULL`, applied by the `ScimStore` migration that runs at construction — **unconditionally, regardless of whether `--scim-enable` is set**. Postgres itself detects any pre-existing duplicate non-empty `external_id` and raises a `unique_violation`, which fails the migration; `ScimStore` then reports `!is_open()` and the server refuses to start, the same fail-closed posture every born-on-PG store uses on a failed migration. This is deliberate, not a bug to work around: a duplicate `externalId` is exactly the mis-link hazard ADR-2001's SCIM↔OIDC token-revoke linkage exists to prevent (a duplicate would let link formation pick a SCIM resource arbitrarily and revoke — or fail to revoke — the wrong principal's tokens), so the index is a **stronger** posture than what shipped before, not a regression to relax.
+
+**Who this affects.** Any deployment with existing SCIM data (has ever run `--scim-enable`, even if it isn't set on this upgrade) where two or more `scim_resources` rows share the same non-empty `external_id` — most likely from an IdP connector bug, a manual data-fix gone wrong, or a resource re-provisioned under a new SCIM `id` without the old row ever being cleaned up.
+
+**Before upgrading, run this against your existing database to check:**
+
+```sql
+SELECT external_id, COUNT(*) FROM scim_store.scim_resources
+WHERE external_id IS NOT NULL
+GROUP BY external_id
+HAVING COUNT(*) > 1;
+```
+
+**If it returns any rows,** the upgrade will fail to boot until you resolve the duplicates first — deactivate or delete the stale/incorrect row(s) for each `external_id` this query surfaces (keep whichever row is the IdP's actual current resource), then re-run the query until it returns nothing. If it returns no rows, this note does not affect you and the migration applies silently on next boot.
+
+### vNEXT — pre-auth request-body caps now apply to (almost) every route, not just `/mcp/` (#2407) (breaking)
+
+**What changed.** Before this release, only the `/mcp/` ingress was capped ahead of authentication (4 MiB, #2437) — every other route was bounded only by httplib's own 100 MiB server-wide default, so an unauthenticated caller could make the server buffer up to 100 MiB per connection on any route. The server now resolves a per-route-class cap from a single table (`body_cap_policy.hpp`) at the same pre-routing chokepoint, before the body is read at all — including `GET`/`HEAD` requests (a GET declaring a `Content-Length` still buffers a body regardless of method) and the four unauthenticated health-probe paths (`/livez`, `/readyz`, `/health`, `/api/health`), which were previously the last unauthenticated 100 MiB buffer on the server because their early-return sat above the cap; they now hit the cap first and remain exempt only from the on-behalf-of guard and the rate limiter. Separately, a request declaring a compressed (non-`identity`) `Content-Encoding` is now refused outright (`415`) on **every** class, because httplib decompresses transparently and bounds only the decompressed size against its own 100 MiB global limit — a sub-cap compressed body could otherwise expand to ~100 MiB before this cap (or any handler) ever saw it. Full per-class numbers and the error contract: [`docs/user-manual/rest-api.md` "Pre-Auth Request Body Caps"](rest-api.md#pre-auth-request-body-caps-2407).
+
+**What a client sees.**
+
+- **`413`** — the declared `Content-Length` exceeds the resolved class's cap.
+- **`411`** — the body cannot be sized in advance **by framing** (chunked, or no `Content-Length`) and this route's class requires one it can size. Today that is `/mcp/` only; every other class still admits an unmeasurable body up to httplib's 100 MiB backstop, unchanged from before this release.
+- **`415`** — the request carries a `Content-Encoding` header other than `identity`. Refused on **every** class, unconditionally — this one is new in this release and does not depend on the class opting into anything. No shipped Yuzu route accepts a compressed request body, so this should not affect a conforming client; a client or intermediary that compresses request bodies (`gzip`/`br`/`deflate`) must stop doing so against this server. Send an identity-encoded body by **omitting `Content-Encoding` entirely** — do not send `Content-Encoding: identity` explicitly, which reaches httplib's own decompressor lookup, finds nothing to do, and today gets a bare `415` with none of this section's error-shape guarantees (no A4 envelope, no `yuzu_body_cap_rejected_total` increment); see the `415` row in [`docs/user-manual/rest-api.md`](rest-api.md#pre-auth-request-body-caps-2407) for the mechanism.
+
+**Who this affects.** Any integration that was sending a body larger than its route's new class cap and relying on httplib's 100 MiB backstop to accept it. The most likely surface to notice: a very large `POST /api/v1/guaranteed-state/rules`, `/api/workflows`, or `/api/product-packs` body — those three classes are capped at a generous but explicit 16 MiB (a judgment call, not a measured contract, because no aggregate size limit for that content exists yet) rather than the previous 100 MiB backstop. Most other routes had a smaller handler-level check already (response templates, CA import) — for those, the effect really is just an earlier rejection at the same byte count (before the body is buffered rather than after). Also newly affected: any client or intermediary that sends a **compressed** request body — that is now refused outright with `415` on every class (see "What changed" above); no shipped Yuzu client compresses request bodies, so this is expected to affect only a custom integration or a reverse proxy doing transparent compression. One class is **not** the simple "earlier rejection, same effect" case, and clients should not assume "no behavior change" from it: **TAR queries** (`POST /api/dashboard/tar-execute`, `POST /api/v1/result-sets/from-tar-query`) — these two classes' caps as originally shipped bounded the RAW body at the same byte count their handlers check on a DECODED/PARSED value, which is not the same number; that unit mismatch caused some legitimate queries to be rejected here that the handler would have admitted. Both caps carry a margin now (see [`docs/user-manual/rest-api.md`](rest-api.md#pre-auth-request-body-caps-2407) for the sizing), so this class is now also a clean earlier-rejection-only change going forward. **SCIM is no longer a special case either** (fixed as part of this same change, D7): the pre-routing rejection now publishes SCIM's own RFC 7644 §3.12 `application/scim+json` error shape, matching what a strict SCIM client already expected from the handler's own (now-superseded) check.
+
+**How to raise a cap.** Edit the table in `server/core/src/body_cap_policy.hpp` (with review) and the matching row in `docs/user-manual/rest-api.md`. Do **not** reach for httplib's global `Server::set_payload_max_length` — that knob is shared by every route on the listener, including the ~70 MiB live-query bundle route and the OTA agent-binary upload, so a single global value can't fit every route class at once. Rejections are visible per class via `yuzu_body_cap_rejected_total{path_class,reason}` — see `docs/user-manual/metrics.md`.
+
+### vNEXT — an authorization-topology floor now applies regardless of RBAC, and engine-principal reads move off `Security:Read` (#2376) (breaking)
+
+This note has **two independent breaking directions** — read both, they
+affect different deployments.
+
+**Direction 1 — RBAC-disabled installs lose three non-admin reads.**
+
+**Who this affects.** Any deployment running with `[rbac] enabled = false`
+(the shipped default) where a non-admin, authenticated session was relying
+on reading one of: the fleet-wide access-review export
+(`/api/v1/access-reviews*`), `GET /api/v1/rbac/roles`, or the
+engine-principal inventory/roles (`/api/v1/engine-principals*` and the
+`list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP
+tools). RBAC-enabled deployments are unaffected by this direction (see
+"Why" below).
+
+**Why.** RBAC ships disabled by default. With RBAC disabled, the legacy
+authorization fallback previously allowed **every** authenticated
+non-engine session to perform **every** `Read` — including reads of the
+authorization topology itself. A plain non-admin `user` on a default,
+just-installed server could read who holds what role and pull the complete
+access-review grant population that exists to be SOC 2 CC6.2 evidence. As
+of this release, `AccessReview:Read`, `UserManagement:Read`, and
+`EnginePrincipal:Read` (see Direction 2) require the `admin` session role
+**regardless of the RBAC toggle**. This is not configurable — there is no
+setting that reopens it. Full design rationale:
+`docs/security-reviews/authz-topology-floor-2026-08-05.md`.
+
+**What does NOT change.** A live RBAC grant is unaffected — under
+RBAC-**enabled** enforcement, a non-admin holding the seeded `Reviewer`
+role still reaches the access-review export exactly as before; a non-admin
+holding `UserManagement:Read`/`EnginePrincipal:Read` (e.g. the built-in
+`Viewer` role holds both) still reaches the other two reads. The floor only
+engages inside the RBAC-off legacy fallback.
+
+**What to do.** If a non-admin session needs one of these three reads,
+enable RBAC and grant the matching role:
+
+```cfg
+[rbac]
+enabled = true
+```
+
+- Access-review export → assign the built-in `Reviewer` role.
+- `/rbac/roles` → the built-in `Viewer` role already holds
+  `UserManagement:Read`, or grant it directly.
+- Engine-principal reads → the built-in `Viewer` role already holds
+  `EnginePrincipal:Read` (see Direction 2), or grant it directly.
+
+See [`rbac.md`](rbac.md) "The authorization topology floor" and "Before
+enabling RBAC in production" before flipping the toggle on a live fleet —
+turning RBAC on also applies management-group-scoped device visibility
+immediately.
+
+**Direction 2 — RBAC-enabled deployments with a custom role granted
+`Security:Read` for engine-principal access must re-grant.**
+
+**Who this affects.** Any RBAC-**enabled** deployment with a **custom**
+role (not `Administrator`/`Viewer`, which are updated automatically — see
+below) that was granted `Security:Read` specifically so its holders could
+reach `GET /api/v1/engine-principals*` or the
+`list_engine_principals`/`get_engine_principal`/`list_engine_roles` MCP
+tools.
+
+**Why.** Those reads moved off `Security:Read` onto a new, narrower
+`EnginePrincipal:Read` securable (the same move #2324 made cutting
+`AccessReview` away from `AuditLog:*`) — `Security:Read` also gates
+unrelated operational reads (quarantine visibility, CA issued-certs,
+`/ca/root-csr`, KEK status) that stay on `Security:Read` unchanged and
+un-floored.
+
+**What changes automatically.** No schema migration is required — the new
+`EnginePrincipal` securable and its `Administrator` (full CRUD) and
+`Viewer` (`Read`) grants are seeded idempotently on every server boot
+(`RbacStore::seed_defaults()`'s `INSERT OR IGNORE` loops), so the two
+built-in roles pick it up on the next boot automatically, with no operator
+action, matching exactly the access they held via `Security:Read` before
+this change.
+
+**What to do.** A custom role does **not** get this automatic re-seed.
+Check whether any custom role was granted `Security:Read` for this
+purpose, and if so, grant it `EnginePrincipal:Read` too — via the Settings
+UI or `RbacStore::set_permission()` directly. `Security:Read` alone no
+longer reaches `/api/v1/engine-principals*` or its MCP twins after this
+upgrade.
+
+**Direction 3 — API consumers of `GET /api/v1/discover/permissions` (and the MCP
+`discover_permissions` twin) lose the role grid unless they hold
+`UserManagement:Read`.**
+
+**Who this affects.** Anything reading the discovery catalogue's
+`roles[].permissions[]` under a principal that holds `Infrastructure:Read` but
+not `UserManagement:Read`.
+
+**What changes.** The route still returns `200` and the full
+`securable_types`/`operations` taxonomy — that half is unchanged and still needs
+only `Infrastructure:Read`. The `roles` key is replaced by `"roles_omitted": true`
+plus a `roles_omitted_reason`. A consumer that iterates `roles` must handle its
+absence; one that checks `roles_omitted` gets an unambiguous answer.
+
+**Why.** That grid is authorization topology, and strictly more of it than
+`GET /api/v1/rbac/roles` discloses — which this same change floors. Leaving it on
+the unfloored `Infrastructure:Read`, which every authenticated session holds on an
+RBAC-off install, left the floor reachable around. Flooring `Infrastructure:Read`
+itself was rejected: it gates ordinary operational reads and would have repeated
+the too-coarse mistake this change avoided with `Security:Read`.
+
+**What to do.** Grant the consuming principal `UserManagement:Read` if it
+legitimately needs the grid, or update it to read `roles_omitted`. Do not treat a
+missing `roles` key as "no roles exist" — that is precisely why the omission is
+declared.
+
+**Check your automation, not just your operators — this is the failure that
+hides.** Neither breaking direction produces a startup warning or a migration
+prompt. Both surface only as a `403` at some later moment, and that moment may
+be inside a script rather than in front of a person. Audit anything
+non-interactive that reads the three floored surfaces
+(`/api/v1/access-reviews/export`, `/api/v1/rbac/roles`,
+`/api/v1/engine-principals*` and their MCP twins) under a **non-admin** token:
+
+- A **compliance evidence collector** is the dangerous case. If it pulls the
+  access-review export on a schedule and treats a non-`2xx` as "no grants to
+  report" rather than as a hard failure, it will keep succeeding while
+  silently collecting nothing — potentially for a whole audit period. Confirm
+  yours fails loudly on `403`, and re-check the first collection after upgrade.
+- A **monitoring or inventory job** on a non-admin token will start logging
+  `403`s rather than breaking visibly.
+
+Either enable RBAC and grant the job's principal the appropriate role
+(`Reviewer` for access reviews, `UserManagement:Read` for `/rbac/roles`,
+`EnginePrincipal:Read` for engine-principal reads), or move the job to an admin credential.
+
+**One caveat on revoking a built-in role's grant.** Because the seed loops
+above run on *every* boot, a grant you deliberately remove from a built-in
+role — for example revoking `Viewer`'s `EnginePrincipal:Read` — is re-inserted
+on the next restart, with no audit line distinguishing it from an
+operator-set grant. This is long-standing behaviour for every seeded
+securable, not new here, but it is worth knowing before you narrow a built-in
+role: express the narrowing as a **custom role** or an explicit `deny` row
+instead, both of which survive a restart.
+
+### vNEXT — approval tickets outstanding at the upgrade must be re-requested (#2442) (breaking)
+
+**Who this affects.** Any deployment holding an **MCP** approval that was granted but not yet
+redeemed at the moment of upgrade — that is, one an agentic worker will present back to an MCP tool
+call. This is independent of the `mcp.` prefix entry below: it does not matter whether you author any
+`mcp.`-prefixed definitions, and a deployment running only Yuzu-supplied content **is** affected if
+it has an MCP approval in flight.
+
+**Scheduled approvals are not affected.** A schedule redeems its own approval by matching the
+schedule id, not through the MCP recall, so the origin check never sees it and a scheduled run
+outstanding across the upgrade still fires. If nothing is awaiting an MCP recall when you upgrade,
+there is nothing to do.
+
+**Rolling BACK across this release re-opens the check, and rolling forward does not close it
+again — but as of this same release, it does not stay open either.** The back-fill runs once, as a
+schema migration. An older server started against an already-migrated database does not re-run it
+and does not refuse to start; approvals it mints while you are rolled back record no minting
+surface at all (the column is never set). Rolling forward will not revisit those rows, because the
+migration has already run — but the MCP mint in this same release always declares its own surface
+(see the "MCP mint now declares its own surface" entry below), so a row with no recorded surface is
+no longer the value that grants: it is refused at recall exactly like a declared foreign surface,
+not exempted. There is no window in which a rollback-minted ticket is redeemable once you are back
+on a current server. Treat a roll-back as a window during which such tickets simply won't work
+later — mint fresh ones after rolling forward rather than relying on anything minted during the
+roll-back.
+
+**What happens.** This release records which surface minted each approval, and rows that predate the
+column carry no surface at all. Rather than assume one they may not have come from, the upgrade
+labels them with a sentinel that fails closed — so an approval granted before the upgrade is refused
+at recall. It is reported as `approval already used (one-time ticket)` even though it was never
+consumed: that message is deliberately identical for every refusal so the recall cannot be used to
+probe which surface minted a ticket, and that is why this note exists rather than the error
+explaining itself.
+
+**Recover** by calling the tool again without `approval_id` to mint a fresh ticket and have it
+re-approved. Nothing is lost but the review. The affected population is only what is outstanding at
+upgrade time, it does not grow afterwards, and approvals expire after 7 days regardless. On the
+server side the refusal is distinguishable: the audit row records `refused: foreign_origin`, not the
+uniform client message.
+
+### vNEXT — the MCP mint now declares its own surface; undeclared tickets stop redeeming (#2442) (breaking)
+
+**Who this affects.** Any deployment holding an **MCP** approval that was granted but not yet
+redeemed at the moment of upgrade — the same population as the entry above, widened. The
+previous release closed the check for a ticket a REST or scheduled mint declared as its own
+surface; an MCP-minted ticket was still exempt, because the MCP gate could not yet declare
+`kMcp` itself. This release removes that exemption: the MCP mint now stamps every new ticket
+`kMcp` explicitly, and an undeclared ticket (the value an omitted `origin` argument used to
+produce) is refused at recall exactly like a declared foreign surface.
+
+**What happens.** Same mechanics as the entry above, same client message
+(`approval already used (one-time ticket)`), same audit distinction (`refused: foreign_origin`).
+The only difference is which population is now caught: any MCP ticket minted by a
+pre-upgrade server — every one of them, since none could declare `kMcp` before this release —
+that is still outstanding when you upgrade.
+
+**Recover** the same way: call the tool again without `approval_id`. The affected population
+does not grow after the upgrade — every ticket minted by the new server declares its surface
+at mint time, so nothing outstanding from this point on can hit this case.
+
+### vNEXT — MCP approval recall is now bound to its submitter (#2442) (intentional compatibility break, no supported flow affected)
+
+**What changes.** An approval ticket's `approval_id` is a bearer capability — presenting it is
+what authorizes the recall — and an id can be **disclosed** to a third party: `GET
+/api/approvals` returns the full id to any principal holding `Approval:Read`, seeded to the
+`Viewer` role. Until this release, a Viewer who also held the target tool's own RBAC permission
+could take another operator's approved ticket id from that listing and redeem it themselves. The
+MCP recall now refuses a ticket whose recorded submitter does not match the recalling principal,
+the same way it already refuses one minted on a foreign surface — same client message, a distinct
+audit token (`refused: foreign_submitter`) for the log.
+
+**Who this affects.** No supported flow: the one production redemption path in this codebase
+(the MCP recall) has only ever redeemed a ticket as the same principal that minted it, verified
+by an exhaustive sweep of every mint and consume call site in the tree, and the non-binding was
+documented as this issue's own hazard, never as an intended capability. What this cannot rule
+out is an external integration that relied on the old behavior to hand an `approval_id` between
+two different authenticated principals deliberately — nothing in this codebase does that, but an
+operator's own tooling might have. If something in your deployment presented a ticket as a
+different principal than the one that minted it, that now fails; there is no supported
+replacement for it today (see #2442 if you need one). Nothing to do at upgrade for the ordinary
+case: there is no outstanding-ticket population affected by this specific change, because a
+legitimately-outstanding ticket was always going to be recalled by its own submitter.
+
 ### vNEXT — the `mcp.` instruction-definition id prefix is reserved (#2442) (breaking)
 
 **Who this affects.** Anyone whose instruction definitions include an id beginning `mcp.`. No
 shipped or bundled content uses that prefix, so a deployment running only Yuzu-supplied content
-is unaffected and needs no action.
+needs no action *for this item* — but the outstanding-approval entry above applies regardless of
+what content you run.
 
-**Why.** `mcp.<tool>` names an MCP approval ticket. The MCP recall matches a ticket on its
-definition id and scope expression and does not bind the submitter, so a definition authored
-under that prefix could line up with an MCP tool's canonical arguments — a ticket raised on one
-surface being redeemable on another. Consuming it still required the schema check, the tier
-gate, per-handler RBAC and a human approval, so this closes a namespace confusion rather than an
-open escalation.
+**Why.** `mcp.<tool>` names an MCP approval ticket. At the time this shipped, the MCP recall
+matched a ticket on its definition id and scope expression alone, so a definition authored under
+that prefix could line up with an MCP tool's canonical arguments — a ticket raised on one surface
+being redeemable on another. (Two later releases closed the redemption side of this directly, by
+binding the recall to the ticket's recorded origin and separately to its submitter — see the two
+entries above. This prefix reservation is the narrower, mint-time-adjacent half: it stops a
+definition from being authored under `mcp.` at all.) Consuming a confused ticket still required
+the schema check, the tier gate, per-handler RBAC and a human approval, so this closes a
+namespace confusion rather than an open escalation.
 
 **What changes.** Creating a definition whose id starts `mcp.` is refused with a 400 on every
 authoring route that accepts an explicit id — `POST /api/instructions`, `POST
@@ -448,26 +708,73 @@ the wire. Plain POST clients (mcp-remote, Claude Desktop) are unaffected.
 Three operator-visible consequences:
 
 - **Sizing.** A streamed POST holds an HTTP worker for up to its response cap
-  (120 s) — **but see #2739: that bound is not enforced on a busy execution, so size
-  against the execution's own duration until the follow-up PR lands.** Streamed POST
-  ships OFF by default for this reason (`--mcp-enable-streamed-post`). It leases from the same held-open budget as the GET channel, so total
-  concurrency is unchanged — but `TimeoutStopSec` and any container termination
-  grace period must be sized against your longest expected execution while #2739 is
-  open, not against the cap. (Once the follow-up PR lands and the cap is enforced,
-  120 s becomes the true bound and 30 s — which suited GET alone — is the figure to
-  move away from.) Under-sizing SIGKILLs mid-drain and silently drops in-flight
-  streams on deploy.
+  (120 s), enforced on a busy execution too (#2739): after the cap expires the
+  bridge delivers one final drain of already-latched progress and then settles,
+  so the bound is the cap plus at most two ~3 s pump ticks plus one bounded
+  mailbox drain and its socket-write time (the server's 30 s write timeout,
+  `set_write_timeout` in `server.cpp`) — worst case ~156 s, not the execution's
+  duration. It leases from the same held-open budget as the GET channel, so
+  total concurrency is unchanged — but `TimeoutStopSec` and any container
+  termination grace period should be sized comfortably above that ~156 s bound
+  (the shipped systemd unit and every shipped compose file use **210 s**); 30 s
+  — which suited GET alone — is the figure to move away from. Under-sizing
+  SIGKILLs mid-drain and silently drops in-flight streams on deploy.
 - **Per-principal ceiling.** `--mcp-max-streams-per-principal` governs the GET
-  channel. The streamed-POST allowance is a separate, fixed 4 per session (twinned
-  to the replay ring's pin slots), so the real per-principal held-open ceiling is
-  `--mcp-max-streams-per-principal + 4`. Lowering the flag to contain a noisy
-  principal does not reduce its streamed-POST concurrency.
+  channel. The streamed-POST allowance is a fixed 4 concurrent calls per
+  principal — numerically the same as, but counted and enforced separately
+  from, any single session's own replay-ring pin-slot count — so the
+  steady-state per-principal held-open sum across both channels is
+  `--mcp-max-streams-per-principal + 4`. That sum is not a hard ceiling: a
+  GET-channel reconnect keeps the superseded connection's count until it
+  finishes draining, and `McpStreamState` bounds this to one pending handover
+  per *session*, not per principal — a principal with every one of its GET
+  sessions mid-handover at once can transiently double the GET component.
+  Lowering the flag to contain a noisy principal does not reduce its
+  streamed-POST concurrency.
 - **Reverse proxies.** The response sets `X-Accel-Buffering: no`, which only nginx
   honours. Envoy, HAProxy, ALB and Cloudflare need their own no-buffering opt-out,
   or the stream is buffered and dead clients are not detected.
 
 `--mcp-no-streaming` remains the kill switch and now also degrades the streamed
 POST arm back to plain JSON, not just GET/DELETE.
+
+### vNEXT — streamed POST (`--mcp-enable-streamed-post`) now ships ON by default (breaking)
+
+The feature described in the vNEXT entry above already existed; this entry is
+about its **default** changing. Every prerequisite that gated the on-by-default flip
+(#2739, #2740, #2785, #2789) is fixed, so a server started with no MCP flags now
+serves streamed POST for any `execute_instruction` call that sends
+`_meta.progressToken` with an SSE-capable `Accept` — no configuration required.
+
+**What this means for an upgrading operator**, restated from the Sizing and
+per-principal bullets above because they are no longer conditional on opting in
+— they now apply to every deployment by default:
+
+- **`TimeoutStopSec` (or your container runtime's equivalent termination grace)
+  must be sized comfortably above the ~156 s worst-case bound derived in the
+  Sizing bullet above** (120 s cap + pump ticks + the 30 s write timeout), not
+  the ~30 s that sufficed for the GET channel alone. The shipped systemd unit
+  and every shipped compose file that runs `yuzu-server` use **210 s** — use
+  that as your own starting point if you're not deploying from one of those. This
+  was previously only a concern for operators who had explicitly enabled the
+  flag; it is now the default posture for every deployment that takes no
+  action.
+- **A principal's steady-state held-open sum is `--mcp-max-streams-per-principal
+  + 4`** — the streamed-POST allowance is no longer contingent on opting in, it
+  applies to every deployment by default. That sum is not a hard ceiling (see
+  the Per-principal ceiling bullet above for the GET-reconnect transient).
+- **If you're behind a non-nginx reverse proxy (Envoy, HAProxy, ALB,
+  Cloudflare) or running an MCP client whose HTTP transport can't consume a
+  streamed response body**, verify SSE-on-POST actually reaches your client
+  before upgrading (see the Reverse proxies bullet above) — otherwise a call
+  that previously answered promptly can appear to hang for up to the ~156 s
+  worst-case bound (see the Sizing bullet above), not just the 120 s cap.
+  Pass `--no-mcp-streamed-post` if you'd rather verify after upgrading.
+
+**To opt out**, pass `--no-mcp-streamed-post` (or set
+`YUZU_MCP_ENABLE_STREAMED_POST=false`) to keep the pre-flip plain-POST-only
+behavior. `--mcp-no-streaming` remains the broader kill switch and disables
+streamed POST along with the rest of the Streamable HTTP transport.
 
 ### vNEXT — MCP stream revalidation rides the tick, and the pin-drift alert moves to a new counter
 
@@ -623,6 +930,69 @@ credential) call `rotate`, not replay `confirm`. Agentic MCP clients honouring
 `idempotentHint:true` get the correct terminal answer automatically. Full
 detail: `docs/user-manual/rest-api.md` (confirm error table) and
 `docs/user-manual/engine-principals.md`.
+
+### vNEXT — API-token rotation confirm-identity binding now survives a restart; first schema change to `api_tokens` (#2961)
+
+Migration v3 adds `api_tokens.rotation_initiator` (durable twin of the
+confirm-identity binding described in `docs/auth-architecture.md`
+"Confirm-identity binding survives a server restart"). This is the FIRST
+schema change ever applied to `api_tokens` since it shipped — every
+authenticated request validates a Bearer token against this table, so it is
+one of the hottest tables on the server.
+
+**Not breaking, but worth knowing before a rolling upgrade.** `ALTER TABLE
+... ADD COLUMN ... DEFAULT ''` takes Postgres's briefest possible form (a
+metadata-only "fast default" on PG 11+, not a table rewrite) but is still an
+`ACCESS EXCLUSIVE` DDL statement: it must wait for every transaction
+currently touching `api_tokens` to finish before it can run, and every new
+transaction on the table queues behind it in turn while it waits. During a
+rolling upgrade, an outgoing replica's still-open request handling can hold
+such a transaction open. This is bounded and loud, not silent: the pool's
+`lock_timeout` (10s, `pg_pool.hpp`) cancels the migration's `ALTER` if it
+queues that long, and `ApiTokenStore` construction fails closed exactly as
+it does for any other migration failure — the new binary refuses to start
+with a clear log line rather than serving degraded or hanging the table. If
+you see this on a rolling upgrade, retry once traffic quiesces (a load
+balancer draining the outgoing replica is usually enough); it is not a data
+integrity concern either way.
+
+### vNEXT — the rotation sweep now carries the full clock-guarded-retention shape (#2964)
+
+**What changed.** `ApiTokenStore::sweep_expired_rotations` — the 60-second
+background sweep that auto-revokes rotation predecessors for *both*
+engine-credential and human API-token overlap pairs — previously issued its
+delete on a bare local wall-clock comparison, capped per tick but with no
+persisted clock anchor and no anomaly detection. It now reads a
+Postgres-authoritative clock, persists a durable anchor in a new
+`rotation_retention_meta` table (schema v4), and classifies every tick
+through the same guard `audit_store`'s retention pass uses — a clock anomaly
+or a not-yet-trustworthy anchor **declines** the tick outright rather than
+revoke on an unverified reading, leaving both credentials in every affected
+pair active for at least one more tick. Detail:
+`docs/user-manual/authentication.md` "Rotating a Token",
+`docs/user-manual/engine-principals.md` "Rotate the credential (overlap-pair
+model)", and `docs/user-manual/metrics.md` "Rotation-sweep clock guard
+metrics".
+
+**HA / multi-replica.** Unlike `audit_store`'s retention pass, this sweep is
+single-writer **by construction**: before it will classify anything, it
+takes a store-wide PostgreSQL **session** advisory lock in its own key
+namespace. This is what makes the per-tick auto-revoke cap (≤200) a
+**cluster-wide** cap rather than a per-replica one that would otherwise let
+an N-replica deployment auto-revoke up to `N x 200` predecessors in one
+tick. A replica that does not win the lock on a given tick records a
+`SkippedLock` outcome and does nothing that tick — expected, routine
+behaviour on a genuinely multi-replica deployment, where roughly
+`(N-1)/N` of ticks land there for any given replica. **On a single-replica
+deployment — the default — this is not "routine leader-election
+contention" at all: one dedicated sweep thread on a sequential 60-second
+loop cannot lose an election against itself, so `SkippedLock` there can only
+mean a *second writer* holding the same session lock** — a zombie process
+left over from a crashed instance, a botched blue-green cutover overlapping
+two live instances briefly, or an unauthorised second server pointed at the
+same DSN. If you run single-replica, treat any sustained non-zero
+`yuzu_rotation_sweep_lock_skipped_total` as a fault to investigate, not
+background noise; see `docs/ops-runbooks/rotation-sweep-clock-guard.md`.
 
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 
@@ -1363,6 +1733,7 @@ OIDC can be configured via CLI flags at startup or through the Settings page:
 | Redirect URI | `--oidc-redirect-uri` | Callback URL registered with the identity provider. Must point to the Yuzu server's `/auth/callback` path. |
 | Admin Group | `--oidc-admin-group` | Entra ID group object ID that maps to the admin role. |
 | Skip TLS Verify | `--oidc-skip-tls-verify` | Disable TLS cert verification for OIDC endpoints (insecure, dev only). Env: `YUZU_OIDC_SKIP_TLS_VERIFY`. |
+| Link Claim | `--oidc-scim-link-claim` | ADR-2001 (SCIM↔OIDC identity linkage, CC6.8) — which validated ID-token claim (`sub` default, or `oid` for Entra) links a SCIM slug to its OIDC login identity so a SCIM deprovision can also revoke that identity's API/MCP tokens. **Not a Settings-page form field** — this page saves the OIDC config CLI/env already set for this value unchanged rather than resetting it to the struct default. See [SCIM ↔ OIDC identity linkage](scim-provisioning.md#scim--oidc-identity-linkage-federated-token-revocation). Env: `YUZU_OIDC_SCIM_LINK_CLAIM`. |
 
 ### Identity Provider Setup
 

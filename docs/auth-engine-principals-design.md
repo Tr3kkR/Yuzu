@@ -602,12 +602,36 @@ for non-HTTP writers is unaffected).
      audit row plus a metric (bounded `reason="successor_unused"` label,
      not `event="security"`; this is an operational health signal, not a
      theft signal, and pages once per rotation rather than sharing the
-     theft-detection alert's channel) — auto-revoke still fires (a window
-     is a ceiling, not a promise, and a silently-extended overlap defeats
-     the point of having one), but the operator is alerted *before* the
-     module goes dark, not after;
+     theft-detection alert's channel). **Revised (governance UP-5):** a
+     window is a ceiling on the OVERLAP, not a promise that auto-revoke will
+     leave a usable credential — so auto-revoke is withheld, not fired, when
+     the successor was NEVER presented at all (`last_used_at == 0`): a
+     dropped rotate response or an operator who never picked up the new
+     credential must not end with zero usable credentials, unattended. In
+     that case both credentials stay active past the window and the warning
+     is raised again on crossing into the elapsed state; the sweep will
+     never resolve this pair on its own, so an operator must act explicitly
+     — confirm once the successor genuinely is in use, or revoke the
+     specific credential no longer trusted via
+     `DELETE /api/v1/tokens/{token_id}` (never the terminal
+     principal-level `DELETE /api/v1/engine-principals/{id}` — see the
+     confirm-identity-durability bullet below for why). **Cadence, and it is
+     NOT uniform across the three
+     signals** (`rotation_warn_dedup.hpp`): the **log line** repeats every
+     tick while the pair stays stuck; the **audit row and the metric** named
+     above fire ONCE per pair per state — once pre-elapse, once more on
+     elapsing — and the state is process-local, so a restart re-emits once.
+     An earlier revision of this paragraph said they were "no longer
+     deduplicated once elapsed"; that held only briefly, and the
+     un-throttled row was itself the defect (~1440/day per stuck pair into
+     the SOC 2 audit store, whose retention pass caps at 25 000 deletions).
+     Indefinite loudness lives on the log channel; the alertable
+     current-state signal is tracked in #2969. A successor that WAS
+     presented at least once is unaffected by this carve-out — auto-revoke
+     still fires for it at window end exactly as before;
   3. predecessor **auto-revokes** at window end (or immediately on operator
-     confirm).
+     confirm) — UNLESS its successor was never presented (bullet 2 above),
+     in which case it stays active until an operator acts explicitly.
   - At most **two** active credentials per engine principal at any moment —
     a third mint is rejected until the overlap resolves (see the
     idempotency carve-out above for the retry case). Every step audits.
@@ -619,6 +643,36 @@ for non-HTTP writers is unaffected).
     *both* credentials and flips the principal's `lifecycle_state` to
     `revoked` (terminal — see §3.1), so an operator responding to a leak
     never has to reason about which of two credentials was the stolen one.
+- **Confirm-identity durability (#2961, fixed).** The check in step 3 above
+  that only the operator who called `rotate` may `confirm` originally
+  resolved **only** from a process-local grace-cache map, so a server
+  restart mid-overlap silently and permanently blocked `confirm` for that
+  pair (the sweep still cut over on the timer, with no error surfaced —
+  the record showed nothing amiss). `api_tokens.rotation_initiator`
+  (migration v3) durably stamps the operator onto the successor row at
+  mint time, inside the same locked transaction; `confirm_rotation` now
+  resolves the identity check via `ApiTokenStore::resolve_rotation_initiator`
+  — RAM first, the durable column as the restart-recovery fallback, fail
+  closed on disagreement, empty never a wildcard. A pair already in flight
+  when v3 shipped has no durable value and stays unconfirmable after a
+  restart by design — that does NOT strand the principal: the T12 sweep
+  (§7 bullet 3 above) resolves the pair on the timer PROVIDED the successor
+  was presented at least once (`last_used_at != 0`) — the same UP-5
+  carve-out that gates every other sweep resolution (§7 bullet 2 above). If
+  the successor was never presented at all, the sweep never resolves this
+  pair (by design — see the UP-5 carve-out), so the correct response is NOT
+  to do nothing: either confirm once the successor genuinely is in use, or
+  revoke the specific credential no longer trusted via
+  `DELETE /api/v1/tokens/{token_id}` (an
+  engine credential is an ordinary API token row; an admin may revoke any
+  token) — **never** the principal-level `DELETE
+  /api/v1/engine-principals/{id}` runbook above, which is terminal and
+  destroys BOTH credentials plus the principal itself, not just the one
+  side that needs discarding. The raw successor secret's short
+  re-serve window (step 1 above) is unaffected and stays RAM-only, since a
+  one-time reveal must not become durable. The human-token rotation feature
+  (`docs/auth-architecture.md` "Human API-token rotation") shares this same
+  fix — one chokepoint, both arms.
 - This is the platform's first rotation workflow (the gap matrix in
   `.claude/skills/auth-and-authz/SKILL.md` lists token rotation as missing
   for all types); the design is deliberately credential-generic so the

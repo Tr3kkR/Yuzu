@@ -157,8 +157,17 @@ public:
             // Scoped: released before the store ctor takes its own lease.
             auto lease = bundle.pool->acquire();
             REQUIRE(lease);
+            // #2964: `rotation_retention_meta` (the T12 sweep's clock-guard
+            // durable state — `last_pass_now`/`last_anomaly_facts`/
+            // `bootstrap_settled`) must be reset alongside `api_tokens`, or a
+            // fixture reusing this shared bundle inherits a PREVIOUS
+            // fixture's anchor/dedup state and its sweep-guard assertions
+            // (bootstrap decline, anomaly dedup, big-step) silently observe
+            // the wrong pass history.
             auto trunc = yuzu::server::pg::exec_params(
-                lease.get(), "TRUNCATE api_token_store.api_tokens RESTART IDENTITY CASCADE",
+                lease.get(),
+                "TRUNCATE api_token_store.api_tokens, api_token_store.rotation_retention_meta "
+                "RESTART IDENTITY CASCADE",
                 std::vector<std::string>{});
             INFO("[ApiTokenStorePgShared] reset: " << PQresultErrorMessage(trunc.get()));
             REQUIRE(trunc.status() == PGRES_COMMAND_OK);

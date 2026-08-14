@@ -60,6 +60,17 @@ failure — restore the schema or redeploy from a clean database. (A *transient*
 store error while the server is already running just degrades `/auto` to an
 "unavailable" note; it does not take the server down.)
 
+A **transient failure reading the response store** while a run is still going
+(separate from the run store above — this is the store holding each check's
+agent results) shows a "temporarily unavailable, retrying" banner on the result
+page and keeps showing the last state that was actually confirmed; it never
+shows a device as newly failed or incomplete just because a read hiccuped, and
+it retries automatically on the next poll. This matters because a device's
+result also feeds **Deploy**'s go/no-go cohort (see below): a device that has
+genuinely passed pre-flight stays counted as passed through a momentary read
+failure, rather than dropping out of the cohort until the run is manually
+re-checked.
+
 ## Verify — before / after performance
 
 The **Verify** stage at the bottom of `/auto` answers a different question from

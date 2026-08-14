@@ -118,11 +118,12 @@ inline constexpr std::int64_t kMcpHandoverRetryAfterMs = 5000;
 
 /// `retry_after_ms` for a streamed-POST admission denial. Deliberately NOT the GET
 /// figure above: a GET slot frees when a dead peer is detected (one tick plus a
-/// write failure), but a streamed-POST slot is held until the WORK finishes or the
-/// response cap elapses. Advising 5 s there has a conforming client burn ~24 full
-/// auth + rate-limit + routing passes before a slot could possibly free - retry
-/// amplification on exactly the surface agentic workers hammer. A quarter of the
-/// cap is a floor that can actually be true.
+/// write failure), but a streamed-POST slot is held until the WORK finishes or cap
+/// settlement completes (#2739: the cap, then one drain pass, then the settle
+/// pass - not the bare cap instant). Advising 5 s there has a conforming client
+/// burn ~24 full auth + rate-limit + routing passes before a slot could possibly
+/// free - retry amplification on exactly the surface agentic workers hammer. A
+/// quarter of the cap is a floor that can actually be true.
 inline constexpr std::int64_t kMcpStreamedPostRetryAfterMs = 30000;
 
 /// Ring / sink frames are the shared `detail::SseEvent` (whose `id` field carries
@@ -179,8 +180,9 @@ enum class McpStreamClose {
     kInternalError,      ///< the pump caught an exception — OUR fault, not the client's
     // The next four are produced ONLY by the streamed-POST surface (2f PR 3b); the GET pump
     // never emits them. Declared here so to_string / close_remediation / the metric seed cover
-    // the whole closed reason set from C4. Their producer code shipped in 3b, but only runs
-    // when --mcp-enable-streamed-post is set (not the default): the POST pump emits all four.
+    // the whole closed reason set from C4. Their producer code shipped in 3b and runs whenever
+    // --mcp-enable-streamed-post is set, which is now the default: the POST pump emits all four
+    // unless an operator has opted out with --no-mcp-streamed-post.
     kCancelled,          ///< the client sent notifications/cancelled; the execution continues
     kCapExpired,         ///< the streamed-POST response time cap elapsed; the execution continues
     kRecordGone,         ///< the bridge can no longer serve this key (erased, or shutting down)
@@ -364,11 +366,86 @@ public:
     /// terminals, not unconditionally: see the degraded case below.
     ///
     /// The pin is written only AFTER the frame commits, so a pre-commit failure leaves no
-    /// ghost pin and consumes no id. A committed final with no free pin slot should be
-    /// unreachable - the bridge admits streamed records against `pinned_count() + unpinned`
-    /// and this array is sized to exactly that cap - so reaching it means ADMISSION
-    /// ACCOUNTING HAS DRIFTED, reported by `yuzu_mcp_stream_pin_displaced_total` (alertable
-    /// on > 0). In that state the slots degrade as an LRU: the OLDEST pin yields to the
+    /// ghost pin and consumes no id.
+    ///
+    /// ### What a FULL PIN-SLOT SET means  <a name="full-slot-set"></a>
+    ///
+    /// **This block owns the DERIVATION.** The operator-facing surfaces - the runbook,
+    /// `/metrics` HELP, the alert annotations, the user manual - each carry their own
+    /// short, self-contained statement, because an SRE holding a shipped container image
+    /// does not have this file. They are NOT citations-in-place-of-content and this block
+    /// does not claim they are: an earlier revision asserted "none of them restate it",
+    /// which was false at all five sites it named.
+    ///
+    /// What this block is for: the arithmetic below is a proof obligation over
+    /// `McpStreamBridge::reserve`'s admission expression and `publish_impl`'s slot scan.
+    /// Change either and re-prove it HERE first, then propagate. The reason to keep one
+    /// authoritative derivation is that when #2740 falsified the old claim, successive
+    /// review rounds each found and fixed a different subset of its paraphrases - and the
+    /// round that introduced this block still got the arithmetic wrong in two places and
+    /// shipped one of them into an alert expression.
+    ///
+    /// Before #2740: a committed final with no free pin slot was unreachable - the bridge
+    /// admits streamed records against `pinned_count() + unpinned` and this array is sized
+    /// to exactly that cap - so reaching it MEANT admission accounting had drifted.
+    ///
+    /// Since #2740 that inference no longer holds on its own. TWO paths reach a full slot
+    /// set without drift. A third - the admission reclaim - is listed with them because it
+    /// is the mechanism whose two failure arms produce them, but the reclaim itself neither
+    /// over-admits nor displaces. The distinction is load-bearing: an earlier revision called
+    /// all three over-cap paths, and that error was compiled straight into an alert
+    /// expression that then subtracted a non-cause.
+    ///
+    ///   1. the admission reclaim releases a pin DELIBERATELY, to admit a new streamed
+    ///      call in place of a final no wire took delivery of. This does **NOT** put the
+    ///      session over cap and CANNOT by itself cause a displacement: it releases one
+    ///      pin and adds one charge, so the sum is unchanged, the session stays AT cap,
+    ///      and `publish_impl` always finds a free slot. Note a full set was reachable
+    ///      BEFORE #2740 too - that is the lockout this fix exists to end - so the reclaim
+    ///      is why a session at a full set can now be ADMITTED, never why the set is
+    ///      reachable;
+    ///   2. #2795 - the release returns without having cleared the slot, because another
+    ///      route got there first. AT MOST one over cap, not certainly: the slot may
+    ///      genuinely have opened, in which case there is no over-admission at all. Client-reachable (racing a GET resume against a POST
+    ///      admission on the same session). Counted as
+    ///      `yuzu_mcp_bridge_pin_release_raced_total`;
+    ///   3. #2805 - the release throws and is contained. Needs a broken platform mutex,
+    ///      so not client-reachable. Counted as `yuzu_mcp_bridge_pin_release_failed_total`.
+    ///
+    /// (#2794 is NOT one of these. It is a separate class - a torn-down record shielding
+    /// its pin from the orphan scan - and does not put a session over cap.)
+    ///
+    /// THE BOUND IS EXACTLY ONE, and it cannot compound: admission requires
+    /// `effective_pinned + unpinned < kMaxStreamedPostsPerSession` (note the strict `<`,
+    /// and that `effective_pinned` already subtracts the at-most-one reclaim) and adds
+    /// exactly one charge, and
+    /// `reclaimed` is capped at 1 per pass, so the post-state is at most cap + 1. The next
+    /// `reserve` re-reads both figures under the same `bridge_mu_` and rejects.
+    ///
+    /// "Transiently" is held for the LIFETIME OF THE OVER-ADMITTED CALL. It ends when the
+    /// last outstanding charge settles into the full array and displaces, or when the extra
+    /// pin clears by another route. It does NOT end when the next admission rejects: a
+    /// rejection mutates nothing, so it bounds GROWTH, not duration. The bound is the #2739
+    /// streamed-POST response cap, or the teardown reaper if the execution never settles.
+    /// Idleness is not the variable.
+    ///
+    /// AND THE NETTING MUST NEVER COME BACK, at any scope. Not a tuning judgement: this
+    /// counter is per-SESSION state, while both residual counters are UNLABELLED
+    /// PROCESS-WIDE totals. Any subtraction nets session A's residual against session B's
+    /// displacement, and a session label is ruled out by the bounded-label convention, so
+    /// the join can never exist. A residual also explains a displacement up to a response
+    /// cap later, straddling any window. If automation is ever wanted it is a RECORDING
+    /// rule producing a named "unexplained" series ALONGSIDE a retained raw `> 0` alert -
+    /// never a subtraction inside the alerting expression.
+    ///
+    /// So a full slot set is a SIGNAL TO CORROBORATE, not a verdict. Drift is what remains
+    /// after the two OVER-CAP paths above (2 and 3) are ruled out against their counters -
+    /// path 1 explains nothing, because it never puts the session over cap - and note that
+    /// ruling out is only possible at all because (2) got its own counter; it previously
+    /// moved none, which is precisely how a runbook came to instruct on-call to rule it out
+    /// using two counters that both read flat in that exact case.
+    ///
+    /// In the degraded state the slots behave as an LRU: the OLDEST pin yields to the
     /// newest, because the newest terminal is the one a client is likeliest still waiting to
     /// resume while the oldest has almost certainly been consumed. The displaced final stays
     /// committed and remains in the ring until ordinary eviction reaches it - it loses its
@@ -378,11 +455,24 @@ public:
     /// so "almost certainly been consumed" is a likelihood, not a fact. Saying otherwise
     /// matters because the sweep cannot tell a displaced pin from a cursor-acknowledged
     /// one and records both as terminal_delivered - a wrong audit fact rather than a
-    /// wrong comment. That gap is fixed in the follow-up PR (a tri-state pin status).
+    /// wrong comment. STILL OPEN, and #2740's admission reclaim widened it by adding a
+    /// third way for a pin to vanish without a client having seen anything. It is
+    /// mitigated, not closed: a reclaim emits `mcp.bridge.pin_displaced_for_admission`
+    /// immediately before the reap, so the trail distinguishes the two causes even
+    /// though the reap's own row does not. A tri-state pin status would close it
+    /// properly; this comment used to promise that as "the follow-up PR", which is the
+    /// PR that wrote this sentence, so the promise was withdrawn rather than re-dated -
+    /// and is now tracked as #2801, because a withdrawn promise with no issue behind it
+    /// is just a lost commitment.
     ///
-    /// The pin is released by unpin() (final written on the POST wire), by attach_and_replay
-    /// when a cursor proves consumption (Last-Event-ID >= its id), by displacement as above,
-    /// or with the whole object. Same return contract and boundary as publish().
+    /// The pin is released by FOUR routes, and they do NOT all mean the client got the
+    /// frame: unpin() when the final was written on the POST wire (it did), attach_and_replay
+    /// when a cursor proves consumption (it did), ring LRU displacement as above (it did
+    /// not — a full slot set; see "What a FULL PIN-SLOT SET means" above), and the
+    /// bridge's admission reclaim (#2740; it did not — the
+    /// session needed the slot for a new streamed call). A pin also dies with the whole
+    /// object. Anything that treats a missing pin as proof of delivery must consult the
+    /// audit trail, not the pin alone. Same return contract and boundary as publish().
     std::uint64_t publish_final(std::string_view event_type, std::string_view data) noexcept;
 
     /// Deterministic fault injection for publish() — TEST SEAM ONLY. The throw sites
@@ -406,6 +496,37 @@ public:
     /// real-final and fallback-final publishes happen inside ONE projector pass, so the
     /// seam cannot be re-armed between them from the test thread.
     void inject_publish_fault_for_test(PublishFault fault, int times = 1);
+
+    /// Deterministic fault injection for unpin() — TEST SEAM ONLY, mirroring the publish
+    /// seam above. It exists because the two accepted residuals of #2740's admission
+    /// reclaim are otherwise unreachable from a single-threaded test: both need the
+    /// release to fail, and one of them needs it to fail by LOSING A RACE, which a test
+    /// cannot stage without the concurrency window tracked as #2791.
+    ///
+    /// Not a convenience. Before this seam the residuals were untestable AND (for the
+    /// raced arm) uncounted, and a runbook was shipped instructing operators to rule the
+    /// raced case out via counters that could not move for it.
+    enum class UnpinFault {
+        kNone,
+        /// Models another route (a resume ack, or a final reaching the wire) having
+        /// cleared the slot between selection and release: unpin returns false WITHOUT
+        /// throwing and without clearing anything (#2795).
+        kRaceLost,
+        /// Models a broken platform mutex: the lock throws (#2805). The bridge contains
+        /// it, because the admission it belongs to has already committed by then.
+        kThrow,
+    };
+    /// `times` arms the same fault for the next N unpins (default 1 = one-shot). A THROWN
+    /// fault still consumes its charge - the counter is decremented before the throw - so
+    /// `times=2` means two throws and then normal service, not a permanently armed seam.
+    void inject_unpin_fault_for_test(UnpinFault fault, int times = 1);
+
+    /// The NEXT `times` close attempts on the poison path throw, modelling close_sink's one
+    /// throw site (the sink's own mutex acquisition) - the fault close_sink itself has no
+    /// seam for. Shared by BOTH poison-path close sites: poison_terminal()'s original close
+    /// and attach_and_replay's poison-branch retry, so `times=2` covers one throw at each.
+    /// One-shot per attempt, consumed under mu_ before the close runs. TEST SEAM ONLY (#2531).
+    void inject_poison_close_fault_for_test(int times = 1);
 
     /// Set a short human-readable log prefix (e.g. the session id) included in publish()'s
     /// rare WARN lines so an operator can attribute a dropped/anomalous frame to a session.
@@ -469,19 +590,44 @@ public:
 
     /// Release the eviction-exemption on a pinned final frame (unpin rule (a): the final was
     /// written on the POST wire). Idempotent - an unknown/already-cleared id is a no-op.
-    void unpin(std::uint64_t id);
+    ///
+    /// Returns TRUE only if THIS call cleared the slot. The bridge's admission reclaim
+    /// (#2740) needs that distinction: it selects a pin, then releases it after the
+    /// admission commits, and in between a resume ack or a delivered final can release the
+    /// same id without holding `bridge_mu_`. Crediting the freed slot on a no-op would admit
+    /// one call over the per-session cap, and reporting one would audit an exemption loss
+    /// that never happened. `[[nodiscard]]` precisely BECAUSE one caller deliberately
+    /// ignores it: the rule-(a) release in `on_final_written` is best-effort and writes
+    /// `(void)`, which makes that choice explicit and stops a future reclaim-shaped caller
+    /// dropping the result silently.
+    [[nodiscard]] bool unpin(std::uint64_t id);
 
     /// True while `id` is a pinned (eviction-exempt) final frame. The 2f bridge sweep polls
     /// this: a parked (ring-only) record whose pin has gone - consumed via a GET resume that
     /// acked past it - can be torn down. Const, cheap (scans the fixed pin array under mu_).
     bool is_pinned(std::uint64_t id) const;
 
+    /// The whole pin array in ONE `mu_` acquisition (0 = empty slot). Two callers
+    /// need the SET, not a membership test: the bridge's admission reclaim has to
+    /// find a pin no record references (an ORPHAN — the sweep's teardown erases a
+    /// record without unpinning, so orphans are reachable and are the one lockout
+    /// shape a record scan can never see), and polling `is_pinned` per candidate
+    /// would take this mutex once per record while the global admission lock is
+    /// held. Returned by value: the caller must not hold `mu_` while it reasons.
+    std::array<std::uint64_t, kMaxStreamedPostsPerSession> pinned_ids_snapshot() const;
+
     /// Poison the session stream: no terminal frame could be delivered (publish_final failed
     /// twice) and the durable result must be fetched by execution_id instead. Sets a sticky
     /// flag so every FUTURE attach fast-fails (AttachStatus::kPoisoned → 410 + remediation)
     /// rather than a client re-attaching and heart-beating forever for a terminal that will
     /// never arrive, and closes any currently-live sink with kInternalError. Idempotent.
-    void poison_terminal();
+    ///
+    /// The flag write is unconditional and durable; the close is best-effort. Its one throw
+    /// site (close_sink's sink mutex acquisition, modelling a broken platform mutex) is
+    /// contained and counted rather than escaping - a client left heart-beating on a failed
+    /// close is not silent, and gets a second close attempt the next time it attaches
+    /// (attach_and_replay's poison branch retries against any still-live stale sink) (#2531).
+    void poison_terminal() noexcept;
 
     std::size_t pinned_count() const;  ///< eviction-exempt frames currently held (observability/tests)
 
@@ -518,6 +664,20 @@ private:
     /// is_pinned() both funnel through it). Scans the fixed pin array - O(pin count).
     bool is_pinned_locked(std::uint64_t id) const;
 
+    /// True (and consumes one) iff a poison-close fault is armed. Assumes mu_ is held -
+    /// the counter is a plain int, not an atomic, because both callers already hold mu_ at
+    /// the point they need to decide. Test seam only (#2531).
+    bool take_poison_close_fault_locked();
+
+    /// The shared contained-close for the poison path: poison_terminal()'s own close and
+    /// attach_and_replay's poison-branch retry both funnel here, so the containment, the
+    /// counter and the log line cannot drift between the two call sites (#2531). Never
+    /// called while mu_ is held - close_sink's lock order (sink->sse->mu, taken outside
+    /// mu_) forbids it, same as close(). `inject_fault` is pre-decided by the caller under
+    /// mu_ (see take_poison_close_fault_locked) since the seam counter is not atomic.
+    void poison_close_contained(const std::shared_ptr<McpStreamSink>& sink,
+                                bool inject_fault) noexcept;
+
     mutable std::mutex mu_;
     std::deque<McpStreamEvent> ring_;
     std::size_t ring_cap_;
@@ -527,7 +687,10 @@ private:
     std::uint64_t evictions_ = 0;
     std::uint64_t generation_ = 0;
     PublishFault publish_fault_ = PublishFault::kNone;  ///< test seam; guarded by mu_
+    UnpinFault unpin_fault_ = UnpinFault::kNone;       ///< test seam; guarded by mu_
+    int unpin_fault_remaining_ = 0;                    ///< unpins left that consume it
     int publish_fault_remaining_ = 0;  ///< publishes left that consume publish_fault_; guarded by mu_
+    int poison_close_fault_remaining_ = 0;  ///< test seam; guarded by mu_ (#2531)
     // Write-once at mint before the stream is shared (set_log_context contract); read
     // unlocked in publish()'s WARN paths. Never mutated after the stream goes live.
     std::string log_context_;
@@ -731,9 +894,9 @@ private:
 ///    WAKE CHANNEL: the projector pokes it, and the pump then asks the bridge
 ///    what to write. Nothing ever enqueues onto that queue.
 ///  - It has a response CAP. The GET channel is open-ended; a POST response is
-///    a request/response exchange, so it is MEANT to be bounded (#2739: the cap does
-///    not fire while progress keeps arriving - the reason streamed POST ships off by
-///    default) and the execution continues
+///    a request/response exchange, so it is MEANT to be bounded (#2739, fixed: the cap
+///    now fires on a busy execution, via the drain-then-settle state in
+///    McpStreamBridge::project_record) and the execution continues
 ///    server-side past the close. That needs a clock of its own, because
 ///    RevalidateGrace privately owns the one injected into it.
 ///  - It NEVER closes the session's stream state. The GET pump owns that stream;

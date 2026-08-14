@@ -28,6 +28,7 @@
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
@@ -44,7 +45,9 @@
 #include <chrono>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -54,6 +57,18 @@ namespace fs = std::filesystem;
 using namespace yuzu::server;
 
 namespace {
+
+// AuditStore migrated to Postgres (ADR-0006) — the harness below clones this
+// pre-migrated template instead of opening a SQLite path. Self-contained
+// (mirrors yuzu::test::AuthDbPg, already embedded in the harness): SKIPs the
+// enclosing TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset (via auth_db's own
+// ctor, constructed first), FAILs when set but broken.
+yuzu::test::PgTestTemplate auth_routes_mfa_audit_tpl{"mfaaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mfaaudit template: store failed to migrate");
+}};
 
 /// RAII temp-dir guard. Must be the first member so the directory is
 /// cleaned up even when a later REQUIRE in the harness constructor
@@ -86,6 +101,12 @@ struct AuthRoutesHarness {
     // api_tokens removed (PR 4.1 review #3): this fixture never calls a token
     // store method, and AuthRoutes null-guards the pointer, so it gets nullptr
     // below — embedding the PG fixture only made every case skip without a DSN.
+    // AuditStore ported to Postgres (ADR-0006): a template-cloned ephemeral
+    // database + pool, mirroring auth_db's own self-contained skip/fail
+    // posture above (auth_db constructs first, so an unset DSN never reaches
+    // this member at all).
+    std::optional<yuzu::test::PostgresTestDb> audit_db;
+    std::optional<yuzu::server::pg::PgPool> audit_pool;
     std::unique_ptr<AuditStore> audit_store;
     std::unique_ptr<AnalyticsEventStore> analytics_store;
     std::shared_mutex oidc_mu;
@@ -138,7 +159,11 @@ struct AuthRoutesHarness {
         // salt and wrote the in-memory entry. AuthDB's row is for the
         // is_active check only.
 
-        audit_store = std::make_unique<AuditStore>(tmp.path / "audit.db");
+        audit_db.emplace(auth_routes_mfa_audit_tpl);
+        INFO("[AuthRoutesHarness] audit db status (blank == ok): " << audit_db->error());
+        REQUIRE(audit_db->available());
+        audit_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = audit_db->dsn(), .size = 4});
+        audit_store = std::make_unique<AuditStore>(*audit_pool);
         analytics_store = std::make_unique<AnalyticsEventStore>(tmp.path / "analytics.db");
 
         auth_routes = std::make_unique<AuthRoutes>(
@@ -181,7 +206,9 @@ struct AuthRoutesHarness {
         q.action = action;
         if (!principal.empty())
             q.principal = principal;
-        return static_cast<int>(audit_store->query(q).size());
+        auto res = audit_store->query(q);
+        REQUIRE(res.has_value());
+        return static_cast<int>(res->size());
     }
 };
 
@@ -469,8 +496,9 @@ TEST_CASE("POST /login/mfa attempts cap erases pending after 5 failures",
     AuditQuery q;
     q.action = "mfa.login.failed";
     auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool saw_exhausted = false;
-    for (const auto& r : rows) {
+    for (const auto& r : *rows) {
         if (r.detail.find("attempts exhausted") != std::string::npos) {
             saw_exhausted = true;
             break;
@@ -505,8 +533,9 @@ TEST_CASE("POST /login/mfa strict shape gate routes non-6-digit to recovery path
     AuditQuery q;
     q.action = "mfa.login.failed";
     auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool saw_recovery = false;
-    for (const auto& r : rows) {
+    for (const auto& r : *rows) {
         if (r.detail.find("recovery") != std::string::npos) {
             saw_recovery = true;
             break;
@@ -545,8 +574,9 @@ TEST_CASE("POST /login/mfa pending token expires after TTL", "[pg][mfa][routes][
     AuditQuery q;
     q.action = "mfa.login.failed";
     auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool saw_expired = false;
-    for (const auto& r : rows) {
+    for (const auto& r : *rows) {
         if (r.detail.find("expired") != std::string::npos) {
             saw_expired = true;
             break;
@@ -692,9 +722,10 @@ TEST_CASE("POST /login/mfa/stepup with wrong TOTP returns 401 + mfa.step_up.fail
     q.action = "mfa.step_up.failed";
     q.principal = "admin";
     auto rows = h.audit_store->query(q);
-    REQUIRE_FALSE(rows.empty());
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty());
     bool saw_totp_reject = false;
-    for (const auto& r : rows) {
+    for (const auto& r : *rows) {
         if (r.detail.find("totp code rejected") != std::string::npos) {
             saw_totp_reject = true;
             break;
@@ -837,8 +868,9 @@ TEST_CASE("enrollment token replayed at /login/mfa is rejected",
     AuditQuery q;
     q.action = "mfa.login.failed";
     auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool saw = false;
-    for (const auto& r : rows) {
+    for (const auto& r : *rows) {
         if (r.detail.find("enrollment token used at login-challenge endpoint") !=
             std::string::npos) {
             saw = true;
@@ -868,8 +900,9 @@ TEST_CASE("login-challenge token replayed at /login/mfa/enroll is rejected",
     AuditQuery q;
     q.action = "mfa.enroll.failed";
     auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool saw = false;
-    for (const auto& r : rows) {
+    for (const auto& r : *rows) {
         if (r.detail.find("login-challenge token used at enrollment endpoint") !=
             std::string::npos) {
             saw = true;
@@ -949,8 +982,9 @@ TEST_CASE("POST /login/mfa/enroll attempts cap erases pending after 5 failures",
     AuditQuery q;
     q.action = "mfa.enroll.failed";
     auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool saw_exhausted = false;
-    for (const auto& r : rows) {
+    for (const auto& r : *rows) {
         if (r.detail.find("attempts exhausted") != std::string::npos) {
             saw_exhausted = true;
             break;
@@ -981,8 +1015,9 @@ TEST_CASE("POST /login/mfa/enroll non-6-digit code is rejected as malformed, tok
     AuditQuery q;
     q.action = "mfa.enroll.failed";
     auto rows = h.audit_store->query(q);
+    REQUIRE(rows.has_value());
     bool saw_malformed = false;
-    for (const auto& r : rows) {
+    for (const auto& r : *rows) {
         if (r.detail.find("malformed") != std::string::npos)
             saw_malformed = true;
     }

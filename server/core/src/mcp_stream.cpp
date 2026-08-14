@@ -20,6 +20,7 @@
 #include <random>
 #include <functional>
 #include <string_view>
+#include <stdexcept>  // std::runtime_error - the unpin() fault-injection seam throws it
 #include <system_error>
 #include <utility>
 
@@ -68,13 +69,14 @@ constexpr const char* kMetricFramesTruncated = "yuzu_mcp_stream_frames_too_large
 constexpr const char* kMetricPublishFailures = "yuzu_mcp_stream_publish_failures_total";
 // A committed final response was published with NO pin at all. Structurally unreachable
 // while the pin array is non-empty - a full slot set displaces its oldest pin instead
-// (kMetricPinDisplaced below, which now carries the admission-drift reading). Kept as
+// (kMetricPinDisplaced below). Kept as
 // defence in depth: non-zero means the array was resized to zero or the displacement
 // path was bypassed.
 constexpr const char* kMetricFinalUnpinned = "yuzu_mcp_stream_final_unpinned_total";
-/// An older pinned terminal yielded its eviction-exemption slot to a newer one. NOT expected:
-/// the bridge admits streamed records against `pinned_count() + unpinned`, and the pin array is
-/// sized to exactly that cap, so a full slot set means admission accounting has drifted. This
+/// An older pinned terminal yielded its eviction-exemption slot to a newer one.
+/// The bridge admits streamed records against `pinned_count() + unpinned` and the pin array
+/// is sized to exactly that cap. What a full set MEANS since #2740 is defined once -
+/// see McpStreamState's "What a FULL PIN-SLOT SET means" block in mcp_stream.hpp. This
 /// counter carries that reading (the LRU is the graceful degradation, not a licence).
 constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total";
 /// The final was written to the wire (the client has it), but the bridge's own
@@ -87,6 +89,14 @@ constexpr const char* kMetricPinDisplaced = "yuzu_mcp_stream_pin_displaced_total
 /// increment site) - a credit step that fails to run without throwing is a
 /// distinct failure shape this counter says nothing about.
 constexpr const char* kMetricFinalCreditFailed = "yuzu_mcp_stream_final_credit_failed_total";
+/// A poison-path close (poison_terminal()'s own close, or attach_and_replay's retry of a
+/// stale sink on a poisoned session) failed and was contained. The poison flag itself is
+/// always durable regardless - this counts only whether the CLIENT was actually told, so
+/// a nonzero value means some client may have kept heart-beating on a stream the server
+/// had already given up on until its next attach retried the close. Needs a genuinely
+/// broken platform mutex (close_sink's one throw site), so any nonzero value is a signal
+/// about the host, not a rate to tune. Alert on > 0 (#2531).
+constexpr const char* kMetricPoisonCloseFailures = "yuzu_mcp_stream_poison_close_failures_total";
 
 void count_reject(yuzu::MetricsRegistry* metrics, const char* reason) {
     if (metrics != nullptr) {
@@ -107,6 +117,12 @@ void count_stream_close(yuzu::MetricsRegistry* metrics, McpStreamClose reason) {
 void count_final_credit_failed(yuzu::MetricsRegistry* metrics) {
     if (metrics != nullptr) {
         metrics->counter(kMetricFinalCreditFailed).increment();
+    }
+}
+
+void count_poison_close_failed(yuzu::MetricsRegistry* metrics) {
+    if (metrics != nullptr) {
+        metrics->counter(kMetricPoisonCloseFailures).increment();
     }
 }
 
@@ -338,7 +354,7 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
     std::uint64_t evicted = 0;
     bool oversized = false;
     bool sink_enqueue_failed = false;
-    bool pin_displaced = false; ///< an older pin yielded its slot (admission drift)
+    bool pin_displaced = false; ///< an older pin yielded its slot (corroborate, not a verdict)
     bool pin_unslotted = false; ///< no slot at all (only if the array is size 0)
     bool post_commit_obs_fault = false;  // test seam; tripped inside the post-commit try
     {
@@ -431,12 +447,11 @@ std::uint64_t McpStreamState::publish_impl(std::string_view event_type_view,
         // eviction never touches). Writing the id only now means a pre-commit push_back throw
         // leaves no ghost pin.
         if (pinned) {
-            // WHAT HAPPENS WHEN THE SLOTS ARE FULL. Reaching this state means admission
-            // accounting has already drifted: `publish_final` runs only for a kRingOnly
-            // record (`publish_terminal_ladder`), the bridge admits streamed records against
-            // `pinned_count() + unpinned >= kMaxStreamedPostsPerSession`, and the array is
-            // sized to exactly that cap - so a full set should be unreachable. It is a
-            // DRIFT SIGNAL, not an ordinary event, and `pin_displaced_total` is alertable.
+            // WHAT HAPPENS WHEN THE SLOTS ARE FULL. What a full set MEANS is defined
+            // once - see McpStreamState's "What a FULL PIN-SLOT SET means" block in
+            // mcp_stream.hpp - and is deliberately not restated here. Since #2740 it is
+            // a signal to CORROBORATE, not a verdict: the state is reachable, so this
+            // branch is a real degradation path rather than an impossible one.
             //
             // But the old fallback made the drift worse than it needed to be: it committed
             // the newest terminal UNPINNED, which is the wrong one to sacrifice. A pin
@@ -596,7 +611,7 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
     std::shared_ptr<McpStreamSink> superseded;
     sse_bus::StreamBudget::Lease new_lease;
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::unique_lock<std::mutex> lk(mu_);
 
         // 0. Poison. A terminal frame could not be delivered (publish_final failed twice),
         //    so this stream will never carry its final - fail every attach fast with a 410
@@ -605,6 +620,14 @@ McpStreamState::AttachResult McpStreamState::attach_and_replay(std::uint64_t las
         //    regardless of cursor.
         if (terminal_poisoned_) {
             out.status = AttachStatus::kPoisoned;
+            std::shared_ptr<McpStreamSink> stale_live = live_;
+            const bool inject_fault = take_poison_close_fault_locked();
+            lk.unlock();  // lock order: close_sink takes sink->sse->mu, never under mu_
+            // Poisoning is sticky and idempotent: retry the close poison_terminal()
+            // attempted, in case IT was contained (#2531) - a stale live client would
+            // otherwise never learn its stream is gone until its own timeout, however
+            // long that is.
+            poison_close_contained(stale_live, inject_fault);
             return out;
         }
 
@@ -841,17 +864,50 @@ bool McpStreamState::is_pinned(std::uint64_t id) const {
     return is_pinned_locked(id);
 }
 
-void McpStreamState::unpin(std::uint64_t id) {
+void McpStreamState::inject_unpin_fault_for_test(UnpinFault fault, int times) {
+    std::lock_guard<std::mutex> lk(mu_);
+    unpin_fault_ = fault;
+    unpin_fault_remaining_ = fault == UnpinFault::kNone ? 0 : times;
+}
+
+void McpStreamState::inject_poison_close_fault_for_test(int times) {
+    std::lock_guard<std::mutex> lk(mu_);
+    poison_close_fault_remaining_ = times;
+}
+
+bool McpStreamState::unpin(std::uint64_t id) {
     if (id == 0) {
-        return;
+        return false;
     }
     std::lock_guard<std::mutex> lk(mu_);
-    for (auto& slot : pinned_ids_) {
-        if (slot == id) {
-            slot = 0; // now evictable; a later publish may reclaim its ring space
-            return;   // ids are unique - at most one slot holds it
+    // TEST SEAM (see UnpinFault). Consumed BEFORE the scan so an armed fault models the
+    // failure regardless of whether the id is still pinned - which is the point for
+    // kRaceLost, whose whole premise is that another route already cleared it.
+    if (unpin_fault_remaining_ > 0) {
+        const UnpinFault fault = unpin_fault_;
+        if (--unpin_fault_remaining_ == 0) {
+            unpin_fault_ = UnpinFault::kNone;
+        }
+        if (fault == UnpinFault::kThrow) {
+            throw std::runtime_error("injected unpin fault");
+        }
+        if (fault == UnpinFault::kRaceLost) {
+            return false;
         }
     }
+    for (auto& slot : pinned_ids_) {
+        if (slot == id) {
+            slot = 0;    // now evictable; a later publish may reclaim its ring space
+            return true; // ids are unique - at most one slot holds it
+        }
+    }
+    return false; // already released by another route, or never pinned
+}
+
+std::array<std::uint64_t, kMaxStreamedPostsPerSession> McpStreamState::pinned_ids_snapshot()
+    const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return pinned_ids_;
 }
 
 std::size_t McpStreamState::pinned_count() const {
@@ -865,17 +921,49 @@ std::size_t McpStreamState::pinned_count() const {
     return n;
 }
 
-void McpStreamState::poison_terminal() {
+bool McpStreamState::take_poison_close_fault_locked() {
+    if (poison_close_fault_remaining_ > 0) {
+        --poison_close_fault_remaining_;
+        return true;
+    }
+    return false;
+}
+
+void McpStreamState::poison_close_contained(const std::shared_ptr<McpStreamSink>& sink,
+                                            bool inject_fault) noexcept {
+    // BEST-EFFORT: close_sink's one throw site is the sink's own mutex acquisition (a
+    // genuinely broken platform mutex). The poison flag is already durable regardless of
+    // what happens here, so a close failure must not escape - it is counted, logged, and
+    // left for the next attach's retry rather than silently heart-beating forever (#2531).
+    try {
+        if (inject_fault) {
+            throw std::runtime_error("injected poison-close fault (test seam)");
+        }
+        close_sink(sink, McpStreamClose::kInternalError);
+    } catch (...) {
+        try {
+            count_poison_close_failed(metrics_);
+            spdlog::warn("MCP stream poison [{}]: close of a live/stale sink failed and was "
+                         "contained; the client may keep heart-beating until its next attach",
+                         log_context_);
+        } catch (...) {  // NOLINT(bugprone-empty-catch) — nothing left we could safely do
+        }
+    }
+}
+
+void McpStreamState::poison_terminal() noexcept {
     std::shared_ptr<McpStreamSink> live;
+    bool inject_fault = false;
     {
         std::lock_guard<std::mutex> lk(mu_);
         terminal_poisoned_ = true; // sticky - every future attach_and_replay 410s
         live = live_;
+        inject_fault = take_poison_close_fault_locked();
     }
     // Close any currently-live GET sink honestly rather than leave it heart-beating for a
     // terminal that will never come. Outside mu_ (lock order), like close(). Idempotent:
     // a second poison_terminal() just re-sets the flag and re-closes an already-closed sink.
-    close_sink(live, McpStreamClose::kInternalError);
+    poison_close_contained(live, inject_fault);
 }
 
 std::uint64_t McpStreamState::current_generation() const {
@@ -1500,7 +1588,11 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
     }
 
     for (const auto& frame : batch.progress) {
-        if (!write_all(write, sse_bus::format_sse(sse_bus::SseEvent{"message", frame}))) {
+        // #2785: the replay-ring event id rides the SSE `id:` line (3-arg
+        // SseEvent; format_sse omits the line for 0) so a POST-only client can
+        // build a `Last-Event-ID` resume cursor from the frames it actually saw.
+        if (!write_all(write, sse_bus::format_sse(
+                                  sse_bus::SseEvent{"message", frame.data, frame.event_id}))) {
             return finish(write, McpStreamClose::kClientGone);
         }
     }
@@ -1509,8 +1601,9 @@ bool McpPostPump::pump_once_impl(const WriteFn& write) {
         // The final goes LAST and is followed by EOF - the spec's
         // progress-before-response ordering, which the 3a GET-after-response
         // shape could not provide.
-        if (!write_all(write, sse_bus::format_sse(
-                                  sse_bus::SseEvent{"message", *batch.final_frame}))) {
+        if (!write_all(write,
+                       sse_bus::format_sse(sse_bus::SseEvent{"message", batch.final_frame->data,
+                                                             batch.final_frame->event_id}))) {
             return finish(write, McpStreamClose::kClientGone);
         }
         if (on_final_written_) {
@@ -1572,9 +1665,9 @@ void handle_get_tail(const httplib::Request& req, httplib::Response& res,
         // Only a prefix of the session id reaches the audit row — enough to join a
         // reject to its stream, never enough to replay it. Sanitized because the id is
         // an attacker-controlled HEADER until it validates: raw bytes here could inject
-        // `;`/`=` field separators or CR/LF into a "k=v;k=v" audit detail that SIEM
-        // tooling parses (yuzu::server::detail::sanitize_detail_value, the convention
-        // for every externally-controlled audit string).
+        // `;`/`=` field separators into a "k=v;k=v" audit detail that SIEM tooling
+        // parses (yuzu::server::detail::sanitize_detail_value, the convention for
+        // every externally-controlled audit string).
         (void)audit("mcp.session.reject", "failure",
                     yuzu::server::detail::sanitize_detail_value(sid.substr(0, 8)),
                     std::string("reason=") + reason + " cid=" + cid);

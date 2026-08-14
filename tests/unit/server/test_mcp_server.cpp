@@ -26,8 +26,10 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "approval_manager.hpp"
 #include "auth_routes.hpp"           // real-AuthRoutes integration test (C1)
+#include "sqlite_raii.hpp"
 #include <yuzu/server/server.hpp>     // Config (real-AuthRoutes integration test)
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "ca_store.hpp"
 #include "discover_routes.hpp"     // A2 discovery builders (Issue 17.1)
 #include "event_bus.hpp"
@@ -54,19 +56,32 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <memory>
 #include <set>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
 
 #include "../test_helpers.hpp"
+#include "pg/pg_pool.hpp"
 
 using namespace yuzu::server::mcp;
 using namespace yuzu::server;
+
+namespace {
+// AuditStore migrated to Postgres (ADR-0006) — "MCP AuditStore: query with
+// mcp_tool field" below clones this pre-migrated template instead of opening
+// a SQLite path.
+yuzu::test::PgTestTemplate mcp_audit_tpl{"mcpaudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mcpaudit template: store failed to migrate");
+}};
+} // namespace
 
 // ── JSON-RPC 2.0 parsing ─────────────────────────────────────────────────
 
@@ -231,6 +246,30 @@ TEST_CASE("MCP Policy: operator tier allows Read + Tag Write + Execute", "[mcp][
     CHECK(!tier_allows("operator", "UserManagement", "Write"));
     CHECK(!tier_allows("operator", "Security", "Write"));
     CHECK(!tier_allows("operator", "ManagementGroup", "Write"));
+}
+
+// P2 #11 security regression guard: operator-tier ApiToken:Write must stay
+// blocked. Full narrative (two abandoned fix attempts + why the shipped
+// ApiToken:Rotate split is correct) lives ONCE, at mcp_policy.hpp's
+// tier_allows() operator-tier comment — this pins only the answer.
+TEST_CASE("MCP Policy: operator tier does NOT allow ApiToken:Write "
+          "(round-3/4 security regression guard)",
+          "[mcp][policy][security]") {
+    CHECK_FALSE(tier_allows("operator", "ApiToken", "Write"));
+    // Confirm this isn't accidentally exempted by the same route/op the two
+    // rotation tools' RBAC check separately consults — Read stays allowed by
+    // the ordinary operator "Read on everything" rule, but Write must not be.
+    CHECK(tier_allows("operator", "ApiToken", "Read"));
+}
+
+// Positive half of the same finding — operator tier DOES allow the shipped
+// ApiToken:Rotate operation (see mcp_policy.hpp for why). REST-transport
+// twin: test_auth_routes.cpp's "operator MCP tier IS allowed ApiToken:Rotate"
+// on AuthRoutes::require_permission.
+TEST_CASE("MCP Policy: operator tier DOES allow the distinct ApiToken:Rotate "
+          "operation",
+          "[mcp][policy][security]") {
+    CHECK(tier_allows("operator", "ApiToken", "Rotate"));
 }
 
 TEST_CASE("MCP Policy: supervised tier allows everything", "[mcp][policy]") {
@@ -469,8 +508,21 @@ TEST_CASE("MCP TagStore: get_all_tags and agents_with_tag", "[mcp][tag]") {
 
 // ── Response store integration (used by query_responses) ──────────────────
 
-TEST_CASE("MCP ResponseStore: query with filters", "[mcp][response]") {
-    ResponseStore store(":memory:");
+namespace {
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
+} // namespace
+
+TEST_CASE("MCP ResponseStore: query with filters", "[pg][mcp][response]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     StoredResponse r1;
@@ -490,13 +542,15 @@ TEST_CASE("MCP ResponseStore: query with filters", "[mcp][response]") {
     // Query all for instruction
     ResponseQuery rq;
     auto results = store.query("instr-1", rq);
-    CHECK(results.size() == 2);
+    REQUIRE(results.has_value());
+    CHECK(results->size() == 2);
 
     // Query filtered by agent
     rq.agent_id = "agent-1";
     results = store.query("instr-1", rq);
-    CHECK(results.size() == 1);
-    CHECK(results[0].agent_id == "agent-1");
+    REQUIRE(results.has_value());
+    CHECK(results->size() == 1);
+    CHECK((*results)[0].agent_id == "agent-1");
 }
 
 // ── Instruction store integration (used by list_definitions) ──────────────
@@ -528,8 +582,10 @@ TEST_CASE("MCP InstructionStore: query definitions", "[mcp][instruction]") {
 
 // ── Audit store integration (used by query_audit_log) ─────────────────────
 
-TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
-    AuditStore store(":memory:");
+TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
     REQUIRE(store.is_open());
 
     AuditEvent evt;
@@ -544,8 +600,9 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
     AuditQuery aq;
     aq.principal = "mcp-admin";
     auto events = store.query(aq);
-    REQUIRE(events.size() >= 1);
-    CHECK(events[0].action == "mcp.list_agents");
+    REQUIRE(events.has_value());
+    REQUIRE(events->size() >= 1);
+    CHECK((*events)[0].action == "mcp.list_agents");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -583,6 +640,22 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[mcp][audit]") {
 #include <vector>
 
 namespace {
+// Pre-migrated template for RbacStore (PG port). Shares the "rbacstore" key
+// with test_rbac_store.cpp's own template (identical setup, replay-verified
+// — docs/postgres-store-playbook.md step 7). Every TEST_CASE below just
+// needs an OPEN RbacStore to satisfy the #1717 fail-closed guard, not RBAC
+// behavior itself.
+yuzu::test::PgTestTemplate mcp_rbac_tpl{"rbacstore", [](const std::string& dsn) {
+                                            yuzu::server::pg::PgPool pool{
+                                                {.conninfo = dsn, .size = 1}};
+                                            yuzu::server::RbacStore store{pool};
+                                            if (!store.is_open())
+                                                throw std::runtime_error(
+                                                    "rbac template: store failed to migrate/seed");
+                                        }};
+} // namespace
+
+namespace {
 
 /// In-process MCP test fixture.
 ///
@@ -602,6 +675,7 @@ struct McpTestServer {
     bool mock_auth_enabled{true};       // false -> auth_fn returns nullopt (401)
     std::vector<std::string> audit_log; // records "action|result" pairs
     std::vector<std::string> audit_details; // records the detail string per audit call (M2)
+    std::vector<std::string> audit_target_ids; // records the target_id string per audit call (#2917)
     bool audit_succeeds_{true};         // false → AuditFn returns false (dropped row)
     bool audit_throws_{false};          // true → AuditFn throws (bad_alloc-class) (#1647)
     bool read_only_mode_{false};        // captured by ref by build_handler
@@ -647,6 +721,11 @@ struct McpTestServer {
     /// the new execution_id exact-correlation collect path. Default nullptr
     /// keeps existing tests on the "Response store unavailable" path.
     yuzu::server::ResponseStore* response_store_for_test{nullptr};
+
+    /// Optionally wire a real AuditStore so query_audit_log can be exercised
+    /// end-to-end through the actual MCP dispatch path. Default nullptr keeps
+    /// every pre-existing test on the "Audit store unavailable" path.
+    yuzu::server::AuditStore* audit_store_for_test{nullptr};
 
     /// PR4 B-2: optionally wire a CaStore + CRL-republish stub so the CA MCP
     /// tools (list_issued_certs / revoke_certificate) can be exercised. Default
@@ -753,11 +832,14 @@ struct McpTestServer {
     /// present Origin). Default nullptr/{} = streaming OFF ⇒ pre-2f behaviour.
     yuzu::server::mcp::McpSessionRegistry* session_registry_for_test{nullptr};
     bool streaming_disabled_{false};
-    /// Streamed POST ships OFF in production while #2739/#2740 are open (see
-    /// Config::mcp_streamed_post_enable). The harness turns it ON so the streamed
-    /// tests exercise the streamed path - without this every one of them would
-    /// silently take the plain path and pass while proving nothing. A test that
-    /// wants the shipped default sets this false explicitly.
+    /// Streamed POST now ships ON in production (see Config::mcp_streamed_post_enable).
+    /// The harness ALSO defaults this true, but for an independent reason: so the
+    /// streamed tests exercise the streamed path - without this every one of them
+    /// would silently take the plain path and pass while proving nothing. The two
+    /// defaults matching is not load-bearing; do not assume they will stay in sync
+    /// without checking (see the harness/Config binding test above the opt-out
+    /// TEST_CASE below). A test that wants the opt-out (--no-mcp-streamed-post)
+    /// posture sets this false explicitly.
     bool streamed_post_enabled_{true};
     std::vector<std::string> allowed_origins_for_test{};
 
@@ -891,10 +973,11 @@ private:
         // a dropped audit row (#1240: AuditFn is bool; revoke surfaces the gap).
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string& /*target_type*/,
-                               const std::string& /*target_id*/,
+                               const std::string& target_id,
                                const std::string& detail) -> bool {
             audit_log.push_back(action + "|" + result);
             audit_details.push_back(detail);
+            audit_target_ids.push_back(target_id);
             if (audit_throws_)
                 throw std::runtime_error("audit DB write blew up"); // bad_alloc-class (#1647)
             return audit_succeeds_;
@@ -942,7 +1025,7 @@ private:
             /*instruction_store=*/instruction_store_for_test,
             /*execution_tracker=*/execution_tracker_for_test,
             /*response_store=*/response_store_for_test,
-            /*audit_store=*/nullptr,
+            /*audit_store=*/audit_store_for_test,
             /*tag_store=*/tag_store_for_test,
             /*inventory_store=*/nullptr,
             /*policy_store=*/nullptr,
@@ -1413,9 +1496,12 @@ TEST_CASE("MCP 2383: registration validator fails closed on table drift", "[mcp]
 // mirrors"); here we only pin the mirror sizes so an accidental edit to one
 // array is caught even when the rbac_store suite is filtered out.
 TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mcp][2g]") {
-    CHECK(rbac_ops_for_test().size() == 7);
-    // 22 + 3 PR1.9a additions (PluginConfig, PluginSecret, UploadGrant).
-    CHECK(rbac_securables_for_test().size() == 25);
+    // 8th op: "Rotate" (P2 #11, SOC 2 CC6.3) — ApiToken-specific, deliberately
+    // distinct from "Write" (see mcp_policy.hpp's tier_allows() operator-tier
+    // comment for why a shared op would have been a privilege escalation).
+    CHECK(rbac_ops_for_test().size() == 8);
+    // 23 + 3 PR1.9a additions (PluginConfig, PluginSecret, UploadGrant).
+    CHECK(rbac_securables_for_test().size() == 26);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
@@ -1584,6 +1670,943 @@ TEST_CASE("MCP confirm_engine_rotation: replay after success is kInvalidParams +
     CHECK(confirm_metric("success") == 1.0); // unchanged by the replay
 }
 
+// ── Human API-token rotation (P2 #11, SOC 2 CC6.3) ──────────────────────────
+//
+// rotate_api_token / confirm_api_token_rotation — MCP twins of POST
+// /api/v1/tokens/{id}/rotate and /confirm. Reuses the SAME
+// engine_credential_store_for_test wiring as the engine arm above (one
+// ApiTokenStore instance backs both).
+
+TEST_CASE("MCP rotate_api_token/confirm_api_token_rotation: self-service round trip at the "
+          "operator tier, successor resolved via the shared helper, audit + confirm metric",
+          "[mcp][pg][token][rotation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t predecessor_expiry = now + 90 * 24 * 3600;
+    // Predecessor carries mcp_tier="operator" to match the session's own
+    // tier below — the authority-inheritance guard (governance Gate 7)
+    // refuses rotation unless the caller's own tier/scope equal the
+    // predecessor's, so this round-trip test's session and predecessor must
+    // agree on tier (empty scope_service on both sides too).
+    REQUIRE(store.create_token("my-key", "test-user", predecessor_expiry, "", "operator")
+                .has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    // ApiToken:Write is reachable at operator (NOT supervised-only like the
+    // engine credential arm) — the whole point of the tier decision under
+    // test.
+    ts.start("operator");
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":950,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+    REQUIRE(rot->status == 200);
+    auto rot_body = nlohmann::json::parse(rot->body);
+    REQUIRE(rot_body.contains("result"));
+    auto rot_payload =
+        nlohmann::json::parse(rot_body["result"]["content"][0]["text"].get<std::string>());
+    REQUIRE_FALSE(rot_payload["raw_token"].get<std::string>().empty());
+    // Pin the TOOL'S OWN response — resolved via the shared
+    // derive_rotation_successor helper (token_rotation_lookup.hpp), not a
+    // private test-side lookup.
+    const auto successor_token_id = rot_payload["token_id"].get<std::string>();
+    REQUIRE_FALSE(successor_token_id.empty());
+    // Lifetime-neutral: successor inherits the predecessor's expires_at
+    // verbatim — never accepted as a caller argument, never recomputed.
+    CHECK(rot_payload["expires_at"].get<int64_t>() == predecessor_expiry);
+    // overlap_expires_at is the PREDECESSOR's own stamp — non-zero, and must
+    // match what the store actually recorded on the predecessor row (never
+    // read off the successor, which never carries one).
+    auto predecessor_row = store.get_token(token_id).value();
+    REQUIRE(predecessor_row.has_value());
+    REQUIRE(predecessor_row->overlap_expires_at > 0);
+    CHECK(rot_payload["overlap_expires_at"].get<int64_t>() ==
+          predecessor_row->overlap_expires_at);
+
+    // Ground truth: the response's token_id really is the structural
+    // successor (its supersedes_token_id links back to the predecessor).
+    auto successor_row = store.get_token(successor_token_id).value();
+    REQUIRE(successor_row.has_value());
+    CHECK(successor_row->supersedes_token_id == token_id);
+
+    // api_token.reveal is the success audit for rotate (mirrors REST/engine).
+    bool reveal_audited = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "api_token.reveal|success")
+            reveal_audited = true;
+    CHECK(reveal_audited);
+
+    auto conf = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":951,)"
+        R"("params":{"name":"confirm_api_token_rotation","arguments":{"token_id":")" +
+        successor_token_id + R"("}}})");
+    REQUIRE(conf->status == 200);
+    auto conf_body = nlohmann::json::parse(conf->body);
+    REQUIRE(conf_body.contains("result"));
+    auto conf_payload =
+        nlohmann::json::parse(conf_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(conf_payload["confirmed"].get<bool>() == true);
+    CHECK(conf_payload["token_id"].get<std::string>() == successor_token_id);
+    CHECK(store.list_active_for_principal("test-user").size() == 1); // predecessor revoked
+
+    bool confirm_audited = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "api_token.confirm|success")
+            confirm_audited = true;
+    CHECK(confirm_audited);
+
+    // Sibling counter to REST's yuzu_api_token_confirm_total{surface="rest"}.
+    CHECK(reg.counter("yuzu_api_token_confirm_total", {{"surface", "mcp"}, {"result", "success"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("MCP rotate_api_token: a committed mint whose successor read-back fails is audited "
+          "'partial', never 'failure' (UP-11) — rotate_token already committed",
+          "[mcp][pg][token][rotation]") {
+    // UP-11: before this fix, the `!successor.found` branch (successor
+    // lookup fails AFTER rotate_token already succeeded and committed) wrote
+    // `api_token.rotate|failure` — a compliance record claiming no
+    // credential exists when one plainly does. Reproduced deterministically
+    // (no threading, no wall-clock race, no pool-timing dependency) via
+    // `test_hook_before_mint_commit_`, which hands the mint's OWN connection
+    // — still mid-transaction, after the successor INSERT/predecessor UPDATE
+    // have already run, right before COMMIT. Poisoning THAT SAME connection
+    // there (renaming a column `list_active_for_principal`'s SELECT
+    // references, but rotate_token's own now-finished reads never will
+    // again) survives the COMMIT and breaks every later query against it —
+    // sanctioned exactly by this hook's own doc comment ("run an invalid
+    // statement on the same connection").
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("my-key", "test-user", now + 90 * 24 * 3600, "", "operator")
+                .has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    store.test_hook_before_mint_commit_ = [&](PGconn* conn) {
+        pg::PgResult r{
+            PQexec(conn, "ALTER TABLE api_token_store.api_tokens RENAME COLUMN name TO up11_gone")};
+        REQUIRE(r.ok());
+    };
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    ts.mock_username = "test-user";
+    ts.start("operator");
+
+    auto rot = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":970,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+
+    REQUIRE(rot);
+    REQUIRE(rot->status == 200); // MCP: transport-level 200, error lives in the JSON-RPC body
+    auto body = nlohmann::json::parse(rot->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("could not be read back") !=
+          std::string::npos);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == 2000); // A5: genuinely retryable
+
+    // THE ASSERTION THIS TEST EXISTS FOR: "partial", never "failure" — the
+    // domain-specific row AND the generic MCP gate-level row both reflect
+    // it, matching every other tool's outcome-string discipline.
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[0] == "api_token.rotate|partial");
+    CHECK(ts.audit_details[0].find("successor") != std::string::npos);
+    CHECK(ts.audit_log[1] == "mcp.rotate_api_token|partial");
+
+    // Ground truth: rotate_token really did mint and commit a live successor
+    // — the audit outcome above must match the database, not contradict it.
+    // Queried via a column list that does NOT touch the now-renamed `name`
+    // column, through a SECOND, independent connection (the pool's own
+    // connections all carry the renamed schema, but that only matters to
+    // queries that reference the missing name).
+    {
+        pg::PgConn side{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(side.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(side.get(),
+                              ("SELECT count(*) FROM api_token_store.api_tokens "
+                               "WHERE supersedes_token_id = '" +
+                               token_id + "' AND revoked = FALSE")
+                                  .c_str())};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(r.get(), 0, 0)) == "1");
+    }
+}
+
+TEST_CASE("MCP rotate_api_token: successor lookup is scoped to the predecessor being rotated, "
+          "not any linked row of the principal (round-3 BLOCKING regression, MCP twin of the "
+          "REST reproduction)",
+          "[mcp][pg][token][rotation][blocking]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    // mcp_tier="operator" on both predecessors, matching the session's own
+    // tier below — the authority-inheritance guard (governance Gate 7)
+    // refuses rotation on a tier mismatch, so an MCP-tiered session can only
+    // rotate a like-tiered predecessor.
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t expiry = now + 89 * 24 * 3600;
+    REQUIRE(store.create_token("token-a", "test-user", expiry, "", "operator").has_value());
+    REQUIRE(store.create_token("token-b", "test-user", expiry, "", "operator").has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(listing.size() == 2);
+    // list_tokens orders newest-first; token-b was created after token-a.
+    const std::string token_b = listing.front().token_id;
+    const std::string token_a = listing.back().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start("operator");
+
+    const auto rotate = [&](const std::string& id, int rpc_id) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                       std::to_string(rpc_id) +
+                       R"(,"params":{"name":"rotate_api_token","arguments":{"token_id":")" + id +
+                       R"("}}})");
+    };
+
+    // Rotate A first — test-user now has an in-flight rotation group for A.
+    auto rot_a = rotate(token_a, 952);
+    REQUIRE(rot_a->status == 200);
+    auto successor_a = nlohmann::json::parse(
+        nlohmann::json::parse(rot_a->body)["result"]["content"][0]["text"].get<std::string>())
+                            ["token_id"]
+                                .get<std::string>();
+
+    // Rotate B while A's rotation is still inside its overlap window — legal
+    // (the <=2-active ceiling is per ROTATION GROUP, never per principal).
+    auto rot_b = rotate(token_b, 953);
+    REQUIRE(rot_b->status == 200);
+    auto successor_b = nlohmann::json::parse(
+        nlohmann::json::parse(rot_b->body)["result"]["content"][0]["text"].get<std::string>())
+                            ["token_id"]
+                                .get<std::string>();
+
+    // The BLOCKING bug an unscoped scan would reproduce: matching "any"
+    // linked row deterministically returns A's successor (minted first) even
+    // though B is the token actually rotated.
+    CHECK(successor_b != successor_a);
+    auto b_row = store.get_token(successor_b).value();
+    REQUIRE(b_row.has_value());
+    CHECK(b_row->supersedes_token_id == token_b);
+
+    // Confirming B's successor must revoke ONLY B's predecessor.
+    auto conf_b = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":954,)"
+        R"("params":{"name":"confirm_api_token_rotation","arguments":{"token_id":")" +
+        successor_b + R"("}}})");
+    REQUIRE(conf_b->status == 200);
+    REQUIRE(nlohmann::json::parse(conf_b->body).contains("result"));
+
+    auto token_b_after = store.get_token(token_b).value();
+    REQUIRE(token_b_after.has_value());
+    CHECK(token_b_after->revoked);
+
+    auto token_a_after = store.get_token(token_a).value();
+    REQUIRE(token_a_after.has_value());
+    CHECK_FALSE(token_a_after->revoked); // A's predecessor must still be LIVE
+}
+
+TEST_CASE("MCP rotate_api_token: non-owner denied — self-service only, no admin bypass, no "
+          "enumeration oracle",
+          "[mcp][pg][token][rotation][owner][idor]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create_token("alice-key", "alice").has_value());
+    auto listing = store.list_tokens("alice").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.mock_username = "bob"; // NOT the owner
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":960,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() == "token not found");
+
+    // Two rows: the domain-specific api_token.rotate|denied (mirrors REST,
+    // detail carries the owner) plus the generic mcp.rotate_api_token|denied
+    // gate-level row every MCP tool call emits — MCP-only, REST has no
+    // equivalent second row.
+    REQUIRE(ts.audit_log.size() == 2);
+    CHECK(ts.audit_log[0] == "api_token.rotate|denied");
+    CHECK(ts.audit_details[0] == "owner=alice");
+    CHECK(ts.audit_log[1] == "mcp.rotate_api_token|denied");
+
+    // Store state unchanged — no rotation started.
+    auto looked_up = store.get_token(token_id).value();
+    REQUIRE(looked_up.has_value());
+    CHECK(looked_up->rotation_group.empty());
+
+    // Response body identical for a genuinely unknown token_id (enumeration
+    // oracle closed) — same "token not found" text, same kInvalidParams code.
+    auto unknown = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":961,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":"deadbeef1234567890"}}})");
+    REQUIRE(unknown->status == 200);
+    auto unknown_body = nlohmann::json::parse(unknown->body);
+    REQUIRE(unknown_body.contains("error"));
+    CHECK(unknown_body["error"]["code"] == body["error"]["code"]);
+    CHECK(unknown_body["error"]["message"] == body["error"]["message"]);
+}
+
+TEST_CASE("MCP rotate_api_token: readonly tier is denied before RBAC (tier-before-RBAC "
+          "ordering), overlap_days out of range rejected before the multiply",
+          "[mcp][pg][token][rotation][policy]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_token("my-key", "test-user").has_value());
+    auto listing = store.list_tokens("test-user").value();
+    REQUIRE(!listing.empty());
+    const std::string token_id = listing.front().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start("readonly"); // readonly allows only Read — ApiToken:Write must be denied
+
+    auto denied = nlohmann::json::parse(
+        ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":970,)"
+                R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+                token_id + R"("}}})")
+            ->body);
+    REQUIRE(denied.contains("error"));
+    CHECK(denied["error"]["code"] == yuzu::server::mcp::kTierDenied);
+    // Store untouched by the tier denial.
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
+
+    // Operator tier passes the tier gate; an out-of-range overlap_days is
+    // rejected by the handler's own bounds check BEFORE the *86400 multiply
+    // (overflow guard, mirrors rotate_engine_credential).
+    McpTestServer ts2;
+    ts2.engine_credential_store_for_test = &store;
+    ts2.start("operator");
+    auto oob = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":971,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"(","overlap_days":3651}}})");
+    REQUIRE(oob->status == 200);
+    auto oob_body = nlohmann::json::parse(oob->body);
+    REQUIRE(oob_body.contains("error"));
+    CHECK(oob_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(oob_body["error"]["message"].get<std::string>().find("overlap_days out of range") !=
+          std::string::npos);
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
+
+    // #2970B (PR #2974 review): overlap_days present but the WRONG JSON TYPE
+    // must be rejected, not silently defaulted to 7. `30.0` is what a Python
+    // or JS client emits for a float, and the old `param_int` returned the
+    // default for it — the range check then passed because 7 is in range, so
+    // the caller asked for 30 days and got 7 with no error. The REST twin
+    // 400s the same shape, and the tool's own schema declares integer.
+    //
+    // Asserted on the STORE as well as the response: a silent default would
+    // have gone on to mint a real successor, so an error-only assertion could
+    // pass while the rotation still happened.
+    McpTestServer ts3;
+    ts3.engine_credential_store_for_test = &store;
+    ts3.start("operator");
+    auto flt = ts3.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":972,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"(","overlap_days":30.0}}})");
+    REQUIRE(flt->status == 200);
+    auto flt_body = nlohmann::json::parse(flt->body);
+    REQUIRE(flt_body.contains("error"));
+    CHECK(flt_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(flt_body["error"]["message"].get<std::string>().find("must be a JSON integer") !=
+          std::string::npos);
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
+
+    // A JSON string is the other shape a loosely-typed client sends.
+    auto str = ts3.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":973,)"
+        R"("params":{"name":"rotate_api_token","arguments":{"token_id":")" +
+        token_id + R"(","overlap_days":"30"}}})");
+    REQUIRE(str->status == 200);
+    auto str_body = nlohmann::json::parse(str->body);
+    REQUIRE(str_body.contains("error"));
+    CHECK(str_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(store.get_token(token_id).value()->rotation_group.empty());
+}
+
+TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drifted "
+          "ticket WITHOUT consuming it (#2443)",
+          "[mcp][pg][engine_principal][confirm][approval]") {
+    // The scenario #2443's issue body names: an approval ticket for
+    // confirm_engine_rotation is minted and approved, then, before it is
+    // recalled, the SAME rotation resolves through a different path (here:
+    // a direct store confirm, standing in for a manual/out-of-band cutover).
+    // Without the precondition wired, the recall would match, CONSUME the
+    // ticket, and only then fail at the handler, burning a human-approved
+    // one-time capability on a no-op. With it wired, the recall must deny
+    // WITHOUT consuming, leaving the ticket recallable.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-precondition";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    // Mint the rotation pair directly at the store (not under test here).
+    REQUIRE(store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "admin").has_value());
+    std::string successor_token_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            successor_token_id = t.token_id;
+    REQUIRE_FALSE(successor_token_id.empty());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_precond_appr-"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised"); // Security:Write requires approval at this tier
+
+    const auto refused_metric = [&]() {
+        return reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "confirm_engine_rotation"}})
+            .value();
+    };
+    CHECK(refused_metric() == 0.0);
+
+    // 1. Mint - no approval_id yet.
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+                            .dump());
+    REQUIRE(mint->status == 200);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    CHECK(mint_body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+
+    // 2. Approve.
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // 3. DRIFT: the rotation resolves out from under the ticket, through a
+    // path that never touches the approval store - the same
+    // `requesting_user` ("admin") that minted it confirms directly.
+    REQUIRE(store.confirm_rotation(principal, successor_token_id, "admin").has_value());
+    REQUIRE(store.list_active_for_principal(principal).size() == 1);
+
+    // 4. Recall. Must be denied - and must NOT be the pre-#2443 "approval
+    // already used" wording, which would misdescribe a ticket that is still
+    // sitting there unconsumed. The client message is deliberately GENERIC
+    // (no rotation-state specifics): the precondition runs before this
+    // tool's own RBAC check, so a specific answer here would be a
+    // credential-state oracle for a tier-eligible, RBAC-less caller.
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id},
+            {"principal_id", principal},
+            {"token_id", successor_token_id}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("error"));
+    const std::string message = recall_body["error"]["message"].get<std::string>();
+    CHECK(message.find("already used") == std::string::npos);
+    CHECK(message.find("already confirmed") == std::string::npos); // NOT leaked pre-RBAC
+    const std::string remediation =
+        recall_body["error"]["data"]["remediation"].get<std::string>();
+    CHECK(remediation.find("NOT consumed") != std::string::npos);
+    // Remediation must not promise a retry will succeed: this drift is
+    // terminal for THIS ticket's pinned token_id.
+    CHECK(remediation.find("retry this exact call") == std::string::npos);
+
+    // 5. The ticket is UNTOUCHED - still consumed_at == 0, still recallable -
+    // not silently burned on the failed recall.
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+    CHECK(row->status == "approved");
+
+    // 6. The generic audit path runs ahead of the kind-specific client
+    // message and carries the specific fact the client message withholds -
+    // confirm both: the kind is named, AND the specific rotation-state fact
+    // is present server-side even though it's absent from the client body.
+    bool precondition_denied_audited = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("approval_id=" + approval_id) != std::string::npos &&
+            d.find("refused: precondition: rotation already confirmed") != std::string::npos)
+            precondition_denied_audited = true;
+    CHECK(precondition_denied_audited);
+
+    // 6b. The generic refusal-rate metric fires too (same shared path, ahead
+    // of the kind-specific branch) - this is what an operator would alert on.
+    CHECK(refused_metric() == 1.0);
+
+    // 7. Handler never ran for the drifted recall - no SECOND success audit
+    // for the credential.confirm domain event beyond what step 3's direct
+    // store call would have produced (none, since that bypassed MCP).
+    CHECK(std::count(ts.audit_log.begin(), ts.audit_log.end(),
+                     std::string("engine_principal.credential.confirm|success")) == 0);
+}
+
+TEST_CASE("MCP confirm_engine_rotation: a NEWER rotation's mismatched pin is caught by "
+          "the precondition, not just confirm_rotation's own check (#2443)",
+          "[mcp][pg][engine_principal][confirm][approval]") {
+    // The burn this closes: `classify_confirm_state` alone would read TWO
+    // active credentials as `kPair` regardless of WHICH pair - so a ticket
+    // pinned to an OLDER rotation's successor, recalled after that rotation
+    // resolved and a NEWER one started, would pass a precondition that only
+    // checked the count, get the ticket consumed, and then fail
+    // confirm_rotation's own token_id pin check. `pair_matches_pin` closes
+    // that gap by checking linkage + pin from the same public data.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-newer-pair";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+
+    // First rotation: predecessor P0 -> successor A.
+    REQUIRE(store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "admin").has_value());
+    std::string token_a;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            token_a = t.token_id;
+    REQUIRE_FALSE(token_a.empty());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_newer_pair_appr-"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    // Mint + approve a ticket pinned to token_a.
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", principal}, {"token_id", token_a}}}}}}
+                            .dump());
+    const std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // DRIFT: token_a's rotation resolves (revoked directly, standing in for
+    // an out-of-band cutover), and a NEW rotation starts - P0 -> successor B.
+    // active is now {P0, B}: still exactly 2 rows, still classify_confirm_state
+    // -> kPair, but the pin the ticket was minted for (token_a) is neither
+    // row.
+    REQUIRE(store.revoke_token(token_a).has_value());
+    REQUIRE(store.list_active_for_principal(principal).size() == 1);
+    REQUIRE(store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "admin").has_value());
+    REQUIRE(store.list_active_for_principal(principal).size() == 2);
+
+    // Recall with the OLD pin (token_a). Must be denied WITHOUT consuming -
+    // not silently pass as kPair and burn on confirm_rotation's own pin
+    // check.
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id}, {"principal_id", principal}, {"token_id", token_a}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("error"));
+
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0); // NOT burned
+    CHECK(row->status == "approved");
+
+    bool precondition_denied_audited = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("approval_id=" + approval_id) != std::string::npos &&
+            d.find("refused: precondition") != std::string::npos)
+            precondition_denied_audited = true;
+    CHECK(precondition_denied_audited);
+}
+
+TEST_CASE("MCP confirm_engine_rotation: precondition ALLOWS an undrifted recall through to "
+          "a successful confirm (#2443)",
+          "[mcp][pg][engine_principal][confirm][approval]") {
+    // Every other #2443 test in this file exercises a DENY branch. None
+    // proves the precondition's allow path (kPair + pair_matches_pin=true ->
+    // `return {}`) actually lets a legitimate, undrifted recall reach the
+    // handler and succeed end-to-end (quality-engineer, Gate 3) - a
+    // regression that flips the switch's default arm to deny-everything
+    // would pass every existing #2443 test in this file while breaking the
+    // tool for every real caller.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-allow-path";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+    // Rotated by "test-user" - McpTestServer's mock session username - so the
+    // recall below actually reaches a REAL confirm_rotation success. Every
+    // sibling #2443 test rotates as "admin" because they all deny before
+    // confirm_rotation's own Hermes F4/F5 initiator-binding check would ever
+    // run; this is the one test where that check is live and must pass.
+    REQUIRE(
+        store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "test-user").has_value());
+    std::string successor_token_id;
+    for (const auto& t : store.list_active_for_principal(principal))
+        if (!t.supersedes_token_id.empty())
+            successor_token_id = t.token_id;
+    REQUIRE_FALSE(successor_token_id.empty());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_allow_appr-"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised");
+
+    const auto refused_metric = [&]() {
+        return reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "confirm_engine_rotation"}})
+            .value();
+    };
+    const auto precondition_denied_metric = [&]() {
+        return reg
+            .counter("yuzu_mcp_approval_precondition_denied_total",
+                     {{"tool", "confirm_engine_rotation"}})
+            .value();
+    };
+
+    // Mint + approve. No drift between approve and recall.
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+                            .dump());
+    const std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // Recall: active is still the clean {predecessor, successor} pair,
+    // linked, pinned to successor_token_id - the precondition's kPair +
+    // pair_matches_pin arm must return {} and let this reach the handler.
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id},
+            {"principal_id", principal},
+            {"token_id", successor_token_id}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("result")); // NOT "error" - the precondition let it through
+    auto result_payload = nlohmann::json::parse(
+        recall_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(result_payload["confirmed"] == true);
+    CHECK(result_payload["principal_id"] == principal);
+
+    // The ticket IS consumed on the success path - this is the mirror image
+    // of every deny-branch test above, which assert consumed_at == 0.
+    // consumed_at is the ONLY consumption signal: `status` has no distinct
+    // "consumed" value and stays "approved" (the consuming CAS is `WHERE
+    // status = 'approved' AND consumed_at = 0`, and never writes `status`).
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at != 0);
+    CHECK(row->status == "approved");
+
+    // Neither refusal counter fired - this recall was never denied.
+    CHECK(refused_metric() == 0.0);
+    CHECK(precondition_denied_metric() == 0.0);
+
+    // The store itself reflects the cutover: successor is now sole active,
+    // confirmed_at stamped.
+    const auto active = store.list_active_for_principal(principal);
+    REQUIRE(active.size() == 1);
+    CHECK(active.front().token_id == successor_token_id);
+    CHECK(active.front().confirmed_at != 0);
+}
+
+TEST_CASE("MCP confirm_engine_rotation: a revoke-to-zero (kNoneActive) denies WITHOUT "
+          "consuming, not a silent pass-through (#2443)",
+          "[mcp][pg][engine_principal][confirm][approval]") {
+    // architect + consistency-auditor (Gate 3/4): an empty active-credential
+    // read is ambiguous with a masked store-read failure, but a precondition
+    // denial never consumes the ticket either way, so "deny, don't guess" is
+    // strictly safer than passing an ambiguous read through to burn the
+    // ticket on what may be a fully-resolved rotation. Drive the active set
+    // to genuinely zero (both pair members revoked) so this test exercises
+    // the real revoke-to-zero cause, not the masked-failure cause.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_engine_referent_check(
+        [](const std::string&) { return yuzu::server::EngineLookupStatus::Active; });
+
+    const std::string principal = "engine:mcp-confirm-revoke-to-zero";
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    REQUIRE(store.create_token("svc", principal, now + 90 * 24 * 3600, "", "readonly", "engine")
+                .has_value());
+    REQUIRE(store.rotate_engine_credential(principal, 7 * 24 * 3600, now, "admin").has_value());
+    std::string predecessor_token_id, successor_token_id;
+    for (const auto& t : store.list_active_for_principal(principal)) {
+        if (!t.supersedes_token_id.empty())
+            successor_token_id = t.token_id;
+        else
+            predecessor_token_id = t.token_id;
+    }
+    REQUIRE_FALSE(successor_token_id.empty());
+    REQUIRE_FALSE(predecessor_token_id.empty());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_confirm_none_active_appr-"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised");
+
+    const auto precondition_denied_metric = [&]() {
+        return reg
+            .counter("yuzu_mcp_approval_precondition_denied_total",
+                     {{"tool", "confirm_engine_rotation"}})
+            .value();
+    };
+
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", principal}, {"token_id", successor_token_id}}}}}}
+                            .dump());
+    const std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // DRIFT: revoke BOTH pair members - active drops to genuinely zero, not
+    // masked by a read failure.
+    REQUIRE(store.revoke_token(predecessor_token_id).has_value());
+    REQUIRE(store.revoke_token(successor_token_id).has_value());
+    REQUIRE(store.list_active_for_principal(principal).empty());
+
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id},
+            {"principal_id", principal},
+            {"token_id", successor_token_id}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("error")); // denied, not passed through to the handler
+
+    // The specific fact stays server-side (audit-only, checked below) - this
+    // precondition runs before RBAC, so a specific answer here would be a
+    // credential-state oracle for a tier-eligible, RBAC-less caller
+    // (security-guardian, Gate 8: regression-pin the anti-oracle property,
+    // not just confirm it by inspection).
+    CHECK(recall->body.find("no active credential") == std::string::npos);
+
+    // The ticket is UNTOUCHED - the whole point of denying instead of
+    // guessing on an ambiguous empty read.
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+    CHECK(row->status == "approved");
+
+    CHECK(precondition_denied_metric() == 1.0);
+
+    bool precondition_denied_audited = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("approval_id=" + approval_id) != std::string::npos &&
+            d.find("refused: precondition: no active credential found") != std::string::npos)
+            precondition_denied_audited = true;
+    CHECK(precondition_denied_audited);
+}
+
+TEST_CASE("MCP confirm_engine_rotation: a closed/unwired engine-credential store "
+          "denies WITHOUT consuming, not a pass-through that burns the ticket "
+          "at the handler's own guard (#2443, fjarvis Gate-8-followup review)",
+          "[mcp][engine_principal][confirm][approval]") {
+    // The precondition's own closed-store check used to `return {}`
+    // (pass-through), reasoning that "the handler's own store-open guard
+    // reports this" - but the handler's guard runs AFTER consume_ticket, not
+    // before, so that pass-through consumed the ticket and only then hit the
+    // handler's guard: burning a human-approved capability on a no-op,
+    // exactly the kNoneActive shape two tests above. No live PG token store
+    // needed here - the whole point is the precondition never reaches one.
+    yuzu::test::TempDbFile adb{
+        std::string_view{"yuzu_test_mcp_confirm_closed_store_appr-"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    // Deliberately NOT set: ts.engine_credential_store_for_test - the
+    // precondition's `!engine_credential_store_` arm is what this test
+    // exercises.
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised");
+
+    const auto precondition_denied_metric = [&]() {
+        return reg
+            .counter("yuzu_mcp_approval_precondition_denied_total",
+                     {{"tool", "confirm_engine_rotation"}})
+            .value();
+    };
+
+    auto mint = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 1},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments", {{"principal_id", "engine:mcp-confirm-closed-store"},
+                         {"token_id", "deadbeefdeadbeefdeadbeef"}}}}}}
+                            .dump());
+    REQUIRE(mint->status == 200);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    auto recall = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 2},
+        {"params",
+         {{"name", "confirm_engine_rotation"},
+          {"arguments",
+           {{"approval_id", approval_id},
+            {"principal_id", "engine:mcp-confirm-closed-store"},
+            {"token_id", "deadbeefdeadbeefdeadbeef"}}}}}}
+                              .dump());
+    REQUIRE(recall->status == 200);
+    auto recall_body = nlohmann::json::parse(recall->body);
+    REQUIRE(recall_body.contains("error")); // denied, not passed through to the handler
+
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0); // NOT burned on a store that was never open
+    CHECK(row->status == "approved");
+
+    CHECK(precondition_denied_metric() == 1.0);
+
+    bool precondition_denied_audited = false;
+    for (const auto& d : ts.audit_details)
+        if (d.find("approval_id=" + approval_id) != std::string::npos &&
+            d.find("refused: precondition: engine credential store unavailable") !=
+                std::string::npos)
+            precondition_denied_audited = true;
+    CHECK(precondition_denied_audited);
+}
+
 // ── 2. ping ─────────────────────────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: ping returns empty result", "[mcp][integration]") {
@@ -1633,6 +2656,41 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
         CHECK(tool.contains("inputSchema"));
         CHECK(tool["inputSchema"].is_object());
         CHECK(tool["inputSchema"].contains("type"));
+    }
+
+    // #2972: mechanical completeness gate for A5's typed-output-schema
+    // requirement (docs/agentic-first-principle.md). Before this, the only
+    // outputSchema check in this file was the get_fleet_posture_fast
+    // special-case below - #2712's own filing named that as the reason the
+    // other ~45 gaps were invisible to CI. This closed, explicit exemption
+    // set is the retrofit backlog #2712 tracks; every tool NOT in it must
+    // advertise outputSchema, or this test fails - so a NEW tool merging
+    // without one fails immediately, and exempting one requires editing
+    // this literal list, a visible reviewable diff line rather than a
+    // silent gap. Mirrors the kToolAnnotation completeness check above
+    // (CHECK(classified == listed)). #2712's three batches (Phase-1 reads,
+    // DEX+network, execute_*/writes) have all landed - this set is now
+    // empty, but kept as the mechanism (not deleted) since it is the
+    // structural gate a NEW tool without a schema fails against.
+    //
+    // CAVEAT (adversarial review of PR #2978, 2026-08-11): this gate checks
+    // outputSchema PRESENCE, not typed-NESS - it does not reject the generic
+    // `kObjectOutputSchema` placeholder ({"type":"object",
+    // "additionalProperties":true}) for a non-exempt tool whose result shape
+    // is actually stable, per docs/agentic-first-principle.md A5 item 4's
+    // own text. assign_engine_role/unassign_engine_role/list_engine_roles
+    // were typed properly as a result of that review; a handful of other
+    // non-exempt tools (the discover_* family, classify_operational_
+    // question, get_incident_playbook, summarize_working_set) still ship
+    // the placeholder and pass this gate anyway - tracked as #2986, not
+    // silently ignored.
+    static const std::set<std::string> kOutputSchemaExempt = {};
+    for (const auto& tool : tools) {
+        const auto name = tool["name"].get<std::string>();
+        if (kOutputSchemaExempt.count(name))
+            continue;
+        INFO("tool = " << name);
+        CHECK(tool.contains("outputSchema"));
     }
 
     // Spot-check specific tool names are present
@@ -1707,6 +2765,20 @@ TEST_CASE("MCP Integration: tools/call list_agents", "[mcp][integration]") {
     CHECK(agents[0]["hostname"] == "web-01");
     CHECK(agents[1]["agent_id"] == "agent-002");
     CHECK(agents[1]["os"] == "windows");
+
+    // #2712: structuredContent wraps the SAME rows under "agents" - a
+    // schema-conformant sibling of content, not a replacement for it. The
+    // bare-array content[0].text above is the pre-#2712 wire shape, unchanged
+    // for backward compat; a client that only reads content[0].text sees no
+    // behavior change at all.
+    REQUIRE(result.contains("structuredContent"));
+    auto& sc = result["structuredContent"];
+    REQUIRE(sc.contains("agents"));
+    REQUIRE(sc["agents"].is_array());
+    CHECK(sc["agents"].size() == 2);
+    CHECK(sc["agents"][0]["agent_id"] == "agent-001");
+    CHECK(sc["agents"][1]["agent_id"] == "agent-002");
+    CHECK(sc["agents"] == agents); // same rows, just wrapped
 
     // Verify audit was recorded
     REQUIRE(ts.audit_log.size() >= 1);
@@ -1803,15 +2875,24 @@ TEST_CASE("MCP Integration: discover_routes matches the OpenAPI-derived catalog"
     CHECK(got.value("source", "") == "openapi");
 }
 
-TEST_CASE("MCP Integration: discover_permissions wired vs unwired", "[mcp][integration][discovery]") {
-    yuzu::server::RbacStore rbac(":memory:");
+TEST_CASE("MCP Integration: discover_permissions wired vs unwired",
+          "[mcp][integration][discovery][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool};
     REQUIRE(rbac.is_open());
 
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
     ts.start("readonly");
 
-    const auto expected = nlohmann::json::parse(yuzu::server::build_permissions_catalog(rbac).json);
+    // include_roles=true: the harness's perm_fn allows every permission unless a
+    // test installs perm_override_for_test, so this caller holds UserManagement:Read
+    // and gets the full grid. The DENIED case is the next test — #2376 split the
+    // catalogue so the role grid needs UserManagement:Read while the taxonomy does not.
+    const auto expected =
+        nlohmann::json::parse(yuzu::server::build_permissions_catalog(rbac, true).json);
 
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":22,"params":{"name":"discover_permissions"}})");
@@ -1822,6 +2903,50 @@ TEST_CASE("MCP Integration: discover_permissions wired vs unwired", "[mcp][integ
         nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
     CHECK(got == expected);
     CHECK_FALSE(got["securable_types"].empty());
+    CHECK(got.contains("roles")); // the grid IS present for a UserManagement:Read holder
+
+    // #2376 — the floor bypass this split closes. discover_permissions is gated
+    // Infrastructure:Read, which is NOT floored and which every authenticated
+    // session holds on an RBAC-off install via the legacy Read-allow. Before the
+    // split it therefore served the complete role -> permission grid to a caller
+    // the floor had just refused at /rbac/roles: a strictly larger disclosure than
+    // the floored route, through an alternate transport. Found by the adversarial
+    // panel AFTER a 14-agent governance run passed the change.
+    //
+    // Deny ONLY UserManagement:Read: the tool itself must still succeed on its own
+    // Infrastructure:Read gate, and the taxonomy must still be served — the split
+    // exists so A2 discovery of the permission MODEL survives.
+    {
+        // The denial comes from perm_override_for_test below, not from a
+        // special store state — the outer PG-backed `rbac` (already open and
+        // seeded) is reused rather than opening a second store.
+        McpTestServer ts_denied;
+        ts_denied.rbac_store_for_test = &rbac;
+        ts_denied.perm_override_for_test = [](const std::string& securable,
+                                              const std::string& operation) {
+            return !(securable == "UserManagement" && operation == "Read");
+        };
+        ts_denied.start("readonly");
+
+        auto res_d = ts_denied.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":24,"params":{"name":"discover_permissions"}})");
+        REQUIRE(res_d);
+        CHECK(res_d->status == 200);
+        auto body_d = nlohmann::json::parse(res_d->body);
+        REQUIRE(body_d.contains("result")); // the TOOL still succeeds
+        auto got_d =
+            nlohmann::json::parse(body_d["result"]["content"][0]["text"].get<std::string>());
+
+        // The grid is gone — this is the assertion that closes the bypass.
+        CHECK_FALSE(got_d.contains("roles"));
+        // ...and its absence is stated, not silent: an agentic worker must not read
+        // this as "the fleet has no RBAC roles" (the absent-vs-empty trap).
+        CHECK(got_d.value("roles_omitted", false));
+        CHECK_FALSE(got_d.value("roles_omitted_reason", std::string{}).empty());
+        // The taxonomy survives — the split is narrow, not a blanket denial.
+        CHECK_FALSE(got_d["securable_types"].empty());
+        CHECK_FALSE(got_d["operations"].empty());
+    }
 
     // Unwired (RbacStore left null, the McpTestServer default) — a JSON-RPC
     // tool error, not a 5xx: MCP has no HTTP-status channel for a store-503
@@ -1938,6 +3063,17 @@ TEST_CASE("MCP: all five discover_* tools are advertised in tools/list",
 // — behavioral) and ADDITIONALLY emits dex.signal.view, so one SIEM filter
 // catches the dashboard, REST and MCP behavioral-access surfaces alike.
 
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every MCP DEX
+// test below constructs its own GuaranteedStateStore against a clone of this
+// schema (ADR-0038 migration).
+static yuzu::test::PgTestTemplate mcp_guardian_pg_tpl{
+    "guardianstate", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        GuaranteedStateStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("guardianstate template: store failed to migrate");
+    }};
+
 // Seed one ruleless DEX observation (the __observation__ projection the DEX
 // aggregations read) — subject + platform land in detail_json.
 static void mcp_seed_obs(GuaranteedStateStore& store, const std::string& id,
@@ -1956,8 +3092,10 @@ static void mcp_seed_obs(GuaranteedStateStore& store, const std::string& id,
 }
 
 TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool call",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
@@ -1987,11 +3125,20 @@ TEST_CASE("MCP DEX: list_dex_signals returns the rollup, audits only the tool ca
     CHECK(ts.audit_log.back() == "mcp.list_dex_signals|success");
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.signal.view") == std::string::npos);
+
+    // #2712 batch 2: content[0].text stays the bare array (backward compat);
+    // structuredContent wraps the SAME rows under "signals".
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("signals"));
+    CHECK(sc["signals"] == rows);
 }
 
 TEST_CASE("MCP DEX: list_dex_signals os filter scopes the catalogue rollup (A1 parity)",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "w1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "m1", "MAC-1", "storage.low", "disk", "macos", "2026-06-10T11:00:00Z");
@@ -2016,8 +3163,10 @@ TEST_CASE("MCP DEX: list_dex_signals os filter scopes the catalogue rollup (A1 p
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as a view",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "o2", "MB-1", "process.crashed", "Safari", "macos", "2026-06-10T11:00:00Z");
@@ -2039,13 +3188,22 @@ TEST_CASE("MCP DEX: get_dex_signal_scope returns per-OS coverage, not audited as
             macos_types = r["distinct_types"].get<int>();
     CHECK(macos_types == 2); // process.crashed + storage.low
     CHECK(ts.audit_log.back() == "mcp.get_dex_signal_scope|success");
+
+    // #2712 batch 2: content[0].text stays the bare array (backward compat);
+    // structuredContent wraps the SAME rows under "platforms".
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("platforms"));
+    CHECK(sc["platforms"] == rows);
     for (const auto& a : ts.audit_log)
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal.view",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "o2", "WS-2", "process.crashed", "chrome.exe", "windows",
@@ -2078,8 +3236,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail returns the shape AND emits dex.signal
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_detail os filter scopes subjects/devices (A1 parity)",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "w1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     mcp_seed_obs(store, "w2", "WS-2", "process.crashed", "outlook.exe", "windows",
@@ -2115,8 +3275,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail os filter scopes subjects/devices (A1 
 // dropped row via audit_persisted:false. MCP set-and-proceeds (parity with the
 // query_responses #1550 and revoke_certificate #1240 siblings — no header channel).
 TEST_CASE("MCP DEX: get_dex_signal_detail dropped audit row surfaces audit_persisted:false (#1647)",
-          "[mcp][integration][dex][audit]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     McpTestServer ts;
@@ -2140,8 +3302,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail dropped audit row surfaces audit_persi
 // MCP path (the bool was discarded). The shared kernel catches it → audit_persisted:false,
 // still serves (MCP set-and-proceed), and never lets the throw escape the handler.
 TEST_CASE("MCP DEX: get_dex_signal_detail throwing audit_fn is caught → audit_persisted:false",
-          "[mcp][integration][dex][audit]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
                  "2026-06-10T10:00:00Z");
     McpTestServer ts;
@@ -2160,8 +3324,10 @@ TEST_CASE("MCP DEX: get_dex_signal_detail throwing audit_fn is caught → audit_
 }
 
 TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without auditing the view",
-          "[mcp][integration][dex]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][mcp][integration][dex]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     McpTestServer ts;
     ts.guaranteed_state_store_for_test = &store;
     ts.start("readonly");
@@ -2247,6 +3413,41 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
     CHECK_FALSE(cohorts["cohorts"][1].contains("cpu_pct"));
 }
 
+// #2712 batch 2: get_dex_perf_fleet's payload is already object-shaped (no
+// array wrap needed - the shared block still routes it through
+// tool_result_split() with structured_payload==payload, same as content);
+// get_dex_perf_cohorts needs the suppressed cohort's stat fields OMITTED
+// from structuredContent too, not just from content[0].text - the
+// anonymization floor must hold in both.
+TEST_CASE("MCP DEX perf: structuredContent mirrors content for fleet + cohorts, "
+          "suppression omits stats in both",
+          "[mcp][integration][dex][perf]") {
+    McpTestServer ts;
+    ts.dex_perf_fn_for_test = mcp_perf_snapshot;
+    ts.start("readonly");
+
+    auto fleet_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":150,"params":{"name":"get_dex_perf_fleet","arguments":{}}})");
+    auto fleet_body = nlohmann::json::parse(fleet_res->body);
+    REQUIRE(fleet_body["result"].contains("structuredContent"));
+    auto fleet_text = nlohmann::json::parse(
+        fleet_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fleet_body["result"]["structuredContent"] == fleet_text);
+
+    auto cohorts_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":151,"params":{"name":"get_dex_perf_cohorts","arguments":{"key":"model"}}})");
+    auto cohorts_body = nlohmann::json::parse(cohorts_res->body);
+    REQUIRE(cohorts_body["result"].contains("structuredContent"));
+    auto cohorts_text = nlohmann::json::parse(
+        cohorts_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(cohorts_body["result"]["structuredContent"] == cohorts_text);
+    auto& sc = cohorts_body["result"]["structuredContent"];
+    CHECK(sc["cohorts"][0]["suppressed"] == false);
+    CHECK(sc["cohorts"][0].contains("cpu_pct")); // unsuppressed cohort keeps its stats
+    CHECK(sc["cohorts"][1]["suppressed"] == true);
+    CHECK_FALSE(sc["cohorts"][1].contains("cpu_pct")); // floor holds in structuredContent too
+}
+
 TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required params)",
           "[mcp][integration][dex][perf]") {
     McpTestServer ts;
@@ -2265,6 +3466,17 @@ TEST_CASE("MCP DEX perf: cohort-diff A-vs-B (found flags, suppression, required 
     CHECK(diff["a"]["suppressed"] == false);
     CHECK(diff["b"]["suppressed"] == true);
     CHECK(diff["delta_pct"]["cpu_pct"].is_null()); // b suppressed → no comparison
+
+    // #2712 batch 2: this tool's payload is always object-shaped, so
+    // structuredContent is the SAME string as content[0].text - pin that
+    // explicitly for this specific tool rather than relying on the sibling
+    // get_dex_perf_fleet/get_dex_perf_cohorts tests to stand in for it (they
+    // share a dispatch block but take a different ternary branch).
+    auto diff_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":57,"params":{"name":"get_dex_perf_cohort_diff","arguments":{"key":"model","a":"a","b":"b"}}})");
+    auto diff_body = nlohmann::json::parse(diff_res->body);
+    REQUIRE(diff_body["result"].contains("structuredContent"));
+    CHECK(diff_body["result"]["structuredContent"] == diff);
 
     // unknown cohort → found_b false, b null.
     auto missing = mcp_tool_payload(
@@ -2478,6 +3690,22 @@ TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit par
     CHECK(badcohort["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(badcohort["error"]["data"]["correlation_id"].is_string());
 
+    // #2712 batch 2: content[0].text stays the bare array (backward compat -
+    // this tool shipped pre-#2712 returning a bare array); structuredContent
+    // wraps the SAME rows under "devices" so it validates against an
+    // object-typed output schema.
+    auto wrap_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":62,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model"}}})");
+    auto wrap_body = nlohmann::json::parse(wrap_res->body);
+    REQUIRE(wrap_body["result"]["content"][0]["text"].get<std::string>().front() == '[');
+    REQUIRE(wrap_body["result"].contains("structuredContent"));
+    auto& wrap_sc = wrap_body["result"]["structuredContent"];
+    REQUIRE(wrap_sc.contains("devices"));
+    REQUIRE(wrap_sc["devices"].is_array());
+    CHECK(wrap_sc["devices"].size() == 16);
+    CHECK(wrap_sc["devices"] ==
+          nlohmann::json::parse(wrap_body["result"]["content"][0]["text"].get<std::string>()));
+
     // Invalid cohort key → kInvalidParams (REST 400 parity), also A4.
     auto badkey = nlohmann::json::parse(
         ts.call(
@@ -2588,6 +3816,16 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
         CHECK(p["cpu"]["after_mean"].get<double>() == Catch::Approx(4.5));
         CHECK(p["distribution"]["up"] == 2);
         CHECK_FALSE(p.contains("verdict")); // EVIDENTIAL — no pass/fail
+    }
+    SECTION("#2712 batch 2: structuredContent mirrors the already-object payload") {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":93,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0"}}})");
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body["result"].contains("structuredContent"));
+        auto text = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+        CHECK(body["result"]["structuredContent"] == text);
+        CHECK(body["result"]["structuredContent"]["cpu"]["after_mean"].get<double>() ==
+              Catch::Approx(4.5));
     }
     SECTION("baseline == candidate → kInvalidParams") {
         auto res = ts.call(
@@ -2744,6 +3982,45 @@ TEST_CASE("MCP network: fleet stats + devices (worst-first sort + limit parity)"
             ->body);
     REQUIRE(bad.contains("error"));
     CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+// #2712 batch 2: get_network_fleet's payload is already object-shaped (no
+// wrap); list_network_devices' content[0].text stays the bare array it
+// shipped pre-#2712, structuredContent wraps the SAME rows under "devices".
+TEST_CASE("MCP network: structuredContent mirrors fleet, wraps devices under "
+          "\"devices\"",
+          "[mcp][integration][network]") {
+    McpTestServer ts;
+    ts.net_perf_fn_for_test = [](const std::string&) {
+        yuzu::server::NetPerfSnapshot snap;
+        yuzu::server::NetPerfDevice d;
+        d.agent_id = "hi-0";
+        d.platform = "linux";
+        d.rtt_ms = 500.0;
+        d.cohort = "site-a";
+        snap.devices.push_back(d);
+        return snap;
+    };
+    ts.start("readonly");
+
+    auto fleet_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":160,"params":{"name":"get_network_fleet","arguments":{}}})");
+    auto fleet_body = nlohmann::json::parse(fleet_res->body);
+    REQUIRE(fleet_body["result"].contains("structuredContent"));
+    auto fleet_text =
+        nlohmann::json::parse(fleet_body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(fleet_body["result"]["structuredContent"] == fleet_text);
+
+    auto dev_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":161,"params":{"name":"list_network_devices","arguments":{}}})");
+    auto dev_body = nlohmann::json::parse(dev_res->body);
+    REQUIRE(dev_body["result"]["content"][0]["text"].get<std::string>().front() == '[');
+    REQUIRE(dev_body["result"].contains("structuredContent"));
+    auto& dev_sc = dev_body["result"]["structuredContent"];
+    REQUIRE(dev_sc.contains("devices"));
+    REQUIRE(dev_sc["devices"].size() == 1); // pin against a vacuous empty==empty pass
+    CHECK(dev_sc["devices"] ==
+          nlohmann::json::parse(dev_body["result"]["content"][0]["text"].get<std::string>()));
 }
 
 TEST_CASE("MCP network: tools report unavailable when no provider is wired",
@@ -3281,6 +4558,21 @@ TEST_CASE("MCP Integration: tools/call validate_scope", "[mcp][integration]") {
 
     auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
     CHECK(text["valid"] == true);
+
+    // #2712: the output schema uses oneOf (valid:true+expression XOR
+    // valid:false+error, never both) - the one union-type schema in this
+    // file's MCP tool set (no other existing precedent). Pin the branch this
+    // call actually exercises: structuredContent must carry expression, and
+    // must NOT carry error, matching the schema's exclusivity claim, not
+    // just the schema's own text.
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["valid"] == true);
+    CHECK(sc.contains("expression"));
+    CHECK_FALSE(sc.contains("error"));
+    // Echoed verbatim, not canonicalized (the schema description says so -
+    // verify the claim, don't just repeat it).
+    CHECK(sc["expression"] == "os == \"linux\"");
 }
 
 // ── 15. validate_scope with invalid expression ──────────────────────────────
@@ -3302,6 +4594,14 @@ TEST_CASE("MCP Integration: tools/call validate_scope invalid expression", "[mcp
     auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
     CHECK(text["valid"] == false);
     CHECK(text.contains("error"));
+
+    // #2712: the other oneOf branch - valid:false+error, and must NOT carry
+    // expression (the exclusivity the schema's oneOf claims).
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["valid"] == false);
+    CHECK(sc.contains("error"));
+    CHECK_FALSE(sc.contains("expression"));
 }
 
 // ── 16. Missing jsonrpc version field through HTTP ──────────────────────────
@@ -3369,6 +4669,13 @@ TEST_CASE("MCP Integration: tools/call get_agent_details", "[mcp][integration]")
     CHECK(text["agent_id"] == "agent-001");
     CHECK(text["hostname"] == "web-01");
     CHECK(text["os"] == "linux");
+
+    // #2712: this tool already returned a flat object pre-#2712 (no bare-
+    // array wire-format concern), so structuredContent is just the SAME
+    // payload the plain tool_result() overload emits - verify it's actually
+    // present and identical, not merely that the wrap-cases work.
+    REQUIRE(body["result"].contains("structuredContent"));
+    CHECK(body["result"]["structuredContent"] == text);
 }
 
 // ── 20. get_agent_details with unknown agent ────────────────────────────────
@@ -3500,6 +4807,16 @@ TEST_CASE("MCP Integration: execute_instruction happy dispatch", "[mcp][integrat
     // create_execution and dispatch_fn sees "").
     CHECK(text["execution_id"].get<std::string>().empty());
     CHECK(ts.last_dispatch_execution_id.empty());
+
+    // #2712: structuredContent mirrors content[0].text exactly (same string,
+    // no wrap) for the normal-dispatch oneOf branch - and must NOT carry the
+    // zero-agents branch's status/message fields, matching the closed
+    // additionalProperties:false per-branch design.
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc == text);
+    CHECK_FALSE(sc.contains("status"));
+    CHECK_FALSE(sc.contains("message"));
 }
 
 // ── 23a2. CDX-R5-02: execute_instruction confinement handoff ───────────────
@@ -4204,6 +5521,18 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
 
     auto text_str = content[0]["text"].get<std::string>();
     CHECK(text_str.find("No agents reachable") != std::string::npos);
+
+    // #2712: structuredContent mirrors content[0].text for the zero-agents
+    // oneOf branch - status is the stable discriminator, agents_reached is
+    // pinned to 0 (const), and the branch must NOT carry the normal-dispatch
+    // branch's fields beyond what both share.
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto text = nlohmann::json::parse(text_str);
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc == text);
+    CHECK(sc["status"] == "no_agents_reached");
+    CHECK(sc["agents_reached"] == 0);
+    CHECK(sc.contains("message"));
 }
 
 // ── 28. Default scope to __all__ ─────────────────────────────────────────
@@ -4531,8 +5860,10 @@ yuzu::server::StoredResponse mk_resp(const std::string& exec_id, const std::stri
 } // namespace
 
 TEST_CASE("MCP query_responses: execution_id collects only that dispatch's rows",
-          "[mcp][integration][response][fanout]") {
-    yuzu::server::ResponseStore store(":memory:");
+          "[pg][mcp][integration][response][fanout]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     // Two executions of the SAME instruction. Pre-execution_id, a
     // timestamp-window join would conflate them; exact-correlation must not.
@@ -4577,8 +5908,10 @@ TEST_CASE("MCP query_responses: execution_id collects only that dispatch's rows"
 }
 
 TEST_CASE("MCP query_responses: instruction_id path unchanged (no execution_id)",
-          "[mcp][integration][response][fanout]") {
-    yuzu::server::ResponseStore store(":memory:");
+          "[pg][mcp][integration][response][fanout]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-A", "instr-1", "agent-1", 0, "A1", 100));
     store.store(mk_resp("exec-B", "instr-1", "agent-3", 0, "B1", 102));
@@ -4599,8 +5932,10 @@ TEST_CASE("MCP query_responses: instruction_id path unchanged (no execution_id)"
 }
 
 TEST_CASE("MCP query_responses: rejects when neither id provided",
-          "[mcp][integration][response][fanout]") {
-    yuzu::server::ResponseStore store(":memory:");
+          "[pg][mcp][integration][response][fanout]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     McpTestServer ts;
     ts.response_store_for_test = &store;
@@ -4621,13 +5956,15 @@ TEST_CASE("MCP query_responses: rejects when neither id provided",
 }
 
 TEST_CASE("MCP query_responses: limit is clamped to [1,1000] (no false-empty, no cap bypass)",
-          "[mcp][integration][response][fanout]") {
+          "[pg][mcp][integration][response][fanout]") {
     // Governance Gate 2 MEDIUM / UP-2 / UP-3: a lower-bound on limit is
     // load-bearing. `limit:0` must NOT return zero rows (a worker misreads that
     // as "done, no responses"); a negative limit must NOT bind as SQLite
     // `LIMIT -1` (= unbounded), which would defeat the 1000-row cap. Both clamp
     // to 1. (offset is intentionally NOT exposed — see UP-1.)
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-C", "instr-1", "agent-1", 0, "C1", 200));
     store.store(mk_resp("exec-C", "instr-1", "agent-2", 0, "C2", 201));
@@ -4654,8 +5991,55 @@ TEST_CASE("MCP query_responses: limit is clamped to [1,1000] (no false-empty, no
     CHECK(query_limit("50").size() == 3);
 }
 
+TEST_CASE("MCP query_audit_log: limit is clamped to [1,500] (no false-empty)",
+          "[pg][mcp][integration][audit]") {
+    // Same class as query_responses's clamp above, and the SAME store-side
+    // trap: AuditStore::query() clamps a non-positive limit to `LIMIT 0` at
+    // its own sink (std::max(q.limit, 0)), which for every OTHER caller is a
+    // legitimate zero-results answer but here reads as "no audit activity" —
+    // exactly the false-empty result ADR-0040 says this store must never
+    // produce. Before this fix, query_audit_log clamped only the upper bound
+    // (std::min(..., 500)), so a caller-supplied limit:0 or limit:-1 reached
+    // the store unclamped on the low end.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AuditStore store(pool);
+    REQUIRE(store.is_open());
+    for (int i = 0; i < 3; ++i) {
+        AuditEvent evt;
+        evt.principal = "mcp-limit-probe";
+        evt.action = "mcp.query_audit_log";
+        evt.target_type = "mcp_tool";
+        evt.target_id = "query_audit_log";
+        evt.result = "success";
+        evt.mcp_tool = "query_audit_log";
+        REQUIRE(store.log(evt));
+    }
+
+    McpTestServer ts;
+    ts.audit_store_for_test = &store;
+    ts.start("readonly");
+
+    auto query_limit = [&](const std::string& limit_literal) {
+        auto res = ts.call(
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":74,)"
+                        R"("params":{"name":"query_audit_log","arguments":)") +
+            R"({"principal":"mcp-limit-probe","limit":)" + limit_literal + "}}}");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    };
+
+    // limit:0 clamps to 1 — a non-empty result, never a false "no activity".
+    CHECK(query_limit("0").size() == 1);
+    // limit:-1 clamps to 1 — does NOT become an unbounded PostgreSQL LIMIT -1.
+    CHECK(query_limit("-1").size() == 1);
+    // A normal limit returns all matching rows up to the cap.
+    CHECK(query_limit("50").size() == 3);
+}
+
 TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution_id loop",
-          "[mcp][integration][response][fanout][execute]") {
+          "[pg][mcp][integration][response][fanout][execute]") {
     // End-to-end: dispatch via execute_instruction (real ExecutionTracker mints
     // the execution_id), stamp a response row with the returned id, then collect
     // it back via query_responses{execution_id}. This is the loop an agentic
@@ -4679,7 +6063,9 @@ TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution
 
     yuzu::server::ExecutionTracker tracker(db);
     tracker.create_tables();
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(pgdb, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = pgdb.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     McpTestServer ts;
@@ -4724,12 +6110,14 @@ TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution
 // ── #1550 HIGH-1/HIGH-2 + review hardening ───────────────────────────────────
 
 TEST_CASE("MCP query_responses: management-group scope filters another operator's rows (#1550)",
-          "[mcp][integration][response][fanout][scope]") {
+          "[pg][mcp][integration][response][fanout][scope]") {
     // Bob must not collect Alice's execution rows by execution_id. exec-S fans out
     // to two agents; the injected scope predicate (production: check_scoped_permission)
     // admits only agent-1 (the caller's). agent-2's row is dropped and the drop is
     // audited distinctly.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-S", "instr-1", "agent-1", 0, "mine", 400));
     store.store(mk_resp("exec-S", "instr-1", "agent-2", 0, "not-mine", 401));
@@ -4767,10 +6155,12 @@ TEST_CASE("MCP query_responses: management-group scope filters another operator'
 }
 
 TEST_CASE("MCP query_responses: no filter when scope predicate is unwired (legacy-open)",
-          "[mcp][integration][response][fanout][scope]") {
+          "[pg][mcp][integration][response][fanout][scope]") {
     // RBAC-off / unwired predicate → every authenticated caller sees all rows
     // (matches require_scoped_permission's legacy posture). No denied audit.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-T", "instr-1", "agent-1", 0, "a", 410));
     store.store(mk_resp("exec-T", "instr-1", "agent-2", 0, "b", 411));
@@ -4795,8 +6185,10 @@ TEST_CASE("MCP query_responses: no filter when scope predicate is unwired (legac
 }
 
 TEST_CASE("MCP query_responses: dropped success-audit surfaces audit_persisted:false (#1550)",
-          "[mcp][integration][response][fanout][audit]") {
-    yuzu::server::ResponseStore store(":memory:");
+          "[pg][mcp][integration][response][fanout][audit]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-U", "instr-1", "agent-1", 0, "x", 420));
 
@@ -4814,14 +6206,31 @@ TEST_CASE("MCP query_responses: dropped success-audit surfaces audit_persisted:f
     // The rows are still returned (the read succeeded); only the evidence gap is flagged.
     auto rows = nlohmann::json::parse(result["content"][0]["text"].get<std::string>());
     CHECK(rows.size() == 1);
+
+    // #2712: structuredContent combines the rows (under "responses") AND the
+    // SAME conditional flag into one object - this is the tool whose legacy
+    // shape put audit_persisted/result_truncated_by_cap as siblings of
+    // content rather than inside it, so structuredContent's construction is
+    // bespoke (not the generic tool_result_split wrap every other tool in
+    // this batch uses). Pin that the conditional flag actually propagates
+    // into BOTH places, not just the legacy one.
+    REQUIRE(result.contains("structuredContent"));
+    auto& sc = result["structuredContent"];
+    REQUIRE(sc.contains("responses"));
+    CHECK(sc["responses"] == rows);
+    REQUIRE(sc.contains("audit_persisted"));
+    CHECK(sc["audit_persisted"] == false);
+    CHECK_FALSE(sc.contains("result_truncated_by_cap")); // not hit in this case
 }
 
 TEST_CASE("MCP query_responses: limit > INT_MAX clamps to the cap, not to 1 (#1550 LOW)",
-          "[mcp][integration][response][fanout]") {
+          "[pg][mcp][integration][response][fanout]") {
     // The int32 cast wrapped a > INT_MAX limit negative, which then clamped to 1
     // (under-serving). The 64-bit clamp pins it to the 1000 cap instead, so a huge
     // limit returns all matching rows up to the cap (here, all 3).
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-V", "instr-1", "agent-1", 0, "V1", 430));
     store.store(mk_resp("exec-V", "instr-1", "agent-2", 0, "V2", 431));
@@ -4842,11 +6251,13 @@ TEST_CASE("MCP query_responses: limit > INT_MAX clamps to the cap, not to 1 (#15
 }
 
 TEST_CASE("MCP query_responses: every agent out of scope → empty result + denied + success (#1550)",
-          "[mcp][integration][response][fanout][scope]") {
+          "[pg][mcp][integration][response][fanout][scope]") {
     // The purest isolation proof: the caller can read NONE of this execution's agents.
     // Response is an empty array; both a denied (the drop) and a success (the served
     // empty set) audit fire; no row leaks.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-W", "instr-1", "agent-1", 0, "alice-1", 440));
     store.store(mk_resp("exec-W", "instr-1", "agent-2", 0, "alice-2", 441));
@@ -4879,11 +6290,13 @@ TEST_CASE("MCP query_responses: every agent out of scope → empty result + deni
 }
 
 TEST_CASE("MCP query_responses: scope filter applies on the instruction_id path too (#1550)",
-          "[mcp][integration][response][fanout][scope]") {
+          "[pg][mcp][integration][response][fanout][scope]") {
     // The instruction_id path is the wider, definition-scoped collect — it must be
     // scoped identically to the execution_id path (the filter runs post-query on
     // whichever branch populated the rows).
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-X1", "instr-9", "agent-1", 0, "mine", 450));
     store.store(mk_resp("exec-X2", "instr-9", "agent-2", 0, "not-mine", 451));
@@ -4906,11 +6319,13 @@ TEST_CASE("MCP query_responses: scope filter applies on the instruction_id path 
 }
 
 TEST_CASE("MCP query_responses: scope check is memoised per distinct agent_id (#1550)",
-          "[mcp][integration][response][fanout][scope]") {
+          "[pg][mcp][integration][response][fanout][scope]") {
     // Two rows for the SAME agent under one execution must trigger only ONE scope
     // check (the memo cache-hit path), and both rows are served when that agent is
     // in scope.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-Y", "instr-1", "agent-1", 0, "row-a", 460));
     store.store(mk_resp("exec-Y", "instr-1", "agent-1", 1, "row-b", 461));
@@ -4935,11 +6350,13 @@ TEST_CASE("MCP query_responses: scope check is memoised per distinct agent_id (#
 }
 
 TEST_CASE("MCP query_responses: result_truncated_by_cap signals a capped raw query (#1550)",
-          "[mcp][integration][response][fanout]") {
+          "[pg][mcp][integration][response][fanout]") {
     // When the raw query hits the limit BEFORE scope filtering, the result flags
     // result_truncated_by_cap so an agentic collector does not treat count<limit as
     // "done" (UP-4/UP-5). Use limit=2 with 3 stored rows to hit the cap deterministically.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-Z", "instr-1", "agent-1", 0, "Z1", 470));
     store.store(mk_resp("exec-Z", "instr-1", "agent-2", 0, "Z2", 471));
@@ -5131,6 +6548,66 @@ TEST_CASE("MCP CA: revoke_certificate supervised + approval manager mints a tick
     CHECK(ts.crl_publish_calls_ == 0);
     CHECK(appr.pending_count() == 1);
     sqlite3_close(raw);
+}
+
+TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches revoked:true "
+          "(#2712)",
+          "[mcp][integration][pki][security][approval]") {
+    yuzu::test::TempDbFile db{std::string_view{"yuzu_test_mcp_ca_"}};
+    yuzu::server::CaStore store(db.path);
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "CAFE";
+    rec.subject = "agent-z";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec));
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"CAFE","reason":"compromised"}}})");
+    REQUIRE(res1);
+    auto body1 = nlohmann::json::parse(res1->body);
+    REQUIRE(body1.contains("error"));
+    std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"CAFE","reason":"compromised","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto res2 = ts.call(recall);
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("result")); // SUCCESS
+    auto payload =
+        nlohmann::json::parse(body2["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["revoked"] == true);
+    CHECK(payload["serial_hex"] == "CAFE");
+    CHECK(payload["crl_republished"] == true);
+    CHECK(store.is_revoked("CAFE"));
+    CHECK(ts.crl_publish_calls_ == 1);
+    // #2712: structuredContent mirrors content[0].text exactly.
+    REQUIRE(body2["result"].contains("structuredContent"));
+    CHECK(body2["result"]["structuredContent"] == payload);
 }
 
 // ── #2395 track D: KEK rotation MCP tools (parity with kek_routes.cpp) ────────
@@ -5650,6 +7127,14 @@ nlohmann::json bundle_payload(const std::unique_ptr<httplib::Response>& res) {
     REQUIRE(body.contains("result"));
     return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
 }
+// #2712: result.structuredContent of the same reply - both execute_bundle and
+// get_bundle_result are already object-shaped, so this must equal bundle_payload().
+nlohmann::json bundle_structured(const std::unique_ptr<httplib::Response>& res) {
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    REQUIRE(body["result"].contains("structuredContent"));
+    return body["result"]["structuredContent"];
+}
 
 bool audit_has(const std::vector<std::string>& log, const std::string& entry) {
     for (const auto& e : log)
@@ -5671,8 +7156,10 @@ yuzu::server::mcp::McpServer::DispatchFn fake_bundle_dispatch() {
 
 TEST_CASE("MCP execute_bundle denies an out-of-scope target agent, dispatches an in-scope one "
           "(CDX-R5-02)",
-          "[mcp][bundle][scope]") {
-    yuzu::server::ResponseStore store(":memory:");
+          "[pg][mcp][bundle][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     bool dispatched = false;
     McpTestServer ts;
@@ -5705,8 +7192,10 @@ TEST_CASE("MCP execute_bundle denies an out-of-scope target agent, dispatches an
 }
 
 TEST_CASE("MCP execute_bundle FAILS CLOSED when the exec-visible derivation is unwired (CDX-R6-02)",
-          "[mcp][bundle][scope]") {
-    yuzu::server::ResponseStore store(":memory:");
+          "[pg][mcp][bundle][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     bool dispatched = false;
     McpTestServer ts;
@@ -5731,14 +7220,16 @@ TEST_CASE("MCP execute_bundle FAILS CLOSED when the exec-visible derivation is u
 
 TEST_CASE("MCP execute_bundle admits a management-group-scoped operator with NO global grant "
           "(governance C4/sec-4 REST/MCP parity)",
-          "[mcp][bundle][scope]") {
+          "[pg][mcp][bundle][scope]") {
     // Simulates the exact twin-disagreement the finding named: a caller who is
     // NOT globally granted Execution:Execute (perm_override denies it) but IS
     // scoped to see this one device (caller_fn admits agent-A). REST's
     // /api/v1/bundles has never required the global grant, only the per-target
     // scoped_perm_fn; before this fix MCP additionally required the global
     // grant and 403'd this exact caller. The twins must now agree: admitted.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     bool dispatched = false;
     McpTestServer ts;
@@ -5768,8 +7259,10 @@ TEST_CASE("MCP execute_bundle admits a management-group-scoped operator with NO 
     CHECK(dispatched);
 }
 
-TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[mcp][bundle]") {
-    yuzu::server::ResponseStore store(":memory:");
+TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[pg][mcp][bundle]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     struct Call {
@@ -5805,10 +7298,15 @@ TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[mcp][bu
     CHECK(audit_has(ts.audit_log, "bundle.os_info.uptime|dispatched"));
     CHECK(audit_has(ts.audit_log, "bundle.os_info.os_name|dispatched"));
     CHECK(audit_has(ts.audit_log, "mcp.execute_bundle|success"));
+
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(bundle_structured(res) == p);
 }
 
-TEST_CASE("MCP get_bundle_result collates the responses in request order", "[mcp][bundle]") {
-    yuzu::server::ResponseStore store(":memory:");
+TEST_CASE("MCP get_bundle_result collates the responses in request order", "[pg][mcp][bundle]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     McpTestServer ts;
@@ -5842,10 +7340,17 @@ TEST_CASE("MCP get_bundle_result collates the responses in request order", "[mcp
     REQUIRE(p["steps"].size() == 2);
     CHECK(p["steps"][0]["action"] == "uptime"); // request order, not arrival
     CHECK(p["steps"][0]["output"] == "up 3d");
+
+    // #2712: structuredContent mirrors content[0].text - aggregate_to_json()'s
+    // output is wrapped UNCHANGED (error_handler_t::replace preserved), never
+    // reserialized, so this must be an exact match, not just field-equivalent.
+    CHECK(bundle_structured(get) == p);
 }
 
-TEST_CASE("MCP get_bundle_result enforces ownership (IDOR)", "[mcp][bundle]") {
-    yuzu::server::ResponseStore store(":memory:");
+TEST_CASE("MCP get_bundle_result enforces ownership (IDOR)", "[pg][mcp][bundle]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
 
     McpTestServer ts;
@@ -5875,8 +7380,10 @@ TEST_CASE("MCP get_bundle_result enforces ownership (IDOR)", "[mcp][bundle]") {
     CHECK(ok.contains("result"));
 }
 
-TEST_CASE("MCP execute_bundle validation errors", "[mcp][bundle][unhappy]") {
-    yuzu::server::ResponseStore store(":memory:");
+TEST_CASE("MCP execute_bundle validation errors", "[pg][mcp][bundle][unhappy]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     McpTestServer ts;
     ts.response_store_for_test = &store;
@@ -5913,9 +7420,11 @@ TEST_CASE("MCP bundle tools error when the orchestrator is unwired", "[mcp][bund
     CHECK(e2.contains("error"));
 }
 
-TEST_CASE("MCP get_bundle_result surfaces dispatch_failed + succeeded=0", "[mcp][bundle]") {
+TEST_CASE("MCP get_bundle_result surfaces dispatch_failed + succeeded=0", "[pg][mcp][bundle]") {
     // governance QE-S2 (MCP surface).
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     McpTestServer ts;
     ts.response_store_for_test = &store;
@@ -5940,10 +7449,12 @@ TEST_CASE("MCP get_bundle_result surfaces dispatch_failed + succeeded=0", "[mcp]
 }
 
 TEST_CASE("MCP get_bundle_result tolerates non-UTF-8 plugin output (no envelope throw)",
-          "[mcp][bundle]") {
+          "[pg][mcp][bundle]") {
     // governance review #1593 blocker 1: on MCP the strict-dump throw ESCAPED the
     // JSON-RPC envelope; with the replace handler collate must return a result.
-    yuzu::server::ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     McpTestServer ts;
     ts.response_store_for_test = &store;
@@ -5967,6 +7478,21 @@ TEST_CASE("MCP get_bundle_result tolerates non-UTF-8 plugin output (no envelope 
     REQUIRE(body.contains("result")); // NOT a thrown / escaped envelope
     auto p = bundle_payload(resp);
     CHECK(p["steps"][0]["state"] == "responded");
+
+    // #2712: structuredContent must ALSO survive the invalid-UTF-8 input
+    // without throwing (it's the same error_handler_t::replace string, wrapped
+    // unchanged by tool_result() - never reserialized) - and must be byte-
+    // identical to content[0].text once both are parsed, not merely
+    // field-equivalent, since a reserialization bug could silently diverge on
+    // exactly this kind of replaced-character content.
+    REQUIRE(body["result"].contains("structuredContent"));
+    CHECK(body["result"]["structuredContent"] == p);
+    // Exact-equality, matching the REST twin's identical scenario
+    // (test_rest_bundle.cpp:455) - confirms the invalid byte was REPLACED
+    // with U+FFFD (not silently dropped/truncated, which a bare
+    // absence-of-0xff check could not distinguish from this).
+    const auto out = p["steps"][0]["output"].get<std::string>();
+    CHECK(out == "\xEF\xBF\xBD" "binary");
 }
 
 // ── query_installed_software (ADR-0016 typed store + management-group scope) ──
@@ -6072,6 +7598,20 @@ TEST_CASE("MCP query_installed_software: fleet rows scoped to the caller's group
     }
     CHECK(saw_denied);
     CHECK(saw_success);
+
+    // #2712/adversarial-review-of-PR#2978: structuredContent wraps the SAME
+    // rows under "software" (content[0].text stays the legacy bare array),
+    // and carries devices_omitted as a genuine JSON INTEGER (not the
+    // quoted-string regression #2973 was wrongly filed against) - pin this
+    // on the one test that actually has a nonzero scope-drop count.
+    REQUIRE(envelope.at("result").contains("structuredContent"));
+    auto& sc = envelope.at("result").at("structuredContent");
+    REQUIRE(sc.contains("software"));
+    CHECK(sc["software"] == rows_json);
+    REQUIRE(sc.contains("devices_omitted"));
+    CHECK(sc["devices_omitted"].is_number_integer());
+    CHECK(sc["devices_omitted"].get<int>() == 1); // agent-out, the one dropped device
+    CHECK_FALSE(sc.contains("audit_persisted")); // fake test audit_fn succeeds
 }
 
 TEST_CASE("MCP query_installed_software: a degraded store errors, never success+[] "
@@ -6148,12 +7688,15 @@ yuzu::server::AgentLicenseRow sle_pii_row() {
 } // namespace
 
 TEST_CASE("MCP query_software_licenses: scope gate unwired → fail closed (never legacy-open)",
-          "[mcp][sle]") {
+          "[mcp][sle][pg]") {
     // No scoped_perm_fn wired (default empty). The twin must REFUSE, not fall through
     // to a global/legacy-open read of per-agent licence facts — parity with the REST
     // drill's sle_gate_usable fail-closed posture.
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ the #1717 guard passes (it targets a
-    REQUIRE(rbac.is_open());                  // CORRUPT db; see the dedicated fail-close test)
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ the #1717 guard passes (it targets a
+    REQUIRE(rbac.is_open());                 // CORRUPT db; see the dedicated fail-close test)
     McpTestServer ts; // no scoped gate, no store
     ts.rbac_store_for_test = &rbac;
     ts.start();
@@ -6190,24 +7733,18 @@ TEST_CASE("MCP query_software_licenses: authorization subsystem unavailable → 
 }
 
 TEST_CASE("MCP query_software_licenses: corrupt rbac.db (non-null, closed) → #1717 fail closed",
-          "[mcp][sle]") {
+          "[mcp][sle][pg]") {
     // The OTHER arm of the #1717 guard (`rbac_store && rbac_store->is_open()`):
     // the sibling test above leaves the store null; this one hands the twin a
-    // NON-NULL store whose backing file is garbage bytes, so sqlite3_open_v2
-    // succeeds but the schema migration hits SQLITE_NOTADB and RbacStore
-    // closes db_ — the literal #1717 corrupt-but-openable scenario. Both arms
-    // collapse into one boolean today, so only this case would catch a future
-    // null-prefix refactor (`if (rbac_store && ...)`) breaking the corrupt
-    // arm (#2104).
-    yuzu::test::TempDbFile db{"yuzu_test_mcp_rbac_corrupt-"};
-    {
-        // NON-empty garbage: SQLite treats a zero-byte file as a valid fresh
-        // database, which would open cleanly and defeat the test.
-        std::ofstream f(db.path, std::ios::binary | std::ios::trunc);
-        REQUIRE(f.is_open());
-        f << "not a valid sqlite database";
-    }
-    yuzu::server::RbacStore broken(db.path);
+    // NON-NULL store whose backing substrate never connects, so is_open()
+    // stays false — the PG analogue of the #1717 corrupt-but-openable
+    // scenario (an unroutable DSN leaves migration never having run). Both
+    // arms collapse into one boolean today, so only this case would catch a
+    // future null-prefix refactor (`if (rbac_store && ...)`) breaking the
+    // unusable-but-non-null arm (#2104).
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore broken{bad_pool};
     REQUIRE_FALSE(broken.is_open());
 
     McpTestServer ts;
@@ -6229,8 +7766,11 @@ TEST_CASE("MCP query_software_licenses: corrupt rbac.db (non-null, closed) → #
     CHECK(saw_failure);
 }
 
-TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[mcp][sle]") {
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[mcp][sle][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6248,12 +7788,15 @@ TEST_CASE("MCP query_software_licenses: missing agent_id → invalid params", "[
 }
 
 TEST_CASE("MCP query_software_licenses: out-of-scope agent is 403'd by the scoped gate",
-          "[mcp][sle]") {
+          "[mcp][sle][pg]") {
     // The per-device confinement (ADR-0017): a group-scoped operator reading an agent
     // OUTSIDE their management group is 403'd by the same scoped gate the REST drill
     // takes — the licence facts are never served, and no store read is attempted.
     std::vector<std::string> calls;
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6280,10 +7823,14 @@ TEST_CASE("MCP query_software_licenses: out-of-scope agent is 403'd by the scope
     CHECK(res->body.find("store unavailable") == std::string::npos);
 }
 
-TEST_CASE("MCP query_software_licenses: store unavailable → A4 internal error", "[mcp][sle]") {
+TEST_CASE("MCP query_software_licenses: store unavailable → A4 internal error",
+          "[mcp][sle][pg]") {
     // Scope gate PASSES (in-scope agent) but no store is configured on this deployment.
     // The twin must return the A4 error envelope, never success+empty.
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // open ⇒ #1717 guard passes
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6320,7 +7867,7 @@ TEST_CASE("MCP query_software_licenses: success shape + user_ref/user_scope OMIT
     REQUIRE(store.is_open());
     REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
 
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    yuzu::server::RbacStore rbac{pool}; // open ⇒ #1717 guard passes (shares the SLE pool)
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6381,7 +7928,7 @@ TEST_CASE("MCP query_software_licenses: a degraded store errors, never success+[
         REQUIRE(drop.status() == PGRES_COMMAND_OK);
     }
 
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    yuzu::server::RbacStore rbac{pool}; // open ⇒ #1717 guard passes (shares the SLE pool)
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6423,7 +7970,7 @@ TEST_CASE("MCP query_software_licenses: dropped audit row surfaces audit_persist
     REQUIRE(store.is_open());
     REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
 
-    yuzu::server::RbacStore rbac(":memory:"); // open ⇒ #1717 guard passes
+    yuzu::server::RbacStore rbac{pool}; // open ⇒ #1717 guard passes (shares the SLE pool)
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6468,7 +8015,7 @@ TEST_CASE("MCP query_software_licenses: throwing audit_fn is caught → audit_pe
     REQUIRE(store.is_open());
     REQUIRE(store.replace_agent_licenses("agent-in", {sle_pii_row()}, "rawhash-1", "hash"));
 
-    yuzu::server::RbacStore rbac(":memory:");
+    yuzu::server::RbacStore rbac{pool}; // shares the SLE pool
     REQUIRE(rbac.is_open());
     McpTestServer ts;
     ts.rbac_store_for_test = &rbac;
@@ -6500,8 +8047,10 @@ TEST_CASE("MCP query_software_licenses: throwing audit_fn is caught → audit_pe
 // operator's agents' rows.
 
 TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + denied audit (#1634)",
-          "[mcp][integration][response][aggregate][scope]") {
-    yuzu::server::ResponseStore store(":memory:");
+          "[pg][mcp][integration][response][aggregate][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     // instr-1: two SUCCESS (status 0), one FAILURE (status 1). Only agent-1 is
     // in the caller's management group.
@@ -6543,11 +8092,24 @@ TEST_CASE("MCP aggregate_responses: out-of-scope agents excluded from totals + d
     }
     CHECK(saw_denied);
     CHECK(saw_success);
+
+    // #2712/adversarial-review-of-PR#2978: structuredContent wraps the SAME
+    // rows under "results" (content[0].text stays the legacy bare array) -
+    // pin this for the scope-filtered case specifically, since it's the one
+    // that also has the conditional audit_persisted sibling flag to get
+    // right in both shapes.
+    REQUIRE(result.contains("structuredContent"));
+    auto& sc = result["structuredContent"];
+    REQUIRE(sc.contains("results"));
+    CHECK(sc["results"] == groups);
+    CHECK_FALSE(sc.contains("audit_persisted")); // fake test audit_fn succeeds
 }
 
 TEST_CASE("MCP aggregate_responses: no filter when scope predicate is unwired (legacy-open) (#1634)",
-          "[mcp][integration][response][aggregate][scope]") {
-    yuzu::server::ResponseStore store(":memory:");
+          "[pg][mcp][integration][response][aggregate][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-2", "instr-2", "agent-1", 0, "ok", 510));
     store.store(mk_resp("exec-2", "instr-2", "agent-2", 0, "ok", 511));
@@ -6572,8 +8134,10 @@ TEST_CASE("MCP aggregate_responses: no filter when scope predicate is unwired (l
 }
 
 TEST_CASE("MCP aggregate_responses: every agent out of scope → empty totals + denied (#1634)",
-          "[mcp][integration][response][aggregate][scope]") {
-    yuzu::server::ResponseStore store(":memory:");
+          "[pg][mcp][integration][response][aggregate][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
     REQUIRE(store.is_open());
     store.store(mk_resp("exec-3", "instr-3", "agent-1", 0, "ok", 520));
     store.store(mk_resp("exec-3", "instr-3", "agent-2", 1, "err", 521));
@@ -6612,6 +8176,14 @@ nlohmann::json write_tool_payload(const std::unique_ptr<httplib::Response>& res)
     REQUIRE(body.contains("result"));
     return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
 }
+// #2712: result.structuredContent of the same reply - every write tool in this
+// block is already object-shaped, so this must equal write_tool_payload().
+nlohmann::json write_tool_structured(const std::unique_ptr<httplib::Response>& res) {
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    REQUIRE(body["result"].contains("structuredContent"));
+    return body["result"]["structuredContent"];
+}
 } // namespace
 
 TEST_CASE("MCP set_tag operator sets the tag and fires the agent tag-push",
@@ -6640,6 +8212,9 @@ TEST_CASE("MCP set_tag operator sets the tag and fires the agent tag-push",
     CHECK(ts.tag_pushes[0].first == "agent-1");
     CHECK(ts.tag_pushes[0].second == "role");
     CHECK(ts.audit_log.back() == "mcp.set_tag|success");
+
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(write_tool_structured(res) == payload);
 }
 
 TEST_CASE("MCP set_tag rejects an invalid category value", "[mcp][integration][tag]") {
@@ -6725,12 +8300,91 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
     auto payload2 = write_tool_payload(res2);
     CHECK(payload2["deleted"] == true);
     CHECK(tags.get_tag("agent-1", "role").empty()); // actually deleted
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(write_tool_structured(res2) == payload2);
 
     // 4. Replay the SAME approval_id → rejected (one-time ticket already consumed).
     auto res3 = ts.call(recall);
     auto body3 = nlohmann::json::parse(res3->body);
     REQUIRE(body3.contains("error"));
     CHECK(body3["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    sqlite3_close(raw);
+}
+
+TEST_CASE("MCP approval recall refuses a ticket presented by a different principal "
+          "than its submitter",
+          "[mcp][integration][tag][approval][security]") {
+    // End-to-end sibling to the store-level submitter-binding tests
+    // (test_approval_manager.cpp): mints and recalls through the REAL MCP
+    // handler, not directly against ApprovalManager, so this pins the
+    // client-facing envelope and the audit string the store-level tests
+    // cannot see. The scenario this closes: operator2 read operator1's
+    // approved ticket id off GET /api/approvals (Approval:Read, seeded to
+    // Viewer) and also holds delete_tag's own RBAC permission.
+    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_2442_mcp_tag_"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_2442_mcp_appr_"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("operator");
+
+    // 1. Mint as operator1 — mock_username is read at call time, so this test
+    //    can swap principals between calls on the SAME server instance.
+    ts.mock_username = "operator1";
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":260,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+    REQUIRE(appr.get(approval_id)->submitted_by == "operator1");
+    REQUIRE(appr.get(approval_id)->origin == ApprovalOrigin::kMcp); // the real mint declares it
+
+    // 2. Recall as operator2 — same tool, same arguments, foreign principal.
+    ts.mock_username = "operator2";
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":261,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // Same client-facing shape as an ordinary replay or a foreign-origin
+    // refusal — the anti-oracle constraint (kNotConsumableMessage) applies
+    // identically to this kind.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"] == "approval already used (one-time ticket)");
+    CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
+    // Not masked — the binding-check read succeeded, it just refused.
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 0.0);
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back() == "approval_id=" + approval_id + " refused: foreign_submitter");
+
+    // Untouched — the rightful submitter can still redeem it.
+    auto row = appr.get(approval_id);
+    REQUIRE(row.has_value());
+    CHECK(row->consumed_at == 0);
+    CHECK(tags.get_tag("agent-1", "role") == "web"); // not deleted
+
+    ts.mock_username = "operator1";
+    auto res2 = ts.call(recall);
+    auto payload2 = write_tool_payload(res2);
+    CHECK(payload2["deleted"] == true);
+    CHECK(tags.get_tag("agent-1", "role").empty()); // the rightful submitter DID delete it
     sqlite3_close(raw);
 }
 
@@ -6925,6 +8579,531 @@ TEST_CASE("MCP approval ticket cannot be reused across tools",
     sqlite3_close(raw);
 }
 
+// ── #2786: approval-store failure at the MCP recall ─────────────────────────
+// The store-error branch at rung 1 (the ticket lookup) had ZERO regression
+// coverage before this: mutating `get_checked` back to `get` (the pre-fix
+// semantics) passed the FULL server suite. These tests drive the real
+// `POST /mcp/v1/` handler with an actually-faulting SQLite connection, not a
+// mocked ApprovalManager, so the fault reaches the production code path.
+
+TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable "
+          "store error, not a mismatch, and the ticket survives it",
+          "[mcp][integration][approval][security]") {
+    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_mcp_tag_"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection and blocking
+    // the temp-file cleanup TempDbFile is trying to do.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("operator");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":250,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":251,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                         approval_id + R"("}}})";
+
+    // Fault the lookup rung on the SAME connection ApprovalManager holds, and
+    // keep it reversible: a bare DROP does not come back via create_tables()
+    // once the store is already at the latest schema version (create_tables's
+    // migrations are gated on the stored version, so v1's CREATE TABLE never
+    // re-runs). A transaction this test rolls back proves the ORIGINAL row
+    // survives, not a recreated empty table.
+    REQUIRE(sqlite3_exec(conn.h, "BEGIN;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(conn.h, "DROP TABLE approvals;", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    auto faulted = ts.call(recall);
+    auto fbody = nlohmann::json::parse(faulted->body);
+    REQUIRE(fbody.contains("error"));
+    // QA-1's exact mutant: reverting get_checked to get made this -32003
+    // "approval_id does not match this tool and arguments" instead.
+    CHECK(fbody["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(fbody["error"]["message"] == "approval store temporarily unavailable");
+    REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
+    CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
+
+    CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
+    // #2786: a lookup-rung fault means the origin check two rungs down never
+    // gets a chance to run either, so the masked-denial counter fires here
+    // exactly as it does for a consume-rung origin-check fault.
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 1.0);
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back() == "approval_id=" + approval_id + " refused: store_error (lookup)");
+
+    REQUIRE(sqlite3_exec(conn.h, "ROLLBACK;", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    // The ORIGINAL approved ticket, not a fresh empty one, is what consumes.
+    auto recovered = ts.call(recall);
+    CHECK(write_tool_payload(recovered)["deleted"] == true);
+    CHECK(tags.get_tag("agent-1", "role").empty());
+}
+
+TEST_CASE("MCP approval masked-denial counter: accumulates per refusal and stays "
+          "per-tool, not a shared/latched series",
+          "[mcp][integration][approval][security]") {
+    // Governance quality-engineer finding: prior tests only ever checked the
+    // masked counter at 0.0 or 1.0, which a "set to 1" mutant would survive,
+    // and only ever exercised a single tool, which a mislabeled-series mutant
+    // would survive. This test drives TWO refusals for the SAME tool (proving
+    // accumulation, not a latch) and one refusal for a DIFFERENT tool (proving
+    // the `tool` label actually separates the series rather than sharing one).
+    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_mcp_tag_"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile qdb{std::string_view{"yuzu_test_mcp_quar_"}};
+    yuzu::server::QuarantineStore quar(qdb.path);
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.quarantine_store_for_test = &quar;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised"); // both delete_tag and quarantine_device are approval-gated here
+
+    auto mint_delete = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":260,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    std::string delete_id =
+        nlohmann::json::parse(mint_delete->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!delete_id.empty());
+    REQUIRE(appr.approve(delete_id, "reviewer-bob", "ok"));
+
+    auto mint_quar = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":261,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-1"}}})");
+    std::string quar_id =
+        nlohmann::json::parse(mint_quar->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!quar_id.empty());
+    REQUIRE(appr.approve(quar_id, "reviewer-bob", "ok"));
+
+    std::string recall_delete = R"({"jsonrpc":"2.0","method":"tools/call","id":262,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                                delete_id + R"("}}})";
+    std::string recall_quar = R"({"jsonrpc":"2.0","method":"tools/call","id":263,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-1","approval_id":")" +
+                              quar_id + R"("}}})";
+
+    // Reversible: BEGIN + DROP TABLE + ROLLBACK, same technique as the lookup-
+    // fault test above — masks EVERY recall's lookup rung regardless of which
+    // tool or ticket it names.
+    REQUIRE(sqlite3_exec(conn.h, "BEGIN;", nullptr, nullptr, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_exec(conn.h, "DROP TABLE approvals;", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    ts.call(recall_delete);
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 1.0);
+
+    // Second refusal for the SAME tool: the counter must ACCUMULATE, not
+    // latch at 1 — a mutant that sets-to-1 instead of increments survives an
+    // assertion that only ever checks 0 vs 1.
+    ts.call(recall_delete);
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 2.0);
+
+    // A refusal for a DIFFERENT tool must land on its OWN series — a mutant
+    // that dropped the `tool` label (or hardcoded one) would make this bump
+    // delete_tag's counter to 3, or leave quarantine_device's at 0.
+    ts.call(recall_quar);
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "quarantine_device"}})
+              .value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 2.0); // unchanged by the quarantine_device refusal
+
+    REQUIRE(sqlite3_exec(conn.h, "ROLLBACK;", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    // Both original tickets survive the fault.
+    CHECK(write_tool_payload(ts.call(recall_delete))["deleted"] == true);
+}
+
+TEST_CASE("MCP approval recall: a genuinely absent ticket stays -32003, not -32603",
+          "[mcp][integration][approval][security]") {
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection and blocking
+    // the temp-file cleanup TempDbFile is trying to do.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    // No fault injected: `get_checked` succeeds and returns std::nullopt. This
+    // must stay indistinguishable from a not-found ticket (-32003), the case
+    // the new rung-1 branch must NOT accidentally widen to catch.
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":252,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":"does-not-exist"}}})";
+    auto res = ts.call(recall);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(body["error"]["message"] == "approval_id does not match this tool and arguments");
+}
+
+TEST_CASE("MCP approval recall: a store that never opened returns the permanent "
+          "body through the real handler, not the transient one",
+          "[mcp][integration][approval][security]") {
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+
+    yuzu::server::ApprovalManager closed(nullptr); // never opened
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &closed;
+    ts.start("operator");
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":253,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":"whatever"}}})";
+    auto res = ts.call(recall);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] == "approval store unavailable");
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+}
+
+TEST_CASE("MCP approval recall: a store fault at the CONSUME rung is caught too, "
+          "not only at the lookup",
+          "[mcp][integration][approval][security]") {
+    yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection and blocking
+    // the temp-file cleanup TempDbFile is trying to do.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("operator");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":254,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // Fault the CONSUME step specifically, not the lookup: the rung-1 SELECT
+    // this test's recall performs first must still succeed, so a trigger on
+    // UPDATE (rather than dropping the table) isolates the site the replaced
+    // ternary covers from the site rung 1 covers.
+    REQUIRE(sqlite3_exec(conn.h,
+                        "CREATE TRIGGER approvals_block_update BEFORE UPDATE ON approvals "
+                        "BEGIN SELECT RAISE(ABORT, 'fault injected'); END;",
+                        nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":255,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto faulted = ts.call(recall);
+    auto fbody = nlohmann::json::parse(faulted->body);
+    REQUIRE(fbody.contains("error"));
+    CHECK(fbody["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(fbody["error"]["message"] == "approval store temporarily unavailable");
+    // The shared body is identical from either rung by design, so message
+    // alone doesn't prove this response came from the CONSUME rung rather
+    // than the lookup rung. retry_after_ms pins the machine-readable A5
+    // directive a hand-written regression at this call site could drop
+    // silently, and the audit token (no " (lookup)" suffix, unlike rung 1's)
+    // is the one thing that actually distinguishes the two rungs.
+    REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
+    CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
+    // Negative control: this fault hit only the CAS, AFTER the binding check
+    // already passed (the MCP mint declares ApprovalOrigin::kMcp, and this
+    // recall's own principal is the ticket's submitter) — the masked-denial
+    // counter must stay at zero, not fire on every store-error kind
+    // indiscriminately.
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 0.0);
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back() == "approval_id=" + approval_id + " refused: store_error");
+
+    REQUIRE(sqlite3_exec(conn.h, "DROP TRIGGER approvals_block_update;", nullptr, nullptr,
+                        nullptr) == SQLITE_OK);
+
+    // Still approved, unconsumed, and still the same ticket → consumes now.
+    auto recovered = ts.call(recall);
+    CHECK(write_tool_payload(recovered)["deleted"] == true);
+}
+
+TEST_CASE("MCP approval recall: a store fault AT the origin check masks a foreign-origin "
+          "ticket's kind — flagged via the masked-denial counter — until the fault clears",
+          "[mcp][integration][approval][security]") {
+    // CH-5 (governance Gate 5 chaos design), origin-check half: fault-inject
+    // the consume rung's own #2442 origin-check SELECT while redeeming a
+    // NON-MCP-origin ticket, and confirm the forgery signal (masked counter +
+    // audit suffix) fires instead of being silently lost to a plain
+    // store_error. The lookup-rung half of CH-5 (SQLITE_BUSY via a real
+    // second-connection lock) is the test above ("a store fault at the
+    // lookup rung..."); that same lock technique cannot isolate THIS read —
+    // rung 1 runs the identical SELECT text first on the same connection, so
+    // it hits the lock first and this test would degenerate into a repeat of
+    // the lookup-rung one. A countdown authorizer denial (SQLITE_AUTH, a
+    // classifier-transient code, same as BUSY) isolates the fault to the
+    // origin check specifically — see the classifier unit tests in
+    // test_approval_manager.cpp for the BUSY case directly.
+    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_mcp_tag_"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("operator");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":256,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // Declare the ticket as minted on a non-MCP surface — the #2442 forgery
+    // scenario — directly on the row, mirroring what a REST-gate mint under
+    // the reserved `mcp.` prefix would have recorded.
+    {
+        SqliteStmt stmt;
+        REQUIRE(sqlite3_prepare_v2(conn.h, "UPDATE approvals SET origin = 'instruction' WHERE id = ?",
+                                   -1, stmt.addr(), nullptr) == SQLITE_OK);
+        sqlite3_bind_text(stmt.get(), 1, approval_id.c_str(), -1, SQLITE_TRANSIENT);
+        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_DONE);
+    }
+
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":257,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                         approval_id + R"("}}})";
+
+    // A two-connection lock cannot isolate this to the origin check alone:
+    // rung 1's lookup runs the identical SELECT text FIRST on the same
+    // connection, so it would hit the lock and fault before consume_ticket
+    // is ever reached — exactly the lookup-rung scenario the test above
+    // already covers. A countdown authorizer lets the 1st SELECT (rung 1)
+    // through and denies only the 2nd (the origin check inside
+    // consume_ticket), isolating the fault to the read this test targets.
+    int select_count = 0;
+    REQUIRE(sqlite3_set_authorizer(
+                conn.h,
+                [](void* ctx, int action, const char*, const char*, const char*,
+                   const char*) -> int {
+                    if (action == SQLITE_SELECT && ++(*static_cast<int*>(ctx)) == 2)
+                        return SQLITE_DENY;
+                    return SQLITE_OK;
+                },
+                &select_count) == SQLITE_OK);
+
+    auto faulted = ts.call(recall);
+    auto fbody = nlohmann::json::parse(faulted->body);
+    REQUIRE(fbody.contains("error"));
+    CHECK(fbody["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(fbody["error"]["message"] == "approval store temporarily unavailable");
+    REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
+    CHECK(fbody["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(reg.counter("yuzu_mcp_approval_refused_total", {{"tool", "delete_tag"}}).value() == 1.0);
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 1.0);
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back() ==
+          "approval_id=" + approval_id + " refused: store_error (origin/submitter unverified)");
+
+    REQUIRE(sqlite3_set_authorizer(conn.h, nullptr, nullptr) == SQLITE_OK);
+
+    // Once the fault clears, the forgery signal is NOT lost: the recall now
+    // correctly reports foreign_origin (the same anti-oracle client message
+    // as an ordinary replay, but a distinct audit token) rather than a
+    // repeat of the masked store_error. The masked counter does not move
+    // again — this refusal was NOT masked.
+    auto cleared = ts.call(recall);
+    auto cbody = nlohmann::json::parse(cleared->body);
+    REQUIRE(cbody.contains("error"));
+    CHECK(cbody["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(cbody["error"]["message"] == "approval already used (one-time ticket)");
+    CHECK(reg.counter("yuzu_mcp_approval_masked_denials_total", {{"tool", "delete_tag"}})
+              .value() == 1.0);
+    REQUIRE(!ts.audit_details.empty());
+    CHECK(ts.audit_details.back() == "approval_id=" + approval_id + " refused: foreign_origin");
+
+    // Untouched throughout.
+    CHECK(appr.get(approval_id)->consumed_at == 0);
+    CHECK(tags.get_tag("agent-1", "role") == "web");
+}
+
+TEST_CASE("MCP approval recall: an OPEN store failing permanently gets the escalate "
+          "body, not the retry-forever one",
+          "[mcp][integration][approval][security]") {
+    // #2786 "PR 1c": the store handle is fine, but a read against it fails in
+    // a way an unchanged retry cannot clear. PRAGMA query_only is used
+    // because it deterministically yields SQLITE_READONLY on the very next
+    // write, without corrupting the file the test fixture needs.
+    yuzu::test::TempDbFile tagdb{std::string_view{"yuzu_test_mcp_tag_"}};
+    yuzu::server::TagStore tags(tagdb.path);
+    tags.set_tag("agent-1", "role", "web", "server");
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":258,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role"}}})");
+    std::string approval_id =
+        nlohmann::json::parse(mint->body)["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":259,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"role","approval_id":")" +
+                         approval_id + R"("}}})";
+
+    // The lookup rung (SELECT) and the origin check (SELECT) both succeed
+    // under query_only; only the consuming UPDATE fails, isolating this to
+    // the CAS site — same as the transient CAS test above, but permanent.
+    REQUIRE(sqlite3_exec(conn.h, "PRAGMA query_only = 1;", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    auto faulted = ts.call(recall);
+    auto fbody = nlohmann::json::parse(faulted->body);
+    REQUIRE(fbody.contains("error"));
+    CHECK(fbody["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(fbody["error"]["message"] == "approval store unavailable");
+    REQUIRE(fbody["error"]["data"].contains("retry_after_ms"));
+    CHECK(fbody["error"]["data"]["retry_after_ms"].is_null());
+
+    REQUIRE(sqlite3_exec(conn.h, "PRAGMA query_only = 0;", nullptr, nullptr, nullptr) == SQLITE_OK);
+
+    // A permanent-classified fault still leaves the ticket redeemable once
+    // cleared — classification changes the RESPONSE, never the store state.
+    auto recovered = ts.call(recall);
+    CHECK(write_tool_payload(recovered)["deleted"] == true);
+}
+
 // Governance UP-1 (BLOCKING): the approval mint is deduplicated — two identical
 // first-calls return the SAME approval_id and leave exactly one pending row, so a
 // token cannot flood the shared pending-approval cap.
@@ -7076,7 +9255,8 @@ TEST_CASE("MCP 2405: approved ticket bound to schema-invalid args is rejected an
 
     // Seed the pre-#2405 state directly: a ticket already minted for
     // schema-invalid args (missing `key`) and approved by an admin.
-    auto seeded = h.appr->submit("mcp.delete_tag", "test-user", R"({"agent_id":"agent-1"})");
+    auto seeded = h.appr->submit("mcp.delete_tag", "test-user", R"({"agent_id":"agent-1"})", "",
+                                 yuzu::server::ApprovalOrigin::kMcp);
     REQUIRE(seeded);
     REQUIRE(h.appr->approve(*seeded, "reviewer-bob", ""));
 
@@ -8033,7 +10213,8 @@ TEST_CASE("MCP approve_request approves a pending request as a second principal"
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
     yuzu::server::ApprovalManager appr(raw);
     appr.create_tables();
-    auto submitted = appr.submit("some.definition", "alice", "{}");
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
     REQUIRE(submitted);
 
     McpTestServer ts;
@@ -8050,6 +10231,8 @@ TEST_CASE("MCP approve_request approves a pending request as a second principal"
     REQUIRE(row);
     CHECK(row->status == "approved");
     CHECK(row->reviewed_by == "test-user");
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(write_tool_structured(res) == payload);
     sqlite3_close(raw);
 }
 
@@ -8059,7 +10242,8 @@ TEST_CASE("MCP reject_request rejects a pending request", "[mcp][integration][ap
     REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
     yuzu::server::ApprovalManager appr(raw);
     appr.create_tables();
-    auto submitted = appr.submit("some.definition", "alice", "{}");
+    auto submitted =
+        appr.submit("some.definition", "alice", "{}", "", yuzu::server::ApprovalOrigin::kInstruction);
     REQUIRE(submitted);
 
     McpTestServer ts;
@@ -8074,6 +10258,8 @@ TEST_CASE("MCP reject_request rejects a pending request", "[mcp][integration][ap
     auto row = appr.get(*submitted);
     REQUIRE(row);
     CHECK(row->status == "rejected");
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(write_tool_structured(res) == payload);
     sqlite3_close(raw);
 }
 
@@ -8162,7 +10348,77 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     REQUIRE(ts.last_dispatch_exec_visible.has_value());
     CHECK(ts.last_dispatch_exec_visible->size() == 1);
     CHECK(ts.last_dispatch_exec_visible->count("agent-q") == 1);
+    // #2712: structuredContent mirrors content[0].text exactly.
+    CHECK(write_tool_structured(res2) == payload2);
     sqlite3_close(raw);
+}
+
+TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCCESS, "
+          "never a failure - pins the schema's minimum:0, not minimum:1",
+          "[mcp][integration][quarantine][approval]") {
+    // #2712: an offline/unreachable device still gets recorded (the isolation
+    // dispatch just never lands) - this is NOT a failure path, and the schema
+    // must accept agents_reached==0 as a valid success value. A naive copy of
+    // execute_instruction's normal-branch minimum:1 onto this tool would be
+    // exactly the wrong constraint here (Fable's review of the #2712 batch 3
+    // plan flagged this as the natural mistake to avoid).
+    yuzu::test::TempDbFile qdb{std::string_view{"yuzu_test_mcp_quar_"}};
+    yuzu::server::QuarantineStore quar(qdb.path);
+    REQUIRE(quar.is_open());
+
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
+    // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
+    // manual close is skipped on failure - leaking the connection.
+    struct Conn {
+        sqlite3* h{nullptr};
+        Conn() = default;
+        ~Conn() {
+            if (h)
+                sqlite3_close(h);
+        }
+        Conn(const Conn&) = delete;
+        Conn& operator=(const Conn&) = delete;
+    } conn;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &conn.h) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(conn.h);
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.approval_manager_for_test = &appr;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    // dispatch_fn_for_test stays unwired (nullptr) - the handler's
+    // `if (dispatch_fn)` guard skips the isolation dispatch entirely, leaving
+    // agents_reached at its default-initialized 0. This is the same shape a
+    // wired-but-offline-device dispatch would produce.
+    ts.start("supervised");
+
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":242,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-offline","reason":"malware"}}})");
+    REQUIRE(res1);
+    auto body1 = nlohmann::json::parse(res1->body);
+    REQUIRE(body1.contains("error"));
+    std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":243,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-offline","reason":"malware","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto res2 = ts.call(recall);
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("result")); // SUCCESS, not an error - recording still worked
+    auto payload2 = write_tool_payload(res2);
+    CHECK(payload2["agents_reached"] == 0);
+    CHECK(payload2["command_id"].get<std::string>().empty());
+    // The record still persisted despite no live dispatch.
+    auto rec = quar.get_status("agent-offline");
+    REQUIRE(rec);
+    CHECK(rec->status == "active");
+    // #2712: structuredContent mirrors content[0].text exactly, including the
+    // agents_reached:0 value the schema must accept (minimum:0).
+    CHECK(write_tool_structured(res2) == payload2);
 }
 
 TEST_CASE("MCP write tools are advertised in tools/list", "[mcp][integration][tag]") {
@@ -8613,6 +10869,30 @@ TEST_CASE("MCP 2f: presented session validated; unknown → 404 + reject audit",
         CHECK(body["error"]["data"]["correlation_id"].get<std::string>().rfind("req-", 0) == 0);
         CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "mcp.session.reject|failure") !=
               ts.audit_log.end());
+    }
+    SECTION("hostile Mcp-Session-Id sanitized before reaching the audit row (#2917)") {
+        // ';'/'=' in the presented id could otherwise forge fields in the flat
+        // "k=v;k=v" audit detail a SIEM parses. httplib's own Request::set_header
+        // already rejects any header value containing CR or LF specifically
+        // (detail::fields::is_field_value -- interior space/tab ARE allowed,
+        // so this is narrower than "any control byte"; verified: a header
+        // value with an embedded \r\n is silently NOT set at all), so a
+        // raw-newline variant of this test would prove nothing -- ';'/'=' are
+        // the realistically-reachable injection bytes for THIS vector. The header
+        // is attacker-controlled until it validates -- an unknown id never
+        // validates, so this exercises exactly that path. Regression for the
+        // one call site (of 13 producing mcp.session.* rows) that was missing
+        // the sanitize_detail_value() wrap every sibling already has.
+        const std::string hostile_sid = "a;b=c;d=e-genuinely-unknown-session-id";
+        auto bad = ts.call_raw("POST", R"({"jsonrpc":"2.0","method":"tools/list","id":2})",
+                               {{"Mcp-Session-Id", hostile_sid}});
+        CHECK(bad->status == 404);
+        REQUIRE_FALSE(ts.audit_target_ids.empty());
+        // Only the first 8 bytes reach the audit row (session-id prefixes are
+        // truncated everywhere in this file); each dangerous byte replaced 1:1.
+        CHECK(ts.audit_target_ids.back() == "a_b_c_d_");
+        CHECK(ts.audit_target_ids.back().find(';') == std::string::npos);
+        CHECK(ts.audit_target_ids.back().find('=') == std::string::npos);
     }
 }
 
@@ -9291,6 +11571,14 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         CHECK(normalize(res_bridged->body, exec_bridged) ==
               normalize(res_plain->body, exec_plain));
 
+        // #2712: this is a deliberate, pinned decision (not an accident of
+        // construction order) - structuredContent must be present on the
+        // GET-only-armed response exactly like the plain one, since `result`
+        // (which now carries structuredContent) is the SAME string passed to
+        // bridge->arm() as result_base below.
+        CHECK(nlohmann::json::parse(res_bridged->body)["result"].contains(
+            "structuredContent"));
+
         // STOP-SHIP SURFACE, widened ahead of the streamed-POST rung (C8).
         // Comparing bodies alone is not "byte-untouched": mcp-remote 0.1.37 and
         // Claude Desktop negotiate on the status line and the headers, and the
@@ -9551,8 +11839,8 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
 // so progress-before-final, on_final_written and EOF are covered by the pump's own
 // tests in test_mcp_stream_bridge.cpp, NOT from here. Stated rather than implied,
 // because a test named "streamed happy path" reads like end-to-end proof.
-TEST_CASE("Config's shipped default for streamed POST is OFF", "[mcp][2f][3b][config]") {
-    // The dormancy test below pins the HARNESS field it is given, not Config's own
+TEST_CASE("Config's shipped default for streamed POST is ON", "[mcp][2f][3b][config]") {
+    // The opt-out test below pins the HARNESS field it is given, not Config's own
     // default — flipping the production default alone, without also flipping the
     // harness line, would leave that test green regardless.
     //
@@ -9563,20 +11851,34 @@ TEST_CASE("Config's shipped default for streamed POST is OFF", "[mcp][2f][3b][co
     // RESIDUAL, deliberately not closed here: nothing in this file exercises
     // server.cpp's own `&cfg_.mcp_streamed_post_enable` wiring. Closing that needs
     // a live ServerImpl, which is not a unit test; tracked as a follow-up.
-    REQUIRE_FALSE(yuzu::server::Config{}.mcp_streamed_post_enable);
+    REQUIRE(yuzu::server::Config{}.mcp_streamed_post_enable);
 }
 
-TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not opened",
+// Closes the RESIDUAL noted on McpTestServer::streamed_post_enabled_'s declaration: the
+// harness field's own default and Config's own default currently agree (both true), but
+// that agreement is coincidental, not load-bearing - the harness defaults it true so
+// every OTHER streamed test exercises the streamed path regardless of what production
+// ships. A future change to either default with no change to the other would leave every
+// harness-default-relying test silently exercising the wrong path. This test is the
+// tripwire for that divergence; it does not replace the still-open residual (nothing
+// here exercises server.cpp's own `&cfg_.mcp_streamed_post_enable` wiring).
+TEST_CASE("Harness default for streamed_post_enabled_ tracks Config's own default",
+          "[mcp][2f][3b][config]") {
+    McpTestServer ts;
+    REQUIRE(ts.streamed_post_enabled_ == yuzu::server::Config{}.mcp_streamed_post_enable);
+}
+
+TEST_CASE("streamed POST opt-out: --no-mcp-streamed-post falls back to a plain response",
           "[mcp][integration][execute][bridge][2f][3b]") {
-    // The shipped default. 3b's machinery is complete, but #2739 (the 120 s response
-    // cap does not fire on a busy execution) and #2740 (an undelivered final holds a
-    // session streamed slot) are open against it, and four operator surfaces document
-    // a bound the implementation does not honour. So it lands off, exactly as Spark
-    // landed behind prefer_spark_ = false, and the follow-up PR flips it.
+    // The shipped default is now ON (see "Config's shipped default for streamed POST is
+    // ON" above). This test covers the operator opt-out instead: with the flag off, the
+    // operator surfaces that document the plain-path bounds still hold - a client asking
+    // to stream simply does not get one, and nothing about the response shape changes.
     //
-    // This test exists because an unpinned default is how dormancy silently ends: the
-    // harness sets streamed_post_enabled_ = true for every OTHER streamed test, so
-    // nothing else in this file would notice the production default changing.
+    // This test exists because an unpinned default is how opt-out coverage silently
+    // rots into no coverage at all: the harness sets streamed_post_enabled_ = true for
+    // every OTHER streamed test, so nothing else in this file would notice the plain-path
+    // fallback breaking.
     namespace smcp = yuzu::server::mcp;
 
     sqlite3* db = nullptr;
@@ -9604,7 +11906,8 @@ TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not o
     ts.session_registry_for_test = &sessions;
     ts.metrics_for_test = &metrics;
     ts.stream_budget_for_test = &budget;
-    // THE POINT: take the shipped default rather than the harness's opt-in.
+    // THE POINT: take the opt-out (--no-mcp-streamed-post) posture rather than the
+    // harness's default-on setting.
     ts.streamed_post_enabled_ = false;
 
     auto minted = sessions.mint("test-user");
@@ -9630,8 +11933,8 @@ TEST_CASE("streamed POST ships DORMANT: the default is off and a stream is not o
                            {{"Mcp-Session-Id", sid}, {"Accept", "text/event-stream"}});
     REQUIRE(res);
 
-    // The command still runs and still answers - dormant is a PLAIN response, not a
-    // refusal. A client asking to stream simply does not get a stream.
+    // The command still runs and still answers - the opt-out path is a PLAIN response,
+    // not a refusal. A client asking to stream simply does not get a stream.
     CHECK(res->status == 200);
     CHECK(dispatched);
     CHECK(res->get_header_value("Content-Type").find("text/event-stream") == std::string::npos);
@@ -9910,6 +12213,87 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
         // The lease taken for the REFUSED call went home rather than leaking - a
         // rejected reservation must not strand the admission slot it acquired.
         CHECK(budget.active() == 0);
+    }
+
+    SECTION("reserve()'s own record cap -> 429 naming post_record_cap, distinct "
+            "from the pre-admission budget's post_global_cap (#2918)") {
+        // A bridge-local cap of 1, separate from the shared `bridge` fixture
+        // (default 256): the FIRST reserve fills it, so the SECOND is refused by
+        // reserve()'s own `cfg_.global_record_cap` check - never reaching the
+        // budget (which has room) or the pin-slots arm (which only ever triggers
+        // past 4 STREAMED records on one session). This is the arm nothing at
+        // the mcp_server.cpp integration level exercised before #2918: the
+        // metric label was shared with the budget's post_global_cap, so the two
+        // causes were indistinguishable in the counter and the audit detail.
+        smcp::McpStreamBridge capped_bridge{&bus, &sessions, &metrics, {},
+                                            smcp::McpStreamBridge::Config{.global_record_cap = 1}};
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&capped_bridge);
+
+        auto first = call_sse(exec_body(755, /*with_token=*/true));
+        REQUIRE(first->status == 200);
+        const auto rows_before = tracker.query_executions({}).size();
+
+        auto second = call_sse(exec_body(756, /*with_token=*/true));
+        REQUIRE(second->status == 429);
+        auto body = nlohmann::json::parse(second->body);
+        CHECK(body["id"] == 756);
+        CHECK(body["error"]["code"] == smcp::kMcpStreamCap);
+        CHECK(reject_count("post_record_cap") == 1.0);
+        CHECK(reject_count("post_global_cap") == 0.0);
+        CHECK(reject_count("post_pin_slots") == 0.0);
+        // Refused at admission: reserve was never called for it, nothing dispatched.
+        CHECK(tracker.query_executions({}).size() == rows_before);
+        CHECK(audit_has("mcp.session.reject|failure"));
+        // `capped_bridge` is SECTION-local and about to go out of scope, but
+        // `ts` (TEST_CASE-scoped) outlives it - null the borrowed pointer
+        // rather than leave it dangling, matching this file's other
+        // borrowed-pointer fixtures (Gate 3 cpp-expert, #2918).
+        ts.mcp.set_stream_bridge(nullptr);
+    }
+
+    SECTION("per-principal cap hit by CONCURRENT streams -> 429 naming "
+            "post_per_principal_cap (#2789)") {
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+        // The pin-slots sibling above closes every response before opening the
+        // next, so the budget always reads back down to 0 and only the ring's
+        // pin_slots arm is ever reached. HOLDING the responses is what makes the
+        // budget itself refuse: with kPerPrincipalMcpPost live streams for one
+        // principal, the fifth must be refused by the per-principal arm - not
+        // the global cap (8 in this fixture) and not pin_slots.
+        std::vector<std::unique_ptr<httplib::Response>> held;
+        for (int i = 0; i < static_cast<int>(smcp::sse_bus::kPerPrincipalMcpPost); ++i) {
+            auto ok = call_sse(exec_body(760 + i, /*with_token=*/true));
+            REQUIRE(ok->status == 200);
+            held.push_back(std::move(ok));
+        }
+        REQUIRE(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") ==
+                smcp::sse_bus::kPerPrincipalMcpPost);
+        const auto rows_before = tracker.query_executions({}).size();
+
+        auto fifth = call_sse(exec_body(770, /*with_token=*/true));
+        REQUIRE(fifth->status == 429);
+        auto body = nlohmann::json::parse(fifth->body);
+        CHECK(body["id"] == 770);
+        CHECK(body["error"]["code"] == smcp::kMcpStreamCap);
+        // The DISTINCT reject reason - this is the arm nothing covered end-to-end.
+        CHECK(reject_count("post_per_principal_cap") == 1.0);
+        CHECK(reject_count("post_global_cap") == 0.0);
+        CHECK(reject_count("post_pin_slots") == 0.0);
+        // And its distinct remediation: the per-principal message tells the
+        // caller to finish THEIR calls, not to come back later.
+        const std::string remediation = body["error"]["data"]["remediation"];
+        CHECK(remediation.find("wait for one of your streamed calls to finish") !=
+              std::string::npos);
+        CHECK(body["error"]["data"]["retry_after_ms"] == smcp::kMcpStreamedPostRetryAfterMs);
+        CHECK(fifth->get_header_value("Retry-After") == "30");
+        // Refused at admission: reserve was never called, nothing dispatched.
+        CHECK(tracker.query_executions({}).size() == rows_before);
+        CHECK(audit_has("mcp.session.reject|failure"));
+        // Reject-not-evict: all four live streams keep their slots.
+        CHECK(budget.active_for(smcp::sse_bus::SseSurface::kMcpPost, "test-user") ==
+              smcp::sse_bus::kPerPrincipalMcpPost);
     }
 
     SECTION("reserve THROWS -> degrade to plain, never 429 and never 500") {

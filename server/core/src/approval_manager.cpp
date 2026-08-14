@@ -1,4 +1,6 @@
 #include "approval_manager.hpp"
+
+#include "sqlite_raii.hpp"
 #include "migration_runner.hpp"
 #include "secure_random.hpp"
 
@@ -46,7 +48,26 @@ std::string col_text(sqlite3_stmt* stmt, int col) {
 
 } // namespace
 
+// Guarded the same way as `consume_denial_reason`. A missing arm here falls
+// through to `return ""`, which `approval_origin_from_string` decodes as
+// kUnspecified — refused at redemption since #2442's closing half
+// (declares_non_mcp_surface). That makes an unhandled enumerator fail CLOSED
+// today, which was not always true: before the MCP mint declared kMcp,
+// kUnspecified was the value that granted, and a missing arm here was
+// fail-open. Kept guarded regardless — this function's return value is a
+// stored column, not just a redemption input, and a silently-wrong write is
+// its own defect independent of which way redemption currently reads it. See
+// that function's header comment for why the MSVC arm is ordered as it is and
+// why it is best-effort.
 const char* to_string(ApprovalOrigin origin) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(1 : 4062) // off by default; `error:` alone does NOT enable it
+#pragma warning(error : 4062)
+#endif
     switch (origin) {
     case ApprovalOrigin::kInstruction:
         return "instruction";
@@ -55,8 +76,18 @@ const char* to_string(ApprovalOrigin origin) {
     case ApprovalOrigin::kMcp:
         return "mcp";
     case ApprovalOrigin::kUnspecified:
+    case ApprovalOrigin::kUnrecognised:
+        // Neither is written as a surface. kUnrecognised only ever comes OUT of
+        // a decode; storing it would round-trip to kUnspecified, collapsing
+        // "this build cannot attribute it to any surface" into "declared
+        // nothing" — different facts even though both refuse today.
         break;
     }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     return "";
 }
 
@@ -67,10 +98,75 @@ ApprovalOrigin approval_origin_from_string(std::string_view text) {
         return ApprovalOrigin::kSchedule;
     if (text == "mcp")
         return ApprovalOrigin::kMcp;
-    // Empty (pre-v5 row or an undeclared mint) and any unrecognised value both
-    // read as "no declared origin" — an unknown string must never be silently
-    // promoted into a surface that grants something.
-    return ApprovalOrigin::kUnspecified;
+    // Empty is an UNDECLARED MINT. Since #2442's closing half, no production
+    // caller writes it any more — the MCP mint now declares kMcp, and
+    // `submit()`'s `origin` parameter is no longer defaulted — so this arm now
+    // exists for two things only: a row minted before this change, and a
+    // caller that regresses the non-default (which the compiler stops, but a
+    // stored row predating the fix is real data, not a hypothetical). Both are
+    // REFUSED at redemption, same as kUnrecognised (declares_non_mcp_surface).
+    // It is NOT the pre-column row: migration v7 rewrote every '' it found to
+    // the sentinel, so a row that predates the column decodes below as
+    // kUnrecognised, not kUnspecified — kept apart so the two refusal causes
+    // ("declared nothing" vs. "predates the column entirely") stay
+    // distinguishable in code even though redemption treats them alike today.
+    // Anything ELSE is a value this build does not know, and it must NOT fold
+    // into either declared case — decode it as its own value (kUnrecognised)
+    // and let the predicate refuse it on that basis, not by accident of
+    // string-matching.
+    if (text.empty())
+        return ApprovalOrigin::kUnspecified;
+    return ApprovalOrigin::kUnrecognised;
+}
+
+// Guarded like the other closed-set switch over this enum, `to_string` above.
+// (`consume_denial_reason` in the header carries the same guard, but over
+// `ConsumeFailure` — a different enum, so it is not part of this set.)
+//
+// The trailing `return true` already fails closed, so a missing arm cannot
+// grant — but it would silently pick the REFUSE side for a surface that may
+// have been added precisely to be redeemable, and the author would never be
+// told. Guarding one of the two was an inconsistency, not a judgement.
+//
+// DO NOT ADD A `default:` LABEL HERE. `-Wswitch` only fires while the switch
+// has none, so a defensive `default: return true;` — which looks like
+// belt-and-braces, and does exactly what the statement below already does —
+// silently deletes this guard, with no warning and no failing test. MEASURED
+// on GCC 15.2: with a default label added, a missing enumerator stops erroring
+// here while still erroring in `to_string`. The trailing return living OUTSIDE
+// the switch is what keeps the guard armed, and that is the whole reason it is
+// out there rather than in a default arm.
+//
+// kUnspecified moved from the grant side to the refuse side here (#2442,
+// closing half): the MCP mint now declares ApprovalOrigin::kMcp explicitly
+// (mcp_server.cpp), so kUnspecified is no longer "the MCP gate, undeclared" —
+// it is now indistinguishable from a row this build cannot attribute to any
+// surface, which is exactly the kUnrecognised case one arm below. Grouping
+// them is deliberate, not an oversight.
+bool declares_non_mcp_surface(ApprovalOrigin origin) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(1 : 4062) // off by default; `error:` alone does NOT enable it
+#pragma warning(error : 4062)
+#endif
+    switch (origin) {
+    case ApprovalOrigin::kInstruction:
+    case ApprovalOrigin::kSchedule:
+    case ApprovalOrigin::kUnrecognised:
+    case ApprovalOrigin::kUnspecified:
+        return true;
+    case ApprovalOrigin::kMcp:
+        return false;
+    }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    return true; // unreachable; fail closed if the enum grows
 }
 
 namespace {
@@ -157,6 +253,17 @@ void ApprovalManager::create_tables() {
         // MCP mint that cannot yet declare itself. Deliberately NOT back-filled
         // to 'instruction': every pre-v5 row would then claim a surface it may
         // not have come from, and these rows are approval evidence.
+        //
+        // Unchanged from the form that shipped to origin/dev. An earlier cut of
+        // this branch added `UPDATE approvals SET origin = 'legacy'` here as
+        // well as in v7. That edit changed no outcome: v5 runs only on a store
+        // below v5 and v7 runs immediately after it with no write in between
+        // (`migration_runner.cpp`, `if (m.version <= current) continue;` inside
+        // the apply loop), and `DEFAULT ''` leaves exactly the rows v7's
+        // `WHERE origin = ''` already matches. What it cost was real — a
+        // numbered migration is the definition of a data state, so editing one
+        // in place means two stores both stamped 5 can differ. The back-fill
+        // lives in v7 alone.
         {5, R"(
             ALTER TABLE approvals ADD COLUMN origin TEXT NOT NULL DEFAULT '';
         )"},
@@ -175,6 +282,45 @@ void ApprovalManager::create_tables() {
                 ON approvals(status, submitted_at);
             CREATE INDEX IF NOT EXISTS idx_approvals_status_consumed_reviewed
                 ON approvals(status, consumed_at, reviewed_at);
+        )"},
+        // v7 (#2442): the ONLY back-fill. '' is the GRANTING case at redemption,
+        // so every row carrying it — whether it predates the column or predates
+        // this migration — has to be moved off it. This reaches both populations
+        // in one step: a store below v5 gets the column from v5 (all rows '')
+        // and is rewritten here in the same loop, and a store already at >= 5,
+        // which never re-runs v5, is rewritten here too. No release carries the
+        // column, but every dev/CI/UAT database tracking origin/dev since
+        // 2026-08-02 does.
+        //
+        // Rewrites EVERY remaining '' row, not just the pre-column ones. A
+        // discriminator was attempted and does not exist: the obvious one is
+        // `submitted_at < schema_meta.upgraded_at`, but the runner re-stamps
+        // `upgraded_at` after EVERY migration, so by the time v7 runs the value
+        // names when v6 finished — seconds ago — not when the column appeared.
+        // A test caught this by asserting a post-column undeclared mint SURVIVES;
+        // it did not. v6 COULD have observed v5's stamp — `set_version` fires
+        // after each migration's SQL, so during v6 the value still named v5's
+        // completion. But v6 has already shipped to exactly the databases this
+        // needs to reach, so the window closed before it was noticed. No
+        // migration addable NOW can see it: every later one overwrites the
+        // stamp. Stated precisely because "impossible" would send the next
+        // author looking for a different mechanism that does not exist, when
+        // the real lesson is that a migration carrying a back-fill must be
+        // written in the same step as the column.
+        //
+        // So this is deliberately blunt: an undeclared MCP ticket outstanding at
+        // upgrade stops redeeming and must be re-requested. That is fail-closed,
+        // bounded by the 7-day approval window, and identical whether the
+        // database arrives via a release or via origin/dev.
+        //
+        // Surgical about everything else, though: `WHERE origin = ''` is what
+        // keeps a DECLARED surface intact. Drop the predicate and every row from
+        // every surface is clobbered to the sentinel and refused. Pinned.
+        //
+        // Matches nothing on a fresh install: v1..v6 run first and the table is
+        // empty. Idempotent: `origin = ''` is false once rewritten.
+        {7, R"(
+            UPDATE approvals SET origin = 'legacy' WHERE origin = '';
         )"},
     };
     if (!MigrationRunner::run(db_, "approval_manager", kMigrations)) {
@@ -204,17 +350,25 @@ ApprovalManager::submit(const std::string& definition_id, const std::string& sub
         return std::unexpected("definition_id is required");
     if (submitted_by.empty())
         return std::unexpected("submitted_by is required");
-    // Namespace reservation (#2442): a surface that has declared itself as
-    // something other than MCP may not mint into the MCP ticket namespace. The
-    // MCP recall matches on (definition_id, scope_expression) and does not bind
-    // the submitter, so without this a ticket minted through the REST
-    // instruction gate — where the definition id is caller-influenced and the
-    // scope expression is caller-supplied verbatim — is a ticket the MCP recall
-    // will accept. Undeclared mints are exempt because the MCP gate itself is
-    // still one of them (ApprovalOrigin::kUnspecified).
-    if (origin != ApprovalOrigin::kMcp && origin != ApprovalOrigin::kUnspecified &&
-        is_reserved_definition_id(definition_id))
-        return std::unexpected(std::string(kReservedDefinitionIdError));
+    // NO mint-time refusal for the reserved namespace. #2442 is defended at
+    // REDEMPTION (see consume_ticket) instead, deliberately:
+    //
+    //  - Refusing here strands pre-existing operator content. A definition
+    //    already under `mcp.` with a schedule submits via kSchedule on every
+    //    fire; refused at mint, that schedule can never run again, and moving a
+    //    schedule between definitions is not supported (#2742).
+    //  - The redemption guard covers more: a ticket minted before the GUARD
+    //    existed, or by a surface that declares itself later, is refused at the
+    //    point of use rather than only at the point of mint. NOT "strictly
+    //    more" — that claim was false and is why migration v7 back-fills a
+    //    sentinel. A row minted before the COLUMN existed carries no surface at
+    //    all, and '' is the granting case; only the back-fill closes it. A
+    //    future caller that omits the defaulted `origin` argument is in the
+    //    same class.
+    //  - Authoring is still refused where authoring happens —
+    //    `instruction_yaml.cpp` and `instruction_store.cpp` both call
+    //    `is_reserved_definition_id`, and `reserved_definition_id.hpp` warns
+    //    that a further call site is "a fourth chance to diverge". This was it.
 
     std::lock_guard lock(mtx_);
 
@@ -412,33 +566,43 @@ std::optional<Approval> ApprovalManager::get(const std::string& id) const {
     return r ? std::move(*r) : std::nullopt;
 }
 
-std::expected<std::optional<Approval>, std::string>
+std::expected<std::optional<Approval>, StoreReadError>
 ApprovalManager::get_checked(const std::string& id) const {
     if (!db_)
-        return std::unexpected("database not open");
+        return std::unexpected(StoreReadError{"database not open"});
     if (id.empty())
-        return std::unexpected("approval id is required");
+        return std::unexpected(StoreReadError{"approval id is required"});
 
     std::lock_guard lock(mtx_);
 
     std::string sql = std::string("SELECT ") + kSelectAllCols + " FROM approvals WHERE id = ?";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
+    // SqliteStmt, not a raw sqlite3_stmt*: row_to_approval() below builds
+    // several std::strings from column data, which is throw-capable, and
+    // that call sits BETWEEN step and any manual finalize — an owner is what
+    // closes that leak window, not call-site ordering (Sol/gpt-5.6-sol
+    // opine review, 2026-08-10: this file's own reordering fix for the
+    // FAILURE branch's std::string build left the SUCCESS branch's
+    // row_to_approval() with the identical exposure).
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK)
+        return std::unexpected(StoreReadError{std::string("prepare failed: ") + sqlite3_errmsg(db_),
+                                              sqlite3_extended_errcode(db_)});
 
-    sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 1, id.c_str(), -1, SQLITE_TRANSIENT);
 
     std::optional<Approval> out;
-    const auto rc = sqlite3_step(stmt);
+    const auto rc = sqlite3_step(stmt.get());
     if (rc == SQLITE_ROW)
-        out = row_to_approval(stmt);
-    sqlite3_finalize(stmt);
+        out = row_to_approval(stmt.get());
 
     // A read that FAILED is not a read that found nothing. Collapsing the two
     // is what let a store error be reported to the operator as "this one-time
     // capability is spent" — see the pre-consume path in consume_ticket.
-    if (rc != SQLITE_ROW && rc != SQLITE_DONE)
-        return std::unexpected(std::string("read failed: ") + sqlite3_errmsg(db_));
+    if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+        const int extended = sqlite3_extended_errcode(db_);
+        return std::unexpected(
+            StoreReadError{std::string("read failed: ") + sqlite3_errmsg(db_), extended});
+    }
     return out;
 }
 
@@ -459,43 +623,64 @@ std::optional<Approval> ApprovalManager::find_pending(const std::string& definit
 
     std::lock_guard lock(mtx_);
 
+    // NO `LIMIT 1`. The newest match is not necessarily a usable one: since the
+    // mint-time namespace refusal was removed, a ticket carrying a declared
+    // non-MCP surface can sit in this dedup key. Handing one back would return a
+    // ticket THIS CALLER'S OWN RECALL WILL REFUSE (`kForeignOrigin`) — so an
+    // administrator reviews and approves a request that can never complete, and
+    // a human approval is spent on a flow with no successful outcome.
+    //
+    // Filtered in C++ through the SHARED predicate rather than a second,
+    // hand-written SQL copy of the rule. A copy in a WHERE clause is a second
+    // home for `declares_non_mcp_surface`, and the two would drift the first
+    // time the enum grows.
+    //
+    // Walk newest-first and take the first REDEEMABLE candidate, rather than
+    // taking the newest and rejecting it — an older undeclared ticket under the
+    // same key is a perfectly good dedup hit, and skipping it would mint a
+    // duplicate.
     std::string sql = std::string("SELECT ") + kSelectAllCols +
                       " FROM approvals WHERE definition_id = ? AND submitted_by = ? "
                       "AND scope_expression = ? AND status = 'pending' "
-                      "ORDER BY submitted_at DESC LIMIT 1";
-    sqlite3_stmt* stmt = nullptr;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
+                      "ORDER BY submitted_at DESC";
+    SqliteStmt stmt;
+    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, stmt.addr(), nullptr) != SQLITE_OK)
         return std::nullopt;
 
-    sqlite3_bind_text(stmt, 1, definition_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, submitted_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 1, definition_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 2, submitted_by.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 3, scope_expression.c_str(), -1, SQLITE_TRANSIENT);
 
-    std::optional<Approval> out;
-    if (sqlite3_step(stmt) == SQLITE_ROW)
-        out = row_to_approval(stmt);
-
-    sqlite3_finalize(stmt);
-    return out;
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        Approval a = row_to_approval(stmt.get());
+        if (!declares_non_mcp_surface(a.origin))
+            return a;
+    }
+    return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------
 // Consume (#289 — one-time MCP approval ticket)
 // ---------------------------------------------------------------------------
 
-std::expected<void, std::string> ApprovalManager::consume_ticket(const std::string& id,
-                                                                 const std::string& consumed_by) {
-    auto r = consume_ticket(id, consumed_by, {});
-    if (r)
-        return {};
-    // The two-argument overload is the pre-#2443 contract: one flat string, and
-    // the same strings as before so its callers keep reporting identically.
-    return std::unexpected(r.error().message);
-}
-
 std::expected<void, ConsumeError>
 ApprovalManager::consume_ticket(const std::string& id, const std::string& consumed_by,
                                 const ConsumePrecondition& precondition) {
+    // These three guards are NOT store faults — `extended_errcode` stays at
+    // its default 0. For `!db_`, that default is harmless: `!mgr.is_open()`
+    // independently forces `approval_store_error_body`'s PERMANENT arm
+    // regardless of `extended_errcode`, so this guard never reaches the
+    // TRANSIENT wording. For the other two (empty id/consumed_by), `db_` IS
+    // open, so `extended_errcode=0` alone (not one of the four permanent
+    // codes) DOES take the transient arm ("retry this call unchanged") if
+    // this `kStoreError` ever reaches `approval_store_error_body` — and
+    // that's misleading, since these are caller/argument errors, not
+    // conditions that clear on their own. Harmless today: the MCP recall
+    // (the sole production caller) pre-validates a non-empty `supplied_id`
+    // before calling, and `consumed_by` is the session's own username, never
+    // empty for an authenticated caller. A future caller that reaches this
+    // function without that pre-validation should not trust the transient
+    // wording for these two cases.
     if (!db_)
         return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, "database not open"});
     if (id.empty())
@@ -507,6 +692,79 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         return std::unexpected(
             ConsumeError{ConsumeFailure::kStoreError, "consumed_by is required"});
 
+    // #2442 CROSS-SURFACE + CROSS-SUBMITTER BINDING. Approvals are one shared
+    // store with three mint paths, and this recall matches a ticket on its
+    // definition id and scope expression — neither of which names the
+    // minting surface, and neither of which is bound to who redeems it. So an
+    // approval raised through the REST instruction gate, where both fields are
+    // caller-influenced, could line up with an MCP tool's canonical arguments
+    // and be redeemed against it; and separately, an id disclosed to any
+    // `Approval:Read` holder (e.g. `GET /api/approvals`) could be redeemed by
+    // a principal other than the one it was granted to. What both buy is the
+    // HUMAN APPROVAL itself: the reviewer sees a ticket id, a submitter and a
+    // scope expression, and nothing that names the SURFACE it was raised on
+    // or BINDS who may present it. (The tool is named: `definition_id` is on
+    // the row, and must be exactly `mcp.<tool>` for the surface confusion to
+    // work at all — that is the premise of the reserved prefix.)
+    //
+    // get_checked, not get: a FAILED read must not decode as an absent row —
+    // `get` collapsed the two, and a transient store fault reading as "no
+    // such row" is exactly the burn class the guard clause below (masked
+    // denial) exists to close. There is no submitter-side equivalent of
+    // kUnspecified's old grant: an empty `submitted_by` never equals a
+    // non-empty `consumed_by` (the empty-argument guard above already
+    // refused an empty `consumed_by`), so a missing submitter simply
+    // mismatches and refuses like any other wrong value.
+    //
+    // Runs BEFORE the precondition block because that block is conditional —
+    // a caller supplying no precondition must not skip this.
+    //
+    // TEST DEPENDENCY: with no precondition supplied (today's only production
+    // caller, the MCP recall), this is the 2nd top-level SELECT this call
+    // issues against the store — the 1st is the caller's own pre-consume
+    // lookup (e.g. mcp_server.cpp's rung-1 get_checked). The MCP integration
+    // test "a store fault AT the origin check masks a foreign-origin ticket's
+    // kind" isolates a fault to THIS read specifically via a countdown
+    // `sqlite3_set_authorizer` that lets the 1st SELECT through and denies
+    // the 2nd. A future read added between the caller's lookup and this one
+    // (on the same connection) would shift that test onto the wrong read
+    // without it failing loudly — update the countdown if you add one. The
+    // submitter check below extends this SAME read rather than adding a 3rd
+    // SELECT, for exactly that reason.
+    {
+        auto row = get_checked(id); // takes mtx_ itself — must be outside any lock
+        if (!row) {
+            // #2786 arm 1: this read failing means neither the origin nor the
+            // submitter comparison below runs, so a foreign-origin OR
+            // foreign-submitter ticket is exactly as likely to be sitting
+            // behind this refusal as an innocent one — the forgery signal is
+            // masked for the duration of the fault. Flag it and log it here,
+            // at the store, so every consume_ticket caller (today only the
+            // MCP recall) gets the signal without duplicating this check.
+            spdlog::warn("ApprovalManager: binding check for ticket {} could not be evaluated "
+                        "(store fault: {}); refusing closed",
+                        redact_id(id), row.error().message);
+            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error().message,
+                                                row.error().extended_errcode,
+                                                /*binding_check_unevaluated=*/true});
+        }
+        if (*row && declares_non_mcp_surface((*row)->origin))
+            return std::unexpected(
+                ConsumeError{ConsumeFailure::kForeignOrigin, kNotConsumableMessage});
+        // #2442 submitter binding: an approval id disclosed to a third party
+        // (e.g. via `GET /api/approvals`, gated on `Approval:Read` — seeded to
+        // Viewer) must not be redeemable by anyone but the principal it was
+        // granted to. Same posture as the origin check: refused with the
+        // uniform message, distinct KIND for the audit trail only, so the
+        // recall cannot be used to probe whether a ticket exists versus who
+        // owns it. Checked in the SAME block, after the origin check, so a
+        // foreign-origin ticket is always reported as that (the more specific
+        // fact) rather than as foreign-submitter when both are true.
+        if (*row && (*row)->submitted_by != consumed_by)
+            return std::unexpected(
+                ConsumeError{ConsumeFailure::kForeignSubmitter, kNotConsumableMessage});
+    }
+
     // Pre-consume recheck (#2443). Skipped entirely when no precondition was
     // supplied, so the two-argument path issues the exact same single statement
     // it always has.
@@ -517,7 +775,8 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         // exists to close, re-entered through the taxonomy.
         auto row = get_checked(id); // takes mtx_ itself — must be outside the lock below
         if (!row)
-            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error()});
+            return std::unexpected(ConsumeError{ConsumeFailure::kStoreError, row.error().message,
+                                                row.error().extended_errcode});
         // A row that cannot transition is reported WITHOUT running the
         // precondition: the callback may be costly or emit audit, and the CAS
         // below would decline this row anyway. Same message as the CAS decline,
@@ -526,7 +785,7 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
         if (!*row || (*row)->status != "approved" || (*row)->consumed_at != 0)
             return std::unexpected(ConsumeError{
                 ConsumeFailure::kNotConsumable,
-                "approval not consumable (already used, not approved, or absent)"});
+                kNotConsumableMessage});
         // The callback is caller code. If it throws, that must not escape a
         // store method as an unhandled exception on an httplib worker: the
         // ticket is untouched either way, so report it as a store error and let
@@ -575,7 +834,8 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
         return std::unexpected(ConsumeError{ConsumeFailure::kStoreError,
-                                            std::string("prepare failed: ") + sqlite3_errmsg(db_)});
+                                            std::string("prepare failed: ") + sqlite3_errmsg(db_),
+                                            sqlite3_extended_errcode(db_)});
 
     sqlite3_bind_int64(stmt, 1, now_epoch());
     sqlite3_bind_text(stmt, 2, consumed_by.c_str(), -1, SQLITE_TRANSIENT);
@@ -591,9 +851,10 @@ ApprovalManager::consume_ticket(const std::string& id, const std::string& consum
     if (rc == SQLITE_DONE)
         return std::unexpected(
             ConsumeError{ConsumeFailure::kNotConsumable,
-                         "approval not consumable (already used, not approved, or absent)"});
+                         kNotConsumableMessage});
     return std::unexpected(ConsumeError{ConsumeFailure::kStoreError,
-                                        std::string("consume failed: ") + sqlite3_errmsg(db_)});
+                                        std::string("consume failed: ") + sqlite3_errmsg(db_),
+                                        sqlite3_extended_errcode(db_)});
 }
 
 // ---------------------------------------------------------------------------

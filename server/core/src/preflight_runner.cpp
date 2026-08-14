@@ -48,6 +48,15 @@ void PreflightRunner::tick() {
         if (d_.response_store)
             checks = preflight::collect_check_responses(*d_.response_store, run.run_id, applicable);
 
+        if (preflight::any_check_degraded(checks)) {
+            // #2691 finding 10: a degraded read must not overwrite an
+            // already-persisted grid with a false "every device incomplete"
+            // verdict, and must not re-dispatch to devices that already
+            // answered on a prior tick — skip this run's tick entirely and
+            // retry next tick, same shape as the empty-targets skip above.
+            continue;
+        }
+
         bool any_pending = false;
         auto grid = preflight::compute_device_results(targets, checks, cfg, &any_pending);
 

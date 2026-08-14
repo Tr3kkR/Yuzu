@@ -29,23 +29,28 @@ if the ADR is amended before PR1.9 lands, this schema may need a rework pass.
 
 ### Vocabulary
 
-- **`securable`** — reuses an existing `RbacStore::list_securable_types()` entry (22 seeded types,
-  `rbac_store.cpp:291-327`, read-only reference for this PR) wherever one accurately describes the
-  protected resource. A Module minting a genuinely new securable is an ADR-0033 §2 escape hatch that
+- **`securable`** — reuses an existing `RbacStore::list_securable_types()` entry (23 seeded types
+  as of #2376's `EnginePrincipal` cut, `rbac_store.cpp:302-348`, read-only reference for this PR)
+  wherever one accurately describes the protected resource. A Module minting a genuinely new
+  securable is an ADR-0033 §2 escape hatch that
   is **not built yet** — its own stated precondition is the runtime capability-declaration registry,
   which is PR1.9's job, not this one's.
 - **`operation`** — `yuzu::server::authz::Operation`. ADR-0033 §2 names "the existing six" as
   Read/Write/Execute/Delete/Approve/Push. `Attest` is a seventh, narrower operation
-  (`rbac_store.cpp` seed comment: Periodic Access Reviews, SOC 2 CC6.2) — deliberately excluded from
-  every CRUD loop there, and included in this model's enum for the same reason: a capability can
-  genuinely declare it.
+  (`rbac_store.cpp` seed comment: Periodic Access Reviews, SOC 2 CC6.2) and `Rotate` is an eighth
+  (`rbac_store.cpp` seed comment: human API-token self-service rotation, P2 #11, SOC 2 CC6.3) —
+  both deliberately excluded from every CRUD loop there, and included in this model's enum for the
+  same reason: a capability can genuinely declare either. `Rotate` is additionally DISTINCT from
+  `Write` on its own securable (`ApiToken`) — a round-3/4 security finding showed a shared op would
+  let an MCP tier allowance for rotation also admit token creation; see `mcp_policy.hpp`'s
+  `tier_allows()` operator-tier comment, the single narrative home for that finding.
 - **`risk_tier`** — `yuzu::server::authz::RiskTier` (Low/Medium/High/Critical). The routing input
   ADR-0033 §5 (D5)'s future auto-approval policy layer will consume; the ADR does not fix concrete
   thresholds (D5 is explicitly future work), so this is a deliberately small, ordered scale captured
   from day one rather than a speculative rule language. `min_risk_tier_for(operation)` is the one
   rule this PR commits to: a **floor**, so a capability cannot under-declare the risk of an
-  inherently sensitive operation class (Delete/Approve/Push floor at High; Write/Execute/Attest at
-  Medium; Read at Low). Declaring above the floor is always fine.
+  inherently sensitive operation class (Delete/Approve/Push floor at High; Write/Execute/Attest/
+  Rotate at Medium; Read at Low). Declaring above the floor is always fine.
 - **`mcp_tier_class`** — `yuzu::server::authz::McpTierClass` (read/write/execute). ADR-0033 §2: the
   routing input PR1.9 **will** feed into the shipped **tier-before-RBAC** ordering
   (`docs/mcp-server.md`, `mcp_policy.hpp::tier_allows`) so every built-in and declared tool routes
@@ -85,7 +90,7 @@ classifies a capability; it never grants one.
 
 ### Seed catalogue
 
-`kSeedCatalogue` is five representative rows, not a full mirror of `RbacStore`'s 21 securables × 7
+`kSeedCatalogue` is five representative rows, not a full mirror of `RbacStore`'s 23 securables × 7
 operations — it exists so PR1.9 has real rows to migrate and so this header's own tests exercise
 `is_valid`, not to be the registry itself. It includes an ordinary CRUD read (`Response:Read`), a
 `Tag:Write` (mirrors `mcp_policy.hpp`'s existing Tag special-case), `Execution:Execute` (the

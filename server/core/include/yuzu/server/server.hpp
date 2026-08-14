@@ -195,6 +195,11 @@ struct Config {
     std::string oidc_admin_group;   // Entra group ID that maps to admin role
     bool oidc_skip_tls_verify{
         false}; // Disable TLS cert verification for OIDC (insecure, for dev only)
+    // ADR-2001 §1 — which validated ID token claim is used as the
+    // SCIM-externalId join key at OIDC login. Allow-list {sub, oid} is
+    // enforced at boot (main.cpp, CLI::IsMember) — fail-closed on anything
+    // else, never a silent fallback to the default.
+    std::string oidc_scim_link_claim{"sub"};
 
     // SAML 2.0 SSO
     // Enabled when idp_sso_url + idp_cert + sp_entity_id + sp_acs_url are all non-empty
@@ -321,14 +326,12 @@ struct Config {
     bool mcp_read_only{false}; // Restrict MCP to read-only tools only
     // MCP Streamable HTTP transport (ADR-1005 Decision 15, track 2f)
     bool mcp_streaming_disable{false}; // --mcp-no-streaming: no sessions, GET/DELETE → 405
-    /// SSE-on-POST (streamed POST, 2f PR 3b). Ships OFF: the machinery is complete and
-    /// reviewed, but two bounds defects are open against it (#2739 - the response cap
-    /// does not fire on a busy execution; #2740 - an undelivered final holds a session
-    /// streamed slot). Both are fixed in the follow-up PR, which flips this default.
-    /// Same shape as Spark's `prefer_spark_`: land the machinery dormant, cut over
-    /// where the invariants actually hold. NOT --mcp-no-streaming, which disables the
-    /// whole transport (sessions + GET/DELETE) including rungs already shipped.
-    bool mcp_streamed_post_enable{false}; // --mcp-enable-streamed-post
+    /// SSE-on-POST (streamed POST, 2f PR 3b). Ships ON: the machinery is complete and
+    /// reviewed, and the four defects that gated the on-by-default flip (#2739, #2740,
+    /// #2785, #2789) are fixed. Pass --no-mcp-streamed-post to opt out.
+    /// NOT --mcp-no-streaming, which disables the whole transport (sessions +
+    /// GET/DELETE) including rungs already shipped.
+    bool mcp_streamed_post_enable{true}; // --mcp-enable-streamed-post
     /// Allowed Origin header values for /mcp/v1/ (scheme+host+port, exact match).
     /// Empty ⇒ any PRESENT Origin is rejected (secure default; absent Origin is
     /// allowed because the endpoint requires a credential). Wired via the

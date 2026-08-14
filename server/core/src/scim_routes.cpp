@@ -1,6 +1,10 @@
 #include "scim_routes.hpp"
 
+#include "analytics_event.hpp"
+#include "analytics_event_store.hpp"
+#include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "deprovision_revoke.hpp"
 #include "engine_principal_store.hpp"
 
 #include <yuzu/metrics.hpp>
@@ -191,6 +195,112 @@ void bump_role_change_failure(auth::AuthManager* auth_mgr) {
         return;
     if (auto* m = auth_mgr->metrics_registry())
         m->counter("yuzu_scim_role_change_failures_total").increment();
+}
+
+/// ADR-2001 D1: a deprovision `deprovision_role_ok` refused (the #2021
+/// role-refusal fork) for a slug that has at least one active linked
+/// federated identity (OIDC and/or SAML) — the federated credentials were
+/// NOT auto-revoked and a human must terminate them manually.
+void bump_deprovision_role_refused_with_link(auth::AuthManager* auth_mgr) {
+    if (!auth_mgr)
+        return;
+    if (auto* m = auth_mgr->metrics_registry())
+        m->counter("yuzu_scim_deprovision_role_refused_with_active_link_total").increment();
+}
+
+/// The result of `federated_links_for_scim_id` below: whether `scim_id` has
+/// at least one active linked federated identity, and how many were
+/// confirmed (best-effort — see that function's doc comment on partial
+/// lookup failure).
+struct FederatedLinkCount {
+    bool has_link = false;
+    std::size_t count = 0;
+};
+
+/// ADR-2001 PR4a — D1's "does this scim_id have any active linked federated
+/// identity" test, UNIONED across OIDC (`links_for_scim_id`) and SAML
+/// (`saml_links_for_scim_id`) — mirrors `resolve_deprovision_principals`'s
+/// union pattern (deprovision_revoke.cpp:17-33), but stays a fire/no-fire +
+/// count question for D1's best-effort LOUDNESS signal rather than a
+/// deprovision-gating resolve (D1 never gates access — see deactivate()'s
+/// doc comment; the underlying role refusal is already fail-closed before
+/// this runs).
+///
+/// A lookup failure on EITHER side is a store blip, not "no linked
+/// identity" — but D1 is best-effort, so it must not CRASH and must not
+/// SUPPRESS a signal the other side would have fired on its own: if OIDC
+/// alone confirms a link, this fires on that count even when the SAML read
+/// blipped, and vice versa (this is why OIDC-only behavior is unchanged
+/// when SAML is the side that blips or is empty). This reports no link
+/// whenever no side actually CONFIRMS one — both blipped, both confirmed-
+/// empty, OR one confirmed-empty while the other blipped. That last case is
+/// the residual: if the blipping side was the one genuinely holding the only
+/// link, the signal is skipped — a single-store-blip degradation identical
+/// in kind to the pre-existing OIDC-only path (no regression, and never a
+/// false-positive fire), acceptable because D1 is a best-effort loudness
+/// overlay on a refusal that has already fail-closed.
+FederatedLinkCount federated_links_for_scim_id(ScimStore& scim_store, const std::string& scim_id) {
+    FederatedLinkCount out;
+    auto oidc_links = scim_store.links_for_scim_id(scim_id);
+    if (oidc_links.has_value()) {
+        out.count += oidc_links->size();
+    } else {
+        spdlog::warn("ScimRoutes: D1 — links_for_scim_id lookup failed for scim_id={} (store "
+                    "blip); the OIDC half of the D1 signal is best-effort skipped, not treated "
+                    "as \"no linked identity\"",
+                    scim_id);
+    }
+    auto saml_links = scim_store.saml_links_for_scim_id(scim_id);
+    if (saml_links.has_value()) {
+        out.count += saml_links->size();
+    } else {
+        spdlog::warn("ScimRoutes: D1 — saml_links_for_scim_id lookup failed for scim_id={} "
+                    "(store blip); the SAML half of the D1 signal is best-effort skipped, not "
+                    "treated as \"no linked identity\"",
+                    scim_id);
+    }
+    out.has_link = out.count > 0;
+    return out;
+}
+
+/// ADR-2001 D1 — the LOUD *severity* channel. `AuditEvent`/`AuditStore`
+/// (what every other call on this surface writes to, via `audit()` below)
+/// has NO severity field — its `result` column is success/denied/failure/
+/// partial, never a severity level, so a D1 audit row can only ever be as
+/// loud as any other row. The one severity-carrying mechanism in this
+/// codebase is `AnalyticsEvent::severity` via `AnalyticsEventStore` — the
+/// SAME channel `AuthRoutes::emit_event` (auth_routes.cpp) uses to record
+/// `Severity::kCritical` break-glass-login events. This mirrors that
+/// function's body: no session to resolve on this bearer-only surface, so
+/// `principal`/`principal_role` are stamped with the fixed SCIM service
+/// principal instead of a resolved session's username/role. `analytics_
+/// store` may be null (deferred-wiring precedent, see the header doc) —
+/// a no-op in that case; the AuditStore row and the counter this always
+/// runs alongside still fire regardless.
+void emit_scim_critical_event(AnalyticsEventStore* analytics_store, const std::string& event_type,
+                              const nlohmann::json& attrs) {
+    if (!analytics_store)
+        return;
+    AnalyticsEvent ae;
+    ae.event_type = event_type;
+    ae.severity = Severity::kCritical;
+    ae.attributes = attrs;
+    ae.principal = kScimPrincipal;
+    ae.principal_role = kScimPrincipal;
+    analytics_store->emit(std::move(ae));
+}
+
+/// ADR-2001 D2: a deprovision resolved NO linked OIDC identity for a slug,
+/// but a recorded login observation shows a claim value matching that
+/// slug's externalId — the user DID authenticate via OIDC but the link
+/// never formed, almost certainly a misconfigured `--oidc-scim-link-claim`.
+/// The CC6.8 false-green tripwire: a deprovision that revokes nothing for a
+/// federated user who exists.
+void bump_deprovision_unlinked(auth::AuthManager* auth_mgr) {
+    if (!auth_mgr)
+        return;
+    if (auto* m = auth_mgr->metrics_registry())
+        m->counter("yuzu_scim_deprovision_unlinked_total").increment();
 }
 
 // ── Audit ────────────────────────────────────────────────────────────────
@@ -666,26 +776,187 @@ void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr
     bump_role_changed(auth_mgr);
 }
 
+/// ADR-2001 D2 detector: called once a deprovision has resolved its
+/// principal set. When `resource`'s scim_id has NO linked OIDC identity AND
+/// its externalId has a recorded login observation, a user DID authenticate
+/// via OIDC but the link never formed — surface the CC6.8 false-green
+/// tripwire. `scim_store`/`auth_mgr` may be null (defense in depth, matching
+/// every other helper on this surface); a no-op then.
+///
+/// Governance fix (PR4a CHANGES_REQUESTED, C2): this used to gate on the
+/// resolved principal-set SIZE (`principals.size() != 1`) as a proxy for
+/// "no OIDC link exists". Once the resolver started appending SAML
+/// principals into that same vector, a user with a coexisting SAML link
+/// AND an unformed OIDC link — the exact D2 misconfiguration this detector
+/// exists to catch — pushed `principals.size()` to 2+, so the proxy read
+/// "has a link" and D2 silently never fired. Query the OIDC link count
+/// SPECIFICALLY instead, independent of any SAML link on the same scim_id.
+/// A store blip on the OIDC read (`nullopt`) is "cannot confirm", not "no
+/// link" — D2 is best-effort and never gates access, so it must not fire a
+/// false tripwire off an unanswerable read; it silently skips instead,
+/// exactly as the OIDC-only code did on any other unanswerable read on this
+/// surface.
+void maybe_flag_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_mgr,
+                            const ScimResource& resource) {
+    if (!scim_store || resource.external_id.empty())
+        return;
+    auto oidc_links = scim_store->links_for_scim_id(resource.scim_id);
+    if (!oidc_links.has_value()) {
+        spdlog::warn("ScimRoutes: D2 — links_for_scim_id lookup failed for scim_id={} (store "
+                    "blip); skipping the unlinked-OIDC tripwire check rather than risk a false "
+                    "positive off an unconfirmed read",
+                    resource.scim_id);
+        return;
+    }
+    if (!oidc_links->empty())
+        return; // an OIDC link IS formed for this scim_id — nothing to flag
+    if (!scim_store->observation_matches(resource.external_id))
+        return;
+    spdlog::warn("ScimRoutes: deprovision of '{}' (scim_id={}) found a login observation "
+                "matching externalId '{}' but no formed identity_link — possible "
+                "--oidc-scim-link-claim misconfiguration",
+                resource.username, resource.scim_id, resource.external_id);
+    bump_deprovision_unlinked(auth_mgr);
+}
+
+/// ADR-2001 §§1,3 — resolve the deprovision principal set for `resource` and
+/// revoke credentials (tokens then sessions, per principal) across it,
+/// credentials-FIRST, before the caller proceeds to mark the account
+/// inactive/deleted. Shared by `deactivate()` (PATCH/PUT active:false) and
+/// the DELETE handler's own active-branch inline flow (which cannot reuse
+/// `deactivate()` wholesale — it persists a row DELETE, not a
+/// `set_active(false)` mirror). Also runs the D2 detector once the
+/// principal set is known.
+///
+/// Returns false (and has already sent a response + audited `audit_action`
+/// as "failure"/"partial") on identity-link resolution failure, a missing/
+/// closed `token_store`, or a non-persisted token revoke — the caller MUST
+/// NOT proceed to `remove_user`/mark-inactive in any of those cases
+/// (ADR-2001 §3 fail-closed-on-non-persist). On success, returns true and
+/// writes the revoked counts into `detail_out` (folded into the caller's own
+/// success audit's detail string, mirroring `/me`'s
+/// `api_tokens_revoked=N`/`sessions_revoked=N` pattern).
+bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* token_store,
+                                       auth::AuthManager* auth_mgr, AuditStore* audit_store,
+                                       const httplib::Request& req, httplib::Response& res,
+                                       const ScimResource& resource,
+                                       const std::string& audit_action, std::string& detail_out) {
+    auto principals =
+        resolve_deprovision_principals(*scim_store, resource.scim_id, resource.username);
+    if (!principals.has_value()) {
+        // FAIL CLOSED (ADR-2001 §1): the link population is UNKNOWN, never
+        // treated as "no links to revoke" — that is the exact silent-under-
+        // revocation gap this ADR closes.
+        spdlog::error("ScimRoutes: identity-link resolution failed for scim_id={} — refusing "
+                     "to deprovision (a store blip must not read as \"no linked identities to "
+                     "revoke\")",
+                     resource.scim_id);
+        send_scim_error(res, 500, "failed to resolve linked identities");
+        audit(auth_mgr, audit_store, req, audit_action, "failure", resource.scim_id,
+             "identity_link_resolution_failed");
+        return false;
+    }
+    maybe_flag_d2_unlinked(scim_store, auth_mgr, resource);
+    if (!token_store || !token_store->is_open()) {
+        spdlog::error("ScimRoutes: ApiTokenStore unavailable — refusing to deprovision '{}' "
+                     "(scim_id={}) without being able to revoke its credentials",
+                     resource.username, resource.scim_id);
+        send_scim_error(res, 503, "credential store unavailable");
+        audit(auth_mgr, audit_store, req, audit_action, "failure", resource.scim_id,
+             "api_token_store_unavailable");
+        return false;
+    }
+    auto revoke_result = revoke_deprovision_credentials(*token_store, *auth_mgr, *principals);
+    detail_out = "api_tokens_revoked=" + std::to_string(revoke_result.api_tokens_revoked) +
+                " sessions_revoked=" + std::to_string(revoke_result.sessions_revoked) +
+                " principals=" + std::to_string(principals->size()) +
+                // Governance Gate 7 SHOULD fix (UP-5): enumerate the actual
+                // principal strings, not just the count, so the audit row is
+                // self-contained CC6.8 evidence.
+                enumerate_principals_for_audit(*principals);
+    if (!revoke_result.api_tokens_persisted) {
+        detail_out += " api_tokens_db_error=true";
+        spdlog::error("ScimRoutes: revoke_for_principal did not persist for one or more "
+                     "principals linked to '{}' (scim_id={}) — refusing to report a clean "
+                     "deprovision (ADR-2001 §3 fail-closed)",
+                     resource.username, resource.scim_id);
+        send_scim_error(res, 500, "failed to revoke API tokens for one or more linked identities");
+        audit(auth_mgr, audit_store, req, audit_action, "partial", resource.scim_id, detail_out);
+        return false;
+    }
+    return true;
+}
+
 /// Deactivate the auth account backing `resource` (provenance- and role-
 /// guarded) and mark the SCIM resource inactive. Shared by PATCH
 /// active=false, PUT active=false, and DELETE. Returns false (and has
-/// already sent a response) on provenance/role refusal, an AuthManager
-/// failure, or a ScimStore mirror-write failure (M-ATOMICITY, UP-5). A
-/// failed termination audit does NOT fail the call — see `audit()`'s doc
-/// comment (set-and-proceed, CC6.8 enforced via the failure-counter alert).
-bool deactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* audit_store,
-                const httplib::Request& req, httplib::Response& res, const ScimResource& resource,
-                const std::string& audit_action,
-                EnginePrincipalStore* engine_principal_store = nullptr) {
+/// already sent a response) on provenance/role refusal, identity-link
+/// resolution failure, a non-persisted credential revoke (ADR-2001 §3), an
+/// AuthManager failure, or a ScimStore mirror-write failure (M-ATOMICITY,
+/// UP-5). A failed termination audit does NOT fail the call — see
+/// `audit()`'s doc comment (set-and-proceed, CC6.8 enforced via the
+/// failure-counter alert).
+bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthManager* auth_mgr,
+                AuditStore* audit_store, const httplib::Request& req, httplib::Response& res,
+                const ScimResource& resource, const std::string& audit_action,
+                EnginePrincipalStore* engine_principal_store = nullptr,
+                AnalyticsEventStore* analytics_store = nullptr) {
     if (!provenance_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id, res))
         return false;
-    if (!deprovision_role_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id, res))
+    if (!deprovision_role_ok(auth_mgr, audit_store, req, resource.username, resource.scim_id,
+                             res)) {
+        // ADR-2001 D1: deprovision_role_ok already sent 404 + audited
+        // scim.user.provenance_denied — #2021's protection for a manually-
+        // elevated account stands, and this deprovision is NOT auto-
+        // revoking any linked federated identity. Leaving that silent would
+        // hide that the termination is incomplete: make it LOUD whenever a
+        // linked identity actually exists to be missed — an AuditStore row
+        // (result="failure": the termination did NOT complete), the
+        // role-refused-with-link counter, AND a Severity::kCritical
+        // analytics event (the codebase's actual severity channel — see
+        // emit_scim_critical_event's doc comment; AuditEvent itself has no
+        // severity field, so "kCritical" is never a legal `result` value).
+        // `links == nullopt` (the lookup itself failed) is treated as
+        // "nothing to report" here — D1's signal is a best-effort ADD-ON
+        // that never gates access, so a store blip skips only the extra
+        // signal, not the underlying (already fail-closed) role refusal.
+        if (scim_store) {
+            auto links = federated_links_for_scim_id(*scim_store, resource.scim_id);
+            if (links.has_link) {
+                std::string detail = "role-refused deprovision has " +
+                                     std::to_string(links.count) +
+                                     " active linked federated identity(ies) (OIDC and/or "
+                                     "SAML) that were NOT auto-revoked (ADR-2001 D1) — a "
+                                     "human must terminate them manually";
+                audit(auth_mgr, audit_store, req,
+                     "scim.user.deprovision_role_refused_with_link", "failure", resource.scim_id,
+                     detail);
+                bump_deprovision_role_refused_with_link(auth_mgr);
+                emit_scim_critical_event(analytics_store,
+                                         "scim.user.deprovision_role_refused_with_link",
+                                         {{"scim_id", resource.scim_id},
+                                          {"linked_identity_count", links.count},
+                                          {"detail", detail}});
+            }
+        }
         return false;
+    }
+
+    // ADR-2001 §§1,3 — credentials-FIRST revoke across the resolved
+    // principal set (slug + every linked OIDC identity) BEFORE the account
+    // is marked inactive. Reorders this function's former remove_user-first
+    // sequence (safe: every op below is idempotent).
+    std::string revoke_detail;
+    if (!revoke_linked_credentials_or_fail(scim_store, token_store, auth_mgr, audit_store, req,
+                                           res, resource, audit_action, revoke_detail))
+        return false;
+
     if (!auth_mgr->remove_user(resource.username)) {
         spdlog::error("ScimRoutes: AuthManager::remove_user failed for '{}' (scim_id={})",
                      resource.username, resource.scim_id);
         send_scim_error(res, 500, "failed to deactivate the underlying account");
-        audit(auth_mgr, audit_store, req, audit_action, "failure", resource.scim_id);
+        audit(auth_mgr, audit_store, req, audit_action, "failure", resource.scim_id,
+             revoke_detail);
         return false;
     }
     // M-ATOMICITY (UP-5): the AuthManager (AuthDB connection) write above
@@ -713,7 +984,7 @@ bool deactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
                      resource.scim_id);
         send_scim_error(res, 500, "failed to persist the deactivated state");
         audit(auth_mgr, audit_store, req, audit_action, "failure", resource.scim_id,
-             "auth account deactivated but scim_resource mirror write failed");
+             "auth account deactivated but scim_resource mirror write failed; " + revoke_detail);
         return false;
     }
     // Set-and-proceed (UP-N2): the mutation above already committed — a lost
@@ -724,7 +995,7 @@ bool deactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
     // `yuzu_scim_audit_write_failures_total` (bumped inside `audit()` on
     // every failure), not by refusing to report the 2xx that already
     // happened.
-    audit(auth_mgr, audit_store, req, audit_action, "success", resource.scim_id);
+    audit(auth_mgr, audit_store, req, audit_action, "success", resource.scim_id, revoke_detail);
     // Detective control (PR 4.3, engine principals): the deprovision above
     // already committed — flag (never block) if the deprovisioned operator
     // owned active engine principals. See `flag_owner_deprovisioned`'s doc
@@ -775,16 +1046,20 @@ bool reactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
 void ScimRoutes::register_routes(httplib::Server& svr, ScimStore* scim_store,
                                  auth::AuthManager* auth_mgr, AuditStore* audit_store,
                                  std::string scim_admin_group,
-                                 EnginePrincipalStore* engine_principal_store) {
+                                 EnginePrincipalStore* engine_principal_store,
+                                 ApiTokenStore* token_store,
+                                 AnalyticsEventStore* analytics_store) {
     HttplibRouteSink sink(svr);
     register_routes(sink, scim_store, auth_mgr, audit_store, std::move(scim_admin_group),
-                    engine_principal_store);
+                    engine_principal_store, token_store, analytics_store);
 }
 
 void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                  auth::AuthManager* auth_mgr, AuditStore* audit_store,
                                  std::string scim_admin_group,
-                                 EnginePrincipalStore* engine_principal_store) {
+                                 EnginePrincipalStore* engine_principal_store,
+                                 ApiTokenStore* token_store,
+                                 AnalyticsEventStore* analytics_store) {
     spdlog::info("SCIM routes: registering /scim/v2/* (provisioning surface)");
 
     // ── Discovery documents — PUBLIC-behind-the-bearer-gate (least exposure:
@@ -817,8 +1092,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
     // ── POST /scim/v2/Users — provision. ──────────────────────────────────
 
-    sink.Post("/scim/v2/Users", [scim_store, auth_mgr, audit_store,
-                                 scim_admin_group](const httplib::Request& req,
+    sink.Post("/scim/v2/Users", [scim_store, auth_mgr, audit_store, scim_admin_group,
+                                 token_store](const httplib::Request& req,
                                                    httplib::Response& res) {
         if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
             record_request(auth_mgr, "create", res.status);
@@ -1080,6 +1355,30 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                 record_request(auth_mgr, "create", 409);
                 return;
             }
+            // Governance Gate 7 SHOULD fix (UP-1): a NEW userName carrying an
+            // externalId already held by a DIFFERENT (typically inactive)
+            // row hits `scim_resources_external_id_uniq` the same way the
+            // concurrent-revive race above does, but for a distinct reason —
+            // distinguish it with its own 409 rather than falling through to
+            // the opaque 500 below. `find_by_external_id` is the plain
+            // (not-active-filtered) lookup: an inactive row still legitimately
+            // holds the externalId. Same M-ORPHAN rollback rule as the 500
+            // branch just below applies here too — this IS a genuine create
+            // failure, just a distinguishable one.
+            if (!input.external_id.empty()) {
+                if (auto colliding = scim_store->find_by_external_id(input.external_id);
+                    colliding.has_value() && colliding->username != input.user_name) {
+                    if (created_auth_row_this_call)
+                        auth_mgr->remove_user(input.user_name);
+                    send_scim_error(res, 409, "externalId already mapped to another resource",
+                                    "uniqueness");
+                    audit(auth_mgr, audit_store, req, "scim.user.provisioned", "denied",
+                         input.user_name,
+                         "externalId already mapped to scim_id=" + colliding->scim_id);
+                    record_request(auth_mgr, "create", 409);
+                    return;
+                }
+            }
             // No mapping — a genuine create failure. Roll back to a
             // deactivated tombstone ONLY if THIS call created the auth row
             // (the fresh-create branch): the next POST for the same
@@ -1115,7 +1414,28 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         // Honour an explicit active:false on create (some IdPs stage a user
         // deactivated) by immediately deactivating the account we just
         // made/revived.
+        std::string revoke_detail;
         if (input.active.has_value() && !*input.active) {
+            // ADR-2001 §§1,3 — credentials-FIRST revoke, same as every other
+            // deprovision seam. `create_resource` (just above) always mints
+            // a fresh CSPRNG scim_id — even on the REVIVE branch (a prior
+            // DELETE hard-removes the old scim_resource row) — so
+            // resolve_deprovision_principals resolves to the slug alone
+            // here in practice (no identity_links row can yet reference a
+            // scim_id that didn't exist until this request). Still routed
+            // through the shared resolver/orchestrator rather than a bare
+            // remove_user(), both for uniformity with the other three
+            // deprovision seams and because SCIM-provisioned accounts are
+            // SSO-only in name only — nothing stops a slug-keyed API token
+            // from existing (e.g. minted directly against the username by
+            // an operator), and this is the credentials-first ordering
+            // that must revoke it before the account goes inactive.
+            if (!revoke_linked_credentials_or_fail(scim_store, token_store, auth_mgr, audit_store,
+                                                   req, res, *resource, "scim.user.provisioned",
+                                                   revoke_detail)) {
+                record_request(auth_mgr, "create", res.status);
+                return;
+            }
             if (!auth_mgr->remove_user(input.user_name)) {
                 // FIX-1 (Hermes MEDIUM, fail-open): previously this branch
                 // only logged and fell through to set_active(false) below,
@@ -1169,8 +1489,10 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
         res.set_content(scim::user_to_json(*resource, base).dump(), kScimJson);
         // set-and-proceed (every SCIM audit call is, per `audit()`'s doc
         // comment) — the 201 above already committed regardless of whether
-        // this row persists.
-        audit(auth_mgr, audit_store, req, "scim.user.provisioned", "success", resource->scim_id);
+        // this row persists. `revoke_detail` is empty unless the
+        // active:false branch above ran a credential revoke.
+        audit(auth_mgr, audit_store, req, "scim.user.provisioned", "success", resource->scim_id,
+             revoke_detail);
         record_request(auth_mgr, "create", 201);
     });
 
@@ -1274,8 +1596,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
     // ── PUT /scim/v2/Users/{id} — full replace (identity fields only). ────
 
     sink.Put(R"(/scim/v2/Users/([0-9a-fA-F]+))",
-            [scim_store, auth_mgr, audit_store,
-             engine_principal_store](const httplib::Request& req,
+            [scim_store, auth_mgr, audit_store, engine_principal_store, token_store,
+             analytics_store](const httplib::Request& req,
                                                 httplib::Response& res) {
                 if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                     record_request(auth_mgr, "replace", res.status);
@@ -1323,8 +1645,9 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
 
                 bool active_transitioned = false;
                 if (input.active.has_value() && !*input.active && resource->active) {
-                    if (!deactivate(scim_store, auth_mgr, audit_store, req, res, *resource,
-                                    "scim.user.deactivated", engine_principal_store)) {
+                    if (!deactivate(scim_store, token_store, auth_mgr, audit_store, req, res,
+                                    *resource, "scim.user.deactivated", engine_principal_store,
+                                    analytics_store)) {
                         record_request(auth_mgr, "replace", res.status);
                         return;
                     }
@@ -1354,8 +1677,9 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                             "(scim_id={}) says inactive but the auth account is still live; "
                             "re-running deactivation",
                             resource->username, resource->scim_id);
-                        if (!deactivate(scim_store, auth_mgr, audit_store, req, res, *resource,
-                                        "scim.user.deactivated", engine_principal_store)) {
+                        if (!deactivate(scim_store, token_store, auth_mgr, audit_store, req, res,
+                                        *resource, "scim.user.deactivated", engine_principal_store,
+                                        analytics_store)) {
                             record_request(auth_mgr, "replace", res.status);
                             return;
                         }
@@ -1427,8 +1751,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
     // ── PATCH /scim/v2/Users/{id} — the critical deprovision path. ────────
 
     sink.Patch(R"(/scim/v2/Users/([0-9a-fA-F]+))",
-              [scim_store, auth_mgr, audit_store,
-               engine_principal_store](const httplib::Request& req,
+              [scim_store, auth_mgr, audit_store, engine_principal_store, token_store,
+               analytics_store](const httplib::Request& req,
                                                   httplib::Response& res) {
                   if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                       record_request(auth_mgr, "patch", res.status);
@@ -1478,8 +1802,9 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                   bool active_transitioned = false;
                   if (patch.active.has_value()) {
                       if (!*patch.active && resource->active) {
-                          if (!deactivate(scim_store, auth_mgr, audit_store, req, res, *resource,
-                                          "scim.user.deactivated", engine_principal_store)) {
+                          if (!deactivate(scim_store, token_store, auth_mgr, audit_store, req,
+                                          res, *resource, "scim.user.deactivated",
+                                          engine_principal_store, analytics_store)) {
                               record_request(auth_mgr, "patch", res.status);
                               return;
                           }
@@ -1505,9 +1830,9 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                   "'{}' (scim_id={}) says inactive but the auth account is "
                                   "still live; re-running deactivation",
                                   resource->username, resource->scim_id);
-                              if (!deactivate(scim_store, auth_mgr, audit_store, req, res,
-                                              *resource, "scim.user.deactivated",
-                                              engine_principal_store)) {
+                              if (!deactivate(scim_store, token_store, auth_mgr, audit_store, req,
+                                              res, *resource, "scim.user.deactivated",
+                                              engine_principal_store, analytics_store)) {
                                   record_request(auth_mgr, "patch", res.status);
                                   return;
                               }
@@ -1575,8 +1900,8 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
     // ── DELETE /scim/v2/Users/{id} ─────────────────────────────────────────
 
     sink.Delete(R"(/scim/v2/Users/([0-9a-fA-F]+))",
-               [scim_store, auth_mgr, audit_store,
-                engine_principal_store](const httplib::Request& req,
+               [scim_store, auth_mgr, audit_store, engine_principal_store, token_store,
+                analytics_store](const httplib::Request& req,
                                                    httplib::Response& res) {
                    if (!require_bearer(scim_store, auth_mgr, audit_store, req, res)) {
                        record_request(auth_mgr, "delete", res.status);
@@ -1589,6 +1914,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        record_request(auth_mgr, "delete", 404);
                        return;
                    }
+                   std::string revoke_detail;
                    if (resource->active) {
                        if (!provenance_ok(auth_mgr, audit_store, req, resource->username, id,
                                          res)) {
@@ -1597,12 +1923,52 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                        }
                        if (!deprovision_role_ok(auth_mgr, audit_store, req, resource->username,
                                                id, res)) {
+                           // ADR-2001 D1 — same loud-refusal signal as
+                           // deactivate()'s doc comment: deprovision_role_ok
+                           // already sent 404 + audited
+                           // scim.user.provenance_denied; make it LOUD if a
+                           // linked federated identity exists to be missed
+                           // (AuditStore result="failure" + the counter +
+                           // a Severity::kCritical analytics event — see
+                           // emit_scim_critical_event's doc comment for why
+                           // severity cannot live on the AuditEvent itself).
+                           auto links = federated_links_for_scim_id(*scim_store, id);
+                           if (links.has_link) {
+                               std::string detail =
+                                   "role-refused deprovision has " +
+                                   std::to_string(links.count) +
+                                   " active linked federated identity(ies) (OIDC and/or "
+                                   "SAML) that were NOT auto-revoked (ADR-2001 D1) — a human "
+                                   "must terminate them manually";
+                               audit(auth_mgr, audit_store, req,
+                                    "scim.user.deprovision_role_refused_with_link", "failure", id,
+                                    detail);
+                               bump_deprovision_role_refused_with_link(auth_mgr);
+                               emit_scim_critical_event(
+                                   analytics_store, "scim.user.deprovision_role_refused_with_link",
+                                   {{"scim_id", id},
+                                    {"linked_identity_count", links.count},
+                                    {"detail", detail}});
+                           }
+                           record_request(auth_mgr, "delete", res.status);
+                           return;
+                       }
+                       // ADR-2001 §§1,3 — credentials-FIRST revoke across the
+                       // resolved principal set BEFORE remove_user/delete
+                       // below. Never reuse deactivate() here — this handler
+                       // persists a row DELETE, not a set_active(false)
+                       // mirror, so it shares the resolve+revoke helper only.
+                       if (!revoke_linked_credentials_or_fail(scim_store, token_store, auth_mgr,
+                                                              audit_store, req, res, *resource,
+                                                              "scim.user.deleted",
+                                                              revoke_detail)) {
                            record_request(auth_mgr, "delete", res.status);
                            return;
                        }
                        if (!auth_mgr->remove_user(resource->username)) {
                            send_scim_error(res, 500, "failed to deactivate the underlying account");
-                           audit(auth_mgr, audit_store, req, "scim.user.deleted", "failure", id);
+                           audit(auth_mgr, audit_store, req, "scim.user.deleted", "failure", id,
+                                revoke_detail);
                            record_request(auth_mgr, "delete", 500);
                            return;
                        }
@@ -1655,8 +2021,10 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                    id);
                    }
                    // Set-and-proceed (UP-N2) — see the matching comment in
-                   // `deactivate()`.
-                   audit(auth_mgr, audit_store, req, "scim.user.deleted", "success", id);
+                   // `deactivate()`. `revoke_detail` is empty for the
+                   // already-inactive branch (no fresh revoke ran there).
+                   audit(auth_mgr, audit_store, req, "scim.user.deleted", "success", id,
+                        revoke_detail);
                    // Detective control (PR 4.3, engine principals): flag
                    // (never block) if the deprovisioned operator owned
                    // active engine principals — see

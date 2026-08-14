@@ -575,8 +575,9 @@ current membership. Mirrors the break-glass metric/audit treatment above.
   source; a miswired call passing `"local"` would mass-delete every local
   group membership fleet-wide.
 - **Fail-closed on the login.** An over-cap assertion or a reconcile-store
-  failure (e.g. a locked/corrupt `rbac.db`) denies the login outright before a
-  session is minted — a heavily-loaded or unhealthy `rbac.db` degrades
+  failure (e.g. an unreachable/degraded PostgreSQL `rbac_store` — pool-acquire
+  timeout or query error, ADR-0041) denies the login outright before a
+  session is minted — a heavily-loaded or unhealthy `rbac_store` degrades
   availability (SSO logins fail) rather than integrity (a session with
   stale/unreconciled roles). The break-glass/local-password escape hatch
   (`/login`, hardened-mode) is unaffected — it never calls `/auth/callback`
@@ -679,12 +680,25 @@ as dead code in the #1837 governance hardening round.
 `username`; the dashboard JS shows `display_name`, falling back to
 `username` for a legacy/local session predating this field.
 
-**SAML is unaffected this slice.** `create_saml_session` still keys
-`username` on the raw NameID (`display_name` is set to the same value,
-purely for render-site parity) — SAML does not sync to `rbac_store` yet
-(dropped in #1827), so the collision this fix closes is dormant there.
-Keying SAML on `entity_id#NameID` is a tracked fast-follow, to land
-alongside SAML group sync.
+**SAML was unaffected this slice; since resolved (ADR-2001 PR4a).** At the
+time of the #1837 hardening round documented above, `create_saml_session`
+still keyed `username` on the raw NameID (`display_name` set to the same
+value, purely for render-site parity) — SAML does not sync to `rbac_store`
+yet (dropped in #1827), so the collision risk this fix closes was dormant
+there. ADR-2001 PR4a has since closed the SAML side of the same gap:
+`create_saml_session` now keys `username` on the stable
+`saml_principal_id(entity_id, name_id)` (`"saml:" + entity_id + "#" +
+name_id`, `saml_principal.hpp`), mirroring the OIDC split above
+byte-for-byte; `display_name` still carries the raw NameID for render-site
+parity. This unlocks force-logout (`DELETE /api/v1/sessions?username=
+saml:<entity_id>#<NameID>`, `is_valid_principal` accepts the `saml:`
+reserved prefix on the same wider SSO charset as `oidc:`) and SCIM
+deprovision-time session revocation for linked SAML identities (see
+`docs/user-manual/scim-provisioning.md` "SCIM ↔ SAML identity linkage").
+JIT elevation is **not** part of this fix — no `auth.db` `users` row is
+provisioned for a SAML principal, so `provision_sso_identity` is still not
+wired to SAML (`AuthManager::provision_sso_identity`'s docstring) and a
+SAML session still cannot elevate.
 
 **Audit-detail-field injection defense (`sanitize_detail_value`).** Every
 IdP-supplied value that reaches an audit `detail` string or an
@@ -706,7 +720,9 @@ unchanged; if that value is later rendered into HTML, the render layer's
 own escaping (`html_escape`) is what neutralises it. See the docstring on
 `detail::sanitize_detail_value` in `auth_routes.hpp` for the full contract.
 
-**Migration.** `RbacStore` schema v3 deletes every `group_members` row
+**Migration.** `RbacStore` **legacy SQLite** schema v3 (distinct from the PG
+schema's own v3, ADR-0041 — different migration sequences, same file)
+deletes every `group_members` row
 belonging to an IdP-sourced group (`groups.source != 'local'`) on
 upgrade — those rows were keyed on the OLD display-name principal and
 would otherwise be BOTH orphaned (never re-referenced by the new
@@ -822,15 +838,18 @@ record.** Four fixes on top of the base restoration above:
   does not touch `#` — a durable SSO principal's `#` was silently truncated
   by the browser's URL-fragment parsing before the request left the client.
 
-SAML is unaffected by this restoration: `create_saml_session` still keys
-`username` on the raw NameID (no reserved-prefix stable principal — see
-"SAML is unaffected this slice" above), so `is_valid_principal` does not
-recognise it as an SSO principal and `provision_sso_identity` is not called
-from the SAML ACS handler. A SAML session is therefore provisioned nowhere
-and cannot elevate — not because of a missing MFA proof specifically, but
-because there is no durable identity row to hold `elevation_eligible` on in
-the first place. Keying SAML on `entity_id#NameID` (the tracked fast-follow
-noted above) is a prerequisite for extending this restoration to SAML.
+SAML still cannot elevate, though the reason has narrowed since ADR-2001
+PR4a (see "SAML was unaffected this slice; since resolved" above):
+`create_saml_session` now keys `username` on the reserved-prefix stable
+principal `saml:<entity_id>#<NameID>`, so `is_valid_principal` DOES
+recognise it as an SSO principal (unlocking force-logout, per that section)
+— but `provision_sso_identity` is still never called from the SAML ACS
+handler, so no `auth.db` `users` row is provisioned for a SAML principal.
+A SAML session therefore still cannot elevate — not because of a missing
+MFA proof specifically, and no longer because `is_valid_principal` rejects
+the identity shape, but because there is no durable identity row to hold
+`elevation_eligible` on in the first place. Wiring `provision_sso_identity`
+into the SAML ACS handler is a tracked follow-up, separate from PR4a.
 
 **This is not a regression of a previously-supported flow.** Before #1837,
 `Session::username` for an OIDC session was the mutable display name
@@ -879,8 +898,9 @@ sweep described at the top of this bullet, for every `auth_source`.
 Implementation: `Session::username`/`display_name`
 (`auth.hpp`), `AuthManager::create_oidc_session` (`auth.cpp`), the
 stable-id construction and per-audit-row `display=`/`email=` detail
-attachment in `auth_routes.cpp` `/auth/callback`, `RbacStore` migration
-v3 (`rbac_store.cpp`). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
+attachment in `auth_routes.cpp` `/auth/callback`, `RbacStore` legacy SQLite
+migration v3 (`rbac_store.cpp`; distinct from the PG schema's own v3,
+ADR-0041). Tests: `tests/unit/server/test_oidc_principal_key.cpp`.
 
 ## SAML 2.0 SP
 
@@ -1500,6 +1520,251 @@ own eventual Postgres cutover. That cutover has now happened for both stores
 in lockstep — the exception is retired, not carried forward. See
 `docs/postgres-migration-ladder.md`'s auth/SCIM row for the shipped record.
 
+### SCIM ↔ OIDC identity linkage for deprovision (ADR-2001, CC6.8)
+
+`docs/adr/2001-scim-oidc-identity-linkage.md` (Accepted). Closes a gap in the
+CC6.8 termination control above: a SCIM-provisioned user and their OIDC login
+identity are **two disjoint `auth.users` rows** (SCIM provisions
+`username=<slug>`; OIDC login always mints `username="oidc:" + iss + "#" +
+sub` and never adopts the slug), and every API/MCP token a federated user
+holds is minted on the **`oidc:` principal**, never the slug. Deprovisioning
+the slug alone (the pre-ADR-2001 behavior) therefore revoked **zero** of a
+federated user's tokens while reporting a clean success — the exact
+silent-under-revocation gap this ADR closes. **PR1+PR2+PR3 of the ADR's
+delivery plan are all shipped** (link formation, the revoke seam, D1, D2,
+and the deny-at-login backstop, ADR §4) — a deprovisioned linked identity
+can no longer re-authenticate via OIDC and mint a fresh session; see
+"Deny-at-login backstop" below for the exact deny sites, the fail-closed
+store-unavailable posture, and the honest (narrowed-not-eliminated) scope
+of the in-flight-deprovision race it self-heals.
+
+**Join key: `--oidc-scim-link-claim`.** Configures which validated ID-token
+claim is compared against a SCIM resource's `externalId` to form the link at
+login. Default `sub`; boot rejects any value outside the allow-list `{sub,
+oid}` fail-closed (`main.cpp`, `CLI::IsMember`) — never a silent fallback to
+an unvalidated claim. This is an **operator decision per IdP**, not a
+universal default:
+
+| IdP | Typical `externalId` source | Correct `--oidc-scim-link-claim` |
+|---|---|---|
+| Okta | The OIDC `sub` claim | `sub` (default — no flag needed) |
+| Microsoft Entra ID | The AAD object id, which rides the ID token as the `oid` claim, **not** `sub` | `oid` (`--oidc-scim-link-claim=oid`) |
+
+Getting this wrong is not silent: it is exactly the condition the D2
+detector (below) exists to surface. An IdP whose SCIM `externalId` shares no
+value with any OIDC claim Yuzu validates **cannot** have its federated
+tokens revoked by SCIM at all — there is no join key available for any
+`--oidc-scim-link-claim` setting to select; this is a fundamental limitation
+of the design (single trusted-issuer join on IdP-asserted claims only, ADR
+constraint 3), not a configuration mistake, and it too is surfaced via D2
+rather than failing silently.
+
+**Link formation (login-time, fail-open).** On a successful OIDC login,
+Yuzu compares the configured claim's value against `scim_resources
+.external_id`. A link is recorded (in `ScimStore`'s dedicated
+`identity_links` table, keyed `(iss, sub)` unique, secondary-indexed on
+`scim_id`) **only when exactly one active SCIM resource matches** —
+zero matches is normal (no link, nothing to do); more than one match is
+treated as **no link**, not an arbitrary pick (`ScimStore::
+find_unique_active_by_external_id`; the mis-link-prevention guard, ADR §2).
+The link write itself is fail-open — a write failure never fails the login,
+because a missing link is caught by the D2 detector below. Independently of
+whether a link formed, **every OIDC login also records a durable
+observation** of the claim value it presented (`ScimStore::
+record_login_observation`) — this is what makes D2 possible at all.
+
+**Deprovision-time revoke.** SCIM `active:false` (PATCH/PUT), SCIM `DELETE`,
+and the dashboard's `DELETE /api/settings/users/{username}` all resolve the
+full principal set — the slug **plus every `oidc:<iss>#<sub>` identity
+currently linked to it** — and revoke API tokens (`ApiTokenStore::
+revoke_for_principal`) and sessions for **each** principal in that set,
+**before** the account is marked inactive/deleted. On any revoke that fails
+to persist, the caller does **not** report a clean success: SCIM returns
+`500` (so the IdP retries) and the audit result is `partial`; the dashboard
+delete likewise refuses to proceed to `remove_user`. This mirrors `/me`'s
+own `api_tokens_revoked=N`/`sessions_revoked=N` detail-string pattern.
+Implementation: `deprovision_revoke.{hpp,cpp}` (the shared
+resolver/orchestrator, deliberately **not** a reuse of `session_revoke_fn`,
+which carries unrelated `caller=self|admin` metric semantics) and
+`oidc_principal.hpp` (the single `oidc_principal_id(iss, sub)` builder every
+call site uses — a hand-built format would silently miss every token for a
+principal built the "wrong" way).
+
+**The ~60s residual, stated honestly.** A previously-issued API/MCP token
+may keep *validating* for up to `ApiTokenStore`'s in-memory validate-cache
+TTL (~60s) after the underlying `revoke_for_principal` call has already
+persisted — the revoke is durable, but a concurrent request racing the
+cache eviction can still see the old cached "valid" answer for that window.
+Add the (irreducible) IdP→SCIM propagation lag on top. **Cookie sessions are
+revoked immediately** (in-memory, no cache layer). The honest guarantee is
+**"revoked within ~60s of the deprovision reaching Yuzu,"** not instant —
+do not describe this as instantaneous revocation.
+
+**D1 — a SCIM slug elevated to admin outside SCIM (the #2021 guard
+interaction).** `deprovision_role_ok` still refuses (404, per the
+provenance/role guard above) to deprovision a slug whose current role is not
+`user` — including when that elevation happened via Groups→role mapping or
+a manual dashboard promotion. Post-linkage, that refusal now has a new
+consequence: the linked federated identity's tokens are **not**
+auto-revoked either (auto-revoking on the IdP's unilateral say-so would
+reopen exactly what #2021 defends against — a compromised or racing IdP
+tearing down an admin). ADR-2001 D1 keeps the refusal, but makes it loud
+whenever a linked identity actually exists to be missed: a human must
+terminate the federated identity manually (revoke its tokens from the
+dashboard, or demote-then-redeprovision). **What actually fires, precisely
+(this is a real divergence from the ADR's `kCritical` shorthand worth
+naming explicitly — see below):**
+
+1. An `AuditStore` row, action `scim.user.deprovision_role_refused_with_link`,
+   **`result="failure"`** — always, and no different in kind from any other
+   audit row on this surface. `AuditEvent` has **no severity column**; a
+   D1 audit row cannot itself be "critical" any more than a break-glass-login
+   audit row can (same pattern there).
+2. The Prometheus counter `yuzu_scim_deprovision_role_refused_with_active_link_total`
+   — always, unconditionally, alongside the audit row.
+3. A `Severity::kCritical` `AnalyticsEvent` (`emit_scim_critical_event`,
+   `scim_routes.cpp`) — **only when `AnalyticsEventStore` is wired**, i.e.
+   only when analytics event collection is enabled (`--no-analytics` is
+   opt-*out*, so this is on by default unless explicitly disabled, but it is
+   a product-analytics pipeline, not a dedicated security-alert channel, and
+   a deployment that disables analytics loses this signal entirely).
+
+**Operator guidance: alert on (1)+(2), the metric and the `result="failure"`
+audit row — that is the primary, always-on D1 signal regardless of the
+analytics-collection setting.** The `kCritical` analytics event is
+enrichment on top for a deployment that has analytics wired, not the
+detection mechanism itself. Do not build a detection rule that assumes an
+audit row can itself carry a severity level — filter on `action=
+"scim.user.deprovision_role_refused_with_link"` (or the metric), not on any
+notion of a "critical audit."
+
+**D2 — the fail-loud detector for a mismatched/misconfigured link claim.**
+Every OIDC login records **both** the `sub` and `oid` candidate claim
+values it observed, not only the value of the claim `--oidc-scim-link-claim`
+is currently configured to use. When a deprovision resolves a principal set
+of size 1 (slug only — no linked identity) but a recorded login observation
+shows the slug's `externalId` matches **either** candidate value at some
+prior OIDC login, that is a real signal: the user **did** authenticate via
+OIDC, but the link never formed — almost always a misconfigured
+`--oidc-scim-link-claim` (or, per the worked-examples table above, an IdP
+whose `externalId` has no matching OIDC claim at all). Recording both
+candidates (rather than only the configured one) is what makes D2 able to
+catch the specific, common failure mode where the *wrong* claim is
+configured — e.g. an Entra deployment left on the default `sub` whose
+`externalId` actually matches `oid` — instead of a case where the
+configured-but-wrong claim's value happens never to have been observed at
+all. This bumps `yuzu_scim_deprovision_unlinked_total`
+(`ScimRoutes::maybe_flag_d2_unlinked`). **A non-zero rate here means some
+federated population's tokens are NOT being revoked by SCIM deprovision
+today** — investigate the flag value before trusting the CC6.8 claim for
+that population. D2 is a detection signal conditioned on a login-then-
+deprovision pair actually occurring in the observed window, not a
+standing guarantee — a zero rate means "nothing detected yet," not
+"every federated user is provably linked."
+
+**Deny-at-login backstop (ADR-2001 §4, PR3 — shipped).** An OIDC login whose
+linked SCIM resource is deprovisioned is refused. `ScimStore::
+linked_resource_active(iss, sub)` resolves the identity in one query — a
+LEFT JOIN from `identity_links` to `scim_resources` — and returns a
+`LinkedResourceState{scim_id, active}` tri-state: store-unavailable (the
+query itself could not be answered) is treated identically to a resolved
+inactive/orphaned link — **fail-closed, deny**; no `identity_links` row at
+all is a genuine non-match — **proceed**; a linked row whose `scim_resources`
+counterpart is gone (hard-DELETEd by a SCIM `DELETE` — `identity_links` is
+**not** FK-cascaded) or explicitly `active=false` — **deny**, naming the
+`scim_id` that drove it; a linked row with `active=true` — **proceed**. The
+LEFT JOIN is load-bearing: an INNER join would collapse the orphaned-link
+case into "no rows," which reads as "no link" and would let a
+fully-deprovisioned identity re-authenticate — exactly the bypass this join
+shape exists to close.
+
+`oidc_login_denied_deprovisioned(scim_store, iss, sub)`
+(`oidc_scim_link.{hpp,cpp}`) is the single pure decision function both call
+sites in `/auth/callback` share:
+
+1. **Primary check**, immediately after the OIDC principal is built and
+   strictly **before** any mutation below it (group reconcile, session mint,
+   `provision_sso_identity`, the ADR-2001 §2 link/observation writes, MFA
+   `amr` seeding) — a denied login leaves no side effect behind.
+2. **Post-mint re-check**, run again immediately after `create_oidc_session`
+   and strictly **before** the `Set-Cookie` header is written. If a
+   concurrent SCIM deactivate/DELETE landed in the window between the
+   primary check and the mint, this re-check catches it: it calls
+   `AuthManager::invalidate_user_sessions` on the session just minted and
+   denies — self-healing the check-then-mint race **without** holding a
+   cross-store lock over the mint (which would violate the "never hold one
+   store's pool lease while calling another" discipline in §3 above).
+
+Both deny sites emit the **byte-identical** `/login?error=sso_failed`
+redirect the existing token-exchange-failure branch uses (no
+"deprovisioned" wording reaches the browser — no oracle), a server-side
+audit row `auth.oidc.deprovisioned_denied` (`result=failure`, principal =
+the OIDC username), and increment the pre-seeded counter
+`yuzu_auth_oidc_deprovisioned_denied_total`. `detail` distinguishes the two
+denial causes rather than folding them into one reason: `reason=
+linked_scim_resource_inactive` plus `;scim_id=<id>` when an actually
+resolved (deactivated or orphaned) SCIM resource drove the denial, versus
+`reason=scim_store_unavailable` (no `scim_id` — there is no resource to
+name; the store itself could not be asked) on the fail-closed
+store-unavailable path — this path denies **every** OIDC login while it
+persists, not only deprovisioned ones (`docs/user-manual/scim-provisioning.md`
+"Availability: a ScimStore/Postgres outage denies ALL OIDC logins"). On the
+post-mint re-check path only, `detail` additionally carries
+`;post_mint_recheck=true;sessions_invalidated=<N>`, and
+`;db_persisted=false` if the session-revoke write itself did not persist.
+
+**The honest guarantee — read this before describing CC6.8 as fully
+closed.** Deny-at-login **fully closes** the dominant case: a re-login
+against an **already-completed** deprovision is refused, unconditionally —
+there is no window left to race once the deprovision itself has landed. It
+**narrows, but does not eliminate by construction**, the rarer
+**in-flight-deprovision** race: a login that authenticates and
+mints/refreshes its link strictly *inside* the gap between the primary
+check and the mint, concurrently with a deprovision landing in that same
+gap, is caught by the post-mint re-check in the overwhelming majority of
+timings — but a microsecond check-then-mint window remains theoretically
+possible and is **deliberately not closed by lock-serialization** (the
+cross-store-lock deadlock hazard above). **That residual's bound differs by
+credential kind — the two must not be collapsed into one figure.** An
+API/MCP token caught in the race is bounded by the existing ~60s
+`ApiTokenStore` validate-cache window. A session that slips through is
+**not** on the same clock: `AuthManager::validate_session` re-checks only
+the session's own expiry/idle timeout on every request, never SCIM-linked
+deprovision state, so a slipped session remains valid for up to the
+**session's own TTL** (the absolute `kSessionDuration`, 8h by default, or a
+shorter configured `--session-inactivity-secs` idle timeout) — it is cut
+short early only if a *subsequent* deprovision call happens to land against
+the same identity, which an IdP is not guaranteed to send again once it
+believes the resource is already deactivated. Do not describe a slipped
+session as bounded by ~60s, and do not describe this residual overall as
+"the race has nothing left to win" — that overclaims what a lock-free,
+cross-store design can guarantee; see
+`docs/adr/2001-scim-oidc-identity-linkage.md` "Known residuals" for the
+full statement, including the forward caveat on single-primary Postgres
+reads (this guarantee assumes no read-replica routing).
+
+### New audit actions (ADR-2001)
+
+| Action | Result | When |
+|---|---|---|
+| `scim.user.deprovision_role_refused_with_link` | `failure` | D1: a role-refused deprovision (`deprovision_role_ok` 404) for a slug with ≥1 active linked OIDC identity that was NOT auto-revoked |
+| `auth.oidc.deprovisioned_denied` | `failure` | §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned) or because `ScimStore` could not answer at all (fail-closed). Emitted from `/auth/callback`, not a `/scim/v2/*` route. `detail` carries `reason=linked_scim_resource_inactive;scim_id=<id>` when an actually resolved resource drove the denial, or `reason=scim_store_unavailable` (no `scim_id`) when the store itself could not be asked, and on the post-mint re-check path only, `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that revoke itself failed to persist) |
+
+The existing `scim.user.deactivated`/`.deleted` rows (see Audit actions
+above) now also carry `api_tokens_revoked=N sessions_revoked=N
+principals=N` in `detail` on success, and `partial` is now a possible
+`result` for those two actions specifically (a non-persisted credential
+revoke — see "Deprovision-time revoke" above), in addition to the existing
+`success`/`failure`.
+
+### New metrics (ADR-2001)
+
+| Metric | Meaning | Operator action on non-zero |
+|---|---|---|
+| `yuzu_scim_deprovision_role_refused_with_active_link_total` | D1: a deprovision was refused (role != `user`) for a slug with an active linked federated identity — that identity's tokens were NOT auto-revoked | A human must terminate the linked federated identity's credentials manually (revoke its tokens, or demote the account then let the next deprovision proceed normally). Alert on this alongside the existing `yuzu_scim_provenance_denied_total`. |
+| `yuzu_scim_deprovision_unlinked_total` | D2: a deprovision found a login observation matching the slug's `externalId` but resolved no formed link — almost certainly a misconfigured `--oidc-scim-link-claim`, or an IdP whose `externalId` has no corresponding OIDC claim (see the worked-examples table) | Re-check `--oidc-scim-link-claim` against your IdP (Okta: `sub`; Entra: `oid`). If neither matches, this population's federated tokens are not reachable by SCIM revoke by design — treat their manual revocation as a required step of the offboarding runbook until a shared claim exists. |
+| `yuzu_auth_oidc_deprovisioned_denied_total` | §4/PR3: an OIDC login was denied at `/auth/callback` because its linked SCIM resource resolved deprovisioned (deactivated, orphaned, or the store degraded) — the deny-at-login backstop actually firing | A deprovisioned federated identity attempted to re-authenticate; confirm the deprovision was intentional. A sustained non-zero rate against one identity may indicate a termination the user (or their IdP session) has not yet noticed, or a store-degrade making the check fail closed — correlate with ScimStore/Postgres availability. |
+
 ### Residual risks / deferred (next slice)
 
 - **Crash-window non-atomicity in the two-store deactivate/reactivate
@@ -1533,6 +1798,40 @@ in lockstep — the exception is retired, not carried forward. See
   `mfa_totp_secret` envelope-encryption (shipped, see MFA/TOTP above) is a
   genuinely different case because TOTP verification needs the *plaintext*
   secret back, not just a compare.
+- **ADR-2001 deny-at-login backstop (§4/PR3) has SHIPPED — the
+  login-vs-deprovision TOCTOU is now closed for OIDC, honestly scoped.** A
+  federated identity whose linked SCIM slug is **already** deprovisioned is
+  refused at OIDC login, unconditionally — the simpler "re-login after
+  deprovision" case is fully closed, no exceptions. The rarer **in-flight**
+  race — a login that authenticates and forms/refreshes the identity link
+  concurrently with a deprovision landing in the same narrow window — is
+  **narrowed, not eliminated by construction**: a post-mint re-check
+  self-heals the overwhelming majority of timings by invalidating a session
+  minted during the race, but a microsecond check-then-mint gap remains
+  theoretically possible and is deliberately not closed via cross-store
+  lock-serialization (a deadlock hazard against this codebase's store
+  discipline). That residual is bounded by the eager revoke PR1/PR2 already
+  provide plus the ~60s `ApiTokenStore` validate-cache window. See "Deny-at-
+  login backstop" above and "Known residuals" in
+  `docs/adr/2001-scim-oidc-identity-linkage.md` for the precise guarantee —
+  do not describe it as "the race has nothing left to win." **The remaining
+  named residuals for the federated population are: (1) the ~60s
+  validate-cache window (unaffected by PR3 — it bounds API/MCP token
+  validation staleness after a *successful* revoke, a different mechanism
+  from the login-path deny); and (2) a SAML identity whose IdP asserts an
+  **unstable NameID Format** (`transient`/`unspecified`, or a missing
+  Format) is deliberately not SCIM-linked** — SAML link formation (PR4a)
+  and the SAML deny-at-login backstop (PR4b, issue #3066) now cover SAML on
+  par with OIDC (see "SAML ↔ SCIM identity linkage" below), but linkage
+  forms ONLY for a **stable** NameID (`persistent` or SAML 1.1
+  `emailAddress`); an unstable-NameID SAML login still succeeds and is
+  simply unrevocable via SCIM, and Yuzu never normalizes it into a linkable
+  identity — a deliberate, documented residual, not an oversight in this
+  ADR's scope. **ADR-2001 is also fundamentally unable to revoke a federated
+  population whose IdP SCIM `externalId` shares no value with any OIDC claim
+  Yuzu validates** — no `--oidc-scim-link-claim` setting helps in that case;
+  see the "SCIM ↔ OIDC identity linkage" subsection above for the D2 metric
+  that surfaces this.
 
 Implementation: `server/core/include/yuzu/server/scim_store.hpp` +
 `server/core/src/scim_store.cpp` (storage layer), `server/core/include/yuzu/
@@ -1541,11 +1840,314 @@ discovery documents), `server/core/src/scim_routes.{hpp,cpp}` (HTTP routes).
 Tests: `tests/unit/server/test_scim_store.cpp`,
 `test_scim_json.cpp`, `test_scim_routes.cpp`.
 
+### SAML ↔ SCIM identity linkage (ADR-2001 PR4a+PR4b, CC6.8)
+
+`docs/adr/2001-scim-oidc-identity-linkage.md` (Accepted, SAML addendum). The
+SAML analogue of "SCIM ↔ OIDC identity linkage for deprovision" above, shipped
+as **PR4a** (link formation + deprovision-time revoke — the SAML counterpart
+of that section's PR1+PR2) **and PR4b** (deny-at-login — the SAML counterpart
+of that section's §4/PR3). Before PR4a, a SAML login's session was keyed on
+the raw NameID alone, and no link to any SCIM resource was ever recorded, so
+a SCIM deprovision could not reach a SAML-authenticated identity's session at
+all.
+
+**Stable principal: `saml:<entity_id>#<NameID>`.** `AuthManager::
+create_saml_session` now keys the session's `username` (the authorization/
+audit/revoke principal) on `saml::saml_principal_id(entity_id, name_id)`
+(`server/core/src/saml_principal.hpp`) — `"saml:" + entity_id + "#" +
+name_id`, mirroring `oidc_principal_id(iss, sub)`'s shape byte-for-byte and
+built through the same kind of single shared builder (both the session-mint
+site and the deprovision resolver route through it, so a hand-built copy at
+either site cannot drift from the other and silently miss a session on
+revoke). `display_name` stays the raw NameID — human-readable rendering
+only (dashboard, audit detail), never the authorization key. Both the NameID
+and the `entity_id` are sanitised at the ACS handler (non-empty, ≤255 bytes,
+no control bytes — the same rule `OidcProvider::validate_claims` applies to
+`sub`/`oid`) **before** either value enters the principal string or the link
+store; a malformed value fails the SAML login outright (redirect
+`/login?error=saml`, no session minted) — fail-closed, the same posture OIDC
+takes for the same class of durable-join-key input.
+
+**Single-IdP precondition — stronger than the OIDC side.** SAML's join key
+is the assertion's NameID; unlike OIDC's `--oidc-scim-link-claim` (which
+selects among candidate claims), there is exactly one candidate value and no
+per-issuer partitioning question, because Yuzu accepts assertions from
+exactly one pinned IdP (`--saml-idp-cert` + `--saml-idp-entity-id`, both
+already required — `SamlProvider::is_enabled()`). `--saml-idp-entity-id` is
+now additionally load-bearing for the principal build itself: it is the
+`entity_id` half of every `saml:<entity_id>#<NameID>` string, verified by
+`SamlProvider::validate_response` to equal the assertion's signed
+`<saml:Issuer>` before the ACS handler ever reads it. This single-pinned-IdP
+shape is what makes a bare NameID→`externalId` match safe by construction —
+the multi-IdP partitioning caveat the OIDC section's constraint 5 states does
+not apply here as written, because there is only ever one IdP to partition
+against.
+
+**The NameID Format contract — a NameID is a safe join key ONLY when it is
+STABLE and equals the SCIM `externalId`.** SAML's `<NameID>` element carries
+an optional `Format` attribute; `SamlProvider::validate_response` now reads
+it into `SamlAssertion::name_id_format` from the same XSW-verified assertion
+node as the NameID itself. A link to a SCIM resource forms **only** when the
+Format is one of the two STABLE URIs Yuzu treats as safe —
+`urn:oasis:names:tc:SAML:2.0:nameid-format:persistent` or the SAML 1.1
+`urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress`
+(`saml::is_linkable_name_id_format`, `saml_scim_link.hpp`). A `transient`
+Format — re-minted per login by design — or an `unspecified`/missing Format
+is conservatively treated as **not linkable**; Yuzu never coerces or
+normalizes an unstable NameID into a linkable one. **This is an operator
+configuration obligation, not something Yuzu can enforce on the IdP's
+behalf: the operator must configure their IdP to emit a NameID that is both
+a stable Format and equal to the SCIM `externalId` it provisions that same
+user with.** A NameID that is stable-Format but numerically different from
+the SCIM `externalId` (or an IdP left on `transient`) simply never forms a
+link — the SAML login still succeeds, but that identity is **unlinkable, and
+therefore unrevocable via SCIM deprovision**. This is the direct SAML
+analogue of the OIDC section's D2 case (a mismatched/misconfigured join
+claim) — with no equivalent detector: SAML has exactly one candidate join
+key (there is no `--saml-oidc-link-claim` knob to misconfigure among several
+candidates), so there is no "should-have-matched-a-different-candidate"
+signal to record, and no `saml_login_observations` table exists.
+
+**Link formation (login-time, fail-open).** On a successful SAML login with a
+linkable NameID Format, Yuzu compares the NameID against
+`scim_resources.external_id` using the same `find_unique_active_by_external_id`
+exactly-one-active-match rule the OIDC side uses (`ScimStore`) — zero matches
+is normal (no link), more than one match forms no link (never an arbitrary
+pick). A formed link is recorded in a **dedicated `saml_identity_links`
+table** (`ScimStore` migration v4 — a separate table from OIDC's
+`identity_links`, deliberately not a generalization of it, keeping this PR
+off the OIDC linkage schema surface), keyed `(entity_id, name_id)` unique
+with a secondary index on `scim_id`. The link write itself is fail-open — a
+write failure never fails the login, mirroring the OIDC side's posture
+exactly (`saml::link_saml_login_to_scim`, `saml_scim_link.{hpp,cpp}`).
+
+**Residual — rotating the pinned trust anchor orphans existing links.**
+Because a link row is keyed on the pinned IdP identifier (`entity_id` for
+SAML, `iss` for OIDC — part of the principal identity itself), rotating
+`--saml-idp-entity-id` (or, symmetrically, the OIDC `--oidc-issuer`) leaves
+every existing `saml_identity_links`/`identity_links` row keyed on the *old*
+value. `saml_linked_resource_active(new_entity_id, name_id)` then matches
+zero rows and reads as "no link → proceed", so the deny-at-login backstop
+does **not** fire for an already-deprovisioned identity logging in under the
+new identifier. Crucially the backstop **cannot re-arm itself via SCIM** for
+such an identity: `link_saml_login_to_scim` re-forms a link only against an
+*active* SCIM resource (`find_unique_active_by_external_id`), and a
+deprovisioned resource is inactive — so the login keeps proceeding, and
+re-running SCIM deprovision does nothing (there is no active resource to
+re-link to). This is a deliberate, documented residual of the
+single-pinned-IdP linkage model, in the same family as the unstable-NameID
+residual below: within the designed envelope — one stable pinned identifier
+— the control holds; rotating that identifier is re-establishing the trust
+anchor. Across such a rotation the operator relies on the **primary**
+termination control — the IdP no longer issuing assertions for a terminated
+user — since the deny-at-login backstop (which exists precisely for the case
+where SCIM deprovision and IdP de-authorization are decoupled or lagging) is
+blind to a pre-rotation-deprovisioned identity until it is re-provisioned
+and re-links on a subsequent login. It is not a code gap the deny logic can
+close without abandoning the `entity_id`/`iss`-scoped link key (which is
+what keeps a SAML `saml:` principal and an OIDC `oidc:` principal from ever
+colliding on a shared NameID/subject).
+
+**Deprovision-time revoke: SAML has no API tokens, so revoke = session
+invalidation.** `resolve_deprovision_principals`
+(`deprovision_revoke.cpp`) now runs a second pass alongside the existing
+OIDC one: for every row `ScimStore::saml_links_for_scim_id(scim_id)` returns,
+it adds `saml::saml_principal_id(entity_id, name_id)` to the principal set a
+deprovision revokes — fail-**closed** on that lookup's own `nullopt`, exactly
+like the OIDC pass (a store blip must never be read as "no linked SAML
+identity"). Because SAML never mints API/MCP tokens (there is no
+`revoke_for_principal` call site keyed on a `saml:` principal — only
+`create_saml_session` mints anything for one), the practical effect of
+resolving a `saml:` principal into the revoke set is **session
+invalidation only**: the linked SAML session (if still live) is torn down;
+there are no SAML-keyed tokens to revoke.
+
+**Deny-at-login backstop — PR4b (#3066), SHIPPED.** PR4a alone closed only the
+*deprovision-time* gap: an existing SAML session for a deprovisioned, linked
+identity is revoked. PR4b closes the login-time gap the same way §4/PR3
+closes it for OIDC above — a deprovisioned SAML identity is now refused *at*
+`/saml/acs`, not merely torn down on the next deprovision pass.
+`ScimStore::saml_linked_resource_active(entity_id, name_id)` is the SAML
+analogue of `linked_resource_active(iss, sub)`: a LEFT JOIN from
+`saml_identity_links` to `scim_resources` in one query, reusing the OIDC
+side's `LinkedResourceState` tri-state shape — store-unavailable is
+fail-**closed** (deny), no linked row is a genuine non-match (proceed), an
+orphaned link (the `scim_resources` row hard-deleted) denies unless an active
+reprovision sibling exists for the same NameID
+(`find_unique_active_by_external_id`, the same reprovision rule §4 uses), and
+an explicitly-deactivated link denies unconditionally. `saml::
+saml_login_denied_deprovisioned(scim_store, entity_id, name_id)`
+(`saml_scim_link.{hpp,cpp}`) is the single pure decision function both call
+sites in `/saml/acs` share — a **primary check** immediately after
+`saml_principal` is built and strictly before any mutation (link formation,
+session mint), and a **post-mint re-check** immediately after
+`create_saml_session` and strictly before `Set-Cookie`, which invalidates the
+just-minted session via `AuthManager::invalidate_user_sessions` and denies if
+a concurrent deprovision landed in the check-then-mint window — the identical
+self-healing shape §4 uses for OIDC. Unlike the OIDC side there is no
+separate link-claim parameter: SAML's join key is always the NameID itself
+(see the NameID Format contract above), so the orphaned-branch reprovision
+check resolves against `name_id` directly.
+
+Both deny sites emit the **byte-identical** `/login?error=saml` redirect
+every other SAML failure branch uses (no oracle), a server-side audit row
+`auth.saml.deprovisioned_denied` (`result=failure`, principal = the
+`saml:<entity_id>#<NameID>` string), and increment the pre-seeded counter
+`yuzu_auth_saml_deprovisioned_denied_total`. `detail` distinguishes the two
+denial causes exactly like the OIDC row: `reason=
+linked_scim_resource_inactive;scim_id=<id>` when a resolved (deactivated or
+orphaned-not-reprovisioned) SCIM resource drove the denial, versus `reason=
+scim_store_unavailable` (no `scim_id`) on the fail-closed store-unavailable
+path; the post-mint re-check path additionally carries `;post_mint_recheck=
+true;sessions_invalidated=<N>` (+`;db_persisted=false` if that session
+invalidation itself failed to persist). PR4b inherits the `--scim-enable`
+gate for free — `/saml/acs` reads the same `AuthRoutes::scim_store_` member
+the SCIM routes already null-check, so with SCIM off the decision function
+receives a null store and unconditionally proceeds; there is no new
+feature-off SAML login outage, only the same store-availability coupling §4
+already documents for OIDC while `--scim-enable` is on.
+
+**The honest guarantee — read this before describing SAML CC6.8 as fully
+closed, exactly as the OIDC section above asks.** Deny-at-login fully closes
+the dominant case for SAML too: a re-login against an already-completed
+deprovision is refused, unconditionally. It narrows, but does not eliminate
+by construction, the same in-flight-deprovision race described for OIDC
+above, for the identical reason (the cross-store-lock deadlock hazard) — the
+post-mint re-check self-heals the overwhelming majority of timings, and a
+microsecond check-then-mint gap remains theoretically possible. SAML mints no
+API/MCP tokens, so there is no ~60s validate-cache bound to lean on for a
+slipped session on this side; a SAML session that does slip through the race
+is bounded only by the session's own TTL (the absolute `kSessionDuration` or
+a configured `--session-inactivity-secs`), the identical residual the OIDC
+section states for a slipped session. **Test coverage caveat, shared by both
+providers, stated once:** this codebase has no mock-IdP integration harness
+exercising a live `/saml/acs` or `/auth/callback` round trip end to end —
+`saml_login_denied_deprovisioned` and `oidc_login_denied_deprovisioned` are
+each covered by direct unit tests against the decision function
+(`test_saml_scim_link.cpp`, `test_oidc_scim_link.cpp`), and each call site's
+wiring into its route handler (ordering relative to link formation, mint, and
+`Set-Cookie`; the audit-detail construction; the redirect) is verified by
+code inspection rather than an end-to-end test — an existing limitation of
+both backstops, not something PR4b newly introduced. See
+`docs/adr/2001-scim-oidc-identity-linkage.md`'s SAML addendum item 8 for the
+full statement.
+
+Implementation: `server/core/src/saml_principal.hpp` (the single
+`saml_principal_id(entity_id, name_id)` builder), `server/core/src/
+saml_scim_link.{hpp,cpp}` (login-site link orchestration + the NameID Format
+gate), `server/core/include/yuzu/server/scim_store.hpp` + `scim_store.cpp`
+(the `saml_identity_links` table, migration v4), `server/core/src/
+deprovision_revoke.cpp` (the SAML second pass), `server/core/src/
+saml_provider.{hpp,cpp}` (`SamlAssertion::name_id_format` extraction).
+Tests: `tests/unit/server/test_saml_principal.cpp`,
+`test_saml_scim_link.cpp`, `test_saml_provider.cpp`, `test_saml_routes.cpp`,
+`test_scim_store_pg.cpp`, `test_scim_routes.cpp`,
+`test_auth_sso_identity.cpp`.
+
 ## Granular RBAC (Phase 3)
 
-- 6 roles, 21 securable types, per-operation permissions, deny-override logic.
+- 6 roles, 23 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
+
+## The authorization topology floor (#2376)
+
+**The defect.** `RbacStore::rbac_enabled_` defaults `false`, so a fresh
+install runs with RBAC off — the default posture, not an edge case. With
+RBAC off, `AuthRoutes::require_permission`/`require_scoped_permission` fall
+through to a legacy branch (`server/core/src/auth_routes.cpp`, both
+functions, ~:713/~:919) that allows every `Read` to any authenticated
+non-engine session (see the `rbac_enforcement_in_effect` gate at ~:699,
+which is the branch above the legacy fallback — a live RBAC grant is always
+consulted first and returns before the legacy branch is ever reached; the
+legacy branch is reachable only when RBAC is disabled or the store is
+unwired). On a default install that gave a plain `user` session read access
+to the authorization TOPOLOGY itself: the fleet-wide access-review export
+(the surface that exists to **be** SOC 2 CC6.2 evidence — see "Periodic
+access reviews" below), `GET /api/v1/rbac/roles` (the RBAC role graph), and
+the engine-principal grant graph (`GET /api/v1/engine-principals*` and its
+MCP twins).
+
+**The fix has three parts**, all keyed off the single
+`server/core/src/authz_topology_floor.hpp` chokepoint:
+
+1. **A new `EnginePrincipal` securable** (`Read` only, so far), cut away
+   from the over-broad `Security:Read`. The engine-principal inventory and
+   grant-graph reads moved onto it: REST `GET /api/v1/engine-principals`,
+   `GET /api/v1/engine-principals/{id}`, `GET
+   /api/v1/engine-principals/{id}/roles`, and the MCP twins
+   `list_engine_principals`, `get_engine_principal`, `list_engine_roles`.
+   This is the same move #2324 made cutting `AccessReview` away from
+   `AuditLog:*` (see "Periodic access reviews" → "#2225 round 2" below) —
+   the same shape of over-broad-securable defect, closed the same way.
+   Seeded (`RbacStore::seed_defaults()`) to `Administrator` (full CRUD via
+   the existing cross-type loop) and `Viewer` (`Read`) — exactly the two
+   built-in roles that reached these routes via `Security:Read` before the
+   cut, so no built-in role's authority widens or narrows under
+   RBAC-enabled enforcement; only the RBAC-off legacy posture changes (see
+   below).
+2. **The topology floor itself**: `{AccessReview:Read, UserManagement:Read,
+   EnginePrincipal:Read}` require the `admin` session role regardless of
+   the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
+   `topology_floor_applies()`. It is consulted **only** inside the legacy
+   (RBAC-off) fallback of `require_permission`/`require_scoped_permission`
+   — never ahead of, or instead of, the live-RBAC branch. That ordering is
+   load-bearing, not incidental: #2324 cut the dedicated `AccessReview`
+   securable specifically so a non-admin `Reviewer` role could be seeded
+   `AccessReview:Read` and reach the export without being `admin`. If the
+   floor ran ahead of the live-RBAC branch (or replaced it), it would deny
+   that seeded `Reviewer` grant and destroy the entire reason the
+   `AccessReview` securable exists. Because the live-RBAC branch in both
+   functions always `return`s (true or false) before the legacy branch's
+   code is reached, "floor only in the legacy branch" is structural, not a
+   convention that could silently drift — there is only one path into the
+   floor check.
+3. **Observability.** A floored denial gets a distinct audit reason —
+   `"topology floor: non-admin role denied <securable>:<operation>"` on the
+   `auth.permission_required`/`auth.scoped_permission_required` audit
+   actions, `result=denied` — instead of the generic `"non-admin role
+   denied ..."` an ordinary legacy write/delete/execute/approve denial
+   gets. It is also counted separately in
+   `yuzu_auth_topology_floor_denied_total{permission}`, so an operator can
+   alert on floored denials specifically rather than parsing audit-log
+   text.
+
+**Deliberately NOT floored, on purpose:**
+
+- **`Security:Read`** — considered and excluded because it is too coarse
+  for this purpose. It also gates quarantine visibility, CA issued-certs
+  (`GET /api/v1/ca/issued` and its `list_issued_certs` MCP twin),
+  `/ca/root-csr`, and KEK status — all operational reads, not authorization
+  topology. Flooring `Security:Read` wholesale would have swept those four
+  in too, denying them to non-admins on RBAC-off installs where they
+  currently work. This is exactly why the engine-principal reads were cut
+  to their own `EnginePrincipal` securable rather than floored on
+  `Security:Read` directly — a floor can only be as narrow as the
+  securable it keys on.
+- **`ApiToken:Read`** and **`ManagementGroup:Read`** — considered and
+  excluded for the same reason: they are operational data, not
+  authorization topology.
+
+The floor is **not configurable** — there is no toggle that widens it back
+open; a footgun that can re-open a security floor is not a feature. See
+`docs/security-reviews/authz-topology-floor-2026-08-05.md` for the full
+recorded decision, including why the floor is keyed on `(securable,
+operation)` rather than route path (an MCP tool call and an unrelated MCP
+tool call share the same `/mcp/v1/` wire path, so a route-keyed floor
+cannot distinguish `list_engine_roles` from `list_issued_certs`), and why
+`Viewer` keeps `EnginePrincipal:Read` under RBAC-enabled enforcement (a
+narrower RBAC-on role model is a separate decision from closing the
+RBAC-off gap, not taken here).
+
+**No schema migration.** `seed_defaults()` runs unconditionally on every
+`RbacStore` construction and its seed loops are `INSERT OR IGNORE`, so an
+existing deployment picks up the `EnginePrincipal` securable and its grants
+on the next boot with no migration required — the same mechanism that
+introduced `AccessReview` and `SoftwareLicensing`. A migration is needed
+only when a change cannot be expressed as an idempotent additive re-seed
+(`rbac_store.cpp`'s legacy SQLite v4 migration *deletes* rows, which is why
+it needed one — distinct from the PG schema's own migration sequence,
+ADR-0041, currently at v3).
 
 ## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 
@@ -1643,8 +2245,10 @@ resulting latency bounds.
   to the legacy pre-RBAC path or the MCP-tier/service-scoped resolution used
   for human and agent sessions. An engine session's authority is resolved
   **exclusively** against `RbacStore`:
-  - `rbac_store_` null/unopened → **`503`** (cannot evaluate authority;
-    retryable, never a silent allow).
+  - `rbac_store_` unavailable — null/unopened, or a runtime degrade of the
+    PostgreSQL `rbac_store` substrate (pool-acquire timeout / query error,
+    ADR-0041) — → **`503`** (cannot evaluate authority; retryable, never a
+    silent allow — the deny-on-degrade contract).
   - RBAC disabled, or no matching `(principal="engine:<slug>", role, scope)`
     grant → **`403`**.
   - A matching grant → allowed.
@@ -1665,9 +2269,10 @@ resulting latency bounds.
 - **Reserved-namespace fail-closed guards.** `find_local_groups_with_prefix`
   returns `std::nullopt` (not an engaged-empty optional) when the RBAC store
   can't be read, and the `server.cpp` boot-time `engine:`-collision preflight
-  requires `rbac_store_->is_open()` before trusting a clean scan — a corrupt
-  `rbac.db` now fails the boot closed rather than booting "clean" past a
-  reserved-namespace collision it could not actually see. `upsert_sso_identity`
+  requires `rbac_store_->is_open()` before trusting a clean scan — a degraded
+  or unreachable `rbac_store` (PostgreSQL substrate, ADR-0041) now fails the
+  boot closed rather than booting "clean" past a reserved-namespace collision
+  it could not actually see. `upsert_sso_identity`
   separately rejects any `engine:`-prefixed write at the SSO identity-sync
   surface (design §3.3), sharing the `kEngineReservedPrefix` constant with the
   store's own create-path guard.
@@ -1712,8 +2317,10 @@ walkthrough.
   behind a one-time secret-reveal panel, revoked rows showing `superseded_by` +
   revoke detail).
 - **REST gating:** every *mutating* route is human-admin + MFA-step-up gated;
-  the three read routes (list, get, `audit/no-admin`) are human-admin + RBAC
-  gated (`Security:Read`/`AuditLog:Read`) but not step-up gated. Every route —
+  the three read routes are human-admin + RBAC gated but not step-up gated —
+  list and get on `EnginePrincipal:Read` (moved off the over-broad
+  `Security:Read` by #2376, see "The authorization topology floor" above), and
+  `audit/no-admin` on `AuditLog:Read`. Every route —
   reads included — structurally denies a caller whose own session is
   engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
   §9 belt): an engine principal can never read or mutate its own or another
@@ -1733,8 +2340,23 @@ walkthrough.
   outright, never truncated, below the floor), a ~120-second grace window
   that re-serves the same successor secret on a same-caller retry, and a
   60-second background sweep that auto-revokes the predecessor once its
-  overlap window elapses and warns (an operational, non-security signal) on
-  an unused successor nearing expiry. **Confirm replay classification (#2404):**
+  overlap window elapses — **unless the successor was never presented at
+  all** (governance UP-5): a dropped/lost successor secret must never leave
+  the principal at zero usable credentials, so that predecessor is left
+  active and the operational, non-security `successor_unused` warning is
+  raised again past the window's own end. Note the three signals do NOT
+  share a cadence (`rotation_warn_dedup.hpp`): the **log line** repeats
+  every tick for as long as the pair stays stuck, while the **audit row and
+  its metric** fire once per pair per state — once pre-elapse, once more on
+  crossing into elapsed. The row records that the decline happened; an
+  un-throttled row would be ~1440/day per stuck pair into the audit store,
+  which is itself a retention hazard. Do not build a stuck-pair alert on
+  `increase(...{reason="successor_unused"})` — it will fire once and never
+  again; the alertable signal is tracked in #2969. The sweep's per-tick
+  auto-revoke is bounded
+  (`kMaxAutoRevokesPerTick`) so a clock jump degrades to a multi-tick drain
+  rather than a fleet-wide cutover in one tick.
+  **Confirm replay classification (#2404):**
   a `confirm` replayed after its own rotation already resolved returns a
   *terminal* conflict (REST `409` / MCP `kInvalidParams`), never a retryable
   `503`, so an agentic client honouring the tool's `idempotentHint` stops
@@ -1743,6 +2365,38 @@ walkthrough.
   `success` a one-time effect. The confirm is never a silent success no-op:
   the initiator grace binding is evicted post-confirm, so a success answer
   would attest without verifying initiation.
+- **Confirm-identity binding survives a server restart (#2961).** The
+  maker-checker check that only the operator who called `rotate` may
+  `confirm` used to be resolvable **only** from the in-process
+  `rotation_grace_cache_` — a restart mid-overlap (default window 7 days)
+  silently and permanently forfeited it, so `confirm` 409'd forever for that
+  pair and the sweep cut over on the timer with no error surfaced at cutover
+  time (filed as #2961; affects both arms). Migration v3 adds a durable
+  twin, `api_tokens.rotation_initiator`, stamped on the successor row
+  **inside the same advisory-locked mint transaction**. Both
+  `confirm_rotation` (engine arm) and `confirm_token_rotation` (human arm,
+  below) now resolve the identity check through the single chokepoint
+  `ApiTokenStore::resolve_rotation_initiator`: RAM first, the durable column
+  as the RAM-absent recovery path, **fail closed** if the two disagree, and
+  an empty durable value is **never** treated as a wildcard. That last point
+  is deliberate: a rotation already in flight when this migration is
+  applied has no durable initiator and stays unconfirmable after a restart
+  — an operator upgrading mid-rotation should confirm it first if possible.
+  If not, the T12 sweep resolves the pair on its own timer **provided the
+  successor was presented at least once** (the same UP-5 carve-out that
+  gates every sweep auto-revoke — "never presented" leaves both credentials
+  active indefinitely, sweep or no sweep); only in that presented case is no
+  action required. If the successor was never presented, or the pair must
+  be resolved by hand for any other reason, revoke the specific credential
+  no longer trusted via `DELETE /api/v1/tokens/{token_id}` (an engine
+  credential is an ordinary API token row), **never** the principal-level
+  revoke route, which is terminal and destroys both credentials plus the
+  principal. **Unaffected
+  — deliberately:** the 120-second raw
+  successor secret re-serve (bullet above, F4) stays RAM-only; a one-time
+  reveal must never become durable, so a restart still forfeits that
+  capability. Design record: `docs/security-reviews/human-token-rotation-2026-08-10.md`
+  "Open risks" (#2961, marked resolved).
 - **No-admin auditor** — `GET /api/v1/engine-principals/audit/no-admin` /
   MCP `audit_engine_no_admin` — independently resolves every engine
   principal's actual roles + effective permissions against the live RBAC
@@ -1775,6 +2429,201 @@ walkthrough.
     revived account). The orphaned principal keeps authenticating on its own
     `principal_type='engine'` credential and never derived authority from the
     owner, so the departed user gains nothing. Alert on the metric.
+
+## Human API-token rotation (P2 #11, SOC 2 CC6.3)
+
+Self-service overlap-pair rotation for **human-owned** API tokens —
+`ApiTokenStore::rotate_token`/`confirm_token_rotation`
+(`server/core/src/api_token_store.hpp`), the human-arm sibling of
+`rotate_engine_credential`/`confirm_rotation` documented under "Engine
+principals & delegation" → "Overlap-pair credential rotation" above. This
+section covers the capability's design rationale; the wire surface, error
+matrix, and telemetry are documented once each, cross-referenced below —
+this section does not restate them.
+
+- **Token-keyed, not principal-keyed — because a human is not an engine
+  principal.** The engine arm arbitrates on a **≤2-active-credentials-PER-
+  PRINCIPAL** ceiling, which is sound because an engine principal has
+  exactly one credential by design. That invariant is **false** for a human:
+  `principal_id` is a username, and one person routinely holds several
+  unrelated named tokens at once (a CI token, a personal automation token, an
+  MCP token). A principal-wide ceiling would therefore block rotating *any*
+  one of those tokens the moment the user held a third, unrelated one — a
+  defensive rejection that has nothing to do with the token actually being
+  rotated. `rotate_token`/`confirm_token_rotation` instead key on the TOKEN
+  being rotated and enforce the ≤2 ceiling **per `rotation_group`** — a
+  human's other, unrelated active tokens never count against it
+  (`api_token_store.hpp` "Human arm" doc block). The advisory lock is still
+  taken on `hashtext(principal_id)`, the same key the engine arm and the
+  T12 maintenance sweep use, so all rotation activity for one principal
+  — human or engine — still serializes.
+- **This distinction was caught at plan review, before any code existed** —
+  a copy of the engine arm's principal-keyed ceiling would have shipped a
+  control that silently blocked rotation for any user with more than two
+  tokens. See `docs/security-reviews/human-token-rotation-2026-08-10.md` for
+  the review record.
+- **The identical class of defect then recurred one layer up, in the REST
+  route, and was caught a second time.** The route's successor lookup
+  (needed to return the freshly-minted token's `token_id`/`expires_at`)
+  initially copied the engine rotate route's inline "linked-row" loop —
+  sound only under that route's own per-principal ≤2 ceiling, unsound here,
+  where several independent in-flight rotations can exist per principal.
+  Reproduced against live Postgres and fixed by extracting the derivation
+  into one shared, DB-free, unit-testable seam — `derive_rotation_successor`
+  (`server/core/src/token_rotation_lookup.hpp`) — so the REST route today
+  and the MCP twin landing separately both call the same function, rather
+  than each risking its own copy of the same defect. Full reproduction
+  narrative and reviewer attribution:
+  `docs/security-reviews/human-token-rotation-2026-08-10.md`.
+- **Self-service only, enforced at the store seam — not merely the route.**
+  Both `rotate_token` and `confirm_token_rotation` reject unless
+  `requesting_user` equals the resolved token row's own `principal_id`,
+  checked inside the store itself (both in a pre-transaction lookup and
+  again, authoritatively, on the fresh re-read under the advisory lock — the
+  route-level ownership check that runs first is defense-in-depth on top of
+  this, not a substitute for it). This is a deliberate asymmetry with the
+  engine arm, where the requesting caller is a third-party admin by design:
+  a **human** token's raw successor secret authenticates *as that user*, so
+  an admin re-serving or confirming another user's rotation would be handed
+  (or would complete the cutover of) a credential that impersonates someone
+  else — identity takeover, not a permission gap an admin override could
+  legitimately cross. An admin who needs to act on another user's token has
+  `revoke_token`/`revoke_for_principal` instead; there is no rotate-as-admin
+  path, by design.
+- **Under RBAC-on, this composes into an effectively admin-only rotation
+  path — a pre-existing property of the surface, not a new caveat.** REST
+  rotate/confirm gate on `ApiToken:Rotate` — deliberately its own operation,
+  distinct from `ApiToken:Write`'s create/list/revoke axis (round-3 security
+  finding; see the `mcp_policy.hpp` `tier_allows()` operator-tier comment for
+  the full narrative on why a shared op string was rejected) — which the
+  RBAC seed data (`rbac_store.cpp:397,480,662`) grants only to
+  `Administrator` and `ApiTokenManager` — no other built-in role (`Operator`,
+  `PlatformEngineer`, `Viewer`, `ITServiceOwner`) holds it. Composed with the
+  self-service-only requirement immediately above (no admin override), an
+  `Operator`- or `Viewer`-role user who owns a token has **no** RBAC-on path
+  to rotate it themselves, and no admin can do it on their behalf either —
+  the token cannot be rotated by anyone until its owner is separately
+  granted `ApiToken:Rotate`. This mirrors the posture of the surface's other
+  operations — `POST /api/v1/tokens` (create) is gated on `ApiToken:Write`;
+  `DELETE /api/v1/tokens/{id}` is gated on the sibling `ApiToken:Delete`
+  operation (`rest_api_v1.cpp:2624`) — and the RBAC seed data grants all
+  three operations to the same two roles (`Administrator`,
+  `ApiTokenManager`) and to no others, so the admin-only conclusion holds
+  identically across create, delete, and rotate. It is stated here because
+  "self-service" throughout this section means *self-service subject to
+  holding the relevant `ApiToken:*` grant*, never *available to any
+  authenticated owner*.
+- **Not an ownership-enumeration oracle.** The non-owner rejection is folded
+  into the exact same wording the genuinely-nonexistent-token case uses
+  (`"no such token to rotate"` / `"no such token to confirm"`) — a caller
+  cannot distinguish "this token doesn't exist" from "this token exists but
+  isn't yours" from the error text alone. Mirrors the posture the human
+  `DELETE /api/v1/tokens/{id}` route already takes for a non-owner.
+- **Lifetime-neutral by deliberate choice — rotation cannot be used to
+  extend a grant.** The successor's absolute `expires_at` always inherits
+  the predecessor's verbatim (a perpetual token stays perpetual; a 30-day
+  token stays a 30-day token measured from its own original grant) — never
+  recomputed as `now + 90d`, which would silently extend authorization
+  lifetime through what should be a lateral credential swap. The store-level
+  API retains an internal `successor_expires_at` override parameter (reused
+  by the engine arm's own successor-TTL logic), but the REST route
+  deliberately does not expose it — a senior-architecture ruling, recorded
+  in the security review, that rotation must read as lifetime-neutral in
+  CC6.3 evidence with no caller-controlled escape hatch. A caller that
+  genuinely needs a longer-lived replacement mints a fresh token via `POST
+  /api/v1/tokens` instead, which is a distinct, separately-audited action.
+- **Confirm error taxonomy is adjudicated, not ad hoc** — the state
+  classifier (`rotation_confirm_state.hpp`'s
+  `classify_confirm_state_in_group`, the group-scoped sibling of the
+  engine arm's `classify_confirm_state`) distinguishes a POSITIVE fact
+  (`kGroupEmpty` — the principal-wide active read succeeded and returned
+  rows, but none carry the pinned `rotation_group`: the rotation has
+  already resolved) from a genuinely AMBIGUOUS one (`kAmbiguousEmpty` — the
+  principal-wide read came back empty, indistinguishable from a swallowed
+  `SELECT` failure). `kGroupEmpty` classifies `Conflict` (REST `409` / MCP
+  `kInvalidParams`, terminal — "rotate again if a new rotation is needed",
+  never retry the same confirm); `kAmbiguousEmpty` stays `Transient` (REST
+  `503`, retryable). An earlier round had this backwards — `kGroupEmpty` as
+  `Transient` — which independent architect adjudication corrected before
+  merge: reusing a retryable classification on a permanently-failing state
+  would make a conforming agentic client (one that honours the tool's
+  `idempotentHint`) retry that exact call forever. See the "Confirm replay
+  classification (#2404)" bullet under the engine arm above for the
+  precedent this decision follows, and
+  `engine_store_error_class.hpp`'s file-level doc comment for the shared
+  classifier both transports read through.
+- **Store-layer scope only in this branch.** REST:
+  `POST /api/v1/tokens/{id}/rotate` / `.../confirm`
+  (`docs/user-manual/rest-api.md` "API Tokens" for the REST reference,
+  `docs/user-manual/authentication.md` "Rotating a Token" for the operator
+  walkthrough) — self-service, gated on
+  `ApiToken:Rotate` (the human permission axis, distinct from
+  `ApiToken:Write`'s create/list/revoke axis; **not** `Security:Write`,
+  which gates the engine admin surface), MFA step-up re-validated on every
+  call including an idempotent grace-window re-serve. Telemetry:
+  `docs/observability-conventions.md` + `docs/user-manual/metrics.md`
+  "Human API-token confirm metric (P2 #11)" (`yuzu_api_token_rotation_*`,
+  `yuzu_api_token_confirm_total`, both kind-discriminated from the engine
+  family at the one `rotation_sweep_names_for_kind` chokepoint,
+  `rotation_sweep_naming.hpp`). Audit:
+  `docs/user-manual/audit-log.md` (`api_token.rotate`, `api_token.confirm`,
+  `api_token.reveal`, `api_token.rotation.auto_revoke`,
+  `api_token.rotation.successor_unused`). **MCP tool twins
+  (`rotate_api_token` / `confirm_api_token_rotation`) have shipped as of
+  this section** — see `docs/mcp-server.md` "Human API-token rotation
+  tools" and `docs/user-manual/mcp.md` rows 70–71 for the MCP-side
+  reference; REST and MCP now have full parity on this surface.
+- **The authority-inheritance guard closes the escalation direction, but is
+  not equivalent to gating `Rotate` the way `Delete` is gated (governance
+  Gate 8 follow-up).** Equality between the caller's own current
+  `mcp_tier`/`scope_service` and the predecessor's guarantees no privilege
+  GAIN — a rotation can never mint more authority than the caller already
+  holds. It does not, on its own, make `rotate`/`confirm` net-neutral with
+  `revoke`/`delete`: `mcp_policy.hpp`'s `requires_approval()` has no
+  `ApiToken` rule at all, so at `supervised` tier a `Delete` call goes
+  through the approval workflow and a `Rotate`/`confirm` pair does not. A
+  caller can therefore rotate-then-confirm a same-principal sibling token of
+  equal tier and scope — destroying its predecessor and revealing a fresh
+  successor secret to themselves — with neither `ApiToken:Delete` nor a
+  supervised-tier approval. No privilege gain, but a real residual:
+  availability (the sibling's predecessor is destroyed) plus cross-consumer
+  credential capture, within one principal's own tokens.
+- **The guard also blocks the DE-escalating direction — an undocumented-
+  until-now capability loss, not a defect.** The guard is equality, not "no
+  broader than": a cookie or JIT-elevated interactive session carries an
+  empty `mcp_tier`/`scope_service`, which matches an untiered predecessor
+  but does **not** match a token that itself carries a tier or scope. So
+  the owner of an MCP-tiered or service-scoped token cannot rotate or
+  confirm it from the dashboard or a plain interactive REST session at
+  all — only the holder of that token's own secret (or an equally-tiered
+  session) can. This is backwards precisely when the token's secret is the
+  thing under suspicion, which is the main reason anyone rotates. Whether
+  to widen the guard to admit a strictly-higher-authority session rotating
+  a narrower token is an open product decision, not made by this fix — see
+  `docs/user-manual/authentication.md` "Rotating a Token" for the
+  operator-facing statement of both points, and
+  `docs/user-manual/rest-api.md`'s rotate/confirm error matrices for the
+  wire-level `400` row this adds. The `"no such token to rotate"`/`"...to
+  confirm"` wording is identical for this case and for absent/not-owned
+  by design (not an authority-probing oracle) — it is therefore misleading
+  for a token that exists and is genuinely the caller's own; this is
+  recorded, not changed, since disambiguating the wording would reopen the
+  oracle it exists to close.
+- **Known residual gaps, tracked, not fixed by this capability:** three
+  pre-existing issues were surfaced while building this feature and filed
+  rather than folded in silently — `#2943` (a confirm-path fallthrough
+  shared by both arms that the human arm inherits), `#2944` (an
+  engine-only defect; this feature's own REST route does not have it), and
+  `#2945` (security-labelled, an open credential-**minting** escalation on
+  the `ApiToken:Write` chokepoint — distinct from this feature's own
+  rotate/confirm routes, which now gate on the separate `ApiToken:Rotate`
+  operation seeded to the SAME two roles). None is a defect *in* the shipped
+  rotation code itself. Full
+  detail, mechanism, and compensating-control status — `#2945` in
+  particular is **not** merely "unrelated and tracked separately"; it is
+  recorded as an open risk against the sibling `ApiToken:Write` mint
+  surface — are in the security review's "Open risks" section:
+  `docs/security-reviews/human-token-rotation-2026-08-10.md`.
 
 ## Agent enrollment (3 tiers)
 
@@ -2159,3 +3008,229 @@ MFA fail-closed on secret-read failure, cleanup cadence, snapshot-and-release
 publishing) live in `.claude/agents/authdb.md` — the AuthDB review agent
 loads them on any change to `auth_db.{hpp,cpp}` / `auth_routes.{hpp,cpp}` /
 `auth.{hpp,cpp}`.
+
+## RbacStore — the authorization substrate (Postgres, ADR-0041 — SQLite `rbac.db` retired)
+
+`RbacStore` (`server/core/src/rbac_store.{hpp,cpp}`) is the **authorization
+substrate**: role definitions, role→permission grants, principal→role
+assignments, RBAC groups + membership, and the global `rbac_enabled` flag.
+`require_permission` / `require_scoped_permission` / `authorize_list_read`
+(World-A confinement, ADR-0017) / the engine-principal default-deny path
+(ADR-0031) all resolve through it. It moved from the SQLite `rbac.db` file to
+the server's PostgreSQL substrate in the ADR-0041 (Wave 2.1) migration, schema
+**`rbac_store`**, born-on-Postgres on the shared server `PgPool` with
+fail-closed construction (`!is_open()` → the server refuses to start,
+ADR-0007/0012 §1). It is the **highest-blast-radius store** on the migration
+ladder — a defect here is a fleet-wide authorization failure — and reuses the
+shared pool, so it adds **no new flag or environment variable**.
+
+**Reads FAIL CLOSED — deny-on-degrade (the load-bearing invariant).** Every
+authz read keeps its `bool`/deny-on-error contract: a store-not-open,
+pool-acquire timeout, or query error returns **deny** (`false` for the
+`check_permission` / `check_scoped_permission` / `holds_permission_via_any_group`
+/ `check_role_has_permission` bool checks; the empty/most-restrictive result for
+the list/scope reads), NEVER allow. Where a caller needs to distinguish "denied"
+from "store degraded" for a 403-vs-503 decision (e.g. `authorize_list_read`),
+that is exposed via a **separate** tri-state / `std::expected` accessor — the
+plain `bool` path stays deny-on-error so no existing chokepoint can regress to
+fail-open. This **closes the prior "fails open on a corrupt `rbac.db`" hole**:
+under SQLite a corrupt/unreadable RBAC store could fall through to an engaged
+allow at some call sites; the PostgreSQL `rbac_store` now denies on any degrade.
+
+**Cross-replica coherence — durable generation token.** Each replica keeps its
+in-process permission cache (`perm_cache_`) but validates it against a **durable
+`rbac_meta.write_generation` counter** bumped in the same transaction as every
+mutation (`assign_role`, `unassign_role`, `set_permission`, role/group changes,
+`set_rbac_enabled`). A read refreshes its cached view of the durable generation
+at most once per `kRbacGenerationRefreshMs` (1000 ms — one cheap indexed
+single-row `SELECT`, not a permission re-query) and clears `perm_cache_` on a
+change; a local mutation bumps the counter and clears its own cache immediately.
+This bounds cross-replica staleness to the refresh interval under normal
+conditions: a revoke on replica A is typically visible on replica B within
+~1 s. **That bound is a target the refresh loop aims for, not a hard
+guarantee**: the interval-gating timestamp is claimed BEFORE the query runs
+(deliberately, to prevent a refresh stampede), so a concurrent reader that
+lands while a refresh is genuinely slow (pool saturation, a Postgres blip)
+can observe staleness beyond the interval. That condition is now measured,
+not silently assumed: a durable-completion timestamp tracks only actual
+refresh successes (separately from the stampede-gating timestamp), and a
+reader who misses the gate while already past the bound counts a
+`stale_beyond_accepted_bound` degrade (fjarvis #2703 F3) — the read still
+proceeds from the existing cache; nothing is denied. **Updated 2026-08-11
+(#2703 Gate 7 merge-slice, ADR-0041 "Update" section — supersedes the
+original "assume changed" text below it):** a failed generation refresh no
+longer clears the cache immediately. Trust is extended for a bounded **~5 s**
+window (`kRbacStaleServeBoundMs`) past the last confirmed-good refresh — a
+deliberate bounded-staleness-for-continuity tradeoff, layered underneath the
+~1 s propagation target above. Only once that 5 s bound is exceeded is the
+failure treated as "assume changed" (cache cleared) and counted as a
+`generation_refresh_failed` degrade. A separate fail-fast circuit breaker
+(2 consecutive pool-acquire/query failures) independently bounds how long an
+**uncached** check can block on a doomed pool — it denies such checks
+immediately once open, but it does not itself clear the cache or shorten the
+5 s bound; a cache hit is served regardless of breaker state. **The bound is
+tight only for pool-acquisition failure** (no connection available within
+the 250ms acquire budget — well under a second for 2 consecutive attempts).
+A query that acquires a connection and then blocks on a PostgreSQL-side lock
+inherits `PgPool`'s `lock_timeout` (10s default) instead — measured ~18.5s
+for 2 such attempts against a live held `ACCESS EXCLUSIVE` lock on
+`rbac_meta` (#3016); both modes still converge on a fail-closed deny, just
+not at the same speed. See
+`docs/enterprise-readiness-soc2-first-customer.md`'s "Availability posture
+under PostgreSQL degradation" note for the full mechanism and its CAIQ
+characterization. **The `rbac_enabled` flag propagates on the same durable
+path.** The ~1 s bounded stale-allow window is an **accepted, gate-recorded
+residual risk** (well inside the fleet's minutes-scale revocation-latency
+envelope); `LISTEN/NOTIFY` (window → 0) is the named follow-up. **The 5 s
+stale-serve bound above covers this flag's cached view too, not just
+`perm_cache_`:** `rbac_enforcement_in_effect()` — the fail-closed accessor
+every confinement-critical caller MUST use instead of the raw
+`is_rbac_enabled()` — consults `rbac_enabled_view_degraded()`, which is
+gated by the same `kRbacStaleServeBoundMs` window as the permission cache.
+A refresh failure inside the bound therefore keeps trusting the
+last-known-good `rbac_enabled` state exactly as it keeps trusting cached
+permission verdicts; only past the bound does the view count as degraded
+and `rbac_enforcement_in_effect()` fail closed (treats degraded the same as
+enabled) regardless of what the raw flag last read.
+
+**Terminology note:** every "the bound" reference in this paragraph and the
+ones above it means `kRbacStaleServeBoundMs` (~5 s, the trust/staleness
+bound governing when cached state stops being trusted) — a DIFFERENT
+constant from `kRbacGenerationRefreshMs` (~1 s, the propagation-target
+interval discussed earlier in this section, which only governs how often a
+refresh may even be attempted and carries no trust semantics of its own).
+
+**Addendum (2026-08-11, same day, pre-merge, never shipped, G11-CPPEXPERT-B2):**
+"a failed generation refresh" above describes only a refresh attempt that
+*ran to completion* and then failed. Gate 8 re-review found the fix missed a
+second trigger the same 5 s bound needs to cover just as strictly: a refresh
+attempt stuck in flight and never completing at all — e.g. blocked on the
+`ACCESS EXCLUSIVE`-class lock contention discussed above, for up to the full
+~10 s `lock_timeout`. Every concurrent caller during that stall either takes
+the gated fast-return path (no state touched) or is itself blocked inside its
+own query, so the completed-failure code path that degrades the cache never
+ran — trust could be extended for the whole stuck-in-flight duration, not
+just the intended 5 s. Fixed same-day: the staleness check now measures
+elapsed time directly rather than depending on a refresh attempt's own
+completion, at all three sites that decide whether cached state is still
+trustworthy (now one shared chokepoint, `generation_view_stale_locked()`).
+Never shipped; no SOC 2 assessment period or deployed fleet carried the gap.
+
+**Fail-closed BOOT on the `rbac_enabled` flag.** The `rbac_enabled` flag is
+durable in `rbac_meta`. An unreadable OR non-canonical flag at boot **refuses
+to start** — the server never serves RBAC-**off** on a fleet that had enabled
+it (which would silently make every confined operator fleet-wide-authorized:
+a catastrophic fail-open). "Non-canonical" means any value other than the
+exact strings `"true"`/`"false"` (fjarvis #2703 F2) — a query error or a
+missing row was always fail-closed, but a *readable* value that wasn't
+exactly one of those two strings previously coerced silently to `false`. A
+schema-level `CHECK` constraint on `rbac_meta.value` for this key rejects a
+non-canonical write outright as defense in depth; the application-level
+strict parse is what refuses to boot if a bad value ever lands regardless.
+
+**Mandatory backfill (ADR-0009/0041).** Unlike the AuthDB fresh-start cutover,
+RBAC state is irreducible operator-authored config that **cannot be
+re-derived** — custom roles, every principal→role grant, groups, and
+membership — so the migration performs a one-time, single-shot, idempotent
+(retried from scratch on interruption — not a cursor-resumed stream, unlike
+AuditStore's larger dataset), reconciled, **fail-CLOSED** backfill from the
+legacy `rbac.db` (seed defaults first, then backfill operator rows via `ON CONFLICT DO NOTHING`;
+operator edits to seeded permissions are preserved via `DO UPDATE`). A
+built-in default permission the operator explicitly revoked (`remove_permission`)
+before upgrading is **deleted** — matching legacy exactly, a plain absent row
+— scoped to (role, securable_type, operation) triples legacy's own catalogue
+actually knew about, so a securable a later `seed_defaults()` adds (e.g.
+`EnginePrincipal`, #2376) or an operation added to an existing role+type pair
+(e.g. `ApiToken:Rotate` — fjarvis #2703 re-review, C1) is untouched (fjarvis
+#2703 F1). The revocation is
+recorded SEPARATELY, as pure reseed-suppression bookkeeping in a dedicated
+`revoked_seed_defaults` table — consulted ONLY by `seed_defaults()`'s grant
+helper, never by any authorization-decision code path — so `seed_defaults()`'s
+unconditional every-boot reseed cannot silently resurrect the revoked default
+without ever making it a real authorization fact again. This mirrors
+`remove_permission()`'s own permanent mechanism for the identical hazard
+beyond the one-time cutover. THREE earlier versions of this fix each
+reintroduced a hazard, all caught by governance before merge (none ever
+pushed to `origin`): a plain `DELETE` with no marker resurrects on the very
+next restart (verified empirically — a second `RbacStore` construction
+against the same database brought the revoked permission back); an
+`effect='deny'` tombstone avoids that but is a REAL authorization fact —
+`check_permission()` / `check_scoped_permission()` / `authorize_list_read()`
+all apply "deny overrides everything, across ALL of a principal's held
+roles" (pre-existing, identical in the legacy store), so the tombstone
+silently changed the authorization OUTCOME for any principal holding a
+second role that independently grants the same permission — on both the
+global and the management-group-scoped read paths (verified empirically
+both ways); the DELETE+marker design that fixes both has its own
+concurrency hazard (**CHAOS-1**) — `seed_defaults()`'s `grant()` fixes its
+READ COMMITTED snapshot at statement start, so if a concurrent revoke's
+marker-insert commits WHILE `grant()` is blocked on the `ON CONFLICT`
+arbiter waiting for that same revoke's uncommitted `DELETE`, Postgres only
+re-checks the conflict target after unblocking — never the `WHERE NOT
+EXISTS` subquery — and `grant()`'s already-computed row lands anyway,
+resurrecting the permission with the marker present but ineffective. Most
+likely during a fleet-wide rolling restart (many replicas' `seed_defaults()`
+calls racing another replica's one-time backfill). Closed with a
+`pg_advisory_xact_lock`, acquired in its own statement strictly BEFORE the
+check-and-mutate statement, in an explicit transaction, in all three writers
+(`grant()`, `remove_permission()`, the backfill's own revoke step) —
+verified empirically with two real Postgres connections, and safe for any
+replica boot ordering. Reconciliation counts roles + grants + groups +
+members and refuses the completion marker on any shortfall (fail-closed →
+refuse boot, retry next start). **The `rbac_enabled` flag is migrated first
+and read-back-verified** before the store is considered open (losing it is
+the single most dangerous outcome); a flag-backfill failure fails the whole
+backfill closed. The legacy `rbac.db` is moved aside only after a verified
+backfill.
+
+**Cross-replica marker fingerprinting (governance re-review, #2703).** The
+shared Postgres `backfill_complete` marker alone cannot distinguish
+"genuinely no legacy data anywhere" from "a fileless replica happened to
+check first" — stamping it from local absence alone let a fileless replica
+permanently foreclose migration for a sibling genuinely holding the real
+`rbac.db` (matches the anti-pattern `docs/postgres-store-playbook.md`
+documents for `AuditStore`, #2697). The fix: a SHA-256 content fingerprint
+of the legacy file (length-prefixed, injective encoding over every migrated
+row — not a delimiter join, which cannot safely disambiguate unconstrained
+operator free-text) is stamped alongside the marker, in the same
+transaction, derived from the exact rows actually migrated (no second file
+read — the trust anchor and the migrated data come from one shared
+in-memory snapshot). Any later replica that still holds a local legacy file
+re-derives its own fingerprint and verifies it against the stored value
+before trusting an existing marker: a genuine match skips (safe); anything
+else fails closed, with a distinct diagnostic for each of a stored
+`"sourceless"` value (no real migration has happened yet, but this later
+boot cannot bound what live post-cutover mutations — e.g. IdP group
+reconciliation — a fresh auto-migration might clobber), a genuinely
+different real fingerprint, and an absent fingerprint from a marker that
+predates this mechanism. None of the fail-closed cases auto-retry; a
+genuine prior migration under live operator changes since cannot be told
+apart from a different replica's completion this file was never part of.
+Promotion of a stored `"sourceless"` value to a real fingerprint happens
+only at STAMP TIME, inside a replica's own migration (a monotonic upsert in
+`stamp_complete`) — by then that replica's writes are already durably
+committed, so correcting the trust anchor cannot clobber anything; a later
+boot's mismatch is a materially different, unbounded situation and always
+refuses. Operator-facing failure modes and recovery:
+`docs/ops-runbooks/rbac-store-backfill-recovery.md`.
+
+**Metrics.** `yuzu_server_rbac_read_degrade_total{reason}` — three
+DENYING reasons (`pool_acquire_timeout` / `query_error` /
+`generation_refresh_failed`): a degrade denies authz fleet-wide, so a
+non-zero rate on one of these is a fleet-wide authorization-availability
+event, and the `YuzuRbacReadDegraded` alert pages on exactly this subset.
+Two OBSERVE-ONLY reasons share the same metric but deny nothing — the read
+still proceeds — and are deliberately excluded from that alert:
+`rbac_enabled_non_canonical` (a periodic refresh saw a non-canonical value;
+the cached enabled-state is left unchanged rather than coerced) and
+`stale_beyond_accepted_bound` (see the cross-replica coherence paragraph
+above). Also `yuzu_server_rbac_backfill_total{result}` (result ∈ `fresh` /
+`completed` / `failed`). See `docs/user-manual/metrics.md` and the
+`YuzuRbacReadDegraded` alert in `docs/prometheus/yuzu-alerts.yml`.
+
+**Read split for reviewers.** The plain `bool` authz checks fail closed
+(deny-on-error) so no chokepoint can regress to fail-open; the tri-state
+`_checked` / `std::expected` accessors are the ONLY place a caller may learn
+"degraded" (503) as distinct from "denied" (403). A new read must land on the
+correct side of this split — see ADR-0041 and
+`docs/adr/0017-management-group-confinement-list-reads.md`.

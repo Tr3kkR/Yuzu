@@ -1,7 +1,5 @@
 #pragma once
 
-#include "reserved_definition_id.hpp" // is_reserved_definition_id (#2442)
-
 #include <sqlite3.h>
 
 #include <cstdint>
@@ -23,26 +21,52 @@ namespace yuzu::server {
 /// surface makes the namespaces separable, and gives audit a clean per-surface
 /// split.
 enum class ApprovalOrigin {
-    /// A mint that predates this enum, or one that has not declared itself:
-    /// today ONLY the MCP gate, which cannot be updated to declare `kMcp` while
-    /// mcp_server.cpp is frozen for a parallel rebase. Kept honest rather than
-    /// mislabelled — a ticket recorded `instruction` when MCP minted it would be
-    /// false evidence. Tighten to `kMcp` when the MCP mint declares itself.
+    /// A mint that has not declared its surface, or a row minted before
+    /// `submit()`'s `origin` parameter existed or before it was made
+    /// non-defaulted. REFUSED at redemption (declares_non_mcp_surface),
+    /// same as kUnrecognised — since #2442's closing half, the MCP gate
+    /// (the one surface that historically relied on this value granting)
+    /// declares `kMcp` explicitly, so nothing in the tree writes
+    /// `kUnspecified` any more and there is no longer a correct reason for a
+    /// new caller to produce it. Kept as a distinct decode target from
+    /// kUnrecognised (see `to_string`'s comment) rather than merged into it,
+    /// so "declared nothing" and "predates the column" stay separable causes
+    /// even though both refuse today.
     kUnspecified,
     /// The interactive REST/dashboard instruction-approval gate
     /// (workflow_routes.cpp).
     kInstruction,
     /// A scheduled-fire submission (schedule_runner.cpp).
     kSchedule,
-    /// The MCP approval-ticket gate (mcp_server.cpp). Not yet passed by that
-    /// caller — see kUnspecified.
+    /// The MCP approval-ticket gate (mcp_server.cpp).
     kMcp,
+    /// A stored value this build does not know — a row written by a newer
+    /// binary, or a corrupted column. DISTINCT from kUnspecified because they
+    /// are different FACTS ("declared nothing" vs. "this build cannot
+    /// attribute it to any surface") even though both refuse at redemption
+    /// today (#2442's closing half retired the era where kUnspecified
+    /// granted): folding an unknown string into kUnspecified would erase that
+    /// distinction in the stored evidence, which matters for audit even
+    /// though it would not currently change whether the ticket redeems.
+    /// Never written, only decoded.
+    kUnrecognised,
 };
 
-/// Column text for `origin`. `kUnspecified` stores the empty string, which is
-/// also what migration v5 back-fills into pre-existing rows, so "no declared
-/// origin" reads identically whether the row predates the column or the caller
-/// stayed silent.
+/// True when `origin` names a surface that is NOT the MCP recall, or names no
+/// surface at all — kUnrecognised and kUnspecified both fail closed. False
+/// ONLY for kMcp, the one surface this binding must not refuse.
+bool declares_non_mcp_surface(ApprovalOrigin origin);
+
+/// Column text for `origin`. `kUnspecified` stores the empty string.
+///
+/// A row that predates the column does NOT read back as `kUnspecified`, and the
+/// difference still matters even though both are refused at redemption today
+/// (#2442's closing half): migration v7 rewrites every `''` row it finds to a
+/// sentinel that decodes to `kUnrecognised`, while a caller that stays silent
+/// writes `''` and decodes to `kUnspecified`. "No declared origin" and
+/// "declared nothing because the column did not exist yet" are deliberately
+/// not the same value — collapsing them would make a future, more permissive
+/// treatment of one silently apply to the other.
 const char* to_string(ApprovalOrigin origin);
 ApprovalOrigin approval_origin_from_string(std::string_view text);
 
@@ -75,7 +99,8 @@ struct Approval {
     /// tuple. Additive column (migration v4).
     std::string schedule_id;
     /// Which surface minted this ticket (#2442). Additive column (migration
-    /// v5); pre-existing rows read back as kUnspecified.
+    /// v5); rows that predate it are rewritten by v7 and read back as
+    /// kUnrecognised, NOT kUnspecified — see `to_string`'s comment.
     ApprovalOrigin origin{ApprovalOrigin::kUnspecified};
 };
 
@@ -90,24 +115,149 @@ struct ApprovalQuery {
 /// kNotConsumable means the one-time capability is spent. Distinguishing them by
 /// parsing the message string would be a fragile seam, so the kind is typed.
 ///
-/// OBLIGATION ON THE FIRST CALLER of the three-argument overload: today the MCP
-/// recall maps every consume failure onto one message — "approval already used
-/// (one-time ticket)", remediating "submit a new request without approval_id".
-/// That is correct only while the two-argument overload is the sole caller.
-/// Wired as-is to a precondition, it would tell the operator to discard a ticket
-/// this code deliberately left recallable — re-entering the very burn class
-/// #2443 exists to close. Map the kinds, and audit a kPrecondition denial: a
-/// refusal to honour a human-approved capability currently leaves nothing but a
-/// log line.
+/// DISCHARGED (#2443, confirm_engine_rotation): the MCP recall's shared consume
+/// failure handling in mcp_server.cpp gives kPrecondition its own client
+/// message instead of falling through to "approval already used" - the
+/// fallthrough would have told the operator to discard a ticket this code
+/// deliberately left recallable, re-entering the very burn class #2443 exists
+/// to close. That message is deliberately GENERIC and kind-independent, not
+/// this error's own `.message` string: the precondition runs before the
+/// tool's own per-handler RBAC check, so echoing the specific fact (which
+/// RotationConfirmState fired) would be a credential-state oracle for a
+/// tier-eligible, RBAC-less caller. The specific fact still reaches the
+/// audit row - server-side, ahead of RBAC concerns - via mcp_server.cpp's
+/// `mcp_audit("denied", ...)`, which already fires generically for every
+/// ConsumeFailure kind, so kPrecondition needed no new audit/metric plumbing
+/// there, only the message split. This store method's own `spdlog::info` on
+/// a precondition decline (see the impl) stays a log line by design; the
+/// caller's audit row is the durable record.
+///
+/// A FUTURE second caller of the three-argument overload inherits this same
+/// obligation for its own kind of drift: (1) do not let its kPrecondition
+/// message fall through to the shared "already used" wording, and (2) if its
+/// `.message` carries anything the caller shouldn't learn before their own
+/// RBAC gate runs, keep it out of the client-facing text the way this one
+/// does - do not assume this comment's DISCHARGED note still covers it.
 enum class ConsumeFailure {
     kPrecondition,  ///< precondition denied — ticket UNTOUCHED, still recallable
     kNotConsumable, ///< absent / not approved / already consumed (the CAS lost)
-    kStoreError,    ///< store unavailable, missing argument, or a SQLite failure
+    kStoreError,    ///< store unavailable, missing argument, or a SQLite failure —
+                    ///< see ConsumeError::extended_errcode/binding_check_unevaluated
+    kForeignOrigin, ///< minted on a surface other than the MCP recall (#2442)
+    kForeignSubmitter, ///< recalled by a principal other than the ticket's submitter (#2442)
+};
+
+/// The one refusal message this STORE returns for every "this ticket cannot
+/// be redeemed" outcome. kForeignOrigin and kForeignSubmitter deliberately
+/// share it with kNotConsumable: the KIND separates a forgery attempt (wrong
+/// surface, or wrong principal) from a replay for the log, but the MESSAGE
+/// must not, or the recall becomes an oracle for which SURFACE minted a
+/// ticket or WHO submitted it. (Not for which definition ids exist: a
+/// mismatched id is refused earlier, and with a different message, before
+/// this is reached.)
+///
+/// NOT one home end-to-end: the MCP recall (`mcp_server.cpp`) does not
+/// consume this constant — it independently hardcodes its own client-facing
+/// string ("approval already used (one-time ticket)"), worded differently
+/// but semantically the same refusal. The two are kept in sync by test
+/// assertions at each layer, not by sharing a symbol. If a future consumer
+/// of `ConsumeError` wants the store's own wording, this is it.
+/// Stable audit token, one per failure kind. The AUDIT trail is server-side and
+/// is never returned to the caller, so the anti-oracle reasoning below does NOT
+/// reach it: suppressing the distinction there would destroy the only evidence
+/// a cross-surface or cross-submitter redemption attempt was refused, which is
+/// the thing #2442 exists to produce.
+///
+/// Closed set. Adding a `ConsumeFailure` without a token here fails the build on
+/// GCC and Clang — `-Wswitch` is promoted to an error locally because
+/// `meson.build` sets `werror=false`, so the warning alone would not stop it,
+/// and a new kind would otherwise inherit whatever the caller happens to say.
+///
+/// The ORDER of the MSVC pragmas is load-bearing. C4062 is off by default, and
+/// `#pragma warning(error : N)` does NOT enable an off-by-default warning —
+/// Microsoft documents that behaviour only for the `1|2|3|4` and `default`
+/// specifiers — so promoting it alone sets an as-error flag on a diagnostic
+/// that is never emitted. The explicit level enable has to come first.
+///
+/// Unverified on MSVC: no Windows leg has built this. That is the only reason
+/// the claim is hedged. (An earlier version of this comment blamed the
+/// whole-function pragma rule instead; that rule is scoped to warnings
+/// 4700-4999, and C4062 is parse-time, so it does not reach the `pop` below.)
+[[nodiscard]] constexpr const char* consume_denial_reason(ConsumeFailure kind) {
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(1 : 4062) // off by default; `error:` alone does NOT enable it
+#pragma warning(error : 4062)
+#endif
+    switch (kind) {
+    case ConsumeFailure::kPrecondition:
+        return "precondition";
+    case ConsumeFailure::kNotConsumable:
+        return "not_consumable";
+    case ConsumeFailure::kStoreError:
+        return "store_error";
+    case ConsumeFailure::kForeignOrigin:
+        return "foreign_origin";
+    case ConsumeFailure::kForeignSubmitter:
+        return "foreign_submitter";
+    }
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+    // Not reachable today: the switch above has an arm per ConsumeFailure
+    // value, and the pragma makes a missing arm a compile ERROR rather than a
+    // warning. Present so the function still returns on a compiler that does
+    // not honour the pragma.
+    return "unknown";
+}
+
+inline constexpr const char* kNotConsumableMessage =
+    "approval not consumable (already used, not approved, or absent)";
+
+/// A store read's failure, kept apart from the row simply not being there.
+/// `extended_errcode` is `sqlite3_extended_errcode()` at the failing
+/// prepare/step, or 0 when the failure has no SQLite origin (store not open,
+/// missing argument) — see `is_permanent_sqlite_error` (#2786 "PR 1c").
+struct StoreReadError {
+    std::string message;
+    int extended_errcode = 0;
 };
 
 struct ConsumeError {
     ConsumeFailure kind{ConsumeFailure::kStoreError};
     std::string message;
+    /// `sqlite3_extended_errcode()` for a `kStoreError` produced by a SQLite
+    /// read/write failure; 0 otherwise (store not open, missing argument, a
+    /// throwing precondition). See `is_permanent_sqlite_error` (#2786). The 0
+    /// default is safe for the store-not-open producer specifically because
+    /// `approval_store_error_body`'s permanent-arm check is `!is_open() ||
+    /// is_permanent_sqlite_error(extended_errcode)` — the `is_open()` disjunct
+    /// alone correctly forces the permanent arm there regardless of
+    /// `extended_errcode`. The missing-argument/throwing-precondition
+    /// producers are NOT similarly protected: the store IS open in those
+    /// cases, so a 0 `extended_errcode` DOES take the transient arm if that
+    /// `kStoreError` ever reaches `approval_store_error_body` (see
+    /// `consume_ticket`'s guard-clause comment for why this is harmless
+    /// today — the sole production caller never triggers them).
+    int extended_errcode = 0;
+    /// True ONLY when the #2442 cross-surface/cross-submitter binding check's
+    /// own read (`get_checked` inside `consume_ticket`) is the thing that
+    /// faulted — so NEITHER the origin nor the submitter comparison ran, and
+    /// a foreign-origin or foreign-submitter ticket could be hiding behind
+    /// this refusal exactly as easily as an innocent one. #2786 arm 1:
+    /// without this, a store fault at that specific read reports as a plain
+    /// `kStoreError` and the forgery-detection signal is lost for the
+    /// duration of the fault. False for every other `kStoreError` producer
+    /// (the store-not-open guard, the missing-id/missing-principal guards,
+    /// the CAS itself, the precondition recheck read, a throwing
+    /// precondition) — those never reached the binding check, so there is
+    /// nothing masked to flag.
+    bool binding_check_unevaluated = false;
 };
 
 /// A cheap, read-only recheck of the state a ticket's effect depends on,
@@ -138,18 +288,23 @@ public:
     /// the owning schedule's id for a scheduled-fire submission — see the
     /// `Approval::schedule_id` doc comment for why this matters.
     ///
-    /// `origin` (#2442) declares the minting surface. A caller that declares a
-    /// non-MCP origin may NOT mint a `mcp.`-prefixed definition_id: that is the
-    /// forgeable half of the cross-surface confusion, since the REST
-    /// instruction gate mints with a caller-influenced definition id and a
-    /// fully caller-controlled scope expression, which the MCP recall matches
-    /// on. Declaring no origin still permits the prefix, because the MCP mint
-    /// itself is the one caller that cannot yet declare — see
-    /// ApprovalOrigin::kUnspecified.
+    /// `origin` (#2442) RECORDS the minting surface. It is not enforced here:
+    /// this store does not refuse a `mcp.`-prefixed definition_id from any
+    /// surface. The binding is applied at REDEMPTION, in `consume_ticket`,
+    /// which refuses a ticket whose recorded surface is not MCP — see the
+    /// rationale in `submit()`'s body for why the check moved.
+    ///
+    /// No default (#2442's closing half — was `= ApprovalOrigin::kUnspecified`
+    /// until the MCP mint could declare `kMcp`; it does now). Every caller
+    /// states its surface explicitly, so a future caller cannot silently
+    /// regain the pre-fix behaviour by forgetting the argument — and forgetting
+    /// it is now a compile error rather than a silent `kUnspecified`, which
+    /// itself refuses at redemption today, not grants (see
+    /// `declares_non_mcp_surface`).
     std::expected<std::string, std::string>
     submit(const std::string& definition_id, const std::string& submitted_by,
-           const std::string& scope_expression, const std::string& schedule_id = "",
-           ApprovalOrigin origin = ApprovalOrigin::kUnspecified);
+           const std::string& scope_expression, const std::string& schedule_id,
+           ApprovalOrigin origin);
 
     std::vector<Approval> query(const ApprovalQuery& q = {}) const;
 
@@ -173,7 +328,7 @@ public:
     /// caller that 404s either way, and NOT fine for one deciding whether a
     /// one-time capability is spent — see consume_ticket's pre-consume recheck,
     /// which uses this.
-    std::expected<std::optional<Approval>, std::string> get_checked(const std::string& id) const;
+    std::expected<std::optional<Approval>, StoreReadError> get_checked(const std::string& id) const;
 
     /// Newest PENDING approval matching (definition_id, submitted_by,
     /// scope_expression), or nullopt. The MCP approval-ticket mint dedup key
@@ -210,8 +365,6 @@ public:
     /// `consumed_by` records WHO recalled the ticket (PR #1796 H3/N2, SOC-2
     /// CC7.2) — the caller passes the authenticated principal; it is stored in
     /// the same CAS UPDATE so the who and the when can never disagree.
-    std::expected<void, std::string> consume_ticket(const std::string& id,
-                                                    const std::string& consumed_by);
 
     /// consume_ticket with a pre-consume recheck (#2443). A ticket can sit
     /// approved-but-unconsumed for up to the 7-day TTL, so the state its effect
@@ -221,10 +374,12 @@ public:
     /// human-approved one-time capability on a no-op and forcing a fresh
     /// approval round.
     ///
-    /// Order: match the row → reject a non-consumable one → evaluate
-    /// `precondition` → CAS. A precondition denial returns
-    /// ConsumeFailure::kPrecondition and leaves the row untouched, so the same
-    /// ticket is still recallable once the operator resolves the drift.
+    /// Order: argument guards → #2442 origin+submitter binding check → match
+    /// the row → reject a non-consumable one → evaluate `precondition` → CAS.
+    /// A precondition denial returns ConsumeFailure::kPrecondition and leaves
+    /// the row untouched, so the same ticket is still recallable once the
+    /// operator resolves the drift; the binding check has the same
+    /// untouched-on-refusal property.
     ///
     /// `precondition` runs WITHOUT `mtx_` held, deliberately: it inspects state
     /// OUTSIDE this store (rotation status, device state — never authority; see

@@ -48,12 +48,14 @@ struct Facts {
     bool would_wipe = false;
     bool big_step = false;
     bool prev_unusable = false;
-    /// This process has not yet reached a VERDICT with a usable previous
-    /// reading (#2579). Deliberately NOT "the anchor is missing right now":
+    /// No pass has yet reached a VERDICT with a usable previous reading
+    /// (#2579). Deliberately NOT "the anchor is missing right now":
     /// `cleanup_once` re-anchors before it probes, so deriving it from the
     /// anchor lets a pass that failed its probes spend the trigger without ever
-    /// classifying anything -- see `AuditStore::bootstrap_pending_`, which is
-    /// what the sole producer passes here.
+    /// classifying anything. The audit store passes `!bootstrap_settled` here --
+    /// a durable `audit_retention_meta` row settled at the verdict, not a
+    /// per-process flag, because N replicas sweep one table and a process-local
+    /// trigger would be spent by whichever booted first (`audit_store.cpp`).
     ///
     /// The in-pass sanitiser sets `prev_unusable`, which outranks, so corrupt
     /// durable state reports as corruption whether or not this is ALSO set --

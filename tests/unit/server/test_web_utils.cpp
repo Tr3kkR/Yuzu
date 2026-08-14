@@ -1014,69 +1014,17 @@ TEST_CASE("mcp_body_unmeasurable: refuses any framing or encoding we do not sole
     }
 }
 
-// ── upload chunk body cap (BR-008) ──────────────────────────────────────────
+// ── upload chunk body cap ───────────────────────────────────────────────────
 //
-// The chunk route's own 8 MiB limit runs in the HANDLER, after httplib has
-// already buffered up to 100 MB. These are the pre-routing predicates that
-// move the decision in front of the body read.
-
-TEST_CASE("upload_chunk_body_exceeds_cap: only the chunk PUT path is capped",
-          "[web_utils][upload][bounds]") {
-    constexpr std::uint64_t kCap = 1024;
-    const std::string chunk = "/api/v1/uploads/abc123/chunk";
-
-    CHECK(upload_chunk_body_exceeds_cap(chunk, kCap + 1, kCap));
-    // Exactly at the cap is admitted — strictly-greater, matching the
-    // in-handler `chunk_exceeds_max` contract this fronts.
-    CHECK_FALSE(upload_chunk_body_exceeds_cap(chunk, kCap, kCap));
-    CHECK_FALSE(upload_chunk_body_exceeds_cap(chunk, 0, kCap));
-
-    // Sibling upload routes carry no large body and are NOT capped here: the
-    // commit/status/cancel paths take a small JSON body or none.
-    CHECK_FALSE(upload_chunk_body_exceeds_cap("/api/v1/uploads/abc123", kCap * 100, kCap));
-    CHECK_FALSE(upload_chunk_body_exceeds_cap("/api/v1/uploads/abc123/commit", kCap * 100, kCap));
-    CHECK_FALSE(upload_chunk_body_exceeds_cap("/api/v1/upload-grants", kCap * 100, kCap));
-    CHECK_FALSE(upload_chunk_body_exceeds_cap("/mcp/v1/", kCap * 100, kCap));
-}
-
-TEST_CASE("is_upload_chunk_path is wider than the route regex, deliberately",
-          "[web_utils][upload][bounds]") {
-    // A pre-routing gate must never be NARROWER than the surface it guards.
-    // The route matches `([a-f0-9]+)`; this matches any id shape, so a
-    // non-hex id cannot evade the cap by being unroutable — it still 404s,
-    // but without buffering 100 MB first.
-    CHECK(is_upload_chunk_path("/api/v1/uploads/ZZZZ/chunk"));
-    CHECK(is_upload_chunk_path("/api/v1/uploads//chunk"));
-    // Suffix and prefix must BOTH hold.
-    CHECK_FALSE(is_upload_chunk_path("/api/v1/uploads/abc/chunkx"));
-    CHECK_FALSE(is_upload_chunk_path("/api/v2/uploads/abc/chunk"));
-    CHECK_FALSE(is_upload_chunk_path("/chunk"));
-}
-
-TEST_CASE("upload_chunk_body_unmeasurable mirrors the MCP framing rules",
-          "[web_utils][upload][bounds]") {
-    const std::string chunk = "/api/v1/uploads/abc123/chunk";
-
-    SECTION("chunked transfer-encoding is refused regardless of case") {
-        CHECK(upload_chunk_body_unmeasurable(chunk, "PUT", true, "chunked", ""));
-        CHECK(upload_chunk_body_unmeasurable(chunk, "PUT", true, "Chunked", ""));
-    }
-    SECTION("a PUT with no Content-Length is refused") {
-        CHECK(upload_chunk_body_unmeasurable(chunk, "PUT", false, "", ""));
-    }
-    SECTION("non-identity content-encoding is refused; identity is not") {
-        CHECK(upload_chunk_body_unmeasurable(chunk, "PUT", true, "", "gzip"));
-        CHECK_FALSE(upload_chunk_body_unmeasurable(chunk, "PUT", true, "", "identity"));
-        CHECK_FALSE(upload_chunk_body_unmeasurable(chunk, "PUT", true, "", "IDENTITY"));
-    }
-    SECTION("the conforming agent request is admitted") {
-        CHECK_FALSE(upload_chunk_body_unmeasurable(chunk, "PUT", true, "", ""));
-    }
-    SECTION("this rule is per-path like its MCP twin") {
-        CHECK_FALSE(upload_chunk_body_unmeasurable("/api/v1/bundles", "POST", false, "chunked",
-                                                   "br"));
-    }
-}
+// HISTORY: three predicate tests lived here for a hand-rolled BR-008
+// pre-routing branch (is_upload_chunk_path / upload_chunk_body_exceeds_cap /
+// upload_chunk_body_unmeasurable). #2407's `kBodyCapTable` landed on dev as
+// the SINGLE per-route body-cap chokepoint (routed-concern: catastrophic if
+// forked), so the branch and its helpers were deleted and the upload surface
+// registered as the `upload_session` table row instead. Coverage moved with
+// it: test_body_cap_policy.cpp asserts the row's cap/measurability/boundary
+// behaviour, and file_retrieval_routes.cpp's static_assert binds the row's
+// cap to `upload_grant::kDefaultChunkMaxBytes`.
 
 // ── JSON depth guard (#2437, governance Gate 5 CH-1) ─────────────────────
 
