@@ -1367,3 +1367,107 @@ TEST_CASE("SecretCodec: a second codec joins a rotation without minting a second
     REQUIRE(codec_a.registered_columns().size() == 1);
     REQUIRE(codec_b.registered_columns().size() == 1);
 }
+
+// #2395/M7 (Codex review): the other half of the story above — the window
+// server.cpp's kek_ops.rotate route classifies HalfCommitted, BEFORE the
+// secondary-codec loop's init()+rewrap_all() step has run for a given
+// codec. codec_b's own registered rows must stay decryptable through
+// codec_b right through that window: proof the two codecs are genuinely
+// INDEPENDENT SecretCodec instances (one's rotate can leave a sibling
+// stale, but never corrupt or block it), not accidentally-correct because
+// nothing ever exercised the gap. Deliberately light — this pins the
+// independence property, not a full HalfCommitted state machine (that
+// belongs to server.cpp's kek_ops.rotate, out of scope here).
+TEST_CASE("SecretCodec: a not-yet-resynced codec's rows stay decryptable through a "
+          "sibling's mint-only rotate",
+          "[pg][secrets][multicodec]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    FileKeyProvider provider(keys.path);
+    PgConn conn = connect(db.dsn());
+    create_test_table(conn.get());
+
+    REQUIRE(PgResult{PQexec(conn.get(), "CREATE SCHEMA IF NOT EXISTS tstore2")}.ok());
+    REQUIRE(PgResult{PQexec(conn.get(), "CREATE TABLE IF NOT EXISTS tstore2.things ("
+                                        "  id     BIGINT PRIMARY KEY,"
+                                        "  secret BYTEA)")}
+                .ok());
+    auto upsert2 = [&](std::int64_t pk, std::span<const std::uint8_t> blob) {
+        const std::string pk_str = std::to_string(pk);
+        const char* values[] = {pk_str.c_str(), reinterpret_cast<const char*>(blob.data())};
+        const int lengths[] = {0, static_cast<int>(blob.size())};
+        const int formats[] = {0, 1};
+        REQUIRE(PgResult{PQexecParams(conn.get(),
+                                      "INSERT INTO tstore2.things (id, secret)"
+                                      " VALUES ($1::bigint, $2)"
+                                      " ON CONFLICT (id) DO UPDATE SET secret = EXCLUDED.secret",
+                                      2, nullptr, values, lengths, formats, 0)}
+                    .ok());
+    };
+    auto fetch2 = [&](std::int64_t pk) {
+        const std::string pk_str = std::to_string(pk);
+        const char* values[] = {pk_str.c_str()};
+        PgResult res{PQexecParams(conn.get(),
+                                  "SELECT secret FROM tstore2.things WHERE id = $1::bigint", 1,
+                                  nullptr, values, nullptr, nullptr, 1)};
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        const auto* p = reinterpret_cast<const std::uint8_t*>(PQgetvalue(res.get(), 0, 0));
+        return std::vector<std::uint8_t>{p, p + PQgetlength(res.get(), 0, 0)};
+    };
+
+    const SecretCodec::SecretId id_a = test_id(1);
+    const SecretCodec::SecretId id_b{"tstore2", "things", "secret",
+                                     SecretCodec::encode_bigint_pk(1)};
+
+    // Both codecs boot against the same database and land on v1 — mirrors
+    // the multi-codec test above.
+    SecretCodec codec_a(provider);
+    REQUIRE(codec_a.register_secret_column({"tstore", "things", "secret", "id"}));
+    REQUIRE(codec_a.init(conn.get()).has_value());
+
+    SecretCodec codec_b(provider);
+    REQUIRE(codec_b.register_secret_column({"tstore2", "things", "secret", "id"}));
+    REQUIRE(codec_b.init(conn.get()).has_value());
+
+    const auto plain_b = bytes_of("plugin-config-sealed-value-still-v1");
+    auto blob_b = codec_b.encrypt(id_b, plain_b);
+    REQUIRE(blob_b.has_value());
+    upsert2(1, *blob_b);
+    REQUIRE(blob_kek_version(*blob_b) == 1);
+
+    // codec_a rotates ALONE — the exact "mint on the primary" step
+    // (server.cpp kek_ops.rotate) that runs BEFORE the secondary-codec
+    // loop calls codec_b->init()/rewrap_all(). Stop right here, as if that
+    // loop's step for codec_b had not run yet (or had failed) — the
+    // HalfCommitted window.
+    auto rotated = codec_a.rotate_kek(conn.get());
+    REQUIRE(rotated.has_value());
+    REQUIRE(*rotated == 2);
+    REQUIRE(codec_a.active_kek_version() == 2);
+
+    // codec_b's in-memory state is stale (nobody has told it about v2 yet)...
+    REQUIRE(codec_b.active_kek_version() == 1);
+    // ...but its own stored row is untouched — still v1, and still
+    // decrypts cleanly through codec_b. codec_a's rotate neither corrupted
+    // nor blocked it; the two codecs are genuinely independent, not merely
+    // accidentally uninvolved with each other.
+    const auto still_v1_blob = fetch2(1);
+    REQUIRE(blob_kek_version(still_v1_blob) == 1);
+    auto back_b = codec_b.decrypt(id_b, still_v1_blob);
+    INFO((back_b ? std::string{} : back_b.error().message));
+    REQUIRE(back_b.has_value());
+    REQUIRE(back_b->size() == plain_b.size());
+    REQUIRE(std::equal(plain_b.begin(), plain_b.end(), back_b->data()));
+
+    // The production resume path (POST /secrets/kek/rewrap): catching up
+    // now brings codec_b onto v2 and its row still decrypts afterward.
+    REQUIRE(codec_b.init(conn.get()).has_value());
+    REQUIRE(codec_b.active_kek_version() == 2);
+    REQUIRE(codec_b.rewrap_all(conn.get()).has_value());
+    const auto v2_blob = fetch2(1);
+    REQUIRE(blob_kek_version(v2_blob) == 2);
+    auto back_b2 = codec_b.decrypt(id_b, v2_blob);
+    REQUIRE(back_b2.has_value());
+    REQUIRE(std::equal(plain_b.begin(), plain_b.end(), back_b2->data()));
+}

@@ -25,15 +25,22 @@
  * hermetic, no httplib acceptor thread (#438).
  *
  * The multi-codec KEK enrolment (`kek_enrolled_codecs()`,
- * `kek_ops_.{rotate,rewrap,status}`) is NOT covered by an automated test
- * here: it is a private ServerImpl member whose exercise requires a live
- * Postgres substrate (SecretCodec::init/rotate_kek/rewrap_all all take a
- * PGconn*), which the standing unit-suite discipline
- * (docs/postgres-store-playbook.md, CLAUDE.md test-efficiency rules) keeps
- * out of the hermetic unit suites. Verified instead by careful reading
- * against `pg/secret_codec.hpp`'s documented contract — recorded as a
- * manual verification in the package summary, as the spec's acceptance
- * criterion for this item explicitly allows.
+ * `kek_ops_.{rotate,rewrap,status}`) is NOT exercised through a live
+ * `ServerImpl` here: it is a private ServerImpl member with no
+ * live-Session-free construction path, same situation as the rest of this
+ * file's bindings. It IS covered end-to-end against a live Postgres
+ * substrate at the `pg::SecretCodec` level, one layer below ServerImpl, in
+ * tests/unit/server/test_secret_codec.cpp: "SecretCodec: a second codec
+ * joins a rotation without minting a second KEK" reproduces the exact
+ * production sequence (mint once via codec_a->rotate_kek(), then bring
+ * codec_b onto the same version via codec_b->init()+codec_b->rewrap_all()
+ * — never a second rotate_kek() call) against two independent SecretCodec
+ * instances sharing one `secrets.kek_meta` table, and asserts exactly one
+ * new KEK version is minted, both codecs converge on it, and both rows
+ * still decrypt. "SecretCodec: a not-yet-resynced codec's rows stay
+ * decryptable through a sibling's mint-only rotate" (same file) covers the
+ * HalfCommitted-adjacent half: a codec that has not yet caught up stays
+ * independently correct, never corrupted or blocked by a sibling's rotate.
  */
 
 #include "approval_manager.hpp"
