@@ -7,18 +7,32 @@
 
 #include "bundle_orchestrator.hpp"
 #include "bundle_service.hpp"
+#include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
 
 // Fake per-command dispatcher: records calls, returns a deterministic
 // command_id per (plugin,action) and a configurable agents_reached.
@@ -26,6 +40,7 @@ struct FakeDispatch {
     struct Call {
         std::string plugin, action, correlation;
         std::vector<std::string> agent_ids;
+        yuzu::server::authz::VisibleSet exec_visible; // governance UP-8: what the caller threaded
     };
     std::vector<Call> calls;
     int sent = 1; // agents_reached returned for every step
@@ -34,8 +49,9 @@ struct FakeDispatch {
         return [this](const std::string& plugin, const std::string& action,
                       const std::vector<std::string>& agent_ids, const std::string& /*scope*/,
                       const std::unordered_map<std::string, std::string>& /*params*/,
-                      const std::string& correlation) -> std::pair<std::string, int> {
-            calls.push_back(Call{plugin, action, correlation, agent_ids});
+                      const std::string& correlation,
+                      const yuzu::server::authz::VisibleSet& exec_visible) -> std::pair<std::string, int> {
+            calls.push_back(Call{plugin, action, correlation, agent_ids, exec_visible});
             return {"cmd-" + plugin + "-" + action, sent};
         };
     }
@@ -73,9 +89,11 @@ std::vector<BundleStepSpec> two_steps() {
 } // namespace
 
 TEST_CASE("orchestrator dispatch fans each step under one bundle- correlation id",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
 
@@ -98,9 +116,56 @@ TEST_CASE("orchestrator dispatch fans each step under one bundle- correlation id
     CHECK(audited == 2);
 }
 
-TEST_CASE("orchestrator collate groups responses in request order", "[bundle][orchestrator]") {
+TEST_CASE("orchestrator threads the caller's exec_visible into DispatchFn unchanged "
+          "(governance UP-8)",
+          "[pg][bundle][orchestrator][scope]") {
+    // Before this fix `dispatch()` hardcoded an unfiltered VisibleSet{} into
+    // every step regardless of what the caller (REST/MCP) had already derived
+    // — a drift hazard: a future dispatch_fn that started consulting this set
+    // for its own confinement would silently see "unfiltered" no matter what
+    // the wrapper actually authorized. This proves the caller's set survives
+    // unchanged, per step.
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    BundleOrchestrator orch(fd.fn(), &store, fixed_id("vis"));
+
+    std::unordered_set<std::string> caller_visible{"agent-1"};
+    auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit(),
+                             yuzu::server::authz::VisibleSet{caller_visible});
+    CHECK(res.expected == 2);
+    REQUIRE(fd.calls.size() == 2);
+    for (const auto& call : fd.calls) {
+        REQUIRE(call.exec_visible.has_value()); // NOT nullopt/unfiltered
+        CHECK(call.exec_visible->size() == 1);
+        CHECK(call.exec_visible->count("agent-1") == 1);
+    }
+}
+
+TEST_CASE("orchestrator defaults to unfiltered exec_visible when the caller supplies none",
+          "[pg][bundle][orchestrator][scope]") {
+    // REST's confinement model authorizes agent_id via scoped_perm_fn BEFORE
+    // calling dispatch() (never derives a VisibleSet), so omitting the
+    // argument must preserve that — nullopt, not a present-empty deny-all.
+    FakeDispatch fd;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    BundleOrchestrator orch(fd.fn(), &store, fixed_id("def"));
+
+    orch.dispatch("agent-1", two_steps(), "alice", null_audit());
+    REQUIRE(fd.calls.size() == 2);
+    CHECK_FALSE(fd.calls[0].exec_visible.has_value());
+}
+
+TEST_CASE("orchestrator collate groups responses in request order", "[pg][bundle][orchestrator]") {
+    FakeDispatch fd;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
 
@@ -127,10 +192,12 @@ TEST_CASE("orchestrator collate groups responses in request order", "[bundle][or
 }
 
 TEST_CASE("orchestrator: a step that reached no agent is dispatch-failed (terminal)",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
     fd.sent = 0; // every step reaches 0 agents
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
 
@@ -143,9 +210,11 @@ TEST_CASE("orchestrator: a step that reached no agent is dispatch-failed (termin
         CHECK(s.state == BundleStepState::DispatchFailed);
 }
 
-TEST_CASE("orchestrator collate enforces ownership (IDOR guard)", "[bundle][orchestrator]") {
+TEST_CASE("orchestrator collate enforces ownership (IDOR guard)", "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
 
@@ -159,28 +228,67 @@ TEST_CASE("orchestrator collate enforces ownership (IDOR guard)", "[bundle][orch
     CHECK(orch.collate(res.correlation_id, "alice", false).has_value());
 }
 
-TEST_CASE("orchestrator collate of an unknown correlation id is nullopt", "[bundle][orchestrator]") {
+TEST_CASE("orchestrator collate of an unknown correlation id is nullopt", "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
-    CHECK_FALSE(orch.collate("bundle-nope", "alice", false).has_value());
+    auto agg = orch.collate("bundle-nope", "alice", false);
+    CHECK_FALSE(agg.has_value());
+    CHECK(agg.error() == CollateError::kNotFoundOrDenied);
+}
+
+// #2691 (Doomgoose finding #3): a manifest that IS found and owned, but whose
+// ResponseStore read fails, must return a DISTINCT error from the same-shaped
+// "not found / not owned" case above — the caller maps kDegraded to a
+// retryable 503/kInternalError, never the terminal 404 a genuinely-absent or
+// denied bundle gets. A not-open store (bad pool) forces query_by_execution()
+// to fail without needing to break a healthy connection mid-test.
+TEST_CASE("orchestrator collate distinguishes a degraded store read from not-found/denied",
+          "[pg][bundle][orchestrator]") {
+    FakeDispatch fd;
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    ResponseStore bad_store(bad_pool);
+    REQUIRE_FALSE(bad_store.is_open());
+    BundleOrchestrator orch(fd.fn(), &bad_store, fixed_id("abc"));
+
+    auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
+    auto agg = orch.collate(res.correlation_id, "alice", /*is_admin=*/false);
+    CHECK_FALSE(agg.has_value());
+    CHECK(agg.error() == CollateError::kDegraded); // NOT kNotFoundOrDenied
+}
+
+// The `!response_store_` (never-wired) branch is the SAME degrade signal,
+// not a third state — a caller must not be able to tell "substrate never
+// wired" apart from "substrate read failed" (#2691).
+TEST_CASE("orchestrator collate with an unwired response store is a degrade not a not-found",
+          "[bundle][orchestrator]") {
+    FakeDispatch fd;
+    BundleOrchestrator orch(fd.fn(), /*response_store=*/nullptr, fixed_id("abc"));
+    auto res = orch.dispatch("agent-1", two_steps(), "alice", null_audit());
+    auto agg = orch.collate(res.correlation_id, "alice", /*is_admin=*/false);
+    CHECK_FALSE(agg.has_value());
+    CHECK(agg.error() == CollateError::kDegraded);
 }
 
 // ── Gate-7 governance hardening regressions ─────────────────────────────────
 
 TEST_CASE("orchestrator: a throwing dispatch step is isolated, manifest still stored (UP-1)",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     // A throw from dispatch_ on step 2 must NOT propagate and must NOT orphan the
     // already-sent commands: the manifest is stored regardless, so collate finds
     // it; the throwing step reads dispatch-failed.
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     int n = 0;
     BundleOrchestrator::DispatchFn throwing =
         [&n](const std::string& plugin, const std::string& action, const std::vector<std::string>&,
              const std::string&, const std::unordered_map<std::string, std::string>&,
-             const std::string&) -> std::pair<std::string, int> {
+             const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
         if (++n == 2)
             throw std::runtime_error("gRPC write failed");
         return {"cmd-" + plugin + "-" + action, 1};
@@ -202,10 +310,12 @@ TEST_CASE("orchestrator: a throwing dispatch step is isolated, manifest still st
 }
 
 TEST_CASE("orchestrator: a single boundary poll does not self-evict; polling slides the TTL",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     // governance UP-3/UP-4 / CH-3/CH-4.
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     std::int64_t clock = 1000;
     BundleOrchestrator::ClockFn now = [&clock]() { return clock; };
@@ -226,9 +336,11 @@ TEST_CASE("orchestrator: a single boundary poll does not self-evict; polling sli
 }
 
 TEST_CASE("orchestrator: an abandoned (un-polled) bundle is eventually swept",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     std::int64_t clock = 0;
     int idctr = 0;
@@ -247,9 +359,11 @@ TEST_CASE("orchestrator: an abandoned (un-polled) bundle is eventually swept",
 }
 
 TEST_CASE("orchestrator: an empty principal can never collate (sec-M2/CH-7)",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     BundleOrchestrator orch(fd.fn(), &store, fixed_id("abc"));
     auto res = orch.dispatch("agent-1", two_steps(), /*principal=*/"", null_audit());
@@ -260,9 +374,11 @@ TEST_CASE("orchestrator: an empty principal can never collate (sec-M2/CH-7)",
 }
 
 TEST_CASE("orchestrator: cap eviction drops the oldest manifest (QE-S3)",
-          "[bundle][orchestrator]") {
+          "[pg][bundle][orchestrator]") {
     FakeDispatch fd;
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     REQUIRE(store.is_open());
     std::int64_t clock = 0;
     int idctr = 0;

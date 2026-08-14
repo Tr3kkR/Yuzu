@@ -141,6 +141,7 @@ struct McpEngineRolesHarness {
             /*scoped_perm_fn=*/{},
             /*sessions=*/nullptr,
             /*mcp_streaming_disabled=*/nullptr,
+            /*mcp_streamed_post_enabled=*/nullptr,
             /*allowed_origins=*/{},
             /*software_licensing_store=*/nullptr,
             /*engine_principal_store=*/engine_store.get());

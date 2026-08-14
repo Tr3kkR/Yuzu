@@ -28,6 +28,7 @@ struct SchemaNode {
     std::vector<std::vector<std::string>> any_of;  // required-only alternatives
     std::optional<double> minimum;
     std::optional<double> maximum;
+    std::optional<std::size_t> min_length;  // bytes
     std::optional<std::size_t> max_length;  // bytes
     std::vector<nlohmann::json> enum_values;
     std::unique_ptr<RE2> pattern;  // precompiled; RE2 matching is const-thread-safe
@@ -47,9 +48,10 @@ constexpr int kMaxSchemaDepth = 8;
 
 // The CLOSED keyword catalogue (see header). Anything else is a compile error.
 constexpr std::string_view kSupportedKeywords[] = {
-    "type",     "properties", "required", "description",          "default",
-    "enum",     "minimum",    "maximum",  "maxLength",            "pattern",
-    "items",    "minItems",   "maxItems", "anyOf",                "additionalProperties"};
+    "type",     "properties", "required",  "description",          "default",
+    "enum",     "minimum",    "maximum",   "minLength",            "maxLength",
+    "pattern",  "items",      "minItems",  "maxItems",             "anyOf",
+    "additionalProperties"};
 
 std::optional<SchemaType> parse_type(std::string_view t) {
     if (t == "string")
@@ -190,14 +192,20 @@ std::unique_ptr<const SchemaNode> compile_node(const nlohmann::json& s, const st
     if (node->minimum && node->maximum && *node->minimum > *node->maximum)
         err("'minimum' exceeds 'maximum' at '" + path + "'");
 
-    // ── maxLength (string only; bytes) ──────────────────────────────────
-    if (s.contains("maxLength")) {
-        require_type("maxLength", SchemaType::kString, "string");
-        if (!s["maxLength"].is_number_integer() || s["maxLength"].get<std::int64_t>() < 0)
-            err("'maxLength' at '" + path + "' must be a non-negative integer");
-        else
-            node->max_length = static_cast<std::size_t>(s["maxLength"].get<std::int64_t>());
+    // ── minLength / maxLength (string only; bytes) ──────────────────────
+    for (const char* kw : {"minLength", "maxLength"}) {
+        if (!s.contains(kw))
+            continue;
+        require_type(kw, SchemaType::kString, "string");
+        if (!s[kw].is_number_integer() || s[kw].get<std::int64_t>() < 0) {
+            err(std::string("'") + kw + "' at '" + path + "' must be a non-negative integer");
+            continue;
+        }
+        (kw == std::string_view{"minLength"} ? node->min_length : node->max_length) =
+            static_cast<std::size_t>(s[kw].get<std::int64_t>());
     }
+    if (node->min_length && node->max_length && *node->min_length > *node->max_length)
+        err("'minLength' exceeds 'maxLength' at '" + path + "'");
 
     // ── pattern (string only; RE2, precompiled) ─────────────────────────
     if (s.contains("pattern")) {
@@ -345,6 +353,9 @@ std::optional<SchemaViolation> validate_node(const SchemaNode& n, const nlohmann
 
     if (v.is_string()) {
         const auto& str = v.get_ref<const std::string&>();
+        if (n.min_length && str.size() < *n.min_length)
+            return SchemaViolation{path, "string is shorter than minLength " +
+                                             std::to_string(*n.min_length) + " (bytes)"};
         if (n.max_length && str.size() > *n.max_length)
             return SchemaViolation{path, "string exceeds maxLength " +
                                              std::to_string(*n.max_length) + " (bytes)"};

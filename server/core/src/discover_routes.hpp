@@ -72,7 +72,12 @@ struct DiscoveryDoc {
 /// list_operations, plus the full role -> permissions grid
 /// (list_roles + get_role_permissions). `rbac_store` must be non-null;
 /// callers null-check and answer 503 / a tool error before calling this.
-DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store);
+/// #2376: `include_roles` gates the `roles[].permissions[]` grid (the
+/// authorization topology) behind `UserManagement:Read`, while the
+/// securable/operation taxonomy stays readable at the route's own
+/// `Infrastructure:Read`. Callers PROBE for the second permission with a
+/// throwaway response — they must not 403 the whole route.
+DiscoveryDoc build_permissions_catalog(RbacStore& rbac_store, bool include_roles);
 
 /// `/discover/instructions`. Subsets InstructionStore::query_definitions
 /// (enabled_only=true — only invokable definitions are published) to

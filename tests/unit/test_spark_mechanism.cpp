@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdint>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <string_view>
@@ -77,9 +78,9 @@ public:
         if (throw_watch_nonstd_)
             throw 42; // non-std throw → exercises watch_guarded()'s catch(...) arm
         if (throw_watch_)
-            throw std::runtime_error("forced watch throw"); // contract-violating mechanism (UP-7)
+            throw std::runtime_error(throw_watch_msg_); // contract-violating mechanism (UP-7)
         if (fail_watch_)
-            return std::unexpected("forced watch failure");
+            return std::unexpected(fail_watch_msg_);
         watched_.insert(key);
         return {};
     }
@@ -87,6 +88,11 @@ public:
         std::lock_guard lk(mu_);
         ++unwatch_calls_;
         watched_.erase(key);
+        // The real mechanisms allocate inside unwatch() (spark_service queues a Cmd
+        // holding a key copy; spark_file grows retiring_), so bad_alloc out of here
+        // is a real production shape, not a contrivance (#2270 round 4).
+        if (throw_unwatch_)
+            throw std::bad_alloc{};
     }
     void stop() override {
         std::lock_guard lk(mu_);
@@ -146,6 +152,20 @@ public:
         std::lock_guard lk(mu_);
         throw_watch_nonstd_ = b;
     }
+    /// Text the thrown/returned watch error carries — a test uses a very long one to
+    /// overrun the engine's bounded error headroom (#2270 round 4).
+    void set_throw_watch_msg(std::string m) {
+        std::lock_guard lk(mu_);
+        throw_watch_msg_ = std::move(m);
+    }
+    void set_fail_watch_msg(std::string m) {
+        std::lock_guard lk(mu_);
+        fail_watch_msg_ = std::move(m);
+    }
+    void set_throw_unwatch(bool b) {
+        std::lock_guard lk(mu_);
+        throw_unwatch_ = b;
+    }
 
 private:
     std::mutex mu_;
@@ -156,6 +176,9 @@ private:
     bool fail_watch_{false};
     bool throw_watch_{false};
     bool throw_watch_nonstd_{false};
+    bool throw_unwatch_{false};
+    std::string throw_watch_msg_{"forced watch throw"};
+    std::string fail_watch_msg_{"forced watch failure"};
     int watch_calls_{0};
     int unwatch_calls_{0};
     int stop_calls_{0};
@@ -772,6 +795,410 @@ TEST_CASE("File spark: a mechanism that THROWS from watch() rolls the arm back c
     auto ok = engine.arm(*c, file_spec("/etc/hosts"));
     CHECK(ok.has_value());
     CHECK(engine.stats().armed_sparks == 1);
+    engine.stop();
+}
+
+// ── #2270: arm_impl is strong-guarantee against an allocation failure ─────────
+//
+// The ghost-entry bug these pin: arm_impl used to insert into armed_ and then keep
+// allocating. A std::bad_alloc part-way left an armed_ entry with no subscriber and
+// no watcher. Nothing could disarm it (no id was ever returned), and — the damaging
+// part — a LATER arm of an equal spec deduped onto it, skipped watch_guarded(), and
+// reported SUCCESS with no OS watcher running. Silent detection loss that outlived
+// the memory pressure. A real bad_alloc cannot be aimed at one statement, so these
+// drive the same unwind through set_arm_fault_hook_for_test().
+
+TEST_CASE("arm_impl: an allocation failure before the sub_keys_ commit leaves no ghost entry "
+          "(#2270)",
+          "[spark][mechanism]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    engine.set_arm_fault_hook_for_test([](int phase) {
+        if (phase == SparkEngine::kArmFaultPhaseBeforeSubKeys)
+            throw std::bad_alloc{};
+    });
+    CHECK_THROWS_AS(engine.arm(*c, file_spec("/etc/hosts")), std::bad_alloc);
+
+    // Exactly as on entry: no armed_ entry, no subscription, no watch attempted.
+    CHECK(engine.stats().armed_sparks == 0);
+    CHECK(engine.stats().subscriptions == 0);
+    CHECK(fake->watch_calls() == 0);
+
+    // The damaging consequence, pinned directly: the NEXT arm of the same key must
+    // arm a REAL watcher, not dedup onto a survivor.
+    engine.set_arm_fault_hook_for_test(nullptr);
+    auto ok = engine.arm(*c, file_spec("/etc/hosts"));
+    REQUIRE(ok.has_value());
+    CHECK(engine.stats().armed_sparks == 1);
+    CHECK(fake->watch_calls() == 1);
+    CHECK(fake->is_watching("file|10:/etc/hosts"));
+    engine.stop();
+}
+
+TEST_CASE("arm_impl: an allocation failure on a DEDUPED arm leaves the existing subscriber and "
+          "its watcher untouched (#2270)",
+          "[spark][mechanism]") {
+    // The existing-key half of the same guarantee, and the reason the commit order
+    // reserves the subs slot up front: the failing arm must not disturb a sibling
+    // whose own arm() has already returned SUCCESS to its caller.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto first = engine.arm(*c, file_spec("/etc/hosts"));
+    REQUIRE(first.has_value());
+    REQUIRE(fake->watch_calls() == 1);
+
+    engine.set_arm_fault_hook_for_test([](int phase) {
+        if (phase == SparkEngine::kArmFaultPhaseBeforeSubKeys)
+            throw std::bad_alloc{};
+    });
+    CHECK_THROWS_AS(engine.arm(*c, file_spec("/etc/hosts")), std::bad_alloc);
+    engine.set_arm_fault_hook_for_test(nullptr);
+
+    CHECK(engine.stats().armed_sparks == 1);
+    CHECK(engine.stats().subscriptions == 1);
+    CHECK(fake->watch_calls() == 1);   // no second watch
+    CHECK(fake->unwatch_calls() == 0); // and nothing torn down
+    CHECK(fake->is_watching("file|10:/etc/hosts"));
+
+    // The survivor is still a working subscription end to end.
+    engine.disarm(*first);
+    CHECK(engine.stats().armed_sparks == 0);
+    CHECK(fake->unwatch_calls() == 1);
+    engine.stop();
+}
+
+// ── #2270 round 4: the window PAST the commit ────────────────────────────────
+//
+// The two cases above cover the in-lock layer. These cover the layer the round-3
+// fix claimed was already closed and was not: everything between arm_impl's commit
+// and its return. The measured escape was watch_guarded's error concat, which ran
+// INSIDE a catch handler — a bad_alloc there unwound past a committed subscription
+// and produced the ghost these tests exist to keep closed.
+//
+// kArmFaultPhaseWatchErrorBuild is a CONTAINMENT pin, not a rollback pin: the
+// production completion (BoundedMsg::finish) is noexcept by construction, so no
+// live statement at that point can throw today. The seam proves the property holds
+// on every platform, including the ones the Linux-only allocation counter in
+// test_spark_alloc_budget.cpp cannot reach.
+
+TEST_CASE("arm_impl: a throw while BUILDING the watch error cannot ghost the key (#2270)",
+          "[spark][mechanism]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    fake->set_throw_watch(true);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    engine.set_arm_fault_hook_for_test([](int phase) {
+        if (phase == SparkEngine::kArmFaultPhaseWatchErrorBuild)
+            throw std::bad_alloc{};
+    });
+
+    std::expected<SparkEngine::SubscriptionId, std::string> sub;
+    REQUIRE_NOTHROW(sub = engine.arm(*c, file_spec("/etc/hosts"))); // must NOT propagate
+    CHECK_FALSE(sub.has_value());
+    // The outer failed-watch wrapper is what the caller sees; the inner text is
+    // truncated to its prefix because the completion was interrupted.
+    CHECK(sub.error().starts_with("watch mechanism failed to arm '"));
+    CHECK(sub.error().find("watch mechanism threw:") != std::string::npos);
+
+    // The ghost, pinned directly. Before the fix this read armed_sparks == 1,
+    // subscriptions == 1, unwatch_calls == 0.
+    CHECK(engine.stats().armed_sparks == 0);
+    CHECK(engine.stats().subscriptions == 0);
+    CHECK(fake->watch_calls() == 1);
+
+    // And the damaging consequence: the next equal-spec arm must arm a REAL
+    // watcher rather than dedup onto a survivor and report success while deaf.
+    engine.set_arm_fault_hook_for_test(nullptr);
+    fake->set_throw_watch(false);
+    auto ok = engine.arm(*c, file_spec("/etc/hosts"));
+    REQUIRE(ok.has_value());
+    CHECK(fake->watch_calls() == 2);
+    CHECK(fake->is_watching("file|10:/etc/hosts"));
+    engine.stop();
+}
+
+TEST_CASE("start(): a throw while building a replay watch error never escapes start() (#2270)",
+          "[spark][mechanism]") {
+    // watch_guarded is the SINGLE boundary for both arm paths (#2019). Hardening it
+    // for arm_impl must not break the pre-start replay caller, whose failure handling
+    // is the opposite: fault in place, never roll back (subscribers hold ids already).
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+
+    auto sub = engine.arm(*c, file_spec("/etc/hosts")); // pre-start: no watch yet
+    REQUIRE(sub.has_value());
+    REQUIRE(fake->watch_calls() == 0);
+
+    fake->set_throw_watch(true);
+    engine.set_arm_fault_hook_for_test([](int phase) {
+        if (phase == SparkEngine::kArmFaultPhaseWatchErrorBuild)
+            throw std::bad_alloc{};
+    });
+    REQUIRE_NOTHROW(engine.start()); // void return — an escape here is unrecoverable
+
+    CHECK(fake->watch_calls() == 1);
+    CHECK(engine.stats().armed_sparks == 1);  // replay keeps the entry...
+    CHECK(engine.stats().armed_faulted == 1); // ...and flags it deaf (B1)
+    engine.set_arm_fault_hook_for_test(nullptr);
+    engine.stop();
+}
+
+TEST_CASE("arm_impl: an over-long watch error is truncated, never grown, past the commit (#2270)",
+          "[spark][mechanism]") {
+    // The bounded buffer's whole point: a mechanism error is caller-controlled in
+    // length, so concatenating it after the commit would put an unbounded allocation
+    // exactly where an allocation must not fail. Both the thrown and the RETURNED
+    // error take that path.
+    const std::string huge(4096, 'x');
+
+    SECTION("thrown") {
+        SparkEngine engine;
+        FakeMechanism* fake = wire_fake(engine, SparkType::File);
+        fake->set_throw_watch(true);
+        fake->set_throw_watch_msg(huge);
+        auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+        REQUIRE(c.has_value());
+        engine.start();
+
+        auto sub = engine.arm(*c, file_spec("/etc/hosts"));
+        REQUIRE_FALSE(sub.has_value());
+        CHECK(sub.error().find("watch mechanism threw:") != std::string::npos);
+        CHECK(sub.error().size() < huge.size()); // truncated, not grown
+        CHECK(engine.stats().armed_sparks == 0);
+        CHECK(engine.stats().subscriptions == 0);
+        engine.stop();
+    }
+    SECTION("returned") {
+        SparkEngine engine;
+        FakeMechanism* fake = wire_fake(engine, SparkType::File);
+        fake->set_fail_watch(true);
+        fake->set_fail_watch_msg(huge);
+        auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+        REQUIRE(c.has_value());
+        engine.start();
+
+        auto sub = engine.arm(*c, file_spec("/etc/hosts"));
+        REQUIRE_FALSE(sub.has_value());
+        CHECK(sub.error().starts_with("watch mechanism failed to arm '"));
+        CHECK(sub.error().size() < huge.size());
+        CHECK(engine.stats().armed_sparks == 0);
+        CHECK(engine.stats().subscriptions == 0);
+        engine.stop();
+    }
+}
+
+// ── #2270 round 4: the consumer-race teardown ────────────────────────────────
+//
+// These reach teardown_arm_race's REAL-WORK branch, which no existing test could:
+// set_arm_race_hook_for_test fires after the insert, so unregister_consumer's own
+// scan performs the teardown and arm_impl's degenerates to a no-op. Unregistering
+// from the PRE-CHECK seam leaves nothing for that scan to find, so the teardown
+// itself must remove the subscription and drop the OS watch.
+
+TEST_CASE("arm_impl: losing the consumer race after the pre-check tears the watch down (#2270)",
+          "[spark][mechanism]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    engine.set_arm_precheck_race_hook_for_test([&] { engine.unregister_consumer(*c); });
+    auto sub = engine.arm(*c, file_spec("/etc/hosts"));
+    engine.set_arm_precheck_race_hook_for_test(nullptr);
+
+    REQUIRE_FALSE(sub.has_value());
+    CHECK(sub.error() == "consumer unregistered during arm"); // the pre-built message, intact
+    CHECK(engine.stats().armed_sparks == 0);
+    CHECK(engine.stats().subscriptions == 0);
+    CHECK(fake->watch_calls() == 1);   // the watch DID come up...
+    CHECK(fake->unwatch_calls() == 1); // ...and the teardown took it back down
+    CHECK_FALSE(fake->is_watching("file|10:/etc/hosts"));
+    CHECK(engine.stats().arm_race_unwatch_failures_total == 0);
+    engine.stop();
+}
+
+TEST_CASE("arm_impl: losing the consumer race never disturbs a deduped SIBLING (#2270)",
+          "[spark][mechanism]") {
+    // The defect two review rounds shipped: a teardown that dropped the whole key
+    // deleted a healthy sibling's subscription and orphaned the live OS watch it
+    // believed it had. Losing the M1 race invalidates OUR arm and nobody else's.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto keeper = engine.register_consumer("keeper", [](const SparkEvent&) {});
+    auto loser = engine.register_consumer("loser", [](const SparkEvent&) {});
+    REQUIRE(keeper.has_value());
+    REQUIRE(loser.has_value());
+    engine.start();
+
+    auto held = engine.arm(*keeper, file_spec("/etc/hosts"));
+    REQUIRE(held.has_value());
+    REQUIRE(fake->watch_calls() == 1);
+
+    engine.set_arm_precheck_race_hook_for_test([&] { engine.unregister_consumer(*loser); });
+    auto sub = engine.arm(*loser, file_spec("/etc/hosts")); // dedups onto the keeper's key
+    engine.set_arm_precheck_race_hook_for_test(nullptr);
+
+    REQUIRE_FALSE(sub.has_value());
+    CHECK(engine.stats().armed_sparks == 1);  // the key survives
+    CHECK(engine.stats().subscriptions == 1); // exactly the keeper's
+    CHECK(fake->watch_calls() == 1);          // dedup: no second watch
+    CHECK(fake->unwatch_calls() == 0);        // and nothing torn down
+    CHECK(fake->is_watching("file|10:/etc/hosts"));
+
+    // The keeper is still live end to end, not just present in the bookkeeping.
+    fake->fire("file|10:/etc/hosts");
+    CHECK(eventually([&] { return engine.stats().events_total == 1; }));
+    engine.stop();
+}
+
+TEST_CASE("arm_impl: a timer spark losing the consumer race touches no mechanism (#2270)",
+          "[spark][mechanism]") {
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    engine.set_arm_precheck_race_hook_for_test([&] { engine.unregister_consumer(*c); });
+    auto sub = engine.arm(*c, interval_spec(20)); // never event-driven: no watch to undo
+    engine.set_arm_precheck_race_hook_for_test(nullptr);
+
+    REQUIRE_FALSE(sub.has_value());
+    CHECK(sub.error() == "consumer unregistered during arm");
+    CHECK(engine.stats().armed_sparks == 0);
+    CHECK(engine.stats().subscriptions == 0);
+    CHECK(fake->watch_calls() == 0);
+    CHECK(fake->unwatch_calls() == 0);
+    engine.stop();
+}
+
+TEST_CASE("arm_impl: the consumer-race teardown skips a STALE unwatch after a re-arm (#2270 M2)",
+          "[spark][mechanism]") {
+    // teardown_arm_race inherits disarm()'s M2 discipline: between dropping the key
+    // under mu_ and calling unwatch() with mu_ released, a concurrent equal-spec arm
+    // may have renewed the key. Unwatching then would tear down the FRESH watch.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto racer = engine.register_consumer("racer", [](const SparkEvent&) {});
+    auto rearmer = engine.register_consumer("rearmer", [](const SparkEvent&) {});
+    REQUIRE(racer.has_value());
+    REQUIRE(rearmer.has_value());
+    engine.start();
+
+    // Both hooks are made one-shot with a FLAG, never by clearing themselves: the
+    // engine invokes the std::function in place, so reassigning it from inside its
+    // own call destroys the callable mid-execution (measured: SIGSEGV).
+    bool precheck_fired = false;
+    engine.set_arm_precheck_race_hook_for_test([&] {
+        if (precheck_fired)
+            return;
+        precheck_fired = true;
+        engine.unregister_consumer(*racer);
+    });
+    // Fires inside the teardown, after the key is gone and before the unwatch.
+    bool rearmed = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (rearmed)
+            return;
+        rearmed = true;
+        auto again = engine.arm(*rearmer, file_spec("/etc/hosts"));
+        CHECK(again.has_value());
+    });
+    auto sub = engine.arm(*racer, file_spec("/etc/hosts"));
+    engine.set_arm_precheck_race_hook_for_test(nullptr);
+    engine.set_disarm_race_hook_for_test(nullptr);
+
+    REQUIRE_FALSE(sub.has_value());
+    CHECK(engine.stats().armed_sparks == 1);  // the re-armed key
+    CHECK(engine.stats().subscriptions == 1); // the re-armer's
+    CHECK(fake->watch_calls() == 2);
+    CHECK(fake->unwatch_calls() == 0); // the stale unwatch was SKIPPED
+    CHECK(fake->is_watching("file|10:/etc/hosts"));
+    engine.stop();
+}
+
+TEST_CASE("arm_impl: a THROWING unwatch during the consumer-race teardown is contained and "
+          "counted (#2270)",
+          "[spark][mechanism]") {
+    // The stated residual. unwatch() is not noexcept and the real mechanisms
+    // allocate inside it, so under the memory pressure this whole layer is about it
+    // can throw. By then the engine's bookkeeping is consistent, so the throw is
+    // contained rather than propagated — but the OS watch it failed to drop outlives
+    // its armed_ entry (reclaimed by stop() on Linux; on Windows it can persist for
+    // the life of the process — see teardown_arm_race). The counter below is the only
+    // egress: it reaches an operator as the sparse heartbeat tag
+    // `yuzu.spark_arm_race_unwatch_failures`, because the fallback log line is itself
+    // inside a catch-all and is dropped under the same OOM.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    fake->set_throw_unwatch(true);
+    engine.set_arm_precheck_race_hook_for_test([&] { engine.unregister_consumer(*c); });
+    std::expected<SparkEngine::SubscriptionId, std::string> sub;
+    REQUIRE_NOTHROW(sub = engine.arm(*c, file_spec("/etc/hosts")));
+    engine.set_arm_precheck_race_hook_for_test(nullptr);
+    fake->set_throw_unwatch(false);
+
+    CHECK_FALSE(sub.has_value());
+    CHECK(sub.error() == "consumer unregistered during arm"); // the clean error still arrives
+    CHECK(engine.stats().armed_sparks == 0);                  // bookkeeping IS consistent
+    CHECK(engine.stats().subscriptions == 0);
+    CHECK(engine.stats().arm_race_unwatch_failures_total == 1); // and the residual is observable
+    engine.stop();
+}
+
+TEST_CASE("disarm: a THROWING unwatch is contained and counted, like its twin (#2270)",
+          "[spark][mechanism]") {
+    // THE SIBLING CASE. The one above pinned teardown_arm_race; disarm() — the path
+    // Guardian's ordinary withdraw takes — was left propagating, which is the fourth
+    // and last lockstep difference between the two.
+    //
+    // Why propagating there was worse than untidy: disarm() is void, and the throw
+    // escapes into GuardianSparkRuntime::detach_rule_locked AFTER index_->remove_rule
+    // and rules_.erase but BEFORE keys_.erase and the "disarmed" lifecycle entry. That
+    // strands a keys_ row, so a later same-key attach's keys_.emplace silently no-ops
+    // and reports success while its fresh subscription is orphaned — and the audit
+    // entry is lost with it.
+    //
+    // This case lives here rather than in the alloc-budget binary deliberately: that
+    // one is Linux-and-no-sanitizer only by construction, so it cannot pin an OUTCOME
+    // on Windows or macOS, and containment is exactly an outcome.
+    SparkEngine engine;
+    FakeMechanism* fake = wire_fake(engine, SparkType::File);
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto sub = engine.arm(*c, file_spec("/etc/hosts"));
+    REQUIRE(sub.has_value());
+    REQUIRE(engine.stats().armed_sparks == 1);
+
+    fake->set_throw_unwatch(true);
+    REQUIRE_NOTHROW(engine.disarm(*sub)); // last subscriber -> whole-key teardown + unwatch
+    fake->set_throw_unwatch(false);
+
+    // Bookkeeping completes despite the throw — that is the property.
+    CHECK(engine.stats().armed_sparks == 0);
+    CHECK(engine.stats().subscriptions == 0);
+    CHECK(engine.stats().disarm_unwatch_failures_total == 1); // residual observable
+    CHECK(engine.stats().arm_race_unwatch_failures_total == 0); // and scoped to its own path
     engine.stop();
 }
 

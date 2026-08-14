@@ -512,6 +512,32 @@ TEST_CASE("prefer_spark=true: an armed rule's record is persisted to the durable
     CHECK(found_armed_r1);
 }
 
+TEST_CASE("prefer_spark=true: journaled event_ids embed the real agent_id (#2237)",
+          "[spark][guardian][reconcile][journal]") {
+    SparkReconcileFixture f; // constructed with agent_id "agent-test"
+    f.apply(make_service_rule("r1"));
+
+    auto rows = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty());
+
+    bool found = false;
+    for (const auto& row : *rows) {
+        auto b = yuzu::agent::parse_journal_batch(row.value);
+        REQUIRE(b.has_value());
+        for (const auto& e : b->entries) {
+            if (e.rule_id == "r1" && e.kind == "armed") {
+                // make_event_id: "<agent_id>-<nonce>-<rule_id>-<wall_ms>-<seq>" - an
+                // unwired provider (the pre-#2237 state) mints an empty-prefixed id
+                // instead ("-<nonce>-r1-...").
+                CHECK(e.event_id.starts_with("agent-test-"));
+                found = true;
+            }
+        }
+    }
+    CHECK(found);
+}
+
 TEST_CASE("prefer_spark=false: no lifecycle record is journaled (inert)",
           "[spark][guardian][reconcile][journal]") {
     auto opened = KvStore::open(unique_kv_path());

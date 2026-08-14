@@ -26,21 +26,45 @@
 /// not, and a REST route including an `mcp_`-named header would be the first
 /// step toward the two surfaces drifting again.
 ///
-/// WHY A SHARED FUNCTION AND NOT A SHARED CONVENTION: `server.cpp` holds FOUR
-/// dispatch closures that each decide targeting independently — the shared
-/// `command_dispatch_fn`, the `/api/command` inline path, the DashboardRoutes
-/// 5-param closure, and the MCP closure. Every caller that is safe is safe
-/// because its author remembered. That is the property this header exists to
-/// replace, and a second copy of these rules is how #2500 happened on REST
-/// after #2492 fixed the identical defect on MCP.
+/// WHY A SHARED FUNCTION AND NOT A SHARED CONVENTION: `server.cpp` used to
+/// hold FOUR dispatch closures that each decided targeting independently.
+/// Every caller that was safe was safe because its author remembered. That is
+/// the property this header exists to replace, and a second copy of these
+/// rules is how #2500 happened on REST after #2492 fixed the identical defect
+/// on MCP.
 ///
-/// SCOPE OF WHAT ACTUALLY CHANGED (#2500), stated because a comment claiming a
-/// pattern is gone when it is half-gone is the trap this header exists to
-/// close: only `command_dispatch_fn` had its default INVERTED to reach nobody
-/// on an unnamed target. The `/api/command` inline path guards at its own
-/// source and sink; the Dashboard and MCP closures still broadcast on empty
-/// and are guarded upstream instead. They are not equivalent, and a fifth
-/// closure must not be written by copying whichever one is nearest.
+/// WHERE THAT STANDS NOW, stated precisely because a comment claiming a pattern
+/// is gone when it is half-gone is the trap this header exists to close:
+///
+///   - `classify_dispatch_arm` (this header) decides WHICH ARM for every
+///     caller. One rule, no copies.
+///   - `dispatch_confined_arms` (dispatch_confined_arms.hpp) decides WHO IS
+///     REACHED for every caller — the per-arm visible-set intersection (#1788).
+///     `ServerImpl::dispatch_confined` (the shared closure serving Dashboard,
+///     MCP, workflow and instruction execute) and the `/api/command` inline
+///     path BOTH route through it; the two byte-identical four-arm copies that
+///     previously existed are gone.
+///   - What each caller still owns is its own TARGET RESOLUTION (group store,
+///     scope engine, principal from a live session vs an execution row) and
+///     its own audit/HTTP shaping. Those legitimately differ, which is why one
+///     closure could not simply absorb the other.
+///
+/// The one thing the arms parameterise is what an UNNAMED target means:
+/// `broadcast_on_none=false` on the shared closure reaches NOBODY (#2500);
+/// `true` is passed by callers whose UI/tool already normalised a deliberate
+/// fleet selection into empty+empty. A new dispatch caller passes `false` and
+/// names `__all__` — it must not rely on empty-fallthrough.
+///
+/// CLOSED (this range): the Dashboard form routes DO distinguish an omitted
+/// `scope` from a supplied-but-empty `scope=` and refuse the latter —
+/// `form_value_supplied()` (`web_utils.hpp`) for the urlencoded body,
+/// `req.has_param("scope")` for the TAR sibling. `extract_form_value` alone
+/// cannot tell them apart, which is the form-encoded twin of the
+/// `extract_json_string_array` erasure this header names as the defect.
+/// They still pass `broadcast_on_none=true` for a different and narrower
+/// reason: an OMITTED `scope` is the legacy UI's whole-fleet contract.
+/// `__all__` is passed through BY NAME and never stripped to empty+empty, so
+/// None now arrives only from a genuinely omitted argument.
 namespace yuzu::server {
 
 /// The ONE spelling of "every enrolled agent" on the dispatch path.

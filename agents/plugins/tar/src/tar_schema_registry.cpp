@@ -994,6 +994,27 @@ const std::unordered_map<std::string, TableRef>& table_ref_map() {
 
 // ── Public API ──────────────────────────────────────────────────────────────
 
+// The single mapping from a support level to its operator-facing name.
+// do_compatibility() (tar_plugin.cpp) derives its `compatibility` action
+// output from this instead of keeping a private duplicate switch (#2204
+// unification) — YuzuSupportLevel is the descriptor's own enum, and
+// OsSupportStatus's values are pinned 1:1 to it (see the header comment).
+std::string_view support_level_name(OsSupportStatus status) {
+    switch (to_yuzu_support_level(status)) {
+    case YUZU_SUPPORT_SUPPORTED:
+        return "supported";
+    case YUZU_SUPPORT_CONSTRAINED:
+        return "constrained";
+    case YUZU_SUPPORT_PLANNED:
+        return "planned";
+    case YUZU_SUPPORT_UNSUPPORTED:
+        return "unsupported";
+    case YUZU_SUPPORT_UNDECLARED:
+        break; // never produced by a registry row; fall through to the default below
+    }
+    return "undeclared";
+}
+
 // Get the timestamp column name for a granularity suffix. Public since #2361:
 // the retention clock guard in `run_retention` needs the same column the DDL
 // indexes and `retention_sql`'s time branch filters on, and a second copy of

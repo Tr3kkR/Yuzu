@@ -46,7 +46,7 @@ skill claims anything is "done."
 | Session-cookie auth (HTMX dashboard) | Shipped | `auth_routes.cpp:43,386` (`extract_session_cookie`, `Set-Cookie: yuzu_session=…`) |
 | API tokens — Bearer + `X-Yuzu-Token` | Shipped | `api_token_store.cpp` (store); both header forms parsed at `auth_routes.cpp:108-119` |
 | Owner-scoped token revocation (#222) | Shipped | `rest_api_v1.cpp:1058-1082` (owner-vs-admin check at L1060) |
-| Granular RBAC — 7 roles (adds `Reviewer`, access-review attestation) × **22** securable types × 7 ops (adds `Attest`, gated via the dedicated `AccessReview` securable — NOT `AuditLog`; the rationale lives in **#2324**, the access-reviews PR, not #2225, which is the governance-gate-check PR that ran alongside it) | Shipped (Phase 3) | `rbac_store.cpp:260-295` — types: Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response, ManagementGroup, ApiToken, Security, Policy, DeviceToken, SoftwareDeployment, License, FileRetrieval, GuaranteedState, Inventory, AccessReview, SoftwareLicensing; ops: Read/Write/Execute/Delete/Approve/Push/Attest |
+| Granular RBAC — 7 roles (adds `Reviewer`, access-review attestation) × **23** securable types × **8** ops (adds `Attest`, gated via the dedicated `AccessReview` securable — NOT `AuditLog`; the rationale lives in **#2324**, the access-reviews PR, not #2225, which is the governance-gate-check PR that ran alongside it — and `Rotate`, P2 #11 SOC 2 CC6.3, ApiToken-specific self-service human-token rotation, seeded only to `Administrator`/`ApiTokenManager`, deliberately distinct from `Write`) | Shipped (Phase 3 + P2 #11) | `rbac_store.cpp:260-295,397` — types: Infrastructure, UserManagement, InstructionDefinition, InstructionSet, Execution, Schedule, Approval, Tag, AuditLog, Response, ManagementGroup, ApiToken, Security, Policy, DeviceToken, SoftwareDeployment, License, FileRetrieval, GuaranteedState, Inventory, AccessReview, SoftwareLicensing, EnginePrincipal (#2376 — cut away from the over-broad Security:Read); ops: Read/Write/Execute/Delete/Approve/Push/Attest/Rotate |
 | Self-target principal-destruction guard (#397/#403) | Shipped | `settings_routes.cpp:434,1830,2488-2504` (3 call sites); design in `docs/auth-architecture.md` §self-target |
 | OIDC SSO — full PKCE flow, Entra discovery, JWT validation | Shipped | `oidc_provider.cpp:189` `generate_code_verifier()`, L194 `compute_code_challenge()`, L385 `code_verifier` post, L766 `/.well-known/openid-configuration` discovery, L542/L623 JWKS fetch + JWT signature verify |
 | Directory Sync — AD/Entra users + groups + role mapping via Microsoft Graph v1.0 | Shipped | `directory_sync.cpp:336,509,556,608` calls `https://graph.microsoft.com/v1.0/users`, `/groups`, `/groups/{id}/members`; persisted `directory_group_role_mappings` + `directory_sync_status` tables (`directory_sync.cpp:147`). NOTE: `oidc_provider.cpp:248` only parses the JWT `groups` claim — Graph integration is the separate Directory Sync subsystem. |
@@ -86,7 +86,7 @@ SOC 2 alignment: CC6.1 (logical access), CC6.2 (provisioning), CC6.3
 | **Just-in-time admin elevation** (time-boxed role promotion + audit) | "Role-based least privilege and separation of duties" | CC6.6 | **SHIPPED** — `POST /api/v1/elevate` (`--jit-max-elevation-secs`); see priority item 9 below |
 | **Inactivity session timeout** | "inactivity timeout" | CC6.3 | **SHIPPED** — `--session-inactivity-secs` (default 0 = disabled, opt-in). Sliding idle window enforced in `AuthManager::validate_session` on the in-memory `Session` (monotonic `last_activity_at`), under the absolute 8h lifetime; cookie sessions only (API/MCP tokens exempt). Best-effort throttled `auth.db` mirror via `AuthDB::touch_session_activity`. See `docs/auth-architecture.md` "Inactivity session timeout". |
 | **Session revocation REST surface** | "expiration, revocation" | CC6.3 | **SHIPPED** — `DELETE /api/v1/sessions?username=<name>` (admin) + `DELETE /api/v1/sessions/me` (self) in `rest_api_v1.cpp` (audit `session.revoke_all`/`session.revoke_all.self`, step-up, self-target guard), over `AuthDB::invalidate_all_sessions()` |
-| **API token rotation workflow** — pair-of-tokens overlap. | "rotation process" | CC6.3 | **PARTIAL — built for engine credentials, not adopted for human tokens.** `ApiTokenStore::rotate_engine_credential`/`confirm_rotation` (`api_token_store.hpp:254`, `pg_advisory_xact_lock`-serialized per principal) ship the §7 overlap-pair design behind `POST /api/v1/engine-principals/{id}/credentials/rotate` + `.../confirm`. Written credential-generic for later human-token adoption; no human-owned token has a `rotate` entry point yet (create + revoke only). See Section 3 item 11. |
+| **API token rotation workflow** — pair-of-tokens overlap. | "rotation process" | CC6.3 | **SHIPPED for both principal kinds on both REST and MCP.** Engine credentials: `ApiTokenStore::rotate_engine_credential`/`confirm_rotation` (`api_token_store.hpp:254`) behind `POST /api/v1/engine-principals/{id}/credentials/rotate` + `.../confirm` (REST + MCP). Human-owned tokens: `ApiTokenStore::rotate_token`/`confirm_token_rotation` (`api_token_store.hpp:397,417`) behind `POST /api/v1/tokens/{id}/rotate` + `.../confirm` AND the `rotate_api_token`/`confirm_api_token_rotation` MCP twins — a deliberately **token-keyed** state machine (≤2 active per `rotation_group`, not per principal), self-service only, lifetime-neutral, gated on the dedicated `ApiToken:Rotate` operation on both transports. See Section 3 item 11. |
 | **API token inventory + last-used view** — data layer, Settings → API Tokens dashboard fragment (`render_api_tokens_fragment` in `settings_routes.cpp`), and `GET /api/v1/tokens` REST route all shipped, both surfacing owner/created/last-used columns. | "token inventory" | CC6.6 | **SHIPPED** |
 | **Periodic access reviews** (export of role assignments + attestation flow) | "Periodic access reviews with manager/security attestation" | CC6.2 | **SHIPPED** — `GET /api/v1/access-reviews/export?format=json\|csv` (**grant-table-driven**: one row per principal holding a live grant, enumerates `principal_type IN (user, group, engine)` per the engine-principal program, a grant on a principal outside every roster is surfaced as `source="orphan"` rather than dropped (a disabled-but-still-granted user correctly shows `source="user"`, `lifecycle_state="disabled"` instead), CSV formula-injection neutralized, `AccessReview:Read`, self-audited `access_review.exported`, `503` fail-loud never a silent partial export) + `GET /api/v1/access-reviews` (list every campaign, newest-first, capped 500, `AccessReview:Read`, self-audited `access_review.list`) + attestation-campaign lifecycle (`POST /api/v1/access-reviews` freezes the current grant population as `pending` rows; `POST .../{id}/attestations` records `attested`/`flagged_revoke` (UPSERT — overwrites a prior decision) — **flag ≠ revoke, evidence only**; `POST .../{id}/close`; `GET .../{id}` for full state — all `AccessReview:Attest` except the reads). Every route, reads included, structurally denies an engine-classed caller. MCP twins `export_access_review`/`open_access_review`/`record_attestation`/`get_access_review`/`list_access_reviews`/`close_access_review` (JSON only; `record_attestation` is `destructiveHint:true`, the rest `false`). 4 Prometheus metrics (`yuzu_access_review_export_total{format}`, `_export_duration_seconds`, `_campaigns_opened_total`, `_attestations_total{decision}`). Dedicated **`AccessReview` securable** (`Read`+`Attest` ops) + seeded `Reviewer` role (`AccessReview:Read`+`Attest` only) — **round-2 fix**: the first round gated this surface on `AuditLog:Read`/`AuditLog:Attest`, which over-disclosed the full grant population to `Operator`/`PlatformEngineer` (both seeded `AuditLog:Read` for unrelated reasons); the dedicated securable closes that. Born-on-PG `AccessReviewStore` (no prune — evidence persists). Deliberately gated on a **global** `AccessReview:Read`/`Attest`, not the ADR-0017 confinement filter (#2225 — a scoped slice is useless as fleet-wide CC6.2 evidence). Known gap: user rows list direct grants only (group-inherited access is on the group's own row); `last_activity_kind` is `"n/a"` for every user row (`AuthDB` has no last-login read accessor yet). See `docs/auth-architecture.md` "Periodic access reviews" and `docs/security-reviews/access-reviews-2026-07-21.md`. |
 | **Account lockout after N failed logins** | implicit (auth hygiene) | CC6.3 | **SHIPPED** — `auth.db` v3 columns (`failed_login_count`/`last_failed_login_at`/`locked_until`) + `AuthDB::lockout_status`/`record_failed_login`/`clear_failed_logins`; `--auth-lockout-threshold`/`--auth-lockout-window-secs`; generic-401 pre-check (no enum/oracle, skips PBKDF2), auto-expiring window w/ fresh budget, admin unlock `POST /api/v1/users/<name>/unlock`; audit `auth.lockout.applied`/`.cleared` + metrics. See `docs/auth-architecture.md` "Account lockout". |
@@ -134,6 +134,22 @@ not by trusting a design doc's status header. Re-stamp this line whenever you
 revise the section; a matrix derived from a stale checkout is worse than no
 matrix (this revision corrected four items that a 571-commit-behind tree had
 reported as unbuilt).
+
+**Item 11 re-verified 2026-08-10, targeted, not wholesale** — against
+`feat/auth-human-token-rotation` @ `e1bf2d86` (a pre-merge integration
+branch off `origin/dev`, not yet on `dev`), by reading
+`api_token_store.{hpp,cpp}`, `rest_api_v1.cpp`, and `mcp_server.cpp`
+directly (the human arm's REST routes exist; `grep`ing `mcp_server.cpp` for
+`rotate_token`/`confirm_token_rotation` **now finds** the `rotate_api_token`
+and `confirm_api_token_rotation` tool handlers calling into the store — the
+MCP twins have merged code, per the SHIPPED status on this surface below).
+Cited by SYMBOL, deliberately not by line number: this stamp has now been
+stale twice — once claiming the grep returned nothing after the twins
+shipped, then once citing line numbers the named grep does not return — and
+a citation that rots on every unrelated edit above it is worse than no
+citation, because it reads as verified. This does **not** re-verify the
+other items in this section — their last wholesale check remains the
+`ef4582be` stamp above.
 
 **Two standing cautions, learned from this revision's own review:**
 
@@ -392,26 +408,39 @@ duplicate `10`; the one live cross-reference to the old numbering
 
 ### Priority 2 — long-tail polish
 
-11. **API token rotation workflow — engine credentials SHIPPED, human tokens
-    NOT ADOPTED.** The overlap-pair state machine designed in
-    `docs/auth-engine-principals-design.md` §7 is built and live:
-    `ApiTokenStore::rotate_engine_credential` / `confirm_rotation`
-    (`api_token_store.hpp:254`), serialized by a `pg_advisory_xact_lock` per
-    principal, surfaced at `POST /api/v1/engine-principals/{id}/credentials/rotate`
-    and `.../confirm`. **Nothing has adopted it for humans:** no `rotate`
-    entry point exists for a human-owned token — only create + revoke.
-
-    Be precise about what is reusable: the **design and state taxonomy** are
-    credential-generic, but the **implementation is engine-only and must be
-    generalized**. `rotate_engine_credential` calls `validate_engine_mint`
-    (`api_token_store.cpp:776`), rejects any active row whose
-    `principal_kind != "engine"` (`:817-825`), and hard-codes empty service
-    scope / readonly MCP tier / `'engine'` in the successor INSERT
-    (`:859-867`); `confirm_rotation` repeats the rejection (`:993-998`). So
-    this is still the cheapest remaining CC6.3 win — the hard part (the
-    concurrency-safe state machine and its replay semantics, hardened by
-    #2384/#2404) is proven in production — but it is a generalization, not a
-    drop-in reuse.
+11. ~~**API token rotation workflow — engine credentials SHIPPED, human
+    tokens NOT ADOPTED.**~~ **HUMAN TOKENS: STORE CORE + REST + MCP ALL
+    SHIPPED (full REST/MCP parity).** Engine-credential
+    rotation was already SHIPPED (`ApiTokenStore::rotate_engine_credential`/
+    `confirm_rotation`, `api_token_store.hpp:254`, `POST
+    /api/v1/engine-principals/{id}/credentials/rotate`/`.../confirm`) — see
+    item 14 below. Human-owned tokens now have their **own**, deliberately
+    different, token-keyed state machine (a principal-keyed copy of the
+    engine arm would have been wrong — a human holds N concurrent unrelated
+    tokens, an engine principal holds one):
+    `ApiTokenStore::rotate_token`/`confirm_token_rotation`
+    (`api_token_store.hpp:397,417`), serialized on the same
+    `pg_advisory_xact_lock(hashtext(principal_id))` the engine arm and the
+    T12 sweep use, enforcing a ≤2-active ceiling **per `rotation_group`**,
+    never per principal. **Shipped:** the store core, `POST
+    /api/v1/tokens/{id}/rotate`/`.../confirm` AND the MCP twins
+    (`rotate_api_token`/`confirm_api_token_rotation`) (self-service only,
+    gated on `ApiToken:Rotate` — a dedicated operation distinct from the
+    `ApiToken:Write` create/list/revoke axis and from `Security:Write` —
+    no admin bypass, wrong-owner indistinguishable from nonexistent,
+    lifetime-neutral with no caller-exposed override), kind-discriminated
+    telemetry (`yuzu_api_token_rotation_*`/`yuzu_api_token_confirm_total`,
+    both surfaces incrementing the same symbol), and a 33-case `[human]`
+    adversarial regression suite. Full design record:
+    `docs/auth-architecture.md` "Human API-token rotation";
+    `docs/mcp-server.md` "Human API-token rotation tools"; evidence chain:
+    `docs/security-reviews/human-token-rotation-2026-08-10.md` (records a
+    caught-in-review, now-shipped-as-adjudicated privilege-escalation
+    finding on the MCP-side RBAC allowance that drove the `ApiToken:Rotate`
+    split, a SEPARATE governance-caught-before-merge authority-inheritance
+    fix on `rotate_token` itself, and three pre-existing follow-up issues
+    it surfaced — `#2943`/`#2944`/`#2945` — none of which are defects in
+    the shipped human-token surface itself).
 12. ~~**API token inventory view.**~~ **DONE** — `render_api_tokens_fragment`
     (Settings → API Tokens, `settings_routes.cpp`) and `GET /api/v1/tokens`
     (`rest_api_v1.cpp`) both surface owner / created / last-used columns from

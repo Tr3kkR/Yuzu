@@ -340,6 +340,78 @@ TEST_CASE("AuthRoutes::require_permission — readonly MCP tier allows Read with
 }
 
 // ---------------------------------------------------------------------------
+// P2 #11 security regression guard: operator-tier ApiToken:Write must stay
+// blocked on `AuthRoutes::require_permission` — the exact chokepoint POST
+// /api/v1/tokens (create_token) and its settings twin POST
+// /api/settings/api-tokens both call with nothing else downstream, so one
+// test here covers both routes. Full narrative (two abandoned fix attempts
+// + why the shipped ApiToken:Rotate split is correct) lives ONCE, at
+// mcp_policy.hpp's tier_allows() operator-tier comment. See "operator MCP
+// tier IS allowed ApiToken:Rotate" below for the positive half.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_permission — operator MCP tier is BLOCKED from ApiToken:Write "
+          "(round-3 security regression guard — gates both POST /api/v1/tokens and its "
+          "settings twin POST /api/settings/api-tokens)",
+          "[pg][auth_routes][scope][mcp][security]") {
+    AuthRoutesFixture fix;
+    // Creator (test_user) is admin and RBAC is disabled on this fixture — if
+    // tier_allows() did not stop this token first, the legacy RBAC-off
+    // fallback would pass it straight through on the creator's admin role,
+    // which is precisely the second half of the escalation this test guards
+    // against (a caller-chosen mcp_tier does not narrow the token's
+    // inherited authority once past the tier gate).
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-atw-op", "test_user",
+                                            now + 3600, "", "operator");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "ApiToken", "Write");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("MCP token tier does not allow ApiToken:Write") != std::string::npos);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["code"].get<int>() == 403);
+    CHECK(j["error"]["permission"].get<std::string>() == "ApiToken:Write");
+}
+
+TEST_CASE("AuthRoutes::require_permission — supervised MCP tier IS allowed ApiToken:Write "
+          "(control: the tier gate itself is untouched above operator)",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-atw-sup", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "ApiToken", "Write");
+    CHECK(ok);
+}
+
+TEST_CASE("AuthRoutes::require_permission — operator MCP tier IS allowed ApiToken:Rotate "
+          "(the actual fix: a DISTINCT operation from ApiToken:Write, giving REST rotate/"
+          "confirm true parity with the MCP tools without touching ApiToken:Write at all)",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-atr-op", "test_user",
+                                            now + 3600, "", "operator");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "ApiToken", "Rotate");
+    CHECK(ok);
+}
+
+// ---------------------------------------------------------------------------
 // require_scoped_permission MCP-tier enforcement tests (#520)
 // ---------------------------------------------------------------------------
 

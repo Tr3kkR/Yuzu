@@ -86,6 +86,9 @@ constexpr std::string_view kEnginePrincipals[] = {
 constexpr std::string_view kAccessReviews[] = {"export_access_review", "open_access_review",
                                                "record_attestation", "get_access_review",
                                                "list_access_reviews", "close_access_review"};
+// Human API-token rotation (P2 #11, SOC 2 CC6.3) — self-service, own family
+// distinct from Engine principals: no admin/approval gate, owner-only.
+constexpr std::string_view kApiTokens[] = {"rotate_api_token", "confirm_api_token_rotation"};
 constexpr std::string_view kAgenticHelpers[] = {"get_fleet_posture_fast",
                                                 "classify_operational_question",
                                                 "get_incident_playbook", "summarize_working_set"};
@@ -93,7 +96,7 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
                                            "discover_routes", "discover_scope_kinds",
                                            "discover_plugins"};
 
-constexpr std::array<ToolFamily, 21> kFamilies{{
+constexpr std::array<ToolFamily, 22> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions and recurring schedules", kDefinitions},
@@ -122,6 +125,9 @@ constexpr std::array<ToolFamily, 21> kFamilies{{
      kEnginePrincipals},
     {"Access reviews", "open, attest, close, and export SOC 2 access-certification reviews",
      kAccessReviews},
+    {"API tokens", "self-service overlap-pair rotation of your own API tokens (owner-only, "
+                   "no admin/approval gate)",
+     kApiTokens},
     {"Agentic helpers", "high-level workflow helpers: fast posture, classification, playbooks",
      kAgenticHelpers},
     {"Discovery", "enumerate permissions, instructions, routes, scope kinds, and plugins",

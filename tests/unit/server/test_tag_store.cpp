@@ -216,6 +216,49 @@ TEST_CASE("TagStore: agents_with_tag", "[tag_store]") {
     REQUIRE(all_env.size() == 3);
 }
 
+// Authorizer callback: deny reads of the `tags` table, allow everything else —
+// forces sqlite3_prepare_v2 to fail deterministically for agents_with_tag's
+// SELECT (B-2b), distinct from a query that legitimately matches zero rows.
+static int deny_tag_read(void*, int action, const char* arg1, const char*, const char*,
+                         const char*) {
+    if (action == SQLITE_READ && arg1 && std::string(arg1) == "tags")
+        return SQLITE_DENY;
+    return SQLITE_OK;
+}
+
+TEST_CASE("TagStore: agents_with_tag_checked distinguishes a degraded prepare from a "
+          "genuinely empty result (B-2b)",
+          "[tag_store][security]") {
+    TagStore store(":memory:");
+    store.set_tag("agent-1", "service", "billing");
+
+    // Genuinely no agents tagged with this service value: a real, present-but-
+    // empty answer — not a failure.
+    auto none = store.agents_with_tag_checked("service", "payroll");
+    REQUIRE(none.has_value());
+    CHECK(none->empty());
+
+    // Degrade the store: deny reads of `tags` so prepare fails deterministically.
+    sqlite3* db = TagStoreFaultHook::db(store);
+    REQUIRE(db != nullptr);
+    sqlite3_set_authorizer(db, deny_tag_read, nullptr);
+
+    auto degraded = store.agents_with_tag_checked("service", "billing");
+    CHECK_FALSE(degraded.has_value()); // nullopt == prepare failed, not "no agents"
+
+    // The legacy accessor still collapses the degraded read to empty — every
+    // existing caller across the tree depends on that contract unchanged.
+    auto legacy = store.agents_with_tag("service", "billing");
+    CHECK(legacy.empty());
+
+    sqlite3_set_authorizer(db, nullptr, nullptr);
+
+    // Lifting the fault restores the happy path.
+    auto present = store.agents_with_tag_checked("service", "billing");
+    REQUIRE(present.has_value());
+    CHECK(present->size() == 1);
+}
+
 TEST_CASE("TagStore: validate_key", "[tag_store]") {
     CHECK(TagStore::validate_key("env") == true);
     CHECK(TagStore::validate_key("os.version") == true);

@@ -444,3 +444,19 @@ When using OIDC/Entra ID:
 - Configure the OIDC provider to require MFA
 - Restrict the app registration to your tenant (single-tenant)
 - Rotate the client secret regularly
+
+> **Upgrading: if `oidc_client_secret` was ever set on this install, rotate it.**
+> Releases up to and including v0.13.0 emitted the value in the clear to three places - the
+> server log (written by the startup override pass on every boot), `GET /api/config` (gated
+> only on `Infrastructure:Read`), and the `config.update` audit detail (readable by every
+> role seeded `AuditLog:Read`, which includes the seeded `Operator` role). Those paths are
+> now closed, and audit rows written before the fix are redacted when read. **The stored
+> value itself is unchanged**, so anyone or anything that already read it still holds a
+> working credential.
+>
+> **Remediation lives in one place:** [`upgrading.md`](upgrading.md) → "⚠️ Security: rotate
+> `oidc_client_secret` if it was ever set on this install". Follow it there rather than from
+> a summary here. Two things that catch people out: adding a second client secret is not a
+> rotation, so the old one must be **deleted** at the IdP; and deletion does not reach what was
+> already issued under it — access tokens stay valid until they expire, and sessions have to be
+> ended separately at the IdP and in Yuzu.

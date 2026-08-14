@@ -13,7 +13,10 @@
 
 #include "device_routes.hpp"
 #include "guaranteed_state_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -26,8 +29,19 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every test
+// below constructs its own GuaranteedStateStore against a clone of this schema
+// (ADR-0038 migration).
+yuzu::test::PgTestTemplate guardian_pg_tpl{"guardianstate", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    GuaranteedStateStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("guardianstate template: store failed to migrate");
+}};
 
 // A live-route harness: stub fns + a registered DeviceRoutes over a TestRouteSink.
 struct LiveHarness {
@@ -602,8 +616,10 @@ TEST_CASE("device live capture_sources: tar status -> read-only source table", "
 // The DEX/Guardian device lenses render per-device behavioral/compliance PII, so
 // they must gate GuaranteedState:Read and audit-on-open (parity with the sibling
 // /fragments/dex/device). Governance Gate-2/3/4 BLOCKING.
-TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("device lenses: Read-gated + audited on open", "[pg][device][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
         return std::optional<auth::Session>(auth::Session{});
     };
@@ -695,8 +711,10 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
 // scoped_perm_fn_ is the chokepoint (here it denies "other-team", allows "mine");
 // the list provider is already per-operator scoped.
 TEST_CASE("device routes: out-of-scope device is not listed/openable/live-queryable",
-          "[device][routes][scope]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][device][routes][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
         return std::optional<auth::Session>(auth::Session{});
     };

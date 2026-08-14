@@ -23,8 +23,10 @@
 #include "stream_budget.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
+#include "workflow_engine.hpp"
 #include "workflow_routes.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -35,12 +37,23 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
 
 fs::path uniq(const std::string& prefix) {
     return yuzu::test::unique_temp_path(prefix + "-");
@@ -75,10 +88,15 @@ struct ExecHarness {
     /// pre-existing test on the unmetered path; the admission tests pass one in.
     yuzu::server::detail::StreamBudget* stream_budget{nullptr};
 
-    fs::path tracker_db, instr_db, resp_db;
+    fs::path tracker_db, instr_db, wf_db;
     std::unique_ptr<ExecutionTracker> tracker;
     std::unique_ptr<InstructionStore> instructions;
     std::unique_ptr<ResponseStore> responses;
+    /// CDX-FV-03: opt-in WorkflowEngine so POST /api/workflows/:id/execute is
+    /// reachable. Opt-in rather than always-on because every other test in this
+    /// file leaves it nullptr, and a fourth SQLite file per harness would be
+    /// unpaid cost on ~60 constructions (CLAUDE.md test-efficiency discipline).
+    std::unique_ptr<WorkflowEngine> workflows;
     /// PR 3: per-execution SSE bus. Constructed BEFORE the tracker (see
     /// member-order comment) so the tracker can attach. Pointer is also
     /// passed into WorkflowRoutes::Deps so the SSE handler is registered.
@@ -117,6 +135,15 @@ struct ExecHarness {
     int dispatch_calls{0};
     std::vector<std::string> last_dispatch_agent_ids;
     std::string last_dispatch_scope;
+    /// K-R7-02: the exec_visible set the execute handler derived and threaded
+    /// into the dispatch stub (the confinement the production dispatch_confined
+    /// seam then applies). Mirrors test_mcp_server.cpp's last_dispatch_exec_visible.
+    yuzu::server::authz::VisibleSet last_dispatch_exec_visible;
+    /// K-R7-02: the reassignable per-request exec-visible derivation. Default
+    /// returns nullopt (UNFILTERED) so every pre-existing workflow test keeps the
+    /// full-fleet path; a confinement test overrides it with a specific set.
+    WorkflowRoutes::ExecVisibleFn exec_visible_fn{
+        [](const httplib::Request&) { return yuzu::server::authz::VisibleSet{}; }};
     WorkflowRoutes routes;
 
     /// Per-process monotonic counter for execution IDs. Replaces the prior
@@ -130,12 +157,20 @@ struct ExecHarness {
     /// bus so SSE-handler 503-on-no-bus tests can exercise the path where
     /// the route is registered but the underlying bus is intentionally
     /// not wired (governance qe-S1).
-    explicit ExecHarness(bool with_bus = true,
-                         yuzu::server::detail::StreamBudget* budget = nullptr)
+    /// `wire_exec_visible = false` registers with an EMPTY ExecVisibleFn so the
+    /// production execute handler's own fail-closed branch (unwired → present-
+    /// empty deny-all) is exercised (K-R7-02).
+    bool wire_exec_visible{true};
+
+    explicit ExecHarness(pg::PgPool& pool, bool with_bus = true,
+                         yuzu::server::detail::StreamBudget* budget = nullptr,
+                         bool wire_exec_visible_arg = true,
+                         bool with_workflow_engine = false)
         : stream_budget(budget),
           tracker_db(uniq("wf-routes-exec")), instr_db(uniq("wf-routes-inst")),
-          resp_db(uniq("wf-routes-resp")) {
-        for (auto& p : {tracker_db, instr_db, resp_db})
+          wf_db(uniq("wf-routes-wf")) {
+        wire_exec_visible = wire_exec_visible_arg;
+        for (auto& p : {tracker_db, instr_db, wf_db})
             fs::remove(p);
 
         // ExecutionTracker takes a raw sqlite3* — open it via the guard so a
@@ -156,9 +191,16 @@ struct ExecHarness {
 
         instructions = std::make_unique<InstructionStore>(instr_db);
         REQUIRE(instructions->is_open());
-        responses = std::make_unique<ResponseStore>(resp_db, /*retention_days=*/0,
-                                                    /*cleanup_interval_min=*/60);
+        responses = std::make_unique<ResponseStore>(pool, /*retention_days=*/0);
         REQUIRE(responses->is_open());
+
+        // CDX-FV-03: a plain on-disk SQLite file — the engine's whole ctor is
+        // sqlite3_open_v2 + CREATE TABLE, so the "disproportionate scaffolding"
+        // this file previously claimed does not exist.
+        if (with_workflow_engine) {
+            workflows = std::make_unique<WorkflowEngine>(wf_db);
+            REQUIRE(workflows->is_open());
+        }
 
         auto auth_fn = [](const httplib::Request&,
                           httplib::Response&) -> std::optional<auth::Session> {
@@ -196,12 +238,16 @@ struct ExecHarness {
                                    const std::vector<std::string>& agent_ids,
                                    const std::string& scope_expr,
                                    const std::unordered_map<std::string, std::string>&,
-                                   const std::string& execution_id) -> std::pair<std::string, int> {
+                                   const std::string& execution_id,
+                                   const yuzu::server::authz::VisibleSet& exec_visible)
+            -> std::pair<std::string, int> {
             last_dispatch_execution_id = execution_id;
             // #2500: capture what the sink was actually asked to target.
             ++dispatch_calls;
             last_dispatch_agent_ids = agent_ids;
             last_dispatch_scope = scope_expr;
+            // K-R7-02: capture the confinement threaded into dispatch.
+            last_dispatch_exec_visible = exec_visible;
             return {dispatch_cmd_override, dispatch_sent_override};
         };
 
@@ -217,7 +263,18 @@ struct ExecHarness {
         wf_deps.execution_tracker = tracker.get();
         wf_deps.instruction_store = instructions.get();
         wf_deps.command_dispatch_fn = cmd_dispatch;
+        // K-R7-02: wire the exec-visible derivation (or leave it EMPTY so the
+        // handler's own fail-closed path runs). The wired form delegates to the
+        // reassignable member so a test can override it after construction.
+        if (wire_exec_visible) {
+            wf_deps.exec_visible_fn = [this](const httplib::Request& req) {
+                return exec_visible_fn ? exec_visible_fn(req) : yuzu::server::authz::VisibleSet{};
+            };
+        }
         wf_deps.response_store = responses.get();
+        // CDX-FV-03: nullptr unless opted in, so /api/workflows/* keeps its 503
+        // path for every pre-existing test.
+        wf_deps.workflow_engine = workflows.get();
         // PR 3 — wire the per-execution event bus. The SSE handler at
         // /sse/executions/{id} returns 503 at request time when this is
         // nullptr but is still registered, which is the qe-S1 path.
@@ -228,6 +285,7 @@ struct ExecHarness {
     }
 
     ~ExecHarness() {
+        workflows.reset();
         responses.reset();
         instructions.reset();
         // PR 3: drop tracker BEFORE the bus — tracker borrows event_bus_,
@@ -251,7 +309,7 @@ struct ExecHarness {
         // a separate remove failure (e.g. file already gone, parent dir
         // missing) happens.
         std::error_code ec;
-        for (auto& p : {tracker_db, instr_db, resp_db}) {
+        for (auto& p : {tracker_db, instr_db, wf_db}) {
             fs::remove(p, ec);
             fs::remove(p.string() + "-wal", ec);
             fs::remove(p.string() + "-shm", ec);
@@ -268,6 +326,24 @@ struct ExecHarness {
         d.action = "list";
         auto created = instructions->create_definition(d);
         REQUIRE(created.has_value());
+    }
+
+    /// CDX-FV-03: single-step workflow whose one step runs `instruction_id`.
+    /// Returns the engine-minted workflow id for the execute URL.
+    std::string make_workflow(const std::string& display_name, const std::string& instruction_id) {
+        REQUIRE(workflows); // constructed with with_workflow_engine=true
+        const std::string yaml = "kind: Workflow\n"
+                                 "metadata:\n"
+                                 "  displayName: " +
+                                 display_name +
+                                 "\n"
+                                 "spec:\n"
+                                 "  steps:\n"
+                                 "    - instruction: " +
+                                 instruction_id + "\n";
+        auto id = workflows->create_workflow(yaml);
+        REQUIRE(id.has_value());
+        return *id;
     }
 
     /// Create an execution row and return its id.
@@ -328,16 +404,20 @@ struct ExecHarness {
 
 // ── List handler ────────────────────────────────────────────────────────────
 
-TEST_CASE("executions list: empty state", "[workflow][executions][list]") {
-    ExecHarness h;
+TEST_CASE("executions list: empty state", "[pg][workflow][executions][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     auto res = h.sink.Get("/fragments/executions");
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(res->body.find("No executions yet") != std::string::npos);
 }
 
-TEST_CASE("executions list: renders definition name not bare id", "[workflow][executions][list]") {
-    ExecHarness h;
+TEST_CASE("executions list: renders definition name not bare id", "[pg][workflow][executions][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-known", "Inspect Service");
     h.make_exec("def-known", "completed", 5, 5, 0);
 
@@ -351,8 +431,10 @@ TEST_CASE("executions list: renders definition name not bare id", "[workflow][ex
 }
 
 TEST_CASE("executions list: id stub fallback when definition is unknown",
-          "[workflow][executions][list]") {
-    ExecHarness h;
+          "[pg][workflow][executions][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_exec("def-orphan-12345-rest", "completed", 5, 5, 0);
 
     auto res = h.sink.Get("/fragments/executions");
@@ -362,8 +444,10 @@ TEST_CASE("executions list: id stub fallback when definition is unknown",
     CHECK(res->body.find("def-orphan-1") != std::string::npos);
 }
 
-TEST_CASE("executions list: definition_id query filter", "[workflow][executions][list]") {
-    ExecHarness h;
+TEST_CASE("executions list: definition_id query filter", "[pg][workflow][executions][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-A", "Definition A");
     h.make_def("def-B", "Definition B");
     h.make_exec("def-A", "completed", 3, 3, 0);
@@ -377,8 +461,10 @@ TEST_CASE("executions list: definition_id query filter", "[workflow][executions]
 }
 
 TEST_CASE("executions list: failed row carries first-error preview + stripe class",
-          "[workflow][executions][list]") {
-    ExecHarness h;
+          "[pg][workflow][executions][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-flake", "Flaky");
     auto eid = h.make_exec("def-flake", "completed", 2, 1, 1);
     // The exec is "completed" with 1 failure; populate the agent error so the
@@ -398,8 +484,10 @@ TEST_CASE("executions list: failed row carries first-error preview + stripe clas
 }
 
 TEST_CASE("executions list: status=failed gets exec-row--failed class",
-          "[workflow][executions][list]") {
-    ExecHarness h;
+          "[pg][workflow][executions][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-X", "X");
     h.make_exec("def-X", "failed", 1, 0, 1);
 
@@ -409,8 +497,10 @@ TEST_CASE("executions list: status=failed gets exec-row--failed class",
 }
 
 TEST_CASE("executions list: time cell carries ISO-8601 UTC in title",
-          "[workflow][executions][list]") {
-    ExecHarness h;
+          "[pg][workflow][executions][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-T", "Time");
     h.make_exec("def-T", "completed", 1, 1, 0, /*dispatched_at=*/1735689600);
 
@@ -421,8 +511,10 @@ TEST_CASE("executions list: time cell carries ISO-8601 UTC in title",
 }
 
 TEST_CASE("executions list: sparkbar aria-label summarises counts",
-          "[workflow][executions][list]") {
-    ExecHarness h;
+          "[pg][workflow][executions][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-K", "K");
     h.make_exec("def-K", "completed", 50, 47, 3);
 
@@ -433,8 +525,10 @@ TEST_CASE("executions list: sparkbar aria-label summarises counts",
 }
 
 TEST_CASE("executions list: zero-agent execution renders empty-state sparkbar",
-          "[workflow][executions][list]") {
-    ExecHarness h;
+          "[pg][workflow][executions][list]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-Z", "Zero");
     h.make_exec("def-Z", "completed", 0, 0, 0);
 
@@ -445,15 +539,19 @@ TEST_CASE("executions list: zero-agent execution renders empty-state sparkbar",
 
 // ── Detail handler ──────────────────────────────────────────────────────────
 
-TEST_CASE("executions detail: 404 on unknown id", "[workflow][executions][detail]") {
-    ExecHarness h;
+TEST_CASE("executions detail: 404 on unknown id", "[pg][workflow][executions][detail]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     auto res = h.sink.Get("/fragments/executions/exec-does-not-exist/detail");
     REQUIRE(res);
     CHECK(res->status == 404);
 }
 
-TEST_CASE("executions detail: 403 when perm_fn denies", "[workflow][executions][detail][rbac]") {
-    ExecHarness h;
+TEST_CASE("executions detail: 403 when perm_fn denies", "[pg][workflow][executions][detail][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-X", "X");
     auto eid = h.make_exec("def-X", "completed", 1, 1, 0);
     h.perm_grant = false;
@@ -462,8 +560,10 @@ TEST_CASE("executions detail: 403 when perm_fn denies", "[workflow][executions][
     CHECK(res->status == 403);
 }
 
-TEST_CASE("executions detail: KPI strip shows counts + p50/p95", "[workflow][executions][detail]") {
-    ExecHarness h;
+TEST_CASE("executions detail: KPI strip shows counts + p50/p95", "[pg][workflow][executions][detail]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-K", "K");
     auto eid = h.make_exec("def-K", "completed", 3, 2, 1);
     // 3 agents with deterministic durations: 1s, 2s, 5s.
@@ -488,8 +588,10 @@ TEST_CASE("executions detail: KPI strip shows counts + p50/p95", "[workflow][exe
 }
 
 TEST_CASE("executions detail: p50/p95 fall back to dash when any agent is running",
-          "[workflow][executions][detail]") {
-    ExecHarness h;
+          "[pg][workflow][executions][detail]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-R", "R");
     auto eid = h.make_exec("def-R", "running", 2, 1, 0);
     h.agent_status(eid, "done", "success", 0, "", 1735689601);
@@ -503,8 +605,10 @@ TEST_CASE("executions detail: p50/p95 fall back to dash when any agent is runnin
 }
 
 TEST_CASE("executions detail: per-agent table sorts failed first",
-          "[workflow][executions][detail]") {
-    ExecHarness h;
+          "[pg][workflow][executions][detail]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-S", "S");
     auto eid = h.make_exec("def-S", "completed", 3, 2, 1);
     h.agent_status(eid, "alpha-success", "success", 0, "", 1735689601);
@@ -537,8 +641,10 @@ TEST_CASE("executions detail: per-agent table sorts failed first",
 }
 
 TEST_CASE("executions detail: agent grid uses decile bucketing above 1024 agents",
-          "[workflow][executions][detail]") {
-    ExecHarness h;
+          "[pg][workflow][executions][detail]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-Big", "Big");
     auto eid = h.make_exec("def-Big", "completed", 1500, 1500, 0);
     for (int i = 0; i < 1500; ++i) {
@@ -555,8 +661,10 @@ TEST_CASE("executions detail: agent grid uses decile bucketing above 1024 agents
 }
 
 TEST_CASE("executions detail: error_detail truncates without tearing UTF-8",
-          "[workflow][executions][detail]") {
-    ExecHarness h;
+          "[pg][workflow][executions][detail]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-U", "U");
     auto eid = h.make_exec("def-U", "completed", 1, 0, 1);
     // 130-byte UTF-8 string mixing ASCII + 4-byte emoji at the boundary.
@@ -574,8 +682,10 @@ TEST_CASE("executions detail: error_detail truncates without tearing UTF-8",
 }
 
 TEST_CASE("executions detail: sidebar carries dispatched_by + ISO timestamps",
-          "[workflow][executions][detail]") {
-    ExecHarness h;
+          "[pg][workflow][executions][detail]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-M", "M");
     auto eid = h.make_exec("def-M", "completed", 1, 1, 0,
                            /*dispatched_at=*/1735689600);
@@ -594,11 +704,13 @@ TEST_CASE("executions detail: sidebar carries dispatched_by + ISO timestamps",
 
 TEST_CASE("ExecutionTracker.query_executions: include_error_detail default "
           "false leaves the field empty (arch-B2 hot-path)",
-          "[workflow][executions][tracker]") {
+          "[pg][workflow][executions][tracker]") {
     // server.cpp:1727 calls query_executions({.limit = 1000}) on every
     // metrics tick; that path must NOT pay the correlated-subquery cost.
     // Default-constructed ExecutionQuery leaves include_error_detail == false.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-OPTOUT", "OPTOUT");
     auto eid = h.make_exec("def-OPTOUT", "completed", 1, 0, 1);
     h.agent_status(eid, "a", "failure", 1, "should not appear", 1735689602);
@@ -611,8 +723,10 @@ TEST_CASE("ExecutionTracker.query_executions: include_error_detail default "
 
 TEST_CASE("ExecutionTracker.get_execution: always populates last_error_detail "
           "(single-row read is rare, opts in unconditionally)",
-          "[workflow][executions][tracker]") {
-    ExecHarness h;
+          "[pg][workflow][executions][tracker]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-GE", "GE");
     auto eid = h.make_exec("def-GE", "completed", 1, 0, 1);
     h.agent_status(eid, "a", "failure", 1, "single-row read sees this", 1735689602);
@@ -626,8 +740,10 @@ TEST_CASE("ExecutionTracker.get_execution: always populates last_error_detail "
 
 TEST_CASE("ExecutionTracker.query_executions: agents_failure>0 with empty "
           "error_detail yields empty last_error_detail (qa-S4)",
-          "[workflow][executions][tracker]") {
-    ExecHarness h;
+          "[pg][workflow][executions][tracker]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-NE", "NoError");
     auto eid = h.make_exec("def-NE", "completed", 1, 0, 1);
     // Failure status but empty error_detail — exit code only.
@@ -645,8 +761,10 @@ TEST_CASE("ExecutionTracker.query_executions: agents_failure>0 with empty "
 // ── sec-M1: LIST handler now gates on Execution:Read ───────────────────────
 
 TEST_CASE("executions list: 403 when perm_fn denies (sec-M1)",
-          "[workflow][executions][list][rbac]") {
-    ExecHarness h;
+          "[pg][workflow][executions][list][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.perm_grant = false;
     auto res = h.sink.Get("/fragments/executions");
     REQUIRE(res);
@@ -657,8 +775,10 @@ TEST_CASE("executions list: 403 when perm_fn denies (sec-M1)",
 
 TEST_CASE("executions detail: agent_id containing single-quote is bound via "
           "data-* attrs, not interpolated into JS (UP-1)",
-          "[workflow][executions][detail][xss]") {
-    ExecHarness h;
+          "[pg][workflow][executions][detail][xss]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-XSS", "XSS-safe");
     auto eid = h.make_exec("def-XSS", "completed", 1, 1, 0);
     // Agent emerges with a single quote in its id — wire-provided, no
@@ -681,8 +801,10 @@ TEST_CASE("executions detail: agent_id containing single-quote is bound via "
 
 TEST_CASE("ExecutionTracker.query_executions: last_error_detail opt-in default "
           "is empty for fully-successful run",
-          "[workflow][executions][tracker]") {
-    ExecHarness h;
+          "[pg][workflow][executions][tracker]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-L", "L");
     auto eid = h.make_exec("def-L", "completed", 2, 2, 0);
     h.agent_status(eid, "a", "success", 0, "", 1735689601);
@@ -697,8 +819,10 @@ TEST_CASE("ExecutionTracker.query_executions: last_error_detail opt-in default "
 
 TEST_CASE("ExecutionTracker.query_executions: last_error_detail surfaces "
           "most recent failure when caller opts in",
-          "[workflow][executions][tracker]") {
-    ExecHarness h;
+          "[pg][workflow][executions][tracker]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-LE", "LE");
     auto eid = h.make_exec("def-LE", "completed", 3, 1, 2);
     h.agent_status(eid, "a", "success", 0, "", 1735689601);
@@ -717,8 +841,10 @@ TEST_CASE("ExecutionTracker.query_executions: last_error_detail surfaces "
 
 TEST_CASE("executions detail PR2: responses correlated by exact execution_id "
           "(no cross-contamination)",
-          "[workflow][executions][detail][pr2]") {
-    ExecHarness h;
+          "[pg][workflow][executions][detail][pr2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-X", "X");
     auto exec_a = h.make_exec("def-X", "completed", 1, 1, 0,
                               /*dispatched_at=*/1735689600);
@@ -750,8 +876,10 @@ TEST_CASE("executions detail PR2: responses correlated by exact execution_id "
 
 TEST_CASE("executions detail PR2: legacy timestamp-window fallback when no "
           "PR-2 rows exist",
-          "[workflow][executions][detail][pr2]") {
-    ExecHarness h;
+          "[pg][workflow][executions][detail][pr2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-Y", "Y");
     auto eid = h.make_exec("def-Y", "completed", 1, 1, 0,
                            /*dispatched_at=*/1735689600);
@@ -769,8 +897,10 @@ TEST_CASE("executions detail PR2: legacy timestamp-window fallback when no "
 }
 
 TEST_CASE("executions detail PR2: PR-2 rows are NOT diluted by legacy fallback",
-          "[workflow][executions][detail][pr2]") {
-    ExecHarness h;
+          "[pg][workflow][executions][detail][pr2]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-Z", "Z");
     auto eid = h.make_exec("def-Z", "completed", 1, 1, 0,
                            /*dispatched_at=*/1735689600);
@@ -795,7 +925,7 @@ TEST_CASE("executions detail PR2: PR-2 rows are NOT diluted by legacy fallback",
 
 TEST_CASE("PR2 hardening — UP2-4: cmd_dispatch receives non-empty execution_id "
           "when create_execution succeeds (FAST-agent race fix)",
-          "[workflow][executions][pr2][hardening]") {
+          "[pg][workflow][executions][pr2][hardening]") {
     // The execute handler now creates the execution row BEFORE calling
     // cmd_dispatch and threads execution_id INTO cmd_dispatch as the 6th
     // parameter. The test stub captures the value passed in
@@ -804,7 +934,9 @@ TEST_CASE("PR2 hardening — UP2-4: cmd_dispatch receives non-empty execution_id
     // by the time cmd_dispatch returns, the execution_id is known to
     // the dispatch closure and the mapping is registered before any
     // RPC goes out.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-FAST", "FAST");
     auto res = h.sink.Post("/api/instructions/def-FAST/execute",
                            R"({"params":{},"agent_ids":["agent-1"]})");
@@ -816,7 +948,7 @@ TEST_CASE("PR2 hardening — UP2-4: cmd_dispatch receives non-empty execution_id
 }
 
 TEST_CASE("#1088 — POST /api/instructions/:id/execute response includes execution_id",
-          "[workflow][executions][execute][issue-1088][agentic]") {
+          "[pg][workflow][executions][execute][issue-1088][agentic]") {
     // The agentic-first workflow shipped in W5.1 (#1094) is:
     //   1. dispatch via POST /api/instructions/:id/execute OR MCP execute_instruction
     //   2. subscribe to live events via GET /api/v1/events?execution_id=<id>
@@ -826,7 +958,9 @@ TEST_CASE("#1088 — POST /api/instructions/:id/execute response includes execut
     // This test pins the contract: dispatch response body MUST contain a
     // non-empty execution_id that can be used immediately with the SSE
     // endpoint.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-AGENTIC", "Agentic");
     // Override the dispatch stub to return sent>0 so the route reaches
     // the response-build path (default stub returns 0 → 503).
@@ -855,7 +989,7 @@ TEST_CASE("#1088 — POST /api/instructions/:id/execute response includes execut
 
 TEST_CASE("PR2 hardening — query_by_execution includes the partial-index "
           "predicate `execution_id != ''` in its SQL (perf-B1 fix)",
-          "[workflow][executions][pr2][hardening][perf]") {
+          "[pg][workflow][executions][pr2][hardening][perf]") {
     // SQLite's planner refuses to use a partial index unless the WHERE
     // clause syntactically subsumes the partial-index predicate. The
     // perf-B1 fix added `AND execution_id != ''` to query_by_execution's
@@ -864,7 +998,9 @@ TEST_CASE("PR2 hardening — query_by_execution includes the partial-index "
     // both PR-2-tagged and legacy rows coexist — which exercises the
     // index path and would surface a regression where the predicate is
     // dropped or rewritten.
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     StoredResponse pr2;
     pr2.instruction_id = "cmd-A";
     pr2.agent_id = "agent-1";
@@ -881,13 +1017,14 @@ TEST_CASE("PR2 hardening — query_by_execution includes the partial-index "
     store.store(legacy);
 
     auto rows = store.query_by_execution("exec-pr2");
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0].output == "tagged");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].output == "tagged");
 }
 
 TEST_CASE("PR2 hardening — multi-agent fan-out: terminal-branch does NOT erase "
           "the mapping so agents 2..N stamp correctly (HF-1 fix)",
-          "[workflow][executions][pr2][hardening]") {
+          "[pg][workflow][executions][pr2][hardening]") {
     // Pre-fix: terminal-status branches in agent_service_impl.cpp erased
     // cmd_execution_ids_ on first response, causing agents 2..N to stamp
     // empty execution_id. The fix removes the erase. We can't drive
@@ -896,7 +1033,9 @@ TEST_CASE("PR2 hardening — multi-agent fan-out: terminal-branch does NOT erase
     // consecutive stores under the same execution_id — which is what
     // the fix enables. The integration coverage is deferred to a UAT
     // round-trip in PR 2.8.
-    ResponseStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
     StoredResponse a1;
     a1.instruction_id = "cmd-fan";
     a1.agent_id = "agent-1";
@@ -912,7 +1051,9 @@ TEST_CASE("PR2 hardening — multi-agent fan-out: terminal-branch does NOT erase
     a2.execution_id = "exec-fan";
     store.store(a2);
 
-    auto rows = store.query_by_execution("exec-fan");
+    auto rows_opt = store.query_by_execution("exec-fan");
+    REQUIRE(rows_opt.has_value());
+    const auto& rows = *rows_opt;
     REQUIRE(rows.size() == 2);
     // Both agents present — HF-1 regression would drop one.
     bool saw_a1 = false, saw_a2 = false;
@@ -928,13 +1069,15 @@ TEST_CASE("PR2 hardening — multi-agent fan-out: terminal-branch does NOT erase
 
 TEST_CASE("PR2 hardening — failed dispatch does NOT orphan a phantom 'running' "
           "execution row (Pattern-C regression close)",
-          "[workflow][executions][pr2][hardening]") {
+          "[pg][workflow][executions][pr2][hardening]") {
     // Reorder of create_execution BEFORE cmd_dispatch (UP2-4 fix) introduced
     // a Pattern-C regression: if dispatch returns sent=0 OR throws, the
     // pre-created execution row was left at status='running' forever, showing
     // as a phantom in-flight run in the LIST handler. The fix calls
     // mark_cancelled on both failure paths. Pin the contract.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-FAIL", "FAIL");
     auto res = h.sink.Post("/api/instructions/def-FAIL/execute",
                            R"({"params":{},"agent_ids":["agent-1"]})");
@@ -961,18 +1104,22 @@ TEST_CASE("PR2 hardening — failed dispatch does NOT orphan a phantom 'running'
 // integration is the seam these tests pin.
 // ─────────────────────────────────────────────────────────────────────────────
 
-TEST_CASE("SSE handler: 404 for unknown execution", "[workflow][executions][pr3]") {
-    ExecHarness h;
+TEST_CASE("SSE handler: 404 for unknown execution", "[pg][workflow][executions][pr3]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     auto res = h.sink.Get("/sse/executions/does-not-exist");
     REQUIRE(res);
     CHECK(res->status == 404);
 }
 
-TEST_CASE("SSE handler: 410 Gone for terminal execution", "[workflow][executions][pr3]") {
+TEST_CASE("SSE handler: 410 Gone for terminal execution", "[pg][workflow][executions][pr3]") {
     // Already-terminal executions must not open an SSE channel — the client
     // should fall back to the static detail fragment. 410 tells EventSource
     // to stop reconnecting (vs 503 which it would retry).
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-DONE", "Done");
     auto exec_id = h.make_exec("def-DONE", "succeeded", 3, 3, 0);
     auto res = h.sink.Get("/sse/executions/" + exec_id);
@@ -989,7 +1136,7 @@ TEST_CASE("SSE handler: 410 Gone for terminal execution", "[workflow][executions
 // allocation-free — so an assertion-based handler test is the only instrument.
 
 TEST_CASE("SSE handler: 429 once the shared stream budget is exhausted",
-          "[workflow][executions][pr3][sse][admission]") {
+          "[pg][workflow][executions][pr3][sse][admission]") {
     // Capacity 1: the first attach consumes the only slot, so the second is refused.
     yuzu::server::detail::StreamBudget budget{
         yuzu::server::detail::StreamBudget::Config{/*global_cap=*/1}};
@@ -999,7 +1146,9 @@ TEST_CASE("SSE handler: 429 once the shared stream budget is exhausted",
     REQUIRE(held.lease);
     REQUIRE(budget.active() == 1);
 
-    ExecHarness h{/*with_bus=*/true, &budget};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, &budget);
     h.make_def("def-CAP", "Cap");
     auto exec_id = h.make_exec("def-CAP", "running", 5, 0, 0);
 
@@ -1013,7 +1162,7 @@ TEST_CASE("SSE handler: 429 once the shared stream budget is exhausted",
 }
 
 TEST_CASE("SSE handler: a budget rejection leaves NO bus subscriber behind",
-          "[workflow][executions][pr3][sse][admission]") {
+          "[pg][workflow][executions][pr3][sse][admission]") {
     // THE regression guard for the listener leak. The lease used to be taken AFTER
     // bus->subscribe, and the 429 path returns without unsubscribing — and
     // gc_terminal_channels only reaps channels whose listener set is empty, so every
@@ -1027,7 +1176,9 @@ TEST_CASE("SSE handler: a budget rejection leaves NO bus subscriber behind",
                                    yuzu::server::detail::kPerPrincipalDashboard);
     REQUIRE(held.lease);
 
-    ExecHarness h{/*with_bus=*/true, &budget};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, &budget);
     h.make_def("def-LEAK", "Leak");
     auto exec_id = h.make_exec("def-LEAK", "running", 5, 0, 0);
 
@@ -1044,11 +1195,13 @@ TEST_CASE("SSE handler: a budget rejection leaves NO bus subscriber behind",
 }
 
 TEST_CASE("SSE handler: an unmetered route still serves (nullptr budget is a test seam)",
-          "[workflow][executions][pr3][sse][admission]") {
+          "[pg][workflow][executions][pr3][sse][admission]") {
     // The budget parameter is nullable for harnesses. Assert that nullability is a
     // pass-through and not an accidental deny, so the guard above cannot pass for
     // the wrong reason.
-    ExecHarness h; // no budget
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool); // no budget
     h.make_def("def-FREE", "Free");
     auto exec_id = h.make_exec("def-FREE", "running", 5, 0, 0);
     auto res = h.sink.Get("/sse/executions/" + exec_id);
@@ -1056,8 +1209,10 @@ TEST_CASE("SSE handler: an unmetered route still serves (nullptr budget is a tes
     CHECK(res->status == 200);
 }
 
-TEST_CASE("SSE handler: 403 when perm_fn denies Read on Execution", "[workflow][executions][pr3]") {
-    ExecHarness h;
+TEST_CASE("SSE handler: 403 when perm_fn denies Read on Execution", "[pg][workflow][executions][pr3]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-FORBID", "Forbid");
     auto exec_id = h.make_exec("def-FORBID", "running", 5, 0, 0);
     h.perm_grant = false;
@@ -1067,8 +1222,10 @@ TEST_CASE("SSE handler: 403 when perm_fn denies Read on Execution", "[workflow][
 }
 
 TEST_CASE("SSE handler: 200 on running execution attaches event-stream",
-          "[workflow][executions][pr3]") {
-    ExecHarness h;
+          "[pg][workflow][executions][pr3]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-RUN", "Run");
     auto exec_id = h.make_exec("def-RUN", "running", 5, 1, 0);
     auto res = h.sink.Get("/sse/executions/" + exec_id);
@@ -1083,11 +1240,13 @@ TEST_CASE("SSE handler: 200 on running execution attaches event-stream",
 
 TEST_CASE("SSE handler: ExecutionTracker.update_agent_status publishes "
           "agent-transition onto the bus",
-          "[workflow][executions][pr3]") {
+          "[pg][workflow][executions][pr3]") {
     // This is the bus integration the SSE handler depends on — the
     // streaming body trusts that update_agent_status feeds the channel.
     // Subscribe directly to the bus so we don't need a real socket.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-INT", "Integration");
     auto exec_id = h.make_exec("def-INT", "running", 3, 0, 0);
 
@@ -1118,12 +1277,14 @@ TEST_CASE("SSE handler: ExecutionTracker.update_agent_status publishes "
 
 TEST_CASE("SSE handler: refresh_counts on terminal threshold publishes "
           "execution-progress + execution-completed",
-          "[workflow][executions][pr3]") {
+          "[pg][workflow][executions][pr3]") {
     // When refresh_counts crosses the all-agents-responded threshold, the
     // tracker must publish BOTH a progress event (so KPI strip updates)
     // AND a terminal event (so the SSE client closes its EventSource).
     // Verify both, in order, on the bus.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-TERM", "Terminal");
     auto exec_id = h.make_exec("def-TERM", "running", 2, 0, 0);
     h.tracker->set_agents_targeted(exec_id, 2);
@@ -1175,12 +1336,14 @@ TEST_CASE("SSE handler: refresh_counts on terminal threshold publishes "
 }
 
 TEST_CASE("SSE handler: mark_cancelled publishes terminal execution-completed",
-          "[workflow][executions][pr3]") {
+          "[pg][workflow][executions][pr3]") {
     // mark_cancelled is the cancel-on-dispatch-failure path (PR 2 Pattern-C
     // close). PR 3 must emit a terminal event so an open SSE drawer
     // closes its EventSource cleanly instead of waiting for a heartbeat
     // timeout.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-CANCEL", "Cancel");
     auto exec_id = h.make_exec("def-CANCEL", "running", 5, 0, 0);
 
@@ -1195,11 +1358,13 @@ TEST_CASE("SSE handler: mark_cancelled publishes terminal execution-completed",
 }
 
 TEST_CASE("SSE handler: ring buffer holds events for late-connecting client",
-          "[workflow][executions][pr3]") {
+          "[pg][workflow][executions][pr3]") {
     // The SSE handler replays the ring buffer to a client that connects
     // mid-execution (with Last-Event-ID=0 → all). Pin the buffer
     // contents the replay would walk.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-LATE", "Late");
     auto exec_id = h.make_exec("def-LATE", "running", 5, 0, 0);
 
@@ -1220,12 +1385,14 @@ TEST_CASE("SSE handler: ring buffer holds events for late-connecting client",
 }
 
 TEST_CASE("SSE handler: per-execution channel partitioning under the routes layer",
-          "[workflow][executions][pr3]") {
+          "[pg][workflow][executions][pr3]") {
     // Two concurrent executions of the same definition; each agent
     // transition must land on the correct channel. This is the contract
     // the SSE handler depends on to keep one drawer's events from
     // bleeding into another.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-PARTITION", "Partition");
     auto a = h.make_exec("def-PARTITION", "running", 2, 0, 0);
     auto b = h.make_exec("def-PARTITION", "running", 2, 0, 0);
@@ -1252,12 +1419,14 @@ TEST_CASE("SSE handler: per-execution channel partitioning under the routes laye
 
 TEST_CASE("SSE handler: list view stamps data-execution-id and "
           "data-execution-status for client SSE bootstrap",
-          "[workflow][executions][pr3]") {
+          "[pg][workflow][executions][pr3]") {
     // The drawer opens an EventSource only when the row was rendered with
     // status=running OR pending. PR 3 added the data-* attributes to the
     // list row markup; verify they are present and round-trip the status
     // we created the execution with.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-LIST", "List");
     auto exec_id = h.make_exec("def-LIST", "running", 3, 0, 0);
 
@@ -1270,11 +1439,13 @@ TEST_CASE("SSE handler: list view stamps data-execution-id and "
 }
 
 TEST_CASE("SSE handler: detail KPI strip carries id=exec-kpi-{id} for partial swaps",
-          "[workflow][executions][pr3]") {
+          "[pg][workflow][executions][pr3]") {
     // Client SSE listener finds the KPI strip via #exec-kpi-{id} so it
     // can update Total / Succeeded / Failed without re-rendering the
     // whole drawer. Pin the id stamp.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-KPI", "KPI");
     auto exec_id = h.make_exec("def-KPI", "running", 3, 0, 0);
     auto res = h.sink.Get("/fragments/executions/" + exec_id + "/detail");
@@ -1284,10 +1455,12 @@ TEST_CASE("SSE handler: detail KPI strip carries id=exec-kpi-{id} for partial sw
 }
 
 TEST_CASE("SSE handler: per-agent status badge has .per-agent-status class for partial swaps",
-          "[workflow][executions][pr3]") {
+          "[pg][workflow][executions][pr3]") {
     // Client SSE listener swaps the status badge in place via
     // .per-agent-status. Pin the class stamp.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-BADGE", "Badge");
     auto exec_id = h.make_exec("def-BADGE", "running", 1, 0, 0);
     h.agent_status(exec_id, "a-1", "running");
@@ -1303,13 +1476,15 @@ TEST_CASE("SSE handler: per-agent status badge has .per-agent-status class for p
 // ─────────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("SSE handler: 503 when execution_event_bus is null (no-bus path)",
-          "[workflow][executions][pr3][pr4]") {
+          "[pg][workflow][executions][pr3][pr4]") {
     // qe-S1: the route is registered even when the bus is intentionally
     // not wired (test harness opt-out, configuration path that omits the
     // bus). Hitting it must return 503, not 200 — opening an EventSource
     // against a missing bus would freeze the drawer waiting for events
     // that will never publish.
-    ExecHarness h(/*with_bus=*/false);
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/false);
     h.make_def("def-NO-BUS", "NoBus");
     auto exec_id = h.make_exec("def-NO-BUS", "running", 3, 0, 0);
 
@@ -1327,11 +1502,13 @@ TEST_CASE("SSE handler: 503 when execution_event_bus is null (no-bus path)",
 }
 
 TEST_CASE("SSE handler: 200 path emits execution.live_subscribe audit",
-          "[workflow][executions][pr3][pr4]") {
+          "[pg][workflow][executions][pr3][pr4]") {
     // Positive control for the audit-absence test below: the happy path
     // DOES emit the audit. Without this pin, a refactor that drops the
     // emit entirely would silently pass the absence test.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-SUB", "Sub");
     auto exec_id = h.make_exec("def-SUB", "running", 1, 0, 0);
 
@@ -1351,13 +1528,15 @@ TEST_CASE("SSE handler: 200 path emits execution.live_subscribe audit",
 }
 
 TEST_CASE("SSE handler: 403 perm-deny does NOT emit live_subscribe audit",
-          "[workflow][executions][pr3][pr4]") {
+          "[pg][workflow][executions][pr3][pr4]") {
     // qe-S4: a denied subscribe must not leave a forensic ghost row in
     // audit_store — the success-shaped audit only fires after perm_fn
     // approves. Pin this so a future refactor that hoists the audit
     // ahead of perm_fn (the kind of "log first, check later" pattern
     // that surfaces in compliance reviews) is caught.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-DENY", "Deny");
     auto exec_id = h.make_exec("def-DENY", "running", 1, 0, 0);
     h.perm_grant = false;
@@ -1385,8 +1564,10 @@ TEST_CASE("SSE handler: 403 perm-deny does NOT emit live_subscribe audit",
 // status code, and the original bug returned a SUCCESS response.
 
 TEST_CASE("#2500 — supplied-but-empty agent_ids is refused, not widened to the fleet",
-          "[workflow][executions][execute][targeting][security]") {
-    ExecHarness h;
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-T1", "T1");
 
     auto res = h.sink.Post("/api/instructions/def-T1/execute", R"({"agent_ids":[]})");
@@ -1409,11 +1590,13 @@ TEST_CASE("#2500 — supplied-but-empty agent_ids is refused, not widened to the
 }
 
 TEST_CASE("#2500 — non-array agent_ids and non-string scope are refused, not ignored",
-          "[workflow][executions][execute][targeting][security]") {
+          "[pg][workflow][executions][execute][targeting][security]") {
     // Both were SILENTLY SKIPPED by the `is_array()` / `is_string()` guards and
     // fell through to broadcast. Neither ever produced an error before.
     SECTION("non-array agent_ids") {
-        ExecHarness h;
+        YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        ExecHarness h(pool);
         h.make_def("def-T2", "T2");
         auto res = h.sink.Post("/api/instructions/def-T2/execute", R"({"agent_ids":"agent-1"})");
         REQUIRE(res);
@@ -1425,7 +1608,9 @@ TEST_CASE("#2500 — non-array agent_ids and non-string scope are refused, not i
                   .value() == 1.0);
     }
     SECTION("non-string scope") {
-        ExecHarness h;
+        YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        ExecHarness h(pool);
         h.make_def("def-T3", "T3");
         auto res = h.sink.Post("/api/instructions/def-T3/execute", R"({"scope":123})");
         REQUIRE(res);
@@ -1437,7 +1622,9 @@ TEST_CASE("#2500 — non-array agent_ids and non-string scope are refused, not i
                   .value() == 1.0);
     }
     SECTION("supplied-but-empty scope") {
-        ExecHarness h;
+        YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        ExecHarness h(pool);
         h.make_def("def-T4", "T4");
         auto res = h.sink.Post("/api/instructions/def-T4/execute", R"({"scope":""})");
         REQUIRE(res);
@@ -1451,14 +1638,16 @@ TEST_CASE("#2500 — non-array agent_ids and non-string scope are refused, not i
 }
 
 TEST_CASE("#2500 — numeric agent_ids entries are refused DELIBERATELY, with a targeting reason",
-          "[workflow][executions][execute][targeting][security]") {
+          "[pg][workflow][executions][execute][targeting][security]") {
     // This shape already 400'd before the fix — via `get<std::string>()`
     // throwing `type_error` into the body-parse catch, which reported
     // "invalid request body", emitted no metric and no audit row, and would
     // have vanished the moment anyone made that loop tolerant. Pin that it is
     // now refused BY THE TARGETING RULE: the reason label is the proof, because
     // only the deliberate path can produce it.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-T5", "T5");
 
     auto res = h.sink.Post("/api/instructions/def-T5/execute", R"({"agent_ids":[1,2,3]})");
@@ -1480,12 +1669,14 @@ TEST_CASE("#2500 — numeric agent_ids entries are refused DELIBERATELY, with a 
 }
 
 TEST_CASE("#2500 — a genuinely omitted target still broadcasts (the over-broadness guard)",
-          "[workflow][executions][execute][targeting]") {
+          "[pg][workflow][executions][execute][targeting]") {
     // The half of the rule that is NOT a refusal, and the one a careless fix
     // breaks: omitting both fields is how a caller deliberately says "the whole
     // fleet", and it must keep working. Without this section a fix that
     // rejected every untargeted execute would pass every test above.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-T6", "T6");
     h.dispatch_cmd_override = "cmd-1";
     h.dispatch_sent_override = 3;
@@ -1504,8 +1695,10 @@ TEST_CASE("#2500 — a genuinely omitted target still broadcasts (the over-broad
 }
 
 TEST_CASE("#2500 — an explicit non-empty target is unaffected",
-          "[workflow][executions][execute][targeting]") {
-    ExecHarness h;
+          "[pg][workflow][executions][execute][targeting]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-T7", "T7");
     h.dispatch_cmd_override = "cmd-2";
     h.dispatch_sent_override = 1;
@@ -1519,7 +1712,7 @@ TEST_CASE("#2500 — an explicit non-empty target is unaffected",
 }
 
 TEST_CASE("#2500 — a non-object body is refused, not read as an unnamed target",
-          "[workflow][executions][execute][targeting][security]") {
+          "[pg][workflow][executions][execute][targeting][security]") {
     // `check_targeting_shape` asks the body whether it CONTAINS targeting keys,
     // and nlohmann's contains() answers false for an array or a scalar. So
     // before the route rejected non-objects, `["dev-1","dev-2"]` — a plausible
@@ -1531,7 +1724,9 @@ TEST_CASE("#2500 — a non-object body is refused, not read as an unnamed target
     // enforced at the route and pinned here rather than left as a header
     // comment, because a comment is not a check.
     for (const char* body : {R"(["dev-1","dev-2"])", "5", "null", R"("dev-1")"}) {
-        ExecHarness h;
+        YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        ExecHarness h(pool);
         h.make_def("def-T8", "T8");
         auto res = h.sink.Post("/api/instructions/def-T8/execute", body);
         REQUIRE(res);
@@ -1554,14 +1749,16 @@ TEST_CASE("#2500 — a non-object body is refused, not read as an unnamed target
 }
 
 TEST_CASE("#2500 — an explicit scope of __all__ broadcasts by name",
-          "[workflow][executions][execute][targeting]") {
+          "[pg][workflow][executions][execute][targeting]") {
     // The vocabulary this fix introduces at the dispatch sink, exercised from
     // the outside. `__all__` is a PUBLISHED ground scope kind — advertised by
     // /discover/scope-kinds and named in the MCP execute_instruction schema —
     // so a caller may legitimately send it, and the dashboard's "All agents"
     // option does exactly that. It must reach the sink intact rather than being
     // refused as a scope that resolves to no devices.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-T9", "T9");
     h.dispatch_cmd_override = "cmd-3";
     h.dispatch_sent_override = 2;
@@ -1575,7 +1772,7 @@ TEST_CASE("#2500 — an explicit scope of __all__ broadcasts by name",
 }
 
 TEST_CASE("#2500 — an explicit agent_ids list wins over a broadcast request",
-          "[workflow][executions][execute][targeting][security]") {
+          "[pg][workflow][executions][execute][targeting][security]") {
     // This pins that the ROUTE forwards both fields intact. The precedence
     // DECISION itself lives in the dispatch sink, which this harness cannot
     // reach (it stubs the dispatch closure) — that is covered by
@@ -1583,7 +1780,9 @@ TEST_CASE("#2500 — an explicit agent_ids list wins over a broadcast request",
     // Saying so explicitly rather than letting the case name imply it proves
     // the sink: getting precedence wrong is how the first attempt at the sink
     // inversion introduced a NEW widening.
-    ExecHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-T10", "T10");
     h.dispatch_cmd_override = "cmd-4";
     h.dispatch_sent_override = 1;
@@ -1595,4 +1794,151 @@ TEST_CASE("#2500 — an explicit agent_ids list wins over a broadcast request",
     CHECK(h.dispatch_calls == 1);
     REQUIRE(h.last_dispatch_agent_ids.size() == 1);
     CHECK(h.last_dispatch_agent_ids[0] == "agent-1");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// K-R7-02 — instruction execute dispatch confinement handoff
+//
+// POST /api/instructions/:id/execute now routes through the shared
+// `dispatch_confined` seam via the CONFINED 7-param command_dispatch_fn,
+// narrowing every arm to the operator's Execution:Execute visible set. As with
+// the MCP (CDX-R5-02) and dashboard (CDX-R7-02) handoff tests, this route-level
+// harness wires a MOCK dispatch, so it asserts the HANDOFF — the handler
+// derived the caller's visible set and threaded it in — while the per-arm
+// narrowing (filter_to_scope / in_scope) is pinned by the authz_model unit
+// tests and the single shared dispatch_confined seam.
+//
+// The sibling POST /api/workflows/:id/execute path threads the SAME
+// per-request `exec_visible` (derived once at the top of the handler) into its
+// inner step-dispatch lambda, and is covered by the CDX-FV-03 cases at the
+// bottom of this file. An earlier revision waived that route as
+// "disproportionate scaffolding"; it was not — WorkflowEngine's ctor is a
+// single sqlite3_open_v2 (workflow_engine.hpp:104), so the waiver is gone and
+// the route is tested, not asserted by inspection.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("K-R7-02 — instruction execute threads the caller's exec_visible into dispatch",
+          "[pg][workflow][executions][execute][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-CONF1", "conf1");
+    h.dispatch_cmd_override = "cmd-x";
+    h.dispatch_sent_override = 1;
+    // Service-scoped confinement: the caller can see only agent-A.
+    h.exec_visible_fn = [](const httplib::Request&) {
+        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+    };
+    // Target agent-B (an id-list arm), OUTSIDE the caller's visible set.
+    auto res = h.sink.Post("/api/instructions/def-CONF1/execute", R"({"agent_ids":["agent-B"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_agent_ids == std::vector<std::string>{"agent-B"});
+    // The handoff: a PRESENT (confined) set, agent-A in / agent-B out. The
+    // production dispatch_confined then drops agent-B via filter_to_scope.
+    REQUIRE(h.last_dispatch_exec_visible.has_value());
+    CHECK(h.last_dispatch_exec_visible->count("agent-A") == 1);
+    CHECK(h.last_dispatch_exec_visible->count("agent-B") == 0);
+}
+
+TEST_CASE("K-R7-02 — instruction execute broadcast still carries the caller's exec_visible",
+          "[pg][workflow][executions][execute][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-CONF3", "conf3");
+    h.dispatch_cmd_override = "cmd-z";
+    h.dispatch_sent_override = 1;
+    h.exec_visible_fn = [](const httplib::Request&) {
+        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+    };
+    // Omitted target → the handler names __all__ (broadcast). Even that composes
+    // with the visible set.
+    auto res = h.sink.Post("/api/instructions/def-CONF3/execute", R"({})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    CHECK(h.last_dispatch_scope == "__all__");
+    REQUIRE(h.last_dispatch_exec_visible.has_value());
+    CHECK(h.last_dispatch_exec_visible->count("agent-A") == 1);
+}
+
+TEST_CASE("K-R7-02 — instruction execute FAILS CLOSED when the exec-visible derivation is unwired",
+          "[pg][workflow][executions][execute][scope][security]") {
+    // Genuinely UNWIRED ExecVisibleFn: the production handler must hand dispatch
+    // a PRESENT EMPTY visible set (deny all), never nullopt (unfiltered).
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/false);
+    h.make_def("def-CONF2", "conf2");
+    h.dispatch_cmd_override = "cmd-fc";
+    h.dispatch_sent_override = 1;
+    auto res = h.sink.Post("/api/instructions/def-CONF2/execute", R"({"agent_ids":["agent-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_exec_visible.has_value()); // PRESENT (deny), not nullopt
+    CHECK(h.last_dispatch_exec_visible->empty());       // EMPTY → production sink reaches no one
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CDX-FV-03 — workflow execute dispatch confinement handoff
+//
+// POST /api/workflows/:id/execute is the primary operator dispatch surface and
+// was the only one with no automated confinement test: loss of the `exec_visible`
+// value capture on the step-dispatch lambda, or of the seventh dispatch argument,
+// would have been unobserved. These cases pin the handoff at the route — the
+// per-arm narrowing itself stays with the shared `dispatch_confined` seam, as in
+// the K-R7-02 instruction cases above.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("CDX-FV-03 — workflow execute threads the caller's exec_visible into step dispatch",
+          "[pg][workflow][executions][execute][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-WF1", "wf1");
+    auto wf_id = h.make_workflow("wf-conf-1", "def-WF1");
+    h.dispatch_cmd_override = "cmd-wf1";
+    h.dispatch_sent_override = 1;
+    // Service-scoped confinement: the caller can see only agent-A.
+    h.exec_visible_fn = [](const httplib::Request&) {
+        return yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+    };
+
+    // Target agent-B — an id-list arm OUTSIDE the caller's visible set. The
+    // route still forwards it; the production dispatch_confined drops it.
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-B"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_agent_ids == std::vector<std::string>{"agent-B"});
+    // The handoff: a PRESENT (confined) set, agent-A in / agent-B out.
+    REQUIRE(h.last_dispatch_exec_visible.has_value());
+    CHECK(h.last_dispatch_exec_visible->count("agent-A") == 1);
+    CHECK(h.last_dispatch_exec_visible->count("agent-B") == 0);
+}
+
+TEST_CASE("CDX-FV-03 — workflow execute FAILS CLOSED when the exec-visible derivation is unwired",
+          "[pg][workflow][executions][execute][scope][security]") {
+    // Genuinely UNWIRED ExecVisibleFn. ADR-0033 §1: the handler must hand step
+    // dispatch a PRESENT EMPTY visible set (deny all), never nullopt — nullopt
+    // means UNFILTERED at the shared seam, i.e. the whole fleet.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/false,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-WF2", "wf2");
+    auto wf_id = h.make_workflow("wf-conf-2", "def-WF2");
+    h.dispatch_cmd_override = "cmd-wf2";
+    h.dispatch_sent_override = 1;
+
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_exec_visible.has_value()); // PRESENT (deny), not nullopt
+    CHECK(h.last_dispatch_exec_visible->empty());      // EMPTY → production sink reaches no one
 }

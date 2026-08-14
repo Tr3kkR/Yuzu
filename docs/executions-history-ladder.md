@@ -286,10 +286,13 @@ publisher list above (`update_agent_status` / `refresh_counts` /
 three live consumers are (1) the dashboard SSE route
 (`execution.live_subscribe`), (2) the agentic route
 (`api.v1.events.subscribe`, `GET /api/v1/events`), and (3) the **MCP
-progress bridge** (track 2f PR 3a, `McpStreamBridge`), a *consumer-side
-projection only*: it maps the same bus events onto an MCP session's `GET`
-stream as `notifications/progress` + a final JSON-RPC response, adds **no
-bus event type** and renames no step. The bridge subscribes via
+progress bridge** (track 2f, `McpStreamBridge`), a *consumer-side
+projection only*: it maps the same bus events onto an MCP session as
+`notifications/progress` + a final JSON-RPC response, adds **no bus event
+type** and renames no step. Which wire carries those frames is a per-request
+client choice and changes nothing here — the session's `GET` stream (PR 3a)
+or the `tools/call` POST response held open as SSE (PR 3b) — because both
+read the same subscription off the same bus. The bridge subscribes via
 `ExecutionEventBus::subscribe_and_replay` (atomic install-then-replay,
 closing the `replay_since`+`subscribe` race the two older siblings still
 carry - tracked for migration in #2410). A new event type must be added

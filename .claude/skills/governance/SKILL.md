@@ -50,7 +50,8 @@ merged, 81 of 81 local branches predated it.
 
 ```bash
 git fetch origin dev -q || echo "WARNING: fetch failed - origin/dev may itself be stale"
-for f in .claude/skills/governance/SKILL.md .claude/routed-concerns.md CLAUDE.md; do
+for f in .claude/skills/governance/SKILL.md .claude/routed-concerns.md \
+         .claude/routed-concerns-access-control.md CLAUDE.md; do
   git diff --quiet origin/dev -- "$f" \
     && echo "  ok       $f" \
     || echo "  DIFFERS  $f   ($(git diff --shortstat origin/dev -- "$f" | sed 's/^ *//'))"
@@ -122,7 +123,14 @@ Check existing memory that might apply — at minimum:
 git diff --name-only <range>
 ```
 
-Open `.claude/routed-concerns.md` and walk it row by row against that path list.
+Open **BOTH** `.claude/routed-concerns.md` **and**
+`.claude/routed-concerns-access-control.md` and walk them row by row against that
+path list. There are TWO files — the table was split when the first hit CLAUDE.md's
+40k-character ceiling and a new catastrophic-invariant row physically would not fit.
+Walking only the first silently skips every access-control and request-admission
+chokepoint, which is where the highest-severity rows live: the authz-topology floor,
+dispatch confinement, dispatch targeting, the pre-auth body cap, and the ADR-1005
+spine. A row that is never opened routes nobody, which defeats the row's only job.
 Each row names the files/change-types it covers and the agents that MUST load on
 them. Those agents are selected **unconditionally** — see the standing rule under
 the Gate 3 decision matrix. Write the matched rows into your Gate 1 summary so the

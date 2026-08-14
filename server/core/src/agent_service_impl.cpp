@@ -1222,6 +1222,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                 sr.instruction_id = resp.command_id();
                 sr.agent_id = agent_id;
                 sr.status = static_cast<int>(resp.status());
+                sr.plugin_result_status = static_cast<int>(resp.plugin_result_status());
                 sr.output = resp.output();
                 sr.plugin = plugin;
                 // PR 2: stamp execution_id from the dispatch-time mapping so
@@ -1291,7 +1292,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                 if (resp.output().empty()) {
                     finalize_result = response_store_->finalize_terminal_status(
                         resp.command_id(), agent_id, static_cast<int>(resp.status()), err_detail,
-                        current_exec);
+                        current_exec, static_cast<int>(resp.plugin_result_status()));
                 }
                 if (finalize_result == FR::NoRow) {
                     // No prior RUNNING row (terminal-only command) or the
@@ -1300,6 +1301,7 @@ grpc::Status AgentServiceImpl::Subscribe(
                     sr.instruction_id = resp.command_id();
                     sr.agent_id = agent_id;
                     sr.status = static_cast<int>(resp.status());
+                    sr.plugin_result_status = static_cast<int>(resp.plugin_result_status());
                     sr.output = resp.output();
                     sr.plugin = plugin_name;
                     sr.error_detail = err_detail;
@@ -1477,6 +1479,7 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             sr.instruction_id = resp.command_id();
             sr.agent_id = agent_id;
             sr.status = static_cast<int>(resp.status());
+            sr.plugin_result_status = static_cast<int>(resp.plugin_result_status());
             sr.output = resp.output();
             sr.plugin = plugin;
             // PR 2: streaming response — keep the mapping until completion.
@@ -1533,13 +1536,14 @@ void AgentServiceImpl::process_gateway_response(const std::string& agent_id,
             if (resp.output().empty()) {
                 finalize_result = response_store_->finalize_terminal_status(
                     resp.command_id(), agent_id, static_cast<int>(resp.status()), err_detail,
-                    current_exec);
+                    current_exec, static_cast<int>(resp.plugin_result_status()));
             }
             if (finalize_result == FR::NoRow) {
                 StoredResponse sr;
                 sr.instruction_id = resp.command_id();
                 sr.agent_id = agent_id;
                 sr.status = static_cast<int>(resp.status());
+                sr.plugin_result_status = static_cast<int>(resp.plugin_result_status());
                 sr.output = resp.output();
                 sr.plugin = gw_plugin;
                 sr.error_detail = err_detail;
@@ -1751,6 +1755,11 @@ void AgentServiceImpl::notify_exec_tracker(const std::string& command_id,
     s.agent_id = agent_id;
     s.dispatched_at = 0; // upsert keeps prior value if non-zero
     s.exit_code = resp.exit_code();
+    // CC-07: mirror the wire enum straight through — both are small,
+    // stable, append-only integer enums (agent.proto's PluginResultStatus /
+    // sdk/include/yuzu/plugin.h's YuzuResultStatus), so no separate mapping
+    // table is needed to avoid drift; 0 in both is PLUGIN_RESULT_UNDECLARED.
+    s.plugin_result_status = static_cast<int>(resp.plugin_result_status());
     if (resp.has_error()) {
         s.error_detail = resp.error().message();
     }

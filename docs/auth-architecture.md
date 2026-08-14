@@ -1543,9 +1543,107 @@ Tests: `tests/unit/server/test_scim_store.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 6 roles, 21 securable types, per-operation permissions, deny-override logic.
+- 6 roles, 23 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO** — Full PKCE flow, Entra ID discovery, JWT validation, group-to-role mapping.
 - **AD/Entra integration** — Microsoft Graph API for user/group import.
+
+## The authorization topology floor (#2376)
+
+**The defect.** `RbacStore::rbac_enabled_` defaults `false`, so a fresh
+install runs with RBAC off — the default posture, not an edge case. With
+RBAC off, `AuthRoutes::require_permission`/`require_scoped_permission` fall
+through to a legacy branch (`server/core/src/auth_routes.cpp`, both
+functions, ~:713/~:919) that allows every `Read` to any authenticated
+non-engine session (see the `rbac_enforcement_in_effect` gate at ~:699,
+which is the branch above the legacy fallback — a live RBAC grant is always
+consulted first and returns before the legacy branch is ever reached; the
+legacy branch is reachable only when RBAC is disabled or the store is
+unwired). On a default install that gave a plain `user` session read access
+to the authorization TOPOLOGY itself: the fleet-wide access-review export
+(the surface that exists to **be** SOC 2 CC6.2 evidence — see "Periodic
+access reviews" below), `GET /api/v1/rbac/roles` (the RBAC role graph), and
+the engine-principal grant graph (`GET /api/v1/engine-principals*` and its
+MCP twins).
+
+**The fix has three parts**, all keyed off the single
+`server/core/src/authz_topology_floor.hpp` chokepoint:
+
+1. **A new `EnginePrincipal` securable** (`Read` only, so far), cut away
+   from the over-broad `Security:Read`. The engine-principal inventory and
+   grant-graph reads moved onto it: REST `GET /api/v1/engine-principals`,
+   `GET /api/v1/engine-principals/{id}`, `GET
+   /api/v1/engine-principals/{id}/roles`, and the MCP twins
+   `list_engine_principals`, `get_engine_principal`, `list_engine_roles`.
+   This is the same move #2324 made cutting `AccessReview` away from
+   `AuditLog:*` (see "Periodic access reviews" → "#2225 round 2" below) —
+   the same shape of over-broad-securable defect, closed the same way.
+   Seeded (`RbacStore::seed_defaults()`) to `Administrator` (full CRUD via
+   the existing cross-type loop) and `Viewer` (`Read`) — exactly the two
+   built-in roles that reached these routes via `Security:Read` before the
+   cut, so no built-in role's authority widens or narrows under
+   RBAC-enabled enforcement; only the RBAC-off legacy posture changes (see
+   below).
+2. **The topology floor itself**: `{AccessReview:Read, UserManagement:Read,
+   EnginePrincipal:Read}` require the `admin` session role regardless of
+   the RBAC on/off toggle, via `authz_topology_floor.hpp`'s
+   `topology_floor_applies()`. It is consulted **only** inside the legacy
+   (RBAC-off) fallback of `require_permission`/`require_scoped_permission`
+   — never ahead of, or instead of, the live-RBAC branch. That ordering is
+   load-bearing, not incidental: #2324 cut the dedicated `AccessReview`
+   securable specifically so a non-admin `Reviewer` role could be seeded
+   `AccessReview:Read` and reach the export without being `admin`. If the
+   floor ran ahead of the live-RBAC branch (or replaced it), it would deny
+   that seeded `Reviewer` grant and destroy the entire reason the
+   `AccessReview` securable exists. Because the live-RBAC branch in both
+   functions always `return`s (true or false) before the legacy branch's
+   code is reached, "floor only in the legacy branch" is structural, not a
+   convention that could silently drift — there is only one path into the
+   floor check.
+3. **Observability.** A floored denial gets a distinct audit reason —
+   `"topology floor: non-admin role denied <securable>:<operation>"` on the
+   `auth.permission_required`/`auth.scoped_permission_required` audit
+   actions, `result=denied` — instead of the generic `"non-admin role
+   denied ..."` an ordinary legacy write/delete/execute/approve denial
+   gets. It is also counted separately in
+   `yuzu_auth_topology_floor_denied_total{permission}`, so an operator can
+   alert on floored denials specifically rather than parsing audit-log
+   text.
+
+**Deliberately NOT floored, on purpose:**
+
+- **`Security:Read`** — considered and excluded because it is too coarse
+  for this purpose. It also gates quarantine visibility, CA issued-certs
+  (`GET /api/v1/ca/issued` and its `list_issued_certs` MCP twin),
+  `/ca/root-csr`, and KEK status — all operational reads, not authorization
+  topology. Flooring `Security:Read` wholesale would have swept those four
+  in too, denying them to non-admins on RBAC-off installs where they
+  currently work. This is exactly why the engine-principal reads were cut
+  to their own `EnginePrincipal` securable rather than floored on
+  `Security:Read` directly — a floor can only be as narrow as the
+  securable it keys on.
+- **`ApiToken:Read`** and **`ManagementGroup:Read`** — considered and
+  excluded for the same reason: they are operational data, not
+  authorization topology.
+
+The floor is **not configurable** — there is no toggle that widens it back
+open; a footgun that can re-open a security floor is not a feature. See
+`docs/security-reviews/authz-topology-floor-2026-08-05.md` for the full
+recorded decision, including why the floor is keyed on `(securable,
+operation)` rather than route path (an MCP tool call and an unrelated MCP
+tool call share the same `/mcp/v1/` wire path, so a route-keyed floor
+cannot distinguish `list_engine_roles` from `list_issued_certs`), and why
+`Viewer` keeps `EnginePrincipal:Read` under RBAC-enabled enforcement (a
+narrower RBAC-on role model is a separate decision from closing the
+RBAC-off gap, not taken here).
+
+**No schema migration.** `seed_defaults()` runs unconditionally on every
+`RbacStore` construction and its seed loops are `INSERT OR IGNORE`, so an
+existing deployment picks up the `EnginePrincipal` securable and its grants
+on the next boot with no migration required — the same mechanism that
+introduced `AccessReview` and `SoftwareLicensing`. A migration is needed
+only when a change cannot be expressed as an idempotent additive re-seed
+(`rbac_store.cpp`'s v4 migration *deletes* rows, which is why it needed
+one).
 
 ## On-behalf-of assertions rejected (ADR-1005 Interim rules)
 
@@ -1712,8 +1810,10 @@ walkthrough.
   behind a one-time secret-reveal panel, revoked rows showing `superseded_by` +
   revoke detail).
 - **REST gating:** every *mutating* route is human-admin + MFA-step-up gated;
-  the three read routes (list, get, `audit/no-admin`) are human-admin + RBAC
-  gated (`Security:Read`/`AuditLog:Read`) but not step-up gated. Every route —
+  the three read routes are human-admin + RBAC gated but not step-up gated —
+  list and get on `EnginePrincipal:Read` (moved off the over-broad
+  `Security:Read` by #2376, see "The authorization topology floor" above), and
+  `audit/no-admin` on `AuditLog:Read`. Every route —
   reads included — structurally denies a caller whose own session is
   engine-classed (`principal_kind="engine"` / `auth_source="engine_token"`, the
   §9 belt): an engine principal can never read or mutate its own or another
@@ -1733,8 +1833,23 @@ walkthrough.
   outright, never truncated, below the floor), a ~120-second grace window
   that re-serves the same successor secret on a same-caller retry, and a
   60-second background sweep that auto-revokes the predecessor once its
-  overlap window elapses and warns (an operational, non-security signal) on
-  an unused successor nearing expiry. **Confirm replay classification (#2404):**
+  overlap window elapses — **unless the successor was never presented at
+  all** (governance UP-5): a dropped/lost successor secret must never leave
+  the principal at zero usable credentials, so that predecessor is left
+  active and the operational, non-security `successor_unused` warning is
+  raised again past the window's own end. Note the three signals do NOT
+  share a cadence (`rotation_warn_dedup.hpp`): the **log line** repeats
+  every tick for as long as the pair stays stuck, while the **audit row and
+  its metric** fire once per pair per state — once pre-elapse, once more on
+  crossing into elapsed. The row records that the decline happened; an
+  un-throttled row would be ~1440/day per stuck pair into the audit store,
+  which is itself a retention hazard. Do not build a stuck-pair alert on
+  `increase(...{reason="successor_unused"})` — it will fire once and never
+  again; the alertable signal is tracked in #2969. The sweep's per-tick
+  auto-revoke is bounded
+  (`kMaxAutoRevokesPerTick`) so a clock jump degrades to a multi-tick drain
+  rather than a fleet-wide cutover in one tick.
+  **Confirm replay classification (#2404):**
   a `confirm` replayed after its own rotation already resolved returns a
   *terminal* conflict (REST `409` / MCP `kInvalidParams`), never a retryable
   `503`, so an agentic client honouring the tool's `idempotentHint` stops
@@ -1775,6 +1890,201 @@ walkthrough.
     revived account). The orphaned principal keeps authenticating on its own
     `principal_type='engine'` credential and never derived authority from the
     owner, so the departed user gains nothing. Alert on the metric.
+
+## Human API-token rotation (P2 #11, SOC 2 CC6.3)
+
+Self-service overlap-pair rotation for **human-owned** API tokens —
+`ApiTokenStore::rotate_token`/`confirm_token_rotation`
+(`server/core/src/api_token_store.hpp`), the human-arm sibling of
+`rotate_engine_credential`/`confirm_rotation` documented under "Engine
+principals & delegation" → "Overlap-pair credential rotation" above. This
+section covers the capability's design rationale; the wire surface, error
+matrix, and telemetry are documented once each, cross-referenced below —
+this section does not restate them.
+
+- **Token-keyed, not principal-keyed — because a human is not an engine
+  principal.** The engine arm arbitrates on a **≤2-active-credentials-PER-
+  PRINCIPAL** ceiling, which is sound because an engine principal has
+  exactly one credential by design. That invariant is **false** for a human:
+  `principal_id` is a username, and one person routinely holds several
+  unrelated named tokens at once (a CI token, a personal automation token, an
+  MCP token). A principal-wide ceiling would therefore block rotating *any*
+  one of those tokens the moment the user held a third, unrelated one — a
+  defensive rejection that has nothing to do with the token actually being
+  rotated. `rotate_token`/`confirm_token_rotation` instead key on the TOKEN
+  being rotated and enforce the ≤2 ceiling **per `rotation_group`** — a
+  human's other, unrelated active tokens never count against it
+  (`api_token_store.hpp` "Human arm" doc block). The advisory lock is still
+  taken on `hashtext(principal_id)`, the same key the engine arm and the
+  T12 maintenance sweep use, so all rotation activity for one principal
+  — human or engine — still serializes.
+- **This distinction was caught at plan review, before any code existed** —
+  a copy of the engine arm's principal-keyed ceiling would have shipped a
+  control that silently blocked rotation for any user with more than two
+  tokens. See `docs/security-reviews/human-token-rotation-2026-08-10.md` for
+  the review record.
+- **The identical class of defect then recurred one layer up, in the REST
+  route, and was caught a second time.** The route's successor lookup
+  (needed to return the freshly-minted token's `token_id`/`expires_at`)
+  initially copied the engine rotate route's inline "linked-row" loop —
+  sound only under that route's own per-principal ≤2 ceiling, unsound here,
+  where several independent in-flight rotations can exist per principal.
+  Reproduced against live Postgres and fixed by extracting the derivation
+  into one shared, DB-free, unit-testable seam — `derive_rotation_successor`
+  (`server/core/src/token_rotation_lookup.hpp`) — so the REST route today
+  and the MCP twin landing separately both call the same function, rather
+  than each risking its own copy of the same defect. Full reproduction
+  narrative and reviewer attribution:
+  `docs/security-reviews/human-token-rotation-2026-08-10.md`.
+- **Self-service only, enforced at the store seam — not merely the route.**
+  Both `rotate_token` and `confirm_token_rotation` reject unless
+  `requesting_user` equals the resolved token row's own `principal_id`,
+  checked inside the store itself (both in a pre-transaction lookup and
+  again, authoritatively, on the fresh re-read under the advisory lock — the
+  route-level ownership check that runs first is defense-in-depth on top of
+  this, not a substitute for it). This is a deliberate asymmetry with the
+  engine arm, where the requesting caller is a third-party admin by design:
+  a **human** token's raw successor secret authenticates *as that user*, so
+  an admin re-serving or confirming another user's rotation would be handed
+  (or would complete the cutover of) a credential that impersonates someone
+  else — identity takeover, not a permission gap an admin override could
+  legitimately cross. An admin who needs to act on another user's token has
+  `revoke_token`/`revoke_for_principal` instead; there is no rotate-as-admin
+  path, by design.
+- **Under RBAC-on, this composes into an effectively admin-only rotation
+  path — a pre-existing property of the surface, not a new caveat.** REST
+  rotate/confirm gate on `ApiToken:Rotate` — deliberately its own operation,
+  distinct from `ApiToken:Write`'s create/list/revoke axis (round-3 security
+  finding; see the `mcp_policy.hpp` `tier_allows()` operator-tier comment for
+  the full narrative on why a shared op string was rejected) — which the
+  RBAC seed data (`rbac_store.cpp:397,480,662`) grants only to
+  `Administrator` and `ApiTokenManager` — no other built-in role (`Operator`,
+  `PlatformEngineer`, `Viewer`, `ITServiceOwner`) holds it. Composed with the
+  self-service-only requirement immediately above (no admin override), an
+  `Operator`- or `Viewer`-role user who owns a token has **no** RBAC-on path
+  to rotate it themselves, and no admin can do it on their behalf either —
+  the token cannot be rotated by anyone until its owner is separately
+  granted `ApiToken:Rotate`. This mirrors the posture of the surface's other
+  operations — `POST /api/v1/tokens` (create) is gated on `ApiToken:Write`;
+  `DELETE /api/v1/tokens/{id}` is gated on the sibling `ApiToken:Delete`
+  operation (`rest_api_v1.cpp:2624`) — and the RBAC seed data grants all
+  three operations to the same two roles (`Administrator`,
+  `ApiTokenManager`) and to no others, so the admin-only conclusion holds
+  identically across create, delete, and rotate. It is stated here because
+  "self-service" throughout this section means *self-service subject to
+  holding the relevant `ApiToken:*` grant*, never *available to any
+  authenticated owner*.
+- **Not an ownership-enumeration oracle.** The non-owner rejection is folded
+  into the exact same wording the genuinely-nonexistent-token case uses
+  (`"no such token to rotate"` / `"no such token to confirm"`) — a caller
+  cannot distinguish "this token doesn't exist" from "this token exists but
+  isn't yours" from the error text alone. Mirrors the posture the human
+  `DELETE /api/v1/tokens/{id}` route already takes for a non-owner.
+- **Lifetime-neutral by deliberate choice — rotation cannot be used to
+  extend a grant.** The successor's absolute `expires_at` always inherits
+  the predecessor's verbatim (a perpetual token stays perpetual; a 30-day
+  token stays a 30-day token measured from its own original grant) — never
+  recomputed as `now + 90d`, which would silently extend authorization
+  lifetime through what should be a lateral credential swap. The store-level
+  API retains an internal `successor_expires_at` override parameter (reused
+  by the engine arm's own successor-TTL logic), but the REST route
+  deliberately does not expose it — a senior-architecture ruling, recorded
+  in the security review, that rotation must read as lifetime-neutral in
+  CC6.3 evidence with no caller-controlled escape hatch. A caller that
+  genuinely needs a longer-lived replacement mints a fresh token via `POST
+  /api/v1/tokens` instead, which is a distinct, separately-audited action.
+- **Confirm error taxonomy is adjudicated, not ad hoc** — the state
+  classifier (`rotation_confirm_state.hpp`'s
+  `classify_confirm_state_in_group`, the group-scoped sibling of the
+  engine arm's `classify_confirm_state`) distinguishes a POSITIVE fact
+  (`kGroupEmpty` — the principal-wide active read succeeded and returned
+  rows, but none carry the pinned `rotation_group`: the rotation has
+  already resolved) from a genuinely AMBIGUOUS one (`kAmbiguousEmpty` — the
+  principal-wide read came back empty, indistinguishable from a swallowed
+  `SELECT` failure). `kGroupEmpty` classifies `Conflict` (REST `409` / MCP
+  `kInvalidParams`, terminal — "rotate again if a new rotation is needed",
+  never retry the same confirm); `kAmbiguousEmpty` stays `Transient` (REST
+  `503`, retryable). An earlier round had this backwards — `kGroupEmpty` as
+  `Transient` — which independent architect adjudication corrected before
+  merge: reusing a retryable classification on a permanently-failing state
+  would make a conforming agentic client (one that honours the tool's
+  `idempotentHint`) retry that exact call forever. See the "Confirm replay
+  classification (#2404)" bullet under the engine arm above for the
+  precedent this decision follows, and
+  `engine_store_error_class.hpp`'s file-level doc comment for the shared
+  classifier both transports read through.
+- **Store-layer scope only in this branch.** REST:
+  `POST /api/v1/tokens/{id}/rotate` / `.../confirm`
+  (`docs/user-manual/rest-api.md` "API Tokens" for the REST reference,
+  `docs/user-manual/authentication.md` "Rotating a Token" for the operator
+  walkthrough) — self-service, gated on
+  `ApiToken:Rotate` (the human permission axis, distinct from
+  `ApiToken:Write`'s create/list/revoke axis; **not** `Security:Write`,
+  which gates the engine admin surface), MFA step-up re-validated on every
+  call including an idempotent grace-window re-serve. Telemetry:
+  `docs/observability-conventions.md` + `docs/user-manual/metrics.md`
+  "Human API-token confirm metric (P2 #11)" (`yuzu_api_token_rotation_*`,
+  `yuzu_api_token_confirm_total`, both kind-discriminated from the engine
+  family at the one `rotation_sweep_names_for_kind` chokepoint,
+  `rotation_sweep_naming.hpp`). Audit:
+  `docs/user-manual/audit-log.md` (`api_token.rotate`, `api_token.confirm`,
+  `api_token.reveal`, `api_token.rotation.auto_revoke`,
+  `api_token.rotation.successor_unused`). **MCP tool twins
+  (`rotate_api_token` / `confirm_api_token_rotation`) have shipped as of
+  this section** — see `docs/mcp-server.md` "Human API-token rotation
+  tools" and `docs/user-manual/mcp.md` rows 70–71 for the MCP-side
+  reference; REST and MCP now have full parity on this surface.
+- **The authority-inheritance guard closes the escalation direction, but is
+  not equivalent to gating `Rotate` the way `Delete` is gated (governance
+  Gate 8 follow-up).** Equality between the caller's own current
+  `mcp_tier`/`scope_service` and the predecessor's guarantees no privilege
+  GAIN — a rotation can never mint more authority than the caller already
+  holds. It does not, on its own, make `rotate`/`confirm` net-neutral with
+  `revoke`/`delete`: `mcp_policy.hpp`'s `requires_approval()` has no
+  `ApiToken` rule at all, so at `supervised` tier a `Delete` call goes
+  through the approval workflow and a `Rotate`/`confirm` pair does not. A
+  caller can therefore rotate-then-confirm a same-principal sibling token of
+  equal tier and scope — destroying its predecessor and revealing a fresh
+  successor secret to themselves — with neither `ApiToken:Delete` nor a
+  supervised-tier approval. No privilege gain, but a real residual:
+  availability (the sibling's predecessor is destroyed) plus cross-consumer
+  credential capture, within one principal's own tokens.
+- **The guard also blocks the DE-escalating direction — an undocumented-
+  until-now capability loss, not a defect.** The guard is equality, not "no
+  broader than": a cookie or JIT-elevated interactive session carries an
+  empty `mcp_tier`/`scope_service`, which matches an untiered predecessor
+  but does **not** match a token that itself carries a tier or scope. So
+  the owner of an MCP-tiered or service-scoped token cannot rotate or
+  confirm it from the dashboard or a plain interactive REST session at
+  all — only the holder of that token's own secret (or an equally-tiered
+  session) can. This is backwards precisely when the token's secret is the
+  thing under suspicion, which is the main reason anyone rotates. Whether
+  to widen the guard to admit a strictly-higher-authority session rotating
+  a narrower token is an open product decision, not made by this fix — see
+  `docs/user-manual/authentication.md` "Rotating a Token" for the
+  operator-facing statement of both points, and
+  `docs/user-manual/rest-api.md`'s rotate/confirm error matrices for the
+  wire-level `400` row this adds. The `"no such token to rotate"`/`"...to
+  confirm"` wording is identical for this case and for absent/not-owned
+  by design (not an authority-probing oracle) — it is therefore misleading
+  for a token that exists and is genuinely the caller's own; this is
+  recorded, not changed, since disambiguating the wording would reopen the
+  oracle it exists to close.
+- **Known residual gaps, tracked, not fixed by this capability:** three
+  pre-existing issues were surfaced while building this feature and filed
+  rather than folded in silently — `#2943` (a confirm-path fallthrough
+  shared by both arms that the human arm inherits), `#2944` (an
+  engine-only defect; this feature's own REST route does not have it), and
+  `#2945` (security-labelled, an open credential-**minting** escalation on
+  the `ApiToken:Write` chokepoint — distinct from this feature's own
+  rotate/confirm routes, which now gate on the separate `ApiToken:Rotate`
+  operation seeded to the SAME two roles). None is a defect *in* the shipped
+  rotation code itself. Full
+  detail, mechanism, and compensating-control status — `#2945` in
+  particular is **not** merely "unrelated and tracked separately"; it is
+  recorded as an open risk against the sibling `ApiToken:Write` mint
+  surface — are in the security review's "Open risks" section:
+  `docs/security-reviews/human-token-rotation-2026-08-10.md`.
 
 ## Agent enrollment (3 tiers)
 

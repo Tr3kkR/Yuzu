@@ -19,6 +19,8 @@
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
+#include "authz_model.hpp" // yuzu::server::authz::VisibleSet (#1788 / CDX-R7-02)
+
 namespace yuzu::server {
 
 // Forward declarations
@@ -48,10 +50,25 @@ public:
     using AgentsJsonFn = std::function<std::string()>;
 
     /// Send command callback — dispatches a command and returns (command_id, agents_reached).
+    ///
+    /// CDX-R7-02: carries the caller's Execution:Execute visible set as a
+    /// trailing param so the dashboard execute surface narrows to it via the
+    /// shared `dispatch_confined` seam, exactly as /api/command and MCP do.
+    /// nullopt == unfiltered.
     using DispatchFn = std::function<std::pair<std::string, int>(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
-        const std::unordered_map<std::string, std::string>& parameters)>;
+        const std::unordered_map<std::string, std::string>& parameters,
+        const yuzu::server::authz::VisibleSet& exec_visible)>;
+
+    /// CDX-R7-02: resolves the caller's Execution:Execute visible set from the
+    /// request (the dashboard execute handlers gate via `perm_fn_` and hold no
+    /// Session object at the dispatch site). Wired in server.cpp to a closure
+    /// that resolves the session and calls `derive_exec_visible`; an UNWIRED
+    /// callback fails CLOSED (the handler passes a present-EMPTY set — deny all,
+    /// never nullopt).
+    using ExecVisibleFn =
+        std::function<yuzu::server::authz::VisibleSet(const httplib::Request&)>;
 
     /// Resolve instruction text → (plugin, action). Empty strings on failure.
     using ResolveFn = std::function<std::pair<std::string, std::string>(
@@ -68,6 +85,7 @@ public:
                          detail::EventBus* event_bus,
                          AgentsJsonFn agents_json_fn,
                          DispatchFn dispatch_fn,
+                         ExecVisibleFn exec_visible_fn,
                          ResolveFn resolve_fn,
                          yuzu::MetricsRegistry* metrics = nullptr,
                          InstructionStore* instruction_store = nullptr);
@@ -88,6 +106,7 @@ public:
                          detail::EventBus* event_bus,
                          AgentsJsonFn agents_json_fn,
                          DispatchFn dispatch_fn,
+                         ExecVisibleFn exec_visible_fn,
                          ResolveFn resolve_fn,
                          yuzu::MetricsRegistry* metrics = nullptr,
                          InstructionStore* instruction_store = nullptr);
@@ -118,10 +137,24 @@ private:
     InstructionStore* instruction_store_{nullptr};
     AgentsJsonFn agents_json_fn_;
     DispatchFn dispatch_fn_;
+    ExecVisibleFn exec_visible_fn_;
     ResolveFn resolve_fn_;
     yuzu::MetricsRegistry* metrics_{nullptr};
 
     // -- Fragment renderers ---------------------------------------------------
+
+    /// Resolves the column-name list @ref render_results and @ref
+    /// col_index_for_name should render/sort against: index 0 is always
+    /// "Agent", followed by the InstructionDefinition's `result_schema`-
+    /// derived columns (via ResponseTemplatesEngine::synthesise_default)
+    /// when @p definition_id names a definition with a non-empty schema,
+    /// falling back to `columns_for_plugin(plugin)` otherwise. This is the
+    /// PR1.7 remediation fix for issue where a schema-only action (no
+    /// `spec.visualization`, e.g. registry's list_profiles) rendered every
+    /// data column as suppressed because `columns_for_plugin` only knows a
+    /// fixed per-plugin schema, not a per-action one.
+    std::vector<std::string> resolve_render_columns(const std::string& plugin,
+                                                     const std::string& definition_id) const;
 
     /// Render filtered/sorted/paginated result rows + OOB thead, pagination,
     /// summary. When @p definition_id is non-empty AND the definition has a
@@ -152,11 +185,15 @@ private:
                                    const std::string& definition_id = {},
                                    const std::string& template_id = {});
 
-    /// Render group creation form.
+    /// Render group creation form. `agent_count` nullopt (#2691, Doomgoose
+    /// finding #7) renders an honest "count unavailable" hint instead of a
+    /// number — the store read that produces it can degrade, and "0 agents
+    /// will be added" is a materially different, wrong claim from "the count
+    /// could not be determined".
     std::string render_create_group_form(const std::string& command_id,
                                           const std::string& plugin,
                                           const std::vector<FacetFilter>& filters,
-                                          int64_t agent_count);
+                                          std::optional<int64_t> agent_count);
 
     /// Render scope list with groups section.
     std::string render_scope_list(const std::string& selected, const std::string& username);
@@ -202,6 +239,15 @@ private:
     // HTTP server needs to wire them directly. Test-only; grants no runtime
     // surface. See tests/unit/server/test_dashboard_tar_retention.cpp.
     friend struct DashboardTarRetentionTestAccess;
+
+    // Unit-test seam (PR1.7 remediation, Gate 3 architect + quality-engineer
+    // finding): resolve_render_columns/render_results and their inputs
+    // (instruction_store_, response_store_) are private, and the schema-aware
+    // column resolution this fix added had no test at this layer -- only the
+    // ResponseTemplatesEngine::synthesise_default primitive it calls was
+    // pinned. Test-only; grants no runtime surface. See
+    // tests/unit/server/test_dashboard_results_columns.cpp.
+    friend struct DashboardResultsColumnsTestAccess;
 };
 
 } // namespace yuzu::server

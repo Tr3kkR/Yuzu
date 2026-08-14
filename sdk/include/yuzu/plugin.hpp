@@ -73,6 +73,20 @@ public:
 
     void report_progress(int percent) { yuzu_ctx_report_progress(raw_, percent); }
 
+    /**
+     * Report the CC-07 typed result status for the command currently
+     * executing (ABI v4+). Optional — a plugin that never calls this leaves
+     * the status YUZU_RESULT_STATUS_UNDECLARED and the agent derives a
+     * coarse one from execute()'s int return code instead. See
+     * yuzu_ctx_set_result_status() in plugin.h for the full contract.
+     */
+    void set_result_status(YuzuResultStatus status, YuzuResultCompleteness completeness,
+                           std::string_view provenance = {}) {
+        const std::string owned{provenance};
+        yuzu_ctx_set_result_status(raw_, status, completeness,
+                                   owned.empty() ? nullptr : owned.c_str());
+    }
+
 private:
     YuzuCommandContext* raw_;
 };

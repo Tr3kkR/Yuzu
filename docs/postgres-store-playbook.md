@@ -167,6 +167,43 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
   config/reference/audit data survives previous-release-SQLite → new-release-Postgres.
 - **Port the transaction owner**: `SqliteTxn`/`SqliteStmt` → `pool.with_txn` (multi-statement
   invariants) or a single autocommit statement (single-statement mutate-and-return).
+- **Local source absence never creates terminal migration state on its own** (ADR-0040 round 3,
+  Sol's diagnosis, #2697). A process that finds no legacy SQLite file at its configured path
+  cannot distinguish "this is a genuine fresh install" from "this replica just doesn't hold the
+  file — a sibling does." Marking a migration COMPLETE from that observation alone is silently
+  unsound: it forecloses the real migration for whichever host does hold the file, and no
+  amount of guarding on the sourceless side closes the gap, because the sourceless process is
+  telling the truth about what IT knows, not about the fleet. The fix has two parts, and the
+  first alone is insufficient: (1) restrict *which* callers may declare "no source, nothing to
+  migrate" — a one-shot CLI is never trusted to, only a full boot; (2) **on the HOLDER side**, a
+  process that finds the completion marker already set but still holds its own legacy file must
+  not trust that marker blindly — verify the file's content was actually what got migrated
+  (`AuditStore` does this by fingerprint: a durable hash-shaped value written in the SAME
+  transaction as the completion marker, re-derived from the file and compared at every later
+  boot that still finds it) and refuse to serve on a mismatch, rather than silently reporting
+  success over a trail nobody streamed. `ManagementGroupStore` and `ResultSetStore` share the
+  first-generation `if (!legacy_exists) → mark complete` shape this closes; porting the
+  holder-side check to them is tracked, not yet done (#2697 deferred this ladder-wide — the fix
+  landed for AuditStore only, as the mandatory-evidence case).
+- **Long-lived migration branches accumulate test-file drift against the pre-migration API —
+  budget for it on every `dev`-merge, not just the first.** Any test file that constructs the
+  store via its old constructor fails to compile once the branch merges current `origin/dev` —
+  whether that file already existed and gained new cases in `dev` while the migration branch was
+  in flight, or is brand new, added by an unrelated, already-merged PR that forked before the
+  migration branch did. The CI merge-ref build fails on all platforms either way; this is not a
+  defect in the migrating branch's own work, and it recurred twice within `AuditStore`'s own
+  migration (#2697): once against an existing file gaining cases in `dev`, once against a
+  brand-new file from an unrelated already-merged PR. The fix is always the same mechanical
+  shape: migrate the test's construction to `PgTestTemplate`/`PgPool` following an established
+  Harness in the same directory, reconcile any call site relying on the old return type (the
+  previous bullet's decision on authoritative-read typing), give the migrated fixture its own
+  explicit `if (pg_admin_dsn_env() == nullptr) SKIP(...)` guard if it has no earlier-constructed
+  PG member to inherit one from (copying a Harness's SKIP-via-earlier-member shape onto a
+  fixture that lacks that earlier member silently turns "skip locally" into "hard-fail
+  locally"), and tag `[pg]` on exactly the `TEST_CASE`s whose bodies construct the migrated
+  fixture — verified per case, never blanket-applied to the file. A branch expected to outlive a
+  single `dev`-sync cycle should re-sync frequently: a smaller delta is easier to triage for
+  which changed test file touches the store's old constructor.
 
 ## Anti-patterns reviewers reject
 
@@ -175,10 +212,54 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
 - Holding a lease across an HTTP call, file I/O, or a second store call (deadlock / starvation).
 - Unqualified runtime table names (works in a migration, breaks on a pooled connection).
 - `sqlite3_changes()`-style mutate-then-count. Use `RETURNING`.
+- Trusting `PQresultStatus() == PGRES_COMMAND_OK` on an `INSERT ... ON CONFLICT DO NOTHING` to mean
+  YOUR value won. It only means the statement executed — true whether the row inserted or silently
+  no-opped on conflict. A "first writer wins" contract (a completion marker, a trust-anchor
+  fingerprint, an idempotency key) needs `PQcmdTuples()` (`"0"` = lost the race) or `RETURNING` +
+  `PQntuples()` to actually answer "did MY write land". `AuditStore::stamp_complete` (ADR-0040,
+  #2697) is the worked example: checking only statement status let a real backfill that lost this
+  exact race report success while a different writer's value sat at the trust anchor — the same
+  silent-discard shape as the `sqlite3_changes()` pitfall above, just on `ON CONFLICT DO NOTHING`
+  rather than a mutate-then-count.
 - A plaintext secret column. Use `SecretCodec` / verify-only hash.
 - A new server **SQLite** store (ADR-0006 forbids it without an exception ADR).
 - A `CREATE INDEX CONCURRENTLY` / `VACUUM` / `ALTER TYPE ADD VALUE` smuggled into a
   `PgMigration` — it cannot run in the runner's transaction (see below).
+- A **counting aggregate** (`count(*)`, `count(*) FILTER (...)`) where the question is only
+  "does at least one row exist?" (`AuditStore`'s retention probe, ADR-0040). A count with no
+  statement-level `WHERE` visits every row before either count is known, including rows that sit
+  outside a partial index built for the "any?" question — full-scanning the one table designed
+  to grow without bound, on every pass. Use `EXISTS(SELECT 1 FROM t WHERE cond)` (or, when the
+  predicate is a range and the planner's selectivity estimate for that range cannot be trusted —
+  a wide window with real matches sparse and clustered at one end — `ORDER BY <indexed column>
+  LIMIT 1 ... IS NOT NULL`, which is plan-independent: a Seq Scan would need a full sort before
+  applying the `LIMIT`, so the index-ordered path wins regardless of the estimate).
+- A **fixed re-arm interval** on a capped, paced background pass (a retention sweep, a rollup, a
+  reconciliation loop) that never shortens when the cap keeps binding. If a pass hits its cap AND
+  a genuine backlog remains, the NEXT pass should re-arm on a short floor (seconds, not the full
+  interval) and keep doing so until a pass clears the backlog — otherwise the cap silently
+  becomes a permanent drain ceiling far below what the pass could actually sustain (`AuditStore`
+  measured this at ~700x: a docs section that quoted only the full-interval cadence as "the"
+  sustained ceiling was off by roughly three orders of magnitude once the re-arm floor was
+  accounted for). Document BOTH cadences wherever a "ceiling" figure is quoted — the quiet-
+  operation rate and the backlog-recovery rate are different numbers with different meanings,
+  and quoting only the first as a hard limit understates real capacity.
+- Assuming a per-operation `timeout` parameter (a `with_txn_for(kFooTimeout, ...)` call, or any
+  similarly-named constant) bounds **statement execution**. It only bounds the pool-ACQUIRE wait
+  (see "Pool connection setup†" below) — every connection the pool hands out carries the same
+  fixed, pool-wide `statement_timeout` GUC for actual query execution regardless of what the
+  caller's own timeout constant is named or documented to mean. An unqualified long-running query
+  (a full-table scan, an unindexed aggregate) needs its OWN explicit `SET LOCAL statement_timeout
+  = '<ms>'` as the first statement inside a `pool.with_txn`/`with_txn_for` callback — never a bare
+  `SET`, which leaks the widened deadline onto the connection's next, unrelated caller once it's
+  returned to the pool. This mismatch has recurred twice in this codebase without ever being
+  written down here: #2530 (a metrics sampler assuming a bounded-`acquire()` deadline also bounded
+  its query) and `AuditStore::migrate_from_sqlite`'s whole-file reconciliation scan (ADR-0040,
+  #2697 round 3) — the second one initially repeated the first's mistake even while citing it as
+  precedent, and initially hand-rolled `BEGIN`/`SET LOCAL`/`COMMIT`/`ROLLBACK` instead of using the
+  already-available `pool.with_txn` + `pg::PgTxn` RAII guard before a second review round caught
+  it. `SoftwareLicensingStore::count_stale_agents` is the clean reference implementation of the
+  correct shape.
 
 ## Non-transactional migrations (the deferred kind)
 

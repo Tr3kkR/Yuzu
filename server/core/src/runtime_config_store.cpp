@@ -1,4 +1,5 @@
 #include "runtime_config_store.hpp"
+#include "config_secret_keys.hpp"
 #include "migration_runner.hpp"
 
 #include <spdlog/spdlog.h>
@@ -40,6 +41,10 @@ const std::vector<std::string>& RuntimeConfigStore::allowed_keys() {
 
 bool RuntimeConfigStore::is_allowed_key(const std::string& key) {
     return std::find(kAllowedKeys.begin(), kAllowedKeys.end(), key) != kAllowedKeys.end();
+}
+
+bool RuntimeConfigStore::is_secret_key(const std::string& key) {
+    return is_secret_config_key(key); // the shared leaf; see config_secret_keys.hpp
 }
 
 // ── Constructor / destructor ─────────────────────────────────────────────────
@@ -95,6 +100,20 @@ void RuntimeConfigStore::create_tables() {
 // ── Queries ──────────────────────────────────────────────────────────────────
 
 std::vector<RuntimeConfigEntry> RuntimeConfigStore::get_all() const {
+    auto entries = get_all_with_secrets();
+    for (auto& e : entries) {
+        // An EMPTY secret stays empty. There is nothing to protect, and replacing it
+        // with the non-empty placeholder destroys the only signal a caller has for
+        // set-vs-unset: GET /api/config derives `is_set` from !value.empty(), so
+        // blanket replacement made `is_set` unconditionally true and no stored
+        // secret could ever report false.
+        if (is_secret_key(e.key) && !e.value.empty())
+            e.value = redacted_placeholder();
+    }
+    return entries;
+}
+
+std::vector<RuntimeConfigEntry> RuntimeConfigStore::get_all_with_secrets() const {
     std::vector<RuntimeConfigEntry> results;
     if (!db_)
         return results;
@@ -125,6 +144,14 @@ std::vector<RuntimeConfigEntry> RuntimeConfigStore::get_all() const {
 }
 
 std::optional<RuntimeConfigEntry> RuntimeConfigStore::get(const std::string& key) const {
+    auto entry = get_with_secrets(key);
+    if (entry && is_secret_key(entry->key) && !entry->value.empty())
+        entry->value = redacted_placeholder();
+    return entry;
+}
+
+std::optional<RuntimeConfigEntry>
+RuntimeConfigStore::get_with_secrets(const std::string& key) const {
     if (!db_)
         return std::nullopt;
 
@@ -161,6 +188,11 @@ std::string RuntimeConfigStore::get_value(const std::string& key) const {
     return entry ? entry->value : std::string{};
 }
 
+std::string RuntimeConfigStore::get_value_with_secrets(const std::string& key) const {
+    auto entry = get_with_secrets(key);
+    return entry ? entry->value : std::string{};
+}
+
 // ── Mutations ────────────────────────────────────────────────────────────────
 
 std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
@@ -171,6 +203,15 @@ std::expected<void, std::string> RuntimeConfigStore::set(const std::string& key,
 
     if (!is_allowed_key(key))
         return std::unexpected("key '" + key + "' is not a configurable runtime setting");
+
+    // The redaction placeholder is not a credential. GET /api/config omits a secret's
+    // value precisely so a round-tripping client cannot write this back -- but the
+    // startup log prints it, and a human copying that line reaches the same place.
+    // Storing it would break SSO and destroy the real secret, so refuse at the sink
+    // rather than relying on every caller to notice.
+    if (is_secret_key(key) && is_redaction_placeholder(value))
+        return std::unexpected("value is the redaction placeholder, not a credential; send the "
+                               "real secret, or omit the key to leave it unchanged");
 
     // Basic validation per key
     if (key == "heartbeat_timeout" || key == "response_retention_days" ||

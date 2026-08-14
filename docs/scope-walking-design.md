@@ -194,6 +194,18 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 string, a non-string value, or an explicit `null` returns `400 RESULT_SET_BAD_PARENT` rather
 than silently dropping the narrowing and running unscoped — a caller who believed it was
 narrowing to one result set must not search or dispatch across the whole fleet instead.
+
+**The three async producers are confined per device (#1788).** `from-tar-query`,
+`from-instruction-result` and `{id}/re-eval` DISPATCH to agents, so they are operator dispatch
+surfaces rather than reads. They admit on a global `Execution:Execute` grant and then reach the
+fleet by scope or `__all__` broadcast — so the caller's derived visible set, intersected at the
+shared `dispatch_confined_arms` seam, is their only per-device authorization. A service-scoped
+token reaches only its own service's agents; targets outside the caller's reach are dropped from
+the send set. A caller whose visible set admits none of the resolved targets receives the same
+`503 RESULT_SET_NO_AGENTS` as one whose scope genuinely matched nobody — deliberately
+indistinguishable, since a distinct status would disclose devices the caller may not see. If the
+server's visibility derivation is left unwired, these routes fail closed with an audited
+`500 RESULT_SET_GATE_UNCONFIGURED` rather than dispatching. See `docs/authz-model.md`.
 Explicit `null` is rejected rather than read as "absent", because a client that serialises an
 unset field as `null` and one whose parent lookup returned nothing are indistinguishable at that
 point, and only one of them wants everything. Refusals are counted as

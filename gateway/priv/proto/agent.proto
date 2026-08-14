@@ -211,6 +211,23 @@ message CommandResponse {
   string plugin  = 7;
   string action  = 8;
   bytes  payload = 9;
+
+  // CC-07 plugin→host typed result-status seam (ABI4, sdk/include/yuzu/plugin.h).
+  // Mirrors the canonical proto/yuzu/agent/v1/agent.proto field 10 (PR1.1) so
+  // gpb does not silently drop it in transit — both gateway copies (this
+  // file and priv/proto/yuzu/agent/v1/agent.proto) must carry it, and the
+  // gateway re-marshals this CommandResponse through gateway_pb when wrapping
+  // it, so gateway_pb's CommandResponse (via import) needs it too. This is the
+  // plugin→host CC-07 status ONLY — not the subprocess-runner
+  // termination-reason enum, which is a separate, out-of-scope concept.
+  enum PluginResultStatus {
+    PLUGIN_RESULT_UNDECLARED        = 0;
+    PLUGIN_RESULT_OK                = 1;
+    PLUGIN_RESULT_UNAVAILABLE       = 2;
+    PLUGIN_RESULT_PERMISSION_DENIED = 3;
+    PLUGIN_RESULT_CONSTRAINED       = 4;
+  }
+  PluginResultStatus plugin_result_status = 10;
 }
 
 // ── Inventory ─────────────────────────────────────────────────────────────────

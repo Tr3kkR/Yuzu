@@ -15,6 +15,7 @@
  */
 
 #include "instruction_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "response_store.hpp"
 #include "test_route_sink.hpp"
@@ -28,16 +29,27 @@
 
 #include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
 
 fs::path uniq(const std::string& prefix) {
     return yuzu::test::unique_temp_path(prefix + "-");
 }
+
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
 
 struct AuditRecord {
     std::string action;
@@ -50,7 +62,7 @@ struct AuditRecord {
 struct VizHarness {
     yuzu::server::test::TestRouteSink sink;
 
-    fs::path inst_db, resp_db;
+    fs::path inst_db;
     std::unique_ptr<InstructionStore> instruction_store;
     std::unique_ptr<ResponseStore> response_store;
 
@@ -59,10 +71,9 @@ struct VizHarness {
 
     RestApiV1 api;
 
-    explicit VizHarness(RestApiV1::ResponseScopeFn scope_fn = {})
-        : inst_db(uniq("rest-viz-inst")), resp_db(uniq("rest-viz-resp")) {
+    explicit VizHarness(pg::PgPool& pool, RestApiV1::ResponseScopeFn scope_fn = {})
+        : inst_db(uniq("rest-viz-inst")) {
         fs::remove(inst_db);
-        fs::remove(resp_db);
         instruction_store = std::make_unique<InstructionStore>(inst_db);
         REQUIRE(instruction_store->is_open());
         // #1073: InstructionStore defaults to require_signed_definitions=true.
@@ -70,8 +81,7 @@ struct VizHarness {
         // normalisation, not the signature gate — opt out so unsigned
         // fixtures still pass.
         instruction_store->set_require_signed_definitions(false);
-        response_store = std::make_unique<ResponseStore>(resp_db, /*retention=*/0,
-                                                         /*cleanup_interval=*/60);
+        response_store = std::make_unique<ResponseStore>(pool, /*retention_days=*/0);
         REQUIRE(response_store->is_open());
 
         auto auth_fn = [](const httplib::Request&,
@@ -136,11 +146,9 @@ struct VizHarness {
     ~VizHarness() {
         response_store.reset();
         instruction_store.reset();
-        for (auto& p : {inst_db, resp_db}) {
-            fs::remove(p);
-            fs::remove(p.string() + "-wal");
-            fs::remove(p.string() + "-shm");
-        }
+        fs::remove(inst_db);
+        fs::remove(inst_db.string() + "-wal");
+        fs::remove(inst_db.string() + "-shm");
     }
 
     /// Insert a definition with the given visualization spec and return its id.
@@ -177,8 +185,10 @@ struct VizHarness {
 
 } // namespace
 
-TEST_CASE("REST visualization: missing definition_id → 400", "[rest][visualization][validation]") {
-    VizHarness h;
+TEST_CASE("REST visualization: missing definition_id → 400", "[pg][rest][visualization][validation]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
     auto res = h.sink.Get("/api/v1/executions/cmd-001/visualization");
     REQUIRE(res);
     CHECK(res->status == 400);
@@ -192,11 +202,13 @@ TEST_CASE("REST visualization: missing definition_id → 400", "[rest][visualiza
 }
 
 TEST_CASE("REST visualization: malformed definition_id → 400",
-          "[rest][visualization][validation]") {
+          "[pg][rest][visualization][validation]") {
     // Closes governance sec-F3 / C-15: REST regex bound matches the
     // dashboard fragment; an unbounded value no longer flows into SQL
     // bind / audit / log without validation.
-    VizHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
     auto res =
         h.sink.Get("/api/v1/executions/cmd-001/visualization?definition_id=evil%22%3E%3Cscript%3E");
     REQUIRE(res);
@@ -207,11 +219,13 @@ TEST_CASE("REST visualization: malformed definition_id → 400",
 }
 
 TEST_CASE("REST visualization: perm_fn denies → 403, no audit emission",
-          "[rest][visualization][rbac]") {
+          "[pg][rest][visualization][rbac]") {
     // Closes governance qe-1: 403 path was untested. A future change that
     // accidentally inverts the permission check would silently expose an
     // operator-only endpoint to lower-privileged sessions.
-    VizHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
     h.perm_grant = false;
     auto res = h.sink.Get("/api/v1/executions/cmd-001/visualization?definition_id=does-not-exist");
     REQUIRE(res);
@@ -249,8 +263,10 @@ TEST_CASE("REST visualization: null stores → 503", "[rest][visualization][unav
     CHECK(res->body.find("service unavailable") != std::string::npos);
 }
 
-TEST_CASE("REST visualization: unknown definition_id → 404", "[rest][visualization][not_found]") {
-    VizHarness h;
+TEST_CASE("REST visualization: unknown definition_id → 404", "[pg][rest][visualization][not_found]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
     auto res = h.sink.Get("/api/v1/executions/cmd-001/visualization?definition_id=does-not-exist");
     REQUIRE(res);
     CHECK(res->status == 404);
@@ -258,8 +274,10 @@ TEST_CASE("REST visualization: unknown definition_id → 404", "[rest][visualiza
 }
 
 TEST_CASE("REST visualization: definition without spec.visualization → 404",
-          "[rest][visualization][not_found]") {
-    VizHarness h;
+          "[pg][rest][visualization][not_found]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
     auto def_id = h.make_def(""); // no visualization configured
     auto res = h.sink.Get("/api/v1/executions/cmd-001/visualization?definition_id=" + def_id);
     REQUIRE(res);
@@ -268,8 +286,10 @@ TEST_CASE("REST visualization: definition without spec.visualization → 404",
 }
 
 TEST_CASE("REST visualization: pie chart over procfetch responses → 200 with buckets",
-          "[rest][visualization][round_trip]") {
-    VizHarness h;
+          "[pg][rest][visualization][round_trip]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
     auto spec = R"({"type":"pie","processor":"single_series","labelField":1,
                     "title":"Top procs"})";
     auto def_id = h.make_def(spec, "procfetch");
@@ -311,8 +331,10 @@ TEST_CASE("REST visualization: pie chart over procfetch responses → 200 with b
 }
 
 TEST_CASE("REST visualization: multi-chart definition (#587)",
-          "[rest][visualization][multi_chart]") {
-    VizHarness h;
+          "[pg][rest][visualization][multi_chart]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
     // Two charts on a single definition, supplied via the canonical
     // `visualizations` array shape that import normalises into the
     // visualization_spec column.
@@ -383,14 +405,16 @@ TEST_CASE("REST visualization: multi-chart definition (#587)",
 }
 
 TEST_CASE("REST visualization: legacy single-object spec is still index-0 reachable",
-          "[rest][visualization][multi_chart][backward_compat]") {
+          "[pg][rest][visualization][multi_chart][backward_compat]") {
     // Operators authoring a single chart can still use the singular
     // `visualization` block; the engine + store treat it equivalently
     // to a 1-element array (the import path normalises, the engine
     // count() / chart_at() tolerate both shapes for any rows that
     // bypass normalisation — e.g. tests calling create_definition
     // directly).
-    VizHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
     auto spec = R"({"type":"pie","processor":"single_series","labelField":1})";
     auto def_id = h.make_def(spec, "procfetch");
 
@@ -406,12 +430,14 @@ TEST_CASE("REST visualization: legacy single-object spec is still index-0 reacha
 }
 
 TEST_CASE("REST visualization: snake_case keys still accepted as legacy alias",
-          "[rest][visualization][backward_compat]") {
+          "[pg][rest][visualization][backward_compat]") {
     // The DSL surface migrated to camelCase (governance dsl-B2). The engine
     // accepts the old snake_case names as deprecated aliases so any
     // pre-rename YAML out in the wild keeps working through one transition
     // window.
-    VizHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
     auto spec = R"({"type":"bar","processor":"single_series","label_field":1})";
     auto def_id = h.make_def(spec, "procfetch");
     h.push_response("cmd-legacy", "a1", "1|chrome|/u/b/c|d\n2|chrome|/u/b/c|d");
@@ -421,8 +447,10 @@ TEST_CASE("REST visualization: snake_case keys still accepted as legacy alias",
 }
 
 TEST_CASE("REST visualization: empty response set → 200 with empty payload",
-          "[rest][visualization][edge]") {
-    VizHarness h;
+          "[pg][rest][visualization][edge]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool);
     auto spec = R"({"type":"bar","processor":"single_series","label_field":1})";
     auto def_id = h.make_def(spec, "procfetch");
 
@@ -516,7 +544,7 @@ TEST_CASE("InstructionStore: import_definition_json accepts visualization_spec a
 }
 
 TEST_CASE("REST visualization: management-group scope drops out-of-scope agents' rows (#1634)",
-          "[rest][visualization][scope]") {
+          "[pg][rest][visualization][scope]") {
     // The flat Response:Read gate is not a per-agent ownership check, so without
     // the scope filter an operator charts another operator's execution by id.
     // Same fixture as the pie round-trip, but the injected scope predicate admits
@@ -524,7 +552,9 @@ TEST_CASE("REST visualization: management-group scope drops out-of-scope agents'
     auto scope_fn = [](const std::string& /*username*/, const std::string& agent_id) -> bool {
         return agent_id == "agent-1";
     };
-    VizHarness h{scope_fn};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool, scope_fn);
     auto spec = R"({"type":"pie","processor":"single_series","labelField":1,
                     "title":"Top procs"})";
     auto def_id = h.make_def(spec, "procfetch");
@@ -558,9 +588,11 @@ TEST_CASE("REST visualization: management-group scope drops out-of-scope agents'
 }
 
 TEST_CASE("REST visualization: every agent out of scope → empty chart, no leak (#1634)",
-          "[rest][visualization][scope]") {
+          "[pg][rest][visualization][scope]") {
     auto scope_fn = [](const std::string&, const std::string&) -> bool { return false; };
-    VizHarness h{scope_fn};
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    VizHarness h(pool, scope_fn);
     auto spec = R"({"type":"pie","processor":"single_series","labelField":1,"title":"t"})";
     auto def_id = h.make_def(spec, "procfetch");
     h.push_response("cmd-S2", "agent-1", "1|chrome|/usr/bin/chrome|d");

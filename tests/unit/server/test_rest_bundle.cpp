@@ -14,9 +14,12 @@
  * test_bundle_orchestrator.cpp; this file asserts the REST wiring.
  */
 
+#include "pg/pg_pool.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
+
+#include "../test_helpers.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -25,12 +28,24 @@
 #include <nlohmann/json.hpp>
 
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical setup).
+yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    ResponseStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("responsestore template: store failed to migrate");
+}};
 
 struct DispatchCall {
     std::string plugin, action, scope_expr, execution_id;
@@ -42,7 +57,7 @@ struct AuditRow {
 };
 
 struct BundleHarness {
-    ResponseStore store{":memory:"};
+    ResponseStore store;
     yuzu::server::test::TestRouteSink sink;
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
@@ -53,8 +68,28 @@ struct BundleHarness {
     bool is_admin = true;
     int dispatch_sent = 1;
     bool wire_dispatch = true;
+    // K-R6-01: the REST bundle route now gates per-target on scoped_perm_fn.
+    // Default permissive so existing tests dispatch; a confinement test flips
+    // scope_allow=false to assert an out-of-scope target is denied.
+    bool scope_allow = true;
+    std::string last_scoped_agent;
+    // Gate-3-architect-F1: the SECOND, independent VisibleSet confinement
+    // check threaded into BundleOrchestrator::dispatch. std::nullopt (default)
+    // = unfiltered, matching every pre-existing test's expectation; a
+    // defense-in-depth test sets an explicit set that excludes the bundle's
+    // target to prove the adapter refuses dispatch even when scoped_perm_fn
+    // (the primary gate) would have allowed it.
+    std::optional<std::unordered_set<std::string>> exec_visible_override;
+    /// Leave `exec_visible_fn` EMPTY at registration, modelling a deployment
+    /// that never wired the derivation. Distinct from `exec_visible_override`
+    /// being nullopt: that is a callback ANSWERING "unfiltered", this is no
+    /// callback at all, which fails CLOSED (present-empty). See the case pair
+    /// at the bottom of this file.
+    bool wire_exec_visible{true};
 
-    explicit BundleHarness(bool with_dispatch = true) : wire_dispatch(with_dispatch) {
+    explicit BundleHarness(pg::PgPool& pool, bool with_dispatch = true, bool with_scope = true,
+                           bool with_exec_visible = true)
+        : store(pool), wire_dispatch(with_dispatch), wire_exec_visible(with_exec_visible) {
         REQUIRE(store.is_open());
 
         auto auth_fn = [this](const httplib::Request&,
@@ -79,9 +114,24 @@ struct BundleHarness {
                                  const std::vector<std::string>& agent_ids,
                                  const std::string& scope_expr,
                                  const std::unordered_map<std::string, std::string>&,
-                                 const std::string& exec_id) -> std::pair<std::string, int> {
+                                 const std::string& exec_id,
+                                 const yuzu::server::authz::VisibleSet&)
+                -> std::pair<std::string, int> {
                 calls.push_back({plugin, action, scope_expr, exec_id, agent_ids});
                 return {"cmd-" + plugin + "-" + action, dispatch_sent};
+            };
+        }
+
+        RestApiV1::ScopedPermFn scoped_perm_fn;  // left EMPTY when with_scope=false
+        if (with_scope) {
+            scoped_perm_fn = [this](const httplib::Request&, httplib::Response& res,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+                last_scoped_agent = agent_id;
+                if (scope_allow)
+                    return true;
+                res.status = 403;
+                return false;
             };
         }
 
@@ -96,7 +146,20 @@ struct BundleHarness {
                             /*device_token_store=*/nullptr, /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
                             /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
-                            dispatch_fn);
+                            dispatch_fn, /*step_up_fn=*/{}, /*guardian_push_fn=*/{},
+                            /*dex_perf_fn=*/{}, /*net_perf_fn=*/{}, /*lockout_clear_fn=*/{},
+                            /*baseline_store=*/nullptr, /*scoped_perm_fn=*/scoped_perm_fn,
+                            /*software_inventory_store=*/nullptr, /*inventory_scope_fn=*/{},
+                            /*response_scope_fn=*/{}, /*app_perf_providers=*/{},
+                            /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
+                            /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
+                            /*stream_budget=*/nullptr,
+                            wire_exec_visible
+                                ? RestApiV1::ExecVisibleFn{[this](const auth::Session&)
+                                                               -> yuzu::server::authz::VisibleSet {
+                                      return exec_visible_override;
+                                  }}
+                                : RestApiV1::ExecVisibleFn{});
     }
 
     nlohmann::json post(const std::string& path, const std::string& body, int& status) {
@@ -135,8 +198,10 @@ bool has_audit(const std::vector<AuditRow>& a, const std::string& verb, const st
 } // namespace
 
 TEST_CASE("POST /api/v1/bundles dispatches each step and returns 202 + execution_id",
-          "[bundle][rest]") {
-    BundleHarness h;
+          "[pg][bundle][rest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
     int status = 0;
     auto j = h.post(
         "/api/v1/bundles",
@@ -158,10 +223,109 @@ TEST_CASE("POST /api/v1/bundles dispatches each step and returns 202 + execution
     CHECK(has_audit(h.audits, "bundle.os_info.uptime", "Agent"));
     CHECK(has_audit(h.audits, "bundle.os_info.os_name", "Agent"));
     CHECK(has_audit(h.audits, "bundle.dispatch", "Execution"));
+    CHECK(h.last_scoped_agent == "agent-1"); // per-target scoped gate ran on the parsed agent
 }
 
-TEST_CASE("GET /api/v1/bundles/{id} collates the responses", "[bundle][rest]") {
-    BundleHarness h;
+TEST_CASE("POST /api/v1/bundles denies an out-of-scope target agent, no dispatch (K-R6-01)",
+          "[pg][bundle][rest][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    h.scope_allow = false; // the per-target scoped gate denies this agent
+    int status = 0;
+    auto j = h.post(
+        "/api/v1/bundles",
+        R"({"agent_id":"agent-B","steps":[{"plugin":"os_info","action":"uptime"}]})", status);
+    CHECK(status == 403);                        // denied by the scoped gate
+    CHECK(h.last_scoped_agent == "agent-B");     // scoped on the PARSED target
+    CHECK(h.calls.empty());                      // never dispatched
+    (void)j;
+}
+
+TEST_CASE("POST /api/v1/bundles fails CLOSED (500) when the scope gate is unwired (K-R6-01/B4)",
+          "[pg][bundle][rest][scope]") {
+    // Register the route WITHOUT scoped_perm_fn (genuinely unwired) -> the route
+    // must 500 and NEVER dispatch, never falling back to a global gate.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool, /*with_dispatch=*/true, /*with_scope=*/false);
+    int status = 0;
+    h.post("/api/v1/bundles",
+           R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]})", status);
+    CHECK(status == 500);       // "scope gate not configured", not a silent global fallback
+    CHECK(h.calls.empty());     // never dispatched
+}
+
+TEST_CASE("POST /api/v1/bundles: the derived VisibleSet is a SECOND, independent confinement "
+          "check even when scoped_perm_fn admits the target (Gate-3-architect-F1)",
+          "[pg][bundle][rest][scope]") {
+    // scoped_perm_fn (the PRIMARY gate) admits agent-B, but the derived
+    // exec_visible excludes it -- proving the orchestrator adapter's in_scope
+    // check is a real, independent enforcement point (defense-in-depth to
+    // match the MCP execute_bundle twin), not decorative plumbing.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    h.scope_allow = true; // primary gate would admit
+    h.exec_visible_override = std::unordered_set<std::string>{"agent-other"}; // agent-B NOT in it
+    int status = 0;
+    auto j = h.post(
+        "/api/v1/bundles",
+        R"({"agent_id":"agent-B","steps":[{"plugin":"os_info","action":"uptime"}]})", status);
+    CHECK(status == 202);       // the handler still accepts (async correlation id minted)
+    CHECK(h.calls.empty());    // but the adapter refused to reach command_dispatch_fn
+    (void)j;
+}
+
+TEST_CASE("POST /api/v1/bundles: an unfiltered (nullopt) VisibleSet still dispatches normally "
+          "(Gate-3-architect-F1 non-regression)",
+          "[pg][bundle][rest][scope]") {
+    // A wired callback ANSWERING nullopt: a genuine global administrator, whose
+    // full-fleet reach is their actual authority rather than a bypass.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool); // exec_visible_override defaults to nullopt (unfiltered)
+    int status = 0;
+    h.post("/api/v1/bundles",
+           R"({"agent_id":"agent-B","steps":[{"plugin":"os_info","action":"uptime"}]})", status);
+    CHECK(status == 202);
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].agent_ids == std::vector<std::string>{"agent-B"});
+}
+
+TEST_CASE("POST /api/v1/bundles: an UNWIRED ExecVisibleFn fails CLOSED, it does not fall back to "
+          "unfiltered",
+          "[pg][bundle][rest][scope][fail-closed][1788]") {
+    // This case previously asserted the OPPOSITE, and asserting it is how the
+    // defect held: the route's fallback was `VisibleSet{}`, which
+    // default-constructs the optional to NULLOPT — i.e. UNFILTERED — so a
+    // deployment that never wired the derivation silently lost the whole
+    // defense-in-depth layer while a green test said the behaviour was intended.
+    //
+    // ADR-0033 §1 is explicit that the two states are not interchangeable:
+    // nullopt means unfiltered, a present-empty set means deny-all, and a
+    // MISSING derivation must never be read as "no filter applies". Every
+    // sibling confined surface (dashboard execute, MCP execute_instruction /
+    // execute_bundle) already substituted present-empty here; this route was
+    // the one that inverted it.
+    //
+    // The per-target scoped_perm_fn gate is left ADMITTING on purpose, so the
+    // only thing that can refuse this dispatch is the fallback under test.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool, /*with_dispatch=*/true, /*with_scope=*/true, /*with_exec_visible=*/false);
+    h.scope_allow = true;
+    int status = 0;
+    h.post("/api/v1/bundles",
+           R"({"agent_id":"agent-B","steps":[{"plugin":"os_info","action":"uptime"}]})", status);
+    CHECK(status == 202);   // handler still mints the async correlation id
+    CHECK(h.calls.empty()); // THE assertion: deny-all, so nothing was reached
+}
+
+TEST_CASE("GET /api/v1/bundles/{id} collates the responses", "[pg][bundle][rest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
     int status = 0;
     auto disp = h.post(
         "/api/v1/bundles",
@@ -187,8 +351,10 @@ TEST_CASE("GET /api/v1/bundles/{id} collates the responses", "[bundle][rest]") {
     CHECK(data["steps"][0]["output"] == "up 3d");
 }
 
-TEST_CASE("GET collate is 404 for a non-owner (IDOR guard)", "[bundle][rest]") {
-    BundleHarness h;
+TEST_CASE("GET collate is 404 for a non-owner (IDOR guard)", "[pg][bundle][rest]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
     int status = 0;
     auto disp = h.post("/api/v1/bundles",
                        R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}]})",
@@ -208,8 +374,10 @@ TEST_CASE("GET collate is 404 for a non-owner (IDOR guard)", "[bundle][rest]") {
     CHECK(status == 200);
 }
 
-TEST_CASE("POST /api/v1/bundles validation 400s", "[bundle][rest][unhappy]") {
-    BundleHarness h;
+TEST_CASE("POST /api/v1/bundles validation 400s", "[pg][bundle][rest][unhappy]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
     int status = 0;
     h.post("/api/v1/bundles", "not json", status);
     CHECK(status == 400);
@@ -222,8 +390,10 @@ TEST_CASE("POST /api/v1/bundles validation 400s", "[bundle][rest][unhappy]") {
     CHECK(status == 400);
 }
 
-TEST_CASE("bundle routes 503 when dispatch is unwired", "[bundle][rest][unhappy]") {
-    BundleHarness h{/*with_dispatch=*/false};
+TEST_CASE("bundle routes 503 when dispatch is unwired", "[pg][bundle][rest][unhappy]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool, /*with_dispatch=*/false);
     int status = 0;
     h.post("/api/v1/bundles",
            R"({"agent_id":"a","steps":[{"plugin":"os_info","action":"uptime"}]})", status);
@@ -231,9 +401,11 @@ TEST_CASE("bundle routes 503 when dispatch is unwired", "[bundle][rest][unhappy]
 }
 
 TEST_CASE("REST collate surfaces dispatch_failed when a step reached no agent",
-          "[bundle][rest]") {
+          "[pg][bundle][rest]") {
     // governance QE-S2: the dispatch-failed path through the HTTP wrapper.
-    BundleHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
     h.dispatch_sent = 0; // every step reaches 0 agents
     int status = 0;
     auto disp = h.post("/api/v1/bundles",
@@ -251,10 +423,20 @@ TEST_CASE("REST collate surfaces dispatch_failed when a step reached no agent",
     CHECK(a["data"]["steps"][0]["state"] == "dispatch_failed");
 }
 
-TEST_CASE("REST collate tolerates non-UTF-8 plugin output (no 500)", "[bundle][rest]") {
+TEST_CASE("REST collate tolerates non-UTF-8 plugin output (no 500)", "[pg][bundle][rest]") {
     // governance review #1593 blocker 1: a 0xff byte in plugin output must not
     // make aggregate_to_json's dump() throw → 500; collate must return 200.
-    BundleHarness h;
+    //
+    // ADR-0039 addendum (Postgres cutover): TEXT columns require valid
+    // server-encoding, unlike SQLite's permissive TEXT affinity — ResponseStore
+    // sanitizes untrusted output/error_detail to U+FFFD (sanitize_utf8_strict,
+    // utf8_sanitize.hpp) BEFORE the insert, so the row still LANDS (never
+    // silently dropped by a fail-soft encoding rejection) — preserving, not
+    // narrowing, the #1593 guarantee: the malformed-but-real result surfaces to
+    // the operator, defanged.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
     int status = 0;
     auto disp = h.post("/api/v1/bundles",
                        R"({"agent_id":"a","steps":[{"plugin":"files","action":"read"}]})", status);
@@ -264,12 +446,20 @@ TEST_CASE("REST collate tolerates non-UTF-8 plugin output (no 500)", "[bundle][r
     auto a = h.get("/api/v1/bundles/" + exec_id, status);
     REQUIRE(status == 200); // NOT 500
     CHECK(a["data"]["complete"] == true);
-    CHECK(a["data"]["steps"][0]["state"] == "responded");
+    CHECK(a["data"]["steps"][0]["state"] == "responded"); // row present, not dropped
+    // The 0xff byte is replaced with U+FFFD (EF BF BD); "binary" survives
+    // untouched. The round-trip through nlohmann::json succeeding at all is
+    // itself proof the stored bytes are valid UTF-8 (invalid input would have
+    // thrown on dump/parse well before this assertion).
+    const std::string output = a["data"]["steps"][0]["output"].get<std::string>();
+    CHECK(output == "\xEF\xBF\xBD" "binary");
 }
 
-TEST_CASE("REST bundle routes are in the OpenAPI spec (A1 discoverability)", "[bundle][rest]") {
+TEST_CASE("REST bundle routes are in the OpenAPI spec (A1 discoverability)", "[pg][bundle][rest]") {
     // governance review #1593 should-fix: REST surface must be machine-discoverable.
-    BundleHarness h;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
     int status = 0;
     auto spec = h.get("/api/v1/openapi.json", status);
     REQUIRE(status == 200);
@@ -280,8 +470,10 @@ TEST_CASE("REST bundle routes are in the OpenAPI spec (A1 discoverability)", "[b
     CHECK(spec["paths"]["/bundles/{id}"].contains("get"));
 }
 
-TEST_CASE("REST POST rejects empty agent_id", "[bundle][rest][unhappy]") {
-    BundleHarness h;
+TEST_CASE("REST POST rejects empty agent_id", "[pg][bundle][rest][unhappy]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
     int status = 0;
     h.post("/api/v1/bundles", R"({"agent_id":"","steps":[{"plugin":"os_info","action":"uptime"}]})",
            status);

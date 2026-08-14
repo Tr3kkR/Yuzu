@@ -140,6 +140,13 @@ encode_command_request(Cmd) ->
                              maps:get(<<"expires_at">>, Cmd, undefined))}.
 
 %% @doc Ensure a CommandResponse map has all required fields.
+%%
+%% NOTE: kept faithful to all ten CommandResponse fields, mirroring
+%% encode_command_request/1 above. Fields 7-9 (`plugin`/`action`/`payload`)
+%% carry the Guardian side-channel (see agent.proto CommandResponse doc) and
+%% field 10 (`plugin_result_status`) is the CC-07 plugin->host typed
+%% result-status seam (ABI4). gpb drops any field a whitelist rebuild omits,
+%% so this must never silently narrow back to a partial field set.
 -spec encode_command_response(map()) -> map().
 encode_command_response(Resp) ->
     #{command_id => command_id(Resp),
@@ -151,7 +158,14 @@ encode_command_response(Resp) ->
       error      => maps:get(error, Resp,
                              maps:get(<<"error">>, Resp, undefined)),
       sent_at    => maps:get(sent_at, Resp,
-                             maps:get(<<"sent_at">>, Resp, now_timestamp()))}.
+                             maps:get(<<"sent_at">>, Resp, now_timestamp())),
+      plugin     => command_plugin(Resp),
+      action     => command_action(Resp),
+      payload    => maps:get(payload, Resp,
+                             maps:get(<<"payload">>, Resp, <<>>)),
+      plugin_result_status => maps:get(plugin_result_status, Resp,
+                                       maps:get(<<"plugin_result_status">>, Resp,
+                                                undefined))}.
 
 %% @doc Build a SendCommandResponse message.
 -spec encode_send_command_response(binary(), map()) -> map().

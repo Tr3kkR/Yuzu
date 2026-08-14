@@ -17,7 +17,10 @@
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
 #include "guaranteed_state_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "guaranteed_state.pb.h"
+
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -25,12 +28,23 @@
 #include <unordered_set>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 using yuzu::server::detail::guardian_event_store_buckets;
 using yuzu::server::detail::ingest_guardian_response;
 using yuzu::server::detail::kGuardianEventStoreDurationMetric;
 using yuzu::server::detail::warm_create_guardian_event_store_metric;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every test
+// below constructs its own GuaranteedStateStore against a clone of this schema
+// (ADR-0038 migration).
+yuzu::test::PgTestTemplate guardian_pg_tpl{"guardianstate", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    GuaranteedStateStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("guardianstate template: store failed to migrate");
+}};
 namespace apb = ::yuzu::agent::v1;
 namespace gpb = ::yuzu::guardian::v1;
 
@@ -69,9 +83,10 @@ apb::CommandResponse make_error_event(const std::string& event_id) {
 } // namespace
 
 TEST_CASE("guardian ingest: DEX observers fire once on insert, never on redelivery/collision",
-          "[guardian][ingest][redelivery]") {
-    GuaranteedStateStore store(":memory:");
-
+          "[pg][guardian][ingest][redelivery]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     BlastRadiusConfig cfg;
     cfg.min_devices = 1; // fire on the first sighting so a single event is observable
     BlastRadiusDetector blast(cfg);
@@ -112,14 +127,16 @@ TEST_CASE("guardian ingest: DEX observers fire once on insert, never on redelive
 }
 
 TEST_CASE("guardian ingest: event-store histogram splits by outcome status, skips non-store paths",
-          "[guardian][ingest][metrics]") {
+          "[pg][guardian][ingest][metrics]") {
     // Pins yuzu_server_guardian_event_store_duration_seconds (A+): the timer wraps exactly the
     // insert_event_classified call and observes ONE sample per event under its outcome `status`
     // label. Only redelivered/conflict run the redelivery byte-compare, so the split is
     // load-bearing (a label-less aggregate would shift with the insert/redelivery mix). A frame
     // that never reaches the store (non-"event" action, unparseable payload) is NOT timed, and a
     // null registry is inert.
-    GuaranteedStateStore store(":memory:");
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     yuzu::MetricsRegistry metrics;
     warm_create_guardian_event_store_metric(metrics); // pin the ladder + boot the series at 0
     const std::string kName = kGuardianEventStoreDurationMetric;

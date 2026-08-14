@@ -1,4 +1,5 @@
 #include "instruction_store.hpp"
+#include "reserved_definition_id.hpp" // the ONE reserved-namespace rule (#2442)
 #include "migration_runner.hpp"
 #include "product_pack_store.hpp" // ProductPackStore::verify_signature (#1073)
 #include "response_templates_engine.hpp"
@@ -448,6 +449,20 @@ InstructionStore::create_definition_impl(const InstructionDefinition& def) {
                 return std::unexpected(
                     "definition id may only contain letters, digits, '.', '_', and '-'");
         }
+        // Reserved namespace (#2442): `mcp.<tool>` ids belong to the MCP
+        // approval-ticket gate, whose recall matches a ticket on
+        // (definition_id, scope_expression) without binding the submitter. An
+        // instruction definition authored under that prefix is the other half
+        // of the cross-surface confusion — it is what would let an approval
+        // minted through the instruction gate line up with an MCP tool's
+        // canonical arguments. No shipped content uses the prefix, so nothing
+        // legitimate is rejected here.
+        // Create-path only, deliberately: update_definition cannot originate an
+        // id (UPDATE ... WHERE id=?), so an id that predates the reservation
+        // stays editable and executable rather than becoming uneditable on
+        // upgrade.
+        if (is_reserved_definition_id(def.id))
+            return std::unexpected(std::string(kReservedDefinitionIdError));
     }
 
     auto id = def.id.empty() ? generate_id() : def.id;

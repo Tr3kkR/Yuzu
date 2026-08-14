@@ -8,6 +8,7 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "authz_model.hpp"
 #include "device_token_store.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
@@ -154,6 +155,31 @@ public:
     /// admit-then-filter gate for fan-out reads lands (the remaining #1634 work).
     using ResponseScopeFn =
         std::function<bool(const std::string& username, const std::string& agent_id)>;
+    /// #1788: derives the caller's dispatch-confinement VisibleSet (nullopt =
+    /// unfiltered, present-empty = deny-all — ADR-0033 §1), the SAME primitive
+    /// `ServerImpl::derive_exec_visible` feeds into `/api/command` and every MCP
+    /// dispatch surface. EVERY dispatching route in this file derives from it;
+    /// what an unwired callback means differs by route CLASS, and the difference
+    /// is deliberate:
+    ///
+    ///   - Routes whose primary authorization is the per-target `scoped_perm_fn`
+    ///     gate (POST /api/v1/bundles, the TAR retention purge, the live device
+    ///     query) thread this in as a SECOND, independent confinement check —
+    ///     defense-in-depth. Unwired substitutes a present-EMPTY set (deny-all),
+    ///     NEVER nullopt: ADR-0033 §1 forbids reading a missing derivation as
+    ///     "no filter". `scoped_perm_fn` already 500s when IT is unwired, so the
+    ///     primary gate reports the misconfiguration.
+    ///   - The async result-set producers (`from-tar-query`,
+    ///     `from-instruction-result`, `{id}/re-eval`) admit on a bare GLOBAL
+    ///     `perm_fn("Execution","Execute")` and dispatch by scope/broadcast, so
+    ///     this derivation is their ONLY per-device authorization — the PRIMARY
+    ///     gate. Unwired there is a server misconfiguration and answers an
+    ///     audited 500, matching how those routes' siblings treat a missing
+    ///     `scoped_perm_fn`, rather than silently reporting "no agents reached".
+    ///
+    /// A test harness wanting genuinely unfiltered dispatch wires a callback
+    /// that RETURNS nullopt; leaving the callback empty is not a synonym for it.
+    using ExecVisibleFn = std::function<yuzu::server::authz::VisibleSet(const auth::Session&)>;
     /// Audit-event callback. Returns true iff the event was persisted
     /// (or the deployment runs audit-off — both look the same to a
     /// caller, see `AuthRoutes::audit_log` doc). Returns false on a
@@ -244,17 +270,33 @@ public:
     /// Command dispatch callback — sends a CommandRequest to agents via gRPC
     /// and returns (command_id, agents_reached). Identical signature to
     /// `WorkflowRoutes::CommandDispatchFn`; the server threads the SAME hoisted
-    /// `command_dispatch_fn` closure into both so the result-set async
-    /// producers (`from-tar-query`, `from-instruction-result`, `re-eval`) drive
-    /// the exact dispatch path the workflow + policy engines use. The trailing
-    /// `execution_id` is registered command_id→execution_id BEFORE any RPC so
-    /// FAST loopback agents can't reply before the mapping lands (UP2-4). Empty
-    /// callback leaves the async producer routes returning 503.
+    /// CONFINED closure (`command_dispatch_confined_fn`) into both, so every
+    /// REST dispatch surface narrows to the caller's reach through the one
+    /// `dispatch_confined_arms` seam. The trailing `execution_id` is registered
+    /// command_id→execution_id BEFORE any RPC so FAST loopback agents can't
+    /// reply before the mapping lands (UP2-4). Empty callback leaves the async
+    /// producer routes returning 503.
+    ///
+    /// #1788 / the review finding this signature exists to make impossible: the
+    /// trailing `exec_visible` is NOT optional. `RestApiV1` was previously
+    /// handed the 6-arg SYSTEM closure, which hardcodes `exec_visible=nullopt`
+    /// (unfiltered — correct for background engines, never for an operator
+    /// surface), and the async result-set producers dispatched through it — so
+    /// a service-scoped token admitted by the global `Execution:Execute` gate
+    /// reached the WHOLE fleet. The fix is not a check bolted onto those
+    /// routes: it is that no unconfined closure is reachable from this class
+    /// any more, so a future dispatch caller cannot pick the wrong one.
+    ///
+    /// Callers MUST NOT pre-intersect their own target list — resolution stays
+    /// here, the intersection belongs to `dispatch_confined_arms` (see that
+    /// header's docstring on why a second copy is the drift class). Broadcast
+    /// and scope arms could not be confined route-locally in any case: the
+    /// candidate set lives in the server's AgentRegistry, not in this file.
     using CommandDispatchFn = std::function<std::pair<std::string, int>(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
-        const std::string& execution_id)>;
+        const std::string& execution_id, const yuzu::server::authz::VisibleSet& exec_visible)>;
 
     /// Production overload — constructs an HttplibRouteSink and delegates
     /// to the sink-based overload below.
@@ -314,7 +356,11 @@ public:
         // ADR-0034: THE shared admission budget for held-open responses. GET /api/v1/events
         // pins an httplib worker for the life of the subscription, so it leases from the same
         // counter as every other streaming surface. nullptr = no admission control (tests).
-        yuzu::server::detail::StreamBudget* stream_budget = nullptr);
+        yuzu::server::detail::StreamBudget* stream_budget = nullptr,
+        // #1788 defense-in-depth: see ExecVisibleFn's doc comment above. Trailing
+        // optional dep; `{}` preserves the pre-existing unfiltered-VisibleSet
+        // behaviour on POST /api/v1/bundles.
+        ExecVisibleFn exec_visible_fn = {});
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -372,7 +418,11 @@ public:
         AccessReviewStore* access_review_store = nullptr, AuthDB* auth_db = nullptr,
         DirectorySync* directory_sync = nullptr,
         // ADR-0034: the shared held-open-response budget (see the overload above).
-        yuzu::server::detail::StreamBudget* stream_budget = nullptr);
+        yuzu::server::detail::StreamBudget* stream_budget = nullptr,
+        // #1788 defense-in-depth: see ExecVisibleFn's doc comment above (production
+        // overload). `{}` preserves the pre-existing unfiltered-VisibleSet behaviour
+        // for test harnesses that haven't wired it.
+        ExecVisibleFn exec_visible_fn = {});
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

@@ -196,3 +196,7 @@ spike/
 # ...but never silently hide an intentionally-committed test fixture DB (#1889
 # review): the broad *.db net above would otherwise drop it from `git add`.
 !tests/**/*.db
+
+# promtool canary scratch tree (created and removed by
+# tests/prometheus/run_promtool_tests.py; only survives a killed run)
+.promtool-canary/

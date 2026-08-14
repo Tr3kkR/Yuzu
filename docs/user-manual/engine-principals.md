@@ -103,10 +103,20 @@ curl -sk -X POST https://localhost:8080/api/v1/engine-principals/engine:vuln-uce
   `engine_principal.credential.reveal`.
 - If the consuming module updates the secret and you never call `confirm`
   (next step), a **60-second background sweep** auto-revokes the predecessor
-  once the overlap window elapses on its own, and separately warns
-  (an operational signal, not a security alert) if the *successor* looks
-  unused as its own window nears expiry — a sign the new secret was never
-  actually picked up.
+  once the overlap window elapses on its own — **unless the successor was
+  never presented at all**, in which case the sweep deliberately leaves BOTH
+  credentials active rather than revoke your only working credential out
+  from under you (a dropped rotate response, or simply never picking up the
+  new secret, must not end in zero usable credentials). The sweep separately
+  warns (an operational signal, not a security alert) whenever the
+  *successor* looks unused — once as its own window nears expiry, and once
+  more on crossing into the elapsed state if it is still unused (that row
+  and its metric fire once per pair per state, process-local — a restart
+  re-emits once; the underlying log line, by contrast, repeats every tick
+  once elapsed) — a sign the new secret was never actually picked up; once
+  that warning has fired for the elapsed state, resolve it explicitly
+  (confirm or revoke) rather than assume the sweep will eventually clean it
+  up.
 
 ### 4. Confirm the rotation (optional but recommended)
 

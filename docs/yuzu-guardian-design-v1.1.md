@@ -2520,3 +2520,108 @@ Guardian ladder must check these.
   `unicode:characters_to_binary/1` which rejects invalid UTF-8 varints — the
   crash surface lands the moment Guardian PR 3 wires fan-out. See #478 for
   the schema/wire fix.
+
+## 25. Lifecycle-audit journal (ADR-0021 Stage 2, item 7)
+
+Guardian's spark-backed rule engine keeps a durable audit trail of `guard.armed` /
+`guard.disarmed` lifecycle events on the agent, independent of the compliance-drift
+event stream. Full implementation-contract history (review lineage, the six
+Sol/Fable hardening rounds, the rev-4.1 refinements, and the reasoning behind every
+design choice below) lives in `docs/spark-item7-lifecycle-journal-design.md` — this
+section states the guarantee and the loss-channel contract as shipped, since some
+names and buckets changed during implementation and that doc is a point-in-time
+design record, not maintained against the code afterward.
+
+**The guarantee.** Process-crash-durable, duplicate-tolerant, bounded-retry delivery
+of armed/disarmed lifecycle events. Once persisted, an event survives a process
+crash or restart and is re-sent on every reconnect/restart — regardless of any
+possible prior acceptance (acceptance is unknowable; there is no ack) — until it
+ages out of retention. A local gRPC `Write()` returning true is never delivery
+confirmation. **Retention eviction and quarantine are the only deletion paths, and
+every removal is counted.** Storage: `kv_store.db`, namespace `__guardian_journal__`
+(`guardian_journal_format.hpp`), distinct from `__guardian__` so it survives
+`full_sync`'s namespace clear. Owned by `GuardianEngine`, not the runtime — the
+runtime is the object built to survive the agent via a detached `SparkEngine`
+handler, so a borrowed `KvStore` there would be a dormant use-after-free.
+
+**Retention (all three bounds enforced together, oldest evicted first by
+`(timestamp, key)`):** 7 days, 1000 batches, 32 MiB
+(`kJournalRetentionDays`/`kMaxJournalBatches`/`kMaxJournalBytes`,
+`guardian_journal_format.hpp`). Quarantine (corrupt/unparseable batches) is
+separately bounded at 100 batches. Replay is rate-limited by a process-lifetime
+token bucket (0.1 batch/agent/s refill, burst 5, `kJournalPageRefillPerSec`/
+`kJournalPageBurst`) that delays paging, never skips it — retention is the only
+deletion path regardless of bucket state.
+
+**The "alert" severities below are the designed posture, not the live one — no
+alert on any of these channels pages an operator today.** The `yuzu-guardian-journal`
+Prometheus rule group (`docs/prometheus/yuzu-alerts.yml`) is entirely commented out,
+for two independent reasons, only the first of which clears at the `prefer_spark`
+cutover: (1) the journal is inert pre-cutover, so every counter is provably 0 and an
+enabled rule could only fire on a forged heartbeat; (2) no churn-robust
+new-increment alert form exists yet for these unlabelled fleet-summed *cumulative*
+counters over a *churning* agent population (`increase()`/`rate()`/`delta()`/bare
+`> 0` each fail differently — full analysis in the YAML file's own preamble) — this
+reason does **not** clear at cutover — tracked at #2336 (filed 2026-07-21), currently
+unowned (no assignee, no milestone). Until both clear, every channel below is
+graph-and-post-incident-review only. The only signals that currently roll up live —
+not page; their alert rules sit in the same commented-out group as everything else
+here — are two pipeline-health counters, `yuzu_fleet_guardian_journal_reporting` and
+`..._tag_rejected` — server-owned counts published every sweep including at 0, unlike
+the 30 agent-self-reported counters below, and the reason they can be sound where the
+loss-channel counters cannot.
+
+**Loss / removal channels — every one counted, all `yuzu.guardian_journal_*`
+heartbeat tags unless noted (sparse-emit: a zero counter ships no tag; writer
+`guardian_journal_heartbeat.hpp`, server-side rollup + HELP text
+`guardian_journal_fleet_tags.hpp`):**
+
+| channel | when | tag | severity |
+|---|---|---|---|
+| stage-drop | `pending_journal_` reserve exhausted under sustained write failure | `stage_dropped` | integrity gap, alert |
+| stage-failure | a disarm record could not be built after the rule was already torn down | `stage_failures` | integrity gap, alert |
+| field rejection | NUL / oversized / non-UTF-8 field kept a record out of the journal | `field_rejected` | integrity gap, alert |
+| skewed-clock reject | normalized event timestamp floors to `seconds <= 0` (would replay as server-receipt-now and false-conflict) | `clock_rejected` | integrity gap, alert |
+| write failure | a `set()` failed; per-push circuit-broken, retried by the maintenance tick | `write_failures` | integrity gap, alert |
+| write-capacity reject | a new batch refused because the journal is at its byte/count cap | `write_capacity_rejected` | integrity gap, alert (UP-1) |
+| gauge underflow | the write-ceiling size gauge read negative; persist fails CLOSED rather than trust a corrupt bound | `gauge_underflow` | integrity gap, alert (UP-2 / #2303) |
+| key collision | boot-nonce + sequence collision upserted over a batch (~2⁻⁶⁴) | `key_collisions` | integrity gap, alert |
+| quarantine | corrupt/unparseable batch removed from replay | `quarantined` | integrity gap, alert |
+| quarantine-rename failure | could not even quarantine a corrupt batch | `quarantine_failures` | integrity gap, alert |
+| quarantine-capacity eviction | quarantine itself over its 100-batch cap, oldest shed | `quarantine_capacity_evicted` | integrity gap, alert (UP-7) |
+| page-read failure | a fallible journal scan failed; distinguished from "journal empty" and retried | `page_read_failures` | integrity gap, alert |
+| eviction, no send evidence | aged out with no sent-label present (best-effort — a live entry may send before its batch key exists) | `evicted_no_send_evidence` | integrity gap, alert |
+| eviction, sent-unacked | aged out with a sent-label present but never server-confirmed | `evicted_sent_unacked` | monitor |
+| eviction, unclassified | aged out with disposition unknown — the third bucket that makes `batches_pruned == evicted_sent_unacked + evicted_no_send_evidence + evicted_unclassified` exact every pass, including shutdown/throw | `evicted_unclassified` | integrity gap, alert |
+| clock-jump decline | a retention pass declined to age-evict because the wall clock jumped implausibly far forward — a deliberate non-delete, not a loss | `clock_jump_skips` | informational (retained evidence, not lost) |
+| maintenance exception | a persist/prune/page throw was firewalled and swallowed | `maint_exceptions` | integrity gap, alert |
+| lifecycle backpressure drop | a lifecycle entry was rejected at outbox enqueue for capacity (a staging loss, distinct from `stage_dropped`) | `guardian_journal_backpressure_drops` | integrity gap, alert |
+| drain/send exception | a per-entry drain send threw; the head is retained and that log's drain stops | `guardian_drain_exceptions` / `guardian_send_exceptions` | integrity gap, alert |
+
+Two related counters are reported alongside but are **not** journal loss channels:
+`guardian_sweep_exceptions` (a firewalled convergence-sweep throw — drift
+*detection* failing, not the audit trail) is kept separate on purpose, per
+`guardian_journal_heartbeat.hpp`: a tag named `journal_maint_exceptions` counting
+both would leave an operator unable to tell "audit trail at risk" from "detection
+degraded", and the two need different remediation.
+
+Two MAX-rolled-up age gauges (never summed fleet-wide — a single stalled endpoint
+is the signal): `yuzu.guardian_journal_page_stale_seconds` and
+`..._prune_stale_seconds`, emitted whenever journal stats are present (including
+zero — a dead worker must not read identically to a healthy idle one). A third,
+`..._headroom_blocked_seconds`, is sparse (0 = no replay-congestion episode, #2364).
+
+**Not claimed:** end-to-end at-least-once (there is no server ack of an individual
+lifecycle event, by design — Option A per the source doc); deterministic sub-second
+ordering. `guard.errored` has no lifecycle-journal producer today (scope is
+armed/disarmed only). All fleet counters are unlabelled or low-cardinality —
+never keyed by raw `agent_id`.
+
+**Standing invariant** (also recorded in §24): journal maintenance is paced by
+time, not by wake count — the drain worker wakes on every outbox enqueue, and a
+paging pass is a full journal scan, so any future maintenance work added to that
+worker must carry its own `steady_clock` cadence or it becomes O(event rate ×
+journal size) on every managed endpoint.
+
+Data-inventory entry: `docs/enterprise-readiness-soc2-first-customer.md`,
+agent-side `kv_store.db` namespaces.

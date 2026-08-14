@@ -14,10 +14,29 @@ plugins that load into the Yuzu agent at runtime.
 ## ABI compatibility
 
 The C ABI advertises a version macro (`YUZU_PLUGIN_ABI_VERSION`). The
-agent refuses to load plugins whose declared version is below
-`YUZU_PLUGIN_ABI_VERSION_MIN`. Breaking ABI changes require bumping
-the major version and are reviewed by the `architect` agent before
-landing.
+agent refuses to load a plugin whose declared `abi_version` falls
+outside the closed range `[YUZU_PLUGIN_ABI_VERSION_MIN,
+YUZU_PLUGIN_ABI_VERSION]` (checked in `plugin_loader.cpp` at load
+time, immediately after `yuzu_plugin_descriptor()` returns and before
+the rest of the descriptor is trusted). Breaking ABI
+changes require bumping the major version and are reviewed by the
+`architect` agent before landing. A version bump does **not** imply
+"recompile everything" — `YuzuPluginDescriptor` only ever grows by
+appending fields, so older plugins keep loading and keep working
+until `YUZU_PLUGIN_ABI_VERSION_MIN` itself moves past them.
+
+| ABI version | Added | Minimum supported (`YUZU_PLUGIN_ABI_VERSION_MIN`) | Rebuild required? |
+|---|---|---|---|
+| 1 | Initial stable C ABI (`YuzuPluginDescriptor` base fields through `execute`) | 1 | No — still loads today |
+| 2 | KV-storage host API (persistent per-plugin SQLite) | 1 | No |
+| 3 | `sdk_version` diagnostic descriptor field | 1 | No |
+| 4 | Per-OS `YuzuActionDescriptor` capability-matrix fields (append-only; #2204) | 1 | No — a plugin built against ABI 1-3 still loads unchanged; only plugins that need the new fields must target ABI 4 |
+
+`sdk/include/yuzu/plugin.h` is the source of truth for the current
+`YUZU_PLUGIN_ABI_VERSION` / `YUZU_PLUGIN_ABI_VERSION_MIN` values — this
+table records when each version was introduced and whether it retired
+support for anything older. See `docs/Instruction-Engine.md` §14.3 for
+the ABI evolution rules.
 
 ## License
 

@@ -150,8 +150,8 @@ bool ScheduleRunner::fire_with_approval(const InstructionSchedule& s, const std:
 
     // 4) No ticket yet → submit one (tagged with this schedule's id, M-02)
     //    and hold the occurrence at its due time.
-    auto submitted =
-        d_.approval_manager->submit(s.definition_id, s.created_by, s.scope_expression, s.id);
+    auto submitted = d_.approval_manager->submit(s.definition_id, s.created_by, s.scope_expression,
+                                                 s.id, ApprovalOrigin::kSchedule);
     if (!submitted) {
         // Submit failure (pending cap, store error): drop THIS occurrence
         // (advance) rather than re-submitting every tick against a full cap.

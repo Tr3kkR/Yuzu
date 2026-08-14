@@ -9,6 +9,7 @@
 #include "management_group_store.hpp"
 #include "mcp_server_testonly.hpp" // rbac_ops/securables_for_test (#2383 mirror binding)
 #include "migration_runner.hpp"
+#include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 
 #include "../test_helpers.hpp"
@@ -54,7 +55,8 @@ TEST_CASE("RbacStore: seed data — system roles exist", "[rbac_store]") {
 TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     RbacStore store(":memory:");
     auto types = store.list_securable_types();
-    REQUIRE(types.size() == 22); // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2)
+    REQUIRE(types.size() == 23); // +SoftwareLicensing (ADR-0024) +AccessReview (SOC 2 CC6.2)
+                                 // +EnginePrincipal (#2376, cut away from Security:Read)
 
     auto has = [&](const std::string& t) {
         return std::find(types.begin(), types.end(), t) != types.end();
@@ -75,6 +77,8 @@ TEST_CASE("RbacStore: seed data — securable types", "[rbac_store]") {
     CHECK(has("Inventory"));
     CHECK(has("SoftwareLicensing")); // SLE securable (ADR-0024 Decision 9) — NOT `License`
     CHECK(has("AccessReview")); // Periodic Access Reviews (SOC 2 CC6.2), dedicated + narrow
+    CHECK(has("EnginePrincipal")); // Engine-principal inventory + grant-graph reads (#2376),
+                                   // cut away from the over-broad Security:Read
 }
 
 TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
@@ -82,8 +86,10 @@ TEST_CASE("RbacStore: seed data — operations", "[rbac_store]") {
     auto ops = store.list_operations();
     // Read, Write, Execute, Delete, Approve, Push (Push added for Guardian
     // distribute-rules-to-fleet operation; design v1.1 §9.2), Attest (added
-    // for Periodic Access Reviews, SOC 2 CC6.2 — AccessReview:Attest sign-off).
-    REQUIRE(ops.size() == 7);
+    // for Periodic Access Reviews, SOC 2 CC6.2 — AccessReview:Attest sign-off),
+    // Rotate (added for human API-token self-service rotation, P2 #11, SOC 2
+    // CC6.3 — ApiToken:Rotate, deliberately distinct from ApiToken:Write).
+    REQUIRE(ops.size() == 8);
 }
 
 // #2383 (governance C-3/UP-6): the MCP C8 boot validator carries closed-catalogue
@@ -107,13 +113,14 @@ TEST_CASE("RbacStore: seeded catalogues match the MCP C8 validator mirrors",
 TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Administrator");
-    // 22 types * 5 CRUD ops = 110 permissions, plus a single targeted Push
-    // grant on GuaranteedState (= 111), plus a single AccessReview:Attest grant
-    // (Periodic Access Reviews, CC6.2) = 112 permissions total. Push and Attest
-    // are deliberately NOT cross-seeded on other securables — see the rationale
-    // in rbac_store.cpp seed_defaults(). (22nd type: AccessReview, SOC 2 CC6.2;
-    // 21st: SoftwareLicensing, ADR-0024.)
-    CHECK(perms.size() == 112);
+    // 23 types * 5 CRUD ops = 115 permissions, plus a single targeted Push
+    // grant on GuaranteedState (= 116), plus a single AccessReview:Attest grant
+    // (Periodic Access Reviews, CC6.2, = 117), plus a single ApiToken:Rotate
+    // grant (P2 #11, SOC 2 CC6.3) = 118 permissions total. Push, Attest, and
+    // Rotate are deliberately NOT cross-seeded on other securables — see the
+    // rationale in rbac_store.cpp seed_defaults(). (23rd type: EnginePrincipal,
+    // #2376; 22nd: AccessReview, SOC 2 CC6.2; 21st: SoftwareLicensing, ADR-0024.)
+    CHECK(perms.size() == 118);
     for (auto& p : perms)
         CHECK(p.effect == "allow");
 
@@ -126,14 +133,26 @@ TEST_CASE("RbacStore: seed data — Administrator has all permissions", "[rbac_s
         }
     }
     CHECK(push_count == 1);
+
+    // Confirm the Rotate grant (P2 #11) exists exactly once, and only on
+    // ApiToken — a cross-seeded Rotate on any other securable would be
+    // exactly the kind of silent widening the round-3 finding was about.
+    size_t rotate_count = 0;
+    for (const auto& p : perms) {
+        if (p.operation == "Rotate") {
+            ++rotate_count;
+            CHECK(p.securable_type == "ApiToken");
+        }
+    }
+    CHECK(rotate_count == 1);
 }
 
 TEST_CASE("RbacStore: seed data — Viewer has read-only", "[rbac_store]") {
     RbacStore store(":memory:");
     auto perms = store.get_role_permissions("Viewer");
-    // 20 types * Read only (everything except Infrastructure; incl. Inventory +
-    // SoftwareLicensing, ADR-0024)
-    CHECK(perms.size() == 20);
+    // 21 types * Read only (everything except Infrastructure; incl. Inventory +
+    // SoftwareLicensing, ADR-0024, + EnginePrincipal, #2376)
+    CHECK(perms.size() == 21);
     for (auto& p : perms) {
         CHECK(p.operation == "Read");
         CHECK(p.effect == "allow");
@@ -1183,28 +1202,33 @@ TEST_CASE("RbacStore: ITServiceOwner role seeded with correct permissions", "[rb
 // ── check_scoped_permission ──────────────────────────────────────────────────
 
 namespace {
-// Per-test SQLite temp file for the on-disk ManagementGroupStore — the fixed
-// "test_scoped_rbac.db" name was a cross-JOB shared resource on the
-// shared-identity CI pools (#1883); TempDbFile also picks up the -wal/-shm
-// cleanup the old fixture missed.
-struct ScopedTestDb : yuzu::test::TempDbFile {
-    ScopedTestDb() : TempDbFile("yuzu_test_scoped_rbac-") {}
-};
+// The ManagementGroupStore is now a Postgres store (ADR-0042); the scoped-
+// permission tests below wire the SQLite RbacStore to a PG-backed mgmt store.
+// Pre-migrated template cloned per test (see PgTestTemplate in test_helpers.hpp).
+yuzu::test::PgTestTemplate scoped_mgmt_tpl{"rbacscopedmgmt", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    ManagementGroupStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("rbacscopedmgmt template: mgmt store failed to migrate");
+}};
 } // namespace
 
-TEST_CASE("RbacStore: check_scoped_permission global allow bypasses scoping", "[rbac_store]") {
+TEST_CASE("RbacStore: check_scoped_permission global allow bypasses scoping",
+          "[pg][rbac_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
     RbacStore rbac(":memory:");
-    ScopedTestDb tmp;
-    ManagementGroupStore mgmt(tmp.path);
 
     rbac.assign_role({"user", "admin_user", "Administrator"});
     CHECK(rbac.check_scoped_permission("admin_user", "Tag", "Write", "agent-1", &mgmt));
 }
 
-TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[rbac_store]") {
+TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[pg][rbac_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
     RbacStore rbac(":memory:");
-    ScopedTestDb tmp;
-    ManagementGroupStore mgmt(tmp.path);
 
     // Create a management group and add agent to it
     ManagementGroup g;
@@ -1227,10 +1251,11 @@ TEST_CASE("RbacStore: check_scoped_permission group-scoped allow", "[rbac_store]
     CHECK(rbac.check_scoped_permission("alice", "Execution", "Execute", "agent-crm-1", &mgmt));
 }
 
-TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[rbac_store]") {
+TEST_CASE("RbacStore: check_scoped_permission denied without scope", "[pg][rbac_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scoped_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore mgmt{pool};
     RbacStore rbac(":memory:");
-    ScopedTestDb tmp;
-    ManagementGroupStore mgmt(tmp.path);
 
     // alice has ITServiceOwner on CRM group, but agent-other is not in it
     ManagementGroup g;

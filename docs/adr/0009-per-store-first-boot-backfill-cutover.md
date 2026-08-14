@@ -69,3 +69,14 @@ data).
   `webhooks`, `offload_targets`, and `runtime_config`. The decided mechanism is app-side
   AES-256-GCM envelope encryption (`SecretCodec`); `pgcrypto` was considered and rejected.
   Backfills that touch secret columns transform (encrypt/hash), never copy — see ADR-0010.
+
+  **Update (`ResponseStore`/#2691, 2026-08-08):** "behind a flag" above overstated the
+  mechanism for the first store to actually exercise the skippable class. No flag was
+  built, and none is needed: `ResponseStore` skips backfill **unconditionally** — on
+  cutover the legacy `responses.db` is never read, and a one-time loud boot log records
+  "response history reset on Postgres cutover." There is no compliance or config-durability
+  requirement to preserve response rows across the cut (unlike the config/reference and
+  audit classes above), so a conditional flag would add a knob nobody has a reason to turn
+  off. `ResponseStore` is the reference case for this class: a future purely-TTL'd,
+  purely-ephemeral store should also skip unconditionally, not gate the skip behind a flag,
+  unless a specific store has a reason this one doesn't.

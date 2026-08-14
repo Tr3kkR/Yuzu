@@ -73,11 +73,13 @@ std::string render_auto_rail(const std::vector<std::pair<std::string, std::strin
 /// `config_summary` is the one-line threshold recap; `repoll_url` non-empty → the
 /// wrapper self-polls. When `repoll_url` is empty: `run_complete` true → "Complete",
 /// false → "still running in the background" (page-poll capped; the run continues
-/// server-side, reopen from the rail to refresh).
+/// server-side, reopen from the rail to refresh). `degrade_note` (#2691 finding 10)
+/// non-empty → an honest banner that `devices` is the last known-good state, not a
+/// fresh read — the poll degraded and is retrying, not "these devices are done."
 std::string render_auto_results(const std::vector<preflight::PreflightDeviceResult>& devices,
                                 const std::string& config_summary, const std::string& scope_label,
                                 const std::string& repoll_url, bool run_complete,
-                                const std::string& run_id);
+                                const std::string& run_id, const std::string& degrade_note = {});
 
 /// PURE: an honest note body (no devices in scope, missing seam, etc.).
 std::string render_auto_note(const std::string& message);
@@ -130,6 +132,12 @@ private:
     /// Render a run's result block: RUNNING → live (collect + compute), COMPLETE
     /// → stored grid. Self-repolls while running + pending + under the poll cap.
     std::string render_run(const PreflightRunRow& run, int attempt);
+
+    // Unit-test seam (#2691 finding 10): render_run and its inputs (run_store_,
+    // collect_fn_) are private, and the degraded-read fallback this fix added
+    // had no test at this layer. Test-only; grants no runtime surface. See
+    // tests/unit/server/test_preflight_routes.cpp.
+    friend struct PreflightRoutesTestAccess;
 };
 
 } // namespace yuzu::server

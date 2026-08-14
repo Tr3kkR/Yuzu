@@ -176,6 +176,12 @@ Requires `GuaranteedState:Push`. Returns `202 Accepted`. Audits `guaranteed_stat
 
 The push is dispatched to in-scope agents; the `agents=<count>` field records how many were targeted. Delivery is best-effort for gateway-connected agents under an upstream outage (durable buffering is Guardian A3), so a non-zero `agents` count records **dispatch, not a per-agent delivery receipt**. SIEM correlation should treat the count as "push fanned out to N agents," and corroborate actual enforcement against the drift/sync records at `/api/v1/guaranteed-state/events`.
 
+> **Store degrade is fail-closed (ADR-0038).** Since the Guardian state store moved to PostgreSQL, a push (and the heartbeat reconcile) **aborts rather than fan out** if the rule store cannot be read — a `503` on the REST path, and no push on the reconcile path — instead of silently pushing an empty rule set (which would disarm every in-scope agent). If a push returns `503`, the store is unreachable/degraded, not "you have no rules"; retry once the store recovers. This is a behaviour change from the SQLite era, where a store read error could surface as an empty result.
+
+> **DEX reads degrade to empty, not error (interim, #2659).** The `/dex` analytic reads (crash/signal/app aggregations) currently return an *empty* result on a degraded PG connection rather than a 503 — a degraded dashboard can read as "0 crashes." Each such degrade is counted at `yuzu_server_guardian_read_degrade_total{reason,source}`; until #2659 widens these reads, alert on `rate(yuzu_server_guardian_read_degrade_total[5m]) > 0` and treat a zero DEX panel under that condition as "unknown," not "healthy."
+
+> **Retention reap cadence + ceiling (#2660).** Expired Guardian events/observations are reaped on a ~60-minute clock-guarded pass capped per pass; under a sustained high-write incident the backlog can drain slower than it accumulated. Alert on a stalled reaper with `absent_over_time(yuzu_server_guardian_reap_passes_total[75m])`; drain-rate tuning for large fleets is tracked in #2660.
+
 ### 5. Query events and status
 
 ```bash
@@ -327,7 +333,11 @@ Each row carries a human `detected_value` sentence plus a structured **`detail_j
 
 ## Retention
 
-Guardian events are pruned on a rolling window. The default is 30 days. Override with `--guardian-event-retention-days` at server start (or set `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`), or via `PUT /api/v1/config/guardian_event_retention_days` at runtime. See the [Retention Settings](server-admin.md#retention-settings) table in the server administration guide.
+Guardian events are pruned on a rolling window. The default is 30 days. Override with `--guardian-event-retention-days` at server start (or set `YUZU_GUARDIAN_EVENT_RETENTION_DAYS`), or via `PUT /api/config/guardian_event_retention_days` at runtime. See the [Retention Settings](server-admin.md#retention-settings) table in the server administration guide. **The change is enforced only after the next restart**: the running store captures its retention window at construction and never re-reads it, so a `PUT` returns `"applied": true` while the reaper keeps using the startup value (#483). See [REST API -> When a change takes effect](rest-api.md#when-a-change-takes-effect).
+
+**Missing-anchor decline (#2579).** The reap pass keeps a durable clock-guard reading (`gc_meta`) so a skewed host clock can't mass-expire live rows. On a fresh deploy, before any pass has reached a verdict, a partial expiry with no comparison point yet declines once rather than deleting — the same missing-anchor trigger `AuditStore`'s retention guard adopted, and the same answer (decline): a mis-timed pass here would destroy non-regenerable Guardian/DEX compliance evidence. Nothing is deleted on the declining pass; the next pass has an anchor and proceeds, paced by the cap as always. Counted at `yuzu_server_guardian_reap_passes_total{result="declined_no_anchor"}`; the `YuzuGuardianReapAnchorNotSurviving` alert (`docs/prometheus/yuzu-alerts.yml`) fires on `increase(...[24h]) > 1` — a single decline is the ordinary fresh-deploy case, a climbing value means the anchor is not surviving.
+
+**Long-retention horizon (#2663).** The reap pass also probes for rows implausibly far in the future (a forward-skewed clock's own writes), and that bound scales with the store's own configured retention — never a fixed guess — so a long-retention deployment (e.g. a multi-year compliance configuration) does not have its own honest, live rows misclassified as implausible **under a stable or growing retention window**. Shrinking `--guardian-event-retention-days` across a restart can still leave older rows stamped under the previous, larger window past the new horizon — a self-correcting decline, not data loss (see [Retention](#retention) above on when a change takes effect).
 
 ## Reconnect replay traffic (durable lifecycle journal)
 
