@@ -69,6 +69,16 @@ message StreamStatusNotification {
   string peer_addr = 4;
   // Gateway node handling this agent.
   string gateway_node = 5;
+
+  // CC-03: wire capabilities this gateway build supports, advertised with
+  // every CONNECTED notification. yuzu_gw_upstream:notify_stream_status/4
+  // sends "command_dispatch_tag_v1" here as proof this build's vendored
+  // agent.proto carries CommandRequest.dispatch_tag = 9 and forwards it
+  // untouched. Mirrors the canonical proto/yuzu/gateway/v1/gateway.proto
+  // field 6; both gateway copies (priv/proto/gateway.proto and
+  // priv/proto/yuzu/gateway/v1/gateway.proto) must carry it identically or
+  // gpb drops it on one of the two build paths.
+  repeated string wire_capabilities = 6;
 }
 
 message StreamStatusAck {

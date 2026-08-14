@@ -63,6 +63,13 @@
 -define(DEFAULT_CB_MAX_RESET_MS, 300000).
 -define(DEFAULT_REPLAY_SPACING_MS, 20).
 
+%% CC-03 wire-capability handshake (proto/yuzu/gateway/v1/gateway.proto,
+%% StreamStatusNotification.wire_capabilities): the literal this gateway
+%% build advertises to prove its vendored agent.proto carries
+%% CommandRequest.dispatch_tag = 9 and forwards it untouched. See
+%% encode_command_request/1 in yuzu_gw_proto.erl for the forwarding half.
+-define(WIRE_CAP_DISPATCH_TAG_V1, <<"command_dispatch_tag_v1">>).
+
 -record(state, {
     notify_pids     :: #{pid() => true},
     %% Circuit breaker state
@@ -193,7 +200,12 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
                         session_id   => ensure_binary(SessionId),
                         event        => case Event of connected -> 'CONNECTED'; disconnected -> 'DISCONNECTED' end,
                         peer_addr    => PeerAddr,
-                        gateway_node => atom_to_binary(node(), utf8)
+                        gateway_node => atom_to_binary(node(), utf8),
+                        %% CC-03: advertised on every notification (connect and
+                        %% disconnect alike) — the server only needs to observe
+                        %% it once per gateway build, and sending it unconditionally
+                        %% avoids a connect-only special case here.
+                        wire_capabilities => [?WIRE_CAP_DISPATCH_TAG_V1]
                     },
                     {Pid, _MonRef} = spawn_monitor(fun() ->
                         case do_rpc('NotifyStreamStatus', Notification, notify_stream) of
