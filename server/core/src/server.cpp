@@ -17676,13 +17676,16 @@ private:
             // was null while the REST twins worked fine — two surfaces
             // disagreeing about whether the same capability exists (ADR-1005 A1).
             mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
-            // Review finding (#3135): the operator upload-grant mint/list/
-            // revoke routes shipped REST-only, with no MCP twin — an
-            // ADR-1005 gap for an ordinary authenticated operator action.
-            // Wired UNCONDITIONALLY, same reasoning as kek_ops above: gating
-            // this behind a conditional would let the MCP tool answer
-            // "unavailable" while the REST route works, two surfaces
-            // disagreeing about whether the capability exists (ADR-1005 A1).
+            // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
+            // wired UNCONDITIONALLY exactly like kek_ops above (never
+            // gated behind an unrelated conditional — see the KEK comment
+            // immediately above for why that matters: two surfaces
+            // disagreeing about whether the same capability exists is an
+            // ADR-1005 A1 violation). Also closes review finding #3135
+            // (operator upload-grant mint/list/revoke shipped REST-only,
+            // with no MCP twin — an ADR-1005 gap for an ordinary
+            // authenticated operator action).
+            mcp_server_->set_plugin_config_store(plugin_config_store_.get());
             mcp_server_->set_upload_grant_ops(
                 upload_grant_store_.get(),
                 // SAME logic as the REST list_read_fn wired at the

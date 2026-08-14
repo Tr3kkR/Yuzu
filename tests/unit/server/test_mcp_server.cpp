@@ -41,6 +41,16 @@
 #include "response_store.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
+// M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
+// only forward-declares PluginConfigStore (its .cpp includes the real header) —
+// the store's live-state assertions below need the full definition + its
+// SecretCodec/FileKeyProvider construction dependencies. UploadGrantStore
+// itself arrives fully defined transitively via mcp_server.hpp's own
+// file_retrieval_routes.hpp include, so it needs no separate include here.
+#include "key_provider.hpp"
+#include "pg/pg_raii.hpp"     // PgConn/PgResult — direct-SQL secret-row verification
+#include "pg/secret_codec.hpp"
+#include "plugin_config_store.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -51,6 +61,7 @@
 
 #include "agent.pb.h" // yuzu::agent::v1::AgentInfo (discover_plugins test)
 
+#include <libpq-fe.h> // direct-SQL secret-row verification (M5 remediation)
 #include <sqlite3.h>
 
 #include <atomic>
@@ -749,6 +760,22 @@ struct McpTestServer {
     /// codec/pool aren't up yet.
     yuzu::server::KekOps kek_ops_for_test{};
 
+    /// M5 remediation — ADR-0031 operator surface (PR1.5c/1.6c, p14):
+    /// optionally wire a real PluginConfigStore / UploadGrantStore so the
+    /// eleven plugin-config/secret/kill-switch/upload-grant MCP tools can be
+    /// exercised end-to-end against live Postgres state, not just the
+    /// registration/schema-validation coverage test_operator_surface_twins.cpp
+    /// and the argument-validation cases elsewhere in this file already give
+    /// them. Default nullptr keeps every pre-existing test on the "store
+    /// unavailable" path, mirroring every other *_for_test pointer above.
+    /// `upload_grant_list_read_fn_for_test` mirrors set_upload_grant_ops's own
+    /// fail-closed (kDenyAll) unwired default — a list_upload_grants test
+    /// must opt in with an explicit AdmitAll/AdmitScoped lambda, same as
+    /// production wiring in server.cpp.
+    yuzu::server::PluginConfigStore* plugin_config_store_for_test{nullptr};
+    yuzu::server::UploadGrantStore* upload_grant_store_for_test{nullptr};
+    yuzu::server::mcp::McpServer::UploadGrantListReadFn upload_grant_list_read_fn_for_test{};
+
     /// ar-S1: optionally wire a GuaranteedStateStore so the DEX read tools
     /// (list_dex_signals / get_dex_signal_scope / get_dex_signal_detail) can be
     /// exercised. Default nullptr keeps every existing test on the no-store path
@@ -868,17 +895,6 @@ struct McpTestServer {
     /// `deny_if_engine_session()` in mcp_server.cpp trips on EITHER key alone.
     std::string mock_principal_kind{"human"};
     std::string mock_auth_source{"local"};
-
-    /// ADR-0031 operator surface (PR1.6c) — optionally wire a real
-    /// UploadGrantStore so mint/list/revoke_upload_grant can be exercised
-    /// end-to-end against live Postgres state. Default nullptr keeps every
-    /// pre-existing test on the "store unavailable" path, mirroring every
-    /// other *_for_test pointer above. `upload_grant_list_read_fn_for_test`
-    /// mirrors set_upload_grant_ops's own fail-closed (kDenyAll) unwired
-    /// default — a list_upload_grants test must opt in with an explicit
-    /// AdmitAll/AdmitScoped lambda, same as production wiring in server.cpp.
-    yuzu::server::UploadGrantStore* upload_grant_store_for_test{nullptr};
-    yuzu::server::mcp::McpServer::UploadGrantListReadFn upload_grant_list_read_fn_for_test{};
 
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
@@ -1020,12 +1036,13 @@ private:
         // this is a no-op for every pre-existing test.
         mcp.set_kek_ops(kek_ops_for_test);
 
-        // ADR-0031 operator surface (PR1.6c, review remediation): the
-        // upload-grant store ALSO rides a setter, same pattern as the two
-        // above — wire before the handlers are built.
+        // M5 remediation: the plugin-config/upload-grant stores ALSO ride
+        // setters, same pattern as the two above — wire before the handlers
+        // are built.
+        if (plugin_config_store_for_test)
+            mcp.set_plugin_config_store(plugin_config_store_for_test);
         if (upload_grant_store_for_test)
-            mcp.set_upload_grant_ops(upload_grant_store_for_test,
-                                     upload_grant_list_read_fn_for_test);
+            mcp.set_upload_grant_ops(upload_grant_store_for_test, upload_grant_list_read_fn_for_test);
 
         // 2f: build GET/DELETE handlers FIRST — they copy auth_fn/audit_fn, which
         // build_handler std::move()s below.
@@ -7130,6 +7147,486 @@ TEST_CASE("MCP KEK: rotate_kek Cooldown threads the seam's honest cooldown_retry
     CHECK(body["error"]["data"]["retry_after_ms"] != 300000);
 }
 
+// ── M5 remediation: ADR-0031 operator-surface FUNCTIONAL coverage ──────────
+// The eleven plugin-config/secret/kill-switch/upload-grant MCP tools
+// (get/list/set/delete_plugin_config, set/delete_plugin_secret,
+// get/set_plugin_kill_switch, mint/list/revoke_upload_grant) already have
+// registration + argument-validation coverage — tools/list advertisement in
+// test_operator_surface_twins.cpp, malformed-args rejection elsewhere in this
+// file. None of that proves a real call reaches PluginConfigStore /
+// UploadGrantStore and changes a row: a handler wired to do nothing would
+// pass every one of those tests. The cases below wire a LIVE Postgres-backed
+// store into McpTestServer (the same seam production server.cpp uses,
+// set_plugin_config_store / set_upload_grant_ops) and assert the STORE
+// STATE — via a direct store read/query that never re-calls the tool that
+// just mutated it — not just the tool's own echoed response.
+//
+// Fixture shapes mirror the two store packages' own PG test files exactly:
+// PluginConfigPgWired == test_plugin_config_store_pg.cpp's `Wired` (register-
+// before-init: FileKeyProvider -> SecretCodec -> PluginConfigStore -> codec
+// init), reusing that file's "plugincfg" PgTestTemplate key (replay-verified
+// identical setup, same sharing discipline mcp_rbac_tpl above already uses
+// for "rbacstore"); the upload-grant template reuses
+// test_upload_grant_store_pg.cpp's "uploadgrant" key verbatim.
+
+namespace {
+
+yuzu::test::PgTestTemplate operator_surface_plugincfg_tpl{
+    "plugincfg", [](const std::string& dsn) {
+        yuzu::test::TempDir keys{"yuzu_test_keys_"};
+        yuzu::server::FileKeyProvider provider(keys.path);
+        yuzu::server::pg::SecretCodec codec(provider);
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::PluginConfigStore store{pool, codec};
+        if (!store.is_open())
+            throw std::runtime_error("operator_surface plugincfg template: store failed to migrate");
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+        if (PQstatus(conn.get()) != CONNECTION_OK)
+            throw std::runtime_error("operator_surface plugincfg template: connect failed");
+        if (!codec.init(conn.get()).has_value())
+            throw std::runtime_error("operator_surface plugincfg template: codec init failed");
+        yuzu::server::pg::PgResult reset{PQexec(conn.get(), "DELETE FROM secrets.kek_meta")};
+        if (!reset.ok())
+            throw std::runtime_error("operator_surface plugincfg template: kek_meta reset failed");
+    }};
+
+/// Fully-wired PluginConfigStore for one test case — same construction order
+/// as the template above, fresh keys/codec/pool per case.
+struct PluginConfigPgWired {
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    yuzu::server::FileKeyProvider provider{keys.path};
+    yuzu::server::pg::SecretCodec codec{provider};
+    yuzu::server::pg::PgPool pool;
+    yuzu::server::PluginConfigStore store;
+
+    explicit PluginConfigPgWired(const std::string& dsn)
+        : pool{{.conninfo = dsn, .size = 4}}, store{pool, codec} {
+        REQUIRE(store.is_open());
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        REQUIRE(codec.init(conn.get()).has_value());
+    }
+};
+
+yuzu::test::PgTestTemplate operator_surface_uploadgrant_tpl{
+    "uploadgrant", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::UploadGrantStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error(
+                "operator_surface uploadgrant template: store failed to migrate");
+    }};
+
+/// Parses the JSON payload carried in result.content[0].text of an MCP tool
+/// reply — same shape as bundle_payload() below, duplicated locally so this
+/// section reads standalone (the bundle helper is declared after this block).
+nlohmann::json operator_surface_payload(const std::unique_ptr<httplib::Response>& res) {
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+}
+
+std::int64_t operator_surface_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+} // namespace
+
+TEST_CASE("MCP operator surface: set_plugin_config writes a real store row; "
+          "delete_plugin_config removes it — proven by a DIRECT store read, never a re-call of "
+          "get_plugin_config",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_plugincfg_tpl);
+    PluginConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.plugin_config_store_for_test = &w.store;
+    ts.start();
+
+    auto set_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"set_plugin_config",)"
+        R"("arguments":{"plugin":"email","key":"smtp.host","value":"mail.example.com"}}})");
+    REQUIRE(set_res);
+    auto set_payload = operator_surface_payload(set_res);
+    CHECK(set_payload["value"] == "mail.example.com");
+    CHECK(set_payload["updated_by"] == "test-user");
+
+    // The proof: read the row DIRECTLY off the store, bypassing the tool
+    // that just wrote it — a handler wired to no-op would leave this NotFound.
+    auto direct = w.store.get_config("email", "smtp.host");
+    REQUIRE(direct.has_value());
+    CHECK(direct->value == "mail.example.com");
+    CHECK(direct->updated_by == "test-user");
+
+    REQUIRE(ts.audit_log.size() == 3);
+    CHECK(ts.audit_log[0] == "plugin_config.set|attempted");
+    CHECK(ts.audit_log[1] == "plugin_config.set|success");
+    CHECK(ts.audit_log[2] == "mcp.set_plugin_config|success");
+
+    auto del_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"delete_plugin_config",)"
+        R"("arguments":{"plugin":"email","key":"smtp.host"}}})");
+    REQUIRE(del_res);
+    auto del_payload = operator_surface_payload(del_res);
+    CHECK(del_payload["deleted"] == true);
+
+    // Same proof, other direction: a real row, really gone — not merely a
+    // re-call of the tool reporting what it wants to be true.
+    CHECK_FALSE(w.store.get_config("email", "smtp.host").has_value());
+
+    REQUIRE(ts.audit_log.size() == 6);
+    CHECK(ts.audit_log[3] == "plugin_config.delete|attempted");
+    CHECK(ts.audit_log[4] == "plugin_config.delete|success");
+    CHECK(ts.audit_log[5] == "mcp.delete_plugin_config|success");
+}
+
+TEST_CASE("MCP operator surface: get_plugin_config / list_plugin_config read LIVE store state, "
+          "not a cached/stale view",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_plugincfg_tpl);
+    PluginConfigPgWired w{db.dsn()};
+    // Seed two rows DIRECTLY through the store, bypassing the MCP tools
+    // entirely — proves get/list are reading real rows, not echoing back
+    // whatever set_plugin_config happened to receive earlier in the case.
+    REQUIRE(w.store.set_config("email", "host", "mail1.example.com", "seed").has_value());
+    REQUIRE(w.store.set_config("firewall", "mode", "strict", "seed").has_value());
+
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 2}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool}; // fresh -> !is_rbac_enabled() -> legacy-open AdmitAll
+    REQUIRE(rbac.is_open());
+
+    McpTestServer ts;
+    ts.plugin_config_store_for_test = &w.store;
+    ts.rbac_store_for_test = &rbac;
+    ts.start();
+
+    auto get_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_plugin_config",)"
+        R"("arguments":{"plugin":"email","key":"host"}}})");
+    REQUIRE(get_res);
+    auto get_payload = operator_surface_payload(get_res);
+    CHECK(get_payload["value"] == "mail1.example.com");
+    CHECK(get_payload["updated_by"] == "seed");
+
+    auto list_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_plugin_config",)"
+        R"("arguments":{}}})");
+    REQUIRE(list_res);
+    auto list_payload = operator_surface_payload(list_res);
+    REQUIRE(list_payload["data"].is_array());
+    CHECK(list_payload["data"].size() == 2);
+
+    // Add a THIRD row directly, out from under the tool — a live read sees
+    // it on the very next call; a cached/stale view would not.
+    REQUIRE(w.store.set_config("email", "port", "587", "seed").has_value());
+    auto list_res2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_plugin_config",)"
+        R"("arguments":{}}})");
+    REQUIRE(list_res2);
+    auto list_payload2 = operator_surface_payload(list_res2);
+    CHECK(list_payload2["data"].size() == 3);
+    bool found_new = false;
+    for (const auto& e : list_payload2["data"])
+        if (e["plugin"] == "email" && e["key"] == "port")
+            found_new = true;
+    CHECK(found_new);
+
+    // Read-only tools: one generic mcp.<tool>|success row each, no separate
+    // domain audit verb — matches the get_kek_status precedent above.
+    REQUIRE(ts.audit_log.size() == 3);
+    CHECK(ts.audit_log[0] == "mcp.get_plugin_config|success");
+    CHECK(ts.audit_log[1] == "mcp.list_plugin_config|success");
+    CHECK(ts.audit_log[2] == "mcp.list_plugin_config|success");
+}
+
+TEST_CASE("MCP operator surface: set_plugin_secret seals a REAL row (proven by direct SQL) and "
+          "never round-trips plaintext through get_plugin_config; delete_plugin_secret removes it",
+          "[pg][mcp][integration][operator_surface][secrets]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_plugincfg_tpl);
+    PluginConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.plugin_config_store_for_test = &w.store;
+    ts.start();
+
+    const std::string plaintext = "sk_live_dO_NoT_LeAk_mcp_987";
+    auto set_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"set_plugin_secret",)"
+        R"("arguments":{"plugin":"email","key":"api_key","value":")" +
+        plaintext + R"("}}})");
+    REQUIRE(set_res);
+    // Nowhere in the raw response — not in a field, not embedded in text.
+    CHECK(set_res->body.find(plaintext) == std::string::npos);
+    auto set_payload = operator_surface_payload(set_res);
+    CHECK_FALSE(set_payload.contains("value"));
+
+    // PluginConfigStore has NO get_secret method anywhere — write-only by
+    // construction (plugin_config_store.hpp's own header contract). The only
+    // way to prove a REAL row landed is a direct SQL check.
+    yuzu::server::pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    {
+        yuzu::server::pg::PgResult chk{PQexec(
+            conn.get(),
+            "SELECT 1 FROM plugin_config_store.secrets WHERE plugin = 'email' AND key = 'api_key'")};
+        REQUIRE(chk.status() == PGRES_TUPLES_OK);
+        CHECK(PQntuples(chk.get()) == 1);
+    }
+
+    // A secret's plaintext must never round-trip through the CONFIG read
+    // path — get_plugin_config addresses a different table entirely, so this
+    // must report NotFound, never the sealed secret's value.
+    auto get_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"get_plugin_config",)"
+        R"("arguments":{"plugin":"email","key":"api_key"}}})");
+    REQUIRE(get_res);
+    auto get_body = nlohmann::json::parse(get_res->body);
+    CHECK(get_body.contains("error")); // NotFound — no such CONFIG row
+    CHECK(get_res->body.find(plaintext) == std::string::npos);
+
+    auto del_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"delete_plugin_secret",)"
+        R"("arguments":{"plugin":"email","key":"api_key"}}})");
+    REQUIRE(del_res);
+    auto del_payload = operator_surface_payload(del_res);
+    CHECK(del_payload["deleted"] == true);
+
+    {
+        yuzu::server::pg::PgResult chk2{PQexec(
+            conn.get(),
+            "SELECT 1 FROM plugin_config_store.secrets WHERE plugin = 'email' AND key = 'api_key'")};
+        REQUIRE(chk2.status() == PGRES_TUPLES_OK);
+        CHECK(PQntuples(chk2.get()) == 0);
+    }
+
+    // get_plugin_config's NotFound answers before ever calling mcp_audit —
+    // only the set/delete_plugin_secret pairs land audit rows.
+    REQUIRE(ts.audit_log.size() == 6);
+    CHECK(ts.audit_log[0] == "plugin_secret.set|attempted");
+    CHECK(ts.audit_log[1] == "plugin_secret.set|success");
+    CHECK(ts.audit_log[2] == "mcp.set_plugin_secret|success");
+    CHECK(ts.audit_log[3] == "plugin_secret.delete|attempted");
+    CHECK(ts.audit_log[4] == "plugin_secret.delete|success");
+    CHECK(ts.audit_log[5] == "mcp.delete_plugin_secret|success");
+    // The audit detail is redacted in EVERY row, matching
+    // plugin_config_parsers.hpp's redact_secret_for_audit contract — no leak
+    // through the evidence trail either.
+    for (const auto& d : ts.audit_details)
+        CHECK(d.find(plaintext) == std::string::npos);
+}
+
+TEST_CASE("MCP operator surface: set_plugin_kill_switch actually flips PluginConfigStore::"
+          "action_allowed() — the real dispatch-gate decision, not just the echoed response",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_plugincfg_tpl);
+    PluginConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.plugin_config_store_for_test = &w.store;
+    ts.start();
+
+    // Baseline: no row yet -> the fail-closed dispatch gate reads "not killed".
+    CHECK(w.store.action_allowed("firewall", "block"));
+
+    auto off_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"set_plugin_kill_switch",)"
+        R"("arguments":{"plugin":"firewall","action":"block","enabled":false,"reason":"incident 99"}}})");
+    REQUIRE(off_res);
+    auto off_payload = operator_surface_payload(off_res);
+    CHECK(off_payload["enabled"] == false);
+    CHECK(off_payload["set_by"] == "test-user");
+
+    // The proof: the REAL fail-closed chokepoint every dispatch caller
+    // shares — not a re-read through get_plugin_kill_switch — now says no.
+    CHECK_FALSE(w.store.action_allowed("firewall", "block"));
+    // A different action under the same plugin is unaffected (action-level
+    // scoping, not a plugin-wide side effect).
+    CHECK(w.store.action_allowed("firewall", "quarantine"));
+
+    auto get_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"get_plugin_kill_switch",)"
+        R"("arguments":{"plugin":"firewall","action":"block"}}})");
+    REQUIRE(get_res);
+    auto get_payload = operator_surface_payload(get_res);
+    CHECK(get_payload["enabled"] == false);
+    CHECK(get_payload["reason"] == "incident 99");
+
+    auto on_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"set_plugin_kill_switch",)"
+        R"("arguments":{"plugin":"firewall","action":"block","enabled":true,"reason":"resolved"}}})");
+    REQUIRE(on_res);
+    // Flipped back — proven directly against the same chokepoint again, not
+    // by trusting the tool's own success response.
+    CHECK(w.store.action_allowed("firewall", "block"));
+
+    REQUIRE(ts.audit_log.size() == 7);
+    CHECK(ts.audit_log[0] == "plugin_config.kill_switch.set|attempted");
+    CHECK(ts.audit_log[1] == "plugin_config.kill_switch.set|success");
+    CHECK(ts.audit_log[2] == "mcp.set_plugin_kill_switch|success");
+    CHECK(ts.audit_log[3] == "mcp.get_plugin_kill_switch|success");
+    CHECK(ts.audit_log[4] == "plugin_config.kill_switch.set|attempted");
+    CHECK(ts.audit_log[5] == "plugin_config.kill_switch.set|success");
+    CHECK(ts.audit_log[6] == "mcp.set_plugin_kill_switch|success");
+}
+
+TEST_CASE("MCP operator surface: mint_upload_grant writes a real UploadGrantStore row — proven "
+          "by a DIRECT list_for_agent read, never a re-call of the tool",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
+        R"("arguments":{"agent_id":"agent-mcp-1","source_path":"/var/log/app.log",)"
+        R"("declared_max_size":4096,"retention_class":"extended"}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload.contains("grant_id"));
+    REQUIRE(payload.contains("grant_secret"));
+    const std::string grant_id = payload["grant_id"].get<std::string>();
+    CHECK_FALSE(grant_id.empty());
+    CHECK_FALSE(payload["grant_secret"].get<std::string>().empty());
+
+    // The proof: a direct store read, bypassing the tool that just minted.
+    auto rows = store.list_for_agent("agent-mcp-1");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].grant_id == grant_id);
+    CHECK((*rows)[0].retention_class == "extended");
+    CHECK((*rows)[0].declared_max_size == 4096);
+    CHECK((*rows)[0].state == "minted");
+    CHECK((*rows)[0].minted_by == "test-user");
+
+    REQUIRE(ts.audit_log.size() == 2);
+    CHECK(ts.audit_log[0] == "upload_grant.mint|success");
+    CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
+}
+
+TEST_CASE("MCP operator surface: list_upload_grants is confined to what's actually in the "
+          "store — a live read, not a cached view",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::server::UploadGrantMintParams p1;
+    p1.agent_id = "agent-a";
+    p1.source_path = "/tmp/a.bin";
+    p1.declared_max_size = 100;
+    p1.retention_class = "standard";
+    p1.minted_by = "seed";
+    REQUIRE(store.mint(p1, operator_surface_now()).has_value());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    // Same AdmitAll shape server.cpp derives from a fresh (RBAC-disabled)
+    // RbacStore — hardcoded here because the authz MAPPING itself is already
+    // covered by test_plugin_config_routes.cpp's list-route AdmitAll case and
+    // this MCP twin shares the identical RbacStore::authorize_list_read
+    // chokepoint; this test's own job is proving the LIST TOOL reads live
+    // store rows once admitted, not re-proving the mapping.
+    ts.upload_grant_list_read_fn_for_test =
+        [](const std::string&) -> UploadGrantListAuthorization {
+        return UploadGrantListAuthorization{.decision = UploadGrantListDecision::kAdmitAll};
+    };
+    ts.start();
+
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_upload_grants",)"
+        R"("arguments":{}}})");
+    REQUIRE(res1);
+    auto payload1 = operator_surface_payload(res1);
+    REQUIRE(payload1["data"].is_array());
+    CHECK(payload1["data"].size() == 1);
+    CHECK(payload1["data"][0]["agent_id"] == "agent-a");
+
+    // Mint a second grant DIRECTLY on the store, out from under the tool —
+    // a live read must see it on the very next call.
+    yuzu::server::UploadGrantMintParams p2 = p1;
+    p2.agent_id = "agent-b";
+    REQUIRE(store.mint(p2, operator_surface_now()).has_value());
+
+    auto res2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_upload_grants",)"
+        R"("arguments":{}}})");
+    REQUIRE(res2);
+    auto payload2 = operator_surface_payload(res2);
+    CHECK(payload2["data"].size() == 2);
+
+    REQUIRE(ts.audit_log.size() == 2);
+    CHECK(ts.audit_log[0] == "mcp.list_upload_grants|success");
+    CHECK(ts.audit_log[1] == "mcp.list_upload_grants|success");
+}
+
+TEST_CASE("MCP operator surface: revoke_upload_grant flips the REAL store row to revoked and "
+          "the grant becomes unredeemable — proven via a direct open_session() attempt",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    auto mint_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
+        R"("arguments":{"agent_id":"agent-revoke","source_path":"/tmp/x.bin",)"
+        R"("declared_max_size":100,"retention_class":"standard"}}})");
+    REQUIRE(mint_res);
+    auto mint_payload = operator_surface_payload(mint_res);
+    const std::string grant_id = mint_payload["grant_id"].get<std::string>();
+    const std::string grant_secret = mint_payload["grant_secret"].get<std::string>();
+
+    auto revoke_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_upload_grant",)"
+        R"("arguments":{"grant_id":")" +
+        grant_id + R"("}}})");
+    REQUIRE(revoke_res);
+    auto revoke_payload = operator_surface_payload(revoke_res);
+    CHECK(revoke_payload["revoked"] == true);
+
+    // The proof: the REAL row's state, read directly.
+    auto rows = store.list_for_agent("agent-revoke");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].state == "revoked");
+    CHECK((*rows)[0].grant_id == grant_id);
+
+    // And it can no longer be redeemed — open_session on a revoked grant
+    // collapses into kGrantUnknown (upload_grant_store.hpp's documented
+    // contract), the identical outcome as a grant that never existed.
+    auto session = store.open_session(grant_id, grant_secret, operator_surface_now());
+    CHECK(session.outcome == yuzu::server::OpenSessionOutcome::kGrantUnknown);
+
+    // Not "mintable again" either — no row for this grant_id is left minted.
+    auto listed = store.list_for_agent();
+    REQUIRE(listed.has_value());
+    bool still_minted = false;
+    for (const auto& r : *listed)
+        if (r.grant_id == grant_id && r.state == "minted")
+            still_minted = true;
+    CHECK_FALSE(still_minted);
+
+    REQUIRE(ts.audit_log.size() == 4);
+    CHECK(ts.audit_log[0] == "upload_grant.mint|success");
+    CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
+    CHECK(ts.audit_log[2] == "upload_grant.revoke|success");
+    CHECK(ts.audit_log[3] == "mcp.revoke_upload_grant|success");
+}
+
 // ── Live-query bundle MCP tools (ADR-0011) ──────────────────────────────────
 // execute_bundle (async dispatch) + get_bundle_result (collate) wrap the SAME
 // BundleOrchestrator as POST/GET /api/v1/bundles — MCP/REST parity by
@@ -9897,196 +10394,6 @@ TEST_CASE("MCP 2405: subset compiler enforces every supported keyword",
     }
 }
 
-namespace {
-
-// ADR-0031 operator surface (PR1.6c, review remediation) — MCP twins of the
-// operator upload-grant routes. Exercises a REAL UploadGrantStore against
-// live Postgres, proving each tool actually mutates/reads the store rather
-// than just returning a plausible-looking response.
-yuzu::test::PgTestTemplate operator_surface_uploadgrant_tpl{
-    "uploadgrant", [](const std::string& dsn) {
-        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
-        yuzu::server::UploadGrantStore store{pool};
-        if (!store.is_open())
-            throw std::runtime_error(
-                "operator_surface uploadgrant template: store failed to migrate");
-    }};
-
-/// Parses the JSON payload carried in result.content[0].text of an MCP tool
-/// reply — same shape as bundle_payload() elsewhere in this file, duplicated
-/// locally so this section reads standalone.
-nlohmann::json operator_surface_payload(const std::unique_ptr<httplib::Response>& res) {
-    auto body = nlohmann::json::parse(res->body);
-    REQUIRE(body.contains("result"));
-    return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
-}
-
-std::int64_t operator_surface_now() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-} // namespace
-
-TEST_CASE("MCP operator surface: mint_upload_grant writes a real UploadGrantStore row — proven "
-          "by a DIRECT list_for_agent read, never a re-call of the tool",
-          "[pg][mcp][integration][operator_surface]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    yuzu::server::UploadGrantStore store{pool};
-    REQUIRE(store.is_open());
-
-    McpTestServer ts;
-    ts.upload_grant_store_for_test = &store;
-    ts.start();
-
-    auto res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
-        R"("arguments":{"agent_id":"agent-mcp-1","source_path":"/var/log/app.log",)"
-        R"("declared_max_size":4096,"retention_class":"extended"}}})");
-    REQUIRE(res);
-    auto payload = operator_surface_payload(res);
-    REQUIRE(payload.contains("grant_id"));
-    REQUIRE(payload.contains("grant_secret"));
-    const std::string grant_id = payload["grant_id"].get<std::string>();
-    CHECK_FALSE(grant_id.empty());
-    CHECK_FALSE(payload["grant_secret"].get<std::string>().empty());
-
-    // The proof: a direct store read, bypassing the tool that just minted.
-    auto rows = store.list_for_agent("agent-mcp-1");
-    REQUIRE(rows.has_value());
-    REQUIRE(rows->size() == 1);
-    CHECK((*rows)[0].grant_id == grant_id);
-    CHECK((*rows)[0].retention_class == "extended");
-    CHECK((*rows)[0].declared_max_size == 4096);
-    CHECK((*rows)[0].state == "minted");
-    CHECK((*rows)[0].minted_by == "test-user");
-
-    REQUIRE(ts.audit_log.size() == 2);
-    CHECK(ts.audit_log[0] == "upload_grant.mint|success");
-    CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
-}
-
-TEST_CASE("MCP operator surface: list_upload_grants is confined to what's actually in the "
-          "store — a live read, not a cached view",
-          "[pg][mcp][integration][operator_surface]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    yuzu::server::UploadGrantStore store{pool};
-    REQUIRE(store.is_open());
-
-    yuzu::server::UploadGrantMintParams p1;
-    p1.agent_id = "agent-a";
-    p1.source_path = "/tmp/a.bin";
-    p1.declared_max_size = 100;
-    p1.retention_class = "standard";
-    p1.minted_by = "seed";
-    REQUIRE(store.mint(p1, operator_surface_now()).has_value());
-
-    McpTestServer ts;
-    ts.upload_grant_store_for_test = &store;
-    // Same AdmitAll shape server.cpp derives from a fresh (RBAC-disabled)
-    // RbacStore — hardcoded here because the authz MAPPING itself is already
-    // covered by test_plugin_config_routes.cpp's list-route AdmitAll case and
-    // this MCP twin shares the identical RbacStore::authorize_list_read
-    // chokepoint; this test's own job is proving the LIST TOOL reads live
-    // store rows once admitted, not re-proving the mapping.
-    ts.upload_grant_list_read_fn_for_test =
-        [](const std::string&) -> UploadGrantListAuthorization {
-        return UploadGrantListAuthorization{.decision = UploadGrantListDecision::kAdmitAll};
-    };
-    ts.start();
-
-    auto res1 = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_upload_grants",)"
-        R"("arguments":{}}})");
-    REQUIRE(res1);
-    auto payload1 = operator_surface_payload(res1);
-    REQUIRE(payload1["data"].is_array());
-    CHECK(payload1["data"].size() == 1);
-    CHECK(payload1["data"][0]["agent_id"] == "agent-a");
-
-    // Mint a second grant DIRECTLY on the store, out from under the tool —
-    // a live read must see it on the very next call.
-    yuzu::server::UploadGrantMintParams p2 = p1;
-    p2.agent_id = "agent-b";
-    REQUIRE(store.mint(p2, operator_surface_now()).has_value());
-
-    auto res2 = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_upload_grants",)"
-        R"("arguments":{}}})");
-    REQUIRE(res2);
-    auto payload2 = operator_surface_payload(res2);
-    CHECK(payload2["data"].size() == 2);
-
-    REQUIRE(ts.audit_log.size() == 2);
-    CHECK(ts.audit_log[0] == "mcp.list_upload_grants|success");
-    CHECK(ts.audit_log[1] == "mcp.list_upload_grants|success");
-}
-
-TEST_CASE("MCP operator surface: revoke_upload_grant flips the REAL store row to revoked and "
-          "the grant becomes unredeemable — proven via a direct open_session() attempt",
-          "[pg][mcp][integration][operator_surface]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
-    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
-    REQUIRE(pool.valid());
-    yuzu::server::UploadGrantStore store{pool};
-    REQUIRE(store.is_open());
-
-    McpTestServer ts;
-    ts.upload_grant_store_for_test = &store;
-    ts.start();
-
-    auto mint_res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
-        R"("arguments":{"agent_id":"agent-revoke","source_path":"/tmp/x.bin",)"
-        R"("declared_max_size":100,"retention_class":"standard"}}})");
-    REQUIRE(mint_res);
-    auto mint_payload = operator_surface_payload(mint_res);
-    const std::string grant_id = mint_payload["grant_id"].get<std::string>();
-    const std::string grant_secret = mint_payload["grant_secret"].get<std::string>();
-
-    auto revoke_res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_upload_grant",)"
-        R"("arguments":{"grant_id":")" +
-        grant_id + R"("}}})");
-    REQUIRE(revoke_res);
-    auto revoke_payload = operator_surface_payload(revoke_res);
-    CHECK(revoke_payload["revoked"] == true);
-
-    // The proof: the REAL row's state, read directly.
-    auto rows = store.list_for_agent("agent-revoke");
-    REQUIRE(rows.has_value());
-    REQUIRE(rows->size() == 1);
-    CHECK((*rows)[0].state == "revoked");
-    CHECK((*rows)[0].grant_id == grant_id);
-
-    // And it can no longer be redeemed — open_session on a revoked grant
-    // collapses into kGrantUnknown (upload_grant_store.hpp's documented
-    // contract), the identical outcome as a grant that never existed.
-    auto session = store.open_session(grant_id, grant_secret, operator_surface_now());
-    CHECK(session.outcome == yuzu::server::OpenSessionOutcome::kGrantUnknown);
-
-    // Not "mintable again" either — no row for this grant_id is left minted.
-    auto listed = store.list_for_agent();
-    REQUIRE(listed.has_value());
-    bool still_minted = false;
-    for (const auto& r : *listed)
-        if (r.grant_id == grant_id && r.state == "minted")
-            still_minted = true;
-    CHECK_FALSE(still_minted);
-
-    REQUIRE(ts.audit_log.size() == 4);
-    CHECK(ts.audit_log[0] == "upload_grant.mint|success");
-    CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
-    CHECK(ts.audit_log[2] == "upload_grant.revoke|success");
-    CHECK(ts.audit_log[3] == "mcp.revoke_upload_grant|success");
-}
-
-
 TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully covered",
           "[mcp][2g][schema]") {
     using yuzu::server::mcp::compile_input_schema;
@@ -10120,10 +10427,13 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         // KEK rotation (#2395 track C): both take zero arguments.
         {"rotate_kek", nlohmann::json::parse(R"({})")},
         {"rewrap_secrets", nlohmann::json::parse(R"({})")},
-        // ADR-0031 operator surface (PR1.6c): revoke_upload_grant gates on
-        // the supervised tier like every other Delete-class tool.
+        // Plugin config/secret + upload grants (PR1.5c/PR1.6c): the Delete-class
+        // operations gate on the supervised tier like every other destructive
+        // tool. `grant_id` must satisfy the schema's ^[a-f0-9]+$ pattern.
         // mint_upload_grant (Write) and list_upload_grants (Read) are not
         // gated — same pattern as mint_engine_credential above.
+        {"delete_plugin_config", nlohmann::json::parse(R"({"plugin":"p","key":"k"})")},
+        {"delete_plugin_secret", nlohmann::json::parse(R"({"plugin":"p","key":"k"})")},
         {"revoke_upload_grant", nlohmann::json::parse(R"({"grant_id":"ab12"})")},
     };
 
