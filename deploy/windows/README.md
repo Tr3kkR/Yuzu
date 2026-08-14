@@ -15,6 +15,7 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 | `toolchain-contract.json` | Reviewable schema for host pins/probes and the separate job-scoped vcpkg baseline. Provisioning parameters must match it. |
 | `Toolchain-Contract.psm1` | Fail-closed schema/pin/probe adapter shared by the assertion and its hermetic tests. |
 | `Assert-Toolchain.ps1` | Runner self-test: verifies the manifest schema and live versions, contract env, and every per-agent PostgreSQL binary/service/health check. Run at provision time **and** as a registration/preflight gate. |
+| `Update-ToolchainManifest.ps1` | Drained-host, manifest-only migration for an already-installed reviewed contract change. Preserves each host's recorded runner/PostgreSQL/telemetry topology, live-asserts a candidate, then atomically replaces the manifest with a backup. |
 | `Assert-VcpkgCheckout.ps1` | Job self-test: after `lukka/run-vcpkg`, verifies the workspace checkout HEAD, clean tracked tree, and executable release against the checkout metadata before CI installs ports. |
 | `Test-ToolchainContract.ps1` | Hermetic schema/version regression tests, also registered in Meson's `docs` suite when `pwsh` exists. Safe anywhere; reads no service or registry state. |
 | `Test-ProvisionLogic.ps1` | Regression tests for the provisioning script's decision logic (maintenance gate, `-D` handling, `ImagePath` rewrite). Safe anywhere — no elevation, no machine state. Run after editing `Provision-Windows-Runner.ps1`. |
@@ -43,6 +44,27 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 
    Provisioning accepts only the target value; the compatibility list affects
    validation during the rollout, not what a newly provisioned host installs.
+
+   Adding a newly required manifest item is stricter than widening an existing
+   pin list: an older manifest cannot claim an artifact it never recorded.
+   Keep the PR draft while every Windows host is drained and migrated from the
+   reviewed branch, and do not enable its runners until `Assert-Toolchain.ps1`
+   passes against that branch's contract. For an already-installed toolchain
+   change, use the manifest-only migration rather than the Wee Tam provisioner:
+
+   ```powershell
+   pwsh -NoProfile -File deploy\windows\Update-ToolchainManifest.ps1
+   ```
+
+   It refuses to run while an Actions worker/job is live, preserves
+   the prior manifest's one-runner or multi-runner topology, validates the
+   candidate against live host state, and only then replaces the manifest
+   atomically. It rechecks for a worker immediately before replacement. An idle
+   listener may remain online because no service or toolchain state is mutated;
+   a racing job sees either the old fail-closed manifest or the fully asserted
+   candidate. The prior manifest is retained as a timestamped backup. Never
+   hand-edit the JSON, and never run the four-runner Wee Tam provisioner on
+   single-runner Shulgi merely to regenerate a manifest.
 
    The schema introduction has one separately bounded bridge for manifests
    emitted by the immediately preceding provisioner: a missing `schema` is
@@ -92,6 +114,34 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    ```powershell
    pwsh -NoProfile -File deploy\windows\Test-ToolchainContract.ps1
    ```
+
+   For the Build Tools/SDK installation, Visual Studio Installer exits
+   1641/3010 and WinGet's translated reboot results mean a reboot is required.
+   Provisioning exits 3 immediately in those cases. On an already-registered
+   host, disable the
+   boot-triggered tasks that invoke `Start-PinnedRunner.ps1` (or preserve the
+   site's runner-admission drain), then verify no `Runner.Listener.exe` or
+   `Runner.Worker.exe` remains before rebooting. After reboot, verify the
+   runners are still absent, rerun provisioning and `Assert-Toolchain.ps1`, and
+   only then re-enable the tasks/admission.
+
+   To roll this SDK target back, keep runner admission closed and revert the
+   repository contract first. Verify the prior target's `Windows.h`,
+   `kernel32.lib`, and `rc.exe` exist; if not, restore the known-good host image
+   or reinstall the prior reviewed SDK target. Re-run provisioning from the
+   reverted contract to regenerate the manifest, validate the prior native
+   MSYS2 environment/build, and only then re-enable runners. Reverting Git alone
+   does not restore host artifacts.
+
+   Record each host reconciliation in the approved maintenance/change record
+   before restoring runner admission. The retrievable record must identify the
+   change ID, reviewed PR and exact commit, host, operator and approved window;
+   link the provisioning transcript and capture the manifest hash,
+   `Assert-Toolchain.ps1` result, native validation `/test` run ID, and any
+   reboot or rollback outcome. Record installer/artifact hashes wherever the
+   upstream distribution exposes stable immutable values. Link that record from
+   the PR before taking it out of draft; a package-manager inventory entry or a
+   host-local transcript alone is not approval evidence.
 
 2. **Self-test** (must pass before registering):
    ```powershell
@@ -204,7 +254,8 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 
 ## `toolchain-manifest.json`
 
-Emitted by provisioning (default `C:\actions-runner\toolchain-manifest.json`),
+Emitted by provisioning or the drained-host manifest-only migration (default
+`C:\actions-runner\toolchain-manifest.json`),
 verified by `Assert-Toolchain.ps1`:
 
 ```json
@@ -214,7 +265,7 @@ verified by `Assert-Toolchain.ps1`:
   "host": "WEETAM",
   "runner_count": 4,
   "pins":  { "python": "3.14.6", "meson": "1.11.1", "erlang": "28.4.2",
-             "rebar3": "3.24.0", "postgres": "18.4", "build_jobs": 16,
+             "rebar3": "3.24.0", "postgres": "18.4", "windows_sdk": "10.0.26100.0", "build_jobs": 16,
              "vcpkg_baseline": "4b77da7..." },
   "env":   { "VCPKG_ROOT": "C:\\vcpkg", "CCACHE_DIR": "D:\\ci\\ccache",
              "RUNNER_TOOL_CACHE": "D:\\ci\\tool_cache",
@@ -235,17 +286,29 @@ verified by `Assert-Toolchain.ps1`:
       "pg_isready": "D:\\ci\\pgbin\\agent-0\\bin\\pg_isready.exe" },
     "..."
   ],
-  "tools": [ { "name": "python", "path": "C:\\Python314\\python.exe", "version": "...", "required": true }, ... ]
+  "tools": [
+    { "name": "python", "path": "C:\\Python314\\python.exe", "version": "...", "required": true },
+    { "name": "windows_sdk_header", "path": "C:\\Program Files (x86)\\Windows Kits\\10\\Include\\10.0.26100.0\\um\\Windows.h", "version": "10.0.26100.0", "required": true },
+    { "name": "windows_sdk_lib", "path": "C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.26100.0\\um\\x64\\kernel32.lib", "version": "10.0.26100.0", "required": true },
+    { "name": "windows_sdk_rc", "path": "C:\\Program Files (x86)\\Windows Kits\\10\\bin\\10.0.26100.0\\x64\\rc.exe", "version": "10.0.26100.0", "required": true },
+    "..."
+  ]
 }
 ```
 
 The manifest is host-generated (like a lockfile) and not committed; this README
 documents its shape so the self-test and any tooling agree on the contract.
 The committed `toolchain-contract.json` is the version-policy source of truth.
+The assertion is deliberately package-manager-agnostic: Chocolatey, WinGet,
+and reviewed direct installs are all acceptable only when their effective
+paths, versions, and live artifacts satisfy this contract. A package manager's
+inventory entry is not validation evidence by itself.
 `Assert-Toolchain.ps1` accepts a missing schema only during the dated rollout
 bridge above, rejects an unknown explicit schema, rejects a host pin outside
 its committed `accepted_host_pins` list, then executes version probes
-for Python, Meson, Erlang OTP, rebar3, and PostgreSQL. It also proves the
+for Python, Meson, Erlang OTP, rebar3, and PostgreSQL. The Windows SDK artifact
+probes require the reviewed target in every recorded artifact version and path;
+the live assertion then requires each recorded file to exist. It also proves the
 effective `python`, `meson`, and `git` commands resolve to the recorded host
 executables. Every executable probe has a 10-second deadline. A launch error,
 timeout, unparseable output, or mismatch is a failure.

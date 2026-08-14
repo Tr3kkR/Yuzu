@@ -507,6 +507,8 @@ jobs:
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          sdk: 10.0.26100.0
 
       - name: Assert toolchain available
         run: |
@@ -519,19 +521,9 @@ jobs:
           done
           meson --version
 
-      - name: Assert toolchain manifest (self-hosted, optional)
+      - name: Assert toolchain manifest (self-hosted)
         shell: pwsh
-        run: |
-          # Manifest-based self-test for boxes provisioned via
-          # deploy/windows/Provision-Windows-Runner.ps1. SKIPS (does not fail) on
-          # runners that predate the manifest — the PATH check above still covers
-          # them. Same step as ci.yml's windows job.
-          $m = 'C:\actions-runner\toolchain-manifest.json'
-          if (Test-Path $m) {
-            ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath $m
-          } else {
-            Write-Host 'no toolchain-manifest.json on this runner — skipping manifest self-test'
-          }
+        run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json'
 
       - name: Assert runner disk (>= 45 GB free)
         run: |
