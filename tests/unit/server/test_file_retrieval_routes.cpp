@@ -441,6 +441,63 @@ TEST_CASE("unauthenticated chunk/commit/cancel requests never grow the write-loc
     CHECK(yuzu::server::upload_write_lock_count_for_test() == before);
 }
 
+TEST_CASE("M3: a degraded store answers 503 for the write-lock admission gate, and never "
+         "allocates a lock entry for the unproven credential",
+         "[server][routes][upload]") {
+    // The exact defect: admit_to_write_lock used to admit on ANY outcome
+    // other than kSessionUnknown, including kUnavailable — so a caller with
+    // a well-formed but never-issued (upload_id, secret) pair, arriving
+    // while the store's pool is exhausted or a query is failing, was
+    // admitted to allocate/contend a lock AND drive a second
+    // authenticate_session call once inside it. That is exactly the wrong
+    // direction: a degraded store is the condition under which admitting
+    // unproven credentials does the most damage.
+    //
+    // Genuinely exhausts a size-1 pool by holding its only lease for the
+    // duration of the call, rather than mocking the store (UploadGrantStore
+    // has no virtual seam) — the real path authenticate_session's
+    // kReadTimeout{1500} takes, so this test's cost is that bounded ~1.5s,
+    // not a flaky timing assumption.
+    YUZU_REQUIRE_PG_DB_TPL(db, routes_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+    UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::test::TempDir blob_dir{"yuzu_test_upload_blobs_"};
+    TestRouteSink sink;
+    yuzu::server::register_file_retrieval_routes(
+        sink, make_deps(store, blob_dir.path, std::make_shared<std::int64_t>(1000)));
+
+    const auto before = yuzu::server::upload_write_lock_count_for_test();
+
+    // Hold the pool's ONLY lease for the duration of the routed calls below,
+    // so authenticate_session's try_acquire_for(kReadTimeout) inside them
+    // times out and returns kUnavailable — a real degraded-store condition,
+    // not a simulated one.
+    auto held_lease = pool.acquire();
+    REQUIRE(held_lease);
+
+    const std::string fake_id(16, 'd');
+    const std::string fake_cred = fake_id + "." + std::string(64, 'f');
+    const std::unordered_map<std::string, std::string> hdr{
+        {"X-Yuzu-Upload-Session", fake_cred}};
+
+    auto chunk = sink.dispatch("PUT", "/api/v1/uploads/" + fake_id + "/chunk", "x",
+                               "application/octet-stream",
+                               {{"X-Yuzu-Upload-Session", fake_cred},
+                                {"Content-Range", content_range(0, 0, 1)}});
+    REQUIRE(chunk != nullptr);
+    CHECK(chunk->status == 503); // NOT 401 — the store's degraded state is real,
+                                 // never mistaken for "no such session"
+
+    auto cancel = sink.dispatch("DELETE", "/api/v1/uploads/" + fake_id, "", "application/json", hdr);
+    REQUIRE(cancel != nullptr);
+    CHECK(cancel->status == 503);
+
+    held_lease.reset(); // release before the store/pool destruct
+
+    CHECK(yuzu::server::upload_write_lock_count_for_test() == before);
+}
+
 TEST_CASE("a completed authenticated upload leaves no write-lock entry behind",
           "[server][routes][upload]") {
     YUZU_REQUIRE_PG_DB_TPL(db, routes_tpl);

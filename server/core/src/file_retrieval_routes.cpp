@@ -487,21 +487,40 @@ void send_session_auth_error(httplib::Response& res, SessionAuthOutcome outcome)
 /// legitimate uploader is using. Refcount eviction bounds the memory; this
 /// bounds who can reach the lock at all.
 ///
-/// It admits on anything OTHER than `kSessionUnknown` — the outcome that
-/// collapses "no such upload_id" and "the secret did not match". Every other
-/// outcome means the credential IS valid for a real session, and the
-/// in-critical-section `authenticate_session` remains the authoritative read:
-/// expiry, terminal state and store-unavailable all carry mutations or
-/// state-dependent responses that must happen under the lock, so this gate
-/// deliberately does not try to answer them.
+/// M3 (review finding): admits ONLY on an outcome that proves a real
+/// credential — `kOk`, `kExpired`, `kSessionTerminal`. `kSessionUnknown`
+/// (collapsing "no such upload_id" and "the secret did not match") and
+/// `kUnavailable` are BOTH refused here. An earlier revision of this gate
+/// admitted on anything other than `kSessionUnknown`, reasoning that
+/// `kUnavailable` was rare enough not to matter — but a degraded store is
+/// exactly the condition under which admitting unproven credentials is
+/// worst: every well-formed-but-unauthenticated (upload_id, secret) pair
+/// would allocate/contend a lock AND drive a second authenticate call once
+/// inside it, doubling load on a pool/query path that is already failing.
+/// Refusing immediately here, before the lock is even touched, is the
+/// correct fail-closed answer — the same posture `require_store` already
+/// takes for a null store. The in-critical-section `authenticate_session`
+/// remains the authoritative read for the three admitted outcomes: expiry
+/// and terminal state carry mutations that must happen under the lock, and
+/// `kOk` is re-validated there against the state the lock now protects.
 [[nodiscard]] bool admit_to_write_lock(const Deps& deps, const std::string& upload_id,
                                        const std::string& secret, httplib::Response& res) {
     const auto outcome = deps.store->authenticate_session(upload_id, secret, resolve_now(deps)).outcome;
-    if (outcome == SessionAuthOutcome::kSessionUnknown) {
+    switch (outcome) {
+    case SessionAuthOutcome::kOk:
+    case SessionAuthOutcome::kExpired:
+    case SessionAuthOutcome::kSessionTerminal:
+        return true;
+    case SessionAuthOutcome::kSessionUnknown:
+    case SessionAuthOutcome::kUnavailable:
         send_session_auth_error(res, outcome);
         return false;
     }
-    return true;
+    // Exhaustive switch above covers every SessionAuthOutcome enumerator;
+    // reachable only if the enum grows without this switch being updated —
+    // fail closed rather than fall through with no response written.
+    send_generic(res, 503, "upload grant store unavailable");
+    return false;
 }
 
 void register_session_open(HttpRouteSink& sink, Deps deps) {
