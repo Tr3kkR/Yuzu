@@ -56,6 +56,11 @@ enum class HiveState {
 struct RawProfileRecord {
     std::string sid;
     std::string profile_image_path;
+    /// True when ProfileImagePath EXISTS but could not be read or decoded, as
+    /// distinct from being absent — both leave profile_image_path empty, and
+    /// before #2771 up-S2 the two were indistinguishable, so an over-long
+    /// path silently became "no path" with no signal at all.
+    bool profile_image_path_unreadable{false};
 };
 
 /// One resolved, classified profile.
@@ -65,6 +70,7 @@ struct ProfileInfo {
                               // EMPTY when unresolvable — NEVER the sid (ADR-0024 D11)
     std::string profile_path; // == the raw record's profile_image_path (already expanded)
     HiveState state{HiveState::not_loaded};
+    bool profile_path_unreadable{false}; // carried from RawProfileRecord (#2771 up-S2)
 };
 
 /// The three well-known local-system profile SIDs ProfileList always carries
@@ -159,6 +165,7 @@ struct ProfileInfo {
         info.profile_path = rec.profile_image_path;
         info.profile_name = profile_name_from_path(rec.profile_image_path);
         info.state = classify_hive_state(rec.sid, hku_subkeys);
+        info.profile_path_unreadable = rec.profile_image_path_unreadable;
         out.push_back(std::move(info));
     }
     return out;

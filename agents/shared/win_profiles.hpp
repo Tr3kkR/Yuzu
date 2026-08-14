@@ -39,6 +39,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -50,6 +52,9 @@ namespace yuzu::win {
 /// explicit ceiling.
 inline constexpr std::size_t kMaxProfiles = 512;
 inline constexpr DWORD kMaxRegValueBytes = 1u * 1024u * 1024u; // 1 MiB
+// A Windows path is at most 32767 wchars; 64 KiB bounds the two-pass
+// ProfileImagePath read without ever truncating a legitimate value.
+inline constexpr DWORD kMaxProfilePathBytes = 64u * 1024u;
 
 // Two-pass ExpandEnvironmentStringsW. The single-pass form SILENTLY
 // TRUNCATES: on overflow the API does not fail -- it returns the required
@@ -108,24 +113,51 @@ inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
         RegKey sid_key;
         if (RegOpenKeyExW(profiles.get(), to_wide(rec.sid).c_str(), 0, KEY_READ, sid_key.put()) ==
             ERROR_SUCCESS) {
-            wchar_t path_buf[512]{};
-            DWORD path_size = sizeof(path_buf); // BYTES
-            DWORD type = 0;
-            if (RegQueryValueExW(sid_key.get(), L"ProfileImagePath", nullptr, &type,
-                                 reinterpret_cast<LPBYTE>(path_buf), &path_size) ==
-                    ERROR_SUCCESS &&
+            // Two-pass (#2771 up-S2). The former fixed 512-wchar buffer made
+            // RegQueryValueExW return ERROR_MORE_DATA for a longer
+            // ProfileImagePath, which left profile_image_path empty and
+            // therefore INDISTINGUISHABLE from "the value is absent" -- a
+            // silent truncation with no signal, unlike the kMaxProfiles cap
+            // which has always warned. Sizing first removes the truncation
+            // outright; the flag covers whatever still fails to decode.
+            DWORD type = 0, path_size = 0;
+            const LSTATUS size_rc = RegQueryValueExW(sid_key.get(), L"ProfileImagePath", nullptr,
+                                                     &type, nullptr, &path_size);
+            if (size_rc == ERROR_SUCCESS && path_size > 0 && path_size <= kMaxProfilePathBytes &&
                 (type == REG_SZ || type == REG_EXPAND_SZ)) {
-                std::size_t nch = path_size / sizeof(wchar_t);
-                while (nch > 0 && path_buf[nch - 1] == L'\0')
-                    --nch;
-                // ProfileImagePath may be REG_EXPAND_SZ -- expand once, here,
-                // so every downstream consumer sees a literal path.
-                const std::wstring expanded = expand_env_strings(std::wstring(path_buf, nch));
-                rec.profile_image_path =
-                    from_wide(expanded.c_str(), static_cast<int>(expanded.size()));
+                // Round up to a whole wchar_t: a malformed value can carry an
+                // odd byte count, and the buffer must still hold every byte
+                // the second call writes.
+                std::vector<wchar_t> path_buf((path_size + sizeof(wchar_t) - 1) / sizeof(wchar_t) + 1,
+                                              L'\0');
+                DWORD read_size = static_cast<DWORD>(path_buf.size() * sizeof(wchar_t));
+                if (RegQueryValueExW(sid_key.get(), L"ProfileImagePath", nullptr, &type,
+                                     reinterpret_cast<LPBYTE>(path_buf.data()), &read_size) ==
+                        ERROR_SUCCESS &&
+                    (type == REG_SZ || type == REG_EXPAND_SZ)) {
+                    std::size_t nch = read_size / sizeof(wchar_t);
+                    if (nch > path_buf.size())
+                        nch = path_buf.size();
+                    while (nch > 0 && path_buf[nch - 1] == L'\0')
+                        --nch;
+                    // ProfileImagePath may be REG_EXPAND_SZ -- expand once,
+                    // here, so every downstream consumer sees a literal path.
+                    const std::wstring expanded =
+                        expand_env_strings(std::wstring(path_buf.data(), nch));
+                    rec.profile_image_path =
+                        from_wide(expanded.c_str(), static_cast<int>(expanded.size()));
+                } else {
+                    // The value was there a moment ago and is not readable
+                    // now (raced delete, ACL, corruption).
+                    rec.profile_image_path_unreadable = true;
+                }
+            } else if (size_rc == ERROR_SUCCESS) {
+                // Present but unusable: over the cap, zero-length, or a type
+                // that is not a string. Absent (any other size_rc) stays
+                // silent -- a profile with no ProfileImagePath is not an
+                // error, it just has no offline path.
+                rec.profile_image_path_unreadable = true;
             }
-            // An unreadable/absent ProfileImagePath leaves profile_image_path
-            // empty on this record -- the record itself is still emitted.
         }
         out.push_back(std::move(rec));
     }
@@ -213,41 +245,83 @@ private:
 
 /// Outcome of with_user_hive's access ladder, rendered honestly by the
 /// caller instead of collapsing every non-ok case to silence.
-enum class HiveAccessStatus {
-    ok,                // fn was called against a reachable root
-    not_found,         // no live hive and no offline profile path to mount
-    privilege_missing, // an offline mount was needed but SeBackup/SeRestore
-                       // could not both be enabled
-    mount_failed,      // an offline mount was attempted (privileges ok) and
-                       // RegLoadKeyW (or the subsequent root open) failed
+///
+/// Defined in user_profile_model.hpp (portable) and aliased here so the
+/// rendering decisions are testable off-Windows; every existing
+/// `yuzu::win::HiveAccessStatus::...` call site is unaffected.
+using HiveAccessStatus = yuzu::profiles::HiveAccessStatus;
+
+/// What with_user_hive did, for callers that need to report it. `mount_name`
+/// is the ACTUAL salted mount subkey, so a remediation message can name what
+/// was really mounted; it is empty when no offline mount was attempted.
+struct HiveAccessReport {
+    HiveAccessStatus status{HiveAccessStatus::not_found};
+    bool mounted_offline{false};
+    bool unload_failed{false};
+    std::string mount_name;
 };
+
+/// Serialises the OFFLINE arm of with_user_hive across the whole process.
+///
+/// PrivilegeScope adjusts the PROCESS token, not a thread token. Once more
+/// than one plugin in the agent uses this ladder -- registry, installed_apps,
+/// license_scan and tar all load into one process, and tar's collectors run
+/// on background threads -- two overlapping scopes race:
+///
+///   A.ctor(prev=disabled) -> B.ctor(prev=enabled) -> A.dtor(restores
+///   disabled) -> B's RegLoadKeyW fails
+///
+/// and the loser degrades SILENTLY into mount_failed/privilege_missing. This
+/// mutex makes the privilege-enable -> RegLoadKeyW -> fn -> unload -> restore
+/// sequence atomic with respect to other callers. It also serialises the
+/// exclusive hive-FILE lock two offline readers of the same profile would
+/// otherwise contend for. The offline path is already file-I/O bound, so the
+/// serialisation costs nothing measurable; the LIVE path (the common case)
+/// never takes the lock.
+inline std::mutex& offline_hive_mutex() {
+    static std::mutex m;
+    return m;
+}
 
 // The live-hive-first, offline-mount-fallback ladder (C-1): tries
 // HKU\<sid> first; only if that is absent does it enable
-// SeBackup/SeRestore and mount `<profile_path>\NTUSER.DAT` under a private
-// "YUZU_HIVE_<sid>" name via ScopedUserHive. Calls fn(root_hkey) with
+// SeBackup/SeRestore and mount `<profile_path>\NTUSER.DAT` under a private,
+// per-call salted name via ScopedUserHive. Calls fn(root_hkey) with
 // whichever root it found, exactly once, iff a root was reachable.
-// `unload_failed`, if non-null, is forwarded to the internal ScopedUserHive
-// and set (never cleared) if the offline mount's RegUnLoadKeyW fails on the
-// way out -- read it AFTER this call returns. The caller must surface a set
+//
+// `report`, if non-null, receives what happened -- including
+// `unload_failed`, set (never cleared) when the offline mount's
+// RegUnLoadKeyW fails on the way out, and the `mount_name` that failed to
+// unload. Read it AFTER this call returns. The caller must surface a set
 // flag rather than drop it: a failed unload leaves a system-wide mount that
 // survives process death and locks the profile's NTUSER.DAT until it is
 // unloaded or the host reboots (see win_reg_handle.hpp's ScopedUserHive
 // doc comment for the common transient-holder case reboot isn't actually
-// required for).
+// required for). yuzu::profiles::render_hive_access_lines turns a report
+// into the operator-facing lines.
 template <typename Fn>
 HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profile_path_utf8,
-                                Fn&& fn, bool* unload_failed = nullptr) {
+                                Fn&& fn, HiveAccessReport* report = nullptr) {
+    auto finish = [&](HiveAccessStatus st) {
+        if (report)
+            report->status = st;
+        return st;
+    };
+
     const std::wstring wsid = to_wide(sid);
 
     RegKey live;
     if (RegOpenKeyExW(HKEY_USERS, wsid.c_str(), 0, KEY_READ, live.put()) == ERROR_SUCCESS) {
         fn(live.get());
-        return HiveAccessStatus::ok;
+        return finish(HiveAccessStatus::ok);
     }
 
     if (profile_path_utf8.empty())
-        return HiveAccessStatus::not_found;
+        return finish(HiveAccessStatus::not_found);
+
+    // Everything below mutates process-token privilege state and takes an
+    // exclusive lock on the hive file -- see offline_hive_mutex().
+    const std::lock_guard<std::mutex> offline_lock(offline_hive_mutex());
 
     // R15: the offline-hive fallback rides SeBackupPrivilege/SeRestorePrivilege,
     // which the agent account already holds (docs/agent-privilege-model.md) --
@@ -258,18 +332,30 @@ HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profi
     PrivilegeScope backup_priv(L"SeBackupPrivilege");
     PrivilegeScope restore_priv(L"SeRestorePrivilege");
     if (!backup_priv.ok() || !restore_priv.ok())
-        return HiveAccessStatus::privilege_missing;
+        return finish(HiveAccessStatus::privilege_missing);
 
     const std::wstring ntuser = to_wide(profile_path_utf8) + L"\\NTUSER.DAT";
-    const std::wstring mount = L"YUZU_HIVE_" + wsid;
-    ScopedUserHive hive(mount, ntuser, unload_failed);
+    const std::wstring mount = unique_hive_mount_name(wsid);
+    // Recorded BEFORE the mount is attempted, so a load failure still names
+    // the mount the operator should check for.
+    if (report) {
+        report->mounted_offline = true;
+        report->mount_name = from_wide(mount.c_str(), static_cast<int>(mount.size()));
+    }
 
+    bool unload_failed = false;
     bool called = false;
-    hive.with_root([&](HKEY root) {
-        fn(root);
-        called = true;
-    });
-    return called ? HiveAccessStatus::ok : HiveAccessStatus::mount_failed;
+    {
+        ScopedUserHive hive(mount, ntuser, &unload_failed);
+        hive.with_root([&](HKEY root) {
+            fn(root);
+            called = true;
+        });
+    } // ScopedUserHive unloads here -- unload_failed is only final after this scope
+    if (report)
+        report->unload_failed = unload_failed;
+
+    return finish(called ? HiveAccessStatus::ok : HiveAccessStatus::mount_failed);
 }
 
 /// Outcome of read_reg_value -- distinct from a plain bool so the caller can
@@ -332,14 +418,45 @@ inline ReadValueStatus read_reg_value(HKEY root, const std::string& value_name,
         out_type_name = "REG_QWORD";
         break;
     }
-    default:
+    case REG_MULTI_SZ: {
+        // #2771 up-S3: a double-NUL-terminated list of strings used to fall
+        // into the hex dump below, so a PATH-like value came back as an
+        // unreadable blob. Records are joined with ';' and each is
+        // sanitised -- a record containing '|' or a newline would otherwise
+        // forge a column or row in the pipe protocol, and the multi-record
+        // shape makes that materially more likely than for a scalar string.
+        // Both the ';' join and the sanitisation are lossy for records that
+        // themselves contain those characters; that is documented in the
+        // operator error/type taxonomy rather than silently accepted.
+        static_assert(sizeof(wchar_t) == sizeof(char16_t),
+                      "REG_MULTI_SZ decoding assumes UTF-16 wchar_t (Windows)");
+        const auto* chars = reinterpret_cast<const char16_t*>(data.data());
+        const std::size_t nch = size / sizeof(wchar_t);
         out_value.clear();
-        for (DWORD i = 0; i < size; ++i) {
-            constexpr char kHex[] = "0123456789abcdef";
-            out_value += kHex[(data[i] >> 4) & 0xF];
-            out_value += kHex[data[i] & 0xF];
+        bool first = true;
+        for (const auto& [off, len] :
+             yuzu::profiles::multi_sz_records(std::span<const char16_t>(chars, nch))) {
+            if (!first)
+                out_value += ';';
+            first = false;
+            out_value += yuzu::profiles::sanitize_field(from_wide(
+                reinterpret_cast<const wchar_t*>(chars + off), static_cast<int>(len)));
         }
-        out_type_name = (type == REG_BINARY) ? "REG_BINARY" : "REG_UNKNOWN";
+        out_type_name = "REG_MULTI_SZ";
+        break;
+    }
+    case REG_LINK:
+        // A symbolic-link target: a string, not opaque bytes.
+        out_value = reg_sz_to_utf8(reinterpret_cast<const wchar_t*>(data.data()), size);
+        out_type_name = "REG_LINK";
+        break;
+    default:
+        // REG_NONE, REG_BINARY, REG_DWORD_BIG_ENDIAN and anything unknown
+        // stay hex — but are now NAMED honestly by the shared table rather
+        // than collapsed into REG_BINARY/REG_UNKNOWN.
+        out_value = yuzu::profiles::hex_encode(
+            std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(data.data()), size));
+        out_type_name = yuzu::profiles::reg_type_name(static_cast<std::uint32_t>(type));
         break;
     }
     return ReadValueStatus::ok;
