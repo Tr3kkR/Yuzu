@@ -67,6 +67,19 @@ yuzu::test::PgTestTemplate plugincfg_tpl{"plugincfg", [](const std::string& dsn)
         throw std::runtime_error("plugincfg template: kek_meta reset failed");
 }};
 
+// Runs one statement directly against `dsn`, bypassing the store's public
+// API entirely — for bulk fixture seeding where looping through
+// `set_config` (a lease acquire + a round trip per call) would be
+// thousands of individual round trips. Mirrors test_audit_store.cpp's
+// `exec_sql` + `generate_series` bulk-seed idiom exactly.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
+
 /// Fully-wired store for a test case: fresh keys dir, fresh codec, fresh
 /// pool, `codec.init()` run in the correct order. Callers keep this alive
 /// for the whole test case (it owns the pool and provider the store borrows).
@@ -407,4 +420,71 @@ TEST_CASE("A degraded/unopened store makes action_allowed return false, never tr
     auto entry = store.get_kill_switch("firewall", "block");
     REQUIRE_FALSE(entry.has_value());
     CHECK(entry.error() == PluginConfigStore::Error::Unavailable);
+}
+
+// ── list_config row cap + truncated out-param (Codex M8) ────────────────
+
+TEST_CASE("list_config caps at kListRowCap rows and only flags truncated past the boundary",
+          "[pg][store][plugin_config]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+
+    // Mirrors plugin_config_store.cpp's anonymous-namespace `kListRowCap`.
+    // Not exposed via the header (deliberately internal/defensive, see the
+    // .cpp's comment) — hardcoded here, so this MUST track that constant if
+    // it ever changes.
+    constexpr int kListRowCap = 5000;
+
+    // Bulk-seed exactly kListRowCap rows for one plugin via a single
+    // server-side INSERT ... SELECT FROM generate_series, straight through
+    // the pool connection — looping kListRowCap times through set_config's
+    // public API would be kListRowCap individual lease-acquire+round-trip
+    // calls, which is the kind of unit-suite cost the repo's test-efficiency
+    // discipline calls out explicitly. Mirrors test_audit_store.cpp's own
+    // generate_series bulk-seed idiom.
+    exec_sql(db.dsn(),
+             "INSERT INTO plugin_config_store.configs (plugin, key, value, updated_by) "
+             "SELECT 'bulkplugin', 'k' || lpad(g::text, 5, '0'), 'v', 'seed' "
+             "FROM generate_series(1, " +
+                 std::to_string(kListRowCap) + ") g");
+
+    // Exact-cap boundary: kListRowCap rows exist, kListRowCap rows come
+    // back, and truncated must NOT flip — this is the whole point of the
+    // production code fetching one row past the cap (see
+    // plugin_config_store.cpp's "Fetch one row PAST the cap" comment): a
+    // full page must be distinguishable from a truncated one.
+    bool truncated = true; // pre-set to a value list_config must overwrite
+    auto at_cap = w.store.list_config("bulkplugin", &truncated);
+    REQUIRE(at_cap.has_value());
+    CHECK(at_cap->size() == static_cast<std::size_t>(kListRowCap));
+    CHECK_FALSE(truncated);
+
+    // One more row for the SAME plugin — now kListRowCap + 1 exist.
+    exec_sql(db.dsn(), "INSERT INTO plugin_config_store.configs (plugin, key, value, updated_by) "
+                       "VALUES ('bulkplugin', 'k05001', 'v', 'seed')");
+
+    truncated = false; // pre-set to a value list_config must overwrite
+    auto over_cap = w.store.list_config("bulkplugin", &truncated);
+    REQUIRE(over_cap.has_value());
+    CHECK(over_cap->size() == static_cast<std::size_t>(kListRowCap)); // still capped
+    CHECK(truncated);                                                 // now flagged
+
+    // A different plugin, well under the cap, is unaffected — the cap
+    // applies per-query (the WHERE plugin = $1 scoping), not globally.
+    exec_sql(db.dsn(),
+             "INSERT INTO plugin_config_store.configs (plugin, key, value, updated_by) VALUES "
+             "('otherplugin', 'a', 'v', 'seed'), "
+             "('otherplugin', 'b', 'v', 'seed'), "
+             "('otherplugin', 'c', 'v', 'seed')");
+    bool other_truncated = true; // pre-set to a value list_config must overwrite
+    auto other = w.store.list_config("otherplugin", &other_truncated);
+    REQUIRE(other.has_value());
+    CHECK(other->size() == 3);
+    CHECK_FALSE(other_truncated);
+
+    // A caller that omits `truncated` (the header's default nullptr) must
+    // not crash, and still gets the same capped row count.
+    auto no_ptr = w.store.list_config("bulkplugin", nullptr);
+    REQUIRE(no_ptr.has_value());
+    CHECK(no_ptr->size() == static_cast<std::size_t>(kListRowCap));
 }
