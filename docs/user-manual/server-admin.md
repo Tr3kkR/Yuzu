@@ -1064,7 +1064,13 @@ pending full status ingest, tracked separately.
 **Who this affects.** Any integration polling either route that (a) uses a
 service-scoped API token against the fleet route — that call now needs
 either a non-service-scoped credential or a per-agent call against
-`/status/{agent_id}` instead; (b) holds a management-group-**confined**
+`/status/{agent_id}` instead, and the per-agent route is not an
+unconditional substitute: `require_scoped_permission` additionally checks
+that the *target* `agent_id`'s own `service` tag matches the token's scope
+(`tag_store`-backed), so a service-scoped token still gets `403` there for
+any device outside its own service, distinct from the fleet route's
+simpler "any service-scoped token, unconditionally" denial; (b) holds a
+management-group-**confined**
 (not global) `GuaranteedState:Read` grant and polls `/status/{agent_id}`
 for a device outside that scope — that call now gets `403` where it
 previously got `200` with placeholder data, the same confinement
