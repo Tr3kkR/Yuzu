@@ -53,7 +53,17 @@
 
 // UTF-16<->UTF-8 registry conversion (#1662). In a header so the #1662
 // regression test exercises the same code, not a re-implementation.
+// Deliberately NOT replaced by agents/shared/win_str.hpp: this copy strips
+// ALL trailing NULs where the shared one stops at the first, so aligning them
+// would change output bytes for interior-NUL values. Both headers carry the
+// do-not-merge note.
 #include "installed_apps_registry_utf8.hpp"
+
+// Shared per-user profile/hive ladder (#2771) — the canonical implementation
+// this plugin's private copy was replaced by.
+#include <user_profile_model.hpp>
+#include <win_profiles.hpp>
+#include <win_reg_handle.hpp>
 #endif
 
 namespace {
@@ -602,92 +612,67 @@ public:
 private:
     int do_list_per_user([[maybe_unused]] yuzu::CommandContext& ctx) {
 #ifdef _WIN32
-        // Enumerate user profiles from the ProfileList registry key
-        static const char* kProfileListKey =
-            "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
+        // #2771: this walk used to be a full private copy of the ProfileList ->
+        // HKU -> RegLoadKeyW ladder — one of three in the tree — and was the
+        // weakest of them: it swallowed the RegUnLoadKeyW result, expanded
+        // ProfileImagePath single-pass into a 512-wchar buffer with the return
+        // value ignored (silent truncation), enabled neither SeBackup nor
+        // SeRestore, and fell back to the SID as a display name in violation
+        // of ADR-0024 D11. It now rides the shared ladder in
+        // agents/shared/win_profiles.hpp, which is the canonical one.
         static const char* kUninstallKey =
             "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
 
-        HKEY profiles_key{};
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, to_wide(kProfileListKey).c_str(), 0,
-                          KEY_READ | KEY_ENUMERATE_SUB_KEYS, &profiles_key) != ERROR_SUCCESS) {
-            ctx.write_output("error|failed to open ProfileList registry key");
+        bool profiles_ok = false;
+        bool truncated = false;
+        auto records = yuzu::win::enumerate_profile_records(profiles_ok, &truncated);
+        if (!profiles_ok) {
+            ctx.write_output("error|profile_list_unreadable");
             return 1;
         }
+        const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
+        // System SIDs are filtered here, BEFORE any per-profile read, rather
+        // than after reading ProfileImagePath as the old walk did.
+        const auto profiles = yuzu::profiles::build_profile_list(records, hku_subkeys);
 
-        wchar_t sid_buf[256]{};
-        DWORD idx = 0;
-        DWORD sid_len = 256; // RegEnumKeyExW counts WCHARs, not bytes
-
-        while (RegEnumKeyExW(profiles_key, idx++, sid_buf, &sid_len,
-                             nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
-            std::string sid = from_wide(sid_buf, static_cast<int>(sid_len));
-            sid_len = 256;
-
-            // Read ProfileImagePath to get the username
-            HKEY sid_key{};
-            if (RegOpenKeyExW(profiles_key, to_wide(sid).c_str(), 0, KEY_READ, &sid_key) !=
-                ERROR_SUCCESS)
-                continue;
-
-            wchar_t path_buf[512]{};
-            DWORD path_size = sizeof(path_buf); // size in BYTES
-            DWORD type = 0;
-            std::string username = sid;  // fallback to SID
-            std::wstring profile_path_w; // kept wide for RegLoadKeyW below
-            if (RegQueryValueExW(sid_key, L"ProfileImagePath", nullptr, &type,
-                                 reinterpret_cast<LPBYTE>(path_buf), &path_size) == ERROR_SUCCESS) {
-                size_t nch = path_size / sizeof(wchar_t);
-                while (nch > 0 && path_buf[nch - 1] == L'\0')
-                    --nch;
-                profile_path_w.assign(path_buf, nch);
-                std::string profile_path =
-                    from_wide(profile_path_w.c_str(), static_cast<int>(profile_path_w.size()));
-                auto last_sep = profile_path.find_last_of("\\/");
-                if (last_sep != std::string::npos)
-                    username = profile_path.substr(last_sep + 1);
-            }
-            RegCloseKey(sid_key);
-
-            // Skip system SIDs (S-1-5-18, S-1-5-19, S-1-5-20)
-            if (sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20")
-                continue;
-
-            // Try to read the user's Uninstall key from HKU\<SID>
-            std::string user_uninstall = sid + "\\" + kUninstallKey;
+        std::size_t privilege_missing = 0;
+        for (const auto& profile : profiles) {
             std::vector<AppInfo> user_apps;
-            enumerate_uninstall_key(HKEY_USERS, user_uninstall.c_str(), 0, user_apps);
+            yuzu::win::HiveAccessReport report;
+            const auto status = yuzu::win::with_user_hive(
+                profile.sid, profile.profile_path,
+                [&](HKEY root) { enumerate_uninstall_key(root, kUninstallKey, 0, user_apps); },
+                &report);
 
-            // The !profile_path_w.empty() guard avoids mounting a hive from a bogus
-            // "\NTUSER.DAT" path when ProfileImagePath failed to read (it also
-            // blocked an empty-path hive-load the prior *A code permitted).
-            if (user_apps.empty() && !profile_path_w.empty()) {
-                // User hive may not be loaded — try loading NTUSER.DAT
-                std::wstring ntuser_path_w = profile_path_w + L"\\NTUSER.DAT";
-                std::string mount_key = "YUZU_APPS_" + sid;
-
-                // Attempt to expand environment variables in the path
-                wchar_t expanded[512]{};
-                ExpandEnvironmentStringsW(ntuser_path_w.c_str(), expanded, 512);
-
-                const std::wstring mount_w = to_wide(mount_key);
-                LONG load_res = RegLoadKeyW(HKEY_USERS, mount_w.c_str(), expanded);
-                if (load_res == ERROR_SUCCESS) {
-                    // RAII: unload the mounted hive on EVERY exit, including a
-                    // std::bad_alloc thrown by enumerate_uninstall_key. A leaked
-                    // mount is system-wide, survives process death, and locks the
-                    // user's NTUSER.DAT until reboot (gov Gate 6 sre / UP-1).
-                    struct HiveUnloadGuard {
-                        const std::wstring& mount;
-                        ~HiveUnloadGuard() { RegUnLoadKeyW(HKEY_USERS, mount.c_str()); }
-                    } unload_guard{mount_w};
-
-                    std::string mounted_uninstall = mount_key + "\\" + kUninstallKey;
-                    enumerate_uninstall_key(HKEY_USERS, mounted_uninstall.c_str(), 0, user_apps);
-                }
+            // A leaked mount is the same system-wide fact wherever it happens,
+            // so the shared renderer supplies the wording. Passing status=ok
+            // deliberately emits ONLY the unload warning: registry's error
+            // vocabulary is registry's contract, and not_found/mount_failed are
+            // routine here (a logged-out user whose hive is locked) — one line
+            // per profile per run would be noise, not signal.
+            if (report.unload_failed) {
+                for (const auto& line : yuzu::profiles::render_hive_access_lines(
+                         yuzu::profiles::HiveAccessStatus::ok, true, report.mount_name,
+                         profile.sid))
+                    ctx.write_output(sanitize_utf8(line));
             }
+            if (status == yuzu::win::HiveAccessStatus::privilege_missing)
+                ++privilege_missing;
+
+            // ADR-0024 D11: an unresolvable profile name is rendered "-", never
+            // the SID. "-" (not "") matches this row's own convention for
+            // version/publisher/install_date below, and is distinguishable from
+            // a rendering fault. The SID fallback this replaces was a
+            // fabricated display name.
+            const std::string username =
+                profile.profile_name.empty() ? std::string{"-"} : profile.profile_name;
 
             for (const auto& app : user_apps) {
+                // The leading "user_app|" tag is LOAD-BEARING: installed_apps is
+                // in result_parsing.hpp's kKeyValuePlugins, so the dashboard
+                // splits these rows into (key, rest) — the opposite of the
+                // registry list_profiles case, where a leading tag caused the
+                // hp-B1 column shift. Do not strip it.
                 ctx.write_output(sanitize_utf8(
                     std::format("user_app|{}|{}|{}|{}|{}", username,
                                 app.name, app.version.empty() ? "-" : app.version,
@@ -695,7 +680,19 @@ private:
                                 app.install_date.empty() ? "-" : app.install_date)));
             }
         }
-        RegCloseKey(profiles_key);
+
+        // Both caps/failures are reported honestly rather than silently
+        // shrinking the result, matching registry.list_profiles' precedent.
+        if (truncated) {
+            ctx.write_output(std::format("warning|profile_list_truncated at {} entries",
+                                         yuzu::win::kMaxProfiles));
+        }
+        if (privilege_missing > 0) {
+            ctx.write_output(std::format(
+                "warning|privilege_missing: SeBackupPrivilege/SeRestorePrivilege could not be "
+                "enabled for {} logged-out profile(s); their per-user apps are not listed",
+                privilege_missing));
+        }
         return 0;
 
 #elif defined(__linux__)
