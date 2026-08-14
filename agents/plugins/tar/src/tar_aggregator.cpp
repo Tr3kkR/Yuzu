@@ -505,6 +505,17 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
     if (!db.is_open()) {
         spdlog::warn("TAR retention: skipped, the TAR database is closed. Storage is offline on "
                      "this endpoint until the agent restarts (see `tar status`).");
+        // Whole-pass bail (#2573 Gate 4): every per-table branch that cannot
+        // positively verify a table's state erases that table's recorded fact
+        // set rather than trust it stale -- the probe-failure path a few dozen
+        // lines down does exactly this. A bail BEFORE the per-table loop is the
+        // same situation for every table at once: this pass learned nothing
+        // about any of them, so a recorded entry surviving untouched could
+        // later coincide with a genuinely NEW anomaly's fact set on some other
+        // table and mask it as a suppressed repeat instead of a fresh decline.
+        // Clearing here is the whole-pass generalisation of the per-table rule.
+        std::lock_guard lock(guard.mu);
+        guard.last_reported.clear();
         return;
     }
 
@@ -518,8 +529,11 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
                      "plausible. Not persisted as the comparison point; retention resumes once a "
                      "sane reading arrives.",
                      now_epoch);
+        // Same rule as the closed-store bail above: this pass verified nothing
+        // about any table, so no recorded fact set survives it untouched.
         std::lock_guard lock(guard.mu);
         ++guard.failures[std::string{kImplausibleNowKey}];
+        guard.last_reported.clear();
         return;
     }
 
@@ -721,7 +735,23 @@ void run_retention(TarDatabase& db, int64_t now_epoch, RetentionGuardState& guar
             // That is the dead-CMOS endpoint this guard was written for
             // (#2361, Sol adversarial review).
             const bool no_anchor = !prev_pass_now;
-
+            // Deliberately raw anchor-PRESENCE, not a verdict-scoped marker
+            // (`audit_retention_rules.hpp`'s own doc comment names this exact
+            // pattern and says NOT to use it -- `Facts::no_anchor` documents
+            // "the audit store passes !bootstrap_settled here", a durable flag
+            // settled only once a verdict is actually reached). TAR has no
+            // per-table verdict-scoped marker to pass instead: the anchor is
+            // ONE store-wide `tar_config` key shared by every table, written
+            // unconditionally near the top of this function before any table's
+            // outcome is known. The gap this could in principle open -- a table
+            // reading `no_anchor=false` because SOME earlier pass populated the
+            // shared anchor, even if THIS table itself never reached a verdict
+            // on that pass -- is bounded by `run_aggregation` running first
+            // every tick (see the comment above): a table with anything to
+            // decide always gets fresh data to decide it with. The recording
+            // rule below is what actually protects TAR's own bootstrap
+            // fail-safe (never recording NoAnchor); this raw-presence choice is
+            // a narrower, deliberate divergence, not the same one.
             const audit_retention::Facts facts{.has_expired = true, // guaranteed above
                                                .would_wipe = would_wipe,
                                                .big_step = big_step,

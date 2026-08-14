@@ -442,7 +442,9 @@ pass declines before anything is persisted or any table is examined, and
 retention resumes once a sane reading arrives.
 
 Per table, the pass then either declines (deletes nothing from that table,
-counts the decline) or proceeds, based on the same **fact set** each time:
+counts the decline) or proceeds, based on the same **fact set** each time --
+the combination of which of these four conditions hold for this table on
+this pass:
 
   1. it would delete **every** datable row of that table;
   2. more than **a fixed 30 days** elapsed since the previous pass;

@@ -2061,17 +2061,22 @@ TEST_CASE("TAR #2573: an implausible caller clock declines the whole pass and do
     CHECK(row_count(*f.db, "process_hourly") == 1);
 }
 
-TEST_CASE("TAR #2573: a cap-paced wipe drains under fact-set equality with exactly ONE decline, "
-          "then re-arms for a fresh anomaly",
+TEST_CASE("TAR #2573: a cap-paced wipe drains with exactly ONE decline, then re-arms for a "
+          "fresh anomaly",
           "[tar][retention][clock-guard]") {
     // Pins the property the retired `latched = would_wipe && cap_will_bind`
     // write existed to provide (#2361 Gate 8 / Sol): a legitimately all-expired
     // table larger than one pass's cap must decline ONCE, then drain silently
-    // across as many capped passes as it takes -- fact-set equality alone
-    // reproduces this because the recorded Facts do not change while the
-    // backlog is still being worked off. The final step is what #2573 adds:
-    // once the entry is released, a FRESH wipe on the same table must decline
-    // again, proving release is real re-arming and not just a stuck bit.
+    // across as many capped passes as it takes. NOTE (Gate 3 / quality-
+    // engineer): this scenario's Facts never CHANGE while the backlog is
+    // being worked off, so it holds equally under the old bool latch and the
+    // new fact-set equality -- it does NOT by itself discriminate the two.
+    // The measured #2573 defect (a DISTINCT anomaly deleting silently under a
+    // still-set latch) is pinned by the adjacent test above, which DOES
+    // change the fact set mid-sequence and fails under the old latch. This
+    // test's own job is the re-arm proof: once the entry releases, a FRESH
+    // wipe on the same table must decline again, proving release is real
+    // re-arming and not just a stuck bit.
     constexpr int64_t kSurplus = 3;
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec,
@@ -2158,4 +2163,90 @@ TEST_CASE("TAR #2573: a wipe first seen without an anchor re-reports once the an
     run_retention(*f.db, kT0 + 2, f.guard); // identical to pass 2: suppressed, drains
     CHECK(declines_of(f.guard, "process_hourly") == 2);
     CHECK(row_count(*f.db, "process_hourly") == 0);
+}
+
+TEST_CASE("TAR #2573: an implausible-now bail clears every table's recorded fact set",
+          "[tar][retention][clock-guard]") {
+    // Governance Gate 4 (UP-1). The two whole-pass early returns -- this one
+    // and the closed-store twin below -- sit BEFORE the per-table loop that
+    // otherwise clears a stale entry on disable / empty / probe failure /
+    // delete failure. Left unclosed, a recorded fact set could survive the
+    // bail and later coincide with a genuinely NEW anomaly's fact set on a
+    // later pass -- reporting nothing when something changed, the exact class
+    // of bug #2573 exists to close. Both bails now clear the whole map.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+
+    run_retention(*f.db, kT0, f.guard); // decline #1, fact set recorded
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(reported_of(f.guard, "process_hourly"));
+
+    run_retention(*f.db, std::numeric_limits<int64_t>::max() / 2, f.guard); // bails
+    CHECK_FALSE(reported_of(f.guard, "process_hourly")); // cleared by the bail
+
+    // The same still-live anomaly must decline again, not silently drain --
+    // proving the clear is real, not just an unobserved no-op.
+    run_retention(*f.db, kT0 + 1, f.guard);
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+    CHECK(row_count(*f.db, "process_hourly") == 20);
+}
+
+TEST_CASE("TAR #2573: a closed-store bail clears every table's recorded fact set",
+          "[tar][retention][clock-guard]") {
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+
+    run_retention(*f.db, kT0, f.guard); // decline #1, fact set recorded
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(reported_of(f.guard, "process_hourly"));
+
+    TarDatabase live = std::move(*f.db); // *f.db is now the closed store
+    REQUIRE_FALSE(f.db->is_open());
+
+    run_retention(*f.db, kT0 + 1, f.guard); // bails on the closed store
+    CHECK_FALSE(reported_of(f.guard, "process_hourly")); // cleared by the bail
+
+    // Reopen (the restart the warning names) and confirm the same still-live
+    // anomaly declines again rather than draining silently.
+    f.db.emplace(std::move(live));
+    run_retention(*f.db, kT0 + 2, f.guard);
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+    CHECK(row_count(*f.db, "process_hourly") == 20);
+}
+
+TEST_CASE("TAR #2573: a stale Wipe entry is erased, not left dangling, when NoAnchor "
+          "overtakes it",
+          "[tar][retention][clock-guard]") {
+    // Governance Gate 3 (quality-engineer). Pins the erase arm in the decide
+    // block reached when classify() returns NoAnchor while a DIFFERENT
+    // (non-NoAnchor) entry is already recorded for the table --
+    // `tar_aggregator.hpp`'s doc comment calls this out explicitly, but no
+    // existing test reached it: every prior no-anchor test starts from an
+    // EMPTY map. Reaching it needs `no_anchor=true` and `would_wipe=false` to
+    // hold SIMULTANEOUSLY (else Wipe outranks NoAnchor in classify's
+    // precedence) with a prior Wipe entry still on record.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5); // all-expired: Wipe
+
+    run_retention(*f.db, kT0, f.guard); // Wipe, recorded
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(reported_of(f.guard, "process_hourly"));
+
+    // Force no_anchor=true (drop the stored reading) AND would_wipe=false (add
+    // a survivor) in one shot, ahead of the next pass.
+    REQUIRE(f.db->execute_sql(
+        "DELETE FROM tar_config WHERE key = 'retention_guard_last_pass'"));
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor: defeats would_wipe
+
+    run_retention(*f.db, kT0 + 1, f.guard); // NoAnchor overtakes the stale Wipe entry
+    CHECK(declines_of(f.guard, "process_hourly") == 2); // reports on its own merits
+    CHECK_FALSE(reported_of(f.guard, "process_hourly")); // erased, not leaked
+
+    // A fresh, independent Wipe must still decline -- proving the erase was
+    // real and nothing suppressed it by residue.
+    REQUIRE(f.db->execute_sql(std::format("DELETE FROM process_hourly WHERE hour_ts = {}",
+                                          kT0 - 3600)));
+    run_retention(*f.db, kT0 + 2, f.guard);
+    CHECK(declines_of(f.guard, "process_hourly") == 3);
+    CHECK(row_count(*f.db, "process_hourly") == 5);
 }
