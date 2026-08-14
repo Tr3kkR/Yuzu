@@ -333,6 +333,19 @@ static int access_review_error_status(const std::string& err) {
     return err.starts_with("not_found:") ? 404 : 503;
 }
 
+// SoftwareDeploymentStore error classifier — mirrors discovery_routes.cpp's
+// is_deployment_db_error (DeploymentStore/ADR-0043): the majority of a
+// route's `unexpected` values here are caller-input validation or
+// not-found/wrong-state business errors (400 territory, matching how
+// DeploymentStore's own REST routes classify — see cancel_job's route,
+// which 400s "job not found" too, not 404; none of these store methods have
+// a REST get-by-id twin that would need the separate nullopt-vs-unexpected
+// 404 split). Keys off the SHARED constant (software_deployment_store.hpp),
+// never a local copy of the literal.
+static int sw_deploy_error_status(const std::string& err) {
+    return err.starts_with(kSwDeployDbErrorPrefix) ? 503 : 400;
+}
+
 // A present-but-wrong-typed JSON body field (e.g. {"title": 5}) must degrade
 // to the default rather than throw nlohmann's type_error.302 out of
 // `body.value(key, default)` (-> uncaught -> 500). Mirrors MCP's
@@ -7623,8 +7636,13 @@ void RestApiV1::register_routes(
                      if (!perm_fn(req, res, "SoftwareDeployment", "Read"))
                          return;
                      auto pkgs = sw_deploy_store->list_packages();
+                     if (!pkgs) {
+                         res.status = 503;
+                         res.set_content(detail::a4_error(res, pkgs.error()), "application/json");
+                         return;
+                     }
                      JArr arr;
-                     for (const auto& p : pkgs) {
+                     for (const auto& p : *pkgs) {
                          arr.add(JObj()
                                      .add("id", p.id)
                                      .add("name", p.name)
@@ -7636,7 +7654,7 @@ void RestApiV1::register_routes(
                                      .add("created_at", p.created_at)
                                      .add("created_by", p.created_by));
                      }
-                     res.set_content(list_json(arr.str(), static_cast<int64_t>(pkgs.size())),
+                     res.set_content(list_json(arr.str(), static_cast<int64_t>(pkgs->size())),
                                      "application/json");
                  });
 
@@ -7747,7 +7765,7 @@ void RestApiV1::register_routes(
 
             auto result = sw_deploy_store->create_package(pkg);
             if (!result) {
-                res.status = 400;
+                res.status = sw_deploy_error_status(result.error());
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
                 return;
             }
@@ -7764,8 +7782,13 @@ void RestApiV1::register_routes(
                 return;
             auto status = req.has_param("status") ? req.get_param_value("status") : std::string{};
             auto deps = sw_deploy_store->list_deployments(status);
+            if (!deps) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, deps.error()), "application/json");
+                return;
+            }
             JArr arr;
-            for (const auto& d : deps) {
+            for (const auto& d : *deps) {
                 arr.add(JObj()
                             .add("id", d.id)
                             .add("package_id", d.package_id)
@@ -7778,7 +7801,7 @@ void RestApiV1::register_routes(
                             .add("agents_success", static_cast<int64_t>(d.agents_success))
                             .add("agents_failure", static_cast<int64_t>(d.agents_failure)));
             }
-            res.set_content(list_json(arr.str(), static_cast<int64_t>(deps.size())),
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(deps->size())),
                             "application/json");
         });
 
@@ -7802,7 +7825,7 @@ void RestApiV1::register_routes(
                       dep.created_by = session->username;
                       auto result = sw_deploy_store->create_deployment(dep);
                       if (!result) {
-                          res.status = 400;
+                          res.status = sw_deploy_error_status(result.error());
                           res.set_content(detail::a4_error(res, result.error()), "application/json");
                           return;
                       }
@@ -7827,13 +7850,14 @@ void RestApiV1::register_routes(
                     !step_up_fn(req, res, *session, "POST /api/v1/software-deployments/{id}/start"))
                     return;
                 auto id = req.matches[1].str();
-                if (sw_deploy_store->start_deployment(id)) {
+                auto result = sw_deploy_store->start_deployment(id);
+                if (result) {
                     audit_fn(req, "software_deployment.start", "success", "SoftwareDeployment", id,
                              "");
                     res.set_content(ok_json(JObj().add("started", true).str()), "application/json");
                 } else {
-                    res.status = 400;
-                    res.set_content(detail::a4_error(res, "cannot start deployment"), "application/json");
+                    res.status = sw_deploy_error_status(result.error());
+                    res.set_content(detail::a4_error(res, result.error()), "application/json");
                 }
             });
 
@@ -7846,14 +7870,15 @@ void RestApiV1::register_routes(
                       if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
                           return;
                       auto id = req.matches[1].str();
-                      if (sw_deploy_store->rollback_deployment(id)) {
+                      auto result = sw_deploy_store->rollback_deployment(id);
+                      if (result) {
                           audit_fn(req, "software_deployment.rollback", "success",
                                    "SoftwareDeployment", id, "");
                           res.set_content(ok_json(JObj().add("rolled_back", true).str()),
                                           "application/json");
                       } else {
-                          res.status = 400;
-                          res.set_content(detail::a4_error(res, "cannot rollback deployment"),
+                          res.status = sw_deploy_error_status(result.error());
+                          res.set_content(detail::a4_error(res, result.error()),
                                           "application/json");
                       }
                   });
@@ -7867,14 +7892,15 @@ void RestApiV1::register_routes(
                       if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
                           return;
                       auto id = req.matches[1].str();
-                      if (sw_deploy_store->cancel_deployment(id)) {
+                      auto result = sw_deploy_store->cancel_deployment(id);
+                      if (result) {
                           audit_fn(req, "software_deployment.cancel", "success",
                                    "SoftwareDeployment", id, "");
                           res.set_content(ok_json(JObj().add("cancelled", true).str()),
                                           "application/json");
                       } else {
-                          res.status = 400;
-                          res.set_content(detail::a4_error(res, "cannot cancel deployment"),
+                          res.status = sw_deploy_error_status(result.error());
+                          res.set_content(detail::a4_error(res, result.error()),
                                           "application/json");
                       }
                   });

