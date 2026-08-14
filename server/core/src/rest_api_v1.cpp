@@ -5947,6 +5947,27 @@ void RestApiV1::register_routes(
                      return; // auth_fn wrote 401
                  if (!perm_fn(req, res, "Inventory", "Read"))
                      return; // perm_fn wrote 401/403
+                 // Governance finding: the management-group scope filter further down
+                 // is INERT under the global Inventory:Read gate (see its own comment)
+                 // — neither axis it (or perm_fn above) checks is the token's own
+                 // service-tag scope, and this route has no scoped_perm_fn wired for a
+                 // per-target check even when agent_id is supplied. Blanket deny,
+                 // matching the dashboard fragment twin (inventory_routes.cpp's
+                 // /fragments/inventory/find/results) and this route's own sibling
+                 // fixes elsewhere in this file.
+                 if (!session->token_scope_service.empty()) {
+                     (void)detail::try_persist_audit(
+                         audit_fn, req, "inventory.software.query", "denied", "Inventory", "fleet",
+                         "fleet-wide software search denied to a service-scoped token; cid=" + cid);
+                     res.status = 403;
+                     res.set_content(
+                         detail::error_json_a4(
+                             403,
+                             "service-scoped tokens may not run a fleet-wide software search",
+                             cid, detail::A4ErrorOpts{.permission = "Inventory:Read"}),
+                         "application/json");
+                     return;
+                 }
                  // Null-store ONLY (not `!is_open()`): a constructed-but-closed store
                  // deliberately falls through to query_software(), which returns nullopt →
                  // the AUDITED degrade branch below (CC7.2 trail + MCP parity — MCP guards

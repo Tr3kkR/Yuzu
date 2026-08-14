@@ -109,11 +109,19 @@ private:
     /// /fragments/auto/deploy/run`, which remains a separate, deliberately
     /// unfixed finding pending its own review of the guarded-transition
     /// contract. Writes the 403 FIRST, audits after via the shared
-    /// try_persist_audit kernel, under `action`. Returns true iff denied
-    /// (caller returns immediately).
+    /// try_persist_audit kernel, under `action`. `target_type` defaults to
+    /// "SoftwareDeployment" (the `.advance`/`.delete` verbs' own established
+    /// success-path target_type per audit-log.md); the config-view call site
+    /// passes "Scope" explicitly, matching its own documented shape — governance
+    /// finding: this previously hardcoded "Scope" for all three call sites,
+    /// silently diverging from `.advance`/`.delete`'s documented contract, the
+    /// same class DexRoutes::deny_service_scoped_ already parametrizes for.
+    /// Returns true iff denied (caller returns immediately).
     [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
                                             const std::string& action,
-                                            const std::string& audit_detail) const;
+                                            const std::string& audit_detail,
+                                            const std::string& target_type =
+                                                "SoftwareDeployment") const;
 
     AuthFn auth_fn_;
     PermFn perm_fn_;

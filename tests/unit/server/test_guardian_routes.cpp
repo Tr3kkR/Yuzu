@@ -526,6 +526,108 @@ TEST_CASE("an ordinary (non-service-scoped) session still reaches every Guardian
     }
 }
 
+// ── Governance finding (guardian-confinement-2298 Gate 2/4/5/6, six
+// independent confirmations): the six MUTATING fragments below had NO
+// service-scoped-token deny at all, unlike their six GET siblings above in
+// this same file — deploy_baseline's fleet-wide full_sync push meant a
+// service-scoped token could change what every OTHER service's agents
+// enforce, not just read it. Mutation-tested per chaos-injector's CH-1
+// design: this test was confirmed to fail (403 becomes 200, h.pushes gains
+// an entry) when deny_service_scoped_mutation_'s call sites are reverted,
+// before being restored to this passing state. ──
+
+TEST_CASE("Guardian MUTATING fragments deny a service-scoped token, regardless of "
+          "GuaranteedState:Write/Push/Delete, and nothing changes",
+          "[pg][guardian_routes][rbac][security]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+    h.session_token_scope_service = "printers"; // any non-empty service scope
+
+    auto create_guard = h.sink.dispatch("POST", "/fragments/guardian/guards?name=NewGuard", "",
+                                        "application/x-www-form-urlencoded");
+    REQUIRE(create_guard != nullptr);
+    CHECK(create_guard->status == 403);
+
+    auto enable = h.sink.dispatch("POST", "/fragments/guardian/guard/g1/enabled?value=0", "",
+                                  "application/x-www-form-urlencoded");
+    REQUIRE(enable != nullptr);
+    CHECK(enable->status == 403);
+
+    auto create_baseline = h.sink.dispatch("POST", "/fragments/guardian/baselines?name=NewBL", "",
+                                           "application/x-www-form-urlencoded");
+    REQUIRE(create_baseline != nullptr);
+    CHECK(create_baseline->status == 403);
+
+    auto deploy = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                                  "application/x-www-form-urlencoded");
+    REQUIRE(deploy != nullptr);
+    CHECK(deploy->status == 403);
+
+    auto update = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1?name=Renamed", "",
+                                  "application/x-www-form-urlencoded");
+    REQUIRE(update != nullptr);
+    CHECK(update->status == 403);
+
+    auto del = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/delete", "",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(del != nullptr);
+    CHECK(del->status == 403);
+
+    // The load-bearing assertions: NOT ONE of the six attempts had any effect.
+    CHECK(h.pushes.empty()); // deploy never reached push_fn_ — no fleet convergence
+    auto rules = h.store->list_rules();
+    REQUIRE(rules.has_value());
+    CHECK(rules->size() == 1); // still just g1 — create_guard never persisted
+    auto g1 = h.store->get_rule("g1");
+    REQUIRE(g1.has_value());
+    REQUIRE(g1->has_value());
+    CHECK((*g1)->enabled == true); // enable(value=0) never applied
+    CHECK(h.baselines->list_baselines().size() == 1); // still just BL1 — create_baseline never persisted
+    auto bl1 = h.baseline_named("BL1");
+    REQUIRE(bl1.has_value());
+    CHECK(bl1->lifecycle == kBaselineDraft); // deploy never applied
+    CHECK(bl1->baseline_id == "bl1");        // delete never applied (still present)
+
+    // Each denial reuses its own action's real success-path verb (result=denied)
+    // — deliberately NOT a shared generic verb, since (unlike the read fragments'
+    // /status etc., which have no per-open success audit to extend) all six of
+    // these mutations already have one.
+    REQUIRE(h.audit_log.size() == 6);
+    const std::vector<std::string> expected_actions = {
+        "guaranteed_state.rule.create",     "guaranteed_state.rule.update",
+        "guaranteed_state.baseline.create", "guaranteed_state.baseline.deploy",
+        "guaranteed_state.baseline.update", "guaranteed_state.baseline.delete"};
+    for (std::size_t i = 0; i < h.audit_log.size(); ++i) {
+        CHECK(h.audit_log[i].action == expected_actions[i]);
+        CHECK(h.audit_log[i].result == "denied");
+    }
+}
+
+TEST_CASE("Guardian mutating fragments are still gated on GuaranteedState:Write/Push/Delete "
+          "(previously untested)",
+          "[pg][guardian_routes][rbac]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+    h.denied = {"GuaranteedState:Write", "GuaranteedState:Push", "GuaranteedState:Delete"};
+
+    auto create_guard = h.sink.dispatch("POST", "/fragments/guardian/guards?name=NewGuard", "",
+                                        "application/x-www-form-urlencoded");
+    REQUIRE(create_guard != nullptr);
+    CHECK(create_guard->status == 403);
+
+    auto deploy = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                                  "application/x-www-form-urlencoded");
+    REQUIRE(deploy != nullptr);
+    CHECK(deploy->status == 403);
+
+    auto del = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/delete", "",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(del != nullptr);
+    CHECK(del->status == 403);
+}
+
 TEST_CASE("the per-guard drilldown emits a guaranteed_state.rule.view audit-on-open, scoped to "
           "the CORRECT guard",
           "[pg][guardian_routes][audit][security]") {

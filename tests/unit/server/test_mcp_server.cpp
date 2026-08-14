@@ -3424,6 +3424,36 @@ TEST_CASE("MCP: list_schedules denies a service-scoped token, denial audited",
     CHECK(saw_denied);
 }
 
+// Governance finding (guardian-confinement-2298 Gate 2/4/6): the management-
+// group scope filter on query_installed_software is INERT under the global
+// Inventory:Read gate (same class as query_responses/query_inventory), and
+// this tool has no per-target scoped check even when agent_id is supplied.
+// The deny fires BEFORE the `!software_inventory_store` null-check (mirrors
+// list_schedules' ordering above), so this needs no real store wired to
+// prove — software_inventory_store_for_test stays nullptr.
+TEST_CASE("MCP: query_installed_software denies a service-scoped token, denial audited",
+          "[mcp][integration][inventory][security]") {
+    McpTestServer ts;
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":48,"params":{"name":"query_installed_software","arguments":{"name":"Chrome"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "inventory.software.query|denied")
+            saw_denied = true;
+        CHECK(a != "inventory.software.query|success");
+        CHECK(a != "mcp.query_installed_software|success");
+    }
+    CHECK(saw_denied);
+}
+
 // ── F2a: DEX fleet-perf tools ────────────────────────────────────────────────
 
 namespace {

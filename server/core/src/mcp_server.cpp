@@ -4476,6 +4476,17 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Governance finding: the management-group scope filter further down
+                // is INERT under the global Inventory:Read gate (same class as
+                // query_responses/query_inventory), and this tool has no per-target
+                // scoped check even when agent_id is supplied. Blanket deny, matching
+                // the REST/dashboard twins (rest_api_v1.cpp, inventory_routes.cpp).
+                if (deny_fleet_wide_service_scoped(
+                        "inventory.software.query", "Inventory",
+                        "fleet-wide software search denied to a service-scoped token (MCP "
+                        "query_installed_software)",
+                        "service-scoped tokens may not run a fleet-wide software search"))
+                    return;
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
                 if (!software_inventory_store) {

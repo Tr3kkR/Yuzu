@@ -322,6 +322,39 @@ bool GuardianRoutes::deny_service_scoped_(const httplib::Request& req,
     return true;
 }
 
+bool GuardianRoutes::deny_service_scoped_mutation_(const httplib::Request& req,
+                                                    httplib::Response& res,
+                                                    const std::string& operation,
+                                                    const std::string& audit_action,
+                                                    const std::string& target_id) const {
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return true; // auth_fn_ already wrote 401/redirect; caller returns.
+    if (session->token_scope_service.empty())
+        return false;
+    const auto cid = detail::make_correlation_id();
+    // Write the 403 FIRST, audit after — same throw-safety rationale as
+    // deny_service_scoped_ above.
+    res.status = 403;
+    res.set_content(
+        detail::error_json_a4(
+            403, "service-scoped tokens may not modify this fleet-wide Guardian resource", cid,
+            detail::A4ErrorOpts{.permission = "GuaranteedState:" + operation}),
+        "application/json");
+    if (audit_fn_) {
+        try {
+            audit_fn_(req, audit_action, "denied", "GuaranteedState", target_id,
+                      "fleet-wide Guardian mutation denied to a service-scoped token (path=" +
+                          req.path + ")");
+        } catch (const std::exception& e) {
+            spdlog::warn("{}: audit_fn_ threw: {}", audit_action, e.what());
+        } catch (...) {
+            spdlog::warn("{}: audit_fn_ threw (non-std)", audit_action);
+        }
+    }
+    return true;
+}
+
 // ── Fragment renderers ───────────────────────────────────────────────────────
 
 std::string GuardianRoutes::render_status_fragment(const std::string& view) const {
@@ -2308,6 +2341,9 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // the shared derive_rule_spec path (single source with the REST create).
     sink.Post("/fragments/guardian/guards",
              [this](const httplib::Request& req, httplib::Response& res) {
+                 if (deny_service_scoped_mutation_(req, res, "Write",
+                                                   "guaranteed_state.rule.create", ""))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  create_guard_from_form(req, res);
              });
@@ -2320,8 +2356,11 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // Watch/Enforce is fixed at creation (a different posture is a different Guard).
     sink.Post(R"(/fragments/guardian/guard/([A-Za-z0-9._\-]+)/enabled)",
              [this](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Write",
+                                                   "guaranteed_state.rule.update", id))
+                     return;
+                 if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  const bool enable = req.has_param("value") && req.get_param_value("value") == "1";
                  apply_guard_change(req, res, id, enable);
              });
@@ -2331,6 +2370,9 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // targeting (management-group assignment) + deploy are set afterwards.
     sink.Post("/fragments/guardian/baselines",
              [this](const httplib::Request& req, httplib::Response& res) {
+                 if (deny_service_scoped_mutation_(req, res, "Write",
+                                                   "guaranteed_state.baseline.create", ""))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
                  create_baseline_from_form(req, res);
              });
@@ -2341,8 +2383,12 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // targeting is deferred). Requires Push (it changes what agents enforce).
     sink.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/deploy)",
              [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Push",
+                                                   "guaranteed_state.baseline.deploy", id))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Push")) return;
-                 deploy_baseline(req, res, req.matches[1].str());
+                 deploy_baseline(req, res, id);
              });
 
     // -- Edit a Baseline (rename + add/remove member guards) --------------
@@ -2350,13 +2396,21 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
     // member regex excludes '/', so it never shadows the suffixed routes.
     sink.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/delete)",
              [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Delete",
+                                                   "guaranteed_state.baseline.delete", id))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Delete")) return;
-                 delete_baseline_action(req, res, req.matches[1].str());
+                 delete_baseline_action(req, res, id);
              });
     sink.Post(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+))",
              [this](const httplib::Request& req, httplib::Response& res) {
+                 const std::string id = req.matches[1].str();
+                 if (deny_service_scoped_mutation_(req, res, "Write",
+                                                   "guaranteed_state.baseline.update", id))
+                     return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Write")) return;
-                 update_baseline_from_form(req, res, req.matches[1].str());
+                 update_baseline_from_form(req, res, id);
              });
 }
 

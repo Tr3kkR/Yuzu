@@ -541,6 +541,31 @@ TEST_CASE("route: find results apply the per-row management-group drop filter", 
     REQUIRE(ok);
 }
 
+// Governance finding (guardian-confinement-2298 Gate 2/4/6): the per-row
+// management-group drop filter above is the ONLY confinement this route had —
+// it never checks token_scope_service, so a service-scoped token still saw
+// every out-of-service device running the searched-for software fleet-wide
+// (this file's own /fragments/inventory/devices sibling, two routes above,
+// already closed this exact class). Blanket deny, matching that sibling.
+TEST_CASE("route: find results — service-scoped token denied, no data leaked, denial audited",
+          "[inventory][route][security]") {
+    InvHarness h;
+    h.service_scoped = true;
+    h.fleet_rows = {fleet_row("agent-alpha", "Chrome", "1.0")};
+
+    auto res = h.sink.Get("/fragments/inventory/find/results?name=Chrome");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+    REQUIRE_FALSE(contains(res->body, "agent-alpha"));
+    bool denied = false;
+    for (const auto& a : h.audits) {
+        if (a == "inventory.software.query|denied")
+            denied = true;
+        REQUIRE(a != "inventory.software.query|success");
+    }
+    REQUIRE(denied);
+}
+
 TEST_CASE("route: find results empty name short-circuits (no store read)", "[inventory][route]") {
     InvHarness h;
     auto res = h.sink.Get("/fragments/inventory/find/results?name=");

@@ -55,9 +55,15 @@ void handle_create_schedule(AuthRoutes& auth_routes, ScheduleEngine* schedule_en
 /// Call this AFTER the route's own permission gate(s) succeed, so the session
 /// `resolve_session` re-reads is known to exist — this helper does not write
 /// a response on a missing/invalid session, only on an affirmative deny.
-bool deny_service_scoped_schedule(AuthRoutes& auth_routes, const httplib::Request& req,
-                                  httplib::Response& res, const std::string& action,
-                                  const std::string& audit_detail);
+/// `[[nodiscard]]`, matching every sibling `deny_service_scoped_*` helper
+/// elsewhere in this branch (deployment/preflight/dex/guardian): a call site
+/// that drops the return value would silently keep handling the request
+/// after a written 403.
+[[nodiscard]] bool deny_service_scoped_schedule(AuthRoutes& auth_routes,
+                                                const httplib::Request& req,
+                                                httplib::Response& res,
+                                                const std::string& action,
+                                                const std::string& audit_detail);
 
 /// Parses the `enabled` field of a `POST /api/schedules/{id}/enable` body.
 /// Extracted from the inline server.cpp lambda (guardian-confinement-2298

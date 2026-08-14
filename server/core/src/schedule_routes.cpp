@@ -5,6 +5,7 @@
 #include "schedule_engine.hpp"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 namespace yuzu::server {
 
@@ -27,7 +28,19 @@ bool deny_service_scoped_schedule(AuthRoutes& auth_routes, const httplib::Reques
     // target_type "schedule" (lowercase) matches every existing schedule.*
     // success-path audit row in this file and server.cpp — a capitalized
     // "Schedule" would split the SIEM verb's target_type between rows.
-    (void)auth_routes.audit_log(req, action, "denied", "schedule", "", audit_detail);
+    // Governance finding (cpp-expert): this call was previously uncaught
+    // despite the comment above claiming parity with the try/catch-wrapped
+    // PreflightRoutes/DeploymentRoutes siblings — a throwing audit_log
+    // (bad_alloc-class) would overwrite the already-written 403 body with
+    // httplib's default empty 500 (no server-wide exception handler exists,
+    // rest_api_v1.cpp:8399). Now genuinely wrapped, matching those siblings.
+    try {
+        (void)auth_routes.audit_log(req, action, "denied", "schedule", "", audit_detail);
+    } catch (const std::exception& e) {
+        spdlog::warn("{}: audit_log threw: {}", action, e.what());
+    } catch (...) {
+        spdlog::warn("{}: audit_log threw (non-std)", action);
+    }
     return true;
 }
 

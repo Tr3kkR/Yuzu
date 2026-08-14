@@ -74,6 +74,11 @@ struct InvHarness {
     yuzu::server::test::TestRouteSink sink;
 
     std::string session_user{"admin"};
+    // Non-empty simulates a service-scoped API token session (guardian-
+    // confinement-2298: the management-group scope_fn below is inert under
+    // the global Inventory:Read gate and never confines a service-scoped
+    // token). Default empty preserves every other test's ordinary session.
+    std::string session_token_scope_service;
     bool allow_perm{true};
     // When false, audit_fn reports a persistence failure (returns false) so a test can
     // exercise the set-and-proceed `audit_persisted:false` honesty field.
@@ -100,6 +105,7 @@ struct InvHarness {
             auth::Session s;
             s.username = session_user;
             s.role = auth::Role::admin;
+            s.token_scope_service = session_token_scope_service;
             return s;
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res, const std::string&,
@@ -180,6 +186,31 @@ TEST_CASE("REST inventory/software: RBAC deny → 403, no success audit",
     auto res = h.sink.Get("/api/v1/inventory/software?name=Chrome");
     REQUIRE(res);
     CHECK(res->status == 403);
+    CHECK_FALSE(h.has_audit("success"));
+}
+
+// Governance finding (guardian-confinement-2298 Gate 2/4/6): the
+// management-group scope_fn filter exercised elsewhere in this file is
+// INERT under this bare Inventory:Read gate (same class as
+// query_responses/query_inventory) — it never confines a service-scoped
+// API token, and this route has no scoped_perm_fn wired for a per-target
+// check even when agent_id is supplied. Blanket deny, matching the
+// dashboard fragment twin (inventory_routes.cpp's
+// /fragments/inventory/find/results) and the MCP twin
+// (query_installed_software).
+TEST_CASE("REST inventory/software: service-scoped token denied, no data leaked, "
+          "denial audited",
+          "[rest][inventory_software][security]") {
+    InvHarness h{/*store=*/nullptr};
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Get("/api/v1/inventory/software?name=Chrome");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body.contains("error"));
+    CHECK_FALSE(body.contains("data"));
+    CHECK(h.has_audit("denied"));
     CHECK_FALSE(h.has_audit("success"));
 }
 

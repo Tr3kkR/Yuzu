@@ -4205,7 +4205,7 @@ flag inside `data` — placement alignment is tracked with #2633.)
 
 Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareInventoryStore`). **Distinct** from the generic `/inventory/*` routes above, which read the generic per-source blob store (`InventoryStore`, also Postgres-backed as of ADR-0037, but a separate schema/table). This is the REST sibling of the `query_installed_software` MCP tool — same data, same scope contract.
 
-**Permission:** `Inventory:Read`
+**Permission:** `Inventory:Read`. A service-scoped API token (bound to one IT service's agents) is denied outright (`inventory.software.query`, `result=denied`) — the management-group scope filter below is a separate, orthogonal confinement axis and does not narrow results for a service-scoped token.
 
 **Query parameters:**
 
