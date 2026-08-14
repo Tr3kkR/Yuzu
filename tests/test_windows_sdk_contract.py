@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import pathlib
 import re
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 
@@ -79,9 +82,190 @@ def sdk_inputs(block: list[str]) -> tuple[int, list[str]]:
 
 def mandatory_manifest_step(body: str) -> bool:
     """Return whether a workflow step unconditionally runs the assertion."""
-    return "Assert-Toolchain.ps1" in body and not re.search(
-        r"(?im)^\s*if\s*:|optional|skipping manifest|if\s*\(\s*Test-Path", body
+    if re.search(
+        r"(?im)^\s*(?:if|continue-on-error)\s*:|optional|skipping manifest|"
+        r"if\s*\(\s*Test-Path|\|\|\s*true\b",
+        body,
+    ):
+        return False
+    run_lines = re.findall(r"(?m)^\s*run:\s*(.*?)\s*$", body)
+    return len(run_lines) == 1 and bool(
+        re.fullmatch(
+            r"\./deploy/windows/Assert-Toolchain\.ps1\s+-ManifestPath\s+"
+            r"'C:\\actions-runner\\toolchain-manifest\.json'",
+            run_lines[0],
+        )
     )
+
+
+def msys_path(path: pathlib.Path) -> str:
+    """Return a path that an MSYS2 bash process can open."""
+    resolved = path.resolve()
+    if sys.platform == "win32":
+        drive, tail = resolved.drive, str(resolved)[len(resolved.drive) :]
+        return f"/{drive[0].lower()}{tail.replace(chr(92), '/')}"
+    return str(resolved)
+
+
+def exercise_setup_sdk_preflight(setup: str, failures: list[str]) -> None:
+    """Prove setup fails closed when any pinned SDK artifact is absent."""
+    # Windows' PATH commonly resolves `bash` to System32\bash.exe (the WSL
+    # launcher), which cannot source an MSYS2 /c/... fixture.  Exercise the
+    # exact shell this setup contract supports instead.
+    if sys.platform == "win32":
+        msys_bash = pathlib.Path(r"C:\msys64\usr\bin\bash.exe")
+        bash = str(msys_bash) if msys_bash.is_file() else None
+    else:
+        bash = shutil.which("bash")
+    if not bash:
+        failures.append("setup_msvc_env.sh regression requires bash on PATH")
+        return
+
+    with tempfile.TemporaryDirectory() as fixture_dir:
+        fixture_root = pathlib.Path(fixture_dir)
+        sdk_root = fixture_root / "Windows Kits" / "10"
+        fixture_setup = fixture_root / "setup_msvc_env.sh"
+        fixture_text = setup.replace(
+            '_WIN_SDK="/c/Program Files (x86)/Windows Kits/10"',
+            f'_WIN_SDK="{msys_path(sdk_root)}"',
+        )
+        if fixture_text == setup:
+            failures.append("setup SDK-root fixture could not replace the canonical path")
+            return
+        fixture_setup.write_text(fixture_text, encoding="utf-8")
+
+        artifacts = {
+            "Windows.h": sdk_root / "Include" / SDK / "um" / "Windows.h",
+            "kernel32.lib": sdk_root / "Lib" / SDK / "um" / "x64" / "kernel32.lib",
+            "rc.exe": sdk_root / "bin" / SDK / "x64" / "rc.exe",
+        }
+        for artifact in artifacts.values():
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            artifact.touch()
+
+        protected_exports = (
+            "CC",
+            "CXX",
+            "VSCMD_VER",
+            "TMP",
+            "TEMP",
+            "CMAKE_GENERATOR",
+            "CMAKE_BUILD_TYPE",
+            "VCPKG_ROOT",
+            "CMAKE_TOOLCHAIN_FILE",
+            "VCPKG_DEFAULT_TRIPLET",
+            "INCLUDE",
+            "LIB",
+            "PATH",
+        )
+        internal_names = (
+            "_MSVC_VER",
+            "_SDK_VER",
+            "_VS_ROOT",
+            "_VS_INSTALLER",
+            "_VC_TOOLS",
+            "_WIN_SDK",
+            "_VCPKG",
+            "_PROJECT_ROOT",
+            "_CMAKE_DIR",
+            "_PYTHON_DIR",
+            "_MESON_DIR",
+            "_SDK_HEADER",
+            "_SDK_LIB",
+            "_SDK_RC",
+            "_SDK_MISSING",
+        )
+        sentinel = "yuzu-sdk-preflight-sentinel"
+        base_env = os.environ.copy()
+        expected_exports = {
+            name: (base_env.get(name, "") if name == "PATH" else sentinel)
+            for name in protected_exports
+        }
+
+        def run_setup(mode: str) -> subprocess.CompletedProcess[str]:
+            if mode == "source":
+                command = (
+                    'for name in ${PROTECTED_EXPORTS}; do '
+                    'printf "BEFORE:%s=%s\\n" "$name" "${!name-__UNSET__}"; done; '
+                    'source "$1"; rc=$?; '
+                    'for name in ${PROTECTED_EXPORTS}; do '
+                    'printf "STATE:%s=%s\\n" "$name" "${!name-__UNSET__}"; done; '
+                    'for name in ${INTERNAL_NAMES}; do '
+                    'printf "LOCAL:%s=%s\\n" "$name" "${!name-__UNSET__}"; done; '
+                    'if declare -F _require_sdk_artifact >/dev/null; then '
+                    'printf "FUNCTION:_require_sdk_artifact=SET\\n"; else '
+                    'printf "FUNCTION:_require_sdk_artifact=__UNSET__\\n"; fi; '
+                    'exit "$rc"'
+                )
+            else:
+                command = ""
+            env = base_env.copy()
+            env.update(expected_exports)
+            env["PROTECTED_EXPORTS"] = " ".join(protected_exports)
+            env["INTERNAL_NAMES"] = " ".join(internal_names)
+            argv = (
+                [bash, "-c", command, "setup-sdk-regression", msys_path(fixture_setup)]
+                if mode == "source"
+                else [bash, msys_path(fixture_setup)]
+            )
+            return subprocess.run(
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+        for mode in ("source", "execute"):
+            complete = run_setup(mode)
+            if complete.returncode != 0:
+                failures.append(
+                    f"setup ({mode}) rejected a complete pinned SDK fixture: "
+                    f"{complete.stdout}{complete.stderr}".strip()
+                )
+
+        for name, artifact in artifacts.items():
+            artifact.unlink()
+            for mode in ("source", "execute"):
+                missing = run_setup(mode)
+                output = f"{missing.stdout}\n{missing.stderr}"
+                if missing.returncode == 0:
+                    failures.append(
+                        f"setup ({mode}) accepted a pinned SDK fixture missing {name}"
+                    )
+                elif name not in output or SDK not in output:
+                    failures.append(
+                        f"setup ({mode}) failure for missing {name} did not identify "
+                        f"the {SDK} artifact"
+                    )
+                if mode == "source":
+                    before = {
+                        line.removeprefix("BEFORE:").partition("=")[0]:
+                        line.partition("=")[2]
+                        for line in output.splitlines()
+                        if line.startswith("BEFORE:")
+                    }
+                    after = {
+                        line.removeprefix("STATE:").partition("=")[0]:
+                        line.partition("=")[2]
+                        for line in output.splitlines()
+                        if line.startswith("STATE:")
+                    }
+                    for export_name in expected_exports:
+                        if before.get(export_name) != after.get(export_name):
+                            failures.append(
+                                f"setup failure for missing {name} mutated {export_name}"
+                            )
+                    for internal_name in internal_names:
+                        if f"LOCAL:{internal_name}=__UNSET__" not in output:
+                            failures.append(
+                                f"setup failure for missing {name} leaked {internal_name}"
+                            )
+                    if "FUNCTION:_require_sdk_artifact=__UNSET__" not in output:
+                        failures.append(
+                            f"setup failure for missing {name} leaked _require_sdk_artifact"
+                        )
+            artifact.touch()
 
 
 def main() -> int:
@@ -130,6 +314,7 @@ def main() -> int:
     setup_pins = re.findall(r'^_SDK_VER="([^"]+)"$', setup, re.MULTILINE)
     if setup_pins != [SDK]:
         failures.append(f"setup_msvc_env.sh _SDK_VER is {setup_pins!r}, expected [{SDK!r}]")
+    exercise_setup_sdk_preflight(setup, failures)
 
     provision = (ROOT / "deploy/windows/Provision-Windows-Runner.ps1").read_text(
         encoding="utf-8"
@@ -162,6 +347,15 @@ def main() -> int:
     )
     if mandatory_manifest_step(disabled_manifest_fixture):
         failures.append("nightly manifest checker accepted a workflow-level if: false")
+    for suppression in (
+        "        continue-on-error: true\n"
+        "        run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath "
+        "'C:\\actions-runner\\toolchain-manifest.json'\n",
+        "        run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath "
+        "'C:\\actions-runner\\toolchain-manifest.json' || true\n",
+    ):
+        if mandatory_manifest_step(suppression):
+            failures.append("nightly manifest checker accepted failure suppression")
 
     contract = (ROOT / "deploy/windows/toolchain-contract.json").read_text(
         encoding="utf-8"

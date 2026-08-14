@@ -45,6 +45,14 @@ environment:
   `Windows.h`, `kernel32.lib`, and `rc.exe`, and records all three artifacts
   plus the version in the host's `toolchain-manifest.json`.
 
+When the reviewed artifacts are already installed on an existing host, refresh
+its manifest with `deploy/windows/Update-ToolchainManifest.ps1`. The updater is
+the non-provisioning path for heterogeneous runner topology: it refuses live
+worker/job processes, preserves the prior runner/PostgreSQL/telemetry inventory,
+asserts the candidate against the live host, and atomically keeps a backup.
+Do not run Wee Tam's full four-runner provisioner on single-runner Shulgi merely
+to emit a manifest.
+
 The target directory and component family are a reviewed repository contract,
 not versions chosen during host maintenance. Moving either requires a PR that
 updates every boundary together and passes
