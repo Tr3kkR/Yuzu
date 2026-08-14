@@ -3209,6 +3209,29 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, "mcp." + tool_name, result_status, "mcp_tool", tool_name, detail);
             };
 
+            // Deny a fleet-wide GuaranteedState:Read tool call to a
+            // service-scoped API token, with a denial audit. MCP sibling of
+            // REST's deny_fleet_wide_service_scoped (rest_api_v1.cpp) — same
+            // rationale: require_permission's service-token branch checks
+            // only the ITServiceOwner ROLE, never the token's own
+            // service-tag scope, so perm_fn alone is not confinement for a
+            // fleet-wide per-agent read with no per-agent parameter to scope
+            // against (the REST siblings of get_dex_signal_detail,
+            // list_dex_perf_devices, and list_network_devices all needed
+            // this same fix — Gate 8 review found the MCP twins share the
+            // gap the REST fix closed). `session` is already resolved once
+            // for the whole request above — no auth_fn call needed here.
+            auto deny_fleet_wide_service_scoped =
+                [&](const std::string& action, const std::string& target_type,
+                    const std::string& audit_detail, const std::string& message) -> bool {
+                if (session->token_scope_service.empty())
+                    return false;
+                (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, "denied",
+                                                              target_type, "", audit_detail);
+                res.set_content(error_response(id, kPermissionDenied, message), "application/json");
+                return true;
+            };
+
             // A4 error envelope for the MCP layer (#1470). The shared tier /
             // approval chokepoints below gate ~13 tools from one code path, so a
             // single helper here makes the whole family A4-consistent: every error
@@ -5545,6 +5568,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Fleet-wide identity-linked disclosure, same gap as the REST
+                // sibling GET /api/v1/dex/signals/{obs_type} (SEC-3 class):
+                // devices[] below names every agent_id exhibiting this
+                // signal, no per-agent parameter to scope a per-target check
+                // against. target_id left empty: this fires before the
+                // obs_type charset/length validation below, so the raw
+                // param is not yet safe to embed in an audit detail string.
+                if (deny_fleet_wide_service_scoped(
+                        "dex.signal.view", "ObsType",
+                        "fleet-wide DEX signal drill-down denied to a service-scoped token "
+                        "(MCP get_dex_signal_detail)",
+                        "service-scoped tokens may not read fleet-wide DEX signal drill-downs"))
+                    return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
                 if (!guaranteed_state_store) {
@@ -5682,6 +5718,21 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Fleet-wide identity-linked disclosure, same gap as the REST
+                // sibling GET /api/v1/dex/perf/devices (SEC-3 class): each row
+                // names an agent_id + its perf metrics, no per-agent parameter
+                // to scope against. Scoped to list_dex_perf_devices ONLY — its
+                // three siblings in this shared block (get_dex_perf_fleet,
+                // get_dex_perf_cohorts, get_dex_perf_cohort_diff) are genuine
+                // aggregates with no agent_id and stay unconfined.
+                if (tool_name == "list_dex_perf_devices" &&
+                    deny_fleet_wide_service_scoped(
+                        "dex.perf.device.view", "GuaranteedState",
+                        "fleet-wide DEX perf device list denied to a service-scoped token "
+                        "(MCP list_dex_perf_devices)",
+                        "service-scoped tokens may not read the fleet-wide DEX perf device "
+                        "list"))
+                    return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
                 if (!dex_perf_fn) {
@@ -5704,6 +5755,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         .str();
                 };
                 std::string payload;
+                // Only meaningful for list_dex_perf_devices (set inside its
+                // branch below); the other three tools in this shared block
+                // are aggregates and stay on the generic mcp.<tool> audit.
+                bool device_list_audit_ok = true;
                 if (tool_name == "get_dex_perf_fleet") {
                     const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
                     payload = JObj()
@@ -5843,6 +5898,21 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     const int limit = (std::min)(raw_limit, 500);
+                    // Behavioral-PII access audit — same verb/target as the
+                    // REST sibling GET /api/v1/dex/perf/devices. MCP
+                    // convention: set-and-proceed (audit_persisted:false
+                    // appended below on failure), not REST's fail-closed —
+                    // JSON-RPC has no response-header channel, matching
+                    // get_dex_signal_detail's own established posture.
+                    // Behavioral-PII access audit — same verb/target as the
+                    // REST sibling GET /api/v1/dex/perf/devices. MCP
+                    // convention: set-and-proceed (audit_persisted:false
+                    // appended below on failure), not REST's fail-closed —
+                    // JSON-RPC has no response-header channel, matching
+                    // get_dex_signal_detail's own established posture.
+                    device_list_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "dex.perf.device.view", "success", "GuaranteedState", "",
+                        "fleet-wide DEX perf device list via MCP list_dex_perf_devices");
                     JArr arr;
                     for (const auto& r : dex_perf_device_list(dex_perf_fn(cohort_key), metric,
                                                               not_reporting, cohort_filter,
@@ -5866,9 +5936,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // is the one bare-array branch and needs the same wrap the Phase-1
                 // reads batch used for its own bare-array tools. content[].text stays
                 // exactly `payload` either way - unchanged wire format.
+                // Evidence-gap signal (matches get_dex_signal_detail): absent
+                // on success (consumers key on absence), false when the
+                // per-read access audit row failed to persist.
                 const std::string structured_payload =
                     tool_name == "list_dex_perf_devices"
-                        ? JObj().raw("devices", payload).str()
+                        ? (device_list_audit_ok
+                               ? JObj().raw("devices", payload).str()
+                               : JObj().raw("devices", payload).add("audit_persisted", false).str())
                         : payload;
                 mcp_audit("success");
                 res.set_content(success_response(
@@ -6271,6 +6346,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Fleet-wide identity-linked disclosure, same gap as the REST
+                // sibling GET /api/v1/network/devices (SEC-3 class): each row
+                // names an agent_id + its network perf/correlation facts, no
+                // per-agent parameter to scope against. Scoped to
+                // list_network_devices ONLY — get_network_fleet is a genuine
+                // aggregate with no agent_id and stays unconfined.
+                if (tool_name == "list_network_devices" &&
+                    deny_fleet_wide_service_scoped(
+                        "network.device.view", "GuaranteedState",
+                        "fleet-wide network device list denied to a service-scoped token "
+                        "(MCP list_network_devices)",
+                        "service-scoped tokens may not read the fleet-wide network device "
+                        "list"))
+                    return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
                 if (!net_perf_fn) {
@@ -6291,6 +6380,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         .str();
                 };
                 std::string payload;
+                // Only meaningful for list_network_devices (set inside its
+                // branch below); get_network_fleet is an aggregate and stays
+                // on the generic mcp.<tool> audit.
+                bool device_list_audit_ok = true;
                 if (tool_name == "get_network_fleet") {
                     const auto now = net_perf_fleet_now(net_perf_fn(std::string{}));
                     payload = JObj()
@@ -6329,6 +6422,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     const int limit = (std::min)(raw_limit, 500);
+                    // Behavioral-PII access audit — same verb/target as the
+                    // REST sibling GET /api/v1/network/devices. MCP
+                    // convention: set-and-proceed (audit_persisted:false
+                    // appended below on failure), not REST's fail-closed.
+                    device_list_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "network.device.view", "success", "GuaranteedState", "",
+                        "fleet-wide network device list via MCP list_network_devices");
                     JArr arr;
                     for (const auto& r : net_perf_device_list(net_perf_fn(cohort_key), metric,
                                                               not_reporting, cooc, cohort_filter,
@@ -6357,9 +6457,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the bare-array branch and needs the same wrap the Phase-1 reads
                 // batch used for its own bare-array tools. content[].text stays
                 // exactly `payload` either way - unchanged wire format.
+                // Evidence-gap signal (matches get_dex_signal_detail): absent
+                // on success (consumers key on absence), false when the
+                // per-read access audit row failed to persist.
                 const std::string structured_payload =
                     tool_name == "list_network_devices"
-                        ? JObj().raw("devices", payload).str()
+                        ? (device_list_audit_ok
+                               ? JObj().raw("devices", payload).str()
+                               : JObj().raw("devices", payload).add("audit_persisted", false).str())
                         : payload;
                 mcp_audit("success");
                 res.set_content(success_response(

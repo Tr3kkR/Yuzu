@@ -955,7 +955,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "DEX per-OS signal coverage", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. How many distinct obs_types each platform reports in the window, with total event count — the live cross-OS coverage the dashboard derives. Fleet aggregate — NOT audited.", "parameters": [{"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-OS scope array (data[].platform, distinct_types, total_events)"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/signals/{obs_type}": {
-      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.signal.view audit row cannot persist, so the device list is never served without durable evidence.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Scope subjects[]/devices[]/by_day[] to one OS; all (or omitted) = every OS. by_os[] stays cross-OS (it IS the split). The applied os is echoed in the response."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, os, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "503": {"description": "Service unavailable OR the dex.signal.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "DEX per-signal drill-down", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. One obs_type's drill-down: top subjects, per-OS split, most-affected devices, and the per-day trend. The devices array names the agent_ids exhibiting this signal (individual-identifying behavioral data), so every call emits a dex.signal.view audit event — parity with the dashboard per-signal view and the agent_id-filtered events query. obs_type must match [A-Za-z0-9._-]{1,64} (a malformed value returns 400); a well-formed obs_type with no observations in the window returns 200 with empty arrays. A service-scoped API token is denied outright (403) — the devices[] list is fleet-wide with no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.signal.view audit row cannot persist, so the device list is never served without durable evidence.", "parameters": [{"name": "obs_type", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9._-]{1,64}$"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}, {"name": "os", "in": "query", "required": false, "schema": {"type": "string", "enum": ["all", "windows", "linux", "macos"], "default": "all"}, "description": "Scope subjects[]/devices[]/by_day[] to one OS; all (or omitted) = every OS. by_os[] stays cross-OS (it IS the split). The applied os is echoed in the response."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}, "description": "Caps the subjects[] and devices[] arrays; clamped to 500."}], "responses": {"200": {"description": "Drill-down object (obs_type, os, subjects[], by_os[], devices[], by_day[])"}, "400": {"description": "Invalid obs_type or limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.signal.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/devices/{id}": {
       "get": {"summary": "Per-device DEX read model", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group (parity with the dashboard device DEX lens). Returns this device's DEX experience score (0-100; -1 = n/a) and its signal summary for the window. Individual-identifying behavioral data, so every call emits a dex.device.view audit event. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when that audit row cannot persist, so the device's behavioural data is never served without durable evidence. The window query parameter is one of 24h/7d/30d/all (default 7d).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "window", "in": "query", "required": false, "schema": {"type": "string", "enum": ["24h", "7d", "30d", "all"], "default": "7d"}}], "responses": {"200": {"description": "Per-device DEX object (agent_id, window, score, signals[].obs_type/count/distinct_devices/last_seen)"}, "400": {"description": "invalid window (expected 24h|7d|30d|all)"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable OR the dex.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
@@ -976,7 +976,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Direct cohort-vs-cohort performance comparison", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. F2c (BRD 99/103): diffs two cohorts (values of the chosen tag key, default model) head-to-head — e.g. image_type vanilla vs layered — where /dex/perf/cohorts benchmarks each cohort against the fleet. Both cohort values a and b are required (an empty value is the untagged residual). delta_pct.<metric> is A's p50 relative to B's p50 (B the baseline), null unless BOTH cohorts expose the metric (neither suppressed below the 10-device floor). found_a/found_b are false when a cohort has no reporting devices. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "a", "in": "query", "required": true, "schema": {"type": "string"}, "description": "First cohort value (empty string = untagged residual)."}, {"name": "b", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Second cohort value (the baseline)."}], "responses": {"200": {"description": "Diff object (key, floor, found_a, found_b, a|null, b|null, delta_pct{cpu_pct|null, commit_pct|null, disk_lat_ms|null})"}, "400": {"description": "Invalid tag key, or missing cohort params"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/perf/devices": {
-      "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Machine-health telemetry (device state, not behavioral data) — NOT audited; the behavioral DEX surfaces keep their audit verbs.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?)"}, "400": {"description": "Invalid cohort_key or limit"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Each row names an agent_id fleet-wide, so every call emits a dex.perf.device.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.perf.device.view audit row cannot persist, so the device list is never served without durable evidence. (The three aggregate DEX-perf endpoints — fleet, cohorts, cohort-diff — stay unaudited: no agent_id, no per-device data.)", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?)"}, "400": {"description": "Invalid cohort_key or limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.perf.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural data was withheld because the access-audit row failed to persist."}}}}}
     },
     )json"
         // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at compile.
@@ -997,7 +997,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Fleet network quality now-stats", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for smoothed RTT ms, the interval TCP retransmit rate % and device throughput bps, computed at request time over registry heartbeat NETWORK facts — OS-blended across the fleet (the per-OS yuzu_fleet_net_* Prometheus gauges split the same facts by os, so a gauge series differs from this blended number on a mixed fleet; the /network Overview cards show this same blended view). A metric nobody reported is null (absent, never 0); reporting, rtt_reporting (the honest RTT denominator) and online carry the populations. cooccurrence counts net-degraded devices that also show device-perf pressure / app instability (measured co-occurrence, never a cause). Device-aggregate link health — NOT audited.", "responses": {"200": {"description": "Fleet now object (rtt_ms|null, retrans_pct|null, throughput_bps|null, reporting, rtt_reporting, online, cooccurrence{degraded, also_device, also_app, network_only})"}, "503": {"description": "service unavailable"}}}
     },
     "/network/devices": {
-      "get": {"summary": "Device list behind every network-quality drill", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default rtt), devices NOT reporting network this cycle (filter=not_reporting), a co-occurrence band (cooc=device|app|network_only|degraded), or one cohort's members. Cohort handling mirrors the /network dashboard fragment: the optional key selects a tag dimension and cohort_value (empty string = the untagged residual) filters to it. Rows carry the co-occurring facts (under_pressure, app_unstable) and fleet_pctile (nearest-rank position for the sort metric) — evidence for correlation, never a verdict. Device-aggregate link health — NOT audited.", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["rtt", "retrans", "throughput"], "default": "rtt"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cooc", "in": "query", "required": false, "schema": {"type": "string", "enum": ["device", "app", "network_only", "degraded"]}}, {"name": "key", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Cohort tag key to resolve per-device cohort values; empty = no cohort dimension. NOTE: the network surface uses 'key' (with a length guard, empty allowed) where /dex/perf uses 'cohort_key' (validated, default 'model') — the difference mirrors each surface's cohort-resolution model."}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?)"}, "400": {"description": "Invalid limit"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Device list behind every network-quality drill", "tags": ["Network"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default rtt), devices NOT reporting network this cycle (filter=not_reporting), a co-occurrence band (cooc=device|app|network_only|degraded), or one cohort's members. Cohort handling mirrors the /network dashboard fragment: the optional key selects a tag dimension and cohort_value (empty string = the untagged residual) filters to it. Rows carry the co-occurring facts (under_pressure, app_unstable) and fleet_pctile (nearest-rank position for the sort metric) — evidence for correlation, never a verdict. Each row names an agent_id fleet-wide, so every call emits a network.device.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the network.device.view audit row cannot persist, so the device list is never served without durable evidence. (GET /network/fleet stays unaudited: an aggregate, no agent_id.)", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["rtt", "retrans", "throughput"], "default": "rtt"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cooc", "in": "query", "required": false, "schema": {"type": "string", "enum": ["device", "app", "network_only", "degraded"]}}, {"name": "key", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Cohort tag key to resolve per-device cohort values; empty = no cohort dimension. NOTE: the network surface uses 'key' (with a length guard, empty allowed) where /dex/perf uses 'cohort_key' (validated, default 'model') — the difference mirrors each surface's cohort-resolution model."}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, platform, cohort, rtt_ms?, retrans_pct?, throughput_bps?, net_degraded, under_pressure, app_unstable, fleet_pctile?)"}, "400": {"description": "Invalid limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the network.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural data was withheld because the access-audit row failed to persist."}}}}}
     },
     "/discover/permissions": {
       "get": {"summary": "RBAC permission catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Agentic-first (A1/A2, docs/agentic-first-principle.md) — every securable_type x operation pair the RbacStore recognizes, plus the full role -> allowed-operations grid (RbacStore::list_roles + get_role_permissions). Cheap pass-through over in-memory RBAC state; ETag + Cache-Control:max-age=300 + 304 revalidation, same contract as GET /guaranteed-state/schemas.", "responses": {"200": {"description": "{version, description, securable_types[], operations[], roles[].{name, description, is_system, permissions[].{securable_type, operation, effect}}}"}, "304": {"description": "Not Modified (If-None-Match matched)"}, "503": {"description": "RBAC store unavailable"}}}
@@ -1349,6 +1349,47 @@ void RestApiV1::register_routes(
         if (exec_visible_fn && sess)
             return exec_visible_fn(*sess);
         return yuzu::server::authz::deny_all();
+    };
+
+    // Deny a fleet-wide GuaranteedState:Read read to a service-scoped API
+    // token, with a denial audit. Extracted after the 4th near-identical
+    // inline copy (Gate 8 review, SEC-3 sibling-gap round): the events fleet
+    // branch, /dex/signals/{obs_type}, /dex/perf/devices, /network/devices
+    // all share this exact shape — resolve session, check
+    // token_scope_service, 403 + audit if non-empty — because
+    // require_permission's service-token branch checks only the
+    // ITServiceOwner ROLE, never the token's own service-tag scope, so the
+    // bare perm_fn gate alone lets a service-scoped token read fleet-wide
+    // identity-linked data on any route with no per-agent shape to scope a
+    // per-target check against. Grep this name before adding a 5th such
+    // route with no per-agent parameter — that is precisely how this defect
+    // class shipped 4 times in one branch.
+    //
+    // Mints its own correlation id and sets X-Correlation-Id unconditionally
+    // (some call sites already set one earlier in the handler for other
+    // branches; this overwrites it with a fresh one on the deny path only —
+    // harmless, since nothing logs the earlier value before this returns).
+    // Routed through try_persist_audit (not a bare audit_fn call): a
+    // throwing audit sink must not be able to turn the intended 403 into an
+    // uncaught-exception 500 (this handler installs no exception_handler_).
+    // Returns true iff the caller must return immediately (either a written
+    // 401/redirect from auth_fn, or the 403 deny itself).
+    auto deny_fleet_wide_service_scoped =
+        [auth_fn, audit_fn](const httplib::Request& req, httplib::Response& res,
+                            const std::string& action, const std::string& target_type,
+                            const std::string& audit_detail, const std::string& message) -> bool {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return true; // auth_fn already wrote the response (401/etc).
+        if (session->token_scope_service.empty())
+            return false;
+        (void)detail::try_persist_audit(audit_fn, req, action, "denied", target_type, "",
+                                        audit_detail);
+        const auto cid = detail::make_correlation_id();
+        res.set_header("X-Correlation-Id", cid);
+        res.status = 403;
+        res.set_content(detail::error_json_a4(403, message, cid), "application/json");
+        return true;
     };
 
     // ── CORS preflight handler for /api/v1/* ─────────────────────────────
@@ -8618,8 +8659,9 @@ void RestApiV1::register_routes(
     //    /guaranteed-state/status route on a separate, unmerged branch — this
     //    route's deny does not depend on it landing.)
     sink.Get("/api/v1/guaranteed-state/events",
-             [perm_fn, scoped_perm_fn, auth_fn, audit_fn, guaranteed_state_store](
-                 const httplib::Request& req, httplib::Response& res) {
+             [perm_fn, scoped_perm_fn, audit_fn, guaranteed_state_store,
+              deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                              httplib::Response& res) {
         const auto cid = detail::make_correlation_id();
         res.set_header("X-Correlation-Id", cid);
 
@@ -8667,36 +8709,17 @@ void RestApiV1::register_routes(
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", q.agent_id))
                 return;
         } else {
-            auto session = auth_fn(req, res);
-            if (!session)
-                return; // auth_fn already wrote the response (401/etc).
-            if (!session->token_scope_service.empty()) {
-                // This deny bypasses perm_fn/require_permission entirely, so
-                // it does NOT get the auth.permission_required audit row that
-                // route ordinarily leaves on a denial — record one explicitly
-                // (same verb as the success path, "denied" result) so a
-                // probing service token leaves a trace, not silence. Routed
-                // through the shared #1647 kernel (not a bare audit_fn call):
-                // a throwing audit_fn is uncaught outside the kernel, and this
-                // handler has no exception_handler_ installed, so an uncaught
-                // throw here would silently replace the intended 403 with a
-                // bare httplib 500. Set-and-proceed, not fail-closed — a
-                // denial is already the safe outcome; do not turn a lost
-                // denial-audit row into an unnecessary 503 on top of it.
-                (void)detail::try_persist_audit(audit_fn, req, "dex.device.view", "denied",
-                                                "GuaranteedState", "",
-                                                "fleet-wide Guaranteed State events denied to "
-                                                "a service-scoped token");
-                res.status = 403;
-                res.set_content(
-                    detail::error_json_a4(
-                        403,
-                        "service-scoped tokens may not read fleet-wide Guaranteed State "
-                        "events; supply agent_id",
-                        cid),
-                    "application/json");
+            // This deny bypasses perm_fn/require_permission entirely, so it does
+            // NOT get the auth.permission_required audit row that route
+            // ordinarily leaves on a denial — deny_fleet_wide_service_scoped
+            // records one explicitly (same verb as the success path) so a
+            // probing service token leaves a trace, not silence.
+            if (deny_fleet_wide_service_scoped(
+                    req, res, "dex.device.view", "GuaranteedState",
+                    "fleet-wide Guaranteed State events denied to a service-scoped token",
+                    "service-scoped tokens may not read fleet-wide Guaranteed State events; "
+                    "supply agent_id"))
                 return;
-            }
             if (!perm_fn(req, res, "GuaranteedState", "Read"))
                 return;
         }
@@ -9253,8 +9276,8 @@ void RestApiV1::register_routes(
     // 404 route-miss; a valid-but-absent type yields 200 with empty arrays (the
     // read-model has no such observations — it is not an entity-not-found).
     sink.Get(R"(/api/v1/dex/signals/([^/]+))",
-             [perm_fn, audit_fn, auth_fn, guaranteed_state_store](const httplib::Request& req,
-                                                                  httplib::Response& res) {
+             [perm_fn, audit_fn, guaranteed_state_store, deny_fleet_wide_service_scoped](
+                 const httplib::Request& req, httplib::Response& res) {
                  // Fleet-wide identity-linked disclosure (sibling of the SEC-3 gap
                  // closed on GET /guaranteed-state/events): the devices[] array
                  // below names every agent_id exhibiting this signal, fleet-wide,
@@ -9264,33 +9287,17 @@ void RestApiV1::register_routes(
                  // so perm_fn alone would let a token scoped to one service read
                  // every agent's signal history for any obs_type. Denied here,
                  // ahead of/independent from perm_fn.
-                 auto session = auth_fn(req, res);
-                 if (!session)
-                     return; // auth_fn already wrote the response (401/etc).
-                 if (!session->token_scope_service.empty()) {
-                     const auto cid = detail::make_correlation_id();
-                     res.set_header("X-Correlation-Id", cid);
-                     // target_id left empty (not the raw obs_type match): this fires
-                     // BEFORE the obs_type charset/length validation below, so the raw
-                     // route match is not yet safe to embed in an audit detail string
-                     // (unvalidated control characters could forge audit-log lines).
-                     // Routed through the shared #1647 kernel, not a bare audit_fn
-                     // call: a throwing audit_fn is uncaught outside the kernel and
-                     // would silently replace this 403 with a bare httplib 500.
-                     (void)detail::try_persist_audit(audit_fn, req, "dex.signal.view", "denied",
-                                                     "ObsType", "",
-                                                     "fleet-wide DEX signal drill-down denied "
-                                                     "to a service-scoped token");
-                     res.status = 403;
-                     res.set_content(
-                         detail::error_json_a4(
-                             403,
-                             "service-scoped tokens may not read fleet-wide DEX signal "
-                             "drill-downs",
-                             cid),
-                         "application/json");
+                 //
+                 // target_id left empty (not the raw obs_type route match): this
+                 // fires BEFORE the obs_type charset/length validation below, so
+                 // the raw match is not yet safe to embed in an audit detail
+                 // string (unvalidated control characters could forge audit-log
+                 // lines).
+                 if (deny_fleet_wide_service_scoped(
+                         req, res, "dex.signal.view", "ObsType",
+                         "fleet-wide DEX signal drill-down denied to a service-scoped token",
+                         "service-scoped tokens may not read fleet-wide DEX signal drill-downs"))
                      return;
-                 }
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  if (!guaranteed_state_store) {
@@ -9621,8 +9628,8 @@ void RestApiV1::register_routes(
     // (default), the not-reporting complement (filter=not_reporting), or a
     // cohort's members (cohort_key + cohort_value; empty value = untagged).
     sink.Get("/api/v1/dex/perf/devices",
-             [perm_fn, audit_fn, auth_fn, dex_perf_fn](const httplib::Request& req,
-                                                       httplib::Response& res) {
+             [perm_fn, audit_fn, dex_perf_fn, deny_fleet_wide_service_scoped](
+                 const httplib::Request& req, httplib::Response& res) {
                  // A4 backfill (#1470): correlation id + A4 error envelope (cohort-diff parity).
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
@@ -9633,24 +9640,12 @@ void RestApiV1::register_routes(
                  // service-token branch checks only the ITServiceOwner ROLE, never
                  // the token's own service-tag scope, so perm_fn alone would let a
                  // token scoped to one service read every agent's perf data.
-                 auto session = auth_fn(req, res);
-                 if (!session)
-                     return; // auth_fn already wrote the response (401/etc).
-                 if (!session->token_scope_service.empty()) {
-                     (void)detail::try_persist_audit(audit_fn, req, "dex.perf.devices.view",
-                                                     "denied", "GuaranteedState", "",
-                                                     "fleet-wide DEX perf device list denied "
-                                                     "to a service-scoped token");
-                     res.status = 403;
-                     res.set_content(
-                         detail::error_json_a4(
-                             403,
-                             "service-scoped tokens may not read the fleet-wide DEX perf "
-                             "device list",
-                             cid),
-                         "application/json");
+                 if (deny_fleet_wide_service_scoped(
+                         req, res, "dex.perf.device.view", "GuaranteedState",
+                         "fleet-wide DEX perf device list denied to a service-scoped token",
+                         "service-scoped tokens may not read the fleet-wide DEX perf device "
+                         "list"))
                      return;
-                 }
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  if (!dex_perf_fn) {
@@ -9703,7 +9698,7 @@ void RestApiV1::register_routes(
                  // refuse to serve when the evidence row is KNOWN to have failed to
                  // persist. Fires after validation, before the data query, so an
                  // invalid request never reaches the audit trail at all.
-                 if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.perf.devices.view",
+                 if (!detail::emit_behavioral_audit(audit_fn, req, res, "dex.perf.device.view",
                                                     "success", "GuaranteedState", "",
                                                     "fleet-wide DEX perf device list via REST "
                                                     "/api/v1/dex/perf/devices")) {
@@ -9716,7 +9711,7 @@ void RestApiV1::register_routes(
                                                            "retry after the audit subsystem "
                                                            "recovers"),
                                      "application/json");
-                     spdlog::warn("dex.perf.devices.view audit fail-closed (503) cid={}", cid);
+                     spdlog::warn("dex.perf.device.view audit fail-closed (503) cid={}", cid);
                      return;
                  }
                  const auto rows = dex_perf_device_list(dex_perf_fn(cohort_key), metric,
@@ -10217,8 +10212,8 @@ void RestApiV1::register_routes(
     // carry the co-occurring FACTS (under_pressure/app_unstable) and the fleet
     // percentile — evidence shown for correlation, never a verdict.
     sink.Get("/api/v1/network/devices",
-             [perm_fn, audit_fn, auth_fn, net_perf_fn](const httplib::Request& req,
-                                                       httplib::Response& res) {
+             [perm_fn, audit_fn, net_perf_fn, deny_fleet_wide_service_scoped](
+                 const httplib::Request& req, httplib::Response& res) {
                  // Fleet-wide identity-linked disclosure (sibling of the SEC-3 gap
                  // closed on GET /guaranteed-state/events): each row names an
                  // agent_id + its network perf/correlation facts, fleet-wide, no
@@ -10227,26 +10222,12 @@ void RestApiV1::register_routes(
                  // ITServiceOwner ROLE, never the token's own service-tag scope, so
                  // perm_fn alone would let a token scoped to one service read every
                  // agent's network data.
-                 auto session = auth_fn(req, res);
-                 if (!session)
-                     return; // auth_fn already wrote the response (401/etc).
-                 if (!session->token_scope_service.empty()) {
-                     const auto cid = detail::make_correlation_id();
-                     res.set_header("X-Correlation-Id", cid);
-                     (void)detail::try_persist_audit(audit_fn, req, "network.devices.view",
-                                                     "denied", "GuaranteedState", "",
-                                                     "fleet-wide network device list denied "
-                                                     "to a service-scoped token");
-                     res.status = 403;
-                     res.set_content(
-                         detail::error_json_a4(
-                             403,
-                             "service-scoped tokens may not read the fleet-wide network "
-                             "device list",
-                             cid),
-                         "application/json");
+                 if (deny_fleet_wide_service_scoped(
+                         req, res, "network.device.view", "GuaranteedState",
+                         "fleet-wide network device list denied to a service-scoped token",
+                         "service-scoped tokens may not read the fleet-wide network device "
+                         "list"))
                      return;
-                 }
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  if (!net_perf_fn) {
@@ -10291,7 +10272,7 @@ void RestApiV1::register_routes(
                  // is KNOWN to have failed to persist. Fires after validation,
                  // before the data query, so an invalid request never reaches the
                  // audit trail at all.
-                 if (!detail::emit_behavioral_audit(audit_fn, req, res, "network.devices.view",
+                 if (!detail::emit_behavioral_audit(audit_fn, req, res, "network.device.view",
                                                     "success", "GuaranteedState", "",
                                                     "fleet-wide network device list via REST "
                                                     "/api/v1/network/devices")) {
@@ -10306,7 +10287,7 @@ void RestApiV1::register_routes(
                                                            "retry after the audit subsystem "
                                                            "recovers"),
                                      "application/json");
-                     spdlog::warn("network.devices.view audit fail-closed (503) cid={}", cid);
+                     spdlog::warn("network.device.view audit fail-closed (503) cid={}", cid);
                      return;
                  }
                  const auto rows = net_perf_device_list(net_perf_fn(cohort_key), metric,

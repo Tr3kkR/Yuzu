@@ -672,6 +672,11 @@ namespace {
 struct McpTestServer {
     // Mock state
     std::string mock_tier;              // MCP tier for mock auth
+    // Non-empty simulates a service-scoped API token session (SEC-3 sibling
+    // gap: get_dex_signal_detail / list_dex_perf_devices / list_network_devices
+    // must deny these on their fleet-wide shape). Default empty preserves
+    // every other test's ordinary-operator session.
+    std::string mock_token_scope_service;
     bool mock_auth_enabled{true};       // false -> auth_fn returns nullopt (401)
     std::vector<std::string> audit_log; // records "action|result" pairs
     std::vector<std::string> audit_details; // records the detail string per audit call (M2)
@@ -950,6 +955,7 @@ private:
             s.mcp_tier = mock_tier;
             s.principal_kind = mock_principal_kind;
             s.auth_source = mock_auth_source;
+            s.token_scope_service = mock_token_scope_service;
             return s;
         };
 
@@ -3339,6 +3345,42 @@ TEST_CASE("MCP DEX: get_dex_signal_detail rejects a malformed obs_type without a
         CHECK(a.find("dex.signal.view") == std::string::npos);
 }
 
+// SEC-3 sibling class (Gate 8 review): a service-scoped token must not read
+// the fleet-wide devices[] this tool returns — mirrors the REST sibling
+// GET /api/v1/dex/signals/{obs_type} deny.
+TEST_CASE("MCP DEX: get_dex_signal_detail denies a service-scoped token, "
+          "denial audited",
+          "[pg][mcp][integration][dex][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_obs(store, "o1", "WS-1", "process.crashed", "chrome.exe", "windows",
+                 "2026-06-10T10:00:00Z");
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":46,"params":{"name":"get_dex_signal_detail","arguments":{"obs_type":"process.crashed","window":"all"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+
+    // Denial is audited, and the tool returns before the success-path
+    // dex.signal.view|success or the generic mcp.get_dex_signal_detail|success
+    // rows fire.
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "dex.signal.view|denied")
+            saw_denied = true;
+        CHECK(a != "dex.signal.view|success");
+        CHECK(a != "mcp.get_dex_signal_detail|success");
+    }
+    CHECK(saw_denied);
+}
+
 TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is wired",
           "[mcp][integration][dex]") {
     McpTestServer ts; // guaranteed_state_store_for_test stays nullptr
@@ -3713,6 +3755,64 @@ TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit par
     CHECK(badkey["error"]["data"]["correlation_id"].is_string());
 }
 
+// SEC-3 sibling class (Gate 8 review): list_dex_perf_devices names an
+// agent_id per row fleet-wide, no per-agent parameter to scope against —
+// same gap as the REST sibling GET /api/v1/dex/perf/devices. Its three
+// siblings in the shared block (fleet/cohorts/cohort_diff) are genuine
+// aggregates and stay unconfined; only the device list denies.
+TEST_CASE("MCP DEX perf: list_dex_perf_devices denies a service-scoped "
+          "token, denial audited; aggregate siblings unaffected",
+          "[mcp][integration][dex][perf][security]") {
+    McpTestServer ts;
+    ts.dex_perf_fn_for_test = mcp_perf_snapshot;
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto denied = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":57,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model"}}})")
+            ->body);
+    REQUIRE(denied.contains("error"));
+    CHECK(denied["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "dex.perf.device.view|denied")
+            saw_denied = true;
+        CHECK(a != "dex.perf.device.view|success");
+    }
+    CHECK(saw_denied);
+
+    // The aggregate sibling in the same shared block stays unconfined for a
+    // service-scoped token — it has no per-agent data to scope against.
+    auto fleet_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":58,"params":{"name":"get_dex_perf_fleet","arguments":{}}})");
+    REQUIRE(fleet_res);
+    CHECK(fleet_res->status == 200);
+    auto fleet_body = nlohmann::json::parse(fleet_res->body);
+    CHECK_FALSE(fleet_body.contains("error"));
+}
+
+// Companion positive case: an ordinary (non-service-scoped) session reaches
+// the device list and gets the NEW dedicated dex.perf.device.view|success
+// audit row — previously this tool had ONLY the generic mcp.<tool> audit.
+TEST_CASE("MCP DEX perf: list_dex_perf_devices ordinary session succeeds, "
+          "dedicated success audit fires",
+          "[mcp][integration][dex][perf][security]") {
+    McpTestServer ts;
+    ts.dex_perf_fn_for_test = mcp_perf_snapshot;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":59,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    bool saw_success = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.perf.device.view|success")
+            saw_success = true;
+    CHECK(saw_success);
+}
+
 TEST_CASE("MCP DEX perf: tools report unavailable when no provider is wired",
           "[mcp][integration][dex][perf]") {
     McpTestServer ts; // dex_perf_fn_for_test stays empty
@@ -3978,6 +4078,80 @@ TEST_CASE("MCP network: fleet stats + devices (worst-first sort + limit parity)"
             ->body);
     REQUIRE(bad.contains("error"));
     CHECK(bad["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+// SEC-3 sibling class (Gate 8 review): list_network_devices names an
+// agent_id + network/correlation facts per row fleet-wide, no per-agent
+// parameter to scope against — same gap as the REST sibling
+// GET /api/v1/network/devices. get_network_fleet is a genuine aggregate and
+// stays unconfined.
+TEST_CASE("MCP network: list_network_devices denies a service-scoped token, "
+          "denial audited; get_network_fleet unaffected",
+          "[mcp][integration][network][security]") {
+    McpTestServer ts;
+    ts.net_perf_fn_for_test = [](const std::string&) {
+        yuzu::server::NetPerfSnapshot snap;
+        yuzu::server::NetPerfDevice d;
+        d.agent_id = "hi-0";
+        d.platform = "linux";
+        d.rtt_ms = 500.0;
+        d.cohort = "site-a";
+        snap.devices.push_back(d);
+        return snap;
+    };
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto denied = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":63,"params":{"name":"list_network_devices","arguments":{}}})")
+            ->body);
+    REQUIRE(denied.contains("error"));
+    CHECK(denied["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "network.device.view|denied")
+            saw_denied = true;
+        CHECK(a != "network.device.view|success");
+    }
+    CHECK(saw_denied);
+
+    auto fleet_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":64,"params":{"name":"get_network_fleet","arguments":{}}})");
+    REQUIRE(fleet_res);
+    CHECK(fleet_res->status == 200);
+    auto fleet_body = nlohmann::json::parse(fleet_res->body);
+    CHECK_FALSE(fleet_body.contains("error"));
+}
+
+// Companion positive case: an ordinary session reaches the device list and
+// gets the NEW dedicated network.device.view|success audit row — previously
+// this tool had ONLY the generic mcp.<tool> audit.
+TEST_CASE("MCP network: list_network_devices ordinary session succeeds, "
+          "dedicated success audit fires",
+          "[mcp][integration][network][security]") {
+    McpTestServer ts;
+    ts.net_perf_fn_for_test = [](const std::string&) {
+        yuzu::server::NetPerfSnapshot snap;
+        yuzu::server::NetPerfDevice d;
+        d.agent_id = "hi-0";
+        d.platform = "linux";
+        d.rtt_ms = 500.0;
+        d.cohort = "site-a";
+        snap.devices.push_back(d);
+        return snap;
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":65,"params":{"name":"list_network_devices","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    bool saw_success = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "network.device.view|success")
+            saw_success = true;
+    CHECK(saw_success);
 }
 
 // #2712 batch 2: get_network_fleet's payload is already object-shaped (no

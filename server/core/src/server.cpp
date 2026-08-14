@@ -14718,7 +14718,7 @@ private:
         };
 
         network_routes_ = std::make_unique<NetworkRoutes>();
-        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, net_perf_fn);
+        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn, net_perf_fn);
 
         // DeviceRoutes — /devices (fleet list) + /device?id= (the shared device
         // page; Device-info lens). Sourced from the live registry (the CONNECTED

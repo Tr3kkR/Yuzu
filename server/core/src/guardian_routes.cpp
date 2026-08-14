@@ -16,10 +16,12 @@
 #include "web_utils.hpp"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <exception>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -282,21 +284,41 @@ bool GuardianRoutes::deny_service_scoped_(const httplib::Request& req,
     if (session->token_scope_service.empty())
         return false;
     const auto cid = detail::make_correlation_id();
-    // One shared verb across all 6 fragments this gate covers (status, guards,
-    // events, guard/page, baselines, baseline/page) — a probing service token
-    // leaves a trace, not silence, mirroring the REST fleet-wide deny's own
-    // denial audit (rest_api_v1.cpp's events route). Fire-and-forget: this
-    // helper has no `res` write left to protect (the 403 below is already the
-    // safe outcome), matching this file's set-and-proceed audit posture.
-    if (audit_fn_)
-        audit_fn_(req, "guaranteed_state.fragment.access_denied", "denied", "GuaranteedState", "",
-                  "fleet-wide Guardian dashboard fragment denied to a service-scoped token");
+    // Write the 403 FIRST, audit after: the audit call is fire-and-forget
+    // (GuardianRoutes::AuditFn is void, no persist signal to route through a
+    // kernel like try_persist_audit), and a THROWING audit_fn must not be able
+    // to prevent the 403 from ever being written — a Gate 8 finding on an
+    // earlier draft of this function had the audit call first, so an
+    // uncaught throw turned the intended 403 into a bare httplib 500 with
+    // no response body at all (worse than silence: it also broke the deny).
     res.status = 403;
     res.set_content(
         detail::error_json_a4(
             403, "service-scoped tokens may not read this fleet-wide Guardian view", cid,
             detail::A4ErrorOpts{.permission = "GuaranteedState:Read"}),
         "application/json");
+    // One shared verb across all 6 fragments this gate covers (status, guards,
+    // events, guard/page, baselines, baseline/page) — a probing service token
+    // leaves a trace, not silence, mirroring the REST fleet-wide deny's own
+    // denial audit (rest_api_v1.cpp's events route). `req.path` in `detail`
+    // disambiguates which of the six fragments was probed, since the verb
+    // itself does not. try/catch (not routed through try_persist_audit, which
+    // requires a bool-returning AuditFn): the 403 above is already durably
+    // written, so this is belt-and-suspenders against a throwing sink, not a
+    // functional requirement.
+    if (audit_fn_) {
+        try {
+            audit_fn_(req, "guaranteed_state.fragment.access_denied", "denied", "GuaranteedState",
+                      "",
+                      "fleet-wide Guardian dashboard fragment denied to a service-scoped token "
+                      "(path=" +
+                          req.path + ")");
+        } catch (const std::exception& e) {
+            spdlog::warn("guaranteed_state.fragment.access_denied: audit_fn_ threw: {}", e.what());
+        } catch (...) {
+            spdlog::warn("guaranteed_state.fragment.access_denied: audit_fn_ threw (non-std)");
+        }
+    }
     return true;
 }
 

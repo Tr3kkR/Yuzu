@@ -937,7 +937,7 @@ TEST_CASE("REST dex/perf/devices: service-scoped token → 403, denial audited",
     REQUIRE(res);
     CHECK(res->status == 403);
     REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "dex.perf.devices.view");
+    CHECK(h.audit_log[0].action == "dex.perf.device.view");
     CHECK(h.audit_log[0].result == "denied");
     CHECK(h.audit_log[0].target_type == "GuaranteedState");
 }
@@ -949,7 +949,7 @@ TEST_CASE("REST dex/perf/devices: ordinary session reaches the route, audited su
     REQUIRE(res);
     CHECK(res->status == 200);
     REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "dex.perf.devices.view");
+    CHECK(h.audit_log[0].action == "dex.perf.device.view");
     CHECK(h.audit_log[0].result == "success");
 }
 
@@ -971,7 +971,7 @@ TEST_CASE("REST network/devices: service-scoped token → 403, denial audited",
     REQUIRE(res);
     CHECK(res->status == 403);
     REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "network.devices.view");
+    CHECK(h.audit_log[0].action == "network.device.view");
     CHECK(h.audit_log[0].result == "denied");
     CHECK(h.audit_log[0].target_type == "GuaranteedState");
 }
@@ -983,7 +983,7 @@ TEST_CASE("REST network/devices: ordinary session reaches the route, audited suc
     REQUIRE(res);
     CHECK(res->status == 200);
     REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "network.devices.view");
+    CHECK(h.audit_log[0].action == "network.device.view");
     CHECK(h.audit_log[0].result == "success");
 }
 
