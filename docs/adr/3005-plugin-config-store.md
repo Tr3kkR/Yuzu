@@ -223,10 +223,13 @@ values to an agent by simply calling `SecretCodec::decrypt` from a request handl
 - `docs/postgres-migration-ladder.md` gets a new "born-on-Pg, no backfill" row for
   `plugin_config_store` — added by a different package in this wave (p6), not here (boundary
   discipline).
-- The kill switch this package builds is **read-only enforcement infrastructure**: it exposes
-  `action_allowed` for a caller to consult, but no dispatch path calls it yet — wiring an actual
-  plugin-action dispatch gate to `action_allowed` is later-PR work (the "later default-off
-  plugins" this package's objective names as the reason this plane exists).
+- The kill switch this package builds started as **read-only enforcement infrastructure** — it
+  exposed `action_allowed` for a caller to consult, but no dispatch path called it. That gap was
+  closed in a later remediation round: `ServerImpl::build_classified_command`
+  (`server.cpp`) now consults `action_allowed(cap.plugin, cap.action)` on every classified
+  dispatch and refuses with a distinct, separately counted `KillSwitched` denial reason. This
+  paragraph is kept as the historical record of the original scope decision; it no longer
+  describes the current state.
 - Construction hand-rolls acquire-lease/run-migration/release rather than calling a named
   `open_with_migrations` helper the playbook describes — that helper has no discoverable
   implementation anywhere in the tree today, and every existing store (including the playbook's

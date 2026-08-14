@@ -539,7 +539,7 @@ Not implemented. Integrity verification of directory trees.
 
 ### 10.13 File Retrieval (Upload to Server) :white_check_mark: `T2`
 
-`upload_file` action in `content_dist` plugin. Agent-side: SHA-256 hash, multipart POST to server. Server-side: `POST /api/v1/file-retrieval` endpoint. File stored in `{data_dir}/file-retrieval/`. `GET/DELETE` endpoints for management.
+`upload_file` action in `content_dist` plugin, via the PR1.6 one-time upload-grant + authenticated chunked-receive protocol (`docs/adr/3004-artifact-blob-storage.md`) — the legacy unauthenticated `POST /api/v1/file-retrieval` endpoint was removed. Operator mints a grant (`POST /api/v1/upload-grants`); the agent redeems it, streams the file in bounded chunks with per-chunk offset CAS, and commits with a SHA-256 computed from the exact bytes acknowledged. File stored in `{data_dir}/upload-blobs/{retention_class}/{grant_id}`. `GET /api/v1/upload-grants` (list) / `DELETE /api/v1/upload-grants/{id}` (revoke) for management.
 
 ### 10.14 Find File by Size and Hash :white_check_mark: `T2`
 

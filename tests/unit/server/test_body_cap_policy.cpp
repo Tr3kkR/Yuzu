@@ -322,17 +322,26 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     CHECK(std::size(kBodyCapTable) == 27);
 }
 
-// ── 7. requires_measurable: ON for /mcp/, OFF for the named public classes ──
+// ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
 
-TEST_CASE("resolve_body_cap: requires_measurable is ON only for /mcp/", "[body_cap]") {
+// M2 (review finding): this case's own name claimed "ON only for /mcp/"
+// while never asserting the OTHER measurable class at all — the doc's
+// rest-api.md carried the identical stale claim (both fixed together). A
+// regression on the upload_session opt-in would have shipped with this
+// test green.
+TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_session, OFF "
+         "for every other named class",
+         "[body_cap]") {
     CHECK(resolve_body_cap("POST", "/mcp/v1/").requires_measurable);
     CHECK(resolve_body_cap("GET", "/mcp/v1/").requires_measurable);
+    CHECK(resolve_body_cap("PUT", "/api/v1/uploads/abc123/chunk").requires_measurable);
+    CHECK(resolve_body_cap("POST", "/api/v1/uploads").requires_measurable);
 
     // Public REST (bundles), SCIM, certificate import (REST + dashboard),
-    // product-pack/workflow authoring, and OTA upload all default OFF — see
-    // the file header's rationale (chunked is legal HTTP; no client
-    // population has been tested against a hard Content-Length contract on
-    // these routes yet).
+    // product-pack/workflow authoring, OTA upload, and plugin-config all
+    // default OFF — see the file header's rationale (chunked is legal HTTP;
+    // no client population has been tested against a hard Content-Length
+    // contract on these routes yet).
     CHECK_FALSE(resolve_body_cap("POST", "/api/v1/bundles").requires_measurable);
     CHECK_FALSE(resolve_body_cap("POST", "/scim/v2/Users").requires_measurable);
     CHECK_FALSE(resolve_body_cap("POST", "/api/v1/ca/import-chain").requires_measurable);
@@ -340,6 +349,7 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON only for /mcp/", "[body_c
     CHECK_FALSE(resolve_body_cap("POST", "/api/workflows").requires_measurable);
     CHECK_FALSE(resolve_body_cap("POST", "/api/product-packs").requires_measurable);
     CHECK_FALSE(resolve_body_cap("POST", "/api/settings/updates/upload").requires_measurable);
+    CHECK_FALSE(resolve_body_cap("PUT", "/api/v1/plugin-config/email/host").requires_measurable);
     CHECK_FALSE(resolve_body_cap("POST", "/api/v1/totally-unknown-route-xyz").requires_measurable);
 }
 

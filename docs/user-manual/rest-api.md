@@ -230,18 +230,18 @@ Every request is checked against a per-route body-size cap **before authenticati
 | Status | Meaning |
 |---|---|
 | `413` | The body's **declared `Content-Length`** exceeds the resolved cap for this route's class. |
-| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Today only `/mcp/` refuses an unmeasurable body** — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule — **the non-`/mcp/` 411 path is consequently unreachable today**; it activates automatically the day a table entry opts in. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
+| `411` | The body cannot be **measured** in advance **by framing** — chunked `Transfer-Encoding`, or a POST/PUT/PATCH with no `Content-Length` at all — and this route's class refuses that. **Two classes refuse an unmeasurable body today: `/mcp/` and `upload_session`** (`PUT /api/v1/uploads/{id}/chunk` and its sibling agent-facing upload routes) — every other class below falls through and is admitted up to httplib's own 100 MiB backstop, because chunked request bodies are legal HTTP and this repo does not control every client population talking to public REST/SCIM/upload routes. This is a deliberate per-class opt-in (`requires_measurable`), not a blanket rule. `upload_session` opts in for the same reason `/mcp/` does: its session gate lives in the route HANDLER, after httplib would otherwise buffer the body, so the pre-routing bound is what actually stops an unauthenticated caller forcing a ~100 MiB buffer per connection — the agent uploader always sends an identity-encoded body with a `Content-Length` (the protocol's `Content-Range` header requires knowing it), so this costs a conforming client nothing. A non-`identity` `Content-Encoding` is judged separately — see `415` below, not this row. |
 | `415` | The request carries a `Content-Encoding` header set to anything other than `identity` (case-insensitive). Refused **unconditionally, on every route class, regardless of `requires_measurable`** — unlike the framing rule above, this does not depend on a per-class opt-in. Why: this build compiles `CPPHTTPLIB_BROTLI_SUPPORT`, httplib decompresses transparently and enforces only its 100 MiB global limit against the **decompressed** size, so `Content-Length` on a compressed body measures the wrong thing and a sub-cap compressed body can expand to ~100 MiB before anything downstream sees it. No Yuzu route accepts a compressed request body today, so this costs a conforming client nothing — send the body identity-encoded by **omitting `Content-Encoding` entirely**. Do **not** send `Content-Encoding: identity` explicitly: `has_non_identity_content_encoding` correctly admits it past this gate (it isn't a compressed encoding), but httplib's own body reader then calls `create_decompressor("identity")` — which matches none of gzip/deflate/br/zstd, returns null, and httplib answers a bare `415` itself (`httplib.h`'s `prepare_content_receiver`), before this gate, any route handler, or the A4/SCIM envelope code ever runs. That response carries none of the structure this section promises — no A4 envelope, no `correlation_id`, no `yuzu_body_cap_rejected_total` increment. Until that gap is closed at the code level, the only conforming way to send an identity-encoded body is to omit the header. |
 
 All three responses use the standard [A4 error envelope](#json-envelope) with a `remediation` hint (no `permission` field — the request is rejected before any principal is resolved) — **except the `scim` class**, which publishes SCIM's own RFC 7644 §3.12 error shape (`schemas`/`status`/`detail`) on `application/scim+json` instead of the generic envelope (`scim::error()`, `scim_json.hpp:192`; wired into all three status codes above in `server.cpp`'s pre-routing handler). This gate is separate from, and runs *before*, any route-local body check a handler may also carry (e.g. the SCIM/response-template 64 KiB checks below) — those still exist for defense-in-depth if a future edit widens this table's entry, but on the current table this pre-routing gate rejects first. **This is not purely a timing change for every affected class.** For most (response templates, CA import), an earlier rejection at the same byte count is the entire effect. SCIM is **no longer** an exception to that either (fixed as part of this change, D7): the pre-routing rejection's SCIM shape matches the wording of the handler's own (now-superseded, and unreachable — the pre-routing cap and the handler check the identical 64 KiB threshold, so the pre-routing gate always wins first) `413` check exactly, and extends the same shape to the `411`/`415` cases the handler-level check never covered.
 
 ### Post-Read Backstop (#2407)
 
-The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 24 of 25 classes below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
+The pre-routing gate above is what stops an oversized body from being buffered at all — but it can only act on a **declared** size. Its structural limit, recorded in `body_cap_policy.hpp`'s KNOWN LIMITATION paragraph: on the 21 of 23 classes below that don't set `requires_measurable`, a genuine chunked (or otherwise undeclared) body is not size-checked by the pre-routing gate at all — it is admitted, up to httplib's own 100 MiB backstop, without that table's cap being consulted.
 
 A second stage, wired at httplib's `Server::set_pre_request_handler` in `server.cpp`, closes that gap from the other side. It runs inside httplib's `dispatch_request` — **after** `read_content` has consumed the body off the socket into `req.body`, and after the route has matched, but **before the route's own handler runs**. At that point the body's actual size is known, so this stage resolves the SAME `kBodyCapTable`/`resolve_body_cap` the pre-routing gate uses (no forked table) and, if the now-fully-read body is over the class's cap, refuses with the same `413` A4/SCIM envelope shape and the same 1-in-100 per-reason log throttle as the pre-routing gate (tagged `[#2407 post-read]` in the journal rather than `[#2407]`). The rejection reason is a new value, `over_cap_post_read`, on `yuzu_body_cap_rejected_total{path_class,reason}` — pre-seeded at 0 for every class, unconditionally, unlike `unmeasurable`; see `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for the full description.
 
-**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 24-of-25-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
+**What an operator observes.** A chunked (or otherwise undeclared) body that exceeds its route class's cap is now refused — where it previously reached the route handler uncapped, bounded only by httplib's 100 MiB backstop. That is the change: the 21-of-23-class gap the pre-routing gate leaves open is now closed for a body that turns out, once read, to be over cap.
 
 **The two stages are mutually exclusive per request, not stacked.** httplib's `routing()` returns as soon as the pre-routing handler answers Handled, so it never calls `dispatch_request` for a request that gate already refused — a **measurable** over-cap body (a declared `Content-Length` above the cap) is still rejected by the pre-routing gate, before anything is buffered, exactly as before this stage existed. Do not describe this as "the cap now runs twice" — in practice `over_cap_post_read` fires almost exclusively for the chunked/unmeasurable case the pre-routing gate deliberately admits.
 
@@ -258,8 +258,10 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 
 | Method | Path prefix | Cap | `path_class` | Notes |
 |---|---|---|---|---|
-| any | `/mcp/` | 4 MiB | `mcp` | Only class with `requires_measurable=true` — see the 411 row above. |
+| any | `/mcp/` | 4 MiB | `mcp` | One of two classes with `requires_measurable=true` — see the 411 row above. |
 | POST | `/api/v1/bundles` | 70 MiB | `bundles` | Sized to the live-query bundle route's own computed 64 MiB parameter-byte floor plus JSON overhead headroom. |
+| any | `/api/v1/uploads` | 8 MiB | `upload_session` | The other `requires_measurable=true` class. Exact mirror of the PR1.6a chunked-receive protocol's own `kDefaultChunkMaxBytes` (`upload_grant_parsers.hpp`), bound to it by a `static_assert` in `file_retrieval_routes.cpp` so the two cannot drift. Any method — the session-open POST, chunk PUT, status GET, commit POST, and cancel DELETE all share this class; only the chunk PUT carries a large body, but scoping to PUT alone would silently drop the sibling verbs to the 4 MiB catch-all. |
+| any | `/api/v1/plugin-config` | 256 KiB | `plugin_config` | † The store's own grammar caps a config value at 8 KiB and a secret plaintext at 64 KiB (`plugin_config_parsers.hpp`); 256 KiB covers the larger of the two plus JSON framing/escaping headroom, while keeping an unauthenticated flood against this surface two orders of magnitude under the 4 MiB catch-all. Any method — PUT config/secret writes, DELETE carries no body, GET/list are bodyless. |
 | POST | `/api/settings/updates/upload` | 100 MiB | `ota_upload` | Kept at httplib's own backstop deliberately, not squeezed — OTA agent binaries are legitimately multi-ten-MB. |
 | POST | `/api/export/json-to-csv` | 100 MiB | `json_to_csv_export` | Unbounded by design — converts a full exported dataset to CSV, and its size follows directly from the caller's own prior query. Kept at httplib's backstop, same treatment as `ota_upload`, rather than squeezed or given an arbitrary MiB judgment-call number. |
 | POST | `/api/nvd/match` | 8 MiB | `nvd_match` | ‡ No aggregate contract; reasoned to this content's own realistic scale (one device's software census, generously overestimated at ~200 bytes/item ⇒ 40000+ items) rather than borrowed from a sibling class. |
@@ -289,7 +291,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
 ‡ = a generous, explicit, judgment-call bound because no aggregate size contract exists for that class yet, reasoned against that class's OWN realistic scale rather than copy-pasted from a sibling — **not** a fixed multiple below httplib's 100 MiB backstop: it ranges from ~12.5× for the 8 MiB `nvd_match` entry (just over one order of magnitude) down to 6.25× for the six 16 MiB entries (under one order of magnitude) — none of the ‡ entries reach two orders of magnitude. Do not read either footnote as license to invent a number for a different route — see the header block of `body_cap_policy.hpp`.
 
-Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **7 rows carry †** (`ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **13 rows total**. Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **5 † classes and 5 ‡ classes — 10 classes total**. `body_cap_policy.hpp`'s file header counts the same ten by CLASS; if the two ever disagree, the table is authoritative and the header is the bug. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly. A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
+Counting by table **ROW** (one `BodyCapEntry` struct in `kBodyCapTable` = one row): **8 rows carry †** (`plugin_config`, `ca_import_chain_dashboard`, `plugin_trust_bundle`, `tar_dashboard_sql`, `tar_result_set_sql`, and all three `instruction_yaml` rows) and **6 rows carry ‡** (`nvd_match`, both `guardian_rule_authoring` rows, `workflow_yaml`, `product_pack_yaml`, `instruction_import`) — **14 rows total**, out of **27 rows** in the table overall. Counting by **CLASS** (`path_class`; several classes span multiple rows) that collapses to **6 † classes and 5 ‡ classes — 11 classes total**, out of **23 classes** overall. Every other row/class mirrors a cited, decoded-equals-raw byte count exactly (this now includes `upload_session`, added alongside `plugin_config` in this table — an exact protocol-constant mirror, not a reasoned margin, so it carries neither footnote). A third, unmarked category (`ota_upload`, `json_to_csv_export`) is pinned at httplib's own 100 MiB backstop as an explicit, reviewed decision rather than squeezed or given a judgment-call number — neither is "reasoned" in the † /‡ sense, since there is no smaller number to reason toward.
 
 **Raising a cap.** Edit the table in `body_cap_policy.hpp` (with review) and update this table to match — never reach for `Server::set_payload_max_length`, which is global across every route on the listener (see "Why not one global cap?" above). See also `docs/user-manual/server-admin.md`'s upgrade note for this change and `docs/user-manual/metrics.md`'s `yuzu_body_cap_rejected_total` row for observing rejections.
 
@@ -5307,34 +5309,75 @@ Get an aggregated view of fleet execution statistics.
 
 ### File Retrieval
 
-#### `POST /api/v1/file-retrieval`
+**`POST /api/v1/file-retrieval` has been REMOVED (PR1.5c/1.6c).** The legacy
+handler trusted a body-supplied `agent_id` as an unauthenticated metadata-only
+"upload" that stored nothing and had no relationship to actual bytes sent. It
+is replaced by the authenticated one-time upload-grant + chunked-receive
+protocol below (`docs/adr/3004-artifact-blob-storage.md`): the operator
+mint/list/revoke routes at `/api/v1/upload-grants*`, and the agent-facing
+session/chunk/status/commit/cancel routes at `/api/v1/uploads*`.
 
-Receive file uploads from agents via the `content_dist` plugin's `upload_file` action. This endpoint is typically called by agents, not by operators.
+#### `POST /api/v1/upload-grants`
 
-**Permission:** `FileRetrieval:Write`
+Mint a one-time upload grant for an agent. Operator-facing.
+
+**Permission:** `UploadGrant:Write`
 
 **Request body:**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `agent_id` | string | Yes | Agent uploading the file |
-| `original_path` | string | No | Original file path on the agent |
-| `sha256` | string | No | SHA-256 hash of the uploaded content |
-| `size` | integer | No | File size in bytes |
+| `agent_id` | string | Yes | The agent authorised to redeem this grant |
+| `declared_max_size` | integer | Yes | Upper bound on the upload size in bytes — a CAP, not an equality requirement; the actual upload may be smaller |
+| `source_path` | string | No | Informational only — never used to derive the destination key |
+| `expected_sha256` | string | No | Optional expected content hash, 64 lowercase hex characters |
+| `retention_class` | string | No | `standard` (default), `extended`, or `transient` |
+| `ttl_secs` | integer | No | Grant expiry override; server default applies when omitted (<= 15 min) |
 
-**Response:**
+**Response (`201`):**
 
 ```json
 {
-  "data": {
-    "status": "received",
-    "bytes": 1048576,
-    "agent_id": "agent-001",
-    "sha256": "abcdef..."
-  },
-  "meta": { "api_version": "v1" }
+  "grant_id": "a1b2c3...",
+  "grant_secret": "d4e5f6...",
+  "expires_at": 1735689600,
+  "destination_key": "standard/a1b2c3..."
 }
 ```
+
+`grant_secret` is returned **exactly once** — the store persists only its
+SHA-256 digest.
+
+#### `GET /api/v1/upload-grants`
+
+List upload grants. **Permission:** `UploadGrant:Read`, routed through
+`RbacStore::authorize_list_read` (admit-then-filter — never a bare global
+permission check).
+
+#### `DELETE /api/v1/upload-grants/{grant_id}`
+
+Revoke a grant before it is redeemed. **Permission:** `UploadGrant:Delete`.
+Returns `204` on success, `404` if the grant does not exist or is no longer
+revocable (already redeemed, expired, or already revoked).
+
+#### The agent-facing upload session (`/api/v1/uploads*`)
+
+Agent-authenticated via the grant credential — never the operator auth
+session. TLS is required for every route below.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/api/v1/uploads` | Redeem a grant (`X-Yuzu-Upload-Grant: <grant_id>.<grant_secret>`), atomically single-use. Returns `upload_id`, a one-time `session_secret`, `chunk_max_bytes`, `offset: 0`. |
+| `PUT` | `/api/v1/uploads/{upload_id}/chunk` | Stream one chunk (`X-Yuzu-Upload-Session: <upload_id>.<session_secret>`, `Content-Range: bytes <start>-<end>/<total>`). Accepts only `start == recorded_offset`. |
+| `GET` | `/api/v1/uploads/{upload_id}` | Session status/resume: `{state, offset, expires_at}`. |
+| `POST` | `/api/v1/uploads/{upload_id}/commit` | Verify and finalize (`{"sha256": "..."}`) — total size and both hashes must agree. |
+| `DELETE` | `/api/v1/uploads/{upload_id}` | Cancel; discards the partial blob. |
+
+See `docs/adr/3004-artifact-blob-storage.md` for the full frozen wire
+protocol (error envelope, the ten closed `reason` values, expiry semantics).
+The `content_dist` agent plugin's `upload_file` action is the reference
+client — see its [InstructionDefinition](../../content/definitions/t2_capabilities.yaml)
+for the operator-facing parameters (`path`, `grant_id`, `grant_secret`).
 
 ---
 
