@@ -2159,6 +2159,20 @@ public:
                           "audit reason= field to distinguish a real deprovision from a store "
                           "outage",
                           "counter");
+        // ADR-2001 §4 (PR4b) — the SAML analogue of the OIDC counter
+        // immediately above. Bumped by `saml_login_denied_deprovisioned`'s
+        // two call sites in auth_routes.cpp's /saml/acs (the primary
+        // pre-mint check and the post-mint re-check for the codex-caught
+        // concurrent-deprovision race) on every DENY.
+        metrics_.describe("yuzu_auth_saml_deprovisioned_denied_total",
+                          "Total SAML logins denied at /saml/acs because the identity's linked "
+                          "SCIM resource is deprovisioned (deactivated, or orphaned by a "
+                          "hard-deleted scim_resources row) OR because the ScimStore could not "
+                          "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
+                          "closing the re-login-mints-fresh-tokens window; correlate with the "
+                          "audit reason= field to distinguish a real deprovision from a store "
+                          "outage",
+                          "counter");
         // describe() only registers HELP/TYPE metadata; the series is absent
         // from /metrics until first .increment(). Instantiate each bare
         // counter at 0 now so absent()-style alert rules on the CC6.8
@@ -2170,6 +2184,7 @@ public:
         metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
         metrics_.counter("yuzu_scim_saml_link_write_failures_total");
         metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");
+        metrics_.counter("yuzu_auth_saml_deprovisioned_denied_total");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning

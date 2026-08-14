@@ -561,16 +561,53 @@ are fail-OPEN by design. A sustained non-zero rate means SAML identities are
 silently not linking during that window; correlate with ScimStore/Postgres
 health. See [Metrics reference](metrics.md) for the full row.
 
-**Residual: SAML deny-at-login is not yet shipped.** Unlike deprovision's
-session-revoke, there is currently no SAML equivalent of "reject a
-deprovisioned user's next login outright" (tracked as PR4b / #3066). A
-deprovisioned SAML user whose IdP still authenticates them can obtain a
-**new** SAML session immediately after their old one is revoked — Yuzu will
-revoke it again on the *next* deprovision pass (e.g. if your IdP re-sends a
-deactivate), but between those two points the account is not locked out at
-the login boundary. Treat disabling the account at your IdP as the
-authoritative offboarding step; SCIM deprovision's SAML session-revoke is
-defense-in-depth on top of that, not a substitute for it.
+### Deny-at-login: a deprovisioned SAML identity cannot re-authenticate
+
+In addition to revoking an already-live session on deprovision (above),
+Yuzu also refuses a **new** SAML login for an identity whose linked SCIM
+resource is already deprovisioned — the SAML analogue of [Availability: a
+ScimStore/Postgres outage denies ALL OIDC
+logins](#availability-a-scimstorepostgres-outage-denies-all-oidc-logins)'s
+OIDC deny-at-login backstop above (ADR-2001 §4/PR3), shipped for SAML as
+PR4b (#3066). Concretely: once a SCIM deprovision has landed for a linked
+identity, that person presenting a still-valid, signed assertion from the
+IdP is redirected to `/login?error=saml` instead of getting a fresh session
+— the same generic error every other SAML login failure shows, so there is
+no way for the browser to distinguish "you were deprovisioned" from any
+other SAML failure.
+
+This closes a gap that existed before PR4b shipped: a deprovisioned SAML
+user could previously still obtain a brand-new session immediately after
+their old one was revoked (correctly torn down again on the *next*
+deprovision pass, but live in the meantime). **A re-login against an
+already-completed deprovision is now refused,
+unconditionally, no exceptions** — the same guarantee OIDC's PR3 gives you,
+stated with the same honesty: a login racing an *in-flight* deprovision (the
+deprovision and the login landing in the same narrow window) is narrowed by
+a post-mint re-check that self-heals the overwhelming majority of timings,
+but is not eliminated by construction — see [Availability: a
+ScimStore/Postgres outage denies ALL OIDC logins](#availability-a-scimstorepostgres-outage-denies-all-oidc-logins)
+above for the precise shape of that residual (same shape here, minus the
+~60s API-token cache bound — SAML mints no tokens, so a session that does
+slip through the in-flight race is bounded only by its own TTL, not ~60s).
+
+**Availability coupling — same posture as OIDC, gated on `--scim-enable`.**
+Deny-at-login for SAML fails **closed**: if `ScimStore` cannot answer, the
+check treats that the same as "deprovisioned" and denies the SAML login too
+— once `--scim-enable` is set, a `ScimStore`/Postgres outage now denies both
+OIDC **and** SAML logins fleet-wide, not only OIDC's. With `--scim-enable`
+off, the SAML ACS handler's SCIM store reference is null and this check is
+inert — SAML login availability is unaffected, exactly as if the check were
+absent.
+
+**Audit and metric.** Every denial writes `auth.saml.deprovisioned_denied`
+(`result=failure`) and increments `yuzu_auth_saml_deprovisioned_denied_total`
+— see [REST API Reference](rest-api.md) and [Metrics
+reference](metrics.md) for the full rows. As with the OIDC counter, a
+sustained non-zero rate with no matching recent SCIM deprovision more likely
+indicates a `ScimStore`/Postgres availability problem than a wave of
+terminated users trying to log back in — correlate with Postgres health
+before assuming every increment is a legitimate deny.
 
 **Rotating your IdP's entity ID strands existing links.** `saml_identity_links`
 rows are keyed on `(entity_id, NameID)`. If you rotate
@@ -650,4 +687,4 @@ with a **currently-active** account.
   [SCIM ↔ OIDC identity linkage](#scim--oidc-identity-linkage-federated-token-revocation)
   and [SCIM ↔ SAML identity linkage](#scim--saml-identity-linkage-federated-session-revocation)
   above (design rationale, the D1/D2 forks, the OIDC deny-at-login backstop
-  shipped as PR3, and the SAML deny-at-login deferred to PR4b).
+  shipped as PR3, and the SAML deny-at-login backstop shipped as PR4b).
