@@ -287,14 +287,20 @@ std::string trim_ascii_whitespace(std::string_view s) {
     return std::string(s.substr(b, e - b + 1));
 }
 
-// CustomPropertiesStore error classifier — mirrors discovery_routes.cpp's
-// is_deployment_db_error, keyed off the SHARED constant
-// (custom_properties_store.hpp) rather than a local copy of the literal, so
-// a future rename of the prefix can't silently regress a classified 503 back
-// to 400 (gov Gate 8 finding, fjarvis re-review of PR #3065).
+namespace {
+// CustomPropertiesStore error classifier — same shape as discovery_routes.cpp's
+// is_deployment_db_error (internal linkage there via an anonymous namespace,
+// matched here rather than left as a bare external-linkage free function),
+// keyed off the SHARED constant (custom_properties_store.hpp) rather than a
+// local copy of the literal, so a future rename of the prefix can't silently
+// regress a classified 503 back to 400 (gov Gate 8 finding, fjarvis
+// re-review of PR #3065; the anonymous-namespace correction is a second Gate
+// 8 finding on THIS fix — cpp-expert/architect/consistency-auditor
+// independently, same round).
 bool is_custom_properties_db_error(const std::string& err) {
     return err.starts_with(kCustomPropertiesDbErrorPrefix);
 }
+} // namespace
 } // namespace yuzu::server
 
 namespace yuzu::server {

@@ -1092,9 +1092,21 @@ metrics.md` and the shipped `YuzuCustomPropertiesReadDegraded` alert).
 `yuzu_server_custom_properties_backfill_total{result}` records the one-time
 backfill outcome.
 
-**Not affected:** the `props.<key>` scope-DSL syntax, the REST API request/
-response shapes, and property/schema semantics are unchanged — only the
-storage substrate and the fail-closed read posture change.
+**Operator-visible behaviour change (fail-closed writes, 2026-08-14 follow-up).**
+`PUT /api/agents/:id/properties/:key` and `POST /api/property-schemas` now return
+**503** (instead of `400`) when the failure is a genuine database/store outage rather
+than caller-input or schema-validation error — previously every failure from either
+write, including a transient Postgres blip, surfaced as the same `400` a caller could
+not distinguish from their own bad input. A caller that branches specifically on `400`
+to mean "don't retry" should treat the new `503`s the same as any other transient
+server error (retry with backoff); a caller that already treats any `5xx` as retryable
+is unaffected. See `docs/user-manual/rest-api.md`'s per-route notes for the exact
+response shapes.
+
+**Not affected:** the `props.<key>` scope-DSL syntax and property/schema semantics are
+unchanged; the `GET`/`DELETE` property routes and `GET` schema route keep their prior
+response shapes — only the two write routes' failure-mode status codes changed, as
+described above.
 
 ## Network-discovered device data migrates to Postgres (mandatory backfill, DiscoveryStore, ADR-0044)
 

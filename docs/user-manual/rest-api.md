@@ -3562,7 +3562,10 @@ Delete a custom property from an agent.
 
 **Note on database degrade:** a transient database failure during this delete currently surfaces
 as the same `404` ("property not found") a genuine miss would return — not yet type-widened,
-predates the Postgres migration. See the `PUT` note above.
+predates the Postgres migration. Unlike `PUT`/`POST` above (fixed to a distinguishable `503`),
+this route's underlying `delete_property` was deliberately left unwidened — it's an
+admin/operator-driven delete, not a scope/dispatch-feeding read, matching `custom_properties_store.hpp`'s
+documented posture — so this stays a tracked gap rather than a fixed one.
 
 ---
 
@@ -3574,7 +3577,10 @@ List all property schemas. Schemas define the allowed keys, types, and validatio
 
 **Note on database degrade:** a transient database failure during this list currently surfaces as
 a `200` with an empty `data` array — indistinguishable from "no schemas configured." Not yet
-type-widened, predates the Postgres migration. See the `PUT` note above.
+type-widened, predates the Postgres migration. Unlike `PUT`/`POST` above (fixed to a
+distinguishable `503`), this route's underlying `list_schemas` was deliberately left unwidened —
+it's an admin-surface read, not scope/dispatch-feeding, matching `custom_properties_store.hpp`'s
+documented posture — so this stays a tracked gap rather than a fixed one.
 
 **Response:**
 
