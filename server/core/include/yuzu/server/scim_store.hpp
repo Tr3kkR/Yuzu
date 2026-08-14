@@ -432,6 +432,37 @@ public:
     std::optional<LinkedResourceState>
     linked_resource_active(const std::string& iss, const std::string& sub) const;
 
+    /// The SAML analogue of `linked_resource_active` — the deny-at-login
+    /// backstop's sole store read for a SAML `(entity_id, name_id)` identity
+    /// (ADR-2001 §4/PR4b). Resolves against `saml_identity_links` FUSED with
+    /// a LEFT JOIN to `scim_resources` in one query, exactly mirroring
+    /// `linked_resource_active`'s LEFT-join/tri-state contract — an INNER
+    /// join would instead collapse an orphaned link (the `scim_resources`
+    /// row hard-DELETEd by a SCIM DELETE — `saml_identity_links` is not
+    /// FK-cascaded) into "no rows", letting a fully-deprovisioned SAML
+    /// identity re-authenticate. Reuses `LinkedResourceState` (see its doc
+    /// comment) rather than a new struct — the tri-state shape is identical.
+    ///
+    /// OUTER `optional<LinkedResourceState>` carries the store-availability
+    /// half of the tri-state; the ENGAGED value's `scim_id`/`active` fields
+    /// carry the rest:
+    ///  - OUTER `nullopt`: the store could not answer (closed, lease
+    ///    timeout, or a failed statement) — the caller MUST fail CLOSED
+    ///    (deny the login), never treat this as "no link".
+    ///  - engaged, `scim_id == nullopt` (zero rows): no `saml_identity_links`
+    ///    row exists for this `(entity_id, name_id)` at all — a genuinely
+    ///    unlinked SAML identity is not a deprovisioned SCIM user, so the
+    ///    caller PROCEEDS.
+    ///  - engaged, `scim_id` set, `active == nullopt`: exactly one linked
+    ///    row, and the joined `scim_resources` row is gone (NULL `active`,
+    ///    the orphaned-link case above) — the caller DENIES.
+    ///  - engaged, `scim_id` set, `active == false`: exactly one linked
+    ///    row, deactivated — the caller DENIES.
+    ///  - engaged, `scim_id` set, `active == true`: exactly one linked row,
+    ///    active — the caller PROCEEDS.
+    std::optional<LinkedResourceState>
+    saml_linked_resource_active(const std::string& entity_id, const std::string& name_id) const;
+
     // ── OIDC login observations (ADR-2001 D2 detector) ───────────────────
     //
     // Records every OIDC login's attempted CANDIDATE claim value(s) —

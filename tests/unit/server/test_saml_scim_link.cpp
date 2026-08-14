@@ -40,6 +40,8 @@ using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
 using yuzu::server::saml::is_linkable_name_id_format;
 using yuzu::server::saml::link_saml_login_to_scim;
+using yuzu::server::saml::saml_login_denied_deprovisioned;
+using yuzu::server::saml::SamlLoginDenyDecision;
 
 namespace {
 
@@ -349,4 +351,245 @@ TEST_CASE("link_saml_login_to_scim: a null metrics pointer is a safe no-op (no c
     link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "grace@example.com",
                             kPersistent);
     SUCCEED("did not throw despite a null metrics pointer and a forced write failure");
+}
+
+// ── saml_login_denied_deprovisioned (ADR-2001 §4 PR4b deny-at-login) ─────
+//
+// Mirrors test_oidc_scim_link.cpp's `oidc_login_denied_deprovisioned`
+// section exactly, adapted for SAML's single-join-key shape: there is no
+// separate `link_claim_value` parameter (see saml_scim_link.hpp's doc
+// comment) — the reprovision check always resolves against `name_id`
+// itself, the same value `saml_linked_resource_active` above it already
+// used.
+
+TEST_CASE("saml_login_denied_deprovisioned: a null ScimStore proceeds (SCIM not "
+         "configured, not a store degrade) — PR3-blocker regression guard",
+         "[saml][scim][2001][deny-at-login]") {
+    // Mirrors link_saml_login_to_scim's null-safety posture: no store means
+    // no link could ever have formed, so there is nothing to deny against —
+    // must NOT be conflated with a present-but-unusable store (which fails
+    // closed, below). A deployment that never enables SCIM must not have
+    // every SAML login denied by this backstop (the exact PR3 regression
+    // this test pins).
+    auto decision = saml_login_denied_deprovisioned(nullptr, "https://idp.example.com/saml/metadata",
+                                                     "name-x");
+    CHECK_FALSE(decision.denied);
+    CHECK_FALSE(decision.scim_id.has_value());
+}
+
+TEST_CASE("saml_login_denied_deprovisioned: an unlinked SAML identity proceeds",
+         "[pg][saml][scim][2001][deny-at-login]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto decision = saml_login_denied_deprovisioned(&store, "https://idp.example.com/saml/metadata",
+                                                     "name-never-linked");
+    CHECK_FALSE(decision.denied);
+    CHECK_FALSE(decision.scim_id.has_value());
+}
+
+TEST_CASE("saml_login_denied_deprovisioned: an active linked identity proceeds",
+         "[pg][saml][scim][2001][deny-at-login]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto r = store.create_resource("active-user", "ext-active");
+    REQUIRE(r.has_value());
+    REQUIRE(store.upsert_saml_link("https://idp.example.com/saml/metadata", "ext-active", r->scim_id));
+
+    auto decision = saml_login_denied_deprovisioned(&store, "https://idp.example.com/saml/metadata",
+                                                     "ext-active");
+    CHECK_FALSE(decision.denied);
+    // PROCEED always carries scim_id=nullopt, even though a linked resource
+    // exists — the audit detail only needs the id on a DENY.
+    CHECK_FALSE(decision.scim_id.has_value());
+}
+
+TEST_CASE("saml_login_denied_deprovisioned: a deactivated linked identity is DENIED "
+         "unconditionally — no reprovision check on this branch — and names the "
+         "resource",
+         "[pg][saml][scim][2001][deny-at-login]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto r = store.create_resource("inactive-user", "ext-inactive");
+    REQUIRE(r.has_value());
+    REQUIRE(store.upsert_saml_link("https://idp.example.com/saml/metadata", "ext-inactive",
+                                   r->scim_id));
+    REQUIRE(store.set_active(r->scim_id, false));
+
+    auto decision = saml_login_denied_deprovisioned(&store, "https://idp.example.com/saml/metadata",
+                                                     "ext-inactive");
+    CHECK(decision.denied);
+    REQUIRE(decision.scim_id.has_value());
+    CHECK(*decision.scim_id == r->scim_id); // the id the audit detail carries
+
+    // MUTATION-CHECK (manually verified during development): flipping this
+    // branch's `if (!*result->active) return {.denied = true, ...};` to
+    // `.denied = false` (unconditional proceed on the inactive branch) makes
+    // the `decision.denied` CHECK above fail — the exact fail-open
+    // regression ADR-2001 §4 exists to prevent.
+}
+
+TEST_CASE("saml_login_denied_deprovisioned: an orphaned link with NO reprovision "
+         "(genuinely deleted, no active resource for its externalId) is DENIED and "
+         "still names the resource",
+         "[pg][saml][scim][2001][deny-at-login]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto r = store.create_resource("deleted-user", "ext-deleted");
+    REQUIRE(r.has_value());
+    REQUIRE(store.upsert_saml_link("https://idp.example.com/saml/metadata", "ext-deleted",
+                                   r->scim_id));
+    REQUIRE(store.delete_by_scim_id(r->scim_id).value());
+
+    // name_id = the deleted resource's own (now-orphaned) externalId — no
+    // active resource exists for it (nothing was re-created), so this is
+    // the "genuinely deleted" case.
+    auto decision = saml_login_denied_deprovisioned(&store, "https://idp.example.com/saml/metadata",
+                                                     "ext-deleted");
+    CHECK(decision.denied);
+    REQUIRE(decision.scim_id.has_value()); // saml_identity_links row still names the (now-gone) id
+    CHECK(*decision.scim_id == r->scim_id);
+
+    // MUTATION-CHECK (manually verified during development): making the
+    // orphaned branch unconditional-proceed (removing the
+    // find_unique_active_by_external_id reprovision check entirely) makes
+    // the `decision.denied` CHECK above fail — see the paired reprovision
+    // test below for the OTHER half of this mutation (a genuine
+    // reprovision sibling must still proceed).
+}
+
+TEST_CASE("saml_login_denied_deprovisioned: an orphaned link WITH an active reprovision "
+         "sibling at the same externalId proceeds — the identity was DELETE'd then "
+         "re-CREATE'd under a new scim_id",
+         "[pg][saml][scim][2001][deny-at-login]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto r1 = store.create_resource("orig-user", "ext-reprovision");
+    REQUIRE(r1.has_value());
+    REQUIRE(store.upsert_saml_link("https://idp.example.com/saml/metadata", "ext-reprovision",
+                                   r1->scim_id));
+    REQUIRE(store.delete_by_scim_id(r1->scim_id).value());
+
+    // Re-provision under a NEW scim_id, same externalId.
+    auto r2 = store.create_resource("new-user", "ext-reprovision");
+    REQUIRE(r2.has_value());
+    REQUIRE(r2->scim_id != r1->scim_id);
+
+    auto decision = saml_login_denied_deprovisioned(&store, "https://idp.example.com/saml/metadata",
+                                                     "ext-reprovision");
+    CHECK_FALSE(decision.denied);
+    CHECK_FALSE(decision.scim_id.has_value());
+}
+
+TEST_CASE("saml_login_denied_deprovisioned: a reactivated identity proceeds again — no "
+         "latched denial, a live read every call",
+         "[pg][saml][scim][2001][deny-at-login]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto r = store.create_resource("flapping-user", "ext-flapping");
+    REQUIRE(r.has_value());
+    REQUIRE(store.upsert_saml_link("https://idp.example.com/saml/metadata", "ext-flapping",
+                                   r->scim_id));
+
+    CHECK_FALSE(saml_login_denied_deprovisioned(&store, "https://idp.example.com/saml/metadata",
+                                                "ext-flapping")
+                    .denied);
+
+    REQUIRE(store.set_active(r->scim_id, false));
+    auto mid = saml_login_denied_deprovisioned(&store, "https://idp.example.com/saml/metadata",
+                                               "ext-flapping");
+    CHECK(mid.denied);
+    REQUIRE(mid.scim_id.has_value());
+    CHECK(*mid.scim_id == r->scim_id);
+
+    REQUIRE(store.set_active(r->scim_id, true));
+    auto after = saml_login_denied_deprovisioned(&store, "https://idp.example.com/saml/metadata",
+                                                 "ext-flapping");
+    CHECK_FALSE(after.denied);
+    CHECK_FALSE(after.scim_id.has_value());
+}
+
+// Models the post-mint re-check race exactly like the OIDC helper's test:
+// two calls to this SAME decision function separated by the mint window.
+TEST_CASE("saml_login_denied_deprovisioned: models the post-mint re-check race — a "
+         "concurrent deprovision between two calls flips PROCEED to DENY and names "
+         "the resource",
+         "[pg][saml][scim][2001][deny-at-login][race]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto r = store.create_resource("race-user", "ext-race");
+    REQUIRE(r.has_value());
+    REQUIRE(store.upsert_saml_link("https://idp.example.com/saml/metadata", "ext-race", r->scim_id));
+
+    // "Primary check" — proceeds.
+    CHECK_FALSE(
+        saml_login_denied_deprovisioned(&store, "https://idp.example.com/saml/metadata", "ext-race")
+            .denied);
+
+    // A concurrent SCIM deactivate lands in the mint window.
+    REQUIRE(store.set_active(r->scim_id, false));
+
+    // "Post-mint re-check" — the SAME call, now denies and names the resource.
+    auto recheck =
+        saml_login_denied_deprovisioned(&store, "https://idp.example.com/saml/metadata", "ext-race");
+    CHECK(recheck.denied);
+    REQUIRE(recheck.scim_id.has_value());
+    CHECK(*recheck.scim_id == r->scim_id);
+}
+
+TEST_CASE("saml_login_denied_deprovisioned: a closed/unusable ScimStore fails CLOSED, "
+         "with no scim_id to name (MUTATION-CHECK target, see the comment below)",
+         "[pg][saml][scim][2001][deny-at-login][failclosed]") {
+    // Mirrors the existing "closed/unusable ScimStore" test above for
+    // link_saml_login_to_scim: an unreachable pool reports !is_open(), so
+    // saml_linked_resource_active's OUTER nullopt path is exercised.
+    PgPool broken_pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1}};
+    ScimStore broken_store{broken_pool};
+    REQUIRE_FALSE(broken_store.is_open());
+
+    auto decision = saml_login_denied_deprovisioned(&broken_store,
+                                                     "https://idp.example.com/saml/metadata",
+                                                     "name-unreachable");
+    CHECK(decision.denied);
+    // The store could not be asked, so there is no resource to name — the
+    // audit detail on this DENY omits scim_id gracefully (audited as
+    // `reason=scim_store_unavailable`, never `linked_scim_resource_inactive`,
+    // at the ACS handler call site).
+    CHECK_FALSE(decision.scim_id.has_value());
+
+    // MUTATION-CHECK (manually verified during development): flipping
+    // `saml_login_denied_deprovisioned`'s `if (!result) return {.denied =
+    // true, ...};` branch to `.denied = false` (i.e. treating a store that
+    // could not answer as PROCEED instead of DENY) makes the
+    // `decision.denied` assertion above fail — the exact fail-open
+    // regression ADR-2001 §4 exists to prevent (a ScimStore outage must
+    // never let a deprovisioned identity re-authenticate by luck of
+    // timing).
 }

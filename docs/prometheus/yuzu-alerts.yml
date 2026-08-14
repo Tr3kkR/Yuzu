@@ -2288,6 +2288,78 @@ groups:
             docs/ops-runbooks/custom-properties-store-backfill-recovery.md
             for the holder-side-verification recovery procedure.
           runbook_url: "docs/ops-runbooks/custom-properties-store-backfill-recovery.md"
+      - alert: YuzuDiscoveryReadDegraded
+        # A discovery_store list_devices read degraded and the caller failed
+        # closed (503, per ADR-0044 §Reads), never a silently-empty device
+        # list. /readyz stays green under pure pool saturation, so this
+        # store-specific counter is the only signal — same class as
+        # YuzuMgmtGroupReadDegraded / YuzuInventoryReadDegraded above.
+        # reason = store_not_open | pool_acquire_timeout | query_error.
+        expr: |
+          sum(rate(yuzu_server_discovery_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Discovered-device reads degrading ({{ $labels.reason }})"
+          description: >-
+            yuzu_server_discovery_read_degrade_total{reason="{{ $labels.reason }}"}
+            is non-zero: GET /api/discovery/results is returning 503 rather than
+            device data. pool_acquire_timeout/query_error correlate with
+            yuzu_pg_* saturation or outage; store_not_open means the store
+            failed to open at boot (should not be reachable post-boot given
+            fail-closed construction — investigate as a possible regression if
+            seen). Do not read a 503 window as "no devices discovered".
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0044"
+      - alert: YuzuDiscoveryBackfillFailing
+        # Mirrors YuzuAuditBackfillFailing's shape, NOT YuzuMgmtGroupBackfillFailing's
+        # (sre Gate 6 finding): the one-time legacy discovery.db -> discovery_store
+        # backfill (ADR-0044) runs during server CONSTRUCTION, and a failure sets
+        # startup_failed_ so run() returns before the HTTP listener starts —
+        # /metrics is never served and a result="failed" sample is never scraped.
+        # An expression keyed on result="failed" (the mgmt-group shape) can
+        # therefore never fire no matter how the counter behaves. What IS
+        # observable from outside is the ABSENCE of a success outcome — a server
+        # that refused to boot publishes no discovery-backfill series at all.
+        #
+        # THIS RULE DEPENDS ON THE PRE-SEED. Unlike AuditStore (whose
+        # set_metrics() owns its own pre-seed), DiscoveryStore::set_metrics()
+        # is a bare pointer assignment — the seed lives in server.cpp's metrics
+        # registration block (the `describe()`/zero-loop right after
+        # DiscoveryStore construction), which initialises the whole `result`
+        # set to 0. That is what makes "series absent" mean "no server is
+        # serving" rather than "no server has this metric registered yet".
+        # Without the seed, the ordinary restart of an already-migrated server
+        # (which returns at the marker check without reaching an outcome this
+        # tick) exports nothing and this rule pages on every routine restart.
+        #
+        # LIMITS: fires only when NO scraped server reports a completed/fresh
+        # backfill, so in a multi-replica deployment one wedged replica among
+        # healthy ones will not trip it (shows up as `up == 0` instead). It ALSO
+        # fires during a legitimately long first-boot backfill on a large
+        # legacy discovery.db — expected during that upgrade window (silence it
+        # for the window). The BOOT LOG carries the actual remediation in every
+        # case (fingerprint mismatch / 0-byte file / reconciliation FAILED);
+        # this is the outside-in backstop, not the primary signal.
+        expr: |
+          absent_over_time(yuzu_server_discovery_backfill_total{result=~"completed|fresh"}[15m])
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No server is reporting a completed discovery-store backfill (possible boot refusal)"
+          description: >-
+            No scraped Yuzu server has reported a successful one-time legacy
+            discovery.db -> PostgreSQL discovery_store backfill (ADR-0044) in
+            the last 15 minutes. After an upgrade the usual cause is a server
+            that FAILED the backfill: it fails CLOSED, refuses to serve, and
+            retries on the next start — a restart loop with no
+            network-discovered-device inventory available. Read the server BOOT
+            log for the specific refusal reason (fingerprint mismatch / 0-byte
+            legacy file / managed-agent_id reconciliation conflict) — it carries
+            the remediation. See the runbook for what each reason means and how
+            to resolve it.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0044"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which

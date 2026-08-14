@@ -79,6 +79,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Custom Properties](#custom-properties)
   - [Webhooks](#webhooks)
   - [Offload Targets](#offload-targets)
+  - [Network Discovery](#network-discovery)
   - [Workflows](#workflows)
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
@@ -3794,6 +3795,84 @@ Recent delivery attempts for a target (default 50, override via `?limit=N`). Eac
 
 ---
 
+### Network Discovery
+
+Network-discovered devices (Issue 7.18) — raw scan results agents report before an operator promotes a device to a managed agent. Backed by `discovery_store` on the shared PostgreSQL substrate (ADR-0044). Not to be confused with [Discovery (A2)](#discovery-a2) above, which is the unrelated agentic self-discovery family (`/api/v1/discover/*`).
+
+#### `POST /api/discovery/scan`
+
+Store discovery scan results. Requires `Infrastructure:Write`. Upserts one row per device by `ip_address` — `mac_address`/`last_seen`/`subnet` always refresh on a re-scan; `hostname` refreshes only when the new value is non-empty; a re-scan never touches an existing row's `managed`/`agent_id`/`discovered_at`/`discovered_by`.
+
+**Request:**
+
+```json
+{
+  "subnet": "10.0.0.0/24",
+  "discovered_by": "agent-scanner-01",
+  "devices": [
+    {"ip_address": "10.0.0.5", "mac_address": "aa:bb:cc:dd:ee:ff", "hostname": "workstation-05"}
+  ]
+}
+```
+
+`devices[].ip_address` is required per entry; an entry with an empty `ip_address` is silently skipped and not counted.
+
+**Response (200, all or partial success):**
+
+```json
+{"status": "ok", "devices_stored": 1, "devices_failed": 0}
+```
+
+A partial batch failure (e.g. under a degraded Postgres pool) still returns `200` but `"status": "partial"` with `devices_failed > 0`, and audits `discovery.scan` as `"partial"`:
+
+```json
+{"status": "partial", "devices_stored": 1, "devices_failed": 1}
+```
+
+**Response (503, every attempted device failed):**
+
+```json
+{"error":{"code":503,"message":"discovery scan storage degraded"},"meta":{"api_version":"v1"}}
+```
+
+Returned only when every device the request attempted to persist failed — an entry skipped for an empty `ip_address` is not counted as an attempt, so an all-skip batch still returns `200`/`"ok"`. Audits `discovery.scan` as `"failure"`.
+
+Re-sending the exact same request body after a `503` or a `"partial"` response is safe: `upsert_device` is idempotent per `ip_address` (see the upsert semantics above), so a byte-identical retry does not double-count or corrupt already-stored devices. This is narrower than "safe to re-scan": a fresh scan is not a replay, and `mac_address`/`subnet` overwrite unconditionally on every upsert (unlike `hostname`, which only refreshes on a non-empty value) — a re-scan that this time fails to resolve a device's MAC (e.g. a transient ARP miss) will blank a previously known-good `mac_address`, not merely retry the failed write.
+
+There is currently no scan-path-specific Prometheus degrade signal (unlike `GET /api/discovery/results`, which increments `yuzu_server_discovery_read_degrade_total`) — `devices_failed` in the response body, and the audit trail's `"partial"`/`"failure"` outcomes, are the per-request evidence today; the shared `yuzu_pg_*` connection-pool metrics are the closest backend-health proxy. A write-path degrade counter is tracked as a follow-up.
+
+#### `GET /api/discovery/results`
+
+List discovered devices. Requires `Infrastructure:Read`. Optional `?subnet=` query param filters to one subnet; omitted returns every discovered device, newest-`last_seen`-first.
+
+**Response (200):**
+
+```json
+{
+  "devices": [
+    {
+      "id": 1,
+      "ip_address": "10.0.0.5",
+      "mac_address": "aa:bb:cc:dd:ee:ff",
+      "hostname": "workstation-05",
+      "managed": false,
+      "agent_id": "",
+      "discovered_by": "agent-scanner-01",
+      "discovered_at": 1714501234,
+      "last_seen": 1714501234,
+      "subnet": "10.0.0.0/24"
+    }
+  ],
+  "total": 1
+}
+```
+
+**Response (503, degraded read):** `{"error":{"code":503,"message":"discovery read degraded"},"meta":{"api_version":"v1"}}`. `discovery_store` is an authoritative store (ADR-0012 §1) — a query/pool failure surfaces as `503`, never as a silently-empty device list. See `yuzu_server_discovery_read_degrade_total{reason}` (`store_not_open`/`pool_acquire_timeout`/`query_error`).
+
+`mark_managed` and `clear_results` exist on the underlying store but have **no REST route today** — dead surface, noted in ADR-0044's Follow-ups.
+
+---
+
 ### Workflows
 
 Workflows define multi-step instruction sequences that execute in order against a set of agents. Each step references an instruction definition and can include parameter overrides.
@@ -7422,7 +7501,7 @@ Begin the SAML 2.0 SP-initiated login flow. Builds an `<samlp:AuthnRequest>` and
 
 #### `POST /saml/acs`
 
-SAML Assertion Consumer Service endpoint. The IdP POSTs the `<samlp:Response>` here after authentication (HTTP-POST binding). The server validates the signed assertion (signature, audience, recipient, expiry, `InResponseTo` single-use) and mints a session cookie on success. On validation failure, the browser is redirected to `/login` with an error. Available only when SAML is enabled (see `GET /auth/saml/start`).
+SAML Assertion Consumer Service endpoint. The IdP POSTs the `<samlp:Response>` here after authentication (HTTP-POST binding). The server validates the signed assertion (signature, audience, recipient, expiry, `InResponseTo` single-use) and mints a session cookie on success. On validation failure, the browser is redirected to `/login` with an error. Available only when SAML is enabled (see `GET /auth/saml/start`). When SCIM linkage is configured (ADR-2001 §4/PR4b), a login whose linked SCIM resource resolves deprovisioned is also refused here — see `auth.saml.deprovisioned_denied` below and `docs/user-manual/scim-provisioning.md` "Deny-at-login: a deprovisioned SAML identity cannot re-authenticate".
 
 ---
 
@@ -7634,6 +7713,7 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
 | `scim.user.deprovision_role_refused_with_link` | `failure` | ADR-2001 D1: a role-refused deprovision (`deprovision_role_ok` 404 — the slug's role is not `user`) for a slug with ≥1 active linked OIDC identity, whose tokens are therefore NOT auto-revoked. Always written alongside `yuzu_scim_deprovision_role_refused_with_active_link_total` — see `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
 | `auth.oidc.deprovisioned_denied` | `failure` | ADR-2001 §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the store could not answer — fail-closed). Emitted from `GET /auth/callback`, not a `/scim/v2/*` route — listed here because it is part of the same ADR-2001 linkage. `detail` carries `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource (deactivated, or orphaned by a hard-deleted `scim_resources` row) drove the denial, or `reason=scim_store_unavailable` when the store could not answer (fail-closed — no `scim_id` to name); and — only on the post-mint re-check path (a concurrent deprovision landed after the primary check) — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). The two `reason` values keep a genuine deprovision (CC6.8 evidence) distinguishable from a store outage. Pairs with `yuzu_auth_oidc_deprovisioned_denied_total`. |
+| `auth.saml.deprovisioned_denied` | `failure` | ADR-2001 §4/PR4b, the SAML analogue of the row above: a SAML login was refused at `POST /saml/acs` because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row) or because `ScimStore` could not answer at all (fail-closed). Principal is the `saml:<entity_id>#<NameID>` string. `detail` uses the identical shape the OIDC row above uses: `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource drove the denial, or `reason=scim_store_unavailable` (no `scim_id`) when the store itself could not be asked; and — only on the post-mint re-check path — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). Pairs with `yuzu_auth_saml_deprovisioned_denied_total`. |
 
 #### Metrics
 
@@ -7651,10 +7731,14 @@ whose tokens were not auto-revoked; a human must terminate them manually),
 `yuzu_scim_deprovision_unlinked_total` (D2 — a deprovision found a
 login observation that should have matched the slug's `externalId` but no
 link had formed, almost always a misconfigured `--oidc-scim-link-claim`),
-and `yuzu_auth_oidc_deprovisioned_denied_total` (§4/PR3 — the deny-at-login
-backstop refused an OIDC re-login against a deprovisioned linked identity;
-see the audit action above and `docs/user-manual/metrics.md` "SSO login
-metrics").
+`yuzu_auth_oidc_deprovisioned_denied_total` (§4/PR3 — the deny-at-login
+backstop refused an OIDC re-login against a deprovisioned linked identity),
+`yuzu_scim_saml_link_write_failures_total` (a SAML login's identity-link
+write failed — see `docs/user-manual/scim-provisioning.md` "SCIM ↔ SAML
+identity linkage"), and `yuzu_auth_saml_deprovisioned_denied_total`
+(§4/PR4b — the SAML analogue of the OIDC deny-at-login backstop above,
+refused a SAML re-login against a deprovisioned linked identity); see the
+audit actions above and `docs/user-manual/metrics.md` "SSO login metrics".
 Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
 Metrics and "SCIM ↔ OIDC identity linkage for deprovision" § New metrics.
 
