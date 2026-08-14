@@ -11,6 +11,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <expected>
 #include <optional>
 #include <string>
@@ -564,6 +565,10 @@ TEST_CASE("route: find results — service-scoped token denied, no data leaked, 
         REQUIRE(a != "inventory.software.query|success");
     }
     REQUIRE(denied);
+    // Gate 8: pin target_id="fleet" to match the REST/MCP siblings and
+    // audit-log.md's documented uniform shape.
+    REQUIRE(std::find(h.audit_full.begin(), h.audit_full.end(),
+                      "inventory.software.query|denied|Inventory|fleet") != h.audit_full.end());
 }
 
 TEST_CASE("route: find results empty name short-circuits (no store read)", "[inventory][route]") {

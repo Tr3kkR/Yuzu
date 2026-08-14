@@ -212,6 +212,9 @@ TEST_CASE("REST inventory/software: service-scoped token denied, no data leaked,
     CHECK_FALSE(body.contains("data"));
     CHECK(h.has_audit("denied"));
     CHECK_FALSE(h.has_audit("success"));
+    for (const auto& a : h.audit_log)
+        if (a.action == "inventory.software.query" && a.result == "denied")
+            CHECK(a.target_id == "fleet");
 }
 
 TEST_CASE("REST inventory/software: path is in the OpenAPI spec (A1 discoverability)",

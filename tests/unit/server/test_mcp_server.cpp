@@ -3445,9 +3445,15 @@ TEST_CASE("MCP: query_installed_software denies a service-scoped token, denial a
     CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
 
     bool saw_denied = false;
-    for (const auto& a : ts.audit_log) {
-        if (a == "inventory.software.query|denied")
+    for (size_t i = 0; i < ts.audit_log.size(); ++i) {
+        const auto& a = ts.audit_log[i];
+        if (a == "inventory.software.query|denied") {
             saw_denied = true;
+            // Gate 8 finding: this MCP denial once left target_id empty while
+            // its REST/dashboard siblings recorded "fleet" — audit-log.md
+            // documents target_id=fleet uniformly across all three surfaces.
+            CHECK(ts.audit_target_ids.at(i) == "fleet");
+        }
         CHECK(a != "inventory.software.query|success");
         CHECK(a != "mcp.query_installed_software|success");
     }
