@@ -236,14 +236,23 @@ TEST_CASE("deployment engine records a non-zero installer exit as failed",
 // — never silently substituting a system caller. `DeploymentRoutes` itself
 // is registered on the raw `httplib::Server&` (not yet migrated onto the
 // `HttpRouteSink` seam `RestApiV1`/`WorkflowRoutes` use), so it has no route-
-// level test harness in this repo; `caller_from_session` there is the SAME
-// four-line pattern already exercised at the REST/dashboard/workflow/MCP
-// call sites (rest_api_v1.cpp et al.), not new logic. The chokepoint's own
-// enforcement of `SoftwareDeployment:Write` — that Execute-without-Write is
-// actually refused — is exhaustively covered independently in
-// test_dispatch_chokepoint.cpp for every declared capability, unchanged by
-// this fix; what THAT coverage could not see, because the parameter did not
-// exist, is proven here.
+// level test harness in this repo. `caller_from_session` there populates
+// `principal`/`principal_role`/`exec_visible` from an injected `ExecVisibleFn`
+// (a governance-round follow-up fix: it originally omitted `exec_visible`,
+// defaulting it to `nullopt`/unfiltered — the exact shape `dispatch_caller.hpp`
+// reserves for a genuine `.system = true` background dispatcher, not an
+// operator-triggered one — which made the chokepoint's per-target
+// `Execution:Execute` intersection a silent no-op for every deployment
+// dispatch; `devices_fn(viewer)∩cohort` above is a DIFFERENT authorization
+// dimension, `Infrastructure:Read`/flat group-membership, and does not
+// substitute for it). It now matches the sibling pattern
+// (rest_api_v1.cpp et al.) field-for-field, unverified at the route level for
+// the same route-level-harness-gap reason as the rest of this comment. The
+// chokepoint's own enforcement of `SoftwareDeployment:Write` — that
+// Execute-without-Write is actually refused — is exhaustively covered
+// independently in test_dispatch_chokepoint.cpp for every declared
+// capability, unchanged by this fix; what THAT coverage could not see,
+// because the parameter did not exist, is proven here.
 TEST_CASE("H1: advance() threads the caller it is given to dispatch_fn, never a "
           "system substitute",
           "[pg][deployment][engine][security]") {

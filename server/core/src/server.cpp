@@ -15814,7 +15814,17 @@ private:
                     response_store_->query_by_execution(execution_id, q)
                         .value_or(std::vector<StoredResponse>{}));
             },
-            audit_fn, preflight_run_store_.get(), deployment_run_store_.get());
+            audit_fn, preflight_run_store_.get(), deployment_run_store_.get(),
+            // #1788 gov finding: the SAME chokepoint-level Execution:Execute
+            // visible-set derivation every other operator-facing dispatch surface
+            // carries — devices_fn(viewer)∩cohort above is TARGETING confinement
+            // (Infrastructure:Read/flat group-membership), a different dimension
+            // from this. Without it, caller.exec_visible defaulted to nullopt
+            // (unfiltered), so the chokepoint's own per-target intersection
+            // (dispatch_confined_arms.hpp) was a no-op for every deployment
+            // dispatch — the exact failure shape dispatch_caller.hpp's contract
+            // reserves for a genuine `.system = true` background dispatcher only.
+            [this](const auth::Session& sess) { return derive_exec_visible(sess); });
 
         // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
         // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME

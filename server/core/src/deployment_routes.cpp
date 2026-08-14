@@ -85,16 +85,16 @@ deployment::DeploymentConfig config_from_row(const DeploymentRow& r) {
     return c;
 }
 
-/// The live session's dispatch identity — never `.system = true`: every
-/// deployment advance here is operator-triggered (a page load, a poll, a
-/// create), so the chokepoint must authorize it against that operator's own
-/// grants, not admit it unconditionally as a background dispatcher would.
-yuzu::server::DispatchCaller caller_from_session(const auth::Session& session) {
-    return yuzu::server::DispatchCaller{.principal = session.username,
-                                        .principal_role = auth::role_to_string(session.role)};
-}
-
 } // namespace
+
+yuzu::server::DispatchCaller
+DeploymentRoutes::caller_from_session(const auth::Session& session) const {
+    return yuzu::server::DispatchCaller{
+        .principal = session.username,
+        .principal_role = auth::role_to_string(session.role),
+        .exec_visible = exec_visible_fn_ ? exec_visible_fn_(session)
+                                         : yuzu::server::authz::deny_all()};
+}
 
 std::string DeploymentRoutes::advance_and_render(const std::string& deployment_id,
                                                  const yuzu::server::DispatchCaller& caller,
@@ -138,11 +138,13 @@ std::string DeploymentRoutes::advance_and_render(const std::string& deployment_i
 void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                        DevicesFn devices_fn, DispatchFn dispatch_fn, PollFn poll_fn,
                                        AuditFn audit_fn, PreflightRunStore* preflight_store,
-                                       DeploymentRunStore* deploy_store) {
+                                       DeploymentRunStore* deploy_store,
+                                       ExecVisibleFn exec_visible_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     devices_fn_ = std::move(devices_fn);
     audit_fn_ = std::move(audit_fn);
+    exec_visible_fn_ = std::move(exec_visible_fn);
     preflight_store_ = preflight_store;
     deploy_store_ = deploy_store;
     engine_.store = deploy_store;

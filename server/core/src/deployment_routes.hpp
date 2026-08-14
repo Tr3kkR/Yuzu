@@ -34,6 +34,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "authz_model.hpp"           // authz::VisibleSet
 #include "deployment_engine.hpp"     // deployment::PollFn / DispatchFn / EngineDeps
 #include "deployment_run_store.hpp"  // DeploymentRow / DeploymentDeviceRow
 #include "device_routes.hpp"         // DeviceRow
@@ -82,19 +83,41 @@ public:
     using DispatchFn = deployment::DispatchFn;
     using PollFn = deployment::PollFn;
     using AuditFn = DexRoutes::AuditFn;
+    /// The caller's Execution:Execute visible set (#1788) — same seam every other
+    /// operator-facing dispatch surface (RestApiV1/WorkflowRoutes/BundleOrchestrator/
+    /// McpServer/DashboardRoutes) is wired with. See `caller_from_session`'s doc
+    /// comment for why an unwired callback must fail closed here too.
+    using ExecVisibleFn = std::function<yuzu::server::authz::VisibleSet(const auth::Session&)>;
 
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
                          DispatchFn dispatch_fn, PollFn poll_fn, AuditFn audit_fn,
-                         PreflightRunStore* preflight_store, DeploymentRunStore* deploy_store);
+                         PreflightRunStore* preflight_store, DeploymentRunStore* deploy_store,
+                         ExecVisibleFn exec_visible_fn = {});
 
 private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
     DevicesFn devices_fn_;
     AuditFn audit_fn_;
+    ExecVisibleFn exec_visible_fn_;
     PreflightRunStore* preflight_store_{nullptr};
     DeploymentRunStore* deploy_store_{nullptr};
     deployment::EngineDeps engine_;
+
+    /// The live session's dispatch identity — never `.system = true`: every
+    /// deployment advance here is operator-triggered, so the chokepoint must
+    /// authorize it against that operator's own grants, not admit it
+    /// unconditionally as a background dispatcher would. `exec_visible` is
+    /// populated from `exec_visible_fn_`, exactly like every sibling
+    /// operator-facing surface — an unwired callback fails closed to
+    /// `authz::deny_all()` (present-empty), NEVER the default-constructed
+    /// `nullopt` (unfiltered): `dispatch_caller.hpp`'s contract reserves
+    /// `nullopt` for a genuine `.system = true` background dispatcher, and
+    /// `devices_fn(viewer)`'s cohort narrowing below is a DIFFERENT
+    /// authorization dimension (`Infrastructure:Read`/flat group-membership)
+    /// from `Execution:Execute`'s ancestor-aware RBAC visibility — it does not
+    /// substitute for this chokepoint-level intersection (#1788 gov finding).
+    yuzu::server::DispatchCaller caller_from_session(const auth::Session& session) const;
 
     /// Advance a deployment one tick (re-auth from the live session) and render its
     /// progress block; self-repolls while in flight + under the page-poll cap.
