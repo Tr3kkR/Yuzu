@@ -215,6 +215,11 @@ TEST_CASE("REST inventory/software: service-scoped token denied, no data leaked,
     for (const auto& a : h.audit_log)
         if (a.action == "inventory.software.query" && a.result == "denied")
             CHECK(a.target_id == "fleet");
+    // Gate 8 wave 2: the handler sets X-Correlation-Id before calling the
+    // shared deny helper, which mints its own — httplib's headers multimap
+    // silently keeps both unless the helper erases first. Exactly one value
+    // must reach the wire.
+    CHECK(res->headers.count("X-Correlation-Id") == 1);
 }
 
 TEST_CASE("REST inventory/software: path is in the OpenAPI spec (A1 discoverability)",

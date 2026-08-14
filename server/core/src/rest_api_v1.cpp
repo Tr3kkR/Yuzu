@@ -1388,6 +1388,13 @@ void RestApiV1::register_routes(
         (void)detail::try_persist_audit(audit_fn, req, action, "denied", target_type, target_id,
                                         audit_detail);
         const auto cid = detail::make_correlation_id();
+        // erase-then-set: httplib's Response::headers is a multimap and
+        // set_header alone is a bare emplace, so a caller that already set
+        // X-Correlation-Id (several do, before reaching this deny) would
+        // otherwise ship BOTH values on the wire (Gate 8 wave 2 finding —
+        // verified against httplib's write_headers, which serializes every
+        // entry unconditionally).
+        res.headers.erase("X-Correlation-Id");
         res.set_header("X-Correlation-Id", cid);
         res.status = 403;
         // Every current caller gates on GuaranteedState:Read by default (gov
@@ -5961,10 +5968,11 @@ void RestApiV1::register_routes(
                  // against) — matching the dashboard fragment twin
                  // (inventory_routes.cpp's /fragments/inventory/find/results) and the
                  // MCP twin (query_installed_software), both target_id="fleet".
-                 // Note: the shared helper mints and sets its OWN X-Correlation-Id on
-                 // the deny path (matching its other call sites) — the outer `cid` set
-                 // above is superseded on this branch, so it is deliberately not baked
-                 // into the audit detail string below (that would record a value the
+                 // Note: the shared helper mints its OWN X-Correlation-Id on the deny
+                 // path (matching its other call sites) and erases the outer `cid`
+                 // header set above before writing it, so the response carries exactly
+                 // one value — the outer `cid` is therefore deliberately not baked into
+                 // the audit detail string below (that would record a value the
                  // response header no longer carries).
                  if (deny_fleet_wide_service_scoped(
                          req, res, "inventory.software.query", "Inventory",

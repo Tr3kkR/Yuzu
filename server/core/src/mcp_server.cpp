@@ -3265,9 +3265,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 return error_response(id, code, message, data);
             };
 
-            // Deny a fleet-wide GuaranteedState:Read tool call to a
-            // service-scoped API token, with a denial audit. MCP sibling of
-            // REST's deny_fleet_wide_service_scoped (rest_api_v1.cpp) — same
+            // Deny a fleet-wide tool call to a service-scoped API token, with
+            // a denial audit. MCP sibling of REST's
+            // deny_fleet_wide_service_scoped (rest_api_v1.cpp) — same
             // rationale: require_permission's service-token branch checks
             // only the ITServiceOwner ROLE, never the token's own
             // service-tag scope, so perm_fn alone is not confinement for a
@@ -3275,8 +3275,13 @@ McpServer::HandlerFn McpServer::build_handler(
             // against (the REST siblings of get_dex_signal_detail,
             // list_dex_perf_devices, and list_network_devices all needed
             // this same fix — Gate 8 review found the MCP twins share the
-            // gap the REST fix closed). `session` is already resolved once
-            // for the whole request above — no auth_fn call needed here.
+            // gap the REST fix closed). Not GuaranteedState-exclusive: a
+            // non-GuaranteedState caller (e.g. query_installed_software's
+            // Inventory:Read, list_schedules' Schedule:Read) passes its own
+            // securable to perm_fn right after this deny — this helper's
+            // deny decision itself is securable-agnostic, keyed only on
+            // token_scope_service. `session` is already resolved once for
+            // the whole request above — no auth_fn call needed here.
             // Routed through a4_error (defined just above) rather than a bare
             // error_response, so this denial carries the same correlation_id
             // /retry_after_ms/remediation envelope as every sibling MCP
