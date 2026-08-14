@@ -4026,12 +4026,39 @@ public:
             tag_store_ = std::make_unique<TagStore>(tag_db);
         }
 
-        // Initialize analytics event store
-        if (cfg_.analytics_enabled) {
-            auto analytics_db = cfg_.db_dir() / "analytics.db";
+        // Analytics event store — born-on-SQLite, migrated to Postgres
+        // (ADR-0006/0008/0049, schema `analytics_event_store`). NO backfill
+        // (ADR-0009 skippable class, ADR-0049): the buffer is a transient
+        // outbox spool, not authoritative state or compliance evidence, so
+        // the legacy `analytics.db` is never read on upgrade.
+        //
+        // Construction posture is a DELIBERATE, RECORDED DIVERGENCE from the
+        // playbook's default "every Postgres store construction failure is
+        // fatal" template (ADR-0049): `--no-analytics` defaults OFF (this
+        // feature is on by default), but every call site in this codebase
+        // already treats `analytics_store_` as optional (`if
+        // (analytics_store_) { ... }`, ~15 sites) — nothing downstream is
+        // load-bearing on it existing. A migration hiccup on this expendable-
+        // telemetry table taking down auth/RBAC/every other store would
+        // contradict the store's own fail-soft-everywhere posture, so a
+        // construction failure here logs and leaves the feature disabled
+        // rather than setting startup_failed_. Flagged for confirmation at
+        // the ADR-0049 governance checkpoint — this is the one point in this
+        // migration that isn't a straight port of an existing pattern.
+        if (cfg_.analytics_enabled && pg_pool_ && !startup_failed_) {
             analytics_store_ = std::make_unique<AnalyticsEventStore>(
-                analytics_db, cfg_.analytics_drain_interval_seconds, cfg_.analytics_batch_size);
-            if (analytics_store_->is_open()) {
+                *pg_pool_, cfg_.analytics_drain_interval_seconds, cfg_.analytics_batch_size);
+            if (!analytics_store_->is_open()) {
+                spdlog::error("[PG] analytics-event store migration/open failed — analytics "
+                              "collection disabled for this run (database reachable but the "
+                              "analytics_event_store schema could not be created/opened)");
+                analytics_store_.reset();
+            } else {
+                analytics_store_->set_metrics(&metrics_);
+                spdlog::warn("[PG] analytics spool reset on Postgres cutover — the legacy "
+                             "analytics.db is not migrated (ADR-0049, skippable backfill class); "
+                             "any events undrained at cutover are lost, new events buffer "
+                             "normally from first boot");
                 if (!cfg_.analytics_jsonl_path.empty()) {
                     analytics_store_->add_sink(make_jsonlines_sink(cfg_.analytics_jsonl_path));
                 }
@@ -9858,6 +9885,14 @@ private:
             };
             std::vector<StoreCheck> checks = {
                 {"response_store", response_store_ && response_store_->is_open()},
+                // ADR-0049: construction is fail-soft-disable, not fatal
+                // (see server.cpp's analytics_store_ construction comment),
+                // so `analytics_store_` is null both when the feature is off
+                // AND when it's on but migration failed — this row tells
+                // those two apart for on-call, without gating the rest of
+                // /readyz on a non-critical telemetry store (Pattern E).
+                {"analytics_event_store",
+                 !cfg_.analytics_enabled || (analytics_store_ && analytics_store_->is_open())},
                 {"audit_store", audit_store_ && audit_store_->is_open()},
                 {"instruction_store", instruction_store_ && instruction_store_->is_open()},
                 {"api_token_store", api_token_store_ && api_token_store_->is_open()},
@@ -13531,8 +13566,23 @@ private:
 
                              nlohmann::json j;
                              if (analytics_store_) {
+                                 // Degrade-distinguishable seam (ADR-0049): a
+                                 // transient PG blip 503s rather than
+                                 // rendering pending_count=0, which would be
+                                 // indistinguishable from a genuinely empty
+                                 // buffer.
+                                 auto pending = analytics_store_->pending_count();
+                                 if (!pending) {
+                                     res.status = 503;
+                                     res.set_content(
+                                         R"({"error":{"code":503,"message":)"
+                                         R"("analytics store degraded"},)"
+                                         R"("meta":{"api_version":"v1"}})",
+                                         "application/json");
+                                     return;
+                                 }
                                  j["enabled"] = true;
-                                 j["pending_count"] = analytics_store_->pending_count();
+                                 j["pending_count"] = *pending;
                                  j["total_emitted"] = analytics_store_->total_emitted();
                              } else {
                                  j["enabled"] = false;
@@ -13558,8 +13608,16 @@ private:
                     return;
                 }
                 auto events = analytics_store_->query_recent(limit);
+                if (!events) {
+                    res.status = 503;
+                    res.set_content(R"({"error":{"code":503,"message":)"
+                                    R"("analytics store degraded"},)"
+                                    R"("meta":{"api_version":"v1"}})",
+                                    "application/json");
+                    return;
+                }
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& e : events) {
+                for (const auto& e : *events) {
                     arr.push_back(e);
                 }
                 res.set_content(nlohmann::json({{"events", arr}, {"count", arr.size()}}).dump(),
