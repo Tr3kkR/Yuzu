@@ -1,6 +1,7 @@
 #include "file_retrieval_routes.hpp"
 
 #include "body_cap_policy.hpp" // kBodyCapTable binding assert below
+#include "evp_raii.hpp"
 #include "http_route_sink.hpp"
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "upload_grant_parsers.hpp"
@@ -188,11 +189,6 @@ std::string string_field(const nlohmann::json& body, const char* key) {
         return {};
     return it->get<std::string>();
 }
-
-struct EvpMdCtxDeleter {
-    void operator()(EVP_MD_CTX* ctx) const noexcept { EVP_MD_CTX_free(ctx); }
-};
-using EvpMdCtxPtr = std::unique_ptr<EVP_MD_CTX, EvpMdCtxDeleter>;
 
 /// Streaming SHA-256 over an already-written blob (never loads the whole
 /// file into memory — 64 KiB read buffer). Computed FRESH at commit time by

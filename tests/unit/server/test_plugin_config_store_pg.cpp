@@ -131,7 +131,7 @@ TEST_CASE("PluginConfigStore opens on a fresh Postgres and migrates once",
     // Re-opening a second store against the SAME already-migrated database
     // is idempotent (the migration runner records the applied version and
     // does not re-run DDL) — a second store/codec pair opens cleanly too.
-    yuzu::test::TempDir keys2;
+    yuzu::test::TempDir keys2{"yuzu_test_keys2_"};
     FileKeyProvider provider2(keys2.path);
     SecretCodec codec2(provider2);
     PluginConfigStore store2{w.pool, codec2};

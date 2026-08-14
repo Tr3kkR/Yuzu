@@ -1,5 +1,6 @@
 #include "upload_grant_store.hpp"
 
+#include "evp_raii.hpp"
 #include "upload_grant_parsers.hpp"
 
 #include "pg/pg_exec.hpp"
@@ -128,11 +129,6 @@ UploadGrantStore::UploadGrantStore(pg::PgPool& pool) : pool_(pool) {
 }
 
 namespace {
-
-struct EvpMdCtxDeleter {
-    void operator()(EVP_MD_CTX* ctx) const noexcept { EVP_MD_CTX_free(ctx); }
-};
-using EvpMdCtxPtr = std::unique_ptr<EVP_MD_CTX, EvpMdCtxDeleter>;
 
 // SHA-256 hex over a short in-memory secret (grant/session secrets — a few
 // dozen bytes). Streaming file digests at commit time are a SEPARATE

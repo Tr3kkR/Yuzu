@@ -151,7 +151,7 @@ namespace {
 // TempDir (destroyed at scope exit), the DELETE empties kek_meta before the
 // template is ever cloned, and template fingerprints are structure-only.
 yuzu::test::PgTestTemplate secrets_tpl{"secrets", [](const std::string& dsn) {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn{PQconnectdb(dsn.c_str())};
@@ -175,7 +175,7 @@ TEST_CASE("SecretCodec: encode_bigint_pk is fixed 8-byte BE", "[secrets]") {
 }
 
 TEST_CASE("SecretCodec: register_secret_column validates identifiers", "[secrets]") {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
@@ -189,7 +189,7 @@ TEST_CASE("SecretCodec: register_secret_column validates identifiers", "[secrets
 // registered-column trip-wire.
 TEST_CASE("SecretCodec: register_secret_column rejects a duplicate (store, table, column)",
           "[secrets]") {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
@@ -206,7 +206,7 @@ TEST_CASE("SecretCodec: register_secret_column rejects a duplicate (store, table
 // #2530 A2: registered_columns() is a snapshot in registration order.
 TEST_CASE("SecretCodec: registered_columns() returns a snapshot in registration order",
           "[secrets]") {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     REQUIRE(codec.registered_columns().empty());
@@ -224,7 +224,7 @@ TEST_CASE("SecretCodec: registered_columns() returns a snapshot in registration 
 
 TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     PgConn conn = connect(db.dsn());
 
@@ -257,7 +257,7 @@ TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][s
 
 TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     PgConn conn = connect(db.dsn());
     {
         FileKeyProvider provider(keys.path);
@@ -266,7 +266,7 @@ TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
     }
 
     SECTION("missing KEK file (backup skew / dual server) -> kek_unresolvable") {
-        yuzu::test::TempDir other_keys; // empty keys dir, same database
+        yuzu::test::TempDir other_keys{"yuzu_test_other_keys_"}; // empty keys dir, same database
         FileKeyProvider provider(other_keys.path);
         SecretCodec codec(provider);
         auto r = codec.init(conn.get());
@@ -293,7 +293,7 @@ TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
 
 TEST_CASE("SecretCodec: round-trip, blob format, fresh DEK per encrypt", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -340,7 +340,7 @@ TEST_CASE("SecretCodec: round-trip, blob format, fresh DEK per encrypt", "[pg][s
 
 TEST_CASE("SecretCodec: AAD anti-swap and boundary-shift", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -388,7 +388,7 @@ TEST_CASE("SecretCodec: AAD anti-swap and boundary-shift", "[pg][secrets]") {
 
 TEST_CASE("SecretCodec: malformed blobs and payload tamper", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -456,7 +456,7 @@ TEST_CASE("SecretCodec: malformed blobs and payload tamper", "[pg][secrets]") {
 
 TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -576,7 +576,7 @@ TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][
 TEST_CASE("SecretCodec: TEXT primary keys rotate and decrypt (uniform binary-pk path)",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -636,7 +636,7 @@ TEST_CASE("SecretCodec: TEXT primary keys rotate and decrypt (uniform binary-pk 
 TEST_CASE("SecretCodec: lifecycle edges — unknown retire, multi-column laggard, zero-row column",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -711,7 +711,7 @@ TEST_CASE("SecretCodec: lifecycle edges — unknown retire, multi-column laggard
 
 TEST_CASE("SecretCodec: audit detail structure and failure-counter classes", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -780,7 +780,7 @@ TEST_CASE("SecretCodec: audit detail structure and failure-counter classes", "[p
 // switches families is caught here rather than in a Grafana query.
 TEST_CASE("SecretCodec decrypt-failure counts export as a Prometheus counter", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -823,7 +823,7 @@ TEST_CASE("SecretCodec decrypt-failure counts export as a Prometheus counter", "
 TEST_CASE("SecretCodec init: orphaned kek_version (deleted registration) fails closed",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     PgConn conn = connect(db.dsn());
 
@@ -854,7 +854,7 @@ TEST_CASE("SecretCodec init: orphaned kek_version (deleted registration) fails c
 
 TEST_CASE("SecretCodec init: unsupported pk_column type fails closed", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     PgConn conn = connect(db.dsn());
 
@@ -879,7 +879,7 @@ TEST_CASE("SecretCodec init: unsupported pk_column type fails closed", "[pg][sec
 TEST_CASE("SecretCodec: retire with failed key deletion records no false destruction",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider file_provider(keys.path);
     FailingDeleteProvider provider(file_provider); // delete_kek always fails
     SecretCodec codec(provider);
@@ -935,7 +935,7 @@ TEST_CASE("SecretCodec: active_kek_version() advances by exactly one per success
           "rotate_kek call (the REST/MCP seam's half-committed detection depends on this)",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -968,7 +968,7 @@ TEST_CASE("SecretCodec: active_kek_version() advances by exactly one per success
 // #2530 A4: live_kek_version_count() counts only non-retired kek_meta rows.
 TEST_CASE("SecretCodec: live_kek_version_count reflects retirement", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -996,7 +996,7 @@ TEST_CASE("SecretCodec: live_kek_version_count reflects retirement", "[pg][secre
 TEST_CASE("SecretCodec: rotate_clock reports any_rows=false against an empty kek_meta",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -1012,7 +1012,7 @@ TEST_CASE("SecretCodec: rotate_clock reports any_rows=false against an empty kek
 TEST_CASE("SecretCodec: rotate_clock reports a small age and no anomaly for a fresh row",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -1028,7 +1028,7 @@ TEST_CASE("SecretCodec: rotate_clock reports a small age and no anomaly for a fr
 TEST_CASE("SecretCodec: rotate_clock flags a future-dated newest row as a clock anomaly",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -1061,7 +1061,7 @@ TEST_CASE("SecretCodec: rotate_clock flags a future-dated newest row as a clock 
 TEST_CASE("SecretCodec: a canceled query maps to LifecycleError::Kind::query_canceled",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -1261,7 +1261,7 @@ TEST_CASE("KEK op lock: the guard leaves nothing held on the connection it relea
 TEST_CASE("SecretCodec: a second codec joins a rotation without minting a second KEK",
           "[pg][secrets][multicodec]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     PgConn conn = connect(db.dsn());
     create_test_table(conn.get());
