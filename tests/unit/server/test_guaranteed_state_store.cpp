@@ -3018,3 +3018,70 @@ TEST_CASE("GuaranteedStateStore: per-(agent,rule) compliance census (Slice B)",
         CHECK(m.count({"a1", "r2"}) == 1); // an unrelated rule's status is untouched
     }
 }
+
+TEST_CASE("GuaranteedStateStore::errored_rule_count — ADR-0017 INV-3 SQL-level confinement",
+          "[pg][guaranteed_state_store][adr0017]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardianstate_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store{pool, /*retention_days=*/30};
+    REQUIRE(store.is_open());
+
+    auto make_rule = [](const std::string& rule_id) {
+        GuaranteedStateRuleRow r;
+        r.rule_id = rule_id;
+        r.name = rule_id + "-name";
+        r.yaml_source = "x";
+        r.enforcement_mode = "audit";
+        r.severity = "high";
+        r.created_at = "2026-06-04T09:00:00Z";
+        r.updated_at = r.created_at;
+        return r;
+    };
+    REQUIRE(store.create_rule(make_rule("r1")));
+    REQUIRE(store.create_rule(make_rule("r2")));
+
+    auto ev = [&](std::string id, std::string rule, std::string agent, std::string type) {
+        auto e = make_event(std::move(id), std::move(rule), std::move(agent), "high",
+                            "2026-06-04T10:00:00Z");
+        e.event_type = std::move(type);
+        return e;
+    };
+    // r1 errored on a1 AND a2 (counted once — DISTINCT rule_id); r2 errored on a1 only.
+    REQUIRE(store.insert_event(ev("e1", "r1", "a1", "guard.unhealthy")));
+    REQUIRE(store.insert_event(ev("e2", "r1", "a2", "guard.unhealthy")));
+    REQUIRE(store.insert_event(ev("e3", "r2", "a1", "guard.unhealthy")));
+    // r-orphan has a census row but was never created as a rule — the SQL JOIN
+    // against guaranteed_state_rules must exclude it (mirrors the C++
+    // rule_names.count() intersection the route used to do post-fetch).
+    REQUIRE(store.insert_event(ev("e4", "r-orphan", "a1", "guard.unhealthy")));
+    // r1 also compliant on a3 — must not contribute.
+    REQUIRE(store.insert_event(ev("e5", "r1", "a3", "guard.compliant")));
+
+    SECTION("nullopt scope: unfiltered fleet-wide count") {
+        auto n = store.errored_rule_count(std::nullopt);
+        REQUIRE(n.has_value());
+        CHECK(*n == 2); // r1 (once) + r2; r-orphan excluded by the catalogue JOIN
+    }
+
+    SECTION("engaged scope: agent_id = ANY($1::text[]) applied before the aggregate") {
+        auto n = store.errored_rule_count(std::vector<std::string>{"a1"});
+        REQUIRE(n.has_value());
+        CHECK(*n == 2); // a1 alone reports both r1 and r2 as errored
+
+        auto n2 = store.errored_rule_count(std::vector<std::string>{"a2"});
+        REQUIRE(n2.has_value());
+        CHECK(*n2 == 1); // a2 only reports r1
+    }
+
+    SECTION("engaged-empty scope: zero without issuing a query (INV-2)") {
+        auto n = store.errored_rule_count(std::vector<std::string>{});
+        REQUIRE(n.has_value());
+        CHECK(*n == 0);
+    }
+
+    SECTION("a scope naming an agent with no errored rows counts nothing") {
+        auto n = store.errored_rule_count(std::vector<std::string>{"a3"});
+        REQUIRE(n.has_value());
+        CHECK(*n == 0); // a3's only row is compliant, not errored
+    }
+}

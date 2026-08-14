@@ -8196,6 +8196,13 @@ private:
                                                        agent_id);
     }
 
+    yuzu::server::ListReadGate require_list_read(const httplib::Request& req,
+                                                 httplib::Response& res,
+                                                 const std::string& securable_type,
+                                                 const std::string& operation) {
+        return auth_routes_->require_list_read(req, res, securable_type, operation);
+    }
+
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
     /// extracted verbatim from the `/api/command` handler so the MCP dispatch path
     /// (execute_instruction / execute_bundle) can intersect against the SAME
@@ -14852,6 +14859,14 @@ private:
                                      const std::string& agent_id) -> bool {
             return require_scoped_permission(req, res, type, op, agent_id);
         };
+        // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
+        // The fleet guaranteed-state status route's SOLE authorization gate —
+        // never stacked with perm_fn (see rest_api_v1.cpp's route comment).
+        auto list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                   const std::string& type,
+                                   const std::string& op) -> yuzu::server::ListReadGate {
+            return require_list_read(req, res, type, op);
+        };
         // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
         // device drills). SAME policy as get_visible_agents_json / the /devices list:
         // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
@@ -17637,7 +17652,11 @@ private:
             // bundle dispatch gets the identical defense-in-depth confinement
             // check as its MCP execute_bundle twin (the scoped_perm_fn gate at
             // the handler remains the primary authorization).
-            [this](const auth::Session& sess) { return derive_exec_visible(sess); });
+            [this](const auth::Session& sess) { return derive_exec_visible(sess); },
+            // ADR-0017: the fleet guaranteed-state status route's SOLE
+            // authorization gate — see rest_api_v1.cpp's route comment for why
+            // it must never be stacked with perm_fn.
+            list_read_fn);
 
         // -- Register MCP server routes ----------------------------------------
 

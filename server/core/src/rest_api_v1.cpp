@@ -956,7 +956,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Two gated shapes behind one route. An agent-scoped query (non-empty agent_id, max 256 chars, no control characters) requires per-device-scoped GuaranteedState:Read (management-group aware; a service-scoped token is confined to its own service's agents) and returns that device's individual-identifying behavioural signal history. A fleet-wide query (no agent_id) requires global GuaranteedState:Read AND denies a service-scoped token outright (403) — the fleet fan-out returns every reporting agent's agent_id + detail_json, which the bare service-token role check alone would not confine. BOTH shapes emit a dex.device.view audit (target_type Agent for the per-device shape, GuaranteedState for the fleet shape) and FAIL CLOSED — 503 + Sec-Audit-Failed: true (retryable, A4 envelope with retry_after_ms) — if that audit row cannot persist, parity with GET /api/v1/dex/devices/{id}. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit/offset, or agent_id too long / contains a control character"}, "403": {"description": "A service-scoped token queried the fleet-wide (no agent_id) shape, or an agent-scoped query named a device outside the caller's scope"}, "503": {"description": "Audit row could not persist — behavioural data withheld on both the agent-scoped and fleet-wide shapes; carries Sec-Audit-Failed: true and is retryable (A4 envelope).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/guaranteed-state/status": {
-      "get": {"summary": "Fleet Guaranteed State status rollup", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, NON-service-scoped (a service-scoped API token is refused with 403 — this route aggregates across every agent's census, which a token scoped to one service must not read) and management-group confined via RbacStore::authorize_list_read (ADR-0017 admit-then-filter): a global grant sees the fleet-wide count, a management-group-confined grant sees errored_rules scoped to visible agents only, no grant anywhere is refused with 403. errored_rules is REAL (#2298 item 6d), derived from the guardian_agent_rule_status census intersected against the live rule catalogue (a census row for a since-deleted rule is excluded) and, for a confined caller, against their visible-agent set: the count of distinct rule_ids with at least one VISIBLE agent reporting state=errored. total_rules is the global rule-catalogue size and is never confined (a rule has no agent/management-group dimension). compliant_rules/drifted_rules stay 0 — full status ingest lands in a later rung. 503 if the guaranteed-state store, rbac store, or list-read resolver is unavailable or degraded (never a silent 0).", "responses": {"200": {"description": "Status rollup", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}, "403": {"description": "Caller presented a service-scoped API token, or holds no GuaranteedState:Read grant (global or management-group) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Guaranteed-state store, rbac store, or list-read resolver unavailable or degraded (A4 envelope) — never rendered as a silent 0", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Fleet Guaranteed State status rollup", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read via AuthRoutes::require_list_read, this route's SOLE authorization gate (ADR-0017 admit-then-filter). NON-service-scoped (a service-scoped API token is refused with 403 outright — this route aggregates across every agent's census, which a token scoped to one service must not read). A global grant sees the fleet-wide count; a management-group-confined grant sees errored_rules scoped to visible agents only (applied in SQL before the aggregate, INV-3), including a real grant that resolves to zero visible agents (200 + 0, not a denial, INV-2); no GuaranteedState:Read grant anywhere (including an unreachable/corrupt RBAC store, which fails closed) is refused with 403, not 503 — the store-unreachable and no-grant cases are not currently distinguished in the response code. errored_rules is REAL (#2298 item 6d), derived from the guardian_agent_rule_status census intersected against the live rule catalogue (a census row for a since-deleted rule is excluded) and, for a confined caller, against their visible-agent set: the count of distinct rule_ids with at least one VISIBLE agent reporting state=errored. total_rules is the global rule-catalogue size and is never confined (a rule has no agent/management-group dimension). compliant_rules/drifted_rules stay 0 — full status ingest lands in a later rung. 503 if the guaranteed-state store degrades, or the list-read gate itself is unwired (server misconfiguration) — never a silent 0.", "responses": {"200": {"description": "Status rollup", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}, "403": {"description": "Caller presented a service-scoped API token, or holds no GuaranteedState:Read grant anywhere — including when the RBAC store itself is unreachable or corrupt, which fails closed to this same 403 rather than a distinct 503 (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Guaranteed-state store degraded, or the list-read gate is unwired (A4 envelope) — never rendered as a silent 0", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/guaranteed-state/status/{agent_id}": {
       "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in, and a service-scoped token is confined to its own service tag) — same World-A confinement shape as GET /guaranteed-state/device-compliance. errored_rules is REAL (#2298 item 6d), derived from this agent's guardian_agent_rule_status census rows intersected against the live rule catalogue; total_rules is the count of rules with ANY census entry for this agent still present in that catalogue, not the fleet catalogue size. compliant_rules/drifted_rules stay 0 — full status ingest lands in a later rung. Audited as guardian.device.view; FAILS CLOSED (503 + Sec-Audit-Failed) if the audit row cannot persist, parity with GET /dex/devices/{id} and GET /guaranteed-state/device-compliance.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}, "400": {"description": "agent_id exceeds the canonical enrolled-agent-id length ceiling (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "Caller lacks GuaranteedState:Read on this agent's scope — RBAC denial, or a service-scoped token whose own service tag does not match this agent's (an unwired scoped-permission fn is 503, not this) — A4 envelope (require_scoped_permission's denial path is detail::a4_denial, itself error_json_a4)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Either the route is misconfigured (scoped-permission fn/store unwired) OR the guardian.device.view audit row could not persist (FAIL-CLOSED, CC7.2) OR the guaranteed-state store is degraded (A4 envelope)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the read was refused because the audit row could not persist (CC7.2 fail-closed); retry after the audit subsystem recovers."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
@@ -1361,7 +1361,7 @@ void RestApiV1::register_routes(
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1375,7 +1375,8 @@ void RestApiV1::register_routes(
                     std::move(scoped_perm_fn), software_inventory_store,
                     std::move(inventory_scope_fn), std::move(response_scope_fn),
                     std::move(app_perf_providers), engine_principal_store, access_review_store,
-                    auth_db, directory_sync, stream_budget, std::move(exec_visible_fn));
+                    auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
+                    std::move(list_read_fn));
 }
 
 void RestApiV1::register_routes(
@@ -1396,7 +1397,7 @@ void RestApiV1::register_routes(
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -10694,34 +10695,46 @@ void RestApiV1::register_routes(
     // route counts a rule as errored if ANY agent currently reports it errored,
     // regardless of that agent's liveness) — documented in the note field.
     //
-    // World-A / ADR-0017: a service-scoped API token is denied outright (require_
-    // permission's service-scoped-token branch checks only the ITServiceOwner ROLE,
-    // never the token's own service-tag scope, so a bare perm_fn pass alone would let
-    // a token scoped to ONE service read a fleet-wide count). For every OTHER caller,
-    // this route now gates via RbacStore::authorize_list_read — the admit-then-filter
-    // chokepoint every new list/fan-out read of per-agent data MUST use per
-    // .claude/routed-concerns-access-control.md's "Authentication, RBAC..." row. That
-    // MUST is a POLICY FLOOR (CLAUDE.md severity-derivation rule 2: "violation of any
-    // explicit MUST / never ... invariant ... closed to three sources: a routed-concern
-    // row's catastrophic clause") — it bypasses the ordinary impact/exposure derivation
-    // and gates regardless of how narrow the exploit surface looks; ADR-0017 itself is
-    // explicit that this applies to AGGREGATES too ("the visible set MUST be applied in
-    // SQL before the aggregate", INV-3, COUNT/SUM/AVG/GROUP BY). A prior round of this
-    // work left this route on the bare perm_fn gate, reasoning that a de-identified
-    // count was lower-risk than an identity-bearing list and that #3038 was an adequate
-    // deferral — governance's own Gate-2 pass derived that via the ordinary I/E-band
-    // table (MEDIUM) rather than recognising the policy-floor bypass; two independent
-    // adversarial-review models (Kimi K2.7, Codex GPT-5.5) and a third independent
-    // consult (Codex GPT-5.6-Sol) all converged on BLOCKING once this was re-checked
-    // against the primary source. #3038 tracked the gap this closes; not filed as its
-    // own follow-up because this IS the fix, not a partial one.
+    // World-A / ADR-0017: this route's SOLE authorization gate is
+    // AuthRoutes::require_list_read (list_read_fn below) — never perm_fn, and
+    // never perm_fn stacked with a direct authorize_list_read call. An earlier
+    // commit on this branch (9269b5636) tried the stacked shape — perm_fn first,
+    // then a direct rbac_store->authorize_list_read(...) call inside the handler
+    // — and shipped a no-op: require_permission's ordinary RBAC branch calls
+    // ONLY RbacStore::check_permission, which never consults ManagementGroupStore
+    // (collect_roles_locked unions only rbac.db's own principal_roles/group_members
+    // arms, a different and older mechanism). So a caller whose only grant was
+    // management-group-scoped was denied 403 by perm_fn before authorize_list_read
+    // was ever reached, and a global-grant caller passed both unfiltered — #3038
+    // was not actually fixed by that commit. It also broke JIT-elevated sessions
+    // (elevation passes perm_fn, then authorize_list_read — which has no elevation
+    // concept — denies it). require_list_read replicates require_permission's full
+    // session-class ladder (auth / Read-only / elevation / engine / MCP tier /
+    // service-scoped token / legacy) itself, delegating ONLY the ordinary-RBAC
+    // case to authorize_list_read, so the two mechanisms never stack.
     //
-    // total_rules stays UNSCOPED by visible_agents deliberately: it is rule_names().size()
-    // — the size of the global rule-definition catalogue (guaranteed_state_rules), which
-    // carries no agent dimension at all (a rule is not owned by a management group; it
-    // becomes applicable to an agent only via scope_expr at push time). Confining it would
-    // filter data that was never per-agent to begin with. errored_rules IS the per-agent
-    // aggregate ADR-0017 governs, and is scoped below.
+    // A service-scoped API token is denied outright by require_list_read (a flat
+    // list-read gate has no single agent_id to scope the token's service tag
+    // against, unlike require_scoped_permission's per-target check — admitting it
+    // would hand a service-scoped token the whole fleet's data). This MUST-use of
+    // the admit-then-filter chokepoint is a POLICY FLOOR (CLAUDE.md
+    // severity-derivation rule 2: "violation of any explicit MUST / never ...
+    // invariant ... closed to three sources: a routed-concern row's catastrophic
+    // clause") — it bypasses the ordinary impact/exposure derivation regardless of
+    // how narrow the exploit surface looks; ADR-0017 itself is explicit that this
+    // applies to AGGREGATES too ("the visible set MUST be applied in SQL before the
+    // aggregate", INV-3, COUNT/SUM/AVG/GROUP BY) — errored_rules is computed by
+    // GuaranteedStateStore::errored_rule_count with the visible scope applied via a
+    // SQL `agent_id = ANY($1::text[])` predicate before the COUNT(DISTINCT ...),
+    // never a C++ post-filter over the whole fleet census.
+    //
+    // total_rules stays UNSCOPED by the visible set deliberately: it is
+    // rule_names().size() — the size of the global rule-definition catalogue
+    // (guaranteed_state_rules), which carries no agent dimension at all (a rule is
+    // not owned by a management group; it becomes applicable to an agent only via
+    // scope_expr at push time). Confining it would filter data that was never
+    // per-agent to begin with. errored_rules IS the per-agent aggregate ADR-0017
+    // governs, and is scoped via errored_rule_count's agent_scope parameter.
     //
     // ADR-1005 MCP-twin note: both status routes below are GRANDFATHERED, not new
     // capability — they existed pre-ADR-1005 as hardcoded placeholders; this rung only
@@ -10734,67 +10747,25 @@ void RestApiV1::register_routes(
     // /metrics gauge family, not this REST route) is still owed.
     sink.Get(
         "/api/v1/guaranteed-state/status",
-        [perm_fn, auth_fn, audit_fn, guaranteed_state_store, rbac_store,
-         mgmt_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Read"))
-                return;
+        [list_read_fn, guaranteed_state_store](const httplib::Request& req,
+                                               httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            auto session = auth_fn(req, res);
-            if (!session)
-                return;
-            if (!session->token_scope_service.empty()) {
-                // sec-M2-class denial (same posture as the session-revoke self-target
-                // guard, :3903 above): a narrow-scope automation token must not read
-                // fleet-wide aggregate compliance data outside its own scope. Audited
-                // like the sibling guaranteed_state.rule.* denials in this file
-                // (best-effort, not fail-closed to 503 on an audit failure — the denial
-                // already happened and nothing was disclosed either way, so a lost
-                // evidence row here is an audit-coverage gap, not a security-control
-                // failure; contrast the FAIL-CLOSED guardian.device.view audit on the
-                // per-agent route below, which gates ACCESS TO PII, not a denial of it).
-                res.status = 403;
-                audit_fn(req, "guaranteed_state.status.denied", "denied", "GuaranteedState", "",
-                         "service-scoped token denied the fleet-wide status rollup "
-                         "(scope='" +
-                             session->token_scope_service + "')");
-                res.set_content(
-                    detail::error_json_a4(
-                        403, "service-scoped tokens cannot read the fleet-wide status rollup",
-                        cid),
-                    "application/json");
-                return;
-            }
-            if (!rbac_store) {
-                spdlog::error("guaranteed-state.status: rbac_store null — registration-order "
-                              "defect; failing closed; cid={}",
+            if (!list_read_fn) {
+                spdlog::error("guaranteed-state.status: list_read_fn unwired — "
+                              "misconfigured call site; failing closed; cid={}",
                               cid);
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                 "application/json");
                 return;
             }
-            // ADR-0017 admit-then-filter. mgmt_store may itself be null (an operational
-            // gap, not a code defect here) — authorize_list_read/resolve_perm_groups
-            // handle that by returning DenyAll (fail-closed, INV-1), never AdmitAll.
-            auto list_auth =
-                rbac_store->authorize_list_read(session->username, "GuaranteedState", "Read",
-                                                mgmt_store);
-            if (list_auth.decision == ListReadDecision::DenyAll) {
-                audit_fn(req, "guaranteed_state.status.denied", "denied", "GuaranteedState", "",
-                         "caller holds no GuaranteedState:Read grant (global or "
-                         "management-group) for the fleet-wide status rollup");
-                res.status = 403;
-                res.set_content(detail::error_json_a4(403, "insufficient permission", cid),
-                                "application/json");
+            // require_list_read is the SOLE gate — see the comment above the route
+            // registration for why it must never be stacked with perm_fn. It
+            // renders 401/403/503 and returns !admitted itself on denial.
+            auto gate = list_read_fn(req, res, "GuaranteedState", "Read");
+            if (!gate.admitted)
                 return;
-            }
-            std::optional<std::unordered_set<std::string>> visible_agents;
-            if (list_auth.decision == ListReadDecision::AdmitScoped)
-                visible_agents = std::unordered_set<std::string>(
-                    list_auth.visible_agents.begin(), list_auth.visible_agents.end());
-            // AdmitAll -> visible_agents stays nullopt -> unfiltered fleet-wide read
-            // (a global grant, or RBAC loaded-and-disabled/legacy-open).
             if (!guaranteed_state_store) {
                 spdlog::error("guaranteed-state.status: store null — registration-order "
                               "defect; cid={}",
@@ -10805,43 +10776,35 @@ void RestApiV1::register_routes(
                 return;
             }
             // ADR-0038 catastrophic-read: a degrade must render 503, never a silent "0
-            // errored"/"0 rules" that would misreport the fleet as compliant. total_rules
-            // now comes from this SAME degrade-checked rule_names() read, replacing the
-            // former separate (non-degrade-checked, silently-zero-on-failure) rule_count().
+            // errored"/"0 rules" that would misreport the fleet as compliant.
+            // ADR-0017 INV-3: gate.scope (nullopt = unfiltered; engaged, incl.
+            // empty = INV-2) is applied IN SQL by errored_rule_count, before the
+            // aggregate — never a C++ post-filter over the full fleet census.
             auto rule_names_result = guaranteed_state_store->rule_names();
-            auto statuses_result = guaranteed_state_store->agent_rule_statuses();
-            if (!rule_names_result || !statuses_result) {
+            auto errored_result = guaranteed_state_store->errored_rule_count(gate.scope);
+            if (!rule_names_result || !errored_result) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
                                 "application/json");
                 spdlog::warn("guaranteed-state.status store degraded (503) cid={}", cid);
                 return;
             }
-            const auto& rule_names = *rule_names_result;
-            std::unordered_set<std::string> errored_rule_ids;
-            for (const auto& st : *statuses_result) {
-                // ADR-0017: the visible set is applied BEFORE the aggregate. A
-                // present-but-empty visible_agents (AdmitScoped with zero visible
-                // agents) correctly contributes nothing — INV-2.
-                if (visible_agents && !visible_agents->count(st.agent_id))
-                    continue;
-                if (st.state == "errored" && rule_names.count(st.rule_id))
-                    errored_rule_ids.insert(st.rule_id);
-            }
             res.set_content(
                 ok_json(JObj()
-                            .add("total_rules", static_cast<int64_t>(rule_names.size()))
+                            .add("total_rules", static_cast<int64_t>(rule_names_result->size()))
                             .add("compliant_rules", 0)
                             .add("drifted_rules", 0)
-                            .add("errored_rules", static_cast<int64_t>(errored_rule_ids.size()))
+                            .add("errored_rules", static_cast<int64_t>(*errored_result))
                             .add("note", "errored_rules is real (M1 census-derived, #2298 "
                                         "item 6d), intersected against the live rule "
-                                        "catalogue, and counts a rule as errored regardless "
-                                        "of the reporting agent's liveness (not the "
-                                        "dashboard's offline-agent-folds-to-unknown rollup); "
+                                        "catalogue via a SQL JOIN, and counts a rule as "
+                                        "errored regardless of the reporting agent's "
+                                        "liveness (not the dashboard's "
+                                        "offline-agent-folds-to-unknown rollup); "
                                         "compliant_rules/drifted_rules land with full status "
                                         "ingest in a later rung. errored_rules is "
-                                        "management-group-confined (ADR-0017): a "
+                                        "management-group-confined via "
+                                        "AuthRoutes::require_list_read (ADR-0017): a "
                                         "group-scoped caller sees the count for their "
                                         "visible agents only, not the whole fleet; "
                                         "total_rules is the global rule-catalogue size "

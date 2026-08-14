@@ -19,10 +19,12 @@
  * scope expansion that PR 3 wires into /push.
  */
 
+#include "auth_routes.hpp"
 #include "baseline_store.hpp"
 #include "dex_app_perf_model.hpp" // AppPerfProviders (slice-2 app-perf read seams)
 #include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
+#include "oidc_provider.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -38,13 +40,22 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <yuzu/server/auth.hpp>
+#include <yuzu/server/server.hpp> // Config's full definition (auth_routes.hpp only forward-declares it)
+
 #include "../test_helpers.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — real tokens for the ADR-0017 list-read gate ladder
 #include "test_mgmt_group_pg_helper.hpp"
+#include "test_rbac_store_pg_helper.hpp" // RbacStorePg — RbacStore is PG-only (ADR-0041)
 
 #include <algorithm>
+#include <chrono>
 #include <filesystem>
+#include <memory>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -70,6 +81,12 @@ struct AuditRecord {
     std::string target_id;
     std::string detail;
 };
+
+std::int64_t now_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
 
 // Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every
 // RestGsHarness below constructs its own GuaranteedStateStore against a clone
@@ -123,16 +140,37 @@ struct RestGsHarness {
     std::unique_ptr<BaselineStore> baseline_store;
 
     // ADR-0017 authorize_list_read confinement for the fleet /guaranteed-state/status
-    // route. `rbac_` is a FRESH in-memory store with RBAC left disabled (the
+    // route. `rbac_` is a FRESH store with RBAC left disabled (the
     // constructor default, never toggled unless a test calls set_rbac_enabled(true)) —
     // rbac_enforcement_in_effect() then reads legacy-open, so authorize_list_read
     // unconditionally returns AdmitAll and every EXISTING test's happy-path behavior is
-    // unchanged by this pair existing. mgmt_bundle_ is PG-backed (ADR-0042) but this
-    // harness already unconditionally requires Postgres for GuaranteedStateStore (the
-    // ctor's own SKIP check above), so adding it introduces no new skip condition.
-    RbacStore rbac_{":memory:"};
+    // unchanged by this pair existing. RbacStore is PG-only (ADR-0041) and
+    // mgmt_bundle_ is PG-backed (ADR-0042), but this harness already
+    // unconditionally requires Postgres for GuaranteedStateStore (the ctor's
+    // own SKIP check above), so adding either introduces no new skip condition.
+    yuzu::test::RbacStorePg rbac_bundle_;
+    RbacStore& rbac_ = *rbac_bundle_;
     yuzu::test::ManagementGroupStorePg mgmt_bundle_;
     ManagementGroupStore& mgmt_ = *mgmt_bundle_;
+
+    // Real AuthRoutes for the fleet /status route's SOLE gate
+    // (AuthRoutes::require_list_read, ADR-0017/#3038 fix) — the composition
+    // bug this replaces shipped BECAUSE the stub auth_fn/perm_fn below
+    // unconditionally granted, so it never exercised the real
+    // require_permission/authorize_list_read interaction. Every OTHER route
+    // in this harness still uses the stub auth_fn/perm_fn/scoped_perm_fn —
+    // this pair is additional, not a replacement. ApiTokenStorePg mints real
+    // service-scoped/MCP-tier tokens for the fleet route's ladder tests; this
+    // harness already unconditionally requires Postgres (the ctor's own SKIP
+    // check above), so this introduces no new skip condition. Declared AFTER
+    // rbac_/mgmt_bundle_/api_tokens_ (destroyed BEFORE them, in reverse
+    // declaration order) since auth_routes_ holds raw pointers into them.
+    Config auth_cfg_{};
+    auth::AuthManager auth_mgr_{};
+    yuzu::test::ApiTokenStorePg api_tokens_;
+    std::shared_mutex oidc_mu_;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider_; // empty
+    std::unique_ptr<AuthRoutes> auth_routes_;
 
     std::string session_user{"alice"};
     auth::Role session_role{auth::Role::admin};
@@ -222,6 +260,10 @@ struct RestGsHarness {
     /// "unfiltered".
     bool wire_exec_visible{true};
 
+    /// false → register the fleet /status route with an EMPTY ListReadFn,
+    /// exercising its fail-closed-503 path (mirrors wire_scoped_perm above).
+    bool wire_list_read_fn_{true};
+
     // ADR-0039: ResponseStore is now a migrated Postgres store, so it needs a
     // live `pg::PgPool&` — but only the handful of `/live`-exercising
     // TEST_CASEs in this file actually touch it. `resp_pool` is nullable
@@ -232,8 +274,9 @@ struct RestGsHarness {
     // explicit `live_deps=false` case already exercised.
     explicit RestGsHarness(bool live_deps = true, bool wire_scoped_perm = true,
                            bool wire_app_perf = true, bool with_exec_visible = true,
-                           pg::PgPool* resp_pool = nullptr)
-        : wire_live_deps(live_deps), wire_exec_visible(with_exec_visible) {
+                           pg::PgPool* resp_pool = nullptr, bool wire_list_read_fn = true)
+        : wire_live_deps(live_deps), wire_exec_visible(with_exec_visible),
+          wire_list_read_fn_(wire_list_read_fn) {
         if (yuzu::test::pg_admin_dsn_env() == nullptr) {
             SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
         }
@@ -250,6 +293,11 @@ struct RestGsHarness {
         REQUIRE(store->is_open());
         baseline_store = std::make_unique<BaselineStore>(bl_db_file.path);
         REQUIRE(baseline_store->is_open());
+
+        auth_routes_ =
+            std::make_unique<AuthRoutes>(auth_cfg_, auth_mgr_, &rbac_, api_tokens_.get(),
+                                         /*audit_store=*/nullptr, &mgmt_, /*tag_store=*/nullptr,
+                                         /*analytics_store=*/nullptr, oidc_mu_, oidc_provider_);
 
         if (wire_live_deps && resp_pool) {
             resp_store = std::make_unique<ResponseStore>(*resp_pool, /*retention_days=*/0);
@@ -322,6 +370,15 @@ struct RestGsHarness {
                 return false;
             }
             return true;
+        };
+
+        // ADR-0017: the fleet /status route's SOLE gate — a REAL
+        // AuthRoutes::require_list_read call, not a stub (see the
+        // auth_routes_ member comment above for why).
+        auto list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                   const std::string& type,
+                                   const std::string& op) -> yuzu::server::ListReadGate {
+            return auth_routes_->require_list_read(req, res, type, op);
         };
 
         // PR W1.1 UP-H1: AuditFn typedef → std::function<bool(...)>. Returns
@@ -415,7 +472,52 @@ struct RestGsHarness {
                                                                -> yuzu::server::authz::VisibleSet {
                                       return exec_visible_override;
                                   }}
-                                : RestApiV1::ExecVisibleFn{});
+                                : RestApiV1::ExecVisibleFn{},
+                            wire_list_read_fn_ ? RestApiV1::ListReadFn{list_read_fn}
+                                               : RestApiV1::ListReadFn{});
+    }
+
+    // The fleet /status route's real AuthRoutes::require_list_read gate needs
+    // an actual authenticated request — unlike every other route in this
+    // harness, still gated by the stub auth_fn/perm_fn above (the
+    // session_user/session_scope_service stub fields do NOT reach this
+    // route). Mints a cookie session for the CURRENT session_user/
+    // session_role and returns headers carrying it; a test that reassigns
+    // session_user before calling this (the DenyAll/AdmitAll/AdmitScoped
+    // [adr0017] cases) gets a session for the new principal.
+    std::unordered_map<std::string, std::string> status_route_headers() {
+        REQUIRE(!session_user.empty());
+        REQUIRE(auth_mgr_.upsert_user(session_user, "password1234", session_role));
+        auto token =
+            auth_mgr_.create_local_session(session_user, session_role, /*mfa_verified=*/true);
+        return {{"Cookie", "yuzu_session=" + token}};
+    }
+
+    // A JIT-elevated session (mirrors the production /api/v1/elevate route)
+    // for the route-level elevated-admits-unfiltered regression test — pins
+    // the SEC-7 regression (an elevated session with zero RBAC grants
+    // getting denied) at the surface where it actually shipped.
+    std::unordered_map<std::string, std::string> elevated_status_route_headers() {
+        REQUIRE(!session_user.empty());
+        REQUIRE(auth_mgr_.upsert_user(session_user, "password1234", auth::Role::user));
+        auto token = auth_mgr_.create_local_session(session_user, auth::Role::user,
+                                                     /*mfa_verified=*/true);
+        REQUIRE(auth_mgr_.elevate_session(token, std::chrono::seconds(300)).has_value());
+        return {{"Cookie", "yuzu_session=" + token}};
+    }
+
+    // A real service-scoped API token (Bearer) for the fleet route's
+    // service-scoped-token denial test — the stub auth_fn's
+    // session_scope_service knob doesn't reach this route once list_read_fn
+    // resolves its own session from headers instead.
+    std::unordered_map<std::string, std::string>
+    service_scoped_token_headers(const std::string& service) {
+        REQUIRE(!session_user.empty());
+        REQUIRE(auth_mgr_.upsert_user(session_user, "password1234", session_role));
+        auto raw = api_tokens_->create_token("svc-token-" + service, session_user,
+                                             now_epoch() + 3600, service, "");
+        REQUIRE(raw.has_value());
+        return {{"Authorization", "Bearer " + *raw}};
     }
 
     // Seed a Guard rule (name resolves in the route's list_rules() lookup).
@@ -1135,7 +1237,7 @@ TEST_CASE("REST gs.status: returns store rule_count rollup", "[pg][rest][guarant
                       RestGsHarness::make_rule_body("r-001", "rule-a"))
                 ->status == 201);
 
-    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -1173,7 +1275,7 @@ TEST_CASE("REST gs.status: errored_rules is real, census-derived and DISTINCT-ru
     h.seed_status("e3", "WS-1", "r2", "guard.unhealthy", "2026-06-20T10:00:00Z");
     h.seed_status("e4", "WS-1", "r3", "guard.compliant", "2026-06-20T10:00:00Z");
 
-    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -1198,7 +1300,7 @@ TEST_CASE("REST gs.status: an errored census row for a DELETED rule is excluded 
     // race the actual delete path).
     h.seed_status("e2", "WS-1", "r-orphan", "guard.unhealthy", "2026-06-20T10:00:00Z");
 
-    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -1206,32 +1308,50 @@ TEST_CASE("REST gs.status: an errored census row for a DELETED rule is excluded 
     CHECK(j["data"]["total_rules"].get<int>() == 1);
 }
 
+TEST_CASE("REST gs.status: an unwired list_read_fn fails closed (503, mirrors "
+          "wire_scoped_perm=false on the per-device route)",
+          "[pg][rest][guaranteed_state][status]") {
+    RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/true,
+                    /*with_exec_visible=*/true, /*resp_pool=*/nullptr,
+                    /*wire_list_read_fn=*/false);
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
 TEST_CASE("REST gs.status: a service-scoped token is denied outright (World-A / ADR-0017)",
           "[pg][rest][guaranteed_state][status]") {
     // Adversarial-review finding: require_permission's service-scoped-token branch
     // checks only the ITServiceOwner role, never the token's own service tag scope —
     // so a bare perm_fn pass alone would let a token scoped to one service read the
-    // fleet-wide aggregate. This route denies a service-scoped token outright.
+    // fleet-wide aggregate. require_list_read (the route's SOLE gate since the #3038
+    // fix) denies a service-scoped token outright, regardless of role. A REAL token
+    // now (not the session_token_scope_service stub) — the stub session never
+    // reaches this route once list_read_fn resolves its own session from headers.
     RestGsHarness h;
-    h.session_token_scope_service = "printers";
-
-    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status",
+                          h.service_scoped_token_headers("printers"));
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(res->body.find("errored_rules") == std::string::npos);
-    // Governance SEC-4/COMP-1: the denial was previously silent in the audit trail
-    // despite an in-code comment claiming parity with the (audited) session-revoke
-    // self-target guard. Now audited.
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "guaranteed_state.status.denied");
-    CHECK(h.audit_log[0].result == "denied");
-    CHECK(h.audit_log[0].detail.find("printers") != std::string::npos);
+    // Audit coverage for require_list_read's own denial path (via
+    // AuthRoutes::audit_log, action "auth.permission_required") is exercised
+    // directly in test_auth_list_read_gate.cpp / test_authz_topology_floor.cpp's
+    // sibling methods — this harness's audit_log vector is fed by a SEPARATE
+    // stub audit_fn used by every OTHER route, which the fleet route no longer
+    // calls (require_list_read renders its own denial + audit row internally).
 }
 
 // ── ADR-0017 authorize_list_read confinement on the fleet route (adversarial-
 // review + second-opinion finding: this was previously a bare perm_fn gate, a
 // policy-floor violation of the routed-concern MUST/never clause, independent
-// of exploitability — CLAUDE.md severity rule 2). ────────────────────────────
+// of exploitability — CLAUDE.md severity rule 2). Rewritten (#3038 correction)
+// to route through the REAL AuthRoutes::require_list_read gate via
+// list_read_fn — the composition bug in the first fix attempt (perm_fn
+// stacked with a direct authorize_list_read call) shipped BECAUSE the stub
+// perm_fn used elsewhere in this harness unconditionally granted, so it never
+// exercised the actual require_permission/authorize_list_read interaction.
+// See status_route_headers()'s doc comment. ─────────────────────────────────
 
 TEST_CASE("REST gs.status: no GuaranteedState:Read grant anywhere denies with 403 (DenyAll)",
           "[pg][rest][guaranteed_state][status][adr0017]") {
@@ -1239,13 +1359,30 @@ TEST_CASE("REST gs.status: no GuaranteedState:Read grant anywhere denies with 40
     h.rbac_.set_rbac_enabled(true); // enforcement in effect; no roles/grants created
     h.session_user = "nobody";
 
-    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(res->body.find("errored_rules") == std::string::npos);
-    REQUIRE(h.audit_log.size() == 1);
-    CHECK(h.audit_log[0].action == "guaranteed_state.status.denied");
-    CHECK(h.audit_log[0].result == "denied");
+}
+
+TEST_CASE("REST gs.status: an elevated session is admitted unfiltered without any RBAC grant "
+          "(SEC-7 regression pinned at the route surface where it shipped)",
+          "[pg][rest][guaranteed_state][status][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true); // enforcement in effect; no roles/grants created
+    h.session_user = "elevated_user";
+
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.elevated_status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    // Elevation is unfiltered fleet-wide, despite zero RBAC grants.
+    CHECK(j["data"]["errored_rules"].get<int>() == 1);
+    CHECK(j["data"]["total_rules"].get<int>() == 1);
 }
 
 TEST_CASE("REST gs.status: a global GuaranteedState:Read grant sees the unfiltered fleet count "
@@ -1265,7 +1402,7 @@ TEST_CASE("REST gs.status: a global GuaranteedState:Read grant sees the unfilter
     h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
     h.seed_status("e2", "WS-2", "r2", "guard.unhealthy", "2026-06-20T10:00:00Z");
 
-    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -1275,7 +1412,9 @@ TEST_CASE("REST gs.status: a global GuaranteedState:Read grant sees the unfilter
 }
 
 TEST_CASE("REST gs.status: a management-group-confined grant scopes errored_rules to visible "
-          "agents only (AdmitScoped)",
+          "agents only (AdmitScoped) — proves the two gates now COMPOSE, the exact bug the "
+          "first #3038 fix attempt shipped (a confined caller was 403'd by perm_fn before "
+          "authorize_list_read was ever reached)",
           "[pg][rest][guaranteed_state][status][adr0017]") {
     RestGsHarness h;
     h.rbac_.set_rbac_enabled(true);
@@ -1289,7 +1428,9 @@ TEST_CASE("REST gs.status: a management-group-confined grant scopes errored_rule
     REQUIRE(gid.has_value());
     REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value()); // WS-1 visible; WS-2 is not
     // Group-SCOPED grant, deliberately NOT a global RbacStore::assign_role - carol
-    // can see only what RegionA can see.
+    // can see only what RegionA can see. carol has NO global grant of any kind, so
+    // the old (broken) perm_fn-stacked-with-authorize_list_read shape would have
+    // denied her 403 before authorize_list_read ever ran.
     REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
     h.session_user = "carol";
 
@@ -1300,7 +1441,7 @@ TEST_CASE("REST gs.status: a management-group-confined grant scopes errored_rule
     h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z"); // visible
     h.seed_status("e2", "WS-2", "r2", "guard.unhealthy", "2026-06-20T10:00:00Z"); // NOT visible
 
-    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
     REQUIRE(res);
     CHECK(res->status == 200);
     auto j = nlohmann::json::parse(res->body);
@@ -1332,7 +1473,7 @@ TEST_CASE("REST gs.status: AdmitScoped with zero visible agents contributes noth
                 ->status == 201);
     h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
 
-    auto res = h.sink.Get("/api/v1/guaranteed-state/status");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
     REQUIRE(res);
     // AdmitScoped with an empty visible set is 200 + zero, not a 403 - the caller has a
     // real grant, it simply resolves to no visible agents (INV-2).

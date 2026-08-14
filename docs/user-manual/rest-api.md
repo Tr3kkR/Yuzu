@@ -5583,19 +5583,23 @@ the `guardian_agent_rule_status` census, intersected against the live rule catal
 (a census row for a since-deleted rule is excluded) — the source of truth also
 behind the dashboard's Unhealthy Guards card, not the (reaped, 30-day) event log.
 `compliant_rules` and `drifted_rules` stay `0` deliberately — full status ingest
-(`action=="status"`) lands in a later rung. A **service-scoped API token is denied
-(`403`) outright**: this route aggregates across every agent's census, and a token
-scoped to one service must not read the fleet-wide count. For every other caller,
-the route is **management-group-confined** via the ADR-0017 admit-then-filter
-`authorize_list_read` chokepoint: a global `GuaranteedState:Read` grant sees the
-fleet-wide count, a management-group-confined grant sees `errored_rules` scoped to
-that operator's visible agents only, and a caller with no grant anywhere is refused
-with `403`. `total_rules` is never confined — it is the size of the global rule
-catalogue, which has no agent or management-group dimension.
+(`action=="status"`) lands in a later rung. This route's SOLE authorization gate is
+`AuthRoutes::require_list_read` (ADR-0017 admit-then-filter; never the flat
+`require_permission`, which does not consult management groups and cannot be
+stacked with a separate confinement check — the two do not compose). A
+**service-scoped API token is denied (`403`) outright**: this route aggregates
+across every agent's census, and a token scoped to one service must not read the
+fleet-wide count. For every other caller, the route is **management-group-confined**:
+a global `GuaranteedState:Read` grant sees the fleet-wide count, a
+management-group-confined grant sees `errored_rules` scoped to that operator's
+visible agents only (applied in SQL before the aggregate, ADR-0017 INV-3), and a
+caller with no grant anywhere is refused with `403`. `total_rules` is never
+confined — it is the size of the global rule catalogue, which has no agent or
+management-group dimension.
 
-- **Permission:** `GuaranteedState:Read` (non-service-scoped; management-group confined via ADR-0017)
+- **Permission:** `GuaranteedState:Read` (non-service-scoped; management-group confined via `AuthRoutes::require_list_read`, ADR-0017)
 - **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
-- **4xx/5xx:** `403` for a service-scoped token or a caller with no `GuaranteedState:Read` grant anywhere; `503` if the Guaranteed State store, RBAC store, or list-read resolver is unavailable or degraded — never a silent `0`.
+- **4xx/5xx:** `403` for a service-scoped token or a caller with no `GuaranteedState:Read` grant anywhere; `503` if the Guaranteed State store or the list-read gate is unwired or degraded — never a silent `0`.
 
 #### `GET /api/v1/guaranteed-state/status/{agent_id}`
 

@@ -1043,8 +1043,11 @@ pending full status ingest, tracked separately.
   for a management-group-**confined** (not global) `GuaranteedState:Read`
   grant — new. This route moved from a bare global permission check (any
   authenticated `GuaranteedState:Read` holder got the unfiltered
-  fleet-wide count) to `RbacStore::authorize_list_read` (ADR-0017
-  admit-then-filter). A caller with no `GuaranteedState:Read` grant at all
+  fleet-wide count) to `AuthRoutes::require_list_read` — the route's SOLE
+  gate (ADR-0017 admit-then-filter; never stacked with the flat
+  `require_permission`, which does not consult management groups and
+  cannot compose with a separate confinement check bolted on afterward). A
+  caller with no `GuaranteedState:Read` grant at all
   (global or via any management group) now gets `403` instead of `200`. A
   caller whose grant is confined to specific management groups now sees
   `errored_rules` scoped to their **visible agents only**, not the whole
@@ -1093,9 +1096,11 @@ previously got `200` with placeholder data, the same confinement
 `/guaranteed-state/device-compliance` has always enforced; (c) holds a
 management-group-**confined** grant and polls the **fleet** route
 (`/status`) — that call still gets `200`, but `errored_rules` now reflects
-only the caller's visible agents rather than the whole fleet, and a caller
-whose confinement resolves to zero visible agents anywhere now gets `403`
-where they previously got `200` with the unfiltered fleet count; or (d)
+only the caller's visible agents rather than the whole fleet; a real grant
+that resolves to ZERO visible agents (an empty or agent-less management
+group) is still `200` with `errored_rules: 0` (ADR-0017 INV-2 — a real
+grant that is simply narrow is not a denial), distinct from holding no
+`GuaranteedState:Read` grant anywhere, which is `403` on either route; or (d)
 treats every response as `200` — both routes can now return `403`/`503`
 and a client that does not already retry on `5xx` (standard practice for
 every other Guaranteed State route) should add that handling. No change
