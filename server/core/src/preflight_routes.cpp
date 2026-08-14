@@ -209,6 +209,7 @@ std::vector<std::pair<std::string, std::string>> recent_runs(PreflightRunStore* 
 } // namespace
 
 bool PreflightRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
+                                           const std::string& action,
                                            const std::string& audit_detail) const {
     auto session = auth_fn_(req, res);
     if (!session)
@@ -224,8 +225,7 @@ bool PreflightRoutes::deny_service_scoped_(const httplib::Request& req, httplib:
             403, "service-scoped tokens may not access this fleet-wide pre-flight surface", cid,
             detail::A4ErrorOpts{.permission = "Infrastructure:Read"}),
         "application/json");
-    (void)detail::try_persist_audit(audit_fn_, req, "preflight.run", "denied", "Scope", "",
-                                    audit_detail);
+    (void)detail::try_persist_audit(audit_fn_, req, action, "denied", "Scope", "", audit_detail);
     return true;
 }
 
@@ -278,7 +278,7 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
         // service-scoped token shares its creating principal's username
         // (ApiToken::principal_id) — it would otherwise enumerate fleet-wide
         // run ids/scope labels outside its own service (SEC-2/SEC-3 class).
-        if (deny_service_scoped_(req, res,
+        if (deny_service_scoped_(req, res, "preflight.run",
                                  "pre-flight saved-runs rail denied to a service-scoped token"))
             return;
         if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))
@@ -302,7 +302,7 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
         // token shares its creating principal's username — it could otherwise
         // delete evidence for a fleet-wide run outside its own service
         // (SEC-2/SEC-3 class).
-        if (deny_service_scoped_(req, res,
+        if (deny_service_scoped_(req, res, "preflight.run.delete",
                                  "pre-flight run delete denied to a service-scoped token"))
             return;
         // A destructive mutation → the Execute tier (you needed Execute to create
@@ -458,7 +458,7 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
         // creating principal's username — it would otherwise read back the
         // full fleet-wide device grid for a run outside its own service
         // (SEC-2/SEC-3 class; found via Gate 4 unhappy-path review).
-        if (deny_service_scoped_(req, res,
+        if (deny_service_scoped_(req, res, "preflight.run",
                                  "pre-flight result poll denied to a service-scoped token"))
             return;
         if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))

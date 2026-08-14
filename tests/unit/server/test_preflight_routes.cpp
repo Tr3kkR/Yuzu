@@ -362,7 +362,7 @@ TEST_CASE("preflight routes: rail/result/delete deny a service-scoped token "
     REQUIRE(run_store.get_run(run_id, "alice").has_value());
 
     REQUIRE(audit_log.size() == 3);
-    CHECK(audit_log[0] == "preflight.run|denied");
-    CHECK(audit_log[1] == "preflight.run|denied");
-    CHECK(audit_log[2] == "preflight.run|denied");
+    CHECK(audit_log[0] == "preflight.run|denied");         // rail
+    CHECK(audit_log[1] == "preflight.run|denied");         // result poll
+    CHECK(audit_log[2] == "preflight.run.delete|denied");  // delete — own verb
 }

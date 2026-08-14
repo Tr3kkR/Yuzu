@@ -134,9 +134,14 @@ private:
     /// confine it to its OWN service the way `token_scope_service` requires.
     /// A token scoped to e.g. "printers" would otherwise read/delete/enumerate
     /// a fleet-wide run its own principal created interactively. Writes the
-    /// 403 FIRST, audits after via the shared try_persist_audit kernel.
-    /// Returns true iff denied (caller returns immediately).
+    /// 403 FIRST, audits after via the shared try_persist_audit kernel, under
+    /// `action` (gov Gate 6 enterprise-readiness: the delete route's denial
+    /// must land under its own `preflight.run.delete` verb, not the generic
+    /// `preflight.run` — a SIEM rule keyed on the delete verb would otherwise
+    /// see zero denials while they were actually occurring). Returns true iff
+    /// denied (caller returns immediately).
     [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
+                                            const std::string& action,
                                             const std::string& audit_detail) const;
 
     AuthFn auth_fn_;
