@@ -126,6 +126,19 @@ public:
                          CollectFn collect_fn, AuditFn audit_fn, PreflightRunStore* run_store);
 
 private:
+    /// Deny a service-scoped API token on an `/auto` Pre-flight surface that
+    /// scopes by `session->username` alone (the run rail, result poll, and
+    /// delete) — SEC-2/SEC-3 confinement-gap class: `ApiToken::principal_id`
+    /// ("username... who created it") means a service-scoped token shares its
+    /// creating human's username, so username-only owner-scoping does not
+    /// confine it to its OWN service the way `token_scope_service` requires.
+    /// A token scoped to e.g. "printers" would otherwise read/delete/enumerate
+    /// a fleet-wide run its own principal created interactively. Writes the
+    /// 403 FIRST, audits after via the shared try_persist_audit kernel.
+    /// Returns true iff denied (caller returns immediately).
+    [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
+                                            const std::string& audit_detail) const;
+
     AuthFn auth_fn_;
     PermFn perm_fn_;
     DevicesFn devices_fn_;

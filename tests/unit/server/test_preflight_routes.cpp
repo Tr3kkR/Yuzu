@@ -296,3 +296,73 @@ TEST_CASE("preflight routes: /fragments/auto/run reaches resolve_targets + "
             saw_success = true;
     CHECK(saw_success);
 }
+
+// SEC-2/SEC-3 confinement-gap class (Gate 4 unhappy-path review, UP-1):
+// /fragments/auto (rail), /fragments/auto/result, and /fragments/auto/delete
+// all scope by session->username alone — but ApiToken::principal_id ("the
+// username... who created it") means a service-scoped token shares its
+// creating principal's username. A token scoped to e.g. "printers" whose
+// principal ALSO happens to be the interactive creator of a fleet-wide
+// pre-flight run could otherwise read/enumerate/delete that run — full
+// fleet-wide device data, not just its own service's.
+TEST_CASE("preflight routes: rail/result/delete deny a service-scoped token "
+          "sharing the run creator's username, run survives and is not "
+          "leaked",
+          "[pg][preflight][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
+    const auto t = now_ms();
+    const std::string run_id = "run-confinement-1";
+    auto run = make_run(run_id, t); // created_by = "alice"
+    REQUIRE(run_store.create_run(run, {{"agent-1", "host-1", "windows"}}));
+
+    // The SAME principal ("alice") now authenticates with a service-scoped
+    // token — mirrors ApiToken::principal_id sharing the creator's username.
+    auto serviceScopedAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.username = "alice";
+        s.token_scope_service = "printers";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+
+    PreflightRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, serviceScopedAuth, okPerm, /*devices_fn=*/{}, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, /*dispatch_fn=*/{}, /*collect_fn=*/{}, audit,
+                           &run_store);
+
+    auto rail = sink.Get("/fragments/auto");
+    REQUIRE(rail);
+    CHECK(rail->status == 403);
+    CHECK(rail->body.find(run_id) == std::string::npos);
+    CHECK(rail->body.find(run.name) == std::string::npos);
+
+    auto result = sink.Get("/fragments/auto/result?run=" + run_id);
+    REQUIRE(result);
+    CHECK(result->status == 403);
+    CHECK(result->body.find(run.scope_label) == std::string::npos);
+    CHECK(result->body.find("host-1") == std::string::npos); // no device identity leaked
+
+    auto del = sink.Post("/fragments/auto/delete?run=" + run_id, "",
+                         "application/x-www-form-urlencoded");
+    REQUIRE(del);
+    CHECK(del->status == 403);
+    // The run survives — the deny fires before delete_run is ever called.
+    REQUIRE(run_store.get_run(run_id, "alice").has_value());
+
+    REQUIRE(audit_log.size() == 3);
+    CHECK(audit_log[0] == "preflight.run|denied");
+    CHECK(audit_log[1] == "preflight.run|denied");
+    CHECK(audit_log[2] == "preflight.run|denied");
+}

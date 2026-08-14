@@ -1388,7 +1388,14 @@ void RestApiV1::register_routes(
         const auto cid = detail::make_correlation_id();
         res.set_header("X-Correlation-Id", cid);
         res.status = 403;
-        res.set_content(detail::error_json_a4(403, message, cid), "application/json");
+        // Every current caller gates on GuaranteedState:Read (gov Gate 4
+        // consistency review: every other 403 this permission gate produces,
+        // via require_permission, carries .permission — this was the one
+        // that didn't).
+        res.set_content(
+            detail::error_json_a4(403, message, cid,
+                                  detail::A4ErrorOpts{.permission = "GuaranteedState:Read"}),
+            "application/json");
         return true;
     };
 

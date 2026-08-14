@@ -208,6 +208,27 @@ std::vector<std::pair<std::string, std::string>> recent_runs(PreflightRunStore* 
 
 } // namespace
 
+bool PreflightRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
+                                           const std::string& audit_detail) const {
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return true; // auth_fn_ already wrote the response (401/etc).
+    if (session->token_scope_service.empty())
+        return false;
+    const auto cid = detail::make_correlation_id();
+    // Write the 403 FIRST, audit after (mirrors DexRoutes/GuardianRoutes'
+    // deny_service_scoped_): a throwing audit_fn_ must not suppress the 403.
+    res.status = 403;
+    res.set_content(
+        detail::error_json_a4(
+            403, "service-scoped tokens may not access this fleet-wide pre-flight surface", cid,
+            detail::A4ErrorOpts{.permission = "Infrastructure:Read"}),
+        "application/json");
+    (void)detail::try_persist_audit(audit_fn_, req, "preflight.run", "denied", "Scope", "",
+                                    audit_detail);
+    return true;
+}
+
 void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                       DevicesFn devices_fn, GroupsFn groups_fn,
                                       GroupMembersFn group_members_fn, DispatchFn dispatch_fn,
@@ -253,6 +274,13 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
             res.set_content("auth required", "text/plain");
             return;
         }
+        // The saved-runs rail is username-scoped (recent_runs below), and a
+        // service-scoped token shares its creating principal's username
+        // (ApiToken::principal_id) — it would otherwise enumerate fleet-wide
+        // run ids/scope labels outside its own service (SEC-2/SEC-3 class).
+        if (deny_service_scoped_(req, res,
+                                 "pre-flight saved-runs rail denied to a service-scoped token"))
+            return;
         if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))
             return;
         std::vector<std::pair<std::string, std::string>> groups;
@@ -270,6 +298,13 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
             res.set_content("auth required", "text/plain");
             return;
         }
+        // Owner-scoped by username (delete_run below), and a service-scoped
+        // token shares its creating principal's username — it could otherwise
+        // delete evidence for a fleet-wide run outside its own service
+        // (SEC-2/SEC-3 class).
+        if (deny_service_scoped_(req, res,
+                                 "pre-flight run delete denied to a service-scoped token"))
+            return;
         // A destructive mutation → the Execute tier (you needed Execute to create
         // the run), not a read tier (#governance least-privilege).
         if (!perm_fn_ || !perm_fn_(req, res, "Execution", "Execute"))
@@ -419,6 +454,13 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
             res.set_content("auth required", "text/plain");
             return;
         }
+        // OWNER-SCOPED by username below, and a service-scoped token shares its
+        // creating principal's username — it would otherwise read back the
+        // full fleet-wide device grid for a run outside its own service
+        // (SEC-2/SEC-3 class; found via Gate 4 unhappy-path review).
+        if (deny_service_scoped_(req, res,
+                                 "pre-flight result poll denied to a service-scoped token"))
+            return;
         if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))
             return;
         if (!run_store_) {

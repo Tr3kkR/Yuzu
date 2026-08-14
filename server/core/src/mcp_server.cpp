@@ -3214,29 +3214,6 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, "mcp." + tool_name, result_status, "mcp_tool", tool_name, detail);
             };
 
-            // Deny a fleet-wide GuaranteedState:Read tool call to a
-            // service-scoped API token, with a denial audit. MCP sibling of
-            // REST's deny_fleet_wide_service_scoped (rest_api_v1.cpp) — same
-            // rationale: require_permission's service-token branch checks
-            // only the ITServiceOwner ROLE, never the token's own
-            // service-tag scope, so perm_fn alone is not confinement for a
-            // fleet-wide per-agent read with no per-agent parameter to scope
-            // against (the REST siblings of get_dex_signal_detail,
-            // list_dex_perf_devices, and list_network_devices all needed
-            // this same fix — Gate 8 review found the MCP twins share the
-            // gap the REST fix closed). `session` is already resolved once
-            // for the whole request above — no auth_fn call needed here.
-            auto deny_fleet_wide_service_scoped =
-                [&](const std::string& action, const std::string& target_type,
-                    const std::string& audit_detail, const std::string& message) -> bool {
-                if (session->token_scope_service.empty())
-                    return false;
-                (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, "denied",
-                                                              target_type, "", audit_detail);
-                res.set_content(error_response(id, kPermissionDenied, message), "application/json");
-                return true;
-            };
-
             // A4 error envelope for the MCP layer (#1470). The shared tier /
             // approval chokepoints below gate ~13 tools from one code path, so a
             // single helper here makes the whole family A4-consistent: every error
@@ -3286,6 +3263,34 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 data += "}";
                 return error_response(id, code, message, data);
+            };
+
+            // Deny a fleet-wide GuaranteedState:Read tool call to a
+            // service-scoped API token, with a denial audit. MCP sibling of
+            // REST's deny_fleet_wide_service_scoped (rest_api_v1.cpp) — same
+            // rationale: require_permission's service-token branch checks
+            // only the ITServiceOwner ROLE, never the token's own
+            // service-tag scope, so perm_fn alone is not confinement for a
+            // fleet-wide per-agent read with no per-agent parameter to scope
+            // against (the REST siblings of get_dex_signal_detail,
+            // list_dex_perf_devices, and list_network_devices all needed
+            // this same fix — Gate 8 review found the MCP twins share the
+            // gap the REST fix closed). `session` is already resolved once
+            // for the whole request above — no auth_fn call needed here.
+            // Routed through a4_error (defined just above) rather than a bare
+            // error_response, so this denial carries the same correlation_id
+            // /retry_after_ms/remediation envelope as every sibling MCP
+            // denial in this family (gov Gate 4 consistency review: it
+            // previously didn't).
+            auto deny_fleet_wide_service_scoped =
+                [&](const std::string& action, const std::string& target_type,
+                    const std::string& audit_detail, const std::string& message) -> bool {
+                if (session->token_scope_service.empty())
+                    return false;
+                (void)yuzu::server::detail::try_persist_audit(audit_fn, req, action, "denied",
+                                                              target_type, "", audit_detail);
+                res.set_content(a4_error(kPermissionDenied, message), "application/json");
+                return true;
             };
 
             // A4 envelope that also carries the durable execution handle. Used by

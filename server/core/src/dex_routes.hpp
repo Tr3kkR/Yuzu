@@ -424,11 +424,17 @@ private:
     /// a service token whose principal resolves to an unscoped grant. Writes the
     /// 403 FIRST (mirrors GuardianRoutes::deny_service_scoped_ — a throwing
     /// audit_fn_ must not be able to suppress the 403), audits after via the
-    /// shared try_persist_audit kernel. Returns true iff denied (caller returns
-    /// immediately); false means the caller should proceed to perm_fn_.
+    /// shared try_persist_audit kernel. `target_type` defaults to
+    /// "GuaranteedState" (every caller but the per-signal fragment, whose
+    /// dex.signal.view contract — the REST/MCP twins, and audit-log.md — uses
+    /// "ObsType"; gov Gate 4 consistency review: the denial row must match its
+    /// own verb's established target_type, not silently diverge from it).
+    /// Returns true iff denied (caller returns immediately); false means the
+    /// caller should proceed to perm_fn_.
     [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
                                             const std::string& action,
-                                            const std::string& audit_detail) const;
+                                            const std::string& audit_detail,
+                                            const std::string& target_type = "GuaranteedState") const;
 
     AuthFn auth_fn_;
     PermFn perm_fn_;

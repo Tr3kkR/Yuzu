@@ -2597,8 +2597,8 @@ std::string render_dex_perf_panel(const std::vector<DexPerfPoint>& points) {
 }
 
 bool DexRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
-                                     const std::string& action,
-                                     const std::string& audit_detail) const {
+                                     const std::string& action, const std::string& audit_detail,
+                                     const std::string& target_type) const {
     auto session = auth_fn_(req, res);
     if (!session)
         return true; // auth_fn_ already wrote the response (401/etc).
@@ -2613,7 +2613,7 @@ bool DexRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Respo
             403, "service-scoped tokens may not read this fleet-wide DEX view", cid,
             detail::A4ErrorOpts{.permission = "GuaranteedState:Read"}),
         "application/json");
-    (void)detail::try_persist_audit(audit_fn_, req, action, "denied", "GuaranteedState", "",
+    (void)detail::try_persist_audit(audit_fn_, req, action, "denied", target_type, "",
                                     audit_detail);
     return true;
 }
@@ -2765,7 +2765,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                  if (deny_service_scoped_(req, res, "dex.signal.view",
                                           "fleet-wide DEX signal most-affected-devices list "
                                           "denied to a service-scoped token (dashboard "
-                                          "fragment)"))
+                                          "fragment)",
+                                          "ObsType"))
                      return;
                  if (!perm_fn_(req, res, "GuaranteedState", "Read"))
                      return;
