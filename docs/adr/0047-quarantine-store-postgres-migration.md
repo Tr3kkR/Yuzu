@@ -81,18 +81,38 @@ quarantine list.
 
 ### Race-safe writes (no in-process mutex)
 
+**Neither mutator trusts a bare `PGRES_COMMAND_OK`/`PGRES_TUPLES_OK` status to mean its `WHERE`
+actually matched a row** — that status is identical whether the predicate matched zero rows or
+one, the same defect class the `NotificationStore` Postgres port's `mark_read`/`dismiss` shipped
+(bare-status-only, no row-affected confirmation). The stakes differ in direction, not in kind, from
+that store's read-adjacent case: a silent no-op `release_device` is the INVERSE of a fail-open
+read — the device stays quarantined while the caller (and any automation reading the `200`
+response) believes it was just freed. Both mutators here confirm via `RETURNING` +
+`PQntuples()`, never a bare command-status check:
+
 - `quarantine_device`: a single `INSERT ... ON CONFLICT (agent_id) WHERE status = 'active' DO
   NOTHING RETURNING id`, targeting the partial unique index above. `PQntuples() == 0` means the
   conflict fired (an active record already exists) → `unexpected("device is already
-  quarantined")`. Replaces the legacy check-then-insert-under-mutex; verified against a live
-  Postgres instance (`docs/postgres-store-playbook.md`'s explicit warning that `ON CONFLICT ...
-  WHERE` semantics are easy to get subtly wrong by reasoning alone).
+  quarantined")` — the playbook's generic `RETURNING` + `PQntuples() == 1` idiom for a
+  first-writer-wins insert. Replaces the legacy check-then-insert-under-mutex; verified against a
+  live Postgres instance (`docs/postgres-store-playbook.md`'s explicit warning that `ON CONFLICT
+  ... WHERE` semantics are easy to get subtly wrong by reasoning alone).
 - `release_device`: a single guarded `UPDATE ... SET status = 'released', released_at = $1 WHERE
   agent_id = $2 AND status = 'active' RETURNING id` (the `#3062`/`cancel_job` pattern this
   kickoff's lessons-learned section calls out). `PQntuples() == 0` → `unexpected("device is not
-  quarantined")`.
+  quarantined")` — the row-confirmation check the kickoff's lessons-learned item 6 names the
+  *pattern* for but does not itself spell out the verification step; named explicitly here so a
+  future edit cannot regress to a bare status check without touching a comment that says why not.
 
 Both retire `sqlite3_changes()` (#1033) in favor of `RETURNING`.
+
+**`is_open()` checked at every entry point, not just reads.** All three surfaces —
+`GET`/`POST /api/v1/quarantine`, `DELETE /api/v1/quarantine/{agent_id}`, and the MCP
+`quarantine_device` tool — gate on `quarantine_store && quarantine_store->is_open()` before doing
+any store work, not merely a null-pointer check. This closes the same asymmetry left as an
+unresolved LOW on the `NotificationStore` Postgres port (its `POST` routes null-checked the store
+pointer but skipped `is_open()`, while its `GET` route checked both) — widened here from "reads"
+to every route so quarantine does not inherit that gap.
 
 **`400` vs `503` classification (`kQuarantineDbErrorPrefix`).** Every genuine store/pool/query
 failure on `quarantine_device`/`release_device` is prefixed `"db_error: "`; a business/state error

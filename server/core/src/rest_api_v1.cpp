@@ -4171,7 +4171,7 @@ void RestApiV1::register_routes(
             // if scoped_perm_fn is unwired, never fall back to an unfiltered list.
             if (!auth_fn(req, res))
                 return;
-            if (!quarantine_store) {
+            if (!quarantine_store || !quarantine_store->is_open()) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
@@ -4216,7 +4216,7 @@ void RestApiV1::register_routes(
         // CDX-P1-02: authenticate first (401 before any store/body work).
         if (!auth_fn(req, res))
             return;
-        if (!quarantine_store) {
+        if (!quarantine_store || !quarantine_store->is_open()) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
@@ -4272,7 +4272,7 @@ void RestApiV1::register_routes(
             // CDX-P1-02: authenticate first (401 before any store work).
             if (!auth_fn(req, res))
                 return;
-            if (!quarantine_store) {
+            if (!quarantine_store || !quarantine_store->is_open()) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;

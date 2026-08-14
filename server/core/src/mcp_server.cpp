@@ -7721,7 +7721,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // quarantine (mirror POST /api/v1/quarantine) AND dispatches the live
             // quarantine-plugin isolation via the same DispatchFn chain.
             if (tool_name == "quarantine_device") {
-                if (!quarantine_store) {
+                if (!quarantine_store || !quarantine_store->is_open()) {
                     res.set_content(
                         error_response(id, kInternalError, "Quarantine store unavailable"),
                         "application/json");
