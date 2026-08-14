@@ -442,6 +442,120 @@ TEST_CASE("compute_dispatch_tag: decodes to the classification supplied, and its
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// finalize_classified_command — the composition build_classified_command
+// runs AFTER classify_and_authorize_dispatch succeeds: the per-action kill
+// switch (M6/branch-review HIGH) and BR-009 canonical wire names (M6/MEDIUM).
+// Before this extraction NEITHER was reachable from a unit test — both lived
+// inline in ServerImpl::build_classified_command, a private member with no
+// live-Session-free construction path — so a revert of either behaviour
+// would have shipped silently. Mirrors classify_and_authorize_dispatch's own
+// section above: bind the shared function every real call site funnels
+// through, never a from-scratch re-implementation.
+// ═════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+constexpr CommandCapability kTarPurgeCap{
+    .plugin = "tar",
+    .action = "purge_source",
+    .dispatch_class = DispatchClass::Mutating,
+    .mutability = Mutability::Reversible,
+    .securable = "Infrastructure",
+    .operation = authz::Operation::Write,
+    .risk_tier = authz::RiskTier::Medium,
+    .system_reserved = false,
+};
+
+} // namespace
+
+TEST_CASE("finalize_classified_command: the per-action kill switch refuses AFTER classification, "
+          "naming the classified securable — never a permissive default on a thrown switch",
+          "[server][dispatch][chokepoint]") {
+    std::function<bool(std::string_view, std::string_view)> switch_off =
+        [](std::string_view, std::string_view) { return false; };
+
+    auto result = finalize_classified_command(kTarPurgeCap, switch_off, "tar", "purge_source",
+                                               "cmd-1", {}, {}, 0, 0, {}, {});
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().reason == DispatchDenialReason::KillSwitched);
+    // Names the securable classification already resolved — an incident
+    // review distinguishing "kill-switched on Infrastructure:Write" from a
+    // bare denial needs this, exactly as the Forbidden path does above.
+    CHECK(result.error().securable == "Infrastructure");
+    CHECK(result.error().operation == authz::Operation::Write);
+}
+
+TEST_CASE("finalize_classified_command: the kill switch is consulted on the CLASSIFIED plugin.action, "
+          "not the caller's raw spelling",
+          "[server][dispatch][chokepoint]") {
+    // A callback that only recognizes the canonical spelling — if
+    // finalize_classified_command consulted the caller's raw "TAR"/"PURGE_SOURCE"
+    // instead of cap.plugin/cap.action, this would (wrongly) refuse.
+    std::function<bool(std::string_view, std::string_view)> canonical_only =
+        [](std::string_view plugin, std::string_view action) {
+            return plugin == "tar" && action == "purge_source";
+        };
+
+    auto result = finalize_classified_command(kTarPurgeCap, canonical_only, "TAR", "PURGE_SOURCE",
+                                               "cmd-2", {}, {}, 0, 0, {}, {});
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("finalize_classified_command: an unwired kill-switch callback is legacy-open, mirroring "
+          "an absent PluginConfigStore in production — never a hard refusal",
+          "[server][dispatch][chokepoint]") {
+    std::function<bool(std::string_view, std::string_view)> unwired; // empty — no store wired
+
+    auto result = finalize_classified_command(kTarPurgeCap, unwired, "tar", "purge_source", "cmd-3",
+                                               {}, {}, 0, 0, {}, {});
+    REQUIRE(result.has_value());
+}
+
+TEST_CASE("finalize_classified_command: BR-009 — the wire command carries the CANONICAL "
+          "plugin/action the catalogue resolved, never the caller's raw casing",
+          "[server][dispatch][chokepoint]") {
+    std::function<bool(std::string_view, std::string_view)> switch_on =
+        [](std::string_view, std::string_view) { return true; };
+
+    // Caller dispatched with a differently-cased spelling — classify() is
+    // case-insensitive so this would have been authorized against kTarPurgeCap,
+    // but the agent matches the wire fields case-SENSITIVELY.
+    auto result = finalize_classified_command(kTarPurgeCap, switch_on, "TAR", "Purge_Source",
+                                               "cmd-4", {}, {}, 0, 0, {}, {});
+    REQUIRE(result.has_value());
+    CHECK(result->wire().plugin() == "tar");
+    CHECK(result->wire().action() == "purge_source");
+    CHECK(result->wire().command_id() == "cmd-4");
+}
+
+TEST_CASE("finalize_classified_command: parameters, payload, stagger and delay reach the wire "
+          "command verbatim, and the dispatch tag is composed over the CALLER's raw plugin/action "
+          "(not the canonical spelling) — matching what compute_dispatch_tag always received",
+          "[server][dispatch][chokepoint]") {
+    std::function<bool(std::string_view, std::string_view)> switch_on =
+        [](std::string_view, std::string_view) { return true; };
+    const std::unordered_map<std::string, std::string> params{{"path", "/var/log"}};
+
+    auto result =
+        finalize_classified_command(kTarPurgeCap, switch_on, "TAR", "purge_source", "cmd-5",
+                                    params, "payload-bytes", 5, 10, "ids", "exec-9");
+    REQUIRE(result.has_value());
+    CHECK(result->wire().parameters().at("path") == "/var/log");
+    CHECK(result->wire().payload() == "payload-bytes");
+    CHECK(result->wire().stagger_seconds() == 5);
+    CHECK(result->wire().delay_seconds() == 10);
+
+    const std::map<std::string, std::string> ordered_params{{"path", "/var/log"}};
+    auto decoded = decode_dispatch_tag(result->wire().dispatch_tag());
+    REQUIRE(decoded.has_value());
+    // Composed over "TAR" (the raw caller spelling this test passed), the
+    // SAME asymmetry build_classified_command has always had: the wire
+    // fields are canonicalized, the plan-hash inputs are not.
+    CHECK(decoded->plan_hash ==
+          compute_plan_hash("TAR", "purge_source", ordered_params, "ids", "exec-9"));
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 // AgentRegistry::send_to/send_to_all — the defensive belt-and-braces tag
 // check (PLAN item 3) and the gateway routed-path capability check (item 5).
 // ═════════════════════════════════════════════════════════════════════════

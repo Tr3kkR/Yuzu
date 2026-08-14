@@ -208,6 +208,23 @@ compute_dispatch_tag(const CommandCapability& cap, std::string_view plugin, std:
         compute_plan_hash(plugin, action, parameters, target_arm, execution_id));
 }
 
+class ClassifiedCommand; // Forward decl — completed below; needed as an
+                         // incomplete type by the declaration immediately
+                         // following.
+
+/// Forward declaration so `ClassifiedCommand` can friend it below — the
+/// definition (which needs the completed class) follows the class. Default
+/// arguments live here, the one declaration every caller and the friend
+/// grant both see; the out-of-class definition repeats none of them (a
+/// second default-argument set on the same declaration is ill-formed).
+[[nodiscard]] inline std::expected<ClassifiedCommand, DispatchDenial> finalize_classified_command(
+    const CommandCapability& cap,
+    const std::function<bool(std::string_view plugin, std::string_view action)>& action_allowed,
+    std::string_view raw_plugin, std::string_view raw_action, const std::string& command_id,
+    const std::unordered_map<std::string, std::string>& parameters = {},
+    const std::string& payload = {}, int stagger_seconds = 0, int delay_seconds = 0,
+    const std::string& target_arm = {}, const std::string& execution_id = {});
+
 /// PLAN item 3 (PLAN-011, provenance not syntax): the type-level guarantee
 /// that a `pb::CommandRequest` reaching `AgentRegistry::send_to`/`send_to_all`
 /// passed through `ServerImpl::build_classified_command` — a syntactically
@@ -215,11 +232,11 @@ compute_dispatch_tag(const CommandCapability& cap, std::string_view plugin, std:
 /// is a public, pure helper any caller could stamp onto a hand-built proto.
 /// The guarantee is therefore a TYPE invariant: PRIVATE constructor, no public
 /// setter, no public conversion that yields a mutable `pb::CommandRequest` —
-/// only `ServerImpl` (production) and `ClassifiedCommandTestAccess` (tests,
-/// mirroring `EngineLivenessTestAccess` in `engine_principal_store.hpp`) may
-/// construct one. A caller that hand-builds a protobuf cannot reach the
-/// registry at all: there is no overload of `send_to`/`send_to_all` that
-/// accepts one.
+/// only `ServerImpl` (production), `finalize_classified_command` (production,
+/// below), and `ClassifiedCommandTestAccess` (tests, mirroring
+/// `EngineLivenessTestAccess` in `engine_principal_store.hpp`) may construct
+/// one. A caller that hand-builds a protobuf cannot reach the registry at
+/// all: there is no overload of `send_to`/`send_to_all` that accepts one.
 class ClassifiedCommand {
 public:
     /// Read-only view of the wire command. Deliberately a named accessor
@@ -231,11 +248,76 @@ public:
 private:
     friend class yuzu::server::ServerImpl;
     friend struct ClassifiedCommandTestAccess;
+    friend std::expected<ClassifiedCommand, DispatchDenial> finalize_classified_command(
+        const CommandCapability&, const std::function<bool(std::string_view, std::string_view)>&,
+        std::string_view, std::string_view, const std::string&,
+        const std::unordered_map<std::string, std::string>&, const std::string&, int, int,
+        const std::string&, const std::string&);
 
     explicit ClassifiedCommand(pb::CommandRequest cmd) : cmd_(std::move(cmd)) {}
 
     pb::CommandRequest cmd_;
 };
+
+/// The composition step `ServerImpl::build_classified_command` runs AFTER
+/// `classify_and_authorize_dispatch` succeeds — extracted for the identical
+/// reason that function was: a from-scratch copy inside a test is how a
+/// shared rule silently drifts from what production actually enforces, and
+/// until this extraction NOTHING unit-tested it directly (M6, wave1
+/// remediation). Two behaviours live here, both revert-survivor-sensitive:
+///
+/// 1. **The per-action kill switch.** `action_allowed` is injected exactly
+///    like `classify_and_authorize_dispatch`'s `has_permission` — the
+///    production binder wraps `PluginConfigStore::action_allowed`, fail-closed
+///    by that store's own contract (a closed store, a lease timeout, or a
+///    query failure all report "not allowed"). An empty/unset callback means
+///    no kill-switch store is wired at all (legacy-open for THIS gate,
+///    mirroring how an absent `plugin_config_store_` behaves in
+///    `server.cpp`) — never call this with a callback that unconditionally
+///    returns `true` "to be safe"; that reintroduces exactly the ZERO-callers
+///    gap this composition exists to close.
+/// 2. **BR-009 canonical wire names.** The wire command is built from `cap`'s
+///    catalogue-resolved spelling (`cap.plugin`/`cap.action`), never the
+///    caller's raw strings — `classify()` is case-insensitive but the agent
+///    matches case-SENSITIVELY, so a caller passing `plugin="TAR"` would
+///    otherwise be authorized here and rejected on the endpoint. `raw_plugin`/
+///    `raw_action` are threaded through ONLY into the dispatch-tag hash
+///    (`compute_dispatch_tag`), unchanged from what `build_classified_command`
+///    always passed there — the hash and the wire fields are deliberately
+///    fed different spellings and this preserves that, rather than "fixing"
+///    it as part of an unrelated extraction.
+[[nodiscard]] inline std::expected<ClassifiedCommand, DispatchDenial> finalize_classified_command(
+    const CommandCapability& cap,
+    const std::function<bool(std::string_view plugin, std::string_view action)>& action_allowed,
+    std::string_view raw_plugin, std::string_view raw_action, const std::string& command_id,
+    const std::unordered_map<std::string, std::string>& parameters,
+    const std::string& payload, int stagger_seconds, int delay_seconds,
+    const std::string& target_arm, const std::string& execution_id) {
+    if (action_allowed && !action_allowed(cap.plugin, cap.action)) {
+        return std::unexpected(
+            DispatchDenial{DispatchDenialReason::KillSwitched, std::string(cap.securable),
+                           cap.operation});
+    }
+
+    pb::CommandRequest cmd;
+    cmd.set_command_id(command_id);
+    cmd.set_plugin(std::string(cap.plugin));
+    cmd.set_action(std::string(cap.action));
+    for (const auto& [k, v] : parameters)
+        (*cmd.mutable_parameters())[k] = v;
+    if (!payload.empty())
+        cmd.set_payload(payload);
+    if (stagger_seconds > 0)
+        cmd.set_stagger_seconds(stagger_seconds);
+    if (delay_seconds > 0)
+        cmd.set_delay_seconds(delay_seconds);
+
+    const std::map<std::string, std::string> ordered_params(parameters.begin(), parameters.end());
+    cmd.set_dispatch_tag(
+        compute_dispatch_tag(cap, raw_plugin, raw_action, ordered_params, target_arm, execution_id));
+
+    return ClassifiedCommand(std::move(cmd));
+}
 
 /// Test-only door to the private constructor above (#2367 pattern — mirrors
 /// `EngineLivenessTestAccess`, `engine_principal_store.hpp`, identical

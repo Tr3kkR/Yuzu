@@ -8114,14 +8114,18 @@ private:
 
         const auto& cap = *decision;
 
-        // PER-ACTION KILL SWITCH (branch review / adversarial HIGH). Until this
-        // wiring landed, `PluginConfigStore::action_allowed` had ZERO production
-        // callers while `/api/v1/plugin-config/{plugin}/kill-switch` told the
-        // operator it was "a reliable emergency stop" — an operator could throw
-        // the switch mid-incident, get a 200, and watch the action keep running.
-        // The claim is only true if a dispatch path actually consults it, and
-        // this is that path: the single command builder every CommandRequest
-        // producer routes through.
+        // PER-ACTION KILL SWITCH + BR-009 canonical wire names (branch review /
+        // adversarial HIGH + MEDIUM). Until the kill-switch wiring landed,
+        // `PluginConfigStore::action_allowed` had ZERO production callers while
+        // `/api/v1/plugin-config/{plugin}/kill-switch` told the operator it was
+        // "a reliable emergency stop" — an operator could throw the switch
+        // mid-incident, get a 200, and watch the action keep running. Both
+        // behaviours are composed by `finalize_classified_command`
+        // (agent_registry.hpp) rather than inlined here, so the composition
+        // itself — not just its two pieces in isolation — is directly
+        // unit-testable without a live `ServerImpl`/`PluginConfigStore` (M6,
+        // wave1 remediation: this composition previously had no discriminating
+        // test and was a silent revert target).
         //
         // Placed AFTER classification+authorization deliberately: an unclassified
         // or forbidden dispatch should report that, not be masked by a kill
@@ -8131,46 +8135,31 @@ private:
         // config store disables the action rather than silently permitting it
         // (ADR-0036). It is checked on EVERY dispatch and never memoized: an
         // emergency stop that takes effect on the next cache expiry is not one.
-        if (plugin_config_store_ != nullptr &&
-            !plugin_config_store_->action_allowed(cap.plugin, cap.action)) {
+        auto finalized = yuzu::server::detail::finalize_classified_command(
+            cap,
+            plugin_config_store_ != nullptr
+                ? std::function<bool(std::string_view, std::string_view)>(
+                      [this](std::string_view p, std::string_view a) {
+                          return plugin_config_store_->action_allowed(p, a);
+                      })
+                : std::function<bool(std::string_view, std::string_view)>{},
+            plugin, action, command_id, parameters, payload, stagger_seconds, delay_seconds,
+            target_arm, execution_id);
+
+        if (!finalized) {
+            // The only denial `finalize_classified_command` can produce is
+            // KillSwitched — classification/authorization already succeeded
+            // above.
             metrics_.counter("yuzu_server_dispatch_denied_total", {{"reason", "kill_switched"}})
                 .increment();
             spdlog::warn("dispatch denied: {}:{} reason=kill_switched caller={}", plugin, action,
                          caller.system ? std::string("system")
                                        : (caller.principal.empty() ? std::string("(anonymous)")
                                                                    : caller.principal));
-            return std::unexpected(yuzu::server::detail::DispatchDenial{
-                yuzu::server::detail::DispatchDenialReason::KillSwitched,
-                std::string(cap.securable), cap.operation});
+            return std::unexpected(finalized.error());
         }
 
-        detail::pb::CommandRequest cmd;
-        cmd.set_command_id(command_id);
-        // BR-009: build the wire from the CANONICAL names the catalogue holds,
-        // not the caller's raw strings. `classify()` is deliberately
-        // case-insensitive on both halves, but the agent matches plugin names
-        // case-SENSITIVELY (`cmd.plugin() == handle.descriptor()->name`), so a
-        // caller passing `plugin="TAR"` was authorized here and then rejected
-        // on the endpoint as "plugin not found". `cap` is the row classification
-        // just resolved, so its spelling is the one the catalogue and the agent
-        // agree on.
-        cmd.set_plugin(std::string(cap.plugin));
-        cmd.set_action(std::string(cap.action));
-        for (const auto& [k, v] : parameters)
-            (*cmd.mutable_parameters())[k] = v;
-        if (!payload.empty())
-            cmd.set_payload(payload);
-        if (stagger_seconds > 0)
-            cmd.set_stagger_seconds(stagger_seconds);
-        if (delay_seconds > 0)
-            cmd.set_delay_seconds(delay_seconds);
-
-        const std::map<std::string, std::string> ordered_params(parameters.begin(),
-                                                                 parameters.end());
-        cmd.set_dispatch_tag(yuzu::server::detail::compute_dispatch_tag(
-            cap, plugin, action, ordered_params, target_arm, execution_id));
-
-        return detail::ClassifiedCommand(std::move(cmd));
+        return *finalized;
     }
 
     /// A-3: the `ConfinedDispatchSink` literal both `dispatch_confined` and
