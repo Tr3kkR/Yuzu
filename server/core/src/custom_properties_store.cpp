@@ -200,7 +200,7 @@ CustomPropertiesStore::validate_against_schema(PGconn* conn, const std::string& 
         // with_txn_for callback aborts (the same "database write failed"
         // shape the INSERT already produces on its own failure) rather than
         // silently accepting an unvalidated write.
-        return std::unexpected("database error");
+        return std::unexpected(std::string(kCustomPropertiesDbErrorPrefix) + "database error");
     }
     if (PQntuples(res.get()) == 0)
         return std::optional<std::string>{std::nullopt}; // genuinely no schema for this key
@@ -398,7 +398,7 @@ std::expected<void, std::string>
 CustomPropertiesStore::set_property(const std::string& agent_id, const std::string& key,
                                     const std::string& value, const std::string& type) {
     if (!open_)
-        return std::unexpected("store not open");
+        return std::unexpected(std::string(kCustomPropertiesDbErrorPrefix) + "store not open");
     if (!validate_key(key))
         return std::unexpected("invalid property key (1-64 chars, alphanumeric/._:-)");
     if (!validate_value(value))
@@ -437,14 +437,14 @@ CustomPropertiesStore::set_property(const std::string& agent_id, const std::stri
             std::vector<std::string>{agent_id, key, sanitized_value, effective_type,
                                      std::to_string(now_secs())});
         if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1) {
-            schema_error = "database write failed";
+            schema_error = std::string(kCustomPropertiesDbErrorPrefix) + "database write failed";
             return false;
         }
         return true;
     });
     if (!ok) {
         if (schema_error.empty())
-            schema_error = "database error";
+            schema_error = std::string(kCustomPropertiesDbErrorPrefix) + "database error";
         return std::unexpected(schema_error);
     }
     return {};
@@ -526,40 +526,43 @@ std::vector<CustomPropertySchema> CustomPropertiesStore::list_schemas() const {
     return results;
 }
 
-std::optional<CustomPropertySchema>
+std::expected<std::optional<CustomPropertySchema>, CustomPropertiesReadError>
 CustomPropertiesStore::get_schema(const std::string& key) const {
-    if (!open_)
-        return std::nullopt;
+    if (!open_) {
+        spdlog::debug("CustomPropertiesStore::get_schema: store not open");
+        return std::unexpected(CustomPropertiesReadError::kDegraded);
+    }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::get_schema: no connection in time ({})",
                       pool_.last_error());
-        return std::nullopt;
+        return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "SELECT key, display_name, type, description, validation_regex "
         "FROM custom_properties_store.custom_property_schemas WHERE key = $1",
         std::vector<std::string>{key});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0) {
-        if (res.status() != PGRES_TUPLES_OK)
-            spdlog::debug("CustomPropertiesStore::get_schema: query failed: {}",
-                          PQerrorMessage(lease.get()));
-        return std::nullopt;
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::debug("CustomPropertiesStore::get_schema: query failed: {}",
+                      PQerrorMessage(lease.get()));
+        return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
+    if (PQntuples(res.get()) == 0)
+        return std::optional<CustomPropertySchema>{std::nullopt};
     CustomPropertySchema s;
     s.key = text_col(res.get(), 0, 0);
     s.display_name = text_col(res.get(), 0, 1);
     s.type = text_col(res.get(), 0, 2);
     s.description = text_col(res.get(), 0, 3);
     s.validation_regex = text_col(res.get(), 0, 4);
-    return s;
+    return std::optional<CustomPropertySchema>{std::move(s)};
 }
 
 std::expected<void, std::string>
 CustomPropertiesStore::upsert_schema(const CustomPropertySchema& schema) {
     if (!open_)
-        return std::unexpected("store not open");
+        return std::unexpected(std::string(kCustomPropertiesDbErrorPrefix) + "store not open");
     if (!validate_key(schema.key))
         return std::unexpected("invalid schema key");
 
@@ -579,7 +582,7 @@ CustomPropertiesStore::upsert_schema(const CustomPropertySchema& schema) {
 
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease)
-        return std::unexpected("database error");
+        return std::unexpected(std::string(kCustomPropertiesDbErrorPrefix) + "database error");
 
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -592,18 +595,21 @@ CustomPropertiesStore::upsert_schema(const CustomPropertySchema& schema) {
         std::vector<std::string>{schema.key, sanitize_pg_text(schema.display_name), schema.type,
                                  sanitize_pg_text(schema.description), schema.validation_regex});
     if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
-        return std::unexpected("database write failed");
+        return std::unexpected(std::string(kCustomPropertiesDbErrorPrefix) + "database write failed");
     return {};
 }
 
-bool CustomPropertiesStore::delete_schema(const std::string& key) {
-    if (!open_)
-        return false;
+std::expected<bool, CustomPropertiesReadError>
+CustomPropertiesStore::delete_schema(const std::string& key) {
+    if (!open_) {
+        spdlog::debug("CustomPropertiesStore::delete_schema: store not open");
+        return std::unexpected(CustomPropertiesReadError::kDegraded);
+    }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         spdlog::debug("CustomPropertiesStore::delete_schema: no connection in time ({})",
                       pool_.last_error());
-        return false;
+        return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -612,7 +618,7 @@ bool CustomPropertiesStore::delete_schema(const std::string& key) {
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("CustomPropertiesStore::delete_schema: query failed: {}",
                       PQerrorMessage(lease.get()));
-        return false;
+        return std::unexpected(CustomPropertiesReadError::kDegraded);
     }
     return PQntuples(res.get()) > 0;
 }

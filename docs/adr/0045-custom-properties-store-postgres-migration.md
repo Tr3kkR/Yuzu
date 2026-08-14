@@ -235,3 +235,40 @@ the server refuses to serve.
   umbrella issue across the ~15-store ladder rather than a per-store follow-up here.
 - Wave 2 continues with the other three parallel easy-store migrations
   (`NotificationStore`/`DiscoveryStore`/`DeploymentStore`); no ordering dependency on this one.
+
+## Update (2026-08-14) — write-path degrade classifier lands for `set_property`/`upsert_schema`
+
+The "Write-path degrade is not type-widened" follow-up above is now PARTIALLY resolved, per an
+adversarial re-review (fjarvis) of the merged PR #3065.
+
+`set_property` and `upsert_schema` keep their `std::expected<void, std::string>` shape, but every
+genuine DB/lease-failure `unexpected()` in both (store-not-open, pool-acquire timeout, the
+schema-validation lookup's own query failure, the write's own query failure) is now prefixed with
+the new public `kCustomPropertiesDbErrorPrefix` constant ("db_error: "), mirroring
+`DeploymentStore`'s `kDeploymentDbErrorPrefix` idiom. Their REST routes (`PUT
+/api/agents/:id/properties/:key`, `POST /api/property-schemas`) classify on that prefix and now
+return a distinguishable `503` for a genuine outage, `400` only for caller-input/schema-validation
+failures — closing the gap where a Postgres blip during either write was indistinguishable from
+the caller's own bad input. `docs/user-manual/rest-api.md`'s per-route notes are updated to match.
+
+`get_schema` and `delete_schema` are separately widened from a plain `std::optional`/`bool` to
+`std::expected<..., CustomPropertiesReadError>` (reusing the existing typed-read enum, not the
+string-prefix idiom — these are pure store-level API surface with **no current REST caller**;
+schema lookup/delete are only exposed today via `GET /api/property-schemas`'s bulk `list_schemas`).
+Widened ahead of a future caller inheriting the SQLite-era not-found/degrade conflation neither had
+a documented justification for (unlike `list_schemas`/`delete_property`, which the fjarvis review
+confirmed already carry adequate "why it's safe" reasoning and were deliberately left as-is).
+
+**Not fixed, deliberately:** `delete_property` and `list_schemas` keep their existing
+bool/plain-container shape — the fjarvis review found both already carry a recorded justification
+(admin-surface/non-scope-feeding, matching the prior SQLite contract), so there was no defect to
+fix, only ones lacking that reasoning (`get_schema`/`delete_schema`) or an active route bug
+(`set_property`/`upsert_schema`).
+
+**Known gap, disclosed rather than closed:** no REST-route-level test asserts the new 400-vs-503
+split for either route (the existing coverage is store-level, asserting the prefixed error string
+directly) — the route's classification is a single `if` branch mirroring `discovery_routes.cpp`'s
+already-tested `is_deployment_db_error` pattern, and building new route-level test infrastructure
+for these two handlers (which are registered inline in `server.cpp`, not through a separately
+testable `register_routes(HttpRouteSink&, ...)` overload) was judged disproportionate to this fix's
+scope.
