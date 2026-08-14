@@ -4921,7 +4921,10 @@ Cancel a running or pending deployment.
 
 ### License Management
 
-Manage Yuzu license entries, seat counts, and alerts.
+Manage Yuzu license entries, seat counts, and alerts. `LicenseStore` is currently not
+constructed by the server (licensing is deliberately shelved — `docs/adr/0048-license-store-postgres-migration.md`
+Context), so these routes do not register today; documented for when a future change re-wires
+them.
 
 #### `GET /api/v1/license`
 
@@ -4947,6 +4950,12 @@ Get the active license details, or `{"status": "none"}` if no license is active.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| A genuine database read failure | `503` |
 
 #### `POST /api/v1/license`
 
@@ -4974,6 +4983,14 @@ Activate a license.
 }
 ```
 
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| `license_key` or `organization` empty | `400` |
+| `license_key` already activated on another license | `400` — `license key already activated` |
+| A genuine database write failure | `503` |
+
 #### `DELETE /api/v1/license/{id}`
 
 Remove a license entry.
@@ -4981,6 +4998,13 @@ Remove a license entry.
 **Permission:** `License:Write`
 
 **Response:** `{"data": {"removed": true}, "meta": {"api_version": "v1"}}`
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| No license with this id | `404` |
+| A genuine database write failure | `503` |
 
 #### `GET /api/v1/license/alerts`
 
@@ -5010,6 +5034,12 @@ List license alerts (expiration warnings, seat limit approaching, etc.).
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| A genuine database read failure | `503` |
 
 ---
 

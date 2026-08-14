@@ -703,7 +703,7 @@ TEST_CASE("migrate_from_sqlite: a sourceless boot never blocks a later boot's re
 
     LegacyLicenseFixture legacy;
     legacy.id = "cccccccccccccccccccccccccccccccc";
-    legacy.license_key_hash = "hash-of-holder-key";
+    legacy.license_key_hash = "411586c0ebfa154ef4af3e0b5a90d4cf1103189288d7aa4e40d3e37d799ebc0d";
     legacy.organization = "Holder Replica Org";
     legacy.seat_count = 42;
     legacy.issued_at = 5000;
@@ -743,7 +743,7 @@ TEST_CASE("migrate_from_sqlite copies a populated legacy file (licenses + alerts
 
     LegacyLicenseFixture l1;
     l1.id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    l1.license_key_hash = "hash-a";
+    l1.license_key_hash = "400075069c197bbcb0114c66fdcaefa53e224de63bbe58f67f9af54691c996fa";
     l1.organization = "Legacy A";
     l1.seat_count = 10;
     l1.issued_at = 1000;
@@ -755,7 +755,7 @@ TEST_CASE("migrate_from_sqlite copies a populated legacy file (licenses + alerts
 
     LegacyLicenseFixture l2;
     l2.id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    l2.license_key_hash = "hash-b";
+    l2.license_key_hash = "580e36de86fe5fde24c0d67de903eacf0531bedc5c7e15020580624bf3fbd2f5";
     l2.organization = "Legacy B";
     l2.seat_count = 20;
     l2.issued_at = 2000;
@@ -808,7 +808,7 @@ TEST_CASE("migrate_from_sqlite fails closed when a legacy license id already exi
 
     LegacyLicenseFixture first;
     first.id = shared_id;
-    first.license_key_hash = "hash-first";
+    first.license_key_hash = "231c3d94a2bd219956a1d6e98e6294f1cf21f2a0c49bf7d064ae94c4916eb23b";
     first.organization = "First Org";
     first.seat_count = 10;
     first.issued_at = 1000;
@@ -848,6 +848,64 @@ TEST_CASE("migrate_from_sqlite fails closed when a legacy license id already exi
     CHECK_FALSE(store.migrate_from_sqlite(second_path));
 }
 
+// Regression test for gov security-guardian HIGH: seat_count is IDENTITY (activate_license sets
+// it once at INSERT, no other method mutates it — same write-once criterion as organization/
+// edition/etc.) but was initially omitted from BOTH identity_matches and lifecycle_matches,
+// so a legacy row differing ONLY in seat_count was misclassified as "identical content" and the
+// legacy value silently discarded. Isolates seat_count as the ONLY differing field — every
+// other identity-mismatch test in this file co-varies seat_count with another field, which
+// would not have caught this gap.
+TEST_CASE("migrate_from_sqlite fails closed when a legacy license's seat_count differs, even "
+          "when every other column matches",
+          "[license_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string shared_id = "2222222222222222222222222222222b";
+
+    LegacyLicenseFixture first;
+    first.id = shared_id;
+    first.license_key_hash = "872583a7bea1528eca57638560cc4bd65cd1843bbf86b25b73798986d573d551";
+    first.organization = "SeatCount Org";
+    first.seat_count = 10;
+    first.issued_at = 1000;
+    first.status = "active";
+    first.activated_at = 1000;
+    auto first_path =
+        yuzu::test::unique_temp_path("yuzu_test_license_seatcount_first") / "license.db";
+    std::filesystem::create_directories(first_path.parent_path());
+    write_legacy_sqlite_db(first_path, {first}, {});
+    REQUIRE(store.migrate_from_sqlite(first_path));
+
+    // ONLY seat_count differs — every other IDENTITY field (organization/edition/etc.) and
+    // every LIFECYCLE field (status/activated_at) is byte-identical to `first`.
+    LegacyLicenseFixture second = first;
+    second.seat_count = 500;
+    auto second_path =
+        yuzu::test::unique_temp_path("yuzu_test_license_seatcount_second") / "license.db";
+    std::filesystem::create_directories(second_path.parent_path());
+    write_legacy_sqlite_db(second_path, {second}, {});
+
+    std::string captured;
+    {
+        LogCapture capture;
+        CHECK_FALSE(store.migrate_from_sqlite(second_path));
+        captured = capture.str();
+    }
+    CHECK(captured.find("different IDENTITY") != std::string::npos);
+
+    // The original row's seat_count survives unchanged — never silently overwritten OR
+    // silently discarded as "identical".
+    auto licenses = store.list_licenses();
+    REQUIRE(licenses.has_value());
+    REQUIRE(licenses->size() == 1);
+    CHECK((*licenses)[0].seat_count == 10);
+
+    CHECK_FALSE(store.migrate_from_sqlite(second_path)); // retries fail the same way
+}
+
 TEST_CASE("migrate_from_sqlite treats an identical-content id conflict as a benign no-op",
           "[license_store][pg][backfill]") {
     YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
@@ -857,7 +915,7 @@ TEST_CASE("migrate_from_sqlite treats an identical-content id conflict as a beni
 
     LegacyLicenseFixture shared;
     shared.id = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
-    shared.license_key_hash = "hash-shared";
+    shared.license_key_hash = "4013d508e12061815ff5cf8de84009f5fd622e47efe4426a19defc85f8407bd2";
     shared.organization = "Shared Org";
     shared.seat_count = 10;
     shared.issued_at = 3000;
@@ -874,7 +932,7 @@ TEST_CASE("migrate_from_sqlite treats an identical-content id conflict as a beni
     // overall fingerprint, so it reaches the per-row conflict path.
     LegacyLicenseFixture new_lic;
     new_lic.id = "ffffffffffffffffffffffffffffffff";
-    new_lic.license_key_hash = "hash-new";
+    new_lic.license_key_hash = "b8465df8db6bbd15016aa10533813ca96ea51eb75dca4f1b60ce98ebcc964d2c";
     new_lic.organization = "New Org";
     new_lic.seat_count = 5;
     new_lic.issued_at = 3001;
@@ -904,7 +962,7 @@ TEST_CASE("migrate_from_sqlite treats a LIFECYCLE-only difference as a benign no
 
     LegacyLicenseFixture original;
     original.id = shared_id;
-    original.license_key_hash = "hash-progressed";
+    original.license_key_hash = "c3dc727e8a4ba1916eab901de821194563abb8bb6408f7238e5d43b4397a5c82";
     original.organization = "Progressed Org";
     original.seat_count = 10;
     original.issued_at = 4000;
@@ -928,7 +986,7 @@ TEST_CASE("migrate_from_sqlite treats a LIFECYCLE-only difference as a benign no
     LegacyLicenseFixture stale_snapshot = original; // identity fields byte-identical
     LegacyLicenseFixture padding;
     padding.id = "8888888888888888888888888888888b";
-    padding.license_key_hash = "hash-padding";
+    padding.license_key_hash = "2c5da24544a6a39f6d6b5681daff085fac91d8d27f3de348df5f465094356f49";
     padding.organization = "Padding Org";
     padding.seat_count = 5;
     padding.issued_at = 4001;
@@ -975,7 +1033,7 @@ TEST_CASE("migrate_from_sqlite fails closed when a legacy license's lifecycle is
 
     LegacyLicenseFixture original;
     original.id = shared_id;
-    original.license_key_hash = "hash-rolled-back";
+    original.license_key_hash = "ee063bbed55f3dcf976a57e62ecf07a9f46c7ae77e20d3f5875f3860e6d4ffe7";
     original.organization = "Rolled Back Org";
     original.seat_count = 10;
     original.issued_at = 5000;
@@ -1019,7 +1077,7 @@ TEST_CASE("migrate_from_sqlite fails closed when a legacy license reports a DIFF
 
     LegacyLicenseFixture original;
     original.id = shared_id;
-    original.license_key_hash = "hash-diverged";
+    original.license_key_hash = "efae9fda6c7921adc73deed474d3e62e2efd31547f3c05bb82376e167ea52718";
     original.organization = "Diverged Org";
     original.seat_count = 5;
     original.issued_at = 6000;
@@ -1070,7 +1128,7 @@ TEST_CASE("migrate_from_sqlite fails closed on a legacy license with an unrecogn
 
     LegacyLicenseFixture garbage;
     garbage.id = "5555555555555555555555555555555e";
-    garbage.license_key_hash = "hash-garbage";
+    garbage.license_key_hash = "29b62fa4d56a4075b9e43cd90acecc8ebfc31bfb89737e39b76c5ef7e05f86cf";
     garbage.organization = "Corrupt Org";
     garbage.seat_count = 5;
     garbage.issued_at = 7000;
@@ -1104,7 +1162,7 @@ TEST_CASE("migrate_from_sqlite fails closed on a legacy alert with an unrecognis
 
     LegacyLicenseFixture lic;
     lic.id = "4444444444444444444444444444444f";
-    lic.license_key_hash = "hash-alerttype";
+    lic.license_key_hash = "a8c68819511695b29e7feedfbc77cfe765d3c36d4f43e849767de7ebd119e776";
     lic.organization = "AlertType Org";
     lic.seat_count = 5;
     lic.issued_at = 8000;
@@ -1131,6 +1189,68 @@ TEST_CASE("migrate_from_sqlite fails closed on a legacy alert with an unrecognis
     CHECK(captured.find("unrecognised alert_type") != std::string::npos);
 
     // Nothing landed — including the license, since the whole transaction never even started.
+    auto licenses = store.list_licenses();
+    REQUIRE(licenses.has_value());
+    CHECK(licenses->empty());
+}
+
+// Regression test for gov architect SHOULD (Gate 3): the Gate-2 security-guardian MEDIUM fix
+// (is_valid_lowercase_hex gating legacy id/license_key_hash before either can reach Postgres)
+// had no dedicated test. Both fixtures below use a VALID status — the status check runs BEFORE
+// the hex checks in the scan loop (license_store.cpp), so an invalid-status fixture would trip
+// that gate first and false-green this test.
+TEST_CASE("migrate_from_sqlite fails closed on a legacy license with a malformed id or "
+          "license_key_hash, before ever reaching Postgres",
+          "[license_store][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("id is not 32 lowercase hex chars") {
+        LegacyLicenseFixture bad_id;
+        bad_id.id = "not-a-valid-hex-id";
+        bad_id.license_key_hash = std::string(64, '1'); // otherwise-valid 64-hex-char hash
+        bad_id.organization = "BadId Org";
+        bad_id.seat_count = 5;
+        bad_id.issued_at = 9000;
+        bad_id.status = "active"; // valid — isolates the id check
+        bad_id.activated_at = 9000;
+        auto path = yuzu::test::unique_temp_path("yuzu_test_license_bad_id") / "license.db";
+        std::filesystem::create_directories(path.parent_path());
+        write_legacy_sqlite_db(path, {bad_id}, {});
+
+        std::string captured;
+        {
+            LogCapture capture;
+            CHECK_FALSE(store.migrate_from_sqlite(path));
+            captured = capture.str();
+        }
+        CHECK(captured.find("invalid id") != std::string::npos);
+    }
+    SECTION("license_key_hash is not 64 lowercase hex chars") {
+        LegacyLicenseFixture bad_hash;
+        bad_hash.id = std::string(32, '1'); // otherwise-valid 32-hex-char id
+        bad_hash.license_key_hash = "not-a-valid-hex-hash";
+        bad_hash.organization = "BadHash Org";
+        bad_hash.seat_count = 5;
+        bad_hash.issued_at = 9100;
+        bad_hash.status = "active"; // valid — isolates the hash check
+        bad_hash.activated_at = 9100;
+        auto path = yuzu::test::unique_temp_path("yuzu_test_license_bad_hash") / "license.db";
+        std::filesystem::create_directories(path.parent_path());
+        write_legacy_sqlite_db(path, {bad_hash}, {});
+
+        std::string captured;
+        {
+            LogCapture capture;
+            CHECK_FALSE(store.migrate_from_sqlite(path));
+            captured = capture.str();
+        }
+        CHECK(captured.find("invalid license_key_hash") != std::string::npos);
+    }
+
+    // Nothing landed under either malformed-fixture path.
     auto licenses = store.list_licenses();
     REQUIRE(licenses.has_value());
     CHECK(licenses->empty());
@@ -1183,7 +1303,7 @@ TEST_CASE("migrate_from_sqlite: an overlapping legacy alert snapshot dedups via 
 
     LegacyLicenseFixture lic;
     lic.id = "3333333333333333333333333333333a";
-    lic.license_key_hash = "hash-alertdedup";
+    lic.license_key_hash = "e1b9288decdda00a2d1ca03e8947b4bd404e831ad8647d66f471ee6eb847a626";
     lic.organization = "AlertDedup Org";
     lic.seat_count = 5;
     lic.issued_at = 9000;
@@ -1247,13 +1367,17 @@ TEST_CASE("migrate_from_sqlite aborts unstamped on a mid-scan legacy read failur
         char idbuf[33];
         std::snprintf(idbuf, sizeof(idbuf), "%032x", i + 1);
         l.id = idbuf;
-        l.license_key_hash = "hash-" + std::to_string(i);
+        // 64 lowercase hex chars, unique per row (60 zeros + a 4-hex-digit row index) — must
+        // stay exactly 64 chars to satisfy is_valid_lowercase_hex's format validation.
+        char hashbuf[65];
+        std::snprintf(hashbuf, sizeof(hashbuf), "%060x%04x", 0, i);
+        l.license_key_hash = hashbuf;
         l.organization = "bulk-org-" + std::to_string(i) + "-padding-for-size-xxxxxxxxxxxxxxx";
         l.seat_count = i;
         l.issued_at = 1000 + i;
         l.status = "active";
         l.activated_at = 1000 + i;
-        bulk.push_back(l);
+        bulk.push_back(std::move(l));
     }
     write_legacy_sqlite_db(legacy_path, bulk, {});
 
@@ -1279,7 +1403,11 @@ TEST_CASE("migrate_from_sqlite aborts unstamped on a mid-scan legacy read failur
         CHECK_FALSE(store.migrate_from_sqlite(legacy_path));
         captured = capture.str();
     }
-    CHECK(captured.find("scan aborted mid-read") != std::string::npos);
+    // The full "legacy licenses scan aborted..." phrase, not just "scan aborted mid-read" (gov
+    // quality-engineer NICE) — that shorter substring is shared with the license_alerts scan's
+    // own abort message, so it wouldn't prove WHICH table's scan actually aborted. This fixture
+    // has 3000 license rows and 0 alerts, so only the licenses-scan branch can fire.
+    CHECK(captured.find("legacy licenses scan aborted mid-read") != std::string::npos);
 
     auto licenses = store.list_licenses();
     REQUIRE(licenses.has_value());

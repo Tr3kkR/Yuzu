@@ -29,7 +29,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <random>
 #include <string_view>
@@ -44,8 +43,10 @@ constexpr const char* kStoreName = "license_store";
 // (validate), same budget class as DeploymentStore (docs/adr/0043-...md).
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
-// validate() processes every currently-active license in one transaction; a generous budget
-// since it is a periodic background pass, not a request/response path.
+// validate()'s pool-ACQUIRE-wait budget only (with_txn_for, per pg_pool.hpp) — NOT a bound on
+// the transaction body's own execution time, which is governed solely by the pool's
+// per-connection statement_timeout GUC (playbook: "Pool connection setup†" quick fact). Set
+// generously since validate() is a periodic background pass, not a request/response path.
 constexpr std::chrono::milliseconds kValidateTimeout{10000};
 
 // gov UP-5 precedent (every migrated store on this ladder): bounded materialization regardless
@@ -116,6 +117,22 @@ int license_status_rank(std::string_view status) {
 bool is_valid_alert_type(std::string_view t) {
     return t == "expiry_warning" || t == "seat_limit_warning" || t == "expired" ||
            t == "exceeded";
+}
+
+// `id` (generate_id(), 32 lowercase hex chars) and `license_key_hash` (hash_key(), 64
+// lowercase hex chars) are both deterministically hex-formatted by every write path this store
+// owns. Validated here, before either can reach Postgres, for the same reason status/alert_type
+// are (gov security-guardian MEDIUM): an invalid-UTF-8 byte in a hand-edited/corrupted legacy
+// value would otherwise reach Postgres raw (sanitize_pg_text is applied to the OTHER free-text
+// columns but not these two) and fail the INSERT with an opaque server-side encoding error —
+// which, unlike a clear "unrecognised value" rejection here, retries identically on every future
+// boot against the same corrupt file, permanently bricking the mandatory backfill.
+bool is_valid_lowercase_hex(std::string_view s, std::size_t expected_len) {
+    if (s.size() != expected_len)
+        return false;
+    return std::all_of(s.begin(), s.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+    });
 }
 
 // ── Backfill fingerprinting ──────────────────────────────────────────────────
@@ -388,18 +405,17 @@ std::string generate_id() {
     return id;
 }
 
-// True iff sqlite_master lists a table named `table_name`; `out_exists` is only meaningful when
-// this returns true (a schema-probe DB error is reported via the false return).
-bool sqlite_table_exists(sqlite3* db, const char* table_name, bool& out_exists) {
+// Whether sqlite_master lists a table named `table_name`; `nullopt` on a schema-probe DB error
+// (never conflated with "table absent").
+std::optional<bool> sqlite_table_exists(sqlite3* db, const char* table_name) {
     SqliteStmt probe;
     if (sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?;",
                            -1, probe.addr(), nullptr) != SQLITE_OK)
-        return false;
+        return std::nullopt;
     sqlite3_bind_text(probe.get(), 1, table_name, -1, SQLITE_TRANSIENT);
     if (sqlite3_step(probe.get()) != SQLITE_ROW)
-        return false;
-    out_exists = sqlite3_column_int64(probe.get(), 0) > 0;
-    return true;
+        return std::nullopt;
+    return sqlite3_column_int64(probe.get(), 0) > 0;
 }
 
 } // namespace
@@ -438,8 +454,9 @@ LicenseStore::LicenseStore(pg::PgPool& pool) : pool_(pool) {
 //      alone makes one row injective but not the SEQUENCE of two variable-length sections.
 //
 // Per-row conflict handling on `licenses.id` (`ON CONFLICT (id) DO NOTHING`) partitions the
-// compared columns into IDENTITY (license_key_hash, organization, issued_at, expires_at,
-// edition, features_json — write-once at INSERT, no other method mutates them) and LIFECYCLE
+// compared columns into IDENTITY (license_key_hash, organization, seat_count, issued_at,
+// expires_at, edition, features_json — write-once at INSERT, no other method mutates them) and
+// LIFECYCLE
 // (status, activated_at — see ADR-0048 for why activated_at is classified LIFECYCLE despite
 // being write-once in the CURRENT code). An identity mismatch fails the boot closed. A
 // lifecycle-only difference is resolved by status-rank direction, exactly mirroring
@@ -489,15 +506,16 @@ bool LicenseStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pa
             return false;
         }
 
-        bool has_licenses = false;
-        bool has_alerts = false;
-        if (!sqlite_table_exists(legacy.get(), "licenses", has_licenses) ||
-            !sqlite_table_exists(legacy.get(), "license_alerts", has_alerts)) {
+        auto licenses_probe = sqlite_table_exists(legacy.get(), "licenses");
+        auto alerts_probe = sqlite_table_exists(legacy.get(), "license_alerts");
+        if (!licenses_probe || !alerts_probe) {
             spdlog::error("LicenseStore::migrate_from_sqlite: schema probe failed on legacy {}: "
                           "{}",
                           legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
             return false;
         }
+        const bool has_licenses = *licenses_probe;
+        const bool has_alerts = *alerts_probe;
 
         if (!has_licenses && !has_alerts) {
             // Present-but-schema-less file — same "nothing to protect" class as no file at all.
@@ -554,6 +572,25 @@ bool LicenseStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pa
                             "unrecognised status '{}' — refusing to stamp a backfill "
                             "containing it",
                             l.id, l.status);
+                        return false;
+                    }
+                    // gov security-guardian MEDIUM: id/license_key_hash are read raw and
+                    // skipped sanitize_pg_text (unlike organization/edition/features_json) —
+                    // validate their hex format before either can reach Postgres.
+                    if (!is_valid_lowercase_hex(l.id, 32)) {
+                        spdlog::error(
+                            "LicenseStore::migrate_from_sqlite: legacy licenses row has an "
+                            "invalid id '{}' (expected 32 lowercase hex chars) — refusing to "
+                            "stamp a backfill containing it",
+                            l.id);
+                        return false;
+                    }
+                    if (!is_valid_lowercase_hex(l.license_key_hash, 64)) {
+                        spdlog::error(
+                            "LicenseStore::migrate_from_sqlite: legacy licenses row {} has an "
+                            "invalid license_key_hash (expected 64 lowercase hex chars) — "
+                            "refusing to stamp a backfill containing it",
+                            l.id);
                         return false;
                     }
                     legacy_licenses.push_back(std::move(l));
@@ -719,10 +756,17 @@ bool LicenseStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pa
                 return false;
             }
             const LegacyLicenseRow stored = read_backfill_row(existing.get(), 0);
+            // seat_count is IDENTITY, not LIFECYCLE: activate_license sets it once at INSERT
+            // and no other method (remove_license/validate/acknowledge_alert) ever mutates it
+            // — same write-once criterion as organization/edition/features_json. Omitting it
+            // here would let a legacy row differing ONLY in seat_count be misclassified as
+            // "identical content" by lifecycle_matches below and silently discarded (gov
+            // security-guardian HIGH finding).
             const bool identity_matches =
                 stored.license_key_hash == l.license_key_hash &&
                 stored.organization == sanitize_pg_text(l.organization) &&
-                stored.issued_at == l.issued_at && stored.expires_at == l.expires_at &&
+                stored.seat_count == l.seat_count && stored.issued_at == l.issued_at &&
+                stored.expires_at == l.expires_at &&
                 stored.edition == sanitize_pg_text(l.edition) &&
                 stored.features_json == sanitize_pg_text(l.features_json);
             if (!identity_matches) {
@@ -730,10 +774,12 @@ bool LicenseStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pa
                 failure_detail =
                     std::string("legacy licenses row id='") + l.id +
                     "' already exists with DIFFERENT identity (stored: organization='" +
-                    stored.organization + "' edition='" + stored.edition + "' expires_at=" +
+                    stored.organization + "' edition='" + stored.edition +
+                    "' seat_count=" + std::to_string(stored.seat_count) + " expires_at=" +
                     std::to_string(stored.expires_at) + "; legacy: organization='" +
                     l.organization + "' edition='" + l.edition +
-                    "' expires_at=" + std::to_string(l.expires_at) +
+                    "' seat_count=" + std::to_string(l.seat_count) +
+                    " expires_at=" + std::to_string(l.expires_at) +
                     ") — refusing to silently discard it";
                 spdlog::error(
                     "LicenseStore::migrate_from_sqlite: row {} conflicts with different "
@@ -791,13 +837,18 @@ bool LicenseStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pa
         }
 
         for (const auto& a : legacy_alerts) {
+            // gov happy-path (Gate 4): license_id is read raw from the untrusted legacy file,
+            // same brick-the-backfill exposure sanitize_pg_text closes elsewhere — but it is a
+            // documented SOFT reference (no FK, an orphaned alert is legitimate), so it is
+            // sanitized here rather than hex-validated like licenses.id/license_key_hash: a
+            // format check would incorrectly reject a legitimately-diverged reference.
             pg::PgResult res = pg::exec_params(
                 conn,
                 "INSERT INTO license_store.license_alerts "
                 "(license_id, alert_type, message, triggered_at, acknowledged) "
                 "VALUES ($1,$2,$3,$4::bigint,$5) "
                 "ON CONFLICT (license_id, alert_type, triggered_at) DO NOTHING",
-                std::vector<std::string>{a.license_id, a.alert_type,
+                std::vector<std::string>{sanitize_pg_text(a.license_id), a.alert_type,
                                          sanitize_pg_text(a.message),
                                          std::to_string(a.triggered_at),
                                          a.acknowledged ? "true" : "false"});
@@ -827,7 +878,7 @@ bool LicenseStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pa
         return true;
     });
     if (!ok) {
-        const std::string& offending =
+        const std::string offending =
             failure_detail.empty() ? std::string("unknown (see the specific-row error above)")
                                    : failure_detail;
         if (row_conflict_guidance) {

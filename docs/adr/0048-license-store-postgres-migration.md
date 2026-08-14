@@ -88,7 +88,8 @@ cross-platform `hash_key()` helper — BCrypt on Windows, OpenSSL elsewhere, kep
 key is never persisted; `activate_license` receives it, hashes it, and discards it. This is a
 verify-only hash column, not envelope-encrypted secret material, so `SecretCodec` is not
 involved — this is exactly why this store sits in Wave 2 rather than the secret-gated Wave 3.
-No other column holds secret material (`security-guardian` confirms this at review).
+No other column holds secret material — confirmed by the `security-guardian` Gate 2 governance
+review (2026-08-14).
 
 ### Posture
 
@@ -178,9 +179,13 @@ no small-human-chosen-identifier collision risk `RbacStore` has to guard against
   length prefix closes the field-boundary case — this is the identical injectivity class
   `fjarvis` blocked #3062 on, one level up (rows within a section vs. sections within a file).
 - **`licenses` conflict handling partitions columns into IDENTITY and LIFECYCLE, per the
-  kickoff's explicit classification:** `license_key_hash`, `organization`, `issued_at`,
-  `expires_at`, `edition`, `features_json` are IDENTITY (write-once at INSERT — no other method
-  mutates them); `status` and `activated_at` are LIFECYCLE. Note that `activated_at` is, in the
+  kickoff's explicit classification:** `license_key_hash`, `organization`, `seat_count`,
+  `issued_at`, `expires_at`, `edition`, `features_json` are IDENTITY (write-once at INSERT — no
+  other method mutates them; `seat_count` was initially omitted from both this list and the
+  `identity_matches` comparison in code — a HIGH gov security-guardian finding, since it meets
+  this same write-once criterion and a legacy-only seat_count divergence would otherwise have
+  been silently discarded as "identical content" — fixed in both places); `status` and
+  `activated_at` are LIFECYCLE. Note that `activated_at` is, in the
   CURRENT code, also write-once in practice (no method updates it post-insert) — it is
   classified LIFECYCLE anyway, per the kickoff's explicit instruction, because that is the
   forgiving direction: a mismatch on a field that never actually diverges in today's code warns
@@ -209,9 +214,10 @@ no small-human-chosen-identifier collision risk `RbacStore` has to guard against
   `DeploymentStore`'s superset test exercises). The fix is a `UNIQUE (license_id, alert_type,
   triggered_at)` constraint plus `ON CONFLICT (license_id, alert_type, triggered_at) DO NOTHING`
   on the backfill insert — semantically sound (the same license, alert type, and trigger second
-  is definitionally the same event) and never tripped by live traffic (`add_alert`'s existing
-  24-hour app-level dedup window means two genuinely-distinct alerts of the same type for the
-  same license are never generated in the same second either). An `INSERT ... WHERE NOT EXISTS`
+  is definitionally the same event) and, as of this writing, never tripped by live traffic
+  (`add_alert`'s 24-hour app-level dedup window means two genuinely-distinct alerts of the same
+  type for the same license are never generated in the same second either — a future change
+  that shrinks that window would need to re-examine this claim). An `INSERT ... WHERE NOT EXISTS`
   without the DB constraint was considered and rejected: it reopens the READ COMMITTED
   fixed-snapshot race the playbook documents at length under `RbacStore`'s round-4
   bug — a concurrent revoke-and-reinsert can blow past a `WHERE NOT EXISTS` taken from a stale
