@@ -286,6 +286,21 @@ std::string trim_ascii_whitespace(std::string_view s) {
     auto e = s.find_last_not_of(" \t\r\n");
     return std::string(s.substr(b, e - b + 1));
 }
+
+namespace {
+// CustomPropertiesStore error classifier — same shape as discovery_routes.cpp's
+// is_deployment_db_error (internal linkage there via an anonymous namespace,
+// matched here rather than left as a bare external-linkage free function),
+// keyed off the SHARED constant (custom_properties_store.hpp) rather than a
+// local copy of the literal, so a future rename of the prefix can't silently
+// regress a classified 503 back to 400 (gov Gate 8 finding, fjarvis
+// re-review of PR #3065; the anonymous-namespace correction is a second Gate
+// 8 finding on THIS fix — cpp-expert/architect/consistency-auditor
+// independently, same round).
+bool is_custom_properties_db_error(const std::string& err) {
+    return err.starts_with(kCustomPropertiesDbErrorPrefix);
+}
+} // namespace
 } // namespace yuzu::server
 
 namespace yuzu::server {
@@ -1275,6 +1290,43 @@ public:
                           "counter");
         for (const auto result : {"completed", "fresh", "failed"})
             metrics_.counter("yuzu_server_mgmt_group_backfill_total", {{"result", result}});
+        // DiscoveryStore observability (ADR-0044). The read-degrade counter is
+        // the fail-closed signal: a non-zero rate means list_devices could not
+        // answer (store_not_open/pool_acquire_timeout/query_error) — /readyz
+        // stays green under pure pool saturation, so this is the read-path
+        // degrade signal for the discovered-device inventory.
+        metrics_.describe("yuzu_server_discovery_read_degrade_total",
+                          "DiscoveryStore list_devices reads that returned a degrade (nullopt) "
+                          "rather than a result, by reason "
+                          "(store_not_open/pool_acquire_timeout/query_error)",
+                          "counter");
+        for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"})
+            metrics_.counter("yuzu_server_discovery_read_degrade_total", {{"reason", reason}});
+        metrics_.describe("yuzu_server_discovery_backfill_total",
+                          "DiscoveryStore legacy-SQLite backfill outcomes by result "
+                          "(completed = rows migrated + reconciled; fresh = no legacy DB / empty; "
+                          "failed = fail-closed refusal). One-time at boot (ADR-0044)",
+                          "counter");
+        for (const auto result : {"completed", "fresh", "failed"})
+            metrics_.counter("yuzu_server_discovery_backfill_total", {{"result", result}});
+        // NotificationStore observability (ADR-0046). Two-way result split (not
+        // RbacStore/ManagementGroupStore/DiscoveryStore's three-way
+        // fresh/completed/failed) — this store's backfill is a single
+        // transaction with no multi-step outcome to report separately, so
+        // "fresh install" and "already-migrated skip" both collapse into
+        // result="success". This wrapper emits on EVERY boot (including
+        // already-migrated restarts), so a boot that never reaches this line
+        // — the failure mode YuzuNotificationBackfillFailing watches for —
+        // is visible as an absent series, not a "reaper" concern (this store
+        // has no retention/reap pass at all).
+        metrics_.describe("yuzu_server_notification_backfill_total",
+                          "One-time legacy notifications.db -> notification_store PostgreSQL "
+                          "backfill outcome on every boot, by result (success = fresh install, "
+                          "already-migrated skip, or a completed migration; failed = fail-closed, "
+                          "boot refused, next start retries). ADR-0046.",
+                          "counter");
+        for (const auto result : {"success", "failed"})
+            metrics_.counter("yuzu_server_notification_backfill_total", {{"result", result}});
         // Generic InventoryStore observability (ADR-0037 hardening round).
         metrics_.describe(
             "yuzu_inventory_ingest_dropped_total",
@@ -2103,6 +2155,57 @@ public:
                           "identity links and/or D2 login observations are silently not being "
                           "recorded",
                           "counter");
+        // ADR-2001 PR4a — the SAML analogue of the OIDC counter immediately
+        // above. Bumped by link_saml_login_to_scim on an upsert_saml_link
+        // failure (saml_scim_link.cpp). Same fail-OPEN posture: the SAML
+        // login itself always succeeds; a sustained non-zero rate means
+        // SAML identities are silently not being linked, and therefore
+        // WON'T be revoked on a later deprovision (the exact CC6.8 gap
+        // ADR-2001 exists to close) — same recurring pre-seed lesson as the
+        // block below (a purely-lazy metric is absent from /metrics until
+        // the first incident, which is exactly the wrong moment for an
+        // alert rule to discover the series does not exist yet).
+        metrics_.describe("yuzu_scim_saml_link_write_failures_total",
+                          "Total ADR-2001 PR4a SAML identity-link/login-observation writes that "
+                          "failed during SAML login (ScimStore outage) — the login itself "
+                          "always succeeds (fail-OPEN by design), but a sustained non-zero rate "
+                          "means SAML identities are silently not being linked and won't be "
+                          "revoked on deprovision",
+                          "counter");
+        // ADR-2001 #3072 — SAML D2 observability, caller/signal layer. Four
+        // new counters mirroring the OIDC D2 shape above, split per-protocol
+        // rather than labeled onto the OIDC series (the established
+        // ADR-2001 pattern — see the SAML link/deny counters above).
+        metrics_.describe("yuzu_scim_saml_link_unmatched_total",
+                          "Total SAML logins with a linkable NameID Format for which ZERO "
+                          "active SCIM resources matched the NameID as an externalId — the "
+                          "identity authenticated but could not be linked (no such SCIM user, "
+                          "or externalId drift between the IdP and SCIM provisioning)",
+                          "counter");
+        metrics_.describe("yuzu_scim_saml_link_ambiguous_total",
+                          "Total SAML logins with a linkable NameID Format for which MORE THAN "
+                          "ONE active SCIM resource matched the NameID as an externalId "
+                          "(ADR-2001 §2 mis-link guard) — a distinct, more actionable "
+                          "misconfiguration than ordinary link drift (duplicate/stale SCIM "
+                          "externalId), kept in its own series rather than folded into "
+                          "yuzu_scim_saml_link_unmatched_total",
+                          "counter");
+        metrics_.describe("yuzu_scim_saml_link_lookup_failures_total",
+                          "Total SAML logins with a linkable NameID Format for which the "
+                          "ScimStore active-externalId lookup itself could not answer (store "
+                          "outage, lease timeout, or a failed statement) — distinct from "
+                          "yuzu_scim_saml_link_unmatched_total (a genuine zero-match answer); "
+                          "a sustained non-zero rate means SAML link formation cannot even be "
+                          "attempted, not just that it is failing to match",
+                          "counter");
+        metrics_.describe("yuzu_scim_deprovision_saml_unlinked_total",
+                          "ADR-2001 #3072 SAML D2 tripwire: a deprovision resolved NO linked "
+                          "SAML identity for a slug, but a recorded SAML login observation "
+                          "shows a NameID matching that slug's externalId — the user DID "
+                          "authenticate via SAML but the identity link never formed (a "
+                          "deprovision that revoked nothing for a federated user who exists)",
+                          "counter");
+
         // ADR-2001 §4 — deny-at-login backstop. Bumped by
         // `oidc_login_denied_deprovisioned`'s two call sites in
         // auth_routes.cpp's /auth/callback (the primary pre-mint check and
@@ -2114,13 +2217,60 @@ public:
         // so a non-zero rate is not proof of a real deprovision alone — see
         // the metric description below and docs/user-manual/metrics.md.
         metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_total",
-                          "Total OIDC logins denied at /auth/callback because the identity's "
+                          "TOTAL OIDC logins denied at /auth/callback because the identity's "
                           "linked SCIM resource is deprovisioned (deactivated, or orphaned by a "
                           "hard-deleted scim_resources row) OR because the ScimStore could not "
                           "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
-                          "closing the re-login-mints-fresh-tokens window; correlate with the "
-                          "audit reason= field to distinguish a real deprovision from a store "
-                          "outage",
+                          "closing the re-login-mints-fresh-tokens window. This is the SUM of "
+                          "yuzu_auth_oidc_deprovisioned_denied_genuine_total and "
+                          "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total below — "
+                          "alert on the genuine sub-counter, not this total (#3069)",
+                          "counter");
+        // #3069 — split the total above into a genuine-deny signal and a
+        // store-unavailable signal. Both call sites in auth_routes.cpp
+        // already compute `decision.scim_id` to build the audit `reason=`
+        // string; these counters key off the SAME predicate (present =
+        // genuine, absent = store outage) rather than re-deriving it.
+        metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_genuine_total",
+                          "OIDC logins denied at /auth/callback because the identity's linked "
+                          "SCIM resource is genuinely deprovisioned (a real deactivated-identity "
+                          "re-login was refused) — the CC6.8-alertable signal; excludes "
+                          "store-unavailable fail-closed denies",
+                          "counter");
+        metrics_.describe("yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
+                          "OIDC logins denied at /auth/callback because the ScimStore could not "
+                          "be reached (fail-closed deny during a ScimStore outage) — an "
+                          "AVAILABILITY signal, not a termination event; correlate with "
+                          "PostgreSQL health, do not treat as a CC6.8 deprovision-deny",
+                          "counter");
+        // ADR-2001 §4 (PR4b) — the SAML analogue of the OIDC counter
+        // immediately above. Bumped by `saml_login_denied_deprovisioned`'s
+        // two call sites in auth_routes.cpp's /saml/acs (the primary
+        // pre-mint check and the post-mint re-check for the codex-caught
+        // concurrent-deprovision race) on every DENY.
+        metrics_.describe("yuzu_auth_saml_deprovisioned_denied_total",
+                          "TOTAL SAML logins denied at /saml/acs because the identity's linked "
+                          "SCIM resource is deprovisioned (deactivated, or orphaned by a "
+                          "hard-deleted scim_resources row) OR because the ScimStore could not "
+                          "be reached (fail-closed) — the ADR-2001 §4 deny-at-login backstop "
+                          "closing the re-login-mints-fresh-tokens window. This is the SUM of "
+                          "yuzu_auth_saml_deprovisioned_denied_genuine_total and "
+                          "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total below — "
+                          "alert on the genuine sub-counter, not this total (#3069)",
+                          "counter");
+        // #3069 — SAML analogue of the OIDC split above; same
+        // `decision.scim_id` predicate.
+        metrics_.describe("yuzu_auth_saml_deprovisioned_denied_genuine_total",
+                          "SAML logins denied at /saml/acs because the identity's linked SCIM "
+                          "resource is genuinely deprovisioned (a real deactivated-identity "
+                          "re-login was refused) — the CC6.8-alertable signal; excludes "
+                          "store-unavailable fail-closed denies",
+                          "counter");
+        metrics_.describe("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
+                          "SAML logins denied at /saml/acs because the ScimStore could not be "
+                          "reached (fail-closed deny during a ScimStore outage) — an "
+                          "AVAILABILITY signal, not a termination event; correlate with "
+                          "PostgreSQL health, do not treat as a CC6.8 deprovision-deny",
                           "counter");
         // describe() only registers HELP/TYPE metadata; the series is absent
         // from /metrics until first .increment(). Instantiate each bare
@@ -2130,8 +2280,19 @@ public:
         // docs/observability-conventions.md).
         metrics_.counter("yuzu_scim_deprovision_role_refused_with_active_link_total");
         metrics_.counter("yuzu_scim_deprovision_unlinked_total");
+        metrics_.counter("yuzu_scim_provenance_denied_total");
         metrics_.counter("yuzu_scim_oidc_link_write_failures_total");
+        metrics_.counter("yuzu_scim_saml_link_write_failures_total");
         metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");
+        metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_genuine_total");
+        metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total");
+        metrics_.counter("yuzu_auth_saml_deprovisioned_denied_total");
+        metrics_.counter("yuzu_auth_saml_deprovisioned_denied_genuine_total");
+        metrics_.counter("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total");
+        metrics_.counter("yuzu_scim_saml_link_unmatched_total");
+        metrics_.counter("yuzu_scim_saml_link_ambiguous_total");
+        metrics_.counter("yuzu_scim_saml_link_lookup_failures_total");
+        metrics_.counter("yuzu_scim_deprovision_saml_unlinked_total");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -4465,9 +4626,36 @@ public:
                 apply_runtime_config_overrides();
             }
         }
-        {
-            auto props_db = cfg_.db_dir() / "custom-properties.db";
-            custom_properties_store_ = std::make_unique<CustomPropertiesStore>(props_db);
+        // Migrated Postgres store (ADR-0006/ADR-0045, schema
+        // `custom_properties_store`) — construction fail-CLOSED per ADR-0012
+        // §1 (same template as ManagementGroupStore above): a reachable
+        // database whose schema can't migrate/open is a fatal startup error,
+        // never a serve-degraded asset-tagging substrate. `migrate_from_sqlite`
+        // runs the one-time, idempotent legacy-`custom-properties.db` backfill
+        // (ADR-0009) — AUTHORITATIVE operator-authored data means a backfill
+        // failure is ALSO fatal (never serve on top of partially-migrated
+        // custom properties/schemas).
+        if (pg_pool_ && !startup_failed_) {
+            custom_properties_store_ = std::make_unique<CustomPropertiesStore>(*pg_pool_);
+            if (!custom_properties_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: custom-properties store migration/open "
+                              "failed (database reachable but the custom_properties_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                custom_properties_store_->set_metrics(&metrics_);
+                auto props_db = cfg_.db_dir() / "custom-properties.db";
+                if (!custom_properties_store_->migrate_from_sqlite(props_db)) {
+                    spdlog::error("[PG] Refusing to start: custom-properties legacy-SQLite "
+                                  "backfill failed (see prior log lines) — custom_properties_store "
+                                  "is the AUTHORITATIVE asset-tagging substrate and must not serve "
+                                  "partially-migrated data. Operator remediation: repair {} or move "
+                                  "it aside to skip the backfill (custom properties/schemas in it "
+                                  "will NOT carry over)",
+                                  props_db.string());
+                    startup_failed_ = true;
+                }
+            }
         }
 
         // Phase 7: Workflow Engine
@@ -4503,11 +4691,41 @@ public:
             }
         }
 
-        // Notification & Webhook stores
-        {
-            auto notif_db = cfg_.db_dir() / "notifications.db";
-            notification_store_ = std::make_unique<NotificationStore>(notif_db);
+        // NotificationStore (ADR-0006 Wave 2): Postgres-backed, construction
+        // fail-closed (ADR-0012 §1) — a reachable database whose schema
+        // can't migrate/open is a fatal startup error, never a serve-degraded
+        // state. `migrate_from_sqlite` runs the one-time, idempotent legacy-
+        // `notifications.db` backfill (ADR-0009, MANDATORY — unread/dismissed
+        // state is operator-relevant, not expendable telemetry) — a backfill
+        // failure is ALSO fatal (never serve on top of a partially-migrated
+        // schema).
+        if (pg_pool_ && !startup_failed_) {
+            notification_store_ = std::make_unique<NotificationStore>(*pg_pool_);
+            if (!notification_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: notification store migration/open "
+                              "failed (database reachable but the notification_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                notification_store_->set_metrics(&metrics_);
+                auto notif_db = cfg_.db_dir() / "notifications.db";
+                if (!notification_store_->migrate_from_sqlite(notif_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: notification legacy-SQLite backfill failed "
+                        "(see prior log lines) — notification_store is authoritative and must "
+                        "not serve partially-migrated data. Operator remediation: repair {} or "
+                        "move it aside to skip the backfill (unread/dismissed history in it "
+                        "will NOT carry over)",
+                        notif_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("NotificationStore initialized (schema notification_store; "
+                                 "legacy backfill source {})",
+                                 notif_db.string());
+                }
+            }
         }
+        // Webhook store
         {
             auto webhook_db = cfg_.db_dir() / "webhooks.db";
             webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
@@ -4755,12 +4973,41 @@ public:
             }
         }
 
-        // Phase 7: Device Discovery (Issue 7.18)
-        {
-            auto discovery_db = cfg_.db_dir() / "discovery.db";
-            discovery_store_ = std::make_unique<DiscoveryStore>(discovery_db);
-            if (discovery_store_ && discovery_store_->is_open()) {
-                spdlog::info("DiscoveryStore initialized at {}", discovery_db.string());
+        // Phase 7: Device Discovery (Issue 7.18). Migrated Postgres store
+        // (ADR-0006/0009, schema `discovery_store`) — construction fail-CLOSED
+        // per ADR-0012 §1: a reachable database whose schema can't
+        // migrate/open is a fatal startup error, never a serve-degraded
+        // state. `migrate_from_sqlite` runs the one-time, idempotent legacy-
+        // `discovery.db` backfill (ADR-0009) — the operator-set `managed`
+        // flag is real state, not expendable telemetry, so backfill is
+        // MANDATORY and a failure is ALSO fatal (never serve on top of
+        // partially-migrated discovery data).
+        if (pg_pool_ && !startup_failed_) {
+            discovery_store_ = std::make_unique<DiscoveryStore>(*pg_pool_);
+            if (!discovery_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: discovery store migration/open failed "
+                              "(database reachable but the discovery_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                discovery_store_->set_metrics(&metrics_);
+                auto discovery_db = cfg_.db_dir() / "discovery.db";
+                if (!discovery_store_->migrate_from_sqlite(discovery_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: discovery legacy-SQLite backfill failed — "
+                        "discovery_store is AUTHORITATIVE and must not serve partially-migrated "
+                        "data. Operator remediation depends on the SPECIFIC reason logged above, "
+                        "not on this line alone: if it names a corrupt/truncated/unreadable {} "
+                        "or a fingerprint refusal BEFORE any insert happened, nothing has been "
+                        "migrated yet and moving it aside safely skips the backfill (its "
+                        "devices, including the operator-set managed flag, will NOT carry "
+                        "over). If it instead names a reconciliation FAILED or completion-marker "
+                        "problem, this replica's rows may ALREADY be durably inserted in "
+                        "Postgres — do NOT move the file aside without first checking "
+                        "discovery_store.discovered_devices for the affected IP(s).",
+                        discovery_db.string());
+                    startup_failed_ = true;
+                }
             }
         }
     }
@@ -6698,6 +6945,25 @@ public:
         if (gateway_service_)
             gateway_service_->set_mgmt_group_store(nullptr);
         mgmt_group_store_.reset();
+        // CustomPropertiesStore borrows pg_pool_ (ADR-0045) — drop before the
+        // pool, matching every other migrated store's belt-and-braces
+        // discipline (declaration order alone is a coincidence, not a
+        // contract — a future caller wired here mid-`stop()` must not find a
+        // still-live store past this point). No OTHER consumer stores a raw
+        // pointer beyond its call duration: `AgentRegistry::evaluate_scope`
+        // takes it as a borrowed per-call argument, never stored, and every
+        // REST handler is quiesced by the drains above. `PolicyEvaluator`
+        // DOES hold a raw `custom_properties_store` pointer
+        // (`PolicyEvaluator::Deps`, wired near this store's construction) on
+        // its background `policy_eval_thread_` — that thread is already
+        // joined earlier in this same `stop()` (see `policy_eval_thread_
+        // .join()` above), before this reset runs, so it is not a live
+        // consumer at this point either; it is called out explicitly here
+        // (governance Gate 8 cpp-safety) because an earlier revision of this
+        // comment claimed "no background thread holds a raw pointer,"
+        // which was inaccurate — the thread exists, it is simply already
+        // joined by the time execution reaches this line.
+        custom_properties_store_.reset();
         // ResultSetStore borrows pg_pool_ — drop before the pool. The maintenance
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
@@ -6761,6 +7027,14 @@ public:
         if (fleet_topology_store_)
             fleet_topology_store_->set_audit_store(nullptr);
         audit_store_.reset();
+        // NotificationStore (ADR-0046) borrows pg_pool_ — unwire the borrowed
+        // raw pointer from agent_service_ (enrollment/execution-failure toast
+        // events), then drop the store, BEFORE the pool. No background
+        // thread to join first — matches the same discipline as the sibling
+        // PG-backed stores above rather than relying on destruct-before-pool
+        // declaration order alone.
+        agent_service_.set_notification_store(nullptr);
+        notification_store_.reset();
         pg_pool_.reset();
     }
 
@@ -9477,11 +9751,20 @@ private:
             // rows above document. A degraded confinement store fails RbacStore's
             // list gate closed, so surface it.
             bool mgmt_group_ok = mgmt_group_store_ && mgmt_group_store_->is_open();
-            // Migrated Postgres store (ADR-0043, gov sre finding, hardening
+            // DiscoveryStore (ADR-0044) — wired into /readyz; adding here too so
+            // this store never joins the readyz-vs-healthz drift class the rows
+            // above were added to fix.
+            bool discovery_ok = discovery_store_ && discovery_store_->is_open();
+            // DeploymentStore (ADR-0043, gov sre finding, hardening
             // round) — parity with every other migrated authoritative store's
             // readyz/healthz wiring; construction is already fail-closed, this
             // is belt-and-braces against a runtime is_open() flip.
             bool deployment_ok = deployment_store_ && deployment_store_->is_open();
+            // NotificationStore (ADR-0046) — born-on-PG (as of this migration),
+            // same readyz-vs-healthz drift class the rows above document; wire
+            // it into both from the start rather than shipping the gap and
+            // fixing it in a later governance round (Gate 3 sre, Pattern E).
+            bool notification_ok = notification_store_ && notification_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -9489,7 +9772,8 @@ private:
                 guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
-                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && deployment_ok;
+                approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
+                deployment_ok && notification_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -9516,7 +9800,9 @@ private:
                   {"rbac_store", rbac_ok ? "ok" : "error"},
                   {"result_set_store", result_set_ok ? "ok" : "error"},
                   {"management_group_store", mgmt_group_ok ? "ok" : "error"},
-                  {"deployment_store", deployment_ok ? "ok" : "error"}}},
+                  {"discovery_store", discovery_ok ? "ok" : "error"},
+                  {"deployment_store", deployment_ok ? "ok" : "error"},
+                  {"notification_store", notification_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -9763,6 +10049,21 @@ private:
                 {"scim_store", !cfg_.scim_enable ||
                                    (scim_store_ && scim_store_->is_open() &&
                                     scim_store_->has_token())},
+                // Wave 2 migrated Postgres store (ADR-0006/0009/0044, schema
+                // `discovery_store`). AUTHORITATIVE per ADR-0012 §1 — the
+                // operator-set `managed` flag is real state. Construction
+                // fail-closed already makes a not-open state unreachable in
+                // production (startup_failed_ stops the server before it
+                // serves), so this is belt-and-braces against a runtime
+                // is_open() flip, matching result_set_store's equivalent row.
+                {"discovery_store", discovery_store_ && discovery_store_->is_open()},
+                // ADR-0046 born-on-PG (as of this migration) store — same
+                // rationale as the other rows above: fail-closed at boot, but
+                // a not-open post-boot state would leave the notification
+                // feed silently dead while /readyz reported "ready" (gov
+                // Pattern E).
+                {"notification_store",
+                 notification_store_ && notification_store_->is_open()},
             };
 
             std::string failed_list;
@@ -10062,8 +10363,15 @@ private:
 
             auto agent_id = req.matches[1].str();
             auto props = custom_properties_store_->get_properties(agent_id);
+            if (!props) {
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"custom properties store degraded"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& p : props) {
+            for (const auto& p : *props) {
                 arr.push_back({{"key", p.key},
                                {"value", p.value},
                                {"type", p.type},
@@ -10120,6 +10428,15 @@ private:
 
             auto result = custom_properties_store_->set_property(agent_id, key, value, type);
             if (!result) {
+                if (is_custom_properties_db_error(result.error())) {
+                    spdlog::error("PUT /api/agents/{}/properties/{}: {}", agent_id, key,
+                                  result.error());
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 res.status = 400;
                 res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                 "application/json");
@@ -10237,6 +10554,14 @@ private:
 
             auto result = custom_properties_store_->upsert_schema(schema);
             if (!result) {
+                if (is_custom_properties_db_error(result.error())) {
+                    spdlog::error("POST /api/property-schemas: {}", result.error());
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 res.status = 400;
                 res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                 "application/json");
@@ -17259,8 +17584,9 @@ private:
     std::unique_ptr<PatchManager> patch_manager_;
 
     // Phase 7: Deployment Jobs (Issue 7.7) & Discovery (Issue 7.18).
-    // DeploymentStore is now Postgres (ADR-0043) — declared after pg_pool_
-    // (above) so it destructs before the pool; Discovery stays SQLite.
+    // Both are now Postgres (DeploymentStore: ADR-0043, DiscoveryStore:
+    // ADR-0044) — both borrow pg_pool_ and are declared after it (above)
+    // so they destruct before the pool does.
     std::unique_ptr<DeploymentStore> deployment_store_;
     std::unique_ptr<DiscoveryStore> discovery_store_;
 

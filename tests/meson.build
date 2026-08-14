@@ -523,8 +523,10 @@ if build_server
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_oidc_scim_link.cpp',
       'unit/server/test_oidc_routes.cpp',
+      'unit/server/test_saml_principal.cpp',
       'unit/server/test_saml_provider.cpp',
       'unit/server/test_saml_routes.cpp',
+      'unit/server/test_saml_scim_link.cpp',
       'unit/server/test_error_codes.cpp',
       'unit/server/test_result_envelope.cpp',
       'unit/server/test_concurrency_manager.cpp',
@@ -594,6 +596,7 @@ if build_server
       'unit/server/test_compliance_eval.cpp',
       'unit/server/test_cel_eval.cpp',
       'unit/server/test_custom_properties_store.cpp',
+      'unit/server/test_props_scope_authz.cpp',
       'unit/server/test_notification_store.cpp',
       'unit/server/test_webhook_store.cpp',
       'unit/server/test_migration_runner.cpp',
@@ -693,6 +696,8 @@ if build_server
       'unit/server/test_scim_store_pg.cpp',
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
+      'unit/server/test_discovery_store.cpp',
+      'unit/server/test_discovery_scan_route.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
@@ -1062,6 +1067,16 @@ test('ci telemetry selftest',
   args: [files('../scripts/ci/test_ci_telemetry.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Windows SDK is selected at four independent boundaries: native MSYS2,
+# runner provisioning/manifest, GHA environment activation, and documentation.
+# Keep them exact and keep the GHA action itself visible to Dependabot.
+test('windows sdk contract',
+  _python3_test,
+  args: [files('test_windows_sdk_contract.py')],
+  suite: 'docs',
+  timeout: 10,
 )
 
 # The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing

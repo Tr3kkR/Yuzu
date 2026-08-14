@@ -1460,3 +1460,249 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuRotationSweepDeclinedSustained", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
             value: 1
+
+  # ── yuzu-scim (#3057, ADR-2001 PR-B) ────────────────────────────────────
+  #
+  # Six of this group's seven rules key on a BARE counter that is boot-seeded
+  # to 0 by its producer (never absent on a build shipping this feature),
+  # matching the YuzuOnBehalfAssertionRejected idiom this group borrows:
+  # `increase(x[1h]) > 0`, no `for:` (the alert fires the same cycle the
+  # condition goes true -- there is no pending phase to assert separately).
+  # Every case below for those six either rises from a flat-0 prefix (fires)
+  # or stays flat-0 the whole hour (quiet). The seventh,
+  # YuzuScimAuditWriteFailures, keys on `yuzu_scim_audit_write_failures_total
+  # {action=...}` -- dynamically labeled by a runtime `action` value the
+  # server cannot enumerate in advance, so it is NOT boot-seeded and is
+  # genuinely BORN-AT-1 on a fresh `action`'s first-ever failure in
+  # production. Its case below (CASE 55) still uses a flat-0-then-1 input
+  # series like the other six, because promtool's `input_series` shape does
+  # not model "a label appearing mid-series with no prior 0 sample" --
+  # exercising THAT gap is out of scope for this file; the documented caveat
+  # (a truly isolated first failure may lag one evaluation cycle) lives in
+  # the rule's own `description` in docs/prometheus/yuzu-alerts.yml instead.
+
+  # ── YuzuScimDeprovisionRoleRefusedWithActiveLink (D1) ───────────────────
+
+  # CASE 41 -- D1 fires: a still-linked out-of-band admin was refused
+  # deprovision.
+  - interval: 1m
+    name: scim D1 role refused with active link - a refusal fires
+    input_series:
+      - series: 'yuzu_scim_deprovision_role_refused_with_active_link_total{job="yuzu",instance="s1"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimDeprovisionRoleRefusedWithActiveLink", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScimDeprovisionRoleRefusedWithActiveLink", alertstate="firing", instance="s1", job="yuzu", severity="critical"}'
+            value: 1
+
+  # CASE 42 -- no refusal, no page. A quiet fleet where D1 never triggers.
+  - interval: 1m
+    name: scim D1 role refused with active link - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_scim_deprovision_role_refused_with_active_link_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimDeprovisionRoleRefusedWithActiveLink"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # ── YuzuScimDeprovisionOidcUnlinked (D2 OIDC) ───────────────────────────
+
+  # CASE 43 -- a SCIM deprovision revoked zero OIDC credentials for want of a
+  # link.
+  - interval: 1m
+    name: scim D2 OIDC unlinked - a deprovision with no OIDC link fires
+    input_series:
+      - series: 'yuzu_scim_deprovision_unlinked_total{job="yuzu",instance="s1"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimDeprovisionOidcUnlinked", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScimDeprovisionOidcUnlinked", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 44 -- every SCIM deprovision in the window found its OIDC link;
+  # stays quiet.
+  - interval: 1m
+    name: scim D2 OIDC unlinked - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_scim_deprovision_unlinked_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimDeprovisionOidcUnlinked"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # ── YuzuScimDeprovisionSamlUnlinked (D2 SAML, #3072) ────────────────────
+
+  # CASE 45 -- the SAML analogue of CASE 43.
+  - interval: 1m
+    name: scim D2 SAML unlinked - a deprovision with no SAML link fires
+    input_series:
+      - series: 'yuzu_scim_deprovision_saml_unlinked_total{job="yuzu",instance="s1"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimDeprovisionSamlUnlinked", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScimDeprovisionSamlUnlinked", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 46 -- the SAML analogue of CASE 44.
+  - interval: 1m
+    name: scim D2 SAML unlinked - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_scim_deprovision_saml_unlinked_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimDeprovisionSamlUnlinked"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # ── YuzuAuthOidcDeprovisionedDeniedGenuine (#3069) ──────────────────────
+
+  # CASE 47 -- a genuinely-deprovisioned OIDC identity was denied re-login.
+  - interval: 1m
+    name: scim genuine deny OIDC - a genuine denial fires
+    input_series:
+      - series: 'yuzu_auth_oidc_deprovisioned_denied_genuine_total{job="yuzu",instance="s1"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuthOidcDeprovisionedDeniedGenuine", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuthOidcDeprovisionedDeniedGenuine", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 48 -- no genuine denial in the window; quiet.
+  - interval: 1m
+    name: scim genuine deny OIDC - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_auth_oidc_deprovisioned_denied_genuine_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuthOidcDeprovisionedDeniedGenuine"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE 49 -- #3069's whole point: a Postgres/store outage that denies every
+  # OIDC login in sight must NOT trip the genuine alert. The total-denied and
+  # store-unavailable-denied counters both climb; the genuine counter stays
+  # flat at 0 throughout (this outage produced zero POSITIVELY-confirmed
+  # deprovision denials, only unresolvable ones). RED if the alert were ever
+  # widened from `..._genuine_total` to the total or the store-unavailable
+  # counter.
+  - interval: 1m
+    name: scim genuine deny OIDC - a store-unavailable outage alone stays quiet
+    input_series:
+      - series: 'yuzu_auth_oidc_deprovisioned_denied_total{job="yuzu",instance="s1"}'
+        values: "0x5 1+1x55"
+      - series: 'yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total{job="yuzu",instance="s1"}'
+        values: "0x5 1+1x55"
+      - series: 'yuzu_auth_oidc_deprovisioned_denied_genuine_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuthOidcDeprovisionedDeniedGenuine"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # ── YuzuAuthSamlDeprovisionedDeniedGenuine ───────────────────────────────
+
+  # CASE 50 -- the SAML analogue of CASE 47.
+  - interval: 1m
+    name: scim genuine deny SAML - a genuine denial fires
+    input_series:
+      - series: 'yuzu_auth_saml_deprovisioned_denied_genuine_total{job="yuzu",instance="s1"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuthSamlDeprovisionedDeniedGenuine", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuAuthSamlDeprovisionedDeniedGenuine", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 51 -- the SAML analogue of CASE 48.
+  - interval: 1m
+    name: scim genuine deny SAML - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_auth_saml_deprovisioned_denied_genuine_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuthSamlDeprovisionedDeniedGenuine"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE 52 -- the SAML analogue of CASE 49: a store-unavailable outage alone
+  # must not trip the genuine SAML alert.
+  - interval: 1m
+    name: scim genuine deny SAML - a store-unavailable outage alone stays quiet
+    input_series:
+      - series: 'yuzu_auth_saml_deprovisioned_denied_total{job="yuzu",instance="s1"}'
+        values: "0x5 1+1x55"
+      - series: 'yuzu_auth_saml_deprovisioned_denied_store_unavailable_total{job="yuzu",instance="s1"}'
+        values: "0x5 1+1x55"
+      - series: 'yuzu_auth_saml_deprovisioned_denied_genuine_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAuthSamlDeprovisionedDeniedGenuine"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # ── YuzuScimProvenanceDenied ─────────────────────────────────────────────
+
+  # CASE 53 -- a SCIM push tried to mutate a non-SCIM/promoted account.
+  - interval: 1m
+    name: scim provenance denied - a mismatched provenance push fires
+    input_series:
+      - series: 'yuzu_scim_provenance_denied_total{job="yuzu",instance="s1"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimProvenanceDenied", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScimProvenanceDenied", alertstate="firing", instance="s1", job="yuzu", severity="warning"}'
+            value: 1
+
+  # CASE 54 -- every push in the window matched its provenance; quiet.
+  - interval: 1m
+    name: scim provenance denied - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_scim_provenance_denied_total{job="yuzu",instance="s1"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimProvenanceDenied"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # ── YuzuScimAuditWriteFailures ────────────────────────────────────────────
+
+  # CASE 55 -- a committed SCIM mutation lost its audit evidence write. The
+  # `sum by (action)` aggregation strips job/instance from the resulting
+  # ALERTS series but the bounded `action` label MUST survive it -- asserted
+  # explicitly here, since `by (action)` dropping to a label-less sum would
+  # still satisfy `> 0` and pass every other assertion in this file silently.
+  - interval: 1m
+    name: scim audit write failures - a failure fires and keeps its action label
+    input_series:
+      - series: 'yuzu_scim_audit_write_failures_total{job="yuzu",instance="s1",action="create"}'
+        values: "0x30 1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimAuditWriteFailures", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScimAuditWriteFailures", alertstate="firing", action="create", severity="critical"}'
+            value: 1
+
+  # CASE 56 -- no audit write failures in the window; quiet.
+  - interval: 1m
+    name: scim audit write failures - a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_scim_audit_write_failures_total{job="yuzu",instance="s1",action="create"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuScimAuditWriteFailures"}'
+        eval_time: 45m
+        exp_samples: []

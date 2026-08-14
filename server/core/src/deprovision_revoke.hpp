@@ -42,21 +42,26 @@ namespace auth {
 class AuthManager;
 }
 
-/// ADR-2001 §1 — the principal-set resolver. Given a SCIM slug's `scim_id`
-/// and its `slug_username`, returns the SET of principal strings a
-/// deprovision must revoke = `{slug_username}` UNION `{oidc_principal_id(iss,
-/// sub) for each row ScimStore::links_for_scim_id(scim_id) returns}`. Every
-/// `oidc:` string is built through `oidc::oidc_principal_id` (`oidc_principal
-/// .hpp`) — never hand-built (a format drift would silently miss every token
-/// for that principal, "reported success, revoked nothing").
+/// ADR-2001 §1 (PR4a extends it to SAML) — the principal-set resolver. Given
+/// a SCIM slug's `scim_id` and its `slug_username`, returns the SET of
+/// principal strings a deprovision must revoke = `{slug_username}` UNION
+/// `{oidc_principal_id(iss, sub) for each row ScimStore::links_for_scim_id
+/// (scim_id) returns}` UNION `{saml_principal_id(entity_id, name_id) for
+/// each row ScimStore::saml_links_for_scim_id(scim_id) returns}`. Every
+/// `oidc:` string is built through `oidc::oidc_principal_id`
+/// (`oidc_principal.hpp`) and every `saml:` string through
+/// `saml::saml_principal_id` (`saml_principal.hpp`) — never hand-built (a
+/// format drift would silently miss every session/token for that principal,
+/// "reported success, revoked nothing").
 ///
-/// FAILS CLOSED: returns `nullopt` when `links_for_scim_id` itself could not
-/// answer (a store blip/lease timeout). `nullopt` is DISTINCT from "no
-/// links" (an engaged-but-empty result — folded into the 1-element
-/// `{slug_username}` vector below) and the caller MUST treat it as "the link
-/// population is unknown", never as "there is nothing to revoke". Reporting
-/// a clean deprovision success after a resolution failure is the exact
-/// silent-under-revocation gap ADR-2001 exists to close.
+/// FAILS CLOSED: returns `nullopt` when EITHER `links_for_scim_id` OR
+/// `saml_links_for_scim_id` could not answer (a store blip/lease timeout).
+/// `nullopt` is DISTINCT from "no links" (an engaged-but-empty result —
+/// folded into the 1-element `{slug_username}` vector below) and the caller
+/// MUST treat it as "the link population is unknown", never as "there is
+/// nothing to revoke". Reporting a clean deprovision success after a
+/// resolution failure is the exact silent-under-revocation gap ADR-2001
+/// exists to close.
 std::optional<std::vector<std::string>>
 resolve_deprovision_principals(ScimStore& scim_store, const std::string& scim_id,
                                const std::string& slug_username);

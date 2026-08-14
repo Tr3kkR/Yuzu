@@ -332,8 +332,9 @@ fragments shipped a destructive operation with no route-handler coverage until #
 **Invariant.** New route owners register through `HttpRouteSink&`; new routes on an existing owner
 register through the sink that owner already uses. Do not add a handler that only the
 `httplib::Server&` overload — or an inline `web_server_->` call in `server.cpp` — can reach.
-Registrations outside the sink are pre-existing debt, not a precedent to copy: eight route owners
-(55 registrations) plus `server.cpp`'s ~105 inline ones, roughly 160 in total.
+Registrations outside the sink are pre-existing debt, not a precedent to copy: seven route owners
+(40 registrations — `DiscoveryRoutes` joined the sink pattern in PR #3064) plus `server.cpp`'s
+~105 inline ones, roughly 145 in total.
 
 ## Storage Architecture
 

@@ -13,6 +13,7 @@
 #include <string_view>
 
 #include "authz_topology_floor.hpp"
+#include "deprovision_deny_split.hpp" // record_deprovision_deny_split — ADR-2001 #3069 shared split
 #include "engine_principal_store.hpp"
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
@@ -22,6 +23,8 @@
 #include "oidc_scim_link.hpp" // link_oidc_login_to_scim — ADR-2001 §2/D2 login-site orchestration
 #include "principal_class.hpp"
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — the unified A4 denial wrapper (#1470)
+#include "saml_principal.hpp"  // saml_principal_id / is_valid_saml_component — ADR-2001 PR4a
+#include "saml_scim_link.hpp"  // link_saml_login_to_scim — ADR-2001 PR4a login-site orchestration
 
 #include <ctime>
 
@@ -2479,6 +2482,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "user", "User", username, deny_detail);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+                // #3069 split: the total above conflates a genuine
+                // deprovision deny with a store-unavailable fail-closed
+                // deny, which lets a Postgres outage inflate the counter
+                // operators alert on. `decision.scim_id` is the SAME
+                // predicate the audit `reason=` string above already
+                // switches on — absent means the store couldn't be asked
+                // (`scim_store_unavailable`), never a genuine deny.
+                record_deprovision_deny_split(
+                    m, "yuzu_auth_oidc_deprovisioned_denied_genuine_total",
+                    "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
+                    decision.scim_id.has_value());
                 // Also bump the established general OIDC login counter so
                 // dashboards keyed on it don't undercount during a deny
                 // episode — every other /auth/callback failure path bumps
@@ -2736,6 +2750,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "user", "User", username, recheck_detail);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+                // #3069 split — see the primary check above; same
+                // `decision.scim_id` predicate the recheck's `reason=`
+                // string already switches on.
+                record_deprovision_deny_split(
+                    m, "yuzu_auth_oidc_deprovisioned_denied_genuine_total",
+                    "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
+                    decision.scim_id.has_value());
                 // Also bump the established general OIDC login counter — see
                 // the primary check above.
                 m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
@@ -2959,6 +2980,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // clean redirect-to-login as an ordinary validation failure rather than
         // an uncaught exception surfacing as a non-A4 500.
         std::string saml_name_id;
+        std::string saml_principal; // ADR-2001 PR4a stable principal — saml::saml_principal_id
         std::string session_token;
         // cons-NICE: mirror the OIDC call site's provider-presence ternary
         // (defense-in-depth — saml_provider_ is always non-null on this
@@ -2967,6 +2989,11 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // outside the try block so the post-login audit row (comp-S1 / UP-5,
         // below) can also reference it.
         auto saml_admin_gid = saml_provider_ ? cfg_.saml_admin_group : std::string{};
+        // ADR-2001 PR4a — the operator-configured, boot-validated IdP
+        // entityID (already verified by validate_response below to equal
+        // the assertion's signed <saml:Issuer>). This is the single-IdP
+        // precondition the SAML principal/link design relies on.
+        const std::string& saml_entity_id = cfg_.saml_idp_entity_id;
         try {
             auto result = saml_provider_->validate_response(saml_response_b64, binding_cookie);
             if (!result) {
@@ -2999,8 +3026,204 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 res.set_redirect("/login?error=saml");
                 return;
             }
-            session_token = auth_mgr_.create_saml_session(saml_name_id, result.value().groups,
-                                                           saml_admin_gid);
+
+            // ADR-2001 PR4a — sanitise both NameID and entity_id BEFORE
+            // either enters the stable principal (the durable RBAC/session
+            // key) or the saml_identity_links store, mirroring
+            // OidcProvider::validate_claims' sub/oid rule exactly. A
+            // malformed value fails the login outright (fail-closed) rather
+            // than being sanitised-and-continued — same posture OIDC takes
+            // for the same class of durable-join-key input.
+            if (!saml::is_valid_saml_component(saml_name_id) ||
+                !saml::is_valid_saml_component(saml_entity_id)) {
+                spdlog::warn("SAML login rejected: NameID or entity_id failed sanitation");
+                audit_log(req, "auth.saml_login_failed", "error", {}, {},
+                          "NameID or entity_id failed sanitation");
+                emit_event("auth.saml_login_failed", req,
+                           {{"source_ip", req.remote_addr},
+                            {"error", "NameID or entity_id failed sanitation"}},
+                           {}, Severity::kWarn);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}})
+                        .increment();
+                }
+                res.set_header("Set-Cookie", kBindCookieClear);
+                res.set_redirect("/login?error=saml");
+                return;
+            }
+
+            saml_principal = saml::saml_principal_id(saml_entity_id, saml_name_id);
+
+            // ADR-2001 §4 (PR4b) — deny-at-login backstop, PRIMARY check.
+            // Runs before every mutation below (link formation, session
+            // mint) so a denied login leaves no side effect behind — a
+            // deprovisioned SCIM user must not be able to re-authenticate
+            // and mint a fresh session just by round-tripping the IdP
+            // again. `saml_login_denied_deprovisioned` is fail-CLOSED: a
+            // ScimStore that cannot answer denies, exactly like a
+            // resolved-inactive link or a genuinely-orphaned (not
+            // re-provisioned) one. Emits the BYTE-IDENTICAL
+            // `/login?error=saml` redirect every other SAML failure branch
+            // above uses — no "deprovisioned"/oracle wording reaches the
+            // browser; the reason (and, when known, the driving scim_id —
+            // server-generated CSPRNG hex, never IdP input, so no
+            // sanitize_detail_value needed) lives only in the server-side
+            // audit row. Mirrors the OIDC primary check's U6 fix: a
+            // store-unavailable DENY (`scim_id` absent) is audited as
+            // `scim_store_unavailable`, never as
+            // `linked_scim_resource_inactive` — the latter is fictional
+            // CC6.8 evidence when the store simply couldn't be asked.
+            if (auto decision =
+                    saml::saml_login_denied_deprovisioned(scim_store_, saml_entity_id, saml_name_id);
+                decision.denied) {
+                spdlog::warn("SAML login denied for '{}': linked SCIM resource is deprovisioned",
+                            saml_principal);
+                std::string deny_detail = decision.scim_id
+                                              ? "reason=linked_scim_resource_inactive;scim_id=" +
+                                                    *decision.scim_id
+                                              : "reason=scim_store_unavailable";
+                audit_log_for_principal(req, "auth.saml.deprovisioned_denied", "failure",
+                                        saml_principal, "user", "User", saml_principal,
+                                        deny_detail);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+                    // #3069 split: same predicate the audit `reason=`
+                    // string above already switches on — see the OIDC
+                    // primary check for the full rationale.
+                    record_deprovision_deny_split(
+                        m, "yuzu_auth_saml_deprovisioned_denied_genuine_total",
+                        "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
+                        decision.scim_id.has_value());
+                    // Also bump the established general SAML login counter
+                    // so dashboards keyed on it don't undercount during a
+                    // deny episode — every other /saml/acs failure path
+                    // bumps this series too.
+                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+                }
+                res.set_header("Set-Cookie", kBindCookieClear);
+                res.set_redirect("/login?error=saml");
+                return;
+            }
+
+            // ADR-2001 PR4a — form a durable SCIM<->SAML identity link when
+            // the NameID Format is stable (see saml_scim_link.hpp), BEFORE
+            // minting the session. Fail-OPEN: never fails this login. No
+            // AuthManager::mu_ is held across this ScimStore call (mint
+            // happens next, after this returns).
+            //
+            // ADR-2001 #3072 — the typed outcome drives per-outcome
+            // observability ONLY; every branch below still falls through to
+            // create_saml_session — this is OBSERVE-AND-PROCEED, never a
+            // deny (the PR4b deny-at-login backstop above is the only
+            // SAML-side path that can refuse the login). `linked`/
+            // `not_linkable`/`link_write_error` keep the pre-#3072 behaviour
+            // (no new login-time audit row; `link_write_error` still bumps
+            // the existing yuzu_scim_saml_link_write_failures_total inside
+            // link_saml_login_to_scim itself).
+            auto link_outcome =
+                saml::link_saml_login_to_scim(scim_store_, saml_entity_id, saml_name_id,
+                                              result.value().name_id_format,
+                                              auth_mgr_.metrics_registry());
+            switch (link_outcome) {
+            case saml::SamlScimLinkOutcome::no_active_match:
+                audit_log_for_principal(
+                    req, "auth.saml.link_unmatched", "failure", saml_principal, "user", "User",
+                    saml_principal,
+                    "reason=no_active_external_id_match;name_id_format=" +
+                        detail::sanitize_detail_value(result.value().name_id_format));
+                if (auto* m = auth_mgr_.metrics_registry())
+                    m->counter("yuzu_scim_saml_link_unmatched_total").increment();
+                break;
+            case saml::SamlScimLinkOutcome::ambiguous_match:
+                // A SEPARATE counter from the plain-unmatched case above —
+                // an ambiguous externalId (more than one active SCIM
+                // resource sharing it) is a distinct, more actionable
+                // misconfiguration than ordinary IdP/SCIM drift and must
+                // stay distinguishable in metrics (task spec).
+                audit_log_for_principal(
+                    req, "auth.saml.link_unmatched", "failure", saml_principal, "user", "User",
+                    saml_principal,
+                    "reason=ambiguous_active_external_id_match;name_id_format=" +
+                        detail::sanitize_detail_value(result.value().name_id_format));
+                if (auto* m = auth_mgr_.metrics_registry())
+                    m->counter("yuzu_scim_saml_link_ambiguous_total").increment();
+                break;
+            case saml::SamlScimLinkOutcome::lookup_store_error:
+                audit_log_for_principal(req, "auth.saml.link_lookup_failed", "failure",
+                                        saml_principal, "user", "User", saml_principal,
+                                        "reason=scim_store_unavailable");
+                if (auto* m = auth_mgr_.metrics_registry())
+                    m->counter("yuzu_scim_saml_link_lookup_failures_total").increment();
+                break;
+            case saml::SamlScimLinkOutcome::linked:
+            case saml::SamlScimLinkOutcome::not_linkable:
+            case saml::SamlScimLinkOutcome::link_write_error:
+                break; // existing behaviour — no new login-time audit row
+            }
+
+            session_token = auth_mgr_.create_saml_session(saml_name_id, saml_entity_id,
+                                                           result.value().groups, saml_admin_gid);
+
+            // ADR-2001 §4 (PR4b) — deny-at-login backstop, POST-MINT
+            // RE-CHECK (the codex-caught check-then-mint race, mirrors the
+            // OIDC side). The primary check above ran before this login's
+            // own mint; a concurrent SCIM deactivate/DELETE could have
+            // landed in the window between that check and
+            // `create_saml_session` above. Re-resolve the SAME decision via
+            // the SAME helper and, if it has now flipped to DENY,
+            // invalidate the session just minted rather than hand it out —
+            // this self-heals the race without holding a cross-store lock
+            // over the mint. Runs BEFORE the Set-Cookie header below so a
+            // denied login never reaches the browser with a live cookie.
+            // `saml_principal` is exactly the `username` `create_saml_session`
+            // minted the session under (`saml::saml_principal_id(entity_id,
+            // name_id)` — see `AuthManager::create_saml_session`), so it is
+            // the correct key to invalidate.
+            if (auto decision =
+                    saml::saml_login_denied_deprovisioned(scim_store_, saml_entity_id, saml_name_id);
+                decision.denied) {
+                spdlog::warn("SAML login denied for '{}' on post-mint re-check: linked SCIM "
+                            "resource is deprovisioned (concurrent deprovision race)",
+                            saml_principal);
+                auto revoke_result = auth_mgr_.invalidate_user_sessions(saml_principal);
+                // Mirrors the OIDC side's U6 fix: a store-unavailable DENY
+                // (`scim_id` absent) is audited as `scim_store_unavailable`,
+                // never as `linked_scim_resource_inactive` (fictional
+                // CC6.8 evidence on a mere outage) — mirrors the primary
+                // check's reason string.
+                std::string recheck_detail = decision.scim_id
+                                                 ? "reason=linked_scim_resource_inactive;scim_id=" +
+                                                       *decision.scim_id
+                                                 : "reason=scim_store_unavailable";
+                recheck_detail += ";post_mint_recheck=true;sessions_invalidated=" +
+                                  std::to_string(revoke_result.count);
+                if (!revoke_result.db_persisted) {
+                    // RevokeResult's contract (auth.hpp): a "success" audit
+                    // row that hides a DB persistence failure produces
+                    // fictional CC6.3/CC6.6 evidence — surface it in the
+                    // row itself.
+                    recheck_detail += ";db_persisted=false";
+                }
+                audit_log_for_principal(req, "auth.saml.deprovisioned_denied", "failure",
+                                        saml_principal, "user", "User", saml_principal,
+                                        recheck_detail);
+                if (auto* m = auth_mgr_.metrics_registry()) {
+                    m->counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+                    // #3069 split — see the primary check above; same
+                    // `decision.scim_id` predicate the recheck's `reason=`
+                    // string already switches on.
+                    record_deprovision_deny_split(
+                        m, "yuzu_auth_saml_deprovisioned_denied_genuine_total",
+                        "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
+                        decision.scim_id.has_value());
+                    // Also bump the established general SAML login counter
+                    // — see the primary check above.
+                    m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+                }
+                res.set_header("Set-Cookie", kBindCookieClear);
+                res.set_redirect("/login?error=saml");
+                return;
+            }
 
             // #1828.3: the verifier flags (rather than logs or increments
             // directly — it has no metrics handle) when the assertion's
@@ -3049,15 +3272,24 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // against the single configured saml_admin_gid, so there is exactly
         // one candidate group to log — no ambiguity about which of possibly
         // several assertion groups triggered the promotion.
-        auto saml_audit_detail = (saml_effective_role == auth::role_to_string(auth::Role::admin))
-                                     ? "auth_source=saml;admin_group=" + saml_admin_gid
-                                     : std::string{"auth_source=saml"};
-        audit_log_for_principal(req, "auth.saml_login", "ok", saml_name_id, saml_effective_role,
-                                "User", saml_name_id, saml_audit_detail);
+        // ADR-2001 PR4a — mirror the OIDC audit pattern exactly (auth.oidc_
+        // login above): the STABLE `saml_principal` is the audit KEY
+        // (never sanitized — it is not a detail value), the raw NameID is
+        // carried in `detail` via sanitize_detail_value (a control/newline
+        // byte there is an audit-log injection/readability hazard, same
+        // rationale as OIDC's display/email handling).
+        auto saml_audit_detail =
+            std::string("auth_source=saml;name_id=") + detail::sanitize_detail_value(saml_name_id);
+        if (saml_effective_role == auth::role_to_string(auth::Role::admin)) {
+            saml_audit_detail += ";admin_group=" + saml_admin_gid;
+        }
+        audit_log_for_principal(req, "auth.saml_login", "ok", saml_principal, saml_effective_role,
+                                "User", saml_principal, saml_audit_detail);
         emit_event("auth.saml_login", req,
                    {{"source_ip", req.remote_addr},
-                    {"username", saml_name_id},
-                    {"auth_method", "saml"}});
+                    {"username", saml_principal},
+                    {"auth_method", "saml"},
+                    {"name_id", detail::sanitize_detail_value(saml_name_id)}});
         if (auto* m = auth_mgr_.metrics_registry()) {
             // #1828.1: role label lets a SIEM/Grafana query distinguish admin
             // vs user SSO logins without joining against the audit store —

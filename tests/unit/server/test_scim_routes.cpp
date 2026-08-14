@@ -33,6 +33,7 @@
 #include "oidc_principal.hpp"
 #include "on_behalf_guard.hpp"
 #include "rate_limiter.hpp"
+#include "saml_principal.hpp"
 #include "test_route_sink.hpp"
 #include "web_utils.hpp"
 
@@ -1291,6 +1292,134 @@ TEST_CASE("resolve_deprovision_principals_for_username: FAILS CLOSED (nullopt) o
     CHECK_FALSE(principals.has_value());
 }
 
+// ── ADR-2001 PR4a: the SAML pass ─────────────────────────────────────────
+//
+// `resolve_deprovision_principals` now also unions in every
+// `saml::saml_principal_id(entity_id, name_id)` from
+// `ScimStore::saml_links_for_scim_id(scim_id)`, fail-closed on ITS nullopt
+// exactly like the pre-existing OIDC pass above.
+
+TEST_CASE("resolve_deprovision_principals: returns {slug, saml:<entity>#<name>, ...} for "
+         "every linked SAML identity (MUTATION-CHECK target — see the comment below)",
+         "[pg][scim][adr2001][resolver][saml]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("multi-saml-link-user");
+    REQUIRE(resource.has_value());
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp-a.example.com/saml/metadata",
+                                           "a@example.com", resource->scim_id));
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp-b.example.com/saml/metadata",
+                                           "b@example.com", resource->scim_id));
+
+    auto principals = resolve_deprovision_principals(*f.scim_store, resource->scim_id,
+                                                      "multi-saml-link-user");
+    REQUIRE(principals.has_value());
+    // MUTATION-CHECK (manually verified during development): commenting out
+    // the `for (const auto& linked : *saml_links) principals.push_back(...)`
+    // loop in deprovision_revoke.cpp's resolve_deprovision_principals
+    // collapses this to size()==1 and fails this REQUIRE — confirming the
+    // test actually exercises the SAML join rather than passing vacuously
+    // with the linkage silently broken.
+    REQUIRE(principals->size() == 3);
+    CHECK(std::find(principals->begin(), principals->end(), "multi-saml-link-user") !=
+         principals->end());
+    CHECK(std::find(principals->begin(), principals->end(),
+                    saml::saml_principal_id("https://idp-a.example.com/saml/metadata",
+                                            "a@example.com")) != principals->end());
+    CHECK(std::find(principals->begin(), principals->end(),
+                    saml::saml_principal_id("https://idp-b.example.com/saml/metadata",
+                                            "b@example.com")) != principals->end());
+}
+
+TEST_CASE("resolve_deprovision_principals: a slug with BOTH an OIDC and a SAML link resolves "
+         "the union of both",
+         "[pg][scim][adr2001][resolver][saml]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("dual-linked-user");
+    REQUIRE(resource.has_value());
+    REQUIRE(f.scim_store->upsert_link("https://oidc-idp.example.com/", "sub-dual",
+                                      resource->scim_id));
+    REQUIRE(f.scim_store->upsert_saml_link("https://saml-idp.example.com/saml/metadata",
+                                           "dual@example.com", resource->scim_id));
+
+    auto principals =
+        resolve_deprovision_principals(*f.scim_store, resource->scim_id, "dual-linked-user");
+    REQUIRE(principals.has_value());
+    REQUIRE(principals->size() == 3);
+    CHECK(std::find(principals->begin(), principals->end(),
+                    oidc::oidc_principal_id("https://oidc-idp.example.com/", "sub-dual")) !=
+         principals->end());
+    CHECK(std::find(principals->begin(), principals->end(),
+                    saml::saml_principal_id("https://saml-idp.example.com/saml/metadata",
+                                            "dual@example.com")) != principals->end());
+}
+
+TEST_CASE("resolve_deprovision_principals: fails closed (nullopt) when "
+         "saml_links_for_scim_id SPECIFICALLY cannot answer even though the OIDC links read "
+         "succeeds cleanly — MUTATION-CHECK target, see the comment below",
+         "[pg][scim][adr2001][resolver][saml][failclosed]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("saml-blip-user");
+    REQUIRE(resource.has_value());
+
+    // Break ONLY the saml_identity_links table so its query fails while
+    // identity_links (OIDC, untouched) stays intact and would answer fine
+    // (zero rows — an engaged-but-empty, non-failing answer).
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(f.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult drop{
+            PQexec(conn.get(), "DROP TABLE scim_store.saml_identity_links")};
+        REQUIRE(drop.ok());
+    }
+
+    auto principals =
+        resolve_deprovision_principals(*f.scim_store, resource->scim_id, "saml-blip-user");
+    // MUTATION-CHECK (manually verified during development): a
+    // resolve_deprovision_principals that never calls (or never checks the
+    // nullopt of) saml_links_for_scim_id would return an ENGAGED {slug}
+    // vector here — the OIDC read alone succeeds cleanly with zero links —
+    // instead of nullopt, confirming this test exercises the SAML-specific
+    // fail-closed branch specifically (the OIDC-side fail-closed test
+    // earlier in this file already covers a wholly-broken store, which
+    // cannot tell the two branches apart).
+    CHECK_FALSE(principals.has_value());
+}
+
+TEST_CASE("revoke_deprovision_credentials: revokes a SAML-linked user's SAML session (keyed "
+         "on the stable principal) — MUTATION-CHECK target, see the comment below",
+         "[pg][scim][adr2001][orchestrator][saml]") {
+    Fixture f;
+    auto resource = f.scim_store->create_resource("saml-yolanda");
+    REQUIRE(resource.has_value());
+
+    const std::string entity_id = "https://idp.example.com/saml/metadata";
+    const std::string name_id   = "yolanda@example.com";
+    REQUIRE(f.scim_store->upsert_saml_link(entity_id, name_id, resource->scim_id));
+
+    auto saml_session = f.auth_mgr.create_saml_session(name_id, entity_id);
+    REQUIRE_FALSE(saml_session.empty());
+    REQUIRE(f.auth_mgr.validate_session(saml_session).has_value());
+
+    auto principals =
+        resolve_deprovision_principals(*f.scim_store, resource->scim_id, "saml-yolanda");
+    REQUIRE(principals.has_value());
+    REQUIRE(principals->size() == 2);
+
+    auto result = revoke_deprovision_credentials(*f.token_store, f.auth_mgr, *principals);
+    CHECK(result.sessions_revoked == 1);
+
+    // MUTATION-CHECK (manually verified during development): reverting
+    // `AuthManager::create_saml_session` to key the session's `username` on
+    // the raw NameID (the pre-ADR-2001-PR4a behaviour) makes this CHECK
+    // fail — the session SURVIVES, because `saml::saml_principal_id(
+    // entity_id, name_id)` (what `resolve_deprovision_principals` resolved
+    // above) no longer matches the session's actual key (bare
+    // "yolanda@example.com") — confirming this test actually catches the
+    // exact ADR-2001 silent-under-revocation failure mode ("reported
+    // success, revoked nothing") for the SAML re-key specifically.
+    CHECK_FALSE(f.auth_mgr.validate_session(saml_session).has_value());
+}
+
 TEST_CASE("revoke_deprovision_credentials: revokes tokens and sessions for EVERY principal in "
          "the resolved set",
          "[pg][scim][adr2001][orchestrator]") {
@@ -1615,6 +1744,284 @@ TEST_CASE("ScimRoutes: D2 — a deprovision with neither a link nor a matching o
     REQUIRE(res);
     CHECK(res->status == 200);
     CHECK(f.metrics.counter("yuzu_scim_deprovision_unlinked_total").value() == 0.0);
+}
+
+// ── Governance PR4a follow-up (C1/C2): D1/D2 must not be OIDC-only ────────
+//
+// PR4a joined SAML principals into the shared deprovision paths but left D1
+// gated on `links_for_scim_id` (OIDC only) and D2 gated on
+// `principals.size() != 1` (which SAML links now also inflate) — both
+// silently stopped firing for a SAML-only or SAML+unformed-OIDC user. These
+// four cases are the closure evidence for that fix.
+
+TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITH an active linked SAML identity "
+         "(ZERO OIDC links) is still a LOUD signal — PATCH deactivate",
+         "[pg][scim][routes][adr2001][d1][saml]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "priya"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp.example.com/saml/metadata",
+                                           "priya@example.com", id));
+    REQUIRE(f.auth_mgr.update_role("priya", auth::Role::admin));
+
+    // Confirm this is genuinely SAML-ONLY — zero OIDC identity_links rows.
+    auto oidc_links = f.scim_store->links_for_scim_id(id);
+    REQUIRE(oidc_links.has_value());
+    CHECK(oidc_links->empty());
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 404); // #2021 refusal unchanged
+    CHECK(f.auth_mgr.get_user_role("priya").value() == auth::Role::admin);
+
+    AuditQuery q;
+    q.action = "scim.user.deprovision_role_refused_with_link";
+    q.target_id = id;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].result == "failure");
+    CHECK((*rows)[0].detail.find("SAML") != std::string::npos);
+    // MUTATION-CHECK (governance C1, manually verified during development):
+    // reverting the D1 branches to a bare
+    // `scim_store->links_for_scim_id(...)` (OIDC only) makes this metric
+    // read 0.0 and this audit row not exist — a SAML-only-linked
+    // role-refusal fires NOTHING, exactly the gap this test closes.
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_role_refused_with_active_link_total").value() ==
+         1.0);
+}
+
+TEST_CASE("ScimRoutes: D1 — role-refused deprovision WITH an active linked SAML identity "
+         "(ZERO OIDC links) is still a LOUD signal — DELETE",
+         "[pg][scim][routes][adr2001][d1][saml]") {
+    Fixture f;
+    auto created = json::parse(f.post("/scim/v2/Users", {{"userName", "quinn"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp.example.com/saml/metadata",
+                                           "quinn@example.com", id));
+    REQUIRE(f.auth_mgr.update_role("quinn", auth::Role::admin));
+
+    auto res = f.del("/scim/v2/Users/" + id);
+    REQUIRE(res);
+    CHECK(res->status == 404); // #2021 refusal unchanged
+    CHECK(f.auth_mgr.get_user_role("quinn").value() == auth::Role::admin);
+
+    AuditQuery q;
+    q.action = "scim.user.deprovision_role_refused_with_link";
+    q.target_id = id;
+    auto rows = f.audit_store->query(q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].result == "failure");
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_role_refused_with_active_link_total").value() ==
+         1.0);
+}
+
+TEST_CASE("ScimRoutes: D2 — a resource with ONE SAML link and ZERO OIDC links still bumps the "
+         "unlinked-OIDC tripwire on a matching login observation (previously masked by the "
+         "coexisting SAML link inflating principals.size())",
+         "[pg][scim][routes][adr2001][d2][saml]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "rowan"}, {"externalId", "ext-rowan"}})->body);
+    auto id = created["id"].get<std::string>();
+    REQUIRE(f.scim_store->upsert_saml_link("https://idp.example.com/saml/metadata",
+                                           "rowan@example.com", id));
+    // A login occurred whose claim value matches this slug's externalId,
+    // under a DIFFERENT OIDC claim than the configured link claim, so
+    // upsert_link (OIDC) never ran — the D2 scenario, now coexisting with a
+    // formed SAML link on the same scim_id.
+    REQUIRE(f.scim_store->record_login_observation("https://idp.example.com/", "sub-rowan", "oid",
+                                                    "ext-rowan"));
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // MUTATION-CHECK (governance C2, manually verified during development):
+    // reverting maybe_flag_d2_unlinked to gate on `principals.size() != 1`
+    // sees size()==2 here (slug + the SAML principal) and returns early —
+    // this metric reads 0.0 instead of 1.0, exactly the masking this test
+    // closes.
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_unlinked_total").value() == 1.0);
+}
+
+// ── ADR-2001 #3072 — SAML D2 (maybe_flag_saml_d2_unlinked) ──────────────────
+//
+// SAML analogue of the OIDC D2 section above. Mirrors those three cases,
+// plus the C1/C2-style coexisting-other-protocol-link regression guard.
+
+TEST_CASE("ScimRoutes: SAML D2 — a deprovision with a SAML login observation but no formed "
+         "SAML link bumps the unlinked-SAML-signal metric",
+         "[pg][scim][routes][adr2001][d2][saml]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "sybil"}, {"externalId", "sybil@example.com"}})
+            ->body);
+    auto id = created["id"].get<std::string>();
+    // A SAML login occurred with a NameID matching this slug's externalId,
+    // but under an unstable Format, so link_saml_login_to_scim never formed
+    // a link — the SAML D2 scenario.
+    REQUIRE(f.scim_store->record_saml_login_observation(
+        "https://idp.example.com/saml/metadata", "sybil@example.com",
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"));
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_saml_unlinked_total").value() == 1.0);
+}
+
+TEST_CASE("ScimRoutes: SAML D2 — a deprovision with neither a SAML link nor a matching SAML "
+         "observation does NOT bump the unlinked-SAML-signal metric",
+         "[pg][scim][routes][adr2001][d2][saml]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "tara"}, {"externalId", "tara@example.com"}})
+            ->body);
+    auto id = created["id"].get<std::string>();
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_saml_unlinked_total").value() == 0.0);
+}
+
+TEST_CASE("ScimRoutes: SAML D2 — a resource with ONE OIDC link and ZERO SAML links still bumps "
+         "the unlinked-SAML tripwire on a matching SAML login observation (must not be masked "
+         "by a coexisting OIDC link, mutation-checked)",
+         "[pg][scim][routes][adr2001][d2][saml]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "ulric"}, {"externalId", "ulric@example.com"}})
+            ->body);
+    auto id = created["id"].get<std::string>();
+    // A formed OIDC link on the SAME scim_id — this must NOT mask the
+    // missing SAML link below (the PR4a C1/C2 lesson, SAML side).
+    REQUIRE(f.scim_store->upsert_link("https://idp.example.com/", "sub-ulric", id));
+    // A SAML login occurred whose NameID matches this slug's externalId
+    // under an unstable Format, so no SAML link ever formed — the SAML D2
+    // scenario, now coexisting with a formed OIDC link on the same scim_id.
+    REQUIRE(f.scim_store->record_saml_login_observation(
+        "https://idp.example.com/saml/metadata", "ulric@example.com",
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"));
+
+    // Confirm this is genuinely OIDC-linked / SAML-unlinked before deprovisioning.
+    auto oidc_links = f.scim_store->links_for_scim_id(id);
+    REQUIRE(oidc_links.has_value());
+    CHECK(oidc_links->size() == 1);
+    auto saml_links = f.scim_store->saml_links_for_scim_id(id);
+    REQUIRE(saml_links.has_value());
+    CHECK(saml_links->empty());
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // MUTATION-CHECK (task spec): reverting maybe_flag_saml_d2_unlinked to
+    // gate on links_for_scim_id (OIDC) or a principals.size() proxy instead
+    // of saml_links_for_scim_id SPECIFICALLY would see the OIDC link (or
+    // the inflated principal set) and return early — this metric would read
+    // 0.0 instead of 1.0, exactly the masking this test closes.
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_saml_unlinked_total").value() == 1.0);
+}
+
+TEST_CASE("ScimRoutes: SAML D2 — a broken saml_identity_links table (saml_links_for_scim_id "
+         "cannot answer) makes maybe_flag_saml_d2_unlinked SKIP rather than risk a false "
+         "positive, mutation-checked",
+         "[pg][scim][routes][adr2001][d2][saml][failclosed]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "victor"}, {"externalId", "victor@example.com"}})
+            ->body);
+    auto id = created["id"].get<std::string>();
+
+    // Break ONLY saml_identity_links (the table maybe_flag_saml_d2_unlinked's
+    // saml_links_for_scim_id read targets). saml_login_observations stays
+    // intact, so if the code under test skipped the link read and jumped
+    // straight to the observation check it would find a match and (wrongly)
+    // fire the tripwire — a mutation this test is designed to catch.
+    //
+    // Note: `resolve_deprovision_principals` (deprovision_revoke.cpp) reads
+    // this SAME table via `saml_links_for_scim_id` and is itself fail-closed
+    // on its own nullopt — it 500s BEFORE `revoke_linked_credentials_or_fail`
+    // ever reaches `maybe_flag_saml_d2_unlinked` below it. There is no way
+    // to reach the D2 detector's own nullopt branch in isolation while this
+    // table is down; asserting the 500 (rather than the 200 the sibling D2
+    // tests above assert) is the correct, and only reachable, observation
+    // here — the counter must still never fire, in a total-degrade scenario
+    // exactly as it must in the isolated one.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(f.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult drop{
+            PQexec(conn.get(), "DROP TABLE scim_store.saml_identity_links")};
+        REQUIRE(drop.ok());
+    }
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 500); // resolve_deprovision_principals fails closed on the same table
+    // MUTATION-CHECK (task spec, adapted to the reachable path above): the
+    // SAML D2 counter must stay 0.0 whether the store degrade is caught by
+    // the earlier fail-closed resolver check or (were that check ever
+    // weakened/removed) by `maybe_flag_saml_d2_unlinked`'s own
+    // `!saml_links.has_value()` early-return — this test pins the observable
+    // outcome (never a spurious fire) regardless of which guard catches it.
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_saml_unlinked_total").value() == 0.0);
+}
+
+TEST_CASE("ScimRoutes: SAML D2 — a broken saml_login_observations table "
+         "(saml_observation_matches cannot answer) makes maybe_flag_saml_d2_unlinked SKIP "
+         "rather than risk a false positive, mutation-checked",
+         "[pg][scim][routes][adr2001][d2][saml][failclosed]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "wendy"}, {"externalId", "wendy@example.com"}})
+            ->body);
+    auto id = created["id"].get<std::string>();
+    // Record the observation FIRST (the table must exist for this write to
+    // succeed) so that, absent the drop below, this scenario would
+    // otherwise be the ordinary D2-fires case — isolating this test to the
+    // observation-read failure specifically, not "no observation exists".
+    REQUIRE(f.scim_store->record_saml_login_observation(
+        "https://idp.example.com/saml/metadata", "wendy@example.com",
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"));
+
+    // Break ONLY saml_login_observations (the table
+    // maybe_flag_saml_d2_unlinked's saml_observation_matches read targets).
+    // saml_identity_links stays intact — the link read above still
+    // succeeds engaged-empty, so the code under test reaches the
+    // observation check specifically.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(f.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult drop{
+            PQexec(conn.get(), "DROP TABLE scim_store.saml_login_observations")};
+        REQUIRE(drop.ok());
+    }
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // MUTATION-CHECK (task spec): changing
+    // `if (!observed.has_value() || !*observed) return;` to
+    // `if (!*observed) return;` dereferences the disengaged `optional`
+    // here (the store-error nullopt from the dropped table) — UB/crash
+    // under this exact scenario instead of the correct skip (0.0).
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_saml_unlinked_total").value() == 0.0);
 }
 
 TEST_CASE("ScimRoutes: revive-on-reprovision refuses an operator-elevated account — 404, and "

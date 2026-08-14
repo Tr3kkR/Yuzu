@@ -839,6 +839,45 @@ for lockout/break-glass recovery — that runbook has been rewritten for this
 cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
 the `auth` schema).
 
+## Notification feed moves to PostgreSQL — history preserved (NotificationStore, ADR-0046)
+
+`NotificationStore` — the dashboard toast/badge feed — moves from the SQLite
+`notifications.db` file to the server's PostgreSQL substrate in this release
+(ADR-0006 Wave 2, ADR-0046), schema `notification_store`. **Unread/dismissed
+state is preserved by a mandatory backfill, not a fresh start.** No new flag
+or environment variable is added (it reuses the shared server `PgPool`).
+
+**What happens on first PG boot:**
+
+- A one-time, idempotent, **fail-closed** backfill copies every notification
+  out of the legacy `notifications.db` into `notification_store`, preserving
+  ids (so any bookmarked/linked notification id stays valid) and read/dismissed
+  state. The legacy file is moved aside once the backfill is verified.
+- **Startup failure mode changed.** Previously, a broken or unreadable
+  `notifications.db` degraded only the notification feature — the store ran
+  closed and `/api/notifications*` returned 503. **It now fails the whole
+  server boot** (matching every other Postgres-migrated store's fail-closed
+  contract): if the schema can't open, or the backfill can't complete, the
+  server logs `[PG] Refusing to start` and refuses to serve at all. If you
+  hit this, the log line names the legacy file and states the remediation:
+  repair it, or move it aside to skip the backfill (unread/dismissed history
+  in it will **not** carry over if you do).
+- **Multi-instance consolidation — boot the authoritative replica first.**
+  If you are consolidating multiple previously-independent server instances
+  (each with genuinely different local `notifications.db` content) onto one
+  shared Postgres for the first time, whichever instance boots first and
+  completes the backfill becomes the fleet's sole notification history — every
+  other instance's own legacy file will permanently fail closed (a
+  holder-side fingerprint mismatch) on every subsequent boot, requiring manual
+  reconciliation (move the losing instances' legacy files aside once you've
+  confirmed their content is disposable). This is the intended fail-loud
+  behavior, not a bug — there is no automated merge across independent legacy
+  files. Boot the instance holding the notification history you want to keep
+  first, same guidance as the RBAC store migration above.
+
+**Not affected:** `/api/notifications*` request/response behavior is
+unchanged — this is a storage-engine swap only, no API change.
+
 ## Audit trail migrates to PostgreSQL — history preserved (AuditStore, ADR-0040)
 
 The audit log (`AuditStore`, the SOC 2 evidence chain) moves from the SQLite
@@ -1024,6 +1063,174 @@ records the one-time backfill outcome (`completed` / `fresh` / `failed`).
 **Not affected:** the confinement hierarchy's semantics, the REST/MCP surface,
 and dynamic-group scope expressions are unchanged — only the storage substrate
 and the fail-closed read posture change.
+
+## Custom properties migrate to Postgres (mandatory backfill, ADR-0045)
+
+The `CustomPropertiesStore` — operator-authored per-agent metadata (properties
+and their optional type/validation schemas) used in scope expressions via
+`props.<key>` — moves from the SQLite `custom-properties.db` file to the
+server's PostgreSQL substrate in this release (ADR-0006 Wave 2), schema
+`custom_properties_store`. It reuses the existing shared connection pool —
+**no new connection flag or config is required**.
+
+**This is NOT a fresh-start cutover.** Custom properties and their schemas are
+irreducible operator-authored asset-tagging data — losing them would silently
+break any `props.<key>`-scoped dispatch, policy, or push rule. The migration
+performs a **mandatory one-time backfill** on first Postgres boot:
+
+- **What is preserved:** every property (agent, key, value, type) and every
+  property schema (key, display name, type, description, validation regex)
+  carry over exactly.
+- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
+  Postgres write error, an unreadable legacy DB, or a holder-side
+  fingerprint-verification refusal (see below) — the server **refuses to
+  boot** rather than come up with partial data. The backfill marker is only
+  stamped on success, so a failed attempt is **retried on the next start**
+  once you have fixed the underlying cause.
+- **Legacy file moved aside after a verified backfill.** Once the backfill is
+  confirmed complete, `custom-properties.db` is renamed to
+  `custom-properties.db.migrated-<epoch>` (the server never reads it again).
+  If you do not see this file appear, the backfill did not run to completion.
+  Keep the renamed file until you have confirmed properties/schemas look
+  correct, then treat it as an operator-managed backup and dispose of it per
+  your data-retention policy.
+- **Multi-replica deployments: boot the replica holding the authoritative
+  `custom-properties.db` FIRST.** Unlike this store's SQLite era, a
+  multi-replica Postgres deployment shares ONE `custom_properties_store`
+  schema — the first replica to complete the backfill wins, and every other
+  replica's boot verifies its own local legacy file against what actually
+  landed rather than trusting the shared completion marker blindly. If two
+  replicas hold genuinely different legacy content (an unusual topology for
+  this store — `custom-properties.db` is ordinarily a single server's local
+  file, not something expected to diverge across replicas of the same
+  logical deployment), the second replica to boot refuses with a
+  **HOLDER-SIDE VERIFICATION FAILED** error rather than silently accepting
+  or silently overwriting the winner's data — see
+  `docs/ops-runbooks/custom-properties-store-backfill-recovery.md` for the
+  recovery procedure.
+- **Budget for a longer first boot.** First boot takes longer than usual while
+  the backfill runs; a large `custom-properties.db` (many agents/properties)
+  extends this further. **Widen your own orchestrator's startup budget
+  accordingly** (Kubernetes `startupProbe` failure/period budget, or the
+  Docker Compose healthcheck `start_period`) so it does not kill the server
+  mid-backfill and restart it into the same long boot repeatedly — do not
+  treat a slower-than-normal first boot as a hang.
+
+**Operator-visible behaviour change (fail-closed reads).** After cutover, a
+`props.<key>`-feeding read that degrades (store not open, pool-acquire
+timeout, or query error) now aborts the whole scope evaluation rather than
+silently resolving the property as absent — a `props.<key>`-scoped
+dispatch/policy/push rule now matches **nobody** while degraded, instead of
+(under a `NOT`/`!=` scope) silently matching **everybody**. `GET
+/api/agents/:id/properties` now returns **503** on a degraded read rather
+than an empty list. Watch the new
+`yuzu_server_custom_properties_read_degrade_total{reason}` counter — a
+non-zero rate means `props.<key>`-scoped rules may be silently matching
+nobody, not that operators removed the properties (see `docs/user-manual/
+metrics.md` and the shipped `YuzuCustomPropertiesReadDegraded` alert).
+`yuzu_server_custom_properties_backfill_total{result}` records the one-time
+backfill outcome.
+
+**Operator-visible behaviour change (fail-closed writes, 2026-08-14 follow-up).**
+`PUT /api/agents/:id/properties/:key` and `POST /api/property-schemas` now return
+**503** (instead of `400`) when the failure is a genuine database/store outage rather
+than caller-input or schema-validation error — previously every failure from either
+write, including a transient Postgres blip, surfaced as the same `400` a caller could
+not distinguish from their own bad input. A caller that branches specifically on `400`
+to mean "don't retry" should treat the new `503`s the same as any other transient
+server error (retry with backoff); a caller that already treats any `5xx` as retryable
+is unaffected. See `docs/user-manual/rest-api.md`'s per-route notes for the exact
+response shapes.
+
+**Not affected:** the `props.<key>` scope-DSL syntax and property/schema semantics are
+unchanged; the `GET`/`DELETE` property routes and `GET` schema route keep their prior
+response shapes — only the two write routes' failure-mode status codes changed, as
+described above.
+
+## Network-discovered device data migrates to Postgres (mandatory backfill, DiscoveryStore, ADR-0044)
+
+The `DiscoveryStore` — the network-discovered devices behind `POST /api/discovery/scan`
+and `GET /api/discovery/results` — moves from the SQLite `discovery.db` file to the
+server's PostgreSQL substrate in this release (ADR-0006 Wave 2), schema
+`discovery_store`. It reuses the existing shared connection pool — no new connection
+flag or config is required.
+
+**This is NOT a fresh-start cutover.** The `managed` flag an operator has set on a
+discovered device (confirming "this is my enrolled agent") is real, non-regenerable
+operator intent, so the migration performs a **mandatory one-time backfill** on first
+Postgres boot:
+
+- **What is preserved:** every discovered device — IP/MAC/hostname, the `managed`
+  flag and its associated `agent_id`, and first-seen (`discovered_at`/`discovered_by`)
+  provenance — carries over (any field containing invalid UTF-8 or an embedded NUL
+  is scrubbed to U+FFFD on write, matching every other field in this store).
+- **Fail-closed boot on backfill failure.** If the backfill cannot complete —
+  Postgres write error, an unreadable legacy DB, or a fingerprint mismatch (below) —
+  the server **refuses to boot** rather than come up with an empty or partial
+  discovered-device inventory. The backfill marker is only stamped on success, so a
+  failed attempt is **retried on the next start** once the underlying cause is fixed.
+- **Fingerprint-verified, not marker-only.** Unlike a plain "did the marker get
+  stamped" check, the backfill records a fingerprint of the migrated content
+  alongside the completion marker. On a multi-replica deployment sharing one
+  Postgres database, this lets a later-booting replica tell apart "this is the same
+  content I already migrated" from "a different replica's data was migrated, not
+  mine" — the latter fails closed rather than silently accepting a completion this
+  replica's own discovered devices were never part of. If you see a "HOLDER-SIDE
+  VERIFICATION FAILED" log line, do not force-boot around it: this indicates two
+  replicas each hold `discovery.db` files with genuinely different content, and an
+  operator needs to decide which is authoritative before either can proceed.
+- **A 0-byte `discovery.db` is refused, not treated as a fresh install.** SQLite
+  opens a 0-byte file as a valid empty database, which looks identical to "this
+  legacy store was created but never used" — but a genuine fresh install never has
+  a `discovery.db` file at all. If you see a log line saying this is "NOT a fresh
+  install... a truncated/corrupted real database", either delete the empty file and
+  retry (if the legacy store genuinely was never used) or restore `discovery.db`
+  from backup before retrying (if it held real data that got truncated).
+- **A conflict during backfill can also refuse the boot, not just a fingerprint
+  mismatch.** On a multi-replica deployment, if a live scan (or a `mark_managed`
+  call through a sibling replica) lands a row for an IP before this replica's own
+  backfill reaches it, and that legacy row was `managed=true` or had an
+  `agent_id` assigned, the backfill verifies the row already in Postgres carries
+  the same values before trusting the migration — refusing (with a
+  "reconciliation FAILED" log line naming the IP) rather than silently dropping
+  or misattributing an operator's managed-device assignment. **This does NOT
+  resolve itself on its own** — the legacy data is frozen and a retry
+  conflict-skips against the same mismatched row every time, so this replica
+  restart-loops until an operator manually reconciles: check
+  `discovery_store.discovered_devices` for the named IP to see which value is
+  actually correct, then either accept the value already in Postgres (delete the
+  legacy file and let this replica take the sourceless-skip path) or correct the
+  row via `mark_managed` before retrying.
+- **Legacy file moved aside after a verified backfill.** Once the backfill is
+  confirmed complete, `discovery.db` is renamed to
+  `discovery.db.migrated-<epoch>` (the server never reads it again). Keep the
+  renamed file until you have confirmed discovery data looks correct, then dispose
+  of it per your data-retention policy.
+
+**Operator-visible behaviour change (fail-closed reads).** `GET /api/discovery/results`
+now returns **503** on a degraded read (store not open, pool-acquire timeout, or query
+error) instead of silently rendering an empty device list — previously, a local SQLite
+read essentially never failed short of file corruption, so this failure mode was not
+practically reachable. Watch the new `yuzu_server_discovery_read_degrade_total{reason}`
+counter — a non-zero rate means the discovery view is degraded, **not** that no devices
+were found. `yuzu_server_discovery_backfill_total{result}` records the one-time
+backfill outcome (`completed` / `fresh` / `failed`).
+
+**Breaking — `POST /api/discovery/scan`'s response contract changed.** The endpoint no
+longer always returns `200 {"status":"ok",...}`: the response gains a `devices_failed`
+count, `status` is `"partial"` when some but not all devices in a batch persisted, and
+the endpoint returns **503** when every attempted device failed to persist (previously
+this was silently reported as `200`/`"ok"`, with the `discovery.scan` audit row always
+saying `"success"` regardless of outcome — the audit outcome is now
+`"success"`/`"partial"`/`"failure"`). A caller that asserts a bare `status == "ok"`, or
+that treats any 5xx from this endpoint as a hard failure needing operator escalation,
+should account for the new value and status code. Re-sending the exact same request body
+is safe — `upsert_device` is idempotent per `ip_address`, so a byte-identical retry cannot
+double-count or corrupt already-stored devices — but a fresh re-scan is not the same
+thing: `mac_address`/`subnet` overwrite unconditionally on every upsert, so a re-scan that
+fails to resolve a device's MAC this time will blank a previously known-good value rather
+than simply retry the earlier failure. See the REST API reference's Network Discovery
+section for the full response shapes.
 
 ## Upgrade Order
 
