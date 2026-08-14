@@ -2238,7 +2238,7 @@ groups:
           runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
       - alert: YuzuCustomPropertiesReadDegraded
         # A props.<key> scope-DSL-feeding read against custom_properties_store
-        # (ADR-0044) degraded. AgentRegistry::evaluate_scope's bulk preload
+        # (ADR-0045) degraded. AgentRegistry::evaluate_scope's bulk preload
         # (get_values_for_keys) ABORTS the whole scope evaluation on this
         # degrade (nullopt), which every caller collapses via .value_or({}) to
         # "zero targets matched" — a fired alert means props.<key>-scoped
@@ -2266,7 +2266,7 @@ groups:
             as authoritative while this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/custom-properties-read-degraded"
       - alert: YuzuCustomPropertiesBackfillFailing
-        # The one-time SQLite->Postgres backfill (ADR-0044) reported a failed
+        # The one-time SQLite->Postgres backfill (ADR-0045) reported a failed
         # outcome. The server fails closed at boot on a backfill failure
         # (write error, or a holder-side fingerprint-verification refusal on
         # a multi-replica boot with divergent legacy content — see

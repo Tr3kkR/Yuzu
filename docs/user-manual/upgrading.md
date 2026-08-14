@@ -1025,7 +1025,7 @@ records the one-time backfill outcome (`completed` / `fresh` / `failed`).
 and dynamic-group scope expressions are unchanged — only the storage substrate
 and the fail-closed read posture change.
 
-## Custom properties migrate to Postgres (mandatory backfill, ADR-0044)
+## Custom properties migrate to Postgres (mandatory backfill, ADR-0045)
 
 The `CustomPropertiesStore` — operator-authored per-agent metadata (properties
 and their optional type/validation schemas) used in scope expressions via

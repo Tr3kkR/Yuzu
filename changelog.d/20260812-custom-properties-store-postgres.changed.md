@@ -1,4 +1,4 @@
-- **`CustomPropertiesStore` migrated to PostgreSQL** (ADR-0006/ADR-0044). Device custom
+- **`CustomPropertiesStore` migrated to PostgreSQL** (ADR-0006/ADR-0045). Device custom
   properties and property schemas now live in the `custom_properties_store` Postgres schema
   instead of a SQLite file. Existing data is backfilled automatically on first boot after
   upgrade (one-time, idempotent) — **if the backfill cannot complete, the server refuses to

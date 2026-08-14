@@ -1,6 +1,6 @@
 /**
  * test_custom_properties_store.cpp -- Unit tests for CustomPropertiesStore
- * (ADR-0006/ADR-0044, migrated Postgres store, schema `custom_properties_store`)
+ * (ADR-0006/ADR-0045, migrated Postgres store, schema `custom_properties_store`)
  *
  * Covers: property CRUD, schema CRUD, schema validation (type checking,
  * regex), key/value validation, agent isolation, property map, the bulk
@@ -904,7 +904,7 @@ TEST_CASE("CustomPropertiesStore: backfill with legacy db missing custom_propert
 // ============================================================================
 // Backfill: holder-side fingerprint verification (marker already set, this
 // replica still holds a legacy file) — the novel logic this store's backfill
-// was specifically built to add over the SQLite original, per ADR-0044 and
+// was specifically built to add over the SQLite original, per ADR-0045 and
 // the RbacStore post-#2703 reference shape it ports unmodified. Governance
 // Gate 3 quality-engineer flagged these branches as having zero coverage.
 // ============================================================================

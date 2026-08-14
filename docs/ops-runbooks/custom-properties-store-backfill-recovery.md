@@ -1,10 +1,10 @@
 # Runbook: CustomPropertiesStore backfill refusals and recovery
 
 Covers boot-time refusals from the mandatory legacy `custom-properties.db` →
-PostgreSQL `custom_properties_store` backfill (ADR-0044). If the server is
+PostgreSQL `custom_properties_store` backfill (ADR-0045). If the server is
 refusing to start because of this backfill, this is the page.
 
-Background: ADR-0044, `docs/postgres-store-playbook.md` "Local source
+Background: ADR-0045, `docs/postgres-store-playbook.md` "Local source
 absence never creates terminal migration state on its own" (#2697); this
 store's mechanism mirrors `RbacStore`'s recovery shape
 (`rbac-store-backfill-recovery.md`) unmodified for the fingerprint machinery,

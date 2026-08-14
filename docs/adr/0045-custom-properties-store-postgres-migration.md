@@ -1,4 +1,4 @@
-# ADR-0044: CustomPropertiesStore → PostgreSQL (Wave 2)
+# ADR-0045: CustomPropertiesStore → PostgreSQL (Wave 2)
 
 - **Status:** Accepted
 - **Date:** 2026-08-12
