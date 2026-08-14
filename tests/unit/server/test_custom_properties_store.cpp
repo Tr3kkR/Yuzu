@@ -38,6 +38,7 @@ using yuzu::server::CustomProperty;
 using yuzu::server::CustomPropertiesReadError;
 using yuzu::server::CustomPropertiesStore;
 using yuzu::server::CustomPropertySchema;
+using yuzu::server::kCustomPropertiesDbErrorPrefix;
 using yuzu::server::SqliteDb;
 using yuzu::server::SqliteErrMsg;
 using yuzu::server::SqliteStmt;
@@ -383,11 +384,26 @@ TEST_CASE("CustomPropertiesStore: reads degrade to kDegraded on a closed store",
     CHECK(store.get_property_map("agent-1").error() == CustomPropertiesReadError::kDegraded);
     CHECK(store.get_values_for_keys({"k"}).error() == CustomPropertiesReadError::kDegraded);
 
-    // set_property on a closed store is also an error (not silently
-    // accepted) — same posture, string-error channel (unchanged contract).
+    // get_schema/delete_schema widened to the same typed contract (gov Gate 8
+    // finding, fjarvis re-review of PR #3065) — degrade on a closed store,
+    // never a silent "not found".
+    CHECK(store.get_schema("k").error() == CustomPropertiesReadError::kDegraded);
+    CHECK(store.delete_schema("k").error() == CustomPropertiesReadError::kDegraded);
+
+    // set_property/upsert_schema on a closed store are also errors (not
+    // silently accepted) — same posture, string-error channel, now prefixed
+    // with kCustomPropertiesDbErrorPrefix so a REST route can classify a
+    // genuine store outage (503) apart from caller-input validation (400)
+    // (gov Gate 8 finding, fjarvis re-review of PR #3065 — the route
+    // previously mapped every failure, including a store outage, to 400).
     auto set_result = store.set_property("agent-1", "k", "v");
     REQUIRE(!set_result.has_value());
-    CHECK(set_result.error() == "store not open");
+    CHECK(set_result.error() == std::string(kCustomPropertiesDbErrorPrefix) + "store not open");
+
+    CustomPropertySchema schema{.key = "k", .display_name = "K", .type = "string"};
+    auto schema_result = store.upsert_schema(schema);
+    REQUIRE(!schema_result.has_value());
+    CHECK(schema_result.error() == std::string(kCustomPropertiesDbErrorPrefix) + "store not open");
 }
 
 // ============================================================================
@@ -463,11 +479,12 @@ TEST_CASE("CustomPropertiesStore: create and get schema", "[pg][custom_props][sc
 
     auto retrieved = store.get_schema("environment");
     REQUIRE(retrieved.has_value());
-    CHECK(retrieved->key == "environment");
-    CHECK(retrieved->display_name == "Environment");
-    CHECK(retrieved->type == "string");
-    CHECK(retrieved->description == "Deployment environment");
-    CHECK(retrieved->validation_regex == "^(dev|staging|production)$");
+    REQUIRE(retrieved->has_value());
+    CHECK((*retrieved)->key == "environment");
+    CHECK((*retrieved)->display_name == "Environment");
+    CHECK((*retrieved)->type == "string");
+    CHECK((*retrieved)->description == "Deployment environment");
+    CHECK((*retrieved)->validation_regex == "^(dev|staging|production)$");
 }
 
 TEST_CASE("CustomPropertiesStore: list schemas", "[pg][custom_props][schema]") {
@@ -502,8 +519,9 @@ TEST_CASE("CustomPropertiesStore: update schema via upsert", "[pg][custom_props]
 
     auto schema = store.get_schema("env");
     REQUIRE(schema.has_value());
-    CHECK(schema->display_name == "Environment");
-    CHECK(schema->description == "Updated");
+    REQUIRE(schema->has_value());
+    CHECK((*schema)->display_name == "Environment");
+    CHECK((*schema)->description == "Updated");
 
     // Still only one schema
     auto all = store.list_schemas();
@@ -516,20 +534,32 @@ TEST_CASE("CustomPropertiesStore: delete schema", "[pg][custom_props][schema]") 
     CustomPropertySchema s{.key = "env", .display_name = "Env", .type = "string"};
     store.upsert_schema(s);
 
-    CHECK(store.delete_schema("env") == true);
-    CHECK(store.get_schema("env") == std::nullopt);
-    CHECK(store.delete_schema("env") == false);
+    auto del1 = store.delete_schema("env");
+    REQUIRE(del1.has_value());
+    CHECK(*del1 == true);
+
+    auto after = store.get_schema("env");
+    REQUIRE(after.has_value());
+    CHECK(*after == std::nullopt);
+
+    auto del2 = store.delete_schema("env");
+    REQUIRE(del2.has_value());
+    CHECK(*del2 == false);
 }
 
 TEST_CASE("CustomPropertiesStore: delete nonexistent schema", "[pg][custom_props][schema]") {
     PROPS_SHARED(store, pool);
-    CHECK(store.delete_schema("nonexistent") == false);
+    auto del = store.delete_schema("nonexistent");
+    REQUIRE(del.has_value());
+    CHECK(*del == false);
 }
 
 TEST_CASE("CustomPropertiesStore: get nonexistent schema returns nullopt",
           "[pg][custom_props][schema]") {
     PROPS_SHARED(store, pool);
-    CHECK(store.get_schema("nonexistent") == std::nullopt);
+    auto schema = store.get_schema("nonexistent");
+    REQUIRE(schema.has_value());
+    CHECK(*schema == std::nullopt);
 }
 
 TEST_CASE("CustomPropertiesStore: schema with invalid key rejected",
@@ -739,7 +769,9 @@ TEST_CASE("CustomPropertiesStore: delete schema removes validation",
     REQUIRE(!r1.has_value());
 
     // Delete schema
-    store.delete_schema("env");
+    auto del = store.delete_schema("env");
+    REQUIRE(del.has_value());
+    CHECK(*del == true);
 
     // Accepted without schema
     auto r2 = store.set_property("agent-1", "env", "testing");
@@ -842,8 +874,9 @@ TEST_CASE("CustomPropertiesStore: backfill copies properties and schemas from le
 
     auto schema = store.get_schema("env");
     REQUIRE(schema.has_value());
-    CHECK(schema->display_name == "Environment");
-    CHECK(schema->validation_regex == "^(dev|staging|production)$");
+    REQUIRE(schema->has_value());
+    CHECK((*schema)->display_name == "Environment");
+    CHECK((*schema)->validation_regex == "^(dev|staging|production)$");
 
     // Legacy file was moved aside (one-release rollback window, ADR-0009).
     CHECK_FALSE(std::filesystem::exists(legacy.path));

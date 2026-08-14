@@ -286,6 +286,15 @@ std::string trim_ascii_whitespace(std::string_view s) {
     auto e = s.find_last_not_of(" \t\r\n");
     return std::string(s.substr(b, e - b + 1));
 }
+
+// CustomPropertiesStore error classifier — mirrors discovery_routes.cpp's
+// is_deployment_db_error, keyed off the SHARED constant
+// (custom_properties_store.hpp) rather than a local copy of the literal, so
+// a future rename of the prefix can't silently regress a classified 503 back
+// to 400 (gov Gate 8 finding, fjarvis re-review of PR #3065).
+bool is_custom_properties_db_error(const std::string& err) {
+    return err.starts_with(kCustomPropertiesDbErrorPrefix);
+}
 } // namespace yuzu::server
 
 namespace yuzu::server {
@@ -10269,6 +10278,15 @@ private:
 
             auto result = custom_properties_store_->set_property(agent_id, key, value, type);
             if (!result) {
+                if (is_custom_properties_db_error(result.error())) {
+                    spdlog::error("PUT /api/agents/{}/properties/{}: {}", agent_id, key,
+                                  result.error());
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 res.status = 400;
                 res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                 "application/json");
@@ -10386,6 +10404,14 @@ private:
 
             auto result = custom_properties_store_->upsert_schema(schema);
             if (!result) {
+                if (is_custom_properties_db_error(result.error())) {
+                    spdlog::error("POST /api/property-schemas: {}", result.error());
+                    res.status = 503;
+                    res.set_content(
+                        R"({"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}})",
+                        "application/json");
+                    return;
+                }
                 res.status = 400;
                 res.set_content(nlohmann::json({{"error", result.error()}}).dump(),
                                 "application/json");

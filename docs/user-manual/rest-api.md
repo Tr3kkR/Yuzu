@@ -3526,16 +3526,22 @@ Set or update a custom property value on an agent. If a property schema exists f
 }
 ```
 
-**Note on database degrade:** unlike `GET /api/agents/:id/properties` above, a transient
-database failure during this write currently surfaces as this same `400` (`"database error"` /
-`"database write failed"`) rather than a distinguishable `503` — not yet type-widened. Most of
-this predates the Postgres migration (the SQLite original had the identical
-collapse-to-generic-error shape on an INSERT failure); it is called out here because a Postgres
-pool/query failure is a more routine occurrence than a local SQLite file error ever was. One
-sub-case is new in this release: a transient failure on the schema-validation lookup itself
-(rather than the property write) used to be silently treated as "no schema, accept any value" by
-the SQLite original — that fail-open is now closed, and this sub-case also surfaces as `400`
-(`"database error"`), correctly rejecting the write rather than accepting it unvalidated.
+**Error (503) -- store outage:**
+
+```json
+{"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}}
+```
+
+**Note on database degrade:** a transient database failure during this write — store not open, a
+pool/query failure on the property INSERT, or a failure on the schema-validation lookup itself —
+now surfaces as this distinguishable `503`, matching `GET /api/agents/:id/properties` above.
+Caller-input validation failures (invalid key/value shape, or a value rejected against an existing
+schema) stay `400`. This closes a gap where every failure, including a genuine store outage,
+collapsed to the same `400` a caller couldn't distinguish from their own bad input (gov Gate 8
+finding, fjarvis re-review of PR #3065). A transient failure on the schema-validation lookup used
+to be silently treated by the SQLite original as "no schema, accept any value" — that fail-open
+was already closed by the original Postgres migration (it correctly rejects the write instead of
+accepting it unvalidated); this change only affects which status code that rejection now uses.
 
 ---
 
@@ -3632,6 +3638,18 @@ Create or update a property schema. If a schema with the given key already exist
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Error (503) -- store outage:**
+
+```json
+{"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}}
+```
+
+**Note on database degrade:** a transient database failure during this write (store not open, a
+pool lease timeout, or a query failure) surfaces as this distinguishable `503`. Caller-input
+validation failures (invalid key, unrecognized type, an invalid/oversized validation regex) stay
+`400` (gov Gate 8 finding, fjarvis re-review of PR #3065 — the same fix as `PUT
+/api/agents/:id/properties/:key` above).
 
 ---
 
