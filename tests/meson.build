@@ -553,6 +553,8 @@ if build_server
       'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
+      'unit/server/test_capability_catalogue.cpp',
+      'unit/server/test_command_capability.cpp',
       'unit/server/test_rest_access_review.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
@@ -886,6 +888,16 @@ test('changelog order',
   args: [files('test_changelog_order.py')],
   suite: 'docs',
   timeout: 10,
+)
+
+# PR1.9 data-gate: every plugin action has exactly one capability-catalogue row
+# across the five fragment headers, and no fragment claims an action no plugin
+# declares. Hermetic — parses sources, builds nothing.
+test('capability catalogue completeness',
+  _python3_test,
+  args: [files('test_capability_catalogue_complete.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint
