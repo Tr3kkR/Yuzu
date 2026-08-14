@@ -2151,11 +2151,44 @@ public:
         // the first incident, which is exactly the wrong moment for an
         // alert rule to discover the series does not exist yet).
         metrics_.describe("yuzu_scim_saml_link_write_failures_total",
-                          "Total ADR-2001 PR4a SAML identity-link writes that failed during "
-                          "SAML login (ScimStore outage) — the login itself always succeeds "
-                          "(fail-OPEN by design), but a sustained non-zero rate means SAML "
-                          "identities are silently not being linked and won't be revoked on "
-                          "deprovision",
+                          "Total ADR-2001 PR4a SAML identity-link/login-observation writes that "
+                          "failed during SAML login (ScimStore outage) — the login itself "
+                          "always succeeds (fail-OPEN by design), but a sustained non-zero rate "
+                          "means SAML identities are silently not being linked and won't be "
+                          "revoked on deprovision",
+                          "counter");
+        // ADR-2001 #3072 — SAML D2 observability, caller/signal layer. Four
+        // new counters mirroring the OIDC D2 shape above, split per-protocol
+        // rather than labeled onto the OIDC series (the established
+        // ADR-2001 pattern — see the SAML link/deny counters above).
+        metrics_.describe("yuzu_scim_saml_link_unmatched_total",
+                          "Total SAML logins with a linkable NameID Format for which ZERO "
+                          "active SCIM resources matched the NameID as an externalId — the "
+                          "identity authenticated but could not be linked (no such SCIM user, "
+                          "or externalId drift between the IdP and SCIM provisioning)",
+                          "counter");
+        metrics_.describe("yuzu_scim_saml_link_ambiguous_total",
+                          "Total SAML logins with a linkable NameID Format for which MORE THAN "
+                          "ONE active SCIM resource matched the NameID as an externalId "
+                          "(ADR-2001 §2 mis-link guard) — a distinct, more actionable "
+                          "misconfiguration than ordinary link drift (duplicate/stale SCIM "
+                          "externalId), kept in its own series rather than folded into "
+                          "yuzu_scim_saml_link_unmatched_total",
+                          "counter");
+        metrics_.describe("yuzu_scim_saml_link_lookup_failures_total",
+                          "Total SAML logins with a linkable NameID Format for which the "
+                          "ScimStore active-externalId lookup itself could not answer (store "
+                          "outage, lease timeout, or a failed statement) — distinct from "
+                          "yuzu_scim_saml_link_unmatched_total (a genuine zero-match answer); "
+                          "a sustained non-zero rate means SAML link formation cannot even be "
+                          "attempted, not just that it is failing to match",
+                          "counter");
+        metrics_.describe("yuzu_scim_deprovision_saml_unlinked_total",
+                          "ADR-2001 #3072 SAML D2 tripwire: a deprovision resolved NO linked "
+                          "SAML identity for a slug, but a recorded SAML login observation "
+                          "shows a NameID matching that slug's externalId — the user DID "
+                          "authenticate via SAML but the identity link never formed (a "
+                          "deprovision that revoked nothing for a federated user who exists)",
                           "counter");
 
         // ADR-2001 §4 — deny-at-login backstop. Bumped by
@@ -2203,6 +2236,10 @@ public:
         metrics_.counter("yuzu_scim_saml_link_write_failures_total");
         metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_total");
+        metrics_.counter("yuzu_scim_saml_link_unmatched_total");
+        metrics_.counter("yuzu_scim_saml_link_ambiguous_total");
+        metrics_.counter("yuzu_scim_saml_link_lookup_failures_total");
+        metrics_.counter("yuzu_scim_deprovision_saml_unlinked_total");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning

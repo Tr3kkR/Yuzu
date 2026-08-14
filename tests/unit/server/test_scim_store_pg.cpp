@@ -1114,6 +1114,220 @@ TEST_CASE("ScimStore: saml_linked_resource_active — LEFT JOIN is load-bearing 
     CHECK(PQntuples(inner.get()) == 0);
 }
 
+// ── ADR-2001 #3072 — SAML login observations (migration v5, D2-style) ───
+//
+// saml_login_observations — the SAML analogue of oidc_login_observations
+// (tested above). Unlike the OIDC surface, saml_observation_matches is
+// TRI-STATE (nullopt/true/false) rather than a plain bool — see the .hpp
+// doc comment for why. Mirrors the oidc test structure, plus the
+// distinct-row-per-name_id_format assertion the SAML uniqueness key adds.
+
+TEST_CASE("ScimStore: saml_login_observations upsert-on-relogin + distinct rows per "
+         "name_id_format",
+         "[pg][scim][2001][linkage][saml]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string entity = "https://saml-idp.example.com/metadata";
+    const std::string name_id = "alice@example.com";
+
+    SECTION("record_saml_login_observation rejects empty entity_id/name_id, but NOT an empty "
+            "name_id_format (Gate 7 fix: a missing NameID Format attribute is a common, "
+            "legitimate IdP configuration and must still be recorded — see the .hpp doc "
+            "comment)") {
+        CHECK_FALSE(store.record_saml_login_observation("", name_id, "persistent"));
+        CHECK_FALSE(store.record_saml_login_observation(entity, "", "persistent"));
+        // MUTATION-CHECK (task spec): restoring `name_id_format.empty()` to
+        // the guard makes this assertion fail (the write is rejected
+        // instead of recorded as "").
+        CHECK(store.record_saml_login_observation(entity, name_id, ""));
+    }
+
+    SECTION("re-login upserts (refreshes seen_at) the SAME (entity_id,name_id,format) row") {
+        REQUIRE(store.record_saml_login_observation(entity, name_id, "persistent"));
+
+        // Force seen_at into the past via raw SQL so the second upsert's
+        // "refreshed to now" effect is observable rather than possibly
+        // landing in the same wall-clock second.
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult backdate{PQexec(
+            conn.get(),
+            "UPDATE scim_store.saml_login_observations SET seen_at = 12345 "
+            "WHERE entity_id = 'https://saml-idp.example.com/metadata' "
+            "AND name_id = 'alice@example.com' AND name_id_format = 'persistent'")};
+        REQUIRE(backdate.ok());
+
+        REQUIRE(store.record_saml_login_observation(entity, name_id, "persistent"));
+
+        PgResult after{PQexec(
+            conn.get(),
+            "SELECT seen_at FROM scim_store.saml_login_observations "
+            "WHERE entity_id = 'https://saml-idp.example.com/metadata' "
+            "AND name_id = 'alice@example.com' AND name_id_format = 'persistent'")};
+        REQUIRE(after.ok());
+        REQUIRE(PQntuples(after.get()) == 1); // still exactly one row — upsert, not accumulate
+        CHECK(std::string(PQgetvalue(after.get(), 0, 0)) != "12345"); // seen_at refreshed to now
+    }
+
+    SECTION("a different name_id_format for the same (entity_id,name_id) is a DISTINCT row — "
+           "both coexist") {
+        REQUIRE(store.record_saml_login_observation(entity, name_id, "persistent"));
+        REQUIRE(store.record_saml_login_observation(entity, name_id, "transient"));
+
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult rows{PQexec(
+            conn.get(),
+            "SELECT name_id_format FROM scim_store.saml_login_observations "
+            "WHERE entity_id = 'https://saml-idp.example.com/metadata' "
+            "AND name_id = 'alice@example.com' ORDER BY name_id_format ASC")};
+        REQUIRE(rows.ok());
+        REQUIRE(PQntuples(rows.get()) == 2); // TWO distinct rows, neither erased the other
+        CHECK(std::string(PQgetvalue(rows.get(), 0, 0)) == "persistent");
+        CHECK(std::string(PQgetvalue(rows.get(), 1, 0)) == "transient");
+
+        // Both remain independently discoverable by name_id — the value the
+        // D2 detector actually keys its read on.
+        auto match = store.saml_observation_matches(name_id);
+        REQUIRE(match.has_value());
+        CHECK(*match);
+    }
+}
+
+TEST_CASE("ScimStore: saml_observation_matches — tri-state (engaged-true / engaged-false / "
+         "store-error)",
+         "[pg][scim][2001][linkage][saml]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("engaged false before any observation is recorded") {
+        auto result = store.saml_observation_matches("never-seen@example.com");
+        REQUIRE(result.has_value()); // store answered
+        CHECK_FALSE(*result);
+    }
+
+    SECTION("engaged true once a matching observation exists, engaged false for a different "
+           "name_id") {
+        REQUIRE(store.record_saml_login_observation("https://saml-idp.example.com/",
+                                                    "bob@example.com", "persistent"));
+
+        auto hit = store.saml_observation_matches("bob@example.com");
+        REQUIRE(hit.has_value());
+        CHECK(*hit);
+
+        auto miss = store.saml_observation_matches("carol@example.com");
+        REQUIRE(miss.has_value());
+        CHECK_FALSE(*miss);
+    }
+
+    SECTION("empty name_id is engaged false — a definitive non-match, not a store error") {
+        auto result = store.saml_observation_matches("");
+        REQUIRE(result.has_value());
+        CHECK_FALSE(*result);
+    }
+
+    SECTION("a store that cannot answer (closed/unreachable pool) returns nullopt, never "
+           "false — the caller must SKIP, not report a false negative") {
+        PgPool broken_pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1}};
+        ScimStore broken_store{broken_pool};
+        REQUIRE_FALSE(broken_store.is_open());
+
+        CHECK_FALSE(broken_store.saml_observation_matches("anything@example.com").has_value());
+    }
+}
+
+// ── ADR-2001 #3072 — find_unique_active_by_external_id_checked ──────────
+//
+// The checked tri/quad-state variant of the mis-link guard already covered
+// (collapsed) above (line ~602). Same underlying query — this exercises the
+// STATUS discrimination the checked variant adds, plus confirms the
+// existing `find_unique_active_by_external_id` wrapper still collapses
+// every non-`matched` status to `nullopt` (byte-unchanged caller contract).
+
+TEST_CASE("ScimStore: find_unique_active_by_external_id_checked — matched / no_match / "
+         "ambiguous / store_error, and the compatibility wrapper",
+         "[pg][scim][2001][linkage]") {
+    using yuzu::server::ActiveExternalIdLookupStatus;
+
+    YUZU_REQUIRE_PG_DB_TPL(db, scim_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    SECTION("matched: exactly one active row — resource populated, wrapper returns it") {
+        auto r = store.create_resource("checked-alice", "checked-ext-1");
+        REQUIRE(r.has_value());
+
+        auto checked = store.find_unique_active_by_external_id_checked("checked-ext-1");
+        CHECK(checked.status == ActiveExternalIdLookupStatus::matched);
+        REQUIRE(checked.resource.has_value());
+        CHECK(checked.resource->scim_id == r->scim_id);
+
+        auto wrapped = store.find_unique_active_by_external_id("checked-ext-1");
+        REQUIRE(wrapped.has_value());
+        CHECK(wrapped->scim_id == r->scim_id);
+    }
+
+    SECTION("no_match: zero rows — resource absent, wrapper returns nullopt") {
+        auto checked = store.find_unique_active_by_external_id_checked("checked-no-such-ext-id");
+        CHECK(checked.status == ActiveExternalIdLookupStatus::no_match);
+        CHECK_FALSE(checked.resource.has_value());
+        CHECK_FALSE(store.find_unique_active_by_external_id("checked-no-such-ext-id").has_value());
+    }
+
+    SECTION("no_match: empty external_id — matches find_unique_active_by_external_id's "
+           "existing empty-input contract, not a store error") {
+        auto checked = store.find_unique_active_by_external_id_checked("");
+        CHECK(checked.status == ActiveExternalIdLookupStatus::no_match);
+        CHECK_FALSE(checked.resource.has_value());
+    }
+
+    SECTION("ambiguous: two ACTIVE rows sharing the external_id — resource absent, wrapper "
+           "returns nullopt") {
+        // Same technique as the existing ambiguous-guard test above: the
+        // partial-unique index makes this unreachable through the store's
+        // own write path, so seed the duplicate directly via SQL after
+        // dropping it — modelling a pre-existing duplicate slipping in.
+        PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        PgResult drop{
+            PQexec(conn.get(), "DROP INDEX scim_store.scim_resources_external_id_uniq")};
+        REQUIRE(drop.ok());
+
+        auto r1 = store.create_resource("checked-dup-1", "checked-dup-ext");
+        auto r2 = store.create_resource("checked-dup-2", "checked-dup-ext");
+        REQUIRE(r1.has_value());
+        REQUIRE(r2.has_value());
+        REQUIRE(r1->scim_id != r2->scim_id);
+
+        auto checked = store.find_unique_active_by_external_id_checked("checked-dup-ext");
+        CHECK(checked.status == ActiveExternalIdLookupStatus::ambiguous);
+        CHECK_FALSE(checked.resource.has_value());
+        CHECK_FALSE(store.find_unique_active_by_external_id("checked-dup-ext").has_value());
+    }
+
+    SECTION("store_error: a store that cannot answer — resource absent, wrapper returns "
+           "nullopt (same collapsed outcome as no_match/ambiguous — byte-unchanged wrapper "
+           "contract)") {
+        PgPool broken_pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1}};
+        ScimStore broken_store{broken_pool};
+        REQUIRE_FALSE(broken_store.is_open());
+
+        auto checked = broken_store.find_unique_active_by_external_id_checked("anything");
+        CHECK(checked.status == ActiveExternalIdLookupStatus::store_error);
+        CHECK_FALSE(checked.resource.has_value());
+        CHECK_FALSE(broken_store.find_unique_active_by_external_id("anything").has_value());
+    }
+}
+
 // ── Dup-detecting fail-closed migration (v3) ────────────────────────────
 //
 // Mirrors the api_token_store #3013 fail-closed test pattern: pre-seed a
