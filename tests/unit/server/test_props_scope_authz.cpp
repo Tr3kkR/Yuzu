@@ -1,5 +1,5 @@
 /**
- * test_props_scope_authz.cpp — the ADR-0043 fail-closed contract for
+ * test_props_scope_authz.cpp — the ADR-0045 fail-closed contract for
  * `props.<key>` scope-DSL resolution (AgentRegistry::evaluate_scope).
  *
  * Mirrors test_scope_walking_authz.cpp's `from_result_set:` degrade/no-store

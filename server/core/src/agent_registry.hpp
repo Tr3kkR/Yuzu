@@ -280,7 +280,7 @@ public:
     // agents not in the live registry) drop silently.
     //
     // Returns std::nullopt (ADR-0036 + 2026-07-26 B2 fail-closed contract,
-    // widened per governance H1 2026-07-29, and again per ADR-0043) in FIVE
+    // widened per governance H1 2026-07-29, and again per ADR-0045) in FIVE
     // cases, all load-bearing:
     //   1. The from_result_set: membership preload hits a Postgres error
     //      mid-scan — NEVER a partial/degraded membership map.
@@ -294,10 +294,10 @@ public:
     //      NOT combinator that inverted to a fleet-wide match — for a
     //      Guardian rule arming an enforcing guard, a fleet-wide arm.)
     //   4. The expression references a props.<key> atom but `props_store`
-    //      is null (ADR-0043) — same "cannot resolve at all here" shape as
+    //      is null (ADR-0045) — same "cannot resolve at all here" shape as
     //      case 3.
     //   5. The expression references a props.<key> atom and the bulk
-    //      get_values_for_keys preload hits a Postgres error (ADR-0043) —
+    //      get_values_for_keys preload hits a Postgres error (ADR-0045) —
     //      same shape as case 1, for CustomPropertiesStore instead of
     //      ResultSetStore.
     // All five are the same fail-open shape: under a NOT combinator, an atom
