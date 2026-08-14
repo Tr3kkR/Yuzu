@@ -1309,6 +1309,24 @@ public:
                           "counter");
         for (const auto result : {"completed", "fresh", "failed"})
             metrics_.counter("yuzu_server_discovery_backfill_total", {{"result", result}});
+        // NotificationStore observability (ADR-0046). Two-way result split (not
+        // RbacStore/ManagementGroupStore/DiscoveryStore's three-way
+        // fresh/completed/failed) — this store's backfill is a single
+        // transaction with no multi-step outcome to report separately, so
+        // "fresh install" and "already-migrated skip" both collapse into
+        // result="success". This wrapper emits on EVERY boot (including
+        // already-migrated restarts), so a boot that never reaches this line
+        // — the failure mode YuzuNotificationBackfillFailing watches for —
+        // is visible as an absent series, not a "reaper" concern (this store
+        // has no retention/reap pass at all).
+        metrics_.describe("yuzu_server_notification_backfill_total",
+                          "One-time legacy notifications.db -> notification_store PostgreSQL "
+                          "backfill outcome on every boot, by result (success = fresh install, "
+                          "already-migrated skip, or a completed migration; failed = fail-closed, "
+                          "boot refused, next start retries). ADR-0046.",
+                          "counter");
+        for (const auto result : {"success", "failed"})
+            metrics_.counter("yuzu_server_notification_backfill_total", {{"result", result}});
         // Generic InventoryStore observability (ADR-0037 hardening round).
         metrics_.describe(
             "yuzu_inventory_ingest_dropped_total",
@@ -2148,11 +2166,44 @@ public:
         // the first incident, which is exactly the wrong moment for an
         // alert rule to discover the series does not exist yet).
         metrics_.describe("yuzu_scim_saml_link_write_failures_total",
-                          "Total ADR-2001 PR4a SAML identity-link writes that failed during "
-                          "SAML login (ScimStore outage) — the login itself always succeeds "
-                          "(fail-OPEN by design), but a sustained non-zero rate means SAML "
-                          "identities are silently not being linked and won't be revoked on "
-                          "deprovision",
+                          "Total ADR-2001 PR4a SAML identity-link/login-observation writes that "
+                          "failed during SAML login (ScimStore outage) — the login itself "
+                          "always succeeds (fail-OPEN by design), but a sustained non-zero rate "
+                          "means SAML identities are silently not being linked and won't be "
+                          "revoked on deprovision",
+                          "counter");
+        // ADR-2001 #3072 — SAML D2 observability, caller/signal layer. Four
+        // new counters mirroring the OIDC D2 shape above, split per-protocol
+        // rather than labeled onto the OIDC series (the established
+        // ADR-2001 pattern — see the SAML link/deny counters above).
+        metrics_.describe("yuzu_scim_saml_link_unmatched_total",
+                          "Total SAML logins with a linkable NameID Format for which ZERO "
+                          "active SCIM resources matched the NameID as an externalId — the "
+                          "identity authenticated but could not be linked (no such SCIM user, "
+                          "or externalId drift between the IdP and SCIM provisioning)",
+                          "counter");
+        metrics_.describe("yuzu_scim_saml_link_ambiguous_total",
+                          "Total SAML logins with a linkable NameID Format for which MORE THAN "
+                          "ONE active SCIM resource matched the NameID as an externalId "
+                          "(ADR-2001 §2 mis-link guard) — a distinct, more actionable "
+                          "misconfiguration than ordinary link drift (duplicate/stale SCIM "
+                          "externalId), kept in its own series rather than folded into "
+                          "yuzu_scim_saml_link_unmatched_total",
+                          "counter");
+        metrics_.describe("yuzu_scim_saml_link_lookup_failures_total",
+                          "Total SAML logins with a linkable NameID Format for which the "
+                          "ScimStore active-externalId lookup itself could not answer (store "
+                          "outage, lease timeout, or a failed statement) — distinct from "
+                          "yuzu_scim_saml_link_unmatched_total (a genuine zero-match answer); "
+                          "a sustained non-zero rate means SAML link formation cannot even be "
+                          "attempted, not just that it is failing to match",
+                          "counter");
+        metrics_.describe("yuzu_scim_deprovision_saml_unlinked_total",
+                          "ADR-2001 #3072 SAML D2 tripwire: a deprovision resolved NO linked "
+                          "SAML identity for a slug, but a recorded SAML login observation "
+                          "shows a NameID matching that slug's externalId — the user DID "
+                          "authenticate via SAML but the identity link never formed (a "
+                          "deprovision that revoked nothing for a federated user who exists)",
                           "counter");
 
         // ADR-2001 §4 — deny-at-login backstop. Bumped by
@@ -2200,6 +2251,10 @@ public:
         metrics_.counter("yuzu_scim_saml_link_write_failures_total");
         metrics_.counter("yuzu_auth_oidc_deprovisioned_denied_total");
         metrics_.counter("yuzu_auth_saml_deprovisioned_denied_total");
+        metrics_.counter("yuzu_scim_saml_link_unmatched_total");
+        metrics_.counter("yuzu_scim_saml_link_ambiguous_total");
+        metrics_.counter("yuzu_scim_saml_link_lookup_failures_total");
+        metrics_.counter("yuzu_scim_deprovision_saml_unlinked_total");
         // Guardian observability (#452 §6). Sized at zero before ingest
         // starts so Prometheus alert rules on these metric names can be
         // authored up front — e.g. events_total > 5e6 as an early-warning
@@ -4598,11 +4653,41 @@ public:
             }
         }
 
-        // Notification & Webhook stores
-        {
-            auto notif_db = cfg_.db_dir() / "notifications.db";
-            notification_store_ = std::make_unique<NotificationStore>(notif_db);
+        // NotificationStore (ADR-0006 Wave 2): Postgres-backed, construction
+        // fail-closed (ADR-0012 §1) — a reachable database whose schema
+        // can't migrate/open is a fatal startup error, never a serve-degraded
+        // state. `migrate_from_sqlite` runs the one-time, idempotent legacy-
+        // `notifications.db` backfill (ADR-0009, MANDATORY — unread/dismissed
+        // state is operator-relevant, not expendable telemetry) — a backfill
+        // failure is ALSO fatal (never serve on top of a partially-migrated
+        // schema).
+        if (pg_pool_ && !startup_failed_) {
+            notification_store_ = std::make_unique<NotificationStore>(*pg_pool_);
+            if (!notification_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: notification store migration/open "
+                              "failed (database reachable but the notification_store schema "
+                              "could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                notification_store_->set_metrics(&metrics_);
+                auto notif_db = cfg_.db_dir() / "notifications.db";
+                if (!notification_store_->migrate_from_sqlite(notif_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: notification legacy-SQLite backfill failed "
+                        "(see prior log lines) — notification_store is authoritative and must "
+                        "not serve partially-migrated data. Operator remediation: repair {} or "
+                        "move it aside to skip the backfill (unread/dismissed history in it "
+                        "will NOT carry over)",
+                        notif_db.string());
+                    startup_failed_ = true;
+                } else {
+                    spdlog::info("NotificationStore initialized (schema notification_store; "
+                                 "legacy backfill source {})",
+                                 notif_db.string());
+                }
+            }
         }
+        // Webhook store
         {
             auto webhook_db = cfg_.db_dir() / "webhooks.db";
             webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
@@ -6904,6 +6989,14 @@ public:
         if (fleet_topology_store_)
             fleet_topology_store_->set_audit_store(nullptr);
         audit_store_.reset();
+        // NotificationStore (ADR-0046) borrows pg_pool_ — unwire the borrowed
+        // raw pointer from agent_service_ (enrollment/execution-failure toast
+        // events), then drop the store, BEFORE the pool. No background
+        // thread to join first — matches the same discipline as the sibling
+        // PG-backed stores above rather than relying on destruct-before-pool
+        // declaration order alone.
+        agent_service_.set_notification_store(nullptr);
+        notification_store_.reset();
         pg_pool_.reset();
     }
 
@@ -9629,6 +9722,11 @@ private:
             // readyz/healthz wiring; construction is already fail-closed, this
             // is belt-and-braces against a runtime is_open() flip.
             bool deployment_ok = deployment_store_ && deployment_store_->is_open();
+            // NotificationStore (ADR-0046) — born-on-PG (as of this migration),
+            // same readyz-vs-healthz drift class the rows above document; wire
+            // it into both from the start rather than shipping the gap and
+            // fixing it in a later governance round (Gate 3 sre, Pattern E).
+            bool notification_ok = notification_store_ && notification_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -9637,7 +9735,7 @@ private:
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok;
+                deployment_ok && notification_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -9665,7 +9763,8 @@ private:
                   {"result_set_store", result_set_ok ? "ok" : "error"},
                   {"management_group_store", mgmt_group_ok ? "ok" : "error"},
                   {"discovery_store", discovery_ok ? "ok" : "error"},
-                  {"deployment_store", deployment_ok ? "ok" : "error"}}},
+                  {"deployment_store", deployment_ok ? "ok" : "error"},
+                  {"notification_store", notification_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -9920,6 +10019,13 @@ private:
                 // serves), so this is belt-and-braces against a runtime
                 // is_open() flip, matching result_set_store's equivalent row.
                 {"discovery_store", discovery_store_ && discovery_store_->is_open()},
+                // ADR-0046 born-on-PG (as of this migration) store — same
+                // rationale as the other rows above: fail-closed at boot, but
+                // a not-open post-boot state would leave the notification
+                // feed silently dead while /readyz reported "ready" (gov
+                // Pattern E).
+                {"notification_store",
+                 notification_store_ && notification_store_->is_open()},
             };
 
             std::string failed_list;
