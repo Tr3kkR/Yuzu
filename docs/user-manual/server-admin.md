@@ -74,6 +74,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--saml-idp-cert` | *(none)* | **SAML 2.0 SP.** Filesystem path to the IdP's assertion-signing certificate (PEM, max 64 KiB). The cert at this path is the **sole** trusted signing authority — in-document `<KeyInfo>` values are ignored. Env: `YUZU_SAML_IDP_CERT`. |
 | `--saml-sp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI this SP advertises to the IdP in the AuthnRequest. Env: `YUZU_SAML_SP_ENTITY_ID`. |
 | `--saml-sp-acs-url` | *(none)* | **SAML 2.0 SP.** Full public URL of the Assertion Consumer Service (`https://<host>/saml/acs`). The IdP must be configured to POST the response to this URL. Env: `YUZU_SAML_SP_ACS_URL`. |
+| `--saml-sp-key` | *(none)* | **SAML 2.0 SP.** Filesystem path to the SP AuthnRequest signing private key (PEM, **RSA only** — EC and RSA-PSS keys are rejected). Optional and independent of the five required `--saml-*` flags above. When set, AuthnRequests are signed over the HTTP-Redirect binding with RSA PKCS#1 v1.5 + SHA-256. The key file must pass the same private-key permission check as the HTTPS/gateway TLS keys (not group/other-readable). Fails closed: an unreadable, over-permissioned, oversized (>64 KiB), malformed, or non-RSA key disables SAML entirely at startup — never a silent fall-back to unsigned requests. When unset (the default), AuthnRequests remain unsigned — backward-compatible with IdPs that accept unsigned requests. Env: `YUZU_SAML_SP_KEY`. |
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 | `--mcp-no-streaming` | off | Disable the MCP **Streamable HTTP** transport (ADR-1005 Decision 15): no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` return `405`, and only plain JSON-RPC POST is served. The spec-required `202` status on notification POSTs still applies. Use where a buffering reverse proxy interferes with streaming. Env: `YUZU_MCP_NO_STREAMING`. |
@@ -1815,12 +1816,35 @@ resolution, see issue #1832.
 > dedicated low-membership group for the mapping. At most 64 group values
 > from the configured attribute are considered.
 
+### AuthnRequest signing
+
+One additional, optional flag, independent of the five-flag gate, signs
+SP-initiated AuthnRequests:
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-sp-key` | `YUZU_SAML_SP_KEY` | Filesystem path to the SP AuthnRequest signing private key (PEM, **RSA only** — EC and RSA-PSS keys are rejected). |
+
+When set, AuthnRequests are signed over the HTTP-Redirect binding with
+RSA PKCS#1 v1.5 + SHA-256 (`SigAlg`
+`http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`), carried as the
+`SigAlg`/`Signature` query parameters. The key file must pass the same
+private-key permission check as the HTTPS/gateway TLS keys (not
+group/other-readable). Left unset (the default), AuthnRequests remain
+**unsigned** — backward-compatible with an IdP that accepts unsigned
+requests.
+
+Fails closed: a configured key that is unreadable, over-permissioned,
+exceeds 64 KiB, is malformed, or is not RSA disables SAML **entirely** at
+startup — loudly (an `ERROR` log line), never a silent fall-back to
+unsigned requests. A per-request signing failure fails `/auth/saml/start`
+rather than emitting an unsigned redirect.
+
 ### Known limitations in this release
 
 - **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
 - **`--auth-mode=sso-only`:** Requires OIDC configuration. A SAML-only deployment cannot disable local-password login.
 - **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.
-- **AuthnRequest signing:** The SP does not sign AuthnRequests. The IdP must accept unsigned requests. If your IdP requires signed AuthnRequests, use OIDC.
 - **IdP cert rotation:** Update `--saml-idp-cert` and restart the server. There is no hot-reload.
 - **No login-page button:** Navigate directly to `GET /auth/saml/start`; there is no "Sign in with SAML" button on the login page.
 

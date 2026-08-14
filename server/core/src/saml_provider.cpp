@@ -26,6 +26,14 @@ SamlProvider::build_authn_request(const std::string& /*relay_state*/) {
     return {}; // url="" and cookie_secret="" — callers check url.empty()
 }
 
+bool SamlProvider::signing_configured_but_broken() const {
+    return false; // N4: SP signing key is never parsed on Windows
+}
+
+const std::string& SamlProvider::signing_init_error() const {
+    return signing_init_error_; // always empty on Windows
+}
+
 std::expected<SamlAssertion, std::string>
 SamlProvider::validate_response(const std::string& /*saml_response_b64*/,
                                 const std::string& /*cookie_secret*/) {
@@ -50,9 +58,12 @@ void SamlProvider::cleanup_expired_states_locked() {}
 #include <xmlsec/openssl/app.h>
 #include <xmlsec/openssl/crypto.h>
 
+#include <openssl/bio.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 #include <openssl/rand.h>
+#include <openssl/rsa.h>
 
 #include <zlib.h>
 
@@ -68,6 +79,7 @@ void SamlProvider::cleanup_expired_states_locked() {}
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -237,6 +249,39 @@ static std::string sha256_hex(const std::string& input) {
         hex.append(buf, 2);
     }
     return hex;
+}
+
+// ── RSA PKCS#1 v1.5 + SHA-256 signing (HTTP-Redirect binding AuthnRequest) ────
+
+/// Returns the raw signature bytes over `octets`, or an empty vector on any
+/// OpenSSL failure. Uses EXPLICIT RSA_PKCS1_PADDING — EVP_DigestSignInit with
+/// EVP_sha256() alone does not itself pin the padding scheme, so the padding
+/// is set on the derived EVP_PKEY_CTX before signing.
+static std::vector<unsigned char> rsa_sha256_sign(EVP_PKEY* key, std::string_view octets) {
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    if (!ctx) return {};
+    struct CtxGuard { EVP_MD_CTX* c; ~CtxGuard() { EVP_MD_CTX_free(c); } } guard{ctx};
+
+    EVP_PKEY_CTX* pctx = nullptr;
+    if (EVP_DigestSignInit(ctx, &pctx, EVP_sha256(), nullptr, key) != 1 || !pctx) {
+        return {};
+    }
+    if (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) <= 0) {
+        return {};
+    }
+    if (EVP_DigestSignUpdate(ctx, octets.data(), octets.size()) != 1) {
+        return {};
+    }
+    std::size_t sig_len = 0;
+    if (EVP_DigestSignFinal(ctx, nullptr, &sig_len) != 1 || sig_len == 0) {
+        return {};
+    }
+    std::vector<unsigned char> sig(sig_len);
+    if (EVP_DigestSignFinal(ctx, sig.data(), &sig_len) != 1) {
+        return {};
+    }
+    sig.resize(sig_len);
+    return sig;
 }
 
 /// Constant-time comparison of two SHA-256 hex strings. Length is compared
@@ -509,9 +554,56 @@ SamlProvider::SamlProvider(SamlConfig config) : config_(std::move(config)) {
         spdlog::error("SamlProvider: initialization failed: {} — disabling", e.what());
         config_.enabled = false;
     }
+
+    // Parse the SP AuthnRequest signing key (if configured) exactly once, at
+    // construction — never per-request. Configured-but-broken (malformed PEM,
+    // or a non-RSA key) sets signing_init_failed_ rather than falling back to
+    // unsigned; server.cpp checks signing_configured_but_broken() and disables
+    // SAML loudly rather than shipping a silent unsigned fallback.
+    if (config_.enabled && !config_.sp_signing_key_pem.empty()) {
+        struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } };
+        BioGuard bio{BIO_new_mem_buf(config_.sp_signing_key_pem.data(),
+                                     static_cast<int>(config_.sp_signing_key_pem.size()))};
+        EVP_PKEY* raw_key = bio.b ? PEM_read_bio_PrivateKey(bio.b, nullptr, nullptr, nullptr)
+                                  : nullptr;
+        if (!raw_key) {
+            signing_init_failed_ = true;
+            signing_init_error_  = "SAML SP signing key: failed to parse PEM private key";
+            spdlog::error("SamlProvider: {}", signing_init_error_);
+        } else {
+            std::shared_ptr<EVP_PKEY> parsed(raw_key, EVP_PKEY_free);
+            const int base_id = EVP_PKEY_base_id(parsed.get());
+            if (base_id != EVP_PKEY_RSA) {
+                // Reject EC and RSA-PSS (and anything else) — only plain RSA
+                // (PKCS#1 v1.5) is supported. `parsed` destructs here
+                // (EVP_PKEY_free) — the rejected key is never retained.
+                signing_init_failed_ = true;
+                signing_init_error_  = "SAML SP signing key must be an RSA key";
+                spdlog::error("SamlProvider: {} (EVP_PKEY base id={})", signing_init_error_,
+                              base_id);
+            } else {
+                sp_signing_key_ = std::move(parsed);
+                spdlog::info("SamlProvider: SP AuthnRequest signing enabled (RSA key configured)");
+            }
+        }
+
+        // Cleanse and clear the transit PEM copy now that parsing is done —
+        // never log it, never retain it beyond this point (config_ is a
+        // by-value member; the owned EVP_PKEY above is what's kept live).
+        OPENSSL_cleanse(config_.sp_signing_key_pem.data(), config_.sp_signing_key_pem.size());
+        config_.sp_signing_key_pem.clear();
+    }
 }
 
 SamlProvider::~SamlProvider() = default;
+
+bool SamlProvider::signing_configured_but_broken() const {
+    return signing_init_failed_;
+}
+
+const std::string& SamlProvider::signing_init_error() const {
+    return signing_init_error_;
+}
 
 bool SamlProvider::is_enabled() const {
     // H-F: Require all config fields that the flow and the Issuer/Audience/
@@ -558,7 +650,9 @@ SamlProvider::build_authn_request(const std::string& relay_state) {
                                          binding_hash};
     }
 
-    // Unsigned AuthnRequest XML (HTTP-Redirect binding signing is a follow-up).
+    // AuthnRequest XML. Signed on the wire via the detached HTTP-Redirect
+    // binding query-string signature below when an SP signing key is
+    // configured (sp_signing_key_); otherwise unsigned (backward-compatible).
     // clang-format off
     const std::string xml =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
@@ -579,11 +673,37 @@ SamlProvider::build_authn_request(const std::string& relay_state) {
     const auto b64 = b64_encode(
         reinterpret_cast<const unsigned char*>(compressed.data()),
         compressed.size());
+    const auto enc_req = url_encode(b64);
 
-    std::string url = config_.idp_sso_url + "?SAMLRequest=" + url_encode(b64);
-    if (!relay_state.empty()) url += "&RelayState=" + url_encode(relay_state);
+    std::string url;
+    if (sp_signing_key_) {
+        // HTTP-Redirect binding signing (SAML 2.0 core §3.4.4.1): the
+        // signature is computed over the ALREADY percent-encoded,
+        // '&'-joined query parameters in exactly this order —
+        // SAMLRequest, RelayState (omitted entirely when empty, never
+        // "RelayState="), SigAlg — with no leading '?' and no Signature
+        // param. The signed bytes and the sent bytes must be byte-identical,
+        // so `base` becomes the URL's query string verbatim.
+        std::string base = "SAMLRequest=" + enc_req;
+        if (!relay_state.empty()) base += "&RelayState=" + url_encode(relay_state);
+        base += "&SigAlg=" + url_encode("http://www.w3.org/2001/04/xmldsig-more#rsa-sha256");
 
-    spdlog::debug("SamlProvider: AuthnRequest id={}", request_id);
+        const auto sig = rsa_sha256_sign(sp_signing_key_.get(), base);
+        if (sig.empty()) {
+            // Per-request signing failure: never emit an unsigned redirect
+            // when signing is configured — fail this request instead.
+            spdlog::error("SamlProvider: AuthnRequest signing failed (id={})", request_id);
+            return {};
+        }
+        const auto sig_b64 = b64_encode(sig.data(), sig.size());
+        url = config_.idp_sso_url + "?" + base + "&Signature=" + url_encode(sig_b64);
+    } else {
+        url = config_.idp_sso_url + "?SAMLRequest=" + enc_req;
+        if (!relay_state.empty()) url += "&RelayState=" + url_encode(relay_state);
+    }
+
+    spdlog::debug("SamlProvider: AuthnRequest id={} signed={}", request_id,
+                  sp_signing_key_ != nullptr);
     return {std::move(url), cookie_secret};
 }
 

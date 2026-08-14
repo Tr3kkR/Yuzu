@@ -2978,6 +2978,48 @@ public:
                                       cfg_.saml_idp_cert, kSamlCertMaxBytes);
                     } else {
                         cert_pem.resize(static_cast<std::size_t>(cert_file.gcount()));
+
+                        // Optionally read the SP AuthnRequest signing key (RSA PEM).
+                        // Fail closed: a configured-but-unreadable/oversized/
+                        // over-permissioned key disables SAML LOUDLY rather than
+                        // silently falling back to unsigned AuthnRequests — mirrors
+                        // the IdP-cert read above, plus the same permission check
+                        // used for the HTTPS/gateway TLS private keys.
+                        bool sp_key_ok = true;
+                        std::string sp_signing_key_pem;
+                        if (!cfg_.saml_sp_key.empty()) {
+                            if (!detail::validate_key_file_permissions(cfg_.saml_sp_key,
+                                                                       "SAML SP signing")) {
+                                spdlog::error("SAML disabled: SP signing key file permissions "
+                                              "too permissive (fail-closed)");
+                                sp_key_ok = false;
+                            } else {
+                                std::ifstream key_file(cfg_.saml_sp_key);
+                                if (!key_file.is_open()) {
+                                    spdlog::error("SAML disabled: SP signing key '{}' unreadable"
+                                                  " (fail-closed)", cfg_.saml_sp_key);
+                                    sp_key_ok = false;
+                                } else {
+                                    // Same 64 KiB cap + rationale as the IdP cert read above.
+                                    std::string key_pem(
+                                        static_cast<std::size_t>(kSamlCertMaxBytes) + 1, '\0');
+                                    key_file.read(key_pem.data(), kSamlCertMaxBytes + 1);
+                                    if (!key_file.eof()) {
+                                        spdlog::error("SAML disabled: SP signing key '{}' "
+                                                      "exceeds {} bytes (fail-closed)",
+                                                      cfg_.saml_sp_key, kSamlCertMaxBytes);
+                                        sp_key_ok = false;
+                                    } else {
+                                        key_pem.resize(static_cast<std::size_t>(key_file.gcount()));
+                                        sp_signing_key_pem = std::move(key_pem);
+                                    }
+                                }
+                            }
+                        }
+
+                        if (!sp_key_ok) {
+                            // SAML disabled loudly — do not construct saml_provider_.
+                        } else {
                         saml::SamlConfig saml_cfg;
                         saml_cfg.idp_entity_id  = cfg_.saml_idp_entity_id;
                         saml_cfg.idp_sso_url    = cfg_.saml_idp_sso_url;
@@ -2985,12 +3027,20 @@ public:
                         saml_cfg.sp_acs_url     = cfg_.saml_sp_acs_url;
                         saml_cfg.idp_cert_pem   = std::move(cert_pem);
                         saml_cfg.group_attribute = cfg_.saml_group_attribute;
+                        saml_cfg.sp_signing_key_pem = std::move(sp_signing_key_pem);
                         saml_cfg.enabled        = true;
                         // Construct in the single-threaded startup phase — xmlsec global init
                         // is not thread-safe; the std::call_once guard in saml_provider.cpp
                         // makes repeated construction safe thereafter.
                         saml_provider_ = std::make_unique<saml::SamlProvider>(std::move(saml_cfg));
-                        if (saml_provider_ && saml_provider_->is_enabled()) {
+                        if (saml_provider_ && saml_provider_->signing_configured_but_broken()) {
+                            // A configured SP signing key was malformed or non-RSA —
+                            // disable SAML loudly rather than silently emitting
+                            // unsigned AuthnRequests (never a silent fallback).
+                            spdlog::error("SAML disabled: {}",
+                                         saml_provider_->signing_init_error());
+                            saml_provider_.reset();
+                        } else if (saml_provider_ && saml_provider_->is_enabled()) {
                             // sre-S2: log the group→role flags alongside the
                             // existing endpoint fields. Both values are
                             // low-sensitivity (an attribute name and a group
@@ -2999,14 +3049,17 @@ public:
                             // boolean — gives an operator a one-line way to
                             // confirm the deployed config matches intent.
                             spdlog::info("SAML SP initialized (idp_sso_url={}, sp_entity_id={}, "
-                                         "group_attribute=\"{}\", admin_group=\"{}\")",
+                                         "group_attribute=\"{}\", admin_group=\"{}\", "
+                                         "sp_signing_key_configured={})",
                                          cfg_.saml_idp_sso_url, cfg_.saml_sp_entity_id,
-                                         cfg_.saml_group_attribute, cfg_.saml_admin_group);
+                                         cfg_.saml_group_attribute, cfg_.saml_admin_group,
+                                         !cfg_.saml_sp_key.empty());
                         } else {
                             spdlog::error("SAML: provider constructed but is_enabled() returned "
                                           "false — SAML login disabled (fail-closed)");
                             saml_provider_.reset();
                         }
+                        } // end sp_key_ok else
                     }
                 } // end cert_file.is_open() else
                 } // end cfg_.https_enabled else
