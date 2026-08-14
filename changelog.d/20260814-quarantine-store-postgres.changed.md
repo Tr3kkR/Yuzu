@@ -29,9 +29,12 @@
   rather than silently accepting whichever replica happened to migrate first; the SAME log
   line and refusal also cover a single-replica rollback-then-reupgrade — see
   `docs/user-manual/upgrading.md` and `docs/ops-runbooks/quarantine-store-backfill-recovery.md`
-  for the full list of refusal modes and remediation. Every quarantine failure path — including a
-  store/pool outage discovered before the request could even be attributed to a device — now
-  emits a `quarantine.enable`/`quarantine.disable` audit row (previously silent); `POST`/`DELETE
+  for the full list of refusal modes and remediation. Store-unavailable, scope-gate-unwired, and
+  write-failure quarantine paths — including a store/pool outage discovered before the request
+  could even be attributed to a device — now emit a `quarantine.enable`/`quarantine.disable`
+  audit row (previously silent); input-validation rejections (missing `agent_id`, oversized
+  `reason`/`whitelist`, a malformed whitelist token on MCP, a malformed JSON body on REST) do
+  not yet audit on either transport (tracked follow-up). `POST`/`DELETE
   /api/v1/quarantine` (REST) and the MCP `quarantine_device` tool carry `retry_after_ms: 5000` on
   a genuine store-failure `503`/`-32603` (never on the non-retryable `400`/`-32602` business-error
   case) — `GET`'s two 503 causes above do not carry this hint (REST-only; MCP has no quarantine
