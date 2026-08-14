@@ -4020,10 +4020,38 @@ public:
                 });
         }
 
-        // Initialize tag store
-        {
-            auto tag_db = cfg_.db_dir() / "tags.db";
-            tag_store_ = std::make_unique<TagStore>(tag_db);
+        // Tag store — migrated Postgres store (ADR-0006/ADR-0050, schema
+        // `tag_store`), construction fail-CLOSED per ADR-0012 §1 (same
+        // template as the sibling PG stores): a reachable database whose
+        // schema can't migrate/open is a fatal startup error, never a
+        // serve-degraded scope-resolution substrate. `migrate_from_sqlite`
+        // runs the one-time, idempotent legacy-`tags.db` backfill (ADR-0009,
+        // MANDATORY — tags are scope/dispatch-targeting input, not
+        // expendable telemetry) — a backfill failure is ALSO fatal. NOTE:
+        // constructed HERE (not down in the later PG-store section) because
+        // the "Wire up store pointers for AgentServiceImpl" block just below
+        // hands agent_service_ the raw pointer — a construction site after
+        // that block would leave the service's pointer null forever.
+        if (pg_pool_ && !startup_failed_) {
+            tag_store_ = std::make_unique<TagStore>(*pg_pool_);
+            if (!tag_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: tag store migration/open failed (database "
+                              "reachable but the tag_store schema could not be created/opened)");
+                startup_failed_ = true;
+            } else {
+                tag_store_->set_metrics(&metrics_);
+                auto tag_db = cfg_.db_dir() / "tags.db";
+                if (!tag_store_->migrate_from_sqlite(tag_db)) {
+                    spdlog::error("[PG] Refusing to start: tag legacy-SQLite backfill failed "
+                                  "(see prior log lines) — tag_store feeds scope resolution and "
+                                  "dispatch targeting and must not serve partially-migrated "
+                                  "data. Operator remediation: reconcile or repair {}, or move "
+                                  "it aside to skip the backfill (tags in it will NOT carry "
+                                  "over)",
+                                  tag_db.string());
+                    startup_failed_ = true;
+                }
+            }
         }
 
         // Initialize analytics event store
@@ -5436,8 +5464,9 @@ public:
                     break;
                 // G6 SRE: the sweep body is a serial budget shared with the
                 // SECURITY-relevant revocation sweep below — a stall here (e.g.
-                // a locked tags.db inside the cohort gauge publish) delays
-                // revoked-agent teardown by the same amount. Make it visible.
+                // a slow tag_store cohort read inside the cohort gauge publish)
+                // delays revoked-agent teardown by the same amount. Make it
+                // visible.
                 const auto sweep_start = std::chrono::steady_clock::now();
                 health_store_.recompute_metrics(metrics_, std::chrono::seconds{90});
                 // PostgreSQL pool gauges (#1368): sampled on the same cadence as
@@ -5997,8 +6026,8 @@ public:
                 }
                 // G6 SRE: sweep-body duration (excludes the sleep) — the
                 // revocation sweep above shares this serial budget, so a stall
-                // (locked tags.db, slow fleet walk) is a security-relevant
-                // delay, not just stale metrics.
+                // (slow tag_store cohort read, slow fleet walk) is a
+                // security-relevant delay, not just stale metrics.
                 metrics_
                     .histogram("yuzu_server_reaper_sweep_duration_seconds")
                     .observe(std::chrono::duration<double>(std::chrono::steady_clock::now() -
@@ -6997,6 +7026,12 @@ public:
         // declaration order alone.
         agent_service_.set_notification_store(nullptr);
         notification_store_.reset();
+        // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
+        // pointer from agent_service_ (Register/heartbeat sync_agent_tags
+        // ingest), then drop the store, BEFORE the pool. No background
+        // thread to join — same discipline as the sibling PG stores above.
+        agent_service_.set_tag_store(nullptr);
+        tag_store_.reset();
         pg_pool_.reset();
     }
 
@@ -7903,19 +7938,18 @@ private:
         facts.service_scoped = !sess.token_scope_service.empty();
         if (facts.service_scoped) {
             if (tag_store_) {
-                // B-2b: agents_with_tag_checked distinguishes "genuinely no
-                // agents carry this tag" (present, possibly empty) from "the
-                // tag DB is degraded" (nullopt on a missing connection or a
-                // failed prepare) — the plain agents_with_tag collapsed both
-                // to an empty vector, so a degraded read was indistinguishable
-                // from a legitimate empty answer.
-                // compose_exec_visible's own contract already treats both as
-                // deny-all (never unfiltered on a service-scoped token), so
-                // the DISPATCH outcome is unchanged; the distinction is what
-                // makes a degraded read observable instead of silently
-                // indistinguishable from "no agents" at /readyz.
-                if (auto svc = tag_store_->agents_with_tag_checked("service",
-                                                                   sess.token_scope_service)) {
+                // B-2b: agents_with_tag distinguishes "genuinely no agents
+                // carry this tag" (present, possibly empty) from "the tag DB
+                // is degraded" (`unexpected(kDegraded)` on a missing
+                // connection or a failed query) — ADR-0050 made the typed
+                // shape the ONLY accessor (the old collapsing variant is
+                // gone). compose_exec_visible's own contract already treats
+                // both as deny-all (never unfiltered on a service-scoped
+                // token), so the DISPATCH outcome is unchanged; the
+                // distinction is what makes a degraded read observable
+                // instead of silently indistinguishable from "no agents".
+                if (auto svc = tag_store_->agents_with_tag("service",
+                                                           sess.token_scope_service)) {
                     facts.service_tagged = std::unordered_set<std::string>(svc->begin(), svc->end());
                 } else {
                     spdlog::error("derive_exec_visible: tag store degraded resolving service "
@@ -8178,10 +8212,19 @@ private:
 
         auto result = mgmt_group_store_->create_group(g);
         if (result) {
-            // Populate with agents that have this service tag
+            // Populate with agents that have this service tag. Degrade
+            // fails CLOSED: dynamic-group membership is confinement input,
+            // so a degraded tag read must never refresh the group to empty
+            // (prior membership is retained; the next successful pass
+            // repopulates).
             if (tag_store_) {
-                auto agents = tag_store_->agents_with_tag("service", service_value);
-                mgmt_group_store_->refresh_dynamic_membership(*result, agents);
+                if (auto agents = tag_store_->agents_with_tag("service", service_value)) {
+                    mgmt_group_store_->refresh_dynamic_membership(*result, *agents);
+                } else {
+                    spdlog::error("Auto-group '{}': tag store degraded resolving service '{}' — "
+                                  "skipping membership refresh (fail-closed)",
+                                  group_name, service_value);
+                }
             }
             spdlog::info("Auto-created management group '{}' for service '{}'", group_name,
                          service_value);
@@ -8258,11 +8301,21 @@ private:
         cmd.set_plugin("asset_tags");
         cmd.set_action("sync");
 
+        // One bulk read instead of 4 point lookups (ADR-0050 — the store is
+        // a network substrate now). Degrade skips the push entirely: pushing
+        // empty category values over a failed read would instruct the agent
+        // to clear its cached tags.
+        auto tag_map = tag_store_->get_tag_map(agent_id);
+        if (!tag_map) {
+            spdlog::warn("push_asset_tags_to_agent({}): tag store degraded — skipping push",
+                         agent_id);
+            return;
+        }
         auto* params = cmd.mutable_parameters();
         for (auto cat_key : kCategoryKeys) {
             std::string key_str{cat_key};
-            auto val = tag_store_->get_tag(agent_id, key_str);
-            (*params)[key_str] = val;
+            auto it = tag_map->find(key_str);
+            (*params)[key_str] = it != tag_map->end() ? it->second : "";
         }
 
         if (registry_.send_to(agent_id, cmd)) {
@@ -9727,6 +9780,13 @@ private:
             // it into both from the start rather than shipping the gap and
             // fixing it in a later governance round (Gate 3 sre, Pattern E).
             bool notification_ok = notification_store_ && notification_store_->is_open();
+            // TagStore (ADR-0050) — born-on-PG (as of this migration), wired
+            // into both /readyz and /healthz from the start (the
+            // readyz-vs-healthz drift class the rows above document). A
+            // degraded tag store fails scope resolution and service-scoped
+            // confinement CLOSED, so a "healthy" report over it would be
+            // misleading.
+            bool tag_ok = tag_store_ && tag_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -9735,7 +9795,7 @@ private:
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok && notification_ok;
+                deployment_ok && notification_ok && tag_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -9764,7 +9824,8 @@ private:
                   {"management_group_store", mgmt_group_ok ? "ok" : "error"},
                   {"discovery_store", discovery_ok ? "ok" : "error"},
                   {"deployment_store", deployment_ok ? "ok" : "error"},
-                  {"notification_store", notification_ok ? "ok" : "error"}}},
+                  {"notification_store", notification_ok ? "ok" : "error"},
+                  {"tag_store", tag_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -9876,6 +9937,7 @@ private:
                 {"workflow_engine", workflow_engine_ && workflow_engine_->is_open()},
                 {"custom_properties_store",
                  custom_properties_store_ && custom_properties_store_->is_open()},
+                {"tag_store", tag_store_ && tag_store_->is_open()},
                 {"guaranteed_state_store",
                  guaranteed_state_store_ && guaranteed_state_store_->is_open()},
                 {"baseline_store", baseline_store_ && baseline_store_->is_open()},
@@ -12066,8 +12128,16 @@ private:
             }
 
             auto tags = tag_store_->get_all_tags(agent_id);
+            if (!tags) {
+                // Degrade → 503, never an empty list (#3097 classification).
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& t : tags) {
+            for (const auto& t : *tags) {
                 arr.push_back({{"key", t.key},
                                {"value", t.value},
                                {"source", t.source},
@@ -12121,7 +12191,23 @@ private:
             if (!require_scoped_permission(req, res, "Tag", "Write", agent_id))
                 return;
 
-            tag_store_->set_tag(agent_id, key, value, "api");
+            // Surface the write result (#3097 classification): db_error →
+            // 503, caller/validation error → 400 — a swallowed failed write
+            // used to report "Tag updated" over nothing written.
+            if (auto set_res = tag_store_->set_tag(agent_id, key, value, "api"); !set_res) {
+                const bool db_error = set_res.error().starts_with(kTagDbErrorPrefix);
+                (void)audit_log(req, "tag.set", "failure", "tag", agent_id + ":" + key,
+                                set_res.error());
+                res.status = db_error ? 503 : 400;
+                res.set_content(nlohmann::json{{"error",
+                                                {{"code", res.status},
+                                                 {"message", db_error ? "tag store unavailable"
+                                                                      : set_res.error()}}},
+                                               {"meta", {{"api_version", "v1"}}}}
+                                    .dump(),
+                                "application/json");
+                return;
+            }
             if (key == "service")
                 ensure_service_management_group(value);
             // Push updated tags to agent if a structured category changed
@@ -12174,14 +12260,24 @@ private:
             if (!require_scoped_permission(req, res, "Tag", "Delete", agent_id))
                 return;
 
-            bool deleted = tag_store_->delete_tag(agent_id, key);
-            (void)audit_log(req, "tag.delete", deleted ? "success" : "not_found", "tag",
+            auto deleted = tag_store_->delete_tag(agent_id, key);
+            if (!deleted) {
+                // Degrade → 503, never "not deleted" (#3097 classification;
+                // the pre-migration bool conflated failure with not-found).
+                (void)audit_log(req, "tag.delete", "failure", "tag", agent_id + ":" + key);
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
+            (void)audit_log(req, "tag.delete", *deleted ? "success" : "not_found", "tag",
                             agent_id + ":" + key);
-            if (deleted) {
+            if (*deleted) {
                 res.set_header("HX-Trigger",
                                R"({"showToast":{"message":"Tag deleted","level":"success"}})");
             }
-            res.set_content(nlohmann::json({{"deleted", deleted}}).dump(), "application/json");
+            res.set_content(nlohmann::json({{"deleted", *deleted}}).dump(), "application/json");
         });
 
         web_server_->Post("/api/tags/query", [this](const httplib::Request& req,
@@ -12208,8 +12304,17 @@ private:
             }
 
             auto agents = tag_store_->agents_with_tag(key, value);
+            if (!agents) {
+                // Degrade → 503, never an empty agent list — this result
+                // feeds operator targeting decisions (#3097 classification).
+                res.status = 503;
+                res.set_content(
+                    R"({"error":{"code":503,"message":"tag store unavailable"},"meta":{"api_version":"v1"}})",
+                    "application/json");
+                return;
+            }
             nlohmann::json arr = nlohmann::json::array();
-            for (const auto& a : agents)
+            for (const auto& a : *agents)
                 arr.push_back(a);
             res.set_content(nlohmann::json({{"agents", arr}, {"count", arr.size()}}).dump(),
                             "application/json");
@@ -14636,8 +14741,16 @@ private:
                 // REST response — both always pass a key. Key-less callers
                 // (the pollable fleet endpoint, the disabled gauge sweep)
                 // don't pay the extra query (grill NFR fix).
-                snap.available_keys = tag_store_->get_distinct_keys();
-                cohort_values = tag_store_->get_values_for_key(cohort_key);
+                //
+                // Render/telemetry caller (ADR-0036/ADR-0050): a degraded
+                // read renders the picker empty and every device
+                // "(untagged)" rather than failing the fragment — it feeds
+                // no grant/target/enforce decision. The store logs + counts
+                // the degrade (yuzu_server_tag_store_read_degrade_total).
+                snap.available_keys =
+                    tag_store_->get_distinct_keys().value_or(std::vector<std::string>{});
+                cohort_values = tag_store_->get_values_for_key(cohort_key)
+                                    .value_or(std::unordered_map<std::string, std::string>{});
             }
             // Same staleness the recompute_metrics sweep prunes by — the tab and
             // the yuzu_fleet_perf_* gauges see the same population. perf_snapshot
@@ -14963,8 +15076,12 @@ private:
             snap.cohort_key = cohort_key;
             std::unordered_map<std::string, std::string> cohort_values;
             if (tag_store_ && !cohort_key.empty()) {
-                snap.available_keys = tag_store_->get_distinct_keys();
-                cohort_values = tag_store_->get_values_for_key(cohort_key);
+                // Render/telemetry caller — same degrade posture as
+                // dex_perf_uncached above (ADR-0036/ADR-0050).
+                snap.available_keys =
+                    tag_store_->get_distinct_keys().value_or(std::vector<std::string>{});
+                cohort_values = tag_store_->get_values_for_key(cohort_key)
+                                    .value_or(std::unordered_map<std::string, std::string>{});
             }
             const auto health = health_store_.net_snapshot(std::chrono::seconds{90});
             std::unordered_map<std::string, const detail::AgentHealthSnapshot*> by_id;

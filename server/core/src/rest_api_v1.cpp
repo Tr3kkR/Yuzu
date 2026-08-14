@@ -4381,8 +4381,16 @@ void RestApiV1::register_routes(
                  }
 
                  auto gaps = tag_store->get_compliance_gaps();
+                 if (!gaps) {
+                     // Degrade → 503, never an empty (fully-compliant-looking)
+                     // report (#3097 classification).
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "tag store unavailable"),
+                                     "application/json");
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& [agent_id, missing] : gaps) {
+                 for (const auto& [agent_id, missing] : *gaps) {
                      JArr m;
                      for (const auto& k : missing)
                          m.add(k);
@@ -4410,9 +4418,16 @@ void RestApiV1::register_routes(
                      return;
                  }
                  auto tags = tag_store->get_all_tags(agent_id);
+                 if (!tags) {
+                     // Degrade → 503, never an empty tag map (#3097).
+                     res.status = 503;
+                     res.set_content(detail::a4_error(res, "tag store unavailable"),
+                                     "application/json");
+                     return;
+                 }
                  JObj obj;
-                 for (size_t i = 0; i < tags.size(); ++i)
-                     obj.add(tags[i].key, tags[i].value);
+                 for (size_t i = 0; i < tags->size(); ++i)
+                     obj.add((*tags)[i].key, (*tags)[i].value);
                  res.set_content(ok_json(obj.str()), "application/json");
              });
 
@@ -4483,8 +4498,16 @@ void RestApiV1::register_routes(
 
         auto result = tag_store->set_tag_checked(agent_id, key, value, "api");
         if (!result) {
-            res.status = 400;
-            res.set_content(detail::a4_error(res, result.error()), "application/json");
+            // #3097 classification: db_error prefix → 503 (degrade),
+            // anything else → 400 (caller/validation error) — never one
+            // catch-all. set_tag_checked now also propagates a FAILED WRITE
+            // (the pre-migration contract validated, then swallowed it and
+            // reported success over nothing written).
+            const bool db_error = result.error().starts_with(kTagDbErrorPrefix);
+            res.status = db_error ? 503 : 400;
+            res.set_content(detail::a4_error(res, db_error ? "tag store unavailable"
+                                                           : result.error()),
+                            "application/json");
             return;
         }
         if (key == "service" && service_group_fn)
@@ -4526,8 +4549,17 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
                 return;
-            bool deleted = tag_store->delete_tag(agent_id, key);
+            auto deleted = tag_store->delete_tag(agent_id, key);
             if (!deleted) {
+                // Degrade → 503 (#3097) — the pre-migration bool answered
+                // 404 for a store failure, telling the caller the tag was
+                // gone when nothing was checked.
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "tag store unavailable"),
+                                "application/json");
+                return;
+            }
+            if (!*deleted) {
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "tag not found"), "application/json");
                 return;

@@ -881,7 +881,23 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             return false;
         }
         if (!agent_id.empty()) {
-            auto agent_service = tag_store_->get_tag(agent_id, "service");
+            // ADR-0050 typed read: a degraded store is a 503 (retryable),
+            // never conflated with "agent has no service tag" — the
+            // pre-migration read collapsed both to "", which happened to
+            // deny (fail-closed) but audited the outage as a scope MISMATCH,
+            // hiding the real cause from the operator.
+            auto service_tag = tag_store_->get_tag(agent_id, "service");
+            if (!service_tag) {
+                audit_log(req, "auth.scoped_permission_required", "denied", agent_id, "",
+                          "service-scoped token blocked: tag store degraded");
+                res.status = 503;
+                res.set_content(detail::a4_denial(res, 503,
+                                                  "tag store unavailable, cannot verify scope",
+                                                  detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                                "application/json");
+                return false;
+            }
+            const std::string agent_service = service_tag->value_or(std::string{});
             if (agent_service != session->token_scope_service) {
                 audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
                           "agent service '" + agent_service + "' does not match token scope '" +
