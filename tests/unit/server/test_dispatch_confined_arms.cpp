@@ -478,7 +478,7 @@ TEST_CASE("resolve_scope_targets: a degraded registry evaluation with no princip
 // none of them called through it. This test does, against a REAL
 // `AgentRegistry` (not a fake — `AgentRegistry` has zero virtuals and cannot
 // be faked polymorphically), using the registry's gateway-pending path
-// (`set_gateway_node` + `drain_gateway_pending()`) to observe exactly which
+// (`set_gateway_route` + `drain_gateway_pending()`) to observe exactly which
 // agent_ids a dispatch reached without needing a live gRPC stream.
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -509,14 +509,14 @@ TEST_CASE("wire_and_dispatch_confined: the Ids arm intersects exec_visible again
         // Gateway-pending path: send_to() queues onto drain_gateway_pending()
         // and returns true with NO live gRPC stream needed — the observable
         // hook this test uses to see exactly who was targeted.
-        registry.set_gateway_node(id, "test-gateway");
         // p8/PR1.9c CC-03: send_to()'s routed-path check now refuses a
         // dispatch-tagged command to a gateway session that hasn't advertised
         // command_dispatch_tag_v1 — irrelevant to what THIS test binds (the
         // exec_visible intersection), so advertise it for every fixture agent
         // exactly as a real gateway's CONNECTED notification would.
-        registry.set_gateway_wire_capabilities(
-            id, {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+        registry.set_gateway_route(
+            id, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
     }
 
     yuzu::agent::v1::CommandRequest cmd;

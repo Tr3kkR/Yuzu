@@ -517,9 +517,9 @@ TEST_CASE("AgentRegistry::send_to: a routed envelope to a gateway session that n
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     registry.register_agent(make_agent_info("dev-gw"));
-    registry.set_gateway_node("dev-gw", "gw-node-1");
-    // Deliberately NOT calling set_gateway_wire_capabilities — this gateway
-    // has not proven it forwards dispatch_tag untouched.
+    // Node set, capabilities deliberately EMPTY — this gateway has not
+    // proven it forwards dispatch_tag untouched.
+    registry.set_gateway_route("dev-gw", "gw-node-1", {});
 
     auto classified = ClassifiedCommandTestAccess::make(make_well_formed_cmd("routed-cmd"));
 
@@ -538,9 +538,8 @@ TEST_CASE("AgentRegistry::send_to: a routed envelope succeeds once the gateway h
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     registry.register_agent(make_agent_info("dev-gw"));
-    registry.set_gateway_node("dev-gw", "gw-node-1");
-    registry.set_gateway_wire_capabilities(
-        "dev-gw", {std::string(kGatewayWireCapabilityDispatchTagV1)});
+    registry.set_gateway_route("dev-gw", "gw-node-1",
+                               {std::string(kGatewayWireCapabilityDispatchTagV1)});
 
     auto classified = ClassifiedCommandTestAccess::make(make_well_formed_cmd("routed-cmd-ok"));
 
@@ -558,12 +557,11 @@ TEST_CASE("AgentRegistry::send_to_all: an individual gateway recipient missing t
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     registry.register_agent(make_agent_info("dev-ok"));
-    registry.set_gateway_node("dev-ok", "gw-node-1");
-    registry.set_gateway_wire_capabilities(
-        "dev-ok", {std::string(kGatewayWireCapabilityDispatchTagV1)});
+    registry.set_gateway_route("dev-ok", "gw-node-1",
+                               {std::string(kGatewayWireCapabilityDispatchTagV1)});
     registry.register_agent(make_agent_info("dev-missing"));
-    registry.set_gateway_node("dev-missing", "gw-node-2");
     // dev-missing's gateway never advertised the capability.
+    registry.set_gateway_route("dev-missing", "gw-node-2", {});
 
     auto classified = ClassifiedCommandTestAccess::make(make_well_formed_cmd("broadcast-cmd"));
 
@@ -576,7 +574,8 @@ TEST_CASE("AgentRegistry::send_to_all: an individual gateway recipient missing t
 // ═════════════════════════════════════════════════════════════════════════
 // PLAN item 5 (CC-03) — AgentRegistry's gateway wire-capability accessors.
 // NotifyStreamStatus (gateway_service_impl.cpp) is a thin delegation to
-// these — set_gateway_wire_capabilities on CONNECTED, clear_stream_if_session
+// these — set_gateway_route on CONNECTED (M1 review fix: node + capabilities
+// publish together, not two separate calls), clear_stream_if_session
 // (extended, agent_registry.cpp) covers DISCONNECTED. Bound directly here
 // rather than via a live GatewayUpstreamServiceImpl, which needs a real
 // auth::AuthManager/AutoApproveEngine this package does not own and no
@@ -590,7 +589,9 @@ TEST_CASE("AgentRegistry: gateway wire capabilities are recorded and queryable",
     AgentRegistry registry(bus, metrics);
     registry.register_agent(make_agent_info("dev-A"));
 
-    registry.set_gateway_wire_capabilities("dev-A", {"command_dispatch_tag_v1", "other_cap"});
+    // Node value is irrelevant here — gateway_has_wire_capability never
+    // reads it — so a fixed placeholder is used throughout this test.
+    registry.set_gateway_route("dev-A", "irrelevant-node", {"command_dispatch_tag_v1", "other_cap"});
 
     CHECK(registry.gateway_has_wire_capability("dev-A", "command_dispatch_tag_v1"));
     CHECK(registry.gateway_has_wire_capability("dev-A", "other_cap"));
@@ -606,12 +607,12 @@ TEST_CASE("AgentRegistry: a reconnect REPLACES advertised wire capabilities, nev
     AgentRegistry registry(bus, metrics);
     registry.register_agent(make_agent_info("dev-A"));
 
-    registry.set_gateway_wire_capabilities("dev-A", {"cap_a", "cap_b"});
+    registry.set_gateway_route("dev-A", "irrelevant-node", {"cap_a", "cap_b"});
     REQUIRE(registry.gateway_has_wire_capability("dev-A", "cap_a"));
     REQUIRE(registry.gateway_has_wire_capability("dev-A", "cap_b"));
 
     // A reconnect behind a DIFFERENT gateway build advertises a narrower set.
-    registry.set_gateway_wire_capabilities("dev-A", {"cap_c"});
+    registry.set_gateway_route("dev-A", "irrelevant-node", {"cap_c"});
 
     CHECK_FALSE(registry.gateway_has_wire_capability("dev-A", "cap_a"));
     CHECK_FALSE(registry.gateway_has_wire_capability("dev-A", "cap_b"));
@@ -626,8 +627,8 @@ TEST_CASE("AgentRegistry: clear_stream_if_session clears advertised wire capabil
     AgentRegistry registry(bus, metrics);
     registry.register_agent(make_agent_info("dev-A"));
     registry.map_session("sess-1", "dev-A");
-    registry.set_gateway_wire_capabilities(
-        "dev-A", {std::string(kGatewayWireCapabilityDispatchTagV1)});
+    registry.set_gateway_route("dev-A", "irrelevant-node",
+                               {std::string(kGatewayWireCapabilityDispatchTagV1)});
     REQUIRE(registry.gateway_has_wire_capability(
         "dev-A", kGatewayWireCapabilityDispatchTagV1));
 
@@ -645,7 +646,7 @@ TEST_CASE("AgentRegistry: clear_gateway_wire_capabilities drops the advertised s
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
     registry.register_agent(make_agent_info("dev-A"));
-    registry.set_gateway_wire_capabilities("dev-A", {"cap_a"});
+    registry.set_gateway_route("dev-A", "irrelevant-node", {"cap_a"});
     REQUIRE(registry.gateway_has_wire_capability("dev-A", "cap_a"));
 
     registry.clear_gateway_wire_capabilities("dev-A");

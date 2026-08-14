@@ -272,12 +272,19 @@ struct PluginMeta {
 
 // -- Agent session (one per connected agent) ----------------------------------
 //
-// IMMUTABILITY CONTRACT: the identity fields (agent_id..scopable_tags,
-// gateway_node) are fully populated BEFORE the session is installed in the
-// registry and are never mutated afterwards — re-registration REPLACES the
-// shared_ptr, it does not edit in place. Lock-free readers (scope evaluation,
-// the DEX perf provider) depend on this. Post-publication writes are confined
-// to stream/server_context/peer_cert_pem (under stream_mu) and the atomic
+// IMMUTABILITY CONTRACT: the identity fields (agent_id..scopable_tags) are
+// fully populated BEFORE the session is installed in the registry and are
+// never mutated afterwards — re-registration REPLACES the shared_ptr, it
+// does not edit in place. Lock-free readers (scope evaluation, the DEX perf
+// provider) depend on this — NONE of them reads `gateway_node` or
+// `gateway_wire_capabilities` (verified: their only readers are
+// send_to/send_to_all, agent_registry.cpp, both under `stream_mu`), which is
+// exactly why those two are NOT in this list. Post-publication writes are
+// confined to stream/server_context/peer_cert_pem, gateway_node +
+// gateway_wire_capabilities (all under stream_mu — the trailing pair
+// published together by set_gateway_route, M1 review fix; an earlier
+// revision wrote gateway_node under the registry mu_ instead, which both
+// raced stream_mu's readers and contradicted this comment) and the atomic
 // last_activity_epoch_ms. (Governance G3 cpp-safety — keep it true.)
 
 struct AgentSession {
@@ -365,18 +372,22 @@ public:
     /// Clear stream only if the session_id matches the current session.
     void clear_stream_if_session(const std::string& agent_id, const std::string& session_id);
 
-    void set_gateway_node(const std::string& agent_id, const std::string& node);
-
-    /// PLAN item 5 (CC-03): record the literal wire-capability strings a
-    /// gateway advertised for `agent_id` on a CONNECTED
-    /// `StreamStatusNotification` — called by `GatewayUpstreamServiceImpl::
-    /// NotifyStreamStatus`. ALWAYS a full replace, never a merge: a
-    /// reconnect (fresh CONNECTED) behind an upgraded — or downgraded —
-    /// gateway build must not keep stacking capabilities the new connection
-    /// never advertised. No-op if `agent_id` is not currently registered
-    /// (mirrors `set_gateway_node`'s own race tolerance).
-    void set_gateway_wire_capabilities(const std::string& agent_id,
-                                       std::vector<std::string> capabilities);
+    /// PLAN item 5 (CC-03) / M1 (review finding, post-merge round): record
+    /// the gateway node AND the literal wire-capability strings it
+    /// advertised for `agent_id` on a CONNECTED `StreamStatusNotification` —
+    /// called by `GatewayUpstreamServiceImpl::NotifyStreamStatus`. ONE call,
+    /// not two: both fields are published together under `stream_mu`, the
+    /// SAME lock `send_to`/`send_to_all` read them under (agent_registry.cpp)
+    /// — this used to be two setters in two different lock domains (`node`
+    /// under the registry `mu_` only), which was both a C++ data race on
+    /// `gateway_node` and let a reader observe `node` present with
+    /// capabilities not yet replaced (a false gateway-capability denial).
+    /// `capabilities` is ALWAYS a full replace, never a merge: a reconnect
+    /// (fresh CONNECTED) behind an upgraded — or downgraded — gateway build
+    /// must not keep stacking capabilities the new connection never
+    /// advertised. No-op if `agent_id` is not currently registered.
+    void set_gateway_route(const std::string& agent_id, const std::string& node,
+                           std::vector<std::string> capabilities);
 
     /// PLAN item 5: drop every advertised wire capability for `agent_id`.
     /// Called on DISCONNECTED. `clear_stream_if_session` also clears this set
