@@ -911,8 +911,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // ITServiceOwner grants full CRUD on Schedule, so a bare Schedule:Read
     // gate alone would still let a service-scoped token enumerate every
     // schedule from every other service. Runs BEFORE perm_fn (independent
-    // of RBAC on/off branch ordering), same as every other deny_service_
-    // scoped_ helper on this branch.
+    // of RBAC on/off branch ordering) — matches the GuardianRoutes/DexRoutes/
+    // NetworkRoutes family of fragment/REST denies with no single per-target
+    // to scope against. The schedule feature's OWN shared REST helper,
+    // deny_service_scoped_schedule (schedule_routes.hpp), deliberately runs
+    // the OPPOSITE order — AFTER its route's permission gate(s) — because
+    // its resolve_session doesn't write a response on failure the way this
+    // lambda's auth_fn does; both orderings are correct for their own
+    // callback contract, this is not one universal rule.
     auto deny_service_scoped_schedule_list = [auth_fn, audit_fn](const httplib::Request& req,
                                                                   httplib::Response& res) -> bool {
         auto session = auth_fn(req, res);

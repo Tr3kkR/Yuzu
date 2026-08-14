@@ -5299,6 +5299,16 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── list_schedules ────────────────────────────────────────────
             if (tool_name == "list_schedules") {
+                // Tier-before-RBAC/confinement (docs/mcp-server.md) — matches
+                // every sibling deny_fleet_wide_service_scoped call site
+                // (get_dex_signal_detail, list_dex_perf_devices,
+                // list_network_devices): tier_allows first, then the deny.
+                if (!tier_allows(tier, "Schedule", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
                 // guardian-confinement-2298 hardening sweep: ITServiceOwner
                 // grants full CRUD on Schedule, and query_schedules has no
                 // owner/service filter of any kind — a bare Schedule:Read
@@ -5311,12 +5321,6 @@ McpServer::HandlerFn McpServer::build_handler(
                         "list_schedules)",
                         "service-scoped tokens may not read the fleet-wide schedule list"))
                     return;
-                if (!tier_allows(tier, "Schedule", "Read")) {
-                    res.set_content(
-                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
-                        "application/json");
-                    return;
-                }
                 if (!perm_fn(req, res, "Schedule", "Read"))
                     return;
                 if (!schedule_engine) {
