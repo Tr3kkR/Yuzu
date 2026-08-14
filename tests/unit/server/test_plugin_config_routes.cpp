@@ -8,11 +8,11 @@
 /// (`PluginConfigStore` has no virtual seam — `Deps::store` is a concrete
 /// pointer per this package's spec — so anything past the perm/auth/authz
 /// gate needs a real store):
-///   - Permission-gate securable/operation pins, the store-unavailable 503,
-///     and the list route's DenyAll/null-rbac-store 403/503 mapping run
-///     WITHOUT Postgres — every one of them returns before the handler ever
-///     dereferences `deps.store` (store is left null; RbacStore is SQLite,
-///     not Postgres, so its own tests need no `[pg]` gate either).
+///   - Permission-gate securable/operation pins and the store-unavailable
+///     503 run WITHOUT Postgres — every one of them returns before the
+///     handler ever dereferences `deps.store` (store is left null). The
+///     authz-mapping cases that need a real RbacStore are `[pg]` too since
+///     ADR-0041 moved RbacStore onto Postgres.
 ///   - CRUD round-trips, the secret write-only response shape, the
 ///     kill-switch route's dispatch precedence over the generic
 ///     `:plugin/:key` route, the audit-failure-503 posture, and the list
@@ -178,13 +178,30 @@ TEST_CASE("plugin_config_routes: a null/closed store answers 503 without crashin
     CHECK(r3->status == 503);
 }
 
-// ── List route: ADR-0017 authz mapping (RbacStore is SQLite — no Postgres
-//    needed for RbacStore itself; `store` stays null since every one of
-//    these cases returns before it would be touched) ─────────────────────
+namespace {
+// RbacStore is Postgres-backed (ADR-0041); pre-migrated template for the
+// authz-mapping cases below. `store` stays null in those cases — they return
+// before it would be touched — so only the RBAC half needs a database.
+yuzu::test::PgTestTemplate routes_rbac_tpl{"pluginroutesrbac", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    RbacStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("pluginroutes rbac template: store failed to migrate");
+}};
+} // namespace
+
+#define ROUTES_RBAC(store_var)                                                                     \
+    YUZU_REQUIRE_PG_DB_TPL(rbacdb_fx_, routes_rbac_tpl);                                           \
+    yuzu::server::pg::PgPool rbacpool_fx_{{.conninfo = rbacdb_fx_.dsn(), .size = 2}};              \
+    REQUIRE(rbacpool_fx_.valid());                                                                 \
+    RbacStore store_var{rbacpool_fx_};                                                             \
+    REQUIRE(store_var.is_open())
+
+// ── List route: ADR-0017 authz mapping ────────────────────────────────────
 
 TEST_CASE("plugin_config_routes: list route 403s when no grant exists anywhere (DenyAll)",
-          "[server][routes][config]") {
-    RbacStore rbac{":memory:"};
+          "[pg][server][routes][config]") {
+    ROUTES_RBAC(rbac);
     rbac.set_rbac_enabled(true); // enforcement ON, no roles granted to 'alice'
     Harness h;
     h.rbac_store = &rbac;
@@ -206,8 +223,8 @@ TEST_CASE("plugin_config_routes: list route 503s when rbac_store is unset",
 
 TEST_CASE("plugin_config_routes: list route fails closed on an authenticated-but-missing-session "
           "gate order (perm_fn runs, then auth_fn)",
-          "[server][routes][config]") {
-    RbacStore rbac{":memory:"};
+          "[pg][server][routes][config]") {
+    ROUTES_RBAC(rbac);
     Harness h;
     h.rbac_store = &rbac;
     h.session_present = false;
@@ -504,7 +521,7 @@ TEST_CASE("plugin_config_routes: list route's AdmitAll (legacy-open RBAC) serves
     PgWired w{db.dsn()};
     REQUIRE(w.store.set_config("email", "host", "mail.example.com", "alice").has_value());
 
-    RbacStore rbac{":memory:"}; // is_open() && !is_rbac_enabled() -> legacy-open -> AdmitAll
+    ROUTES_RBAC(rbac); // is_open() && !is_rbac_enabled() -> legacy-open -> AdmitAll
     Harness h;
     h.store = &w.store;
     h.rbac_store = &rbac;

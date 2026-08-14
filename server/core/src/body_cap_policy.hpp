@@ -209,6 +209,15 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // Bodyless GET/DELETE on this prefix are unaffected: the measurability
     // rule fires only for POST/PUT/PATCH (web_utils.hpp body_unmeasurable).
     {kBodyCapAnyMethod, "/api/v1/uploads", 8u * 1024 * 1024, true, "upload_session"},
+    // /api/v1/plugin-config — the PR1.5 config/secret/kill-switch plane. The
+    // store's own grammar caps a config value at 8 KiB and a secret plaintext
+    // at 64 KiB (plugin_config_parsers.hpp kMaxConfigValueBytes/
+    // kMaxSecretValueBytes); 256 KiB covers the larger of the two plus JSON
+    // framing/escaping headroom with room to spare, while keeping an
+    // unauthenticated flood against this surface two orders of magnitude
+    // under the 4 MiB catch-all. ANY method — PUT config/secret writes,
+    // DELETE carries no body, GET/list are bodyless.
+    {kBodyCapAnyMethod, "/api/v1/plugin-config", 256u * 1024, false, "plugin_config"},
 
     // POST /api/settings/updates/upload — OTA agent binary upload
     // (settings_routes.cpp:5146 handler start, :5206 the unbounded file

@@ -20,6 +20,7 @@
 #include "schedule_runner.hpp"
 
 #include "../test_helpers.hpp"
+#include "pg/pg_pool.hpp"
 
 #include <yuzu/metrics.hpp>
 
@@ -526,10 +527,26 @@ TEST_CASE("ScheduleRunner: D7 true arming_check still lets the auto and approved
     CHECK(h.get(gated_id).execution_count == 1);
 }
 
+namespace {
+// AuditStore is Postgres-backed now — pre-migrated template for the single
+// audit-consuming case below (everything else in this file stays hermetic
+// SQLite via the runner's own stores).
+yuzu::test::PgTestTemplate schedrunner_audit_tpl{"schedrunneraudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("schedrunner audit template: store failed to migrate");
+}};
+} // namespace
+
 TEST_CASE("ScheduleRunner: D7 a denied arming check audits the principal + target and counts "
           "the deny",
-          "[schedule][runner][d7]") {
-    AuditStore audit(":memory:"); // create_tables() runs in the constructor
+          "[schedule][runner][d7][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, schedrunner_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
     yuzu::MetricsRegistry metrics;
     Harness h([](const std::string&, const std::string&, const std::string&) { return false; },
              &audit, &metrics);
@@ -540,8 +557,9 @@ TEST_CASE("ScheduleRunner: D7 a denied arming check audits the principal + targe
     CHECK(metrics.counter("yuzu_schedule_arming_denied_total").value() == 1.0);
 
     auto rows = audit.query({.action = "instruction.schedule_fired"});
+    REQUIRE(rows.has_value()); // PG store: query reports availability, not just rows
     bool found = false;
-    for (const auto& e : rows) {
+    for (const auto& e : *rows) {
         if (e.result == "denied" && e.principal == "admin" &&
             e.detail.find("plugin=procs") != std::string::npos &&
             e.detail.find("action=list") != std::string::npos) {

@@ -1897,8 +1897,10 @@ TEST_CASE("K-R7-02 — instruction execute FAILS CLOSED when the exec-visible de
 // IDENTITY half of DispatchCaller — a wired CallerFn's principal must reach
 // the dispatch seam, not just its exec_visible.
 TEST_CASE("PLAN-006 — instruction execute threads the caller's principal into dispatch",
-          "[workflow][executions][execute][scope]") {
-    ExecHarness h;
+          "[pg][workflow][executions][execute][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
     h.make_def("def-CONF4", "conf4");
     h.dispatch_cmd_override = "cmd-p";
     h.dispatch_sent_override = 1;
@@ -1915,10 +1917,12 @@ TEST_CASE("PLAN-006 — instruction execute threads the caller's principal into 
 }
 
 TEST_CASE("PLAN-006 — instruction execute FAILS CLOSED on an empty principal when unwired",
-          "[workflow][executions][execute][scope][security]") {
+          "[pg][workflow][executions][execute][scope][security]") {
     // Genuinely UNWIRED CallerFn: the production handler must hand dispatch an
     // EMPTY principal alongside a present-empty exec_visible.
-    ExecHarness h(/*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/false);
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/false);
     h.make_def("def-CONF5", "conf5");
     h.dispatch_cmd_override = "cmd-pfc";
     h.dispatch_sent_override = 1;

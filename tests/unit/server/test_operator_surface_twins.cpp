@@ -44,6 +44,7 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "mcp_server_testonly.hpp"
+#include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 #include "schedule_arming_check.hpp"
 #include "schedule_engine.hpp"
@@ -85,14 +86,33 @@ bool compose_arming_check(const CommandCapabilityRegistry& registry, const RbacS
 
 } // namespace
 
+namespace {
+// RbacStore is Postgres-backed (ADR-0041) — a pre-migrated template cloned per
+// test, the same recipe test_rbac_store.cpp uses. Every case below therefore
+// carries the [pg] tag and SKIPs when YUZU_TEST_POSTGRES_DSN is unset.
+yuzu::test::PgTestTemplate twins_rbac_tpl{"optwinsrbac", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    RbacStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("optwins rbac template: store failed to migrate");
+}};
+} // namespace
+
+#define TWINS_RBAC(store_var)                                                                      \
+    YUZU_REQUIRE_PG_DB_TPL(twins_db_fx_, twins_rbac_tpl);                                          \
+    yuzu::server::pg::PgPool twins_pool_fx_{{.conninfo = twins_db_fx_.dsn(), .size = 4}};          \
+    REQUIRE(twins_pool_fx_.valid());                                                               \
+    RbacStore store_var{twins_pool_fx_};                                                           \
+    REQUIRE(store_var.is_open())
+
 // ═════════════════════════════════════════════════════════════════════════
 // compose_arming_check — the composed decision in isolation
 // ═════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("arming_check composition: unclassified plugin.action denies (ADR-0033 §2)",
-          "[server][routes][mcp]") {
+          "[server][routes][mcp][pg]") {
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
-    RbacStore rbac(":memory:");
+    TWINS_RBAC(rbac);
     rbac.set_rbac_enabled(true);
     REQUIRE(rbac.assign_role(PrincipalRole{"user", "alice", "Administrator"}).has_value());
 
@@ -110,7 +130,7 @@ TEST_CASE("arming_check composition: null/closed RbacStore denies fail-closed",
 
 TEST_CASE("arming_check composition: a system_reserved capability is refused to every operator "
           "(BR-003 confused deputy)",
-          "[server][routes][mcp]") {
+          "[server][routes][mcp][pg]") {
     // THE branch that drifted. A schedule is operator-authored but fires
     // through `command_dispatch_fn`, which dispatches as
     // `DispatchCaller{.system = true}`; the chokepoint's system_reserved
@@ -126,7 +146,7 @@ TEST_CASE("arming_check composition: a system_reserved capability is refused to 
     CommandCapabilityRegistry registry{capdecls::core_dispatch_capabilities(),
                                        capdecls::plugin_action_catalogue_a()};
 
-    RbacStore rbac(":memory:");
+    TWINS_RBAC(rbac);
     rbac.set_rbac_enabled(true);
     // Administrator holds every (securable, operation) pair, so RBAC alone
     // would ADMIT — the denial has to come from the system_reserved branch,
@@ -135,9 +155,12 @@ TEST_CASE("arming_check composition: a system_reserved capability is refused to 
     CHECK_FALSE(compose_arming_check(registry, &rbac, "alice", "tar", "fleet_snapshot"));
 
     // Legacy-open RBAC does not rescue it either: the reserved check runs
-    // BEFORE the enforcement-in-effect early-return.
-    RbacStore open_rbac(":memory:");
-    CHECK_FALSE(compose_arming_check(registry, &open_rbac, "alice", "tar", "fleet_snapshot"));
+    // BEFORE the enforcement-in-effect early-return. Reuse the SAME store,
+    // toggled open — a second clone would double the fixture cost for no
+    // additional coverage, and the toggle is itself the production lever.
+    rbac.set_rbac_enabled(false);
+    CHECK_FALSE(compose_arming_check(registry, &rbac, "alice", "tar", "fleet_snapshot"));
+    rbac.set_rbac_enabled(true);
 
     // Sanity: a non-reserved row in the same composed registry still admits,
     // so the denial above is specific to system_reserved and not the
@@ -146,18 +169,18 @@ TEST_CASE("arming_check composition: a system_reserved capability is refused to 
 }
 
 TEST_CASE("arming_check composition: RBAC legacy-open (disabled) admits regardless of grant",
-          "[server][routes][mcp]") {
+          "[server][routes][mcp][pg]") {
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
-    RbacStore rbac(":memory:");
-    // Fresh store defaults to rbac_enabled_=false (legacy-open) — no
+    TWINS_RBAC(rbac);
+    // Fresh store defaults to rbac_enabled=false (legacy-open) — no
     // set_rbac_enabled(true) call here, on purpose.
     CHECK(compose_arming_check(registry, &rbac, "nobody-with-no-role", "filesystem", "exists"));
 }
 
 TEST_CASE("arming_check composition: RBAC enabled + granted principal admits",
-          "[server][routes][mcp]") {
+          "[server][routes][mcp][pg]") {
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
-    RbacStore rbac(":memory:");
+    TWINS_RBAC(rbac);
     rbac.set_rbac_enabled(true);
     // filesystem.exists classifies to FileRetrieval:Read (plugin_action_catalogue_a.hpp);
     // Administrator holds every (securable, operation) pair (rbac_store.cpp's
@@ -167,9 +190,9 @@ TEST_CASE("arming_check composition: RBAC enabled + granted principal admits",
 }
 
 TEST_CASE("arming_check composition: RBAC enabled + ungranted principal denies",
-          "[server][routes][mcp]") {
+          "[server][routes][mcp][pg]") {
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
-    RbacStore rbac(":memory:");
+    TWINS_RBAC(rbac);
     rbac.set_rbac_enabled(true);
     // "bob" holds no role at all -> check_permission's collect_roles_locked
     // returns empty -> false.
@@ -205,14 +228,18 @@ struct Harness {
     InstructionStore is{insdb.path};
 
     CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
-    RbacStore rbac{":memory:"};
+    // Postgres-backed (ADR-0041): the store is constructed by the TEST_CASE
+    // via TWINS_RBAC (which carries the SKIP-if-no-DSN guard a struct member
+    // cannot) and borrowed here for the harness's lifetime.
+    RbacStore& rbac;
 
     std::vector<std::string> dispatched_actions;
 
     ScheduleRunner runner;
 
-    explicit Harness()
-        : runner(ScheduleRunner::Deps{
+    explicit Harness(RbacStore& rbac_store)
+        : rbac(rbac_store),
+          runner(ScheduleRunner::Deps{
               .schedule_engine = &engine,
               .instruction_store = &is,
               .execution_tracker = &tracker,
@@ -275,8 +302,9 @@ struct Harness {
 
 TEST_CASE("arming_check (auto path): a schedule whose creator lost the required permission "
           "does not fire, and re-fires once permission is restored",
-          "[server][routes][mcp][schedule]") {
-    Harness h;
+          "[server][routes][mcp][schedule][pg]") {
+    TWINS_RBAC(rbac);
+    Harness h{rbac};
     REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "carol", "Administrator"}).has_value());
     auto id = h.make_due("carol", /*requires_approval=*/false);
 
@@ -301,8 +329,9 @@ TEST_CASE("arming_check (auto path): a schedule whose creator lost the required 
 
 TEST_CASE("arming_check (approval path): a schedule whose creator lost the required "
           "permission does not submit an approval ticket and does not fire",
-          "[server][routes][mcp][schedule]") {
-    Harness h;
+          "[server][routes][mcp][schedule][pg]") {
+    TWINS_RBAC(rbac);
+    Harness h{rbac};
     REQUIRE(h.rbac.assign_role(PrincipalRole{"user", "dave", "Administrator"}).has_value());
     auto id = h.make_due("dave", /*requires_approval=*/true);
 

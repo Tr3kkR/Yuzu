@@ -251,8 +251,8 @@ bool has_grant(const std::vector<Permission>& perms, const std::string& securabl
 } // namespace
 
 TEST_CASE("RbacStore: seed data — Administrator has full CRUD on the three new securables",
-          "[rbac_store][plan-001]") {
-    RbacStore store(":memory:");
+          "[rbac_store][plan-001][pg]") {
+    RBAC_STORE(store);
     auto perms = store.get_role_permissions("Administrator");
     for (const std::string& securable : {"PluginConfig", "PluginSecret", "UploadGrant"}) {
         INFO("securable=" << securable);
@@ -264,8 +264,8 @@ TEST_CASE("RbacStore: seed data — Administrator has full CRUD on the three new
 
 TEST_CASE("RbacStore: seed data — PlatformEngineer has Read/Write/Delete on the three new "
           "securables",
-          "[rbac_store][plan-001]") {
-    RbacStore store(":memory:");
+          "[rbac_store][plan-001][pg]") {
+    RBAC_STORE(store);
     auto perms = store.get_role_permissions("PlatformEngineer");
     for (const std::string& securable : {"PluginConfig", "PluginSecret", "UploadGrant"}) {
         INFO("securable=" << securable);
@@ -277,8 +277,8 @@ TEST_CASE("RbacStore: seed data — PlatformEngineer has Read/Write/Delete on th
 
 TEST_CASE("RbacStore: seed data — Operator has Read on PluginConfig and UploadGrant, "
           "nothing on PluginSecret",
-          "[rbac_store][plan-001]") {
-    RbacStore store(":memory:");
+          "[rbac_store][plan-001][pg]") {
+    RBAC_STORE(store);
     auto perms = store.get_role_permissions("Operator");
 
     CHECK(has_grant(perms, "PluginConfig", "Read"));

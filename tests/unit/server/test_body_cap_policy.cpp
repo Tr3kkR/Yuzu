@@ -91,6 +91,12 @@ constexpr ExpectedResolution kExpected[] = {
     {"PUT",    "/api/v1/uploads/abc123/chunk",            8u * 1024 * 1024,   true,  "upload_session"},
     {"POST",   "/api/v1/uploads",                          8u * 1024 * 1024,  true,  "upload_session"},
     {"POST",   "/api/v1/uploads/abc123/commit",            8u * 1024 * 1024,  true,  "upload_session"},
+    // body_cap_policy.hpp plugin_config row — the PR1.5 config/secret/
+    // kill-switch plane. 256 KiB = the 64 KiB secret-plaintext grammar cap
+    // (plugin_config_parsers.hpp) plus JSON framing headroom.
+    {"PUT",    "/api/v1/plugin-config/email/host",         256u * 1024,        false, "plugin_config"},
+    {"PUT",    "/api/v1/plugin-config/email/key/secret",   256u * 1024,        false, "plugin_config"},
+    {"DELETE", "/api/v1/plugin-config/email/host",         256u * 1024,        false, "plugin_config"},
     // settings_routes.cpp:5146,:5206 — keeps httplib's 100 MiB backstop.
     {"POST",   "/api/settings/updates/upload",            100u * 1024 * 1024, false, "ota_upload"},
     // server.cpp:10809 — unbounded by design, kept at httplib's backstop.
@@ -168,6 +174,7 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "response_templates",
     "tar_dashboard_sql",
     "upload_session",
+    "plugin_config",
     "tar_result_set_sql",
     "guardian_rule_authoring",
     "workflow_yaml",
@@ -309,8 +316,10 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // tar_dashboard_sql(1) + tar_result_set_sql(1) +
     // guardian_rule_authoring(2: POST create + PUT update) +
     // workflow_yaml(1) + product_pack_yaml(1) + instruction_import(1) +
-    // instruction_yaml(3: save/validate/preview) + default(1).
-    CHECK(std::size(kBodyCapTable) == 25);
+    // instruction_yaml(3: save/validate/preview) + upload_session(1: the
+    // PR1.6a chunked-receive surface) + plugin_config(1: the PR1.5 config/
+    // secret plane) + default(1).
+    CHECK(std::size(kBodyCapTable) == 27);
 }
 
 // ── 7. requires_measurable: ON for /mcp/, OFF for the named public classes ──
