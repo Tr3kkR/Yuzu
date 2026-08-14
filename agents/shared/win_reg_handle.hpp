@@ -1,7 +1,9 @@
 // win_reg_handle.hpp -- RAII owners for HKEY and RegLoadKeyW-mounted hives.
 //
-// Canonical home for the HKEY-RAII pattern (PR1.7). Originally six
-// independent copies of this shape existed across the tree; #2771 swept the
+// Canonical home for the HKEY-RAII pattern (PR1.7). Originally eight
+// independent copies of this shape existed across the tree (three
+// HiveUnloadGuard-class mount/unload owners, three plain-HKEY closers, and
+// two .put()-style wrappers, enumerated below); #2771 swept the
 // three HiveUnloadGuard copies feeding the per-user hive ladder specifically
 // (licensing_win.cpp's, installed_apps_plugin.cpp's, tar_mapdrive_collector
 // .cpp's -- all deleted, replaced by ScopedUserHive) onto this header. Their
@@ -168,7 +170,8 @@ public:
     /// `unload_failed`, if non-null, is set (never cleared) when
     /// RegUnLoadKeyW fails in the destructor -- read it AFTER this guard
     /// goes out of scope, since a destructor cannot throw or return a status
-    /// (mirrors licensing_win.cpp's HiveUnloadGuard).
+    /// (the same constraint licensing_win.cpp's now-retired HiveUnloadGuard
+    /// -- one of the three #2771 swept onto this type -- was built around).
     ScopedUserHive(std::wstring mount_name, const std::wstring& hive_file_path,
                    bool* unload_failed = nullptr)
         : mount_name_(std::move(mount_name)), unload_failed_(unload_failed) {

@@ -415,6 +415,9 @@ private:
                 case yuzu::win::ReadValueStatus::malformed:
                     key_status = yuzu::profiles::UserKeyStatus::value_malformed;
                     break;
+                case yuzu::win::ReadValueStatus::changed_during_read:
+                    key_status = yuzu::profiles::UserKeyStatus::value_changed_during_read;
+                    break;
                 case yuzu::win::ReadValueStatus::not_found:
                     key_status = yuzu::profiles::UserKeyStatus::value_not_found;
                     break;

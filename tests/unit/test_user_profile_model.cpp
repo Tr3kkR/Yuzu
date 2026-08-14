@@ -489,6 +489,44 @@ TEST_CASE("hex_encode: empty, low and high-bit bytes", "[profiles]") {
     CHECK(hex_encode(high) == "ff");
 }
 
+// ── #2771 code-review C-M3 / P2-N3: the honest-truncation decision ─────────
+//
+// The REAL regression: `out.size() >= kMaxProfiles` alone conflated "the cap
+// was reached" with "a record was dropped" -- a host with EXACTLY
+// kMaxProfiles subkeys got a false truncation warning that license_scan then
+// escalated into a false ok=false surface failure. The FIX's own first-round
+// regression test (in the Windows-gated test_registry_local_dispatcher.cpp)
+// cannot actually discriminate this: it calls enumerate_profile_records on
+// whatever real host it runs on, which has far fewer than 512 profiles, so
+// BOTH the pre-fix and post-fix implementations report truncated=false there
+// -- passing proves nothing about the boundary case a unit test cannot
+// fabricate 512 real registry subkeys to exercise. Testing the DECISION
+// (extracted pure specifically so this is possible) is what actually pins
+// the fix.
+
+TEST_CASE("profile_list_actually_truncated: the exact C-M3 boundary case",
+         "[profiles]") {
+    // Cap reached, but the probe finds nothing further -- exactly 512
+    // subkeys, nothing lost. This is the case the buggy `out.size() >=
+    // kMaxProfiles` check got wrong (it would have said "truncated" here).
+    CHECK_FALSE(profile_list_actually_truncated(/*cap_reached=*/true,
+                                                /*probe_found_more=*/false));
+}
+
+TEST_CASE("profile_list_actually_truncated: a genuine drop", "[profiles]") {
+    // Cap reached AND the probe confirms a 513th subkey exists -- something
+    // really was dropped.
+    CHECK(profile_list_actually_truncated(/*cap_reached=*/true, /*probe_found_more=*/true));
+}
+
+TEST_CASE("profile_list_actually_truncated: cap never reached", "[profiles]") {
+    // The ordinary case on every real dev/CI host. probe_found_more is
+    // irrelevant (the shell never probes when the cap wasn't hit) but the
+    // function must still be safe to call with either value.
+    CHECK_FALSE(profile_list_actually_truncated(false, false));
+    CHECK_FALSE(profile_list_actually_truncated(false, true));
+}
+
 // ── #2771 up-S2: the unreadable-path signal ────────────────────────────────
 
 TEST_CASE("build_profile_list: carries profile_path_unreadable through", "[profiles]") {

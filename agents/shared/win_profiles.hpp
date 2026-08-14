@@ -88,9 +88,13 @@ inline std::wstring expand_env_strings(const std::wstring& in) {
 // set false only when the ProfileList key itself could not be opened -- a
 // per-profile ProfileImagePath read failure is reported as an empty
 // profile_image_path on that one record, never a dropped record. `truncated`,
-// if non-null, is set true when the cap was reached -- a caller that cares
-// about completeness (list_profiles) surfaces this; one that's looking up a
-// single profile (get_user_value) may pass nullptr and ignore it.
+// if non-null, is set true when a record was ACTUALLY DROPPED -- the cap was
+// reached AND a probe confirmed a further ProfileList subkey exists (#2771
+// code-review C-M3: "cap reached" alone is not the same fact -- a host with
+// exactly kMaxProfiles subkeys hits the cap without losing anything). A
+// caller that cares about completeness (list_profiles) surfaces this; one
+// that's looking up a single profile (get_user_value) may pass nullptr and
+// ignore it.
 inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
     bool& ok, bool* truncated = nullptr) {
     std::vector<yuzu::profiles::RawProfileRecord> out;
@@ -176,19 +180,21 @@ inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
         out.push_back(std::move(rec));
     }
     if (truncated) {
-        // #2771 code-review C-M3: `out.size() >= kMaxProfiles` means "the cap
-        // was REACHED", not "records were DROPPED" -- a host with EXACTLY
-        // kMaxProfiles subkeys hits the former without the latter, and the
-        // old check reported truncation on a complete list. One extra
-        // RegEnumKeyExW probe (nothing is stored from it) settles whether a
-        // NEXT entry actually exists before claiming anything was lost.
-        // license_scan turns a false truncated=true into a false ok=false
-        // surface failure, so this is not cosmetic.
-        if (out.size() >= kMaxProfiles) {
+        // The DECISION (cap reached AND a next entry actually exists) is
+        // yuzu::profiles::profile_list_actually_truncated, extracted pure so
+        // it is unit-tested without a real registry (#2771 code-review
+        // C-M3 / P2-N3). This Win32 shell's job is only to gather the two
+        // input facts: did we hit the cap, and does one extra RegEnumKeyExW
+        // probe (nothing stored from it) find a next subkey.
+        const bool cap_reached = (out.size() >= kMaxProfiles);
+        if (cap_reached) {
             wchar_t probe_buf[kSidBufLen]{};
             DWORD probe_len = kSidBufLen;
-            *truncated = (RegEnumKeyExW(profiles.get(), idx, probe_buf, &probe_len, nullptr,
-                                       nullptr, nullptr, nullptr) == ERROR_SUCCESS);
+            const bool probe_found_more =
+                (RegEnumKeyExW(profiles.get(), idx, probe_buf, &probe_len, nullptr, nullptr,
+                              nullptr, nullptr) == ERROR_SUCCESS);
+            *truncated = yuzu::profiles::profile_list_actually_truncated(cap_reached,
+                                                                         probe_found_more);
         } else {
             *truncated = false;
         }
@@ -434,6 +440,13 @@ enum class ReadValueStatus {
     oversized, // exists but exceeds kMaxRegValueBytes
     malformed, // exists with a declared numeric type but a size too small
               // for that type (e.g. a REG_DWORD value under 4 bytes)
+    changed_during_read, // exists -- a concurrent writer grew it faster
+                        // than the bounded retry could keep up. Distinct
+                        // from not_found (#2771 code-review CODEX-P1-02):
+                        // the value demonstrably EXISTS, it just could not
+                        // be pinned down; reporting it as absent would be
+                        // exactly the kind of dishonest collapse this
+                        // function exists to avoid.
 };
 
 // Reads a single string/DWORD/QWORD/binary value under `root`, formatting it
@@ -451,29 +464,62 @@ inline ReadValueStatus read_reg_value(HKEY root, const std::string& value_name,
     if (exceeds_cap)
         size = kMaxRegValueBytes;
 
-    std::vector<BYTE> data(size);
-    LSTATUS read_rc = RegQueryValueExW(root, wname.c_str(), nullptr, &type, data.data(), &size);
-    if (read_rc == ERROR_MORE_DATA && !exceeds_cap) {
-        // #2771 code-review CODEX-P1-02: a value that GROWS between the size
-        // query and the data query (an ordinary race with a concurrent
-        // writer, not exotic) also returns ERROR_MORE_DATA here even though
-        // the first size we saw was under the cap -- treating that
-        // identically to "the value was deleted" would report a value that
-        // demonstrably EXISTS as `not_found`, contradicting this function's
-        // whole "distinguish absence from failure" purpose. One bounded
-        // retry against a freshly queried size closes the race rather than
-        // reporting a false negative; if it still doesn't fit, the value has
-        // grown past the cap, which IS oversized.
+    // #2771 code-review P2-N5: NEVER allocate a zero-length buffer here, even
+    // when the value is genuinely empty (size==0). std::vector<BYTE>::data()
+    // on an empty vector is permitted by the standard to return nullptr, and
+    // passing lpData==nullptr to RegQueryValueExW switches it into SIZE-QUERY
+    // mode regardless of what *lpcbData held -- so a value that is 0 bytes at
+    // this exact instant but grows before Win32 processes the call would
+    // silently succeed as a size query, leaving `data` at its original
+    // (possibly zero) capacity while `size` is overwritten with the NEW,
+    // larger real size -- and every switch branch below would then read
+    // `size` bytes from a buffer that never held them: an out-of-bounds read,
+    // not merely a wrong answer. Allocating at least 1 byte keeps
+    // `data.data()` a real, non-null pointer, so Win32 takes the DATA-QUERY
+    // path (an actually-too-small buffer) and correctly reports
+    // ERROR_MORE_DATA -- routing this exact race through the SAME bounded
+    // retry loop below, rather than needing a second, separate defence.
+    std::vector<BYTE> data(size > 0 ? size : 1);
+    DWORD buffer_capacity = static_cast<DWORD>(data.size());
+    LSTATUS read_rc =
+        RegQueryValueExW(root, wname.c_str(), nullptr, &type, data.data(), &buffer_capacity);
+    size = buffer_capacity; // downstream code treats `size` as the real byte count
+
+    // #2771 code-review CODEX-P1-02 (both rounds): a value that GROWS between
+    // the size query and the data query (an ordinary race with a concurrent
+    // writer, not exotic) also returns ERROR_MORE_DATA here even though the
+    // size we last saw was under the cap -- treating that identically to
+    // "the value was deleted" would report a value that demonstrably EXISTS
+    // as `not_found`, contradicting this function's whole "distinguish
+    // absence from failure" purpose. A single retry only narrows the race
+    // window; it does not close it, so this is a BOUNDED LOOP -- if the
+    // value is still racing us after kMaxGrowthRetries consecutive attempts,
+    // that is reported as its own honest outcome (changed_during_read)
+    // rather than silently reusing not_found/oversized for a value we never
+    // established either fact about.
+    constexpr int kMaxGrowthRetries = 3;
+    for (int attempt = 0; read_rc == ERROR_MORE_DATA && !exceeds_cap && attempt < kMaxGrowthRetries;
+        ++attempt) {
         DWORD fresh_size = 0;
-        if (RegQueryValueExW(root, wname.c_str(), nullptr, &type, nullptr, &fresh_size) ==
+        if (RegQueryValueExW(root, wname.c_str(), nullptr, &type, nullptr, &fresh_size) !=
             ERROR_SUCCESS) {
-            exceeds_cap = fresh_size > kMaxRegValueBytes;
-            size = exceeds_cap ? kMaxRegValueBytes : fresh_size;
-            data.assign(size, BYTE{0});
-            read_rc = RegQueryValueExW(root, wname.c_str(), nullptr, &type, data.data(), &size);
-        } else {
-            read_rc = ERROR_FILE_NOT_FOUND; // genuinely gone by the retry
+            read_rc = ERROR_FILE_NOT_FOUND; // genuinely gone by this retry
+            break;
         }
+        exceeds_cap = fresh_size > kMaxRegValueBytes;
+        size = exceeds_cap ? kMaxRegValueBytes : fresh_size;
+        // Same zero-length guard as the first call (P2-N5) -- the value may
+        // have shrunk back to empty by this retry.
+        data.assign(size > 0 ? size : 1, BYTE{0});
+        buffer_capacity = static_cast<DWORD>(data.size());
+        read_rc =
+            RegQueryValueExW(root, wname.c_str(), nullptr, &type, data.data(), &buffer_capacity);
+        size = buffer_capacity;
+    }
+    if (read_rc == ERROR_MORE_DATA && !exceeds_cap) {
+        // Retries exhausted and the value is STILL racing us -- honest
+        // "could not pin down", not a claim of absence.
+        return ReadValueStatus::changed_during_read;
     }
     if (read_rc != ERROR_SUCCESS) {
         // A capped buffer that was too small for the real value surfaces
@@ -520,20 +566,38 @@ inline ReadValueStatus read_reg_value(HKEY root, const std::string& value_name,
         static_assert(sizeof(wchar_t) == sizeof(char16_t),
                       "REG_MULTI_SZ decoding assumes UTF-16 wchar_t (Windows)");
         // reinterpret_cast justification (code-review Standards S7, revised
-        // per CODEX-P1-03): alignment comes from the C++ ALLOCATOR, not a
-        // Win32 promise -- std::vector<BYTE>'s default allocator calls
-        // operator new, which returns storage aligned to
-        // alignof(std::max_align_t) regardless of the vector's element type;
-        // that is >= alignof(char16_t) unconditionally, verified empirically
-        // (20 trials, odd and even sizes, always max_align_t-aligned).
-        // Win32 has no say in it either way -- RegQueryValueExW only knows
-        // it was handed an LPBYTE. Read-only (const), no ownership transfer
-        // -- `chars` borrows `data`'s lifetime for this function's duration
-        // only. This is the SAME cast shape as the pre-existing, UNCHANGED
-        // REG_SZ branch two cases above (also reinterpret_cast<const
-        // wchar_t*> over this same std::vector<BYTE>) -- not a new risk
-        // profile this PR introduces, and not something this PR's scope
-        // extends to fixing project-wide.
+        // twice per CODEX-P1-03 rounds 1 and 2 -- alignment AND object
+        // lifetime, the two distinct questions a cast like this raises):
+        //
+        // Alignment: std::vector<BYTE>'s default allocator calls
+        // operator new(size_t), which the standard guarantees returns
+        // storage suitably aligned for any object of that size or smaller
+        // ([basic.stc.dynamic.allocation]) -- the guarantee is SIZE-
+        // dependent, not unconditional, but any allocation large enough to
+        // hold a char16_t is therefore large enough to be guaranteed
+        // alignof(char16_t)-aligned; RegQueryValueExW's actual REG_MULTI_SZ
+        // payload always is. Empirically confirmed (20 trials, odd and even
+        // sizes, always max_align_t-aligned in practice, consistent with the
+        // guarantee). Win32 itself has no say either way -- it only knows it
+        // was handed an LPBYTE.
+        //
+        // Object lifetime: reading BYTE-typed storage through a char16_t*
+        // without an explicit lifetime-starting operation (placement-new,
+        // std::start_lifetime_as, memcpy) is the real question C++'s object
+        // model raises, separate from alignment. Since C++20's implicit
+        // object creation for low-level storage manipulation ([intro.object]
+        // p10-11, P0593), allocating storage via operator new implicitly
+        // creates objects of implicit-lifetime type (char16_t, a scalar
+        // type, qualifies) as needed to give the program defined behaviour --
+        // this is precisely the rule that makes malloc/operator-new-backed
+        // reinterpret_cast idioms well-defined in C++20/23, which is the
+        // standard this codebase targets (CLAUDE.md: C++23).
+        //
+        // Read-only (const), no ownership transfer -- `chars` borrows
+        // `data`'s lifetime for this function's duration only. Same cast
+        // shape as the pre-existing, UNCHANGED REG_SZ branch two cases
+        // above -- not a new risk profile this PR introduces, and not
+        // something this PR's scope extends to fixing project-wide.
         const auto* chars = reinterpret_cast<const char16_t*>(data.data());
         const std::size_t nch = size / sizeof(wchar_t);
         out_value.clear();

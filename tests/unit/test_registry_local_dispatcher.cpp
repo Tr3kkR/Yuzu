@@ -323,16 +323,18 @@ TEST_CASE("unique_hive_mount_name: produces distinct, well-formed names",
     CHECK(std::adjacent_find(names.begin(), names.end()) == names.end());
 }
 
-TEST_CASE("enumerate_profile_records: truncated means records were dropped, not "
-         "cap-reached (#2771 code-review C-M3)",
+TEST_CASE("enumerate_profile_records: ordinary host reports untruncated",
          "[registry][windows]") {
-    // C-M3: the ORIGINAL check was `out.size() >= kMaxProfiles`, true for
-    // "hit the cap" whether or not a further profile actually existed -- a
-    // host with EXACTLY 512 raw ProfileList subkeys got a false truncation
-    // warning, and license_scan turned that into a false ok=false surface.
-    // Every real CI/dev host has far fewer than 512 profiles, so this pins
-    // the honest-case regression: truncated must be false when nothing was
-    // dropped, not merely "usually false because the cap is rarely hit".
+    // Real end-to-end sanity check against the actual Win32 shell, on
+    // whatever real profile count this host has (far under kMaxProfiles).
+    // NOT the C-M3 regression pin (#2771 code-review P2-N3): a host far
+    // under the cap reports truncated=false under BOTH the pre-fix and
+    // post-fix logic, so this alone cannot discriminate the boundary case --
+    // it only proves the ordinary path still works after the refactor. The
+    // actual regression coverage is the DECISION function
+    // (profile_list_actually_truncated) tested directly in the portable
+    // test_user_profile_model.cpp, which can exercise the exact
+    // cap-reached-but-nothing-dropped case no real host here can fabricate.
     bool ok = false;
     bool truncated = true; // pre-set to the WRONG answer -- must be cleared
     yuzu::win::enumerate_profile_records(ok, &truncated);

@@ -270,6 +270,12 @@ enum class UserKeyStatus {
     value_not_found,   // the subkey opened; the value does not exist
     value_oversized,   // the value exists but exceeds the read cap
     value_malformed,   // declared numeric type with a size too small for that type
+    value_changed_during_read, // the value exists but a concurrent writer
+                              // grew it faster than the bounded retry could
+                              // keep up (#2771 code-review CODEX-P1-02) --
+                              // distinct from value_not_found because the
+                              // value's EXISTENCE was never in doubt, only
+                              // its size.
 };
 
 /// Renders the operator-facing lines for one hive-access outcome, in emission
@@ -337,6 +343,9 @@ enum class UserKeyStatus {
         return "error|value exceeds 1 MiB limit";
     case UserKeyStatus::value_malformed:
         return "error|value size too small for its declared type";
+    case UserKeyStatus::value_changed_during_read:
+        return "error|value changed while reading -- a concurrent writer kept growing it faster "
+              "than the bounded retry could keep up; retry the read";
     case UserKeyStatus::key_not_found:
     case UserKeyStatus::value_not_found:
         return "error|key or value not found in user hive";
@@ -344,10 +353,27 @@ enum class UserKeyStatus {
     return "error|key or value not found in user hive"; // unreachable — see -Wswitch note above
 }
 
+/// The honest-truncation DECISION, extracted pure (#2771 code-review P2-N3):
+/// "the record cap was reached" and "a record was actually dropped" are
+/// different facts (C-M3) -- a host with EXACTLY kMaxProfiles subkeys hits
+/// the former without the latter. Extracting the decision itself, rather
+/// than leaving it inline beside the real RegEnumKeyExW probe call, is what
+/// makes the boundary case (cap reached, probe finds nothing further) and
+/// the genuine-drop case (cap reached, probe finds a next entry)
+/// deterministically testable on every host -- a unit test cannot
+/// fabricate exactly kMaxProfiles real registry subkeys, but it can call
+/// this function with both bool combinations directly.
+[[nodiscard]] constexpr bool profile_list_actually_truncated(bool cap_reached,
+                                                              bool probe_found_more) {
+    return cap_reached && probe_found_more;
+}
+
 /// Renders the `profile_list_truncated` warning every ProfileList-walking
-/// consumer emits when enumerate_profile_records hits kMaxProfiles.
-/// Deduplicated (#2771 code-review Standards S6): registry.list_profiles and
-/// installed_apps.list_per_user previously carried byte-identical
+/// consumer emits when enumerate_profile_records' `truncated` out-param is
+/// true -- which means a record was actually dropped, confirmed by a probe,
+/// not merely that the cap was reached (see that function's doc comment,
+/// #2771 code-review C-M3). Deduplicated (Standards S6): registry.list_profiles
+/// and installed_apps.list_per_user previously carried byte-identical
 /// `std::format` calls independently.
 [[nodiscard]] inline std::string render_profile_list_truncated_warning(std::size_t max_profiles) {
     return std::format("warning|profile_list_truncated at {} entries", max_profiles);
