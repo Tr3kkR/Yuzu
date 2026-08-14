@@ -848,6 +848,12 @@ void maybe_flag_saml_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_
     if (!scim_store || resource.external_id.empty())
         return;
     auto saml_links = scim_store->saml_links_for_scim_id(resource.scim_id);
+    // NOTE: via the deprovision route this nullopt branch is currently unreachable —
+    // resolve_deprovision_principals reads saml_links_for_scim_id first and fails the
+    // request closed (500) before this D2 check runs. It is retained as defense-in-depth
+    // so a future reordering (or a caller that reaches D2 without that pre-read) still
+    // fails safe rather than firing a false-positive off an unconfirmed read. The
+    // saml_observation_matches nullopt-skip below IS route-reachable and is tested.
     if (!saml_links.has_value()) {
         spdlog::warn("ScimRoutes: SAML D2 — saml_links_for_scim_id lookup failed for "
                     "scim_id={} (store blip); skipping the unlinked-SAML tripwire check "

@@ -466,7 +466,7 @@ ScimStore::find_unique_active_by_external_id(const std::string& external_id) con
     // pre-existing caller.
     auto checked = find_unique_active_by_external_id_checked(external_id);
     if (checked.status == ActiveExternalIdLookupStatus::matched)
-        return checked.resource;
+        return std::move(checked.resource);
     return std::nullopt;
 }
 
@@ -1161,7 +1161,7 @@ bool ScimStore::observation_matches(const std::string& claim_value) const {
 bool ScimStore::record_saml_login_observation(const std::string& entity_id,
                                               const std::string& name_id,
                                               const std::string& name_id_format) {
-    if (!open_ || entity_id.empty() || name_id.empty() || name_id_format.empty())
+    if (!open_ || entity_id.empty() || name_id.empty())
         return false;
 
     auto lease = pool_.try_acquire_for(kWriteTimeout);

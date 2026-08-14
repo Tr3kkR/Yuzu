@@ -1934,6 +1934,96 @@ TEST_CASE("ScimRoutes: SAML D2 — a resource with ONE OIDC link and ZERO SAML l
     CHECK(f.metrics.counter("yuzu_scim_deprovision_saml_unlinked_total").value() == 1.0);
 }
 
+TEST_CASE("ScimRoutes: SAML D2 — a broken saml_identity_links table (saml_links_for_scim_id "
+         "cannot answer) makes maybe_flag_saml_d2_unlinked SKIP rather than risk a false "
+         "positive, mutation-checked",
+         "[pg][scim][routes][adr2001][d2][saml][failclosed]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "victor"}, {"externalId", "victor@example.com"}})
+            ->body);
+    auto id = created["id"].get<std::string>();
+
+    // Break ONLY saml_identity_links (the table maybe_flag_saml_d2_unlinked's
+    // saml_links_for_scim_id read targets). saml_login_observations stays
+    // intact, so if the code under test skipped the link read and jumped
+    // straight to the observation check it would find a match and (wrongly)
+    // fire the tripwire — a mutation this test is designed to catch.
+    //
+    // Note: `resolve_deprovision_principals` (deprovision_revoke.cpp) reads
+    // this SAME table via `saml_links_for_scim_id` and is itself fail-closed
+    // on its own nullopt — it 500s BEFORE `revoke_linked_credentials_or_fail`
+    // ever reaches `maybe_flag_saml_d2_unlinked` below it. There is no way
+    // to reach the D2 detector's own nullopt branch in isolation while this
+    // table is down; asserting the 500 (rather than the 200 the sibling D2
+    // tests above assert) is the correct, and only reachable, observation
+    // here — the counter must still never fire, in a total-degrade scenario
+    // exactly as it must in the isolated one.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(f.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult drop{
+            PQexec(conn.get(), "DROP TABLE scim_store.saml_identity_links")};
+        REQUIRE(drop.ok());
+    }
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 500); // resolve_deprovision_principals fails closed on the same table
+    // MUTATION-CHECK (task spec, adapted to the reachable path above): the
+    // SAML D2 counter must stay 0.0 whether the store degrade is caught by
+    // the earlier fail-closed resolver check or (were that check ever
+    // weakened/removed) by `maybe_flag_saml_d2_unlinked`'s own
+    // `!saml_links.has_value()` early-return — this test pins the observable
+    // outcome (never a spurious fire) regardless of which guard catches it.
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_saml_unlinked_total").value() == 0.0);
+}
+
+TEST_CASE("ScimRoutes: SAML D2 — a broken saml_login_observations table "
+         "(saml_observation_matches cannot answer) makes maybe_flag_saml_d2_unlinked SKIP "
+         "rather than risk a false positive, mutation-checked",
+         "[pg][scim][routes][adr2001][d2][saml][failclosed]") {
+    Fixture f;
+    auto created = json::parse(
+        f.post("/scim/v2/Users", {{"userName", "wendy"}, {"externalId", "wendy@example.com"}})
+            ->body);
+    auto id = created["id"].get<std::string>();
+    // Record the observation FIRST (the table must exist for this write to
+    // succeed) so that, absent the drop below, this scenario would
+    // otherwise be the ordinary D2-fires case — isolating this test to the
+    // observation-read failure specifically, not "no observation exists".
+    REQUIRE(f.scim_store->record_saml_login_observation(
+        "https://idp.example.com/saml/metadata", "wendy@example.com",
+        "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"));
+
+    // Break ONLY saml_login_observations (the table
+    // maybe_flag_saml_d2_unlinked's saml_observation_matches read targets).
+    // saml_identity_links stays intact — the link read above still
+    // succeeds engaged-empty, so the code under test reaches the
+    // observation check specifically.
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(f.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult drop{
+            PQexec(conn.get(), "DROP TABLE scim_store.saml_login_observations")};
+        REQUIRE(drop.ok());
+    }
+
+    json patch_body{{"Operations", json::array({{{"op", "replace"},
+                                                 {"value", {{"active", false}}}}})}};
+    auto res = f.patch("/scim/v2/Users/" + id, patch_body);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // MUTATION-CHECK (task spec): changing
+    // `if (!observed.has_value() || !*observed) return;` to
+    // `if (!*observed) return;` dereferences the disengaged `optional`
+    // here (the store-error nullopt from the dropped table) — UB/crash
+    // under this exact scenario instead of the correct skip (0.0).
+    CHECK(f.metrics.counter("yuzu_scim_deprovision_saml_unlinked_total").value() == 0.0);
+}
+
 TEST_CASE("ScimRoutes: revive-on-reprovision refuses an operator-elevated account — 404, and "
          "the remove_user() undo leaves the account INACTIVE, not reactivated-at-elevated-role "
          "(UP-N5/FIX-5, Gate-8 round-2)",

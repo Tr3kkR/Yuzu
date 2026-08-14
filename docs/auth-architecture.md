@@ -2180,6 +2180,39 @@ model forces a split OIDC's multi-candidate-claim model does not need:
   to give deprovision time a second candidate to check the way OIDC's `oid`
   gives D2 one).
 
+**Two further residuals (governance hardening round, UP-2/UP-3).**
+**UP-2 — the observation write is fail-open, like every other write on this
+path.** If `record_saml_login_observation` itself fails (a `ScimStore`
+blip during the login window), the login still proceeds and that login is
+simply never recorded, so a later deprovision's D2 tripwire cannot fire
+for it — the same shape as a missed link write. Not a security regression
+versus pre-#3072 (D2 is a detective control; deprovision-time revocation
+itself is unaffected), and it is itself surfaced: the observation write
+and the link write share `yuzu_scim_saml_link_write_failures_total`, so a
+sustained non-zero rate there is the honest signal that D2 coverage — not
+only linkage — is degraded for that window. **UP-3 — no GC, and the
+deprovision-time match is entity/format-agnostic.** `saml_login_observations`
+rows are never pruned, a deliberate choice mirroring `oidc_login_observations`:
+the table is a bounded upsert keyed on distinct identities, not one row
+per login event, and it is durable CC6.8 evidence rather than regenerable
+scratch data — the `ResultSetStore` pruning model does not apply here.
+Separately, `saml_observation_matches` matches on `name_id` **value
+alone** (`WHERE name_id = $1`, no `entity_id`/`name_id_format`
+predicate) — safe under the single-pinned-IdP precondition already stated
+for this addendum, but worth naming explicitly: `maybe_flag_saml_d2_unlinked`
+therefore fires on *any* recorded NameID-value match regardless of the
+Format it was observed under, which makes the tripwire slightly
+**broader** than "catches the unstable-Format-but-value-matches case"
+alone — an under-statement in the framing above, not a false guarantee,
+since the detector is strictly more protective than described (it would
+also, for example, catch a stable-Format value-match whose link write
+itself failed). A future multi-`entity_id` SAML deployment would need an
+`entity_id` predicate added to `saml_observation_matches` before this
+match stays safe, the same way constraint 5's forward caveat already
+requires for OIDC's issuer partitioning.
+`yuzu_scim_deprovision_saml_unlinked_total` remains a **review** signal,
+not a hard alarm with one root cause.
+
 New metrics: `yuzu_scim_saml_link_unmatched_total`,
 `yuzu_scim_saml_link_ambiguous_total`,
 `yuzu_scim_saml_link_lookup_failures_total`,

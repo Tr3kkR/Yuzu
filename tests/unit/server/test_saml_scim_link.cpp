@@ -177,7 +177,9 @@ TEST_CASE("link_saml_login_to_scim: a transient NameID Format forms NO link — 
     REQUIRE(session.has_value());
 }
 
-TEST_CASE("link_saml_login_to_scim: a missing/empty NameID Format forms NO link",
+TEST_CASE("link_saml_login_to_scim: a missing/empty NameID Format forms NO link, BUT the "
+          "observation IS recorded (Gate 7 fix — a common, legitimate IdP config must not "
+          "be dropped from the D2 detector) and does not bump the write-failure counter",
           "[pg][saml][scim][2001][failclosed]") {
     YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -188,13 +190,83 @@ TEST_CASE("link_saml_login_to_scim: a missing/empty NameID Format forms NO link"
     auto resource = store.create_resource("dave", "dave@example.com");
     REQUIRE(resource.has_value());
 
+    MetricsRegistry metrics;
+    const double before = metrics.counter("yuzu_scim_saml_link_write_failures_total").value();
+
     auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
-                                           "dave@example.com", /*name_id_format=*/"");
+                                           "dave@example.com", /*name_id_format=*/"", &metrics);
     CHECK(outcome == SamlScimLinkOutcome::not_linkable);
 
     auto links = store.saml_links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
     CHECK(links->empty());
+
+    // MUTATION-CHECK (task spec): restoring the
+    // `name_id_format.empty()` guard in
+    // `ScimStore::record_saml_login_observation` makes this assertion fail
+    // — an empty-format login (a common, legitimate IdP omitting the
+    // NameID Format attribute) would then record NOTHING, defeating the D2
+    // detector for that population.
+    auto observed = store.saml_observation_matches("dave@example.com");
+    REQUIRE(observed.has_value());
+    CHECK(*observed);
+
+    // The empty-format case is an ordinary, successfully-recorded
+    // observation — it must never be conflated with a genuine store
+    // write failure.
+    const double after = metrics.counter("yuzu_scim_saml_link_write_failures_total").value();
+    CHECK(after == before);
+}
+
+TEST_CASE("link_saml_login_to_scim: an oversized/control-byte NameID Format is normalized to "
+          "\"\" before it reaches the store — bounded, and the login/observation still "
+          "proceed",
+          "[pg][saml][scim][2001][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto resource = store.create_resource("heidi", "heidi@example.com");
+    REQUIRE(resource.has_value());
+
+    // Two malformed shapes: over the 255-byte cap, and control bytes.
+    const std::string oversized_format(300, 'x');
+    const std::string control_byte_format = "urn:oasis:names:tc:SAML:2.0:nameid-format:\x01x";
+
+    auto outcome1 = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                            "heidi@example.com", oversized_format);
+    CHECK(outcome1 == SamlScimLinkOutcome::not_linkable);
+
+    auto outcome2 = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                            "heidi@example.com", control_byte_format);
+    CHECK(outcome2 == SamlScimLinkOutcome::not_linkable);
+
+    // The login proceeds (no deny) regardless — mirrors every other
+    // non-linkable-format case.
+    auto links = store.saml_links_for_scim_id(resource->scim_id);
+    REQUIRE(links.has_value());
+    CHECK(links->empty());
+
+    // The observation was still recorded (bounded, not dropped).
+    auto observed = store.saml_observation_matches("heidi@example.com");
+    REQUIRE(observed.has_value());
+    CHECK(*observed);
+
+    // Raw-SQL peek: the stored row's format is the normalized "" — bounded
+    // even though two malformed formats were presented (both collapse to
+    // the same normalized row under the (entity_id, name_id, name_id_format)
+    // upsert key).
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult res = yuzu::server::pg::exec_params(
+        conn.get(),
+        "SELECT name_id_format FROM scim_store.saml_login_observations WHERE name_id = $1",
+        std::vector<std::string>{"heidi@example.com"});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 0)).empty());
 }
 
 TEST_CASE("link_saml_login_to_scim: zero matches forms no link", "[pg][saml][scim][2001]") {

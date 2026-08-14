@@ -549,7 +549,14 @@ public:
     /// Idempotent upsert keyed `(entity_id, name_id, name_id_format)` — one
     /// observation per distinct NameID+format pair, refreshed (`seen_at`) on
     /// every login. Returns false on db failure or an empty
-    /// `entity_id`/`name_id`/`name_id_format`.
+    /// `entity_id`/`name_id`. An IdP that omits the NameID Format attribute
+    /// is a common, legitimate configuration — `name_id_format` MAY be
+    /// empty and is recorded as `""` (the column is NOT NULL; an empty
+    /// string is a valid, distinct key component), so that population is
+    /// never silently dropped from the D2 detector. The caller
+    /// (`link_saml_login_to_scim`) is responsible for bounding/normalizing
+    /// an oversized or malformed `name_id_format` before it reaches here —
+    /// this method itself does not cap it.
     bool record_saml_login_observation(const std::string& entity_id, const std::string& name_id,
                                        const std::string& name_id_format);
 

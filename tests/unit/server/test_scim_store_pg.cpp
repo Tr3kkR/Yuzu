@@ -1134,10 +1134,16 @@ TEST_CASE("ScimStore: saml_login_observations upsert-on-relogin + distinct rows 
     const std::string entity = "https://saml-idp.example.com/metadata";
     const std::string name_id = "alice@example.com";
 
-    SECTION("record_saml_login_observation rejects empty entity_id/name_id/name_id_format") {
+    SECTION("record_saml_login_observation rejects empty entity_id/name_id, but NOT an empty "
+            "name_id_format (Gate 7 fix: a missing NameID Format attribute is a common, "
+            "legitimate IdP configuration and must still be recorded — see the .hpp doc "
+            "comment)") {
         CHECK_FALSE(store.record_saml_login_observation("", name_id, "persistent"));
         CHECK_FALSE(store.record_saml_login_observation(entity, "", "persistent"));
-        CHECK_FALSE(store.record_saml_login_observation(entity, name_id, ""));
+        // MUTATION-CHECK (task spec): restoring `name_id_format.empty()` to
+        // the guard makes this assertion fail (the write is rejected
+        // instead of recorded as "").
+        CHECK(store.record_saml_login_observation(entity, name_id, ""));
     }
 
     SECTION("re-login upserts (refreshes seen_at) the SAME (entity_id,name_id,format) row") {

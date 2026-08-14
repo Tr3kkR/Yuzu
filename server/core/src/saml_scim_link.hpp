@@ -115,7 +115,16 @@ enum class SamlScimLinkOutcome {
 /// before the NameID-Format-linkable gate — so even an unstable-format
 /// login is observed (needed for the SAML D2 detector,
 /// `scim_routes.cpp`'s `maybe_flag_saml_d2_unlinked`). The NameID itself is
-/// never normalized here — only observed as-is.
+/// never normalized here — only observed as-is. `name_id_format`, unlike
+/// the NameID, IS bounded before it is recorded (Gate 7 fix): a value
+/// exceeding 255 bytes or containing a control byte (<0x20 or ==0x7F)
+/// collapses to `""` ("format unspecified") rather than being stored
+/// as-is — defense-in-depth against a hostile/misconfigured pinned IdP
+/// growing the observations table's index unbounded. A missing/empty
+/// Format is a normal, legitimate IdP configuration and is recorded as
+/// `""` either way — it is never treated as a reason to skip the
+/// observation write (see `ScimStore::record_saml_login_observation`'s own
+/// doc comment).
 ///
 /// `metrics` may be null (test/CLI contexts) — bumps
 /// `yuzu_scim_saml_link_write_failures_total` on an `upsert_saml_link`

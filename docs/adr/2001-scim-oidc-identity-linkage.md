@@ -401,6 +401,59 @@ SAML failure shapes, not the same shape observed twice:
   not attempt it, to avoid fabricating CC6.8 evidence from a
   single-candidate join key).
 
+**Two further residuals, stated honestly (governance hardening round,
+UP-2/UP-3):**
+
+- **UP-2 (fail-open observation write).** `record_saml_login_observation`'s
+  write is called unconditionally but is itself fail-open, matching every
+  other write on this login path: if the `ScimStore` write fails (a store
+  blip during the login window), the login proceeds anyway and that
+  specific login is simply never recorded — so a later deprovision's D2
+  tripwire cannot fire for it, the identical shape as a missed
+  `identity_links`/`saml_identity_links` write. This is **not** a security
+  regression relative to pre-#3072: before this change there was no signal
+  for this population at all, and D2 is a detective control, not a
+  preventive one — deprovision-time revocation itself (§3/PR4a) is
+  unaffected by an observation-write failure. The only externally visible
+  effect is a blind spot in detection coverage, and it is itself surfaced:
+  both the observation write and the link write share
+  `yuzu_scim_saml_link_write_failures_total` (`bump_link_write_failure`,
+  `saml_scim_link.cpp`), so a sustained non-zero rate on that counter is
+  the honest signal that D2 coverage — not just linkage — is degraded for
+  logins in that window.
+- **UP-3 (no-GC + entity/format-agnostic match).** `saml_login_observations`
+  rows are never pruned — a deliberate choice, not an oversight, following
+  the same reasoning `oidc_login_observations` already applies and the
+  routed clock-guarded-retention rule's "decide deliberately and record
+  why": the table is a bounded upsert keyed on distinct
+  `(entity_id, name_id, name_id_format)` identities (one row per identity
+  ever observed, not one row per login event), and it exists to be durable
+  CC6.8 evidence, not regenerable scratch data — `ResultSetStore`'s
+  reasoning for pruning does not transfer here any more than it transfers
+  to `oidc_login_observations`. Separately, `ScimStore::
+  saml_observation_matches` matches on the `name_id` **value alone** —
+  `WHERE name_id = $1`, with no `entity_id` or `name_id_format` predicate.
+  This is safe under the single-pinned-IdP precondition already stated
+  above (constraint 5 / item 6): with exactly one trusted `entity_id` in
+  play, a name_id-value match cannot cross an IdP boundary. It is also,
+  necessarily, **format-agnostic** — a consequence worth being explicit
+  about: `maybe_flag_saml_d2_unlinked` therefore fires on *any* recorded
+  NameID-value match for the deprovisioned resource's `externalId`,
+  regardless of the Format under which it was observed, which makes it
+  slightly **broader** than "catches the unstable-Format-but-value-matches
+  case" alone (the framing used above and in `docs/auth-architecture.md`)
+  — it would, for instance, also catch a stable-Format value-match whose
+  *link write itself* failed (UP-2/`link_write_error`), a case the
+  login-time signals do not separately name. This is an under-statement in
+  the existing framing, not a false guarantee: the tripwire is strictly
+  more protective than described, never less. A future multi-IdP OIDC-side
+  change already requires partitioning by issuer per constraint 5's forward
+  caveat; an eventual multi-`entity_id` SAML change would need the same
+  discipline applied to `saml_observation_matches` before this
+  format-agnostic match stays safe under more than one pinned IdP.
+  `yuzu_scim_deprovision_saml_unlinked_total` remains a **review** signal
+  for a human to investigate, not a hard alarm with a single root cause.
+
 Full description (table schema, all four call sites, the audit-verb detail
 shapes, the metric descriptions): `docs/auth-architecture.md` "SAML D2
 observability (#3072)".

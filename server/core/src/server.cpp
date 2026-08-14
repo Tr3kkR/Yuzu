@@ -2133,11 +2133,11 @@ public:
         // the first incident, which is exactly the wrong moment for an
         // alert rule to discover the series does not exist yet).
         metrics_.describe("yuzu_scim_saml_link_write_failures_total",
-                          "Total ADR-2001 PR4a SAML identity-link writes that failed during "
-                          "SAML login (ScimStore outage) — the login itself always succeeds "
-                          "(fail-OPEN by design), but a sustained non-zero rate means SAML "
-                          "identities are silently not being linked and won't be revoked on "
-                          "deprovision",
+                          "Total ADR-2001 PR4a SAML identity-link/login-observation writes that "
+                          "failed during SAML login (ScimStore outage) — the login itself "
+                          "always succeeds (fail-OPEN by design), but a sustained non-zero rate "
+                          "means SAML identities are silently not being linked and won't be "
+                          "revoked on deprovision",
                           "counter");
         // ADR-2001 #3072 — SAML D2 observability, caller/signal layer. Four
         // new counters mirroring the OIDC D2 shape above, split per-protocol
