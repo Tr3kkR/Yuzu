@@ -1250,6 +1250,14 @@ boot:
   an already-set completion marker. A "HOLDER-SIDE VERIFICATION FAILED" log line means
   two replicas each hold `quarantine.db` files with genuinely different content — do
   not force-boot around it; an operator needs to decide which is authoritative first.
+  Two narrower variants of the same "don't trust the marker blindly" check also
+  refuse and require manual reconciliation: a marker set with **no** recorded
+  fingerprint at all (predates this mechanism) while this replica still holds real
+  legacy content, and a marker set **sourceless** (no replica has ever migrated real
+  content for this fleet yet) while this replica holds real content — in the second
+  case, refusing matters because a live `quarantine_device`/`release_device` call
+  could already have landed against the sourceless-stamped store, and blindly
+  migrating stale legacy content on top would silently clobber it.
 - **A 0-byte `quarantine.db` is refused, not treated as a fresh install** — same
   rationale as `discovery.db` above (SQLite opens a 0-byte file as a valid empty
   database, indistinguishable from "never used" without an explicit check, but a
@@ -1259,11 +1267,33 @@ boot:
   manual DB surgery) fails the backfill closed with a log line naming the offending
   `agent_id` and value, rather than silently inserting an unrecognised state or
   silently dropping the row.
+- **More than one `active` record for the same agent in the legacy file also
+  refuses the boot.** The legacy SQLite schema never enforced "at most one active
+  record per agent" at the database level (only an in-process mutex the server no
+  longer runs did), so a legacy file could in principle hold a duplicate from
+  pre-existing data corruption or a hand-edited file. The backfill checks for this
+  before touching Postgres and names the offending `agent_id`, rather than aborting
+  mid-transaction on a raw database constraint-violation error.
+- **More than 500,000 legacy records refuses the boot** as a sanity/DoS cap on a
+  single backfill transaction — quarantine records are a manually-curated security
+  list, so this is not expected to bind in practice; contact platform engineering
+  before raising it if it does.
 - **Legacy file moved aside after a verified backfill.** Once the backfill is
   confirmed complete, `quarantine.db` is renamed to
-  `quarantine.db.migrated-<epoch>` (the server never reads it again). Keep the
-  renamed file until you have confirmed quarantine history looks correct, then
-  dispose of it per your data-retention policy.
+  `quarantine.db.migrated-<epoch>` (the server never reads it again). If the rename
+  itself fails (e.g. a permissions issue), this is logged as a warning and does
+  **not** block boot — the file is safe to archive or remove manually, and every
+  later boot re-verifies it by fingerprint before trusting the already-set marker,
+  so a lingering un-renamed file is never silently re-migrated. Keep the renamed
+  file (or the un-renamed original) until you have confirmed quarantine history
+  looks correct, then dispose of it per your data-retention policy.
+- **A same-boot race between two replicas migrating for the first time is
+  serialized, not refused.** If two replicas reach the backfill within the same
+  narrow window, one waits on the other under an internal database lock (bounded by
+  the same timeout as the backfill transaction itself) rather than both attempting
+  the insert; the loser then re-verifies by fingerprint as described above. This is
+  expected, self-resolving behavior on a fresh multi-replica rollout and does not
+  need operator action.
 
 **Operator-visible behaviour change (fail-closed reads).** `GET /api/v1/quarantine`
 now returns **503** on a degraded read (store not open, pool-acquire timeout, or query

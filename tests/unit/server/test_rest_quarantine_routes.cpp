@@ -23,6 +23,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -70,6 +71,12 @@ struct QuarantineRouteHarness {
     // decisions -- the single `scope_allow` bool can't express that. Checked
     // before falling back to `scope_allow`.
     std::unordered_map<std::string, bool> scope_allow_for;
+    // Per-agent DEGRADE simulation (gov Gate 2 security-guardian): a real
+    // require_scoped_permission returns false with res.status==503 on an
+    // RBAC/tag-store outage (engine-principal / service-scoped-token
+    // branches, auth_routes.cpp) -- distinct from a 403 denial. Checked
+    // before scope_allow_for/scope_allow.
+    std::unordered_set<std::string> scope_degrade_for;
     std::vector<AuditCall> audit_calls;
 
     explicit QuarantineRouteHarness(pg::PgPool& pool, bool wire_scope = true)
@@ -107,6 +114,10 @@ struct QuarantineRouteHarness {
                                const std::string& agent_id) -> bool {
                 scope_fn_called = true;
                 scoped_target = agent_id;
+                if (scope_degrade_for.count(agent_id)) {
+                    res.status = 503;
+                    return false;
+                }
                 auto it = scope_allow_for.find(agent_id);
                 bool allow = it != scope_allow_for.end() ? it->second : scope_allow;
                 if (allow)
@@ -283,6 +294,28 @@ TEST_CASE("REST GET /api/v1/quarantine admits-then-filters per record (gov-fix/c
         REQUIRE(res);
         CHECK(res->status == 500);
         CHECK(res->body.find("agent-visible") == std::string::npos);
+    }
+    // gov Gate 2 (security-guardian): a per-record scope-gate DEGRADE
+    // (require_scoped_permission genuinely returns false with status==503 on
+    // an RBAC/tag-store outage, distinct from a 403 denial) must fail the
+    // WHOLE list closed, not be silently filtered like a denial -- that
+    // would render a degraded per-record authz check as "not quarantined"
+    // for that record, the same fail-open class the store-layer nullopt
+    // check exists to close, one layer up.
+    SECTION("a per-record scope-gate DEGRADE (503) fails the whole list closed, never a "
+            "silently-filtered partial list") {
+        QuarantineRouteHarness h(qpool);
+        REQUIRE(h.quarantine_store.quarantine_device("agent-visible", "seed", "r1", ""));
+        REQUIRE(h.quarantine_store.quarantine_device("agent-degraded", "seed", "r2", ""));
+        h.scope_allow_for["agent-visible"] = true;
+        h.scope_degrade_for.insert("agent-degraded");
+        auto res = h.get();
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        // Neither record is rendered -- not a partial list that silently
+        // dropped only the degraded one.
+        CHECK(res->body.find("agent-visible") == std::string::npos);
+        CHECK(res->body.find("agent-degraded") == std::string::npos);
     }
     SECTION("no session is refused before any store work") {
         QuarantineRouteHarness h(qpool);

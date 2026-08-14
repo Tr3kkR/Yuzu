@@ -521,3 +521,31 @@ TEST_CASE("QuarantineStore: backfill refuses an unrecognised legacy status value
                           "'backfill_complete'") == "0");
     CHECK(std::filesystem::exists(legacy.path)); // left in place for the operator
 }
+
+// gov Gate 2 (security-guardian): the legacy SQLite schema never enforced "at
+// most one active record per agent" at the database level (only the
+// in-process mutex this migration retires did), so a legacy file could hold
+// a duplicate from pre-existing corruption or a hand-edited file. Without a
+// pre-check this would abort mid-transaction on a raw Postgres unique-
+// constraint-violation error instead of a named, actionable log line.
+TEST_CASE("QuarantineStore: backfill refuses a legacy file with two active records for the "
+          "same agent",
+          "[pg][quarantine][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, quarantine_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    QuarantineStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::test::TempDbFile legacy{"yuzu_test_quarantine_dupactive_"};
+    std::filesystem::remove(legacy.path);
+    make_legacy_quarantine_db(
+        legacy.path,
+        {LegacyRow{"agent-dup", "active", "admin", "", "First", 1000, 0},
+         LegacyRow{"agent-dup", "active", "security-team", "10.0.0.1", "Second", 2000, 0}});
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM quarantine_store.quarantine_records") == "0");
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM quarantine_store.quarantine_meta WHERE key = "
+                          "'backfill_complete'") == "0");
+    CHECK(std::filesystem::exists(legacy.path)); // left in place for the operator
+}

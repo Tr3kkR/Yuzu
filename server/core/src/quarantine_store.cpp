@@ -24,6 +24,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server {
@@ -306,10 +307,33 @@ BackfillOutcome commit_backfill(pg::PgPool& pool, const std::vector<LRecord>& ro
                                 std::string_view fingerprint) {
     BackfillOutcome out;
     out.ok = pool.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
+        // gov-fix(security-guardian): the pool's connection-level lock_timeout
+        // GUC (default 10s, ADR-0012) is far shorter than kBackfillTxnTimeout —
+        // a replica losing the first-ever-migration race would otherwise abort
+        // its wait for kBackfillLockSql (and thus refuse to boot) whenever the
+        // WINNER's own row-insert loop simply takes longer than 10s, even
+        // though the winner's transaction is itself correctly bounded by
+        // kBackfillTxnTimeout. Widen the LOCAL lock wait to match, so a loser
+        // only fails if the winner is genuinely wedged past its own bound, not
+        // merely slower than the pool's generic connection default.
+        pg::PgResult lt = pg::exec_params(
+            c,
+            ("SET LOCAL lock_timeout = '" + std::to_string(kBackfillTxnTimeout.count()) + "ms'")
+                .c_str(),
+            std::vector<std::string>{});
+        if (lt.status() != PGRES_COMMAND_OK) {
+            spdlog::error("QuarantineStore: migrate_from_sqlite: backfill lock_timeout set "
+                         "failed: {}",
+                         PQerrorMessage(c));
+            return false;
+        }
+
         pg::PgResult lk = pg::exec_params(c, kBackfillLockSql, std::vector<std::string>{});
         if (lk.status() != PGRES_TUPLES_OK) {
-            spdlog::error("QuarantineStore: migrate_from_sqlite: backfill lock failed: {}",
-                          PQerrorMessage(c));
+            spdlog::error("QuarantineStore: migrate_from_sqlite: backfill lock failed (retryable "
+                         "on next boot if this was a same-boot race against another replica): "
+                         "{}",
+                         PQerrorMessage(c));
             return false;
         }
 
@@ -892,6 +916,35 @@ bool QuarantineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
                     sanitize_pg_text(r.status));
                 backfill_metric("failed");
                 return false;
+            }
+        }
+
+        // gov-fix(security-guardian): the legacy SQLite schema had no DB-level
+        // uniqueness on (agent_id, 'active') — only the in-process mutex this
+        // migration retires — so a legacy file COULD hold more than one active
+        // row for the same agent (a bug in the pre-migration app, or manual
+        // edits). Left unchecked, that row would reach commit_backfill's INSERT
+        // loop and abort mid-transaction on a raw
+        // "duplicate key value violates unique constraint" error instead of a
+        // named, actionable log line. Catch it here, before any row reaches
+        // Postgres, matching the status-value check above.
+        {
+            std::unordered_set<std::string> seen_active;
+            for (const auto& r : snap) {
+                if (r.status != "active")
+                    continue;
+                if (!seen_active.insert(r.agent_id).second) {
+                    spdlog::error(
+                        "QuarantineStore: migrate_from_sqlite: legacy db {} has more than one "
+                        "'active' record for agent_id='{}' — the legacy SQLite schema never "
+                        "enforced this uniqueness (an in-process mutex did, not the database), "
+                        "so this can only be pre-existing data corruption or a hand-edited "
+                        "file. Refusing backfill (fail-closed); release/repair the duplicate "
+                        "legacy row(s) before retrying.",
+                        legacy_db_path.string(), sanitize_pg_text(r.agent_id));
+                    backfill_metric("failed");
+                    return false;
+                }
             }
         }
 

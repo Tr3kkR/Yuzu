@@ -4197,8 +4197,25 @@ void RestApiV1::register_routes(
             int64_t visible = 0;
             for (const auto& r : *records) {
                 httplib::Response probe; // throwaway: per-record admit probe, never sent
-                if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id))
+                if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id)) {
+                    // gov-fix(security-guardian): a per-record 503 (RBAC/tag-store
+                    // degraded — require_scoped_permission's engine-principal and
+                    // service-scoped-token branches genuinely return this, distinct
+                    // from a 403 denial) is NOT a denial and must not be silently
+                    // filtered out — that would render a degraded authz check as
+                    // "not quarantined", the exact fail-open the store-layer nullopt
+                    // check above exists to close, just one layer up. Fail the WHOLE
+                    // list closed rather than return a list that omitted an unknown
+                    // number of records for a reason other than scope.
+                    if (probe.status == 503) {
+                        res.status = 503;
+                        res.set_content(
+                            detail::a4_error(res, "authorization check unavailable — try again"),
+                            "application/json");
+                        return;
+                    }
                     continue;
+                }
                 arr.add(JObj()
                             .add("agent_id", r.agent_id)
                             .add("status", r.status)
@@ -4258,6 +4275,11 @@ void RestApiV1::register_routes(
         if (!result) {
             res.status = is_quarantine_db_error(result.error()) ? 503 : 400;
             res.set_content(detail::a4_error(res, result.error()), "application/json");
+            // gov-fix(security-guardian): the MCP quarantine_device twin
+            // already audits this branch (mcp_audit("failure", ...)) — REST
+            // was silently skipping it, the only quarantine failure path with
+            // no audit row.
+            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id, result.error());
             return;
         }
         audit_fn(req, "quarantine.enable", "success", "Security", agent_id, reason);
@@ -4297,6 +4319,8 @@ void RestApiV1::register_routes(
             if (!result) {
                 res.status = is_quarantine_db_error(result.error()) ? 503 : 400;
                 res.set_content(detail::a4_error(res, result.error()), "application/json");
+                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
+                         result.error());
                 return;
             }
             audit_fn(req, "quarantine.disable", "success", "Security", agent_id, "");

@@ -79,6 +79,18 @@ quarantined" — both masked an ACTIVE containment. `GET /api/v1/quarantine`
 (`rest_api_v1.cpp`) now checks for `nullopt` and returns 503 rather than rendering an empty
 quarantine list.
 
+**The store-layer fix alone was incomplete — the SAME hazard existed one layer up (gov Gate 2
+security-guardian, hardening round).** `GET /api/v1/quarantine`'s per-record admit-then-filter
+loop (`scoped_perm_fn(req, probe, "Security", "Read", r.agent_id)`, pre-existing from #1788/
+CDX-P1-02, untouched by this migration's first commit) calls `continue` on any `false` return —
+but `require_scoped_permission` genuinely returns `false` with `probe.status == 503` (not `403`)
+on an RBAC-store or tag-store degrade (its engine-principal and service-scoped-token branches,
+`auth_routes.cpp`), distinct from a real per-device denial. The loop was treating a degraded
+per-record authorization check identically to a denial — silently omitting the record rather
+than failing the whole list closed, which is the exact fail-open this section's store-layer fix
+exists to close, just moved one layer up. Fixed: a `probe.status == 503` inside the loop now
+fails the WHOLE response 503 rather than continuing to filter.
+
 ### Race-safe writes (no in-process mutex)
 
 **Neither mutator trusts a bare `PGRES_COMMAND_OK`/`PGRES_TUPLES_OK` status to mean its `WHERE`
@@ -123,6 +135,13 @@ failure on `quarantine_device`/`release_device` is prefixed `"db_error: "`; a bu
 finding on that store (2026-08-12) that its write routes previously collapsed every failure,
 including genuine outages, to `400`. Applied here from the start rather than shipping the same
 defect class and fixing it in a later round.
+
+**Every failure branch audits (gov Gate 2 security-guardian, hardening round).** The MCP
+`quarantine_device` twin already audited its store-error branch (`mcp_audit("failure", ...)`);
+the REST `POST`/`DELETE` routes' equivalent branches did not — the only quarantine failure path
+with no audit row. Both now call `audit_fn(req, "quarantine.enable"/"quarantine.disable",
+"failure", "Security", agent_id, result.error())` on the post-gate store/business failure branch,
+matching the MCP twin and the existing scope-gate-unwired branch's own audit call.
 
 ### Backfill (ADR-0009) — MANDATORY, fingerprint-verified, single-transaction
 
@@ -172,6 +191,22 @@ required by that clause:
   dropped) — the CHECK constraint would also reject it, but validating up front produces a
   clear, actionable log line naming the offending row instead of a generic constraint-violation
   error surfacing from mid-transaction.
+- **Duplicate `active` rows for the same agent are ALSO validated before any row reaches Postgres
+  (gov Gate 2 security-guardian, hardening round).** The legacy SQLite schema never enforced "at
+  most one active record per agent" at the database level — only the in-process mutex this
+  migration retires did — so a legacy file could in principle hold two. Without this check, such
+  a row would reach `commit_backfill`'s plain `INSERT` loop and abort mid-transaction on a raw
+  `duplicate key value violates unique constraint "idx_quarantine_agent_active"` error instead of
+  a named, actionable log line naming the `agent_id`.
+- **The backfill advisory lock's wait is explicitly widened to `kBackfillTxnTimeout` (gov Gate 2
+  security-guardian, hardening round).** The pool's connection-level `lock_timeout` GUC defaults
+  to 10s (ADR-0012) — far shorter than the backfill transaction's own bound. Without an explicit
+  `SET LOCAL lock_timeout` matching `kBackfillTxnTimeout`, a replica losing the first-ever-
+  migration race would abort its wait for `kBackfillLockSql` (and thus refuse to boot) whenever
+  the WINNER's own row-insert loop simply took longer than 10s — even though the winner's
+  transaction is itself correctly bounded by `kBackfillTxnTimeout`. This is a narrow, self-
+  healing-on-restart race (documented in `upgrading.md`), but the fix removes an unnecessary
+  boot failure for a legitimately-slow (not wedged) winner.
 - **No IDENTITY/LIFECYCLE column-conflict partition (unlike `DeploymentStore`/#3062).** That
   partition exists to resolve a real row *already present in Postgres* (from a prior backfill or
   live traffic) disagreeing with the legacy row trying to land on top of it via `ON CONFLICT DO
