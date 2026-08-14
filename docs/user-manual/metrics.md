@@ -1196,6 +1196,12 @@ PostgreSQL store (authoritative posture).
 | `yuzu_server_custom_properties_read_degrade_total{reason}` | counter | A `props.<key>` scope-feeding read (the bulk `get_values_for_keys` preload `AgentRegistry::evaluate_scope` uses, or a direct property read) degraded instead of returning a result. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection available in time — correlates with `yuzu_pg_acquire_*` saturation), `query_error` (the query failed). **A non-zero rate means a `props.<key>`-scoped dispatch/policy/push rule is aborting scope evaluation** — every caller collapses that abort to "zero targets matched," so this is NOT the same as "operators removed the properties." |
 | `yuzu_server_custom_properties_backfill_total{result}` | counter | Outcome of the one-time SQLite→Postgres backfill at boot (ADR-0045). `result` ∈ `success` (legacy `custom-properties.db` found and backfilled, then moved aside), `fresh` (no legacy DB — a clean install, nothing to migrate), `failed` (backfill could not complete — write error, unreadable legacy file, or a holder-side fingerprint-verification refusal on a multi-replica boot with divergent legacy content; the server **fails closed at boot** and retries on next start). Emitted once per boot; a `failed` sample is the signal that the server refused to come up. |
 
+## Notification store metrics (dashboard feed, ADR-0046)
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_notification_backfill_total{result}` | counter | Outcome of the one-time legacy `notifications.db` → PostgreSQL backfill, emitted on **every** boot (not just first boot — unlike the sibling stores' *three-way* fresh/completed/failed split, this store's backfill is a single transaction with no separate fresh/completed outcome, so "fresh install" and "already-migrated skip" both collapse into `result="success"`, and the wrapper always emits it). `result` ∈ `success` (fresh install, an already-migrated skip, or a completed migration), `failed` (backfill could not complete — the server **fails the boot closed** and retries on the next start). |
+
 **Useful PromQL queries:**
 
 ```promql
@@ -1205,6 +1211,9 @@ sum(rate(yuzu_server_custom_properties_read_degrade_total[5m])) by (reason) > 0
 
 # One-time custom-properties backfill failed → server refused to boot (ADR-0045).
 sum(rate(yuzu_server_custom_properties_backfill_total{result="failed"}[15m])) > 0
+
+# One-time notification backfill failed → server refused to boot (ADR-0046).
+sum(rate(yuzu_server_notification_backfill_total{result="failed"}[15m])) > 0
 ```
 
 ## RBAC store metrics (authorization substrate, ADR-0041)
