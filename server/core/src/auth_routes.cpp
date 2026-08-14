@@ -13,6 +13,7 @@
 #include <string_view>
 
 #include "authz_topology_floor.hpp"
+#include "deprovision_deny_split.hpp" // record_deprovision_deny_split — ADR-2001 #3069 shared split
 #include "engine_principal_store.hpp"
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
@@ -2481,6 +2482,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "user", "User", username, deny_detail);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+                // #3069 split: the total above conflates a genuine
+                // deprovision deny with a store-unavailable fail-closed
+                // deny, which lets a Postgres outage inflate the counter
+                // operators alert on. `decision.scim_id` is the SAME
+                // predicate the audit `reason=` string above already
+                // switches on — absent means the store couldn't be asked
+                // (`scim_store_unavailable`), never a genuine deny.
+                record_deprovision_deny_split(
+                    m, "yuzu_auth_oidc_deprovisioned_denied_genuine_total",
+                    "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
+                    decision.scim_id.has_value());
                 // Also bump the established general OIDC login counter so
                 // dashboards keyed on it don't undercount during a deny
                 // episode — every other /auth/callback failure path bumps
@@ -2738,6 +2750,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "user", "User", username, recheck_detail);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+                // #3069 split — see the primary check above; same
+                // `decision.scim_id` predicate the recheck's `reason=`
+                // string already switches on.
+                record_deprovision_deny_split(
+                    m, "yuzu_auth_oidc_deprovisioned_denied_genuine_total",
+                    "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
+                    decision.scim_id.has_value());
                 // Also bump the established general OIDC login counter — see
                 // the primary check above.
                 m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
@@ -3068,6 +3087,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                         deny_detail);
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+                    // #3069 split: same predicate the audit `reason=`
+                    // string above already switches on — see the OIDC
+                    // primary check for the full rationale.
+                    record_deprovision_deny_split(
+                        m, "yuzu_auth_saml_deprovisioned_denied_genuine_total",
+                        "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
+                        decision.scim_id.has_value());
                     // Also bump the established general SAML login counter
                     // so dashboards keyed on it don't undercount during a
                     // deny episode — every other /saml/acs failure path
@@ -3084,9 +3110,56 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // minting the session. Fail-OPEN: never fails this login. No
             // AuthManager::mu_ is held across this ScimStore call (mint
             // happens next, after this returns).
-            saml::link_saml_login_to_scim(scim_store_, saml_entity_id, saml_name_id,
-                                          result.value().name_id_format,
-                                          auth_mgr_.metrics_registry());
+            //
+            // ADR-2001 #3072 — the typed outcome drives per-outcome
+            // observability ONLY; every branch below still falls through to
+            // create_saml_session — this is OBSERVE-AND-PROCEED, never a
+            // deny (the PR4b deny-at-login backstop above is the only
+            // SAML-side path that can refuse the login). `linked`/
+            // `not_linkable`/`link_write_error` keep the pre-#3072 behaviour
+            // (no new login-time audit row; `link_write_error` still bumps
+            // the existing yuzu_scim_saml_link_write_failures_total inside
+            // link_saml_login_to_scim itself).
+            auto link_outcome =
+                saml::link_saml_login_to_scim(scim_store_, saml_entity_id, saml_name_id,
+                                              result.value().name_id_format,
+                                              auth_mgr_.metrics_registry());
+            switch (link_outcome) {
+            case saml::SamlScimLinkOutcome::no_active_match:
+                audit_log_for_principal(
+                    req, "auth.saml.link_unmatched", "failure", saml_principal, "user", "User",
+                    saml_principal,
+                    "reason=no_active_external_id_match;name_id_format=" +
+                        detail::sanitize_detail_value(result.value().name_id_format));
+                if (auto* m = auth_mgr_.metrics_registry())
+                    m->counter("yuzu_scim_saml_link_unmatched_total").increment();
+                break;
+            case saml::SamlScimLinkOutcome::ambiguous_match:
+                // A SEPARATE counter from the plain-unmatched case above —
+                // an ambiguous externalId (more than one active SCIM
+                // resource sharing it) is a distinct, more actionable
+                // misconfiguration than ordinary IdP/SCIM drift and must
+                // stay distinguishable in metrics (task spec).
+                audit_log_for_principal(
+                    req, "auth.saml.link_unmatched", "failure", saml_principal, "user", "User",
+                    saml_principal,
+                    "reason=ambiguous_active_external_id_match;name_id_format=" +
+                        detail::sanitize_detail_value(result.value().name_id_format));
+                if (auto* m = auth_mgr_.metrics_registry())
+                    m->counter("yuzu_scim_saml_link_ambiguous_total").increment();
+                break;
+            case saml::SamlScimLinkOutcome::lookup_store_error:
+                audit_log_for_principal(req, "auth.saml.link_lookup_failed", "failure",
+                                        saml_principal, "user", "User", saml_principal,
+                                        "reason=scim_store_unavailable");
+                if (auto* m = auth_mgr_.metrics_registry())
+                    m->counter("yuzu_scim_saml_link_lookup_failures_total").increment();
+                break;
+            case saml::SamlScimLinkOutcome::linked:
+            case saml::SamlScimLinkOutcome::not_linkable:
+            case saml::SamlScimLinkOutcome::link_write_error:
+                break; // existing behaviour — no new login-time audit row
+            }
 
             session_token = auth_mgr_.create_saml_session(saml_name_id, saml_entity_id,
                                                            result.value().groups, saml_admin_gid);
@@ -3136,6 +3209,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                         recheck_detail);
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+                    // #3069 split — see the primary check above; same
+                    // `decision.scim_id` predicate the recheck's `reason=`
+                    // string already switches on.
+                    record_deprovision_deny_split(
+                        m, "yuzu_auth_saml_deprovisioned_denied_genuine_total",
+                        "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
+                        decision.scim_id.has_value());
                     // Also bump the established general SAML login counter
                     // — see the primary check above.
                     m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();

@@ -220,6 +220,201 @@ groups:
             migrated (see the runbook).
           runbook_url: "docs/ops-runbooks/rbac-store-backfill-recovery.md"
 
+  # ── yuzu-scim — ADR-2001 (SCIM ↔ OIDC/SAML identity-link revoke chokepoint,
+  # CC6.8) ─────────────────────────────────────────────────────────────────
+  # Every BARE (unlabeled) counter in this group is boot-seeded to 0 (never
+  # absent on a build that ships this feature — see server.cpp's bare-seed
+  # block), so the `increase(x[1h]) > 0` idiom catches even the FIRST
+  # occurrence and `absent()` would be the wrong shape for those rules — see
+  # YuzuOnBehalfAssertionRejected above for the precedent this group follows.
+  # The ONE exception is `yuzu_scim_audit_write_failures_total{action=...}`
+  # (YuzuScimAuditWriteFailures below): it carries a runtime `action` label
+  # the server cannot enumerate in advance, so it is a genuinely BORN-AT-1
+  # series — its first-ever `action` value has no zero sample to increase
+  # from, so `increase(...)>0` can lag one evaluation cycle on a truly
+  # isolated first failure of that action (it still fires reliably on
+  # recurrence/sustained failures, and does not affect any other counter in
+  # this group).
+  - name: yuzu-scim
+    rules:
+      # D1: a SCIM deprovision refused to demote/deprovision a slug that is
+      # still elevated to admin OUTSIDE SCIM while an active OIDC/SAML link
+      # exists (routed-concerns.md D1: "the refusal is made LOUD instead").
+      # This is NOT the credential-revoke path completing with a gap — it is
+      # the deliberate refusal itself, which still needs an operator to act
+      # (manually demote or unlink), so it is critical rather than warning.
+      - alert: YuzuScimDeprovisionRoleRefusedWithActiveLink
+        expr: |
+          increase(yuzu_scim_deprovision_role_refused_with_active_link_total[1h]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "SCIM deprovision refused — a still-linked admin was NOT deprovisioned"
+          description: >-
+            yuzu_scim_deprovision_role_refused_with_active_link_total moved: an
+            IdP-initiated SCIM deprovision targeted a slug that is elevated to
+            admin outside SCIM (#2021) and carries an active OIDC/SAML
+            identity link, so D1 refused the deprovision rather than silently
+            demoting or revoking it. The termination did NOT complete — the
+            account is still fully privileged. Manually confirm whether the
+            user should be demoted/deprovisioned, then act via the
+            dashboard/REST (never rely on the next SCIM sync to retry this on
+            its own). Correlate via the
+            scim.user.deprovision_role_refused_with_link audit row.
+          runbook_url: "https://docs.yuzu.io/runbooks/scim-deprovision-role-refused"
+
+      # D2 OIDC: a SCIM deprovision revoked zero OIDC credentials because the
+      # link-claim (iss/sub) was never formed — most often a client that never
+      # logged in via OIDC, or a login that predates the D2 observability
+      # wiring. Warning, not critical: the SCIM-side account state is still
+      # correctly deprovisioned, only the (possibly nonexistent) OIDC session
+      # is left unrevoked.
+      - alert: YuzuScimDeprovisionOidcUnlinked
+        expr: |
+          increase(yuzu_scim_deprovision_unlinked_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "SCIM deprovision found no linked OIDC identity to revoke"
+          description: >-
+            yuzu_scim_deprovision_unlinked_total moved: a SCIM deprovision ran
+            against a user with no OIDC identity_links row, so zero OIDC
+            tokens/sessions were revoked for that principal. Usually benign
+            (the user never authenticated via OIDC SSO), but worth checking if
+            the deprovisioned user is known to use SSO — the link may be
+            missing because the OIDC login-time linkage
+            (oidc_principal_id(iss,sub)) never fired for that account. See
+            docs/adr/2001-scim-oidc-identity-linkage.md.
+          runbook_url: "https://docs.yuzu.io/runbooks/scim-deprovision-oidc-unlinked"
+
+      # D2 SAML analogue (#3072): same reasoning as the OIDC rule above, for
+      # the SAML identity-link table instead.
+      - alert: YuzuScimDeprovisionSamlUnlinked
+        expr: |
+          increase(yuzu_scim_deprovision_saml_unlinked_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "SCIM deprovision found no linked SAML identity to revoke"
+          description: >-
+            yuzu_scim_deprovision_saml_unlinked_total moved: a SCIM
+            deprovision ran against a user with no saml_identity_links row, so
+            zero SAML sessions were revoked for that principal. Usually benign
+            (the user never authenticated via SAML SSO), but worth checking if
+            the deprovisioned user is known to use SSO — the link may be
+            missing because the NameID was never a stable/linkable Format
+            (saml::is_linkable_name_id_format), or the SAML login-time linkage
+            never fired for that account. See
+            docs/adr/2001-scim-oidc-identity-linkage.md "SAML ↔ SCIM identity
+            linkage".
+          runbook_url: "https://docs.yuzu.io/runbooks/scim-deprovision-saml-unlinked"
+
+      # Genuine deny (OIDC): the deny-at-login backstop refused a login for an
+      # identity it could positively confirm was deprovisioned (not merely
+      # store-unavailable — that is a SEPARATE counter,
+      # ..._deprovisioned_denied_store_unavailable_total, deliberately excluded
+      # here so a Postgres outage cannot trip this alert; #3069). Expected but
+      # noteworthy — an operator may want to know a deprovisioned identity is
+      # still attempting to log in.
+      - alert: YuzuAuthOidcDeprovisionedDeniedGenuine
+        expr: |
+          increase(yuzu_auth_oidc_deprovisioned_denied_genuine_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A deprovisioned OIDC identity was denied re-login (genuine, not an outage)"
+          description: >-
+            yuzu_auth_oidc_deprovisioned_denied_genuine_total moved: the
+            deny-at-login backstop (routed-concerns.md PR3, §4) refused a
+            login for an OIDC identity it positively confirmed is
+            deprovisioned — a hard-DELETEd or explicitly-deactivated SCIM
+            resource with no active reprovision sibling for that externalId.
+            This is the GENUINE counter, not the total: a Postgres pool
+            outage or a scim_store degrade denies logins too but increments
+            only
+            yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total, never
+            this one, so a firing here means a genuinely deprovisioned
+            identity is attempting to authenticate — expected if that account
+            was recently deprovisioned, worth investigating if not. Correlate
+            via the auth.oidc.deprovisioned_denied audit row.
+          runbook_url: "https://docs.yuzu.io/runbooks/auth-oidc-deprovisioned-denied-genuine"
+
+      # Genuine deny (SAML): analogue of the OIDC rule above.
+      - alert: YuzuAuthSamlDeprovisionedDeniedGenuine
+        expr: |
+          increase(yuzu_auth_saml_deprovisioned_denied_genuine_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A deprovisioned SAML identity was denied re-login (genuine, not an outage)"
+          description: >-
+            yuzu_auth_saml_deprovisioned_denied_genuine_total moved: the SAML
+            deny-at-login backstop (routed-concerns.md PR4b) refused a login
+            for a SAML identity (keyed on saml_principal_id(entity_id,
+            name_id)) it positively confirmed is deprovisioned. This is the
+            GENUINE counter, not the total: a store-unavailable denial
+            increments only
+            yuzu_auth_saml_deprovisioned_denied_store_unavailable_total, never
+            this one — so a firing here means a genuinely deprovisioned SAML
+            identity is attempting to authenticate, not a Postgres outage.
+            Correlate via the auth.saml.deprovisioned_denied audit row.
+          runbook_url: "https://docs.yuzu.io/runbooks/auth-saml-deprovisioned-denied-genuine"
+
+      # Provenance: a SCIM push (create/PATCH/PUT) tried to mutate an account
+      # that either was never SCIM-provisioned, or was promoted out of SCIM's
+      # ownership (the same #2021 admin-elevation boundary D1 protects on the
+      # deprovision side). Either a misconfigured IdP push targeting the wrong
+      # externalId, or a compromised/malicious IdP probing account takeover.
+      - alert: YuzuScimProvenanceDenied
+        expr: |
+          increase(yuzu_scim_provenance_denied_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A SCIM push tried to mutate a non-SCIM or promoted account"
+          description: >-
+            yuzu_scim_provenance_denied_total moved: an inbound SCIM
+            create/PATCH/PUT targeted an account the SCIM provenance check
+            refused to mutate — either the account was never provisioned by
+            SCIM, or it was elevated/promoted outside SCIM's ownership
+            boundary (#2021). A single event is usually a misconfigured IdP
+            attribute mapping; a sustained rate is worth treating as a
+            possibly compromised or misbehaving IdP. Correlate via the
+            scim provenance-denial audit row for the calling IdP/client.
+          runbook_url: "https://docs.yuzu.io/runbooks/scim-provenance-denied"
+
+      # Audit-write-failures: a committed SCIM mutation (create/update/patch/
+      # delete/deprovision) lost its audit evidence write. This is an evidence
+      # INTEGRITY gap on an already-committed change, not a rejected request —
+      # critical, like YuzuSecretDecryptTamperSignal and
+      # YuzuRbacBackfillFailing above. `action` is bounded (create/update/
+      # patch/delete/deprovision-shaped verbs) — preserved via `by (action)`
+      # so a failure on one action class cannot hide inside another's healthy
+      # rate.
+      - alert: YuzuScimAuditWriteFailures
+        expr: |
+          sum by (action) (increase(yuzu_scim_audit_write_failures_total[1h])) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "A committed SCIM mutation lost its audit evidence write ({{ $labels.action }})"
+          description: >-
+            yuzu_scim_audit_write_failures_total{action="{{ $labels.action }}"}
+            moved: a SCIM mutation that already COMMITTED to scim_store failed
+            to write its audit trail row. The mutation itself is not rolled
+            back — this is an evidence-integrity gap on a change that already
+            happened, which SOC 2 CC6.8 relies on being complete. Check the
+            server log around the time of the failing action for the audit
+            store write error (pool exhaustion, statement timeout, disk
+            pressure) and confirm no other SCIM mutations are affected. NOTE:
+            this counter is dynamically labeled by `action` and is NOT
+            boot-seeded (the server cannot enumerate every action value in
+            advance) — a truly isolated first failure of a given `action`
+            may lag up to one evaluation cycle before this rule fires;
+            treat a single fresh occurrence with that in mind, and rely on
+            recurrence/sustained failures for confident detection.
+          runbook_url: "https://docs.yuzu.io/runbooks/scim-audit-write-failures"
+
   - name: yuzu-mcp
     rules:
       - alert: YuzuMcpProgressBridgeAtCapacity
@@ -2360,6 +2555,60 @@ groups:
             the remediation. See the runbook for what each reason means and how
             to resolve it.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#network-discovered-device-data-migrates-to-postgres-mandatory-backfill-discoverystore-adr-0044"
+      - alert: YuzuNotificationBackfillFailing
+        # Mirrors YuzuDiscoveryBackfillFailing's shape (same underlying reason,
+        # not YuzuMgmtGroupBackfillFailing's result="failed" shape): the
+        # one-time legacy notifications.db -> notification_store backfill
+        # (ADR-0046) runs during server CONSTRUCTION, and a failure sets
+        # startup_failed_ so run() returns before the HTTP listener starts —
+        # /metrics is never served and a result="failed" sample is never
+        # scraped. An expression keyed on result="failed" can therefore never
+        # fire no matter how the counter behaves. What IS observable from
+        # outside is the ABSENCE of a success outcome — a server that refused
+        # to boot publishes no notification-backfill series at all.
+        #
+        # THIS RULE DEPENDS ON THE PRE-SEED. NotificationStore::set_metrics()
+        # is a bare pointer assignment — the seed lives in server.cpp's
+        # metrics registration block (the describe()/zero-loop right after
+        # DiscoveryStore's own, both pre-seeding their result sets to 0). That
+        # is what makes "series absent" mean "no server is serving" rather
+        # than "no server has this metric registered yet".
+        #
+        # TWO-WAY RESULT SPLIT (not discovery/rbac/mgmt-group's three-way
+        # fresh/completed/failed): this store's backfill is a single
+        # transaction with no multi-step outcome to report separately, so the
+        # wrapper (migrate_from_sqlite in notification_store.cpp) only ever
+        # emits result="success" or result="failed" — expr below matches
+        # "success" only, not "completed|fresh".
+        #
+        # LIMITS: fires only when NO scraped server reports a successful
+        # backfill, so in a multi-replica deployment one wedged replica among
+        # healthy ones will not trip it (shows up as `up == 0` instead). It
+        # ALSO fires during a legitimately long first-boot backfill on a large
+        # legacy notifications.db — expected during that upgrade window
+        # (silence it for the window). The BOOT LOG carries the actual
+        # remediation in every case (holder-side fingerprint mismatch /
+        # sourceless-marker refusal / unreadable legacy file) — this is the
+        # outside-in backstop, not the primary signal.
+        expr: |
+          absent_over_time(yuzu_server_notification_backfill_total{result="success"}[15m])
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No server is reporting a completed notification-store backfill (possible boot refusal)"
+          description: >-
+            No scraped Yuzu server has reported a successful one-time legacy
+            notifications.db -> PostgreSQL notification_store backfill
+            (ADR-0046) in the last 15 minutes. After an upgrade the usual
+            cause is a server that FAILED the backfill: it fails CLOSED,
+            refuses to serve, and retries on the next start — a restart loop
+            with the whole server down, not just the notification feed. Read
+            the server BOOT log for the specific refusal reason (holder-side
+            fingerprint mismatch / sourceless-marker refusal / unreadable
+            legacy file) — it carries the remediation. See the runbook for
+            what each reason means and how to resolve it.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#notification-feed-moves-to-postgresql--history-preserved-notificationstore-adr-0046"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which

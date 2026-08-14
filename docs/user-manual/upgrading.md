@@ -839,6 +839,45 @@ for lockout/break-glass recovery — that runbook has been rewritten for this
 cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
 the `auth` schema).
 
+## Notification feed moves to PostgreSQL — history preserved (NotificationStore, ADR-0046)
+
+`NotificationStore` — the dashboard toast/badge feed — moves from the SQLite
+`notifications.db` file to the server's PostgreSQL substrate in this release
+(ADR-0006 Wave 2, ADR-0046), schema `notification_store`. **Unread/dismissed
+state is preserved by a mandatory backfill, not a fresh start.** No new flag
+or environment variable is added (it reuses the shared server `PgPool`).
+
+**What happens on first PG boot:**
+
+- A one-time, idempotent, **fail-closed** backfill copies every notification
+  out of the legacy `notifications.db` into `notification_store`, preserving
+  ids (so any bookmarked/linked notification id stays valid) and read/dismissed
+  state. The legacy file is moved aside once the backfill is verified.
+- **Startup failure mode changed.** Previously, a broken or unreadable
+  `notifications.db` degraded only the notification feature — the store ran
+  closed and `/api/notifications*` returned 503. **It now fails the whole
+  server boot** (matching every other Postgres-migrated store's fail-closed
+  contract): if the schema can't open, or the backfill can't complete, the
+  server logs `[PG] Refusing to start` and refuses to serve at all. If you
+  hit this, the log line names the legacy file and states the remediation:
+  repair it, or move it aside to skip the backfill (unread/dismissed history
+  in it will **not** carry over if you do).
+- **Multi-instance consolidation — boot the authoritative replica first.**
+  If you are consolidating multiple previously-independent server instances
+  (each with genuinely different local `notifications.db` content) onto one
+  shared Postgres for the first time, whichever instance boots first and
+  completes the backfill becomes the fleet's sole notification history — every
+  other instance's own legacy file will permanently fail closed (a
+  holder-side fingerprint mismatch) on every subsequent boot, requiring manual
+  reconciliation (move the losing instances' legacy files aside once you've
+  confirmed their content is disposable). This is the intended fail-loud
+  behavior, not a bug — there is no automated merge across independent legacy
+  files. Boot the instance holding the notification history you want to keep
+  first, same guidance as the RBAC store migration above.
+
+**Not affected:** `/api/notifications*` request/response behavior is
+unchanged — this is a storage-engine swap only, no API change.
+
 ## Audit trail migrates to PostgreSQL — history preserved (AuditStore, ADR-0040)
 
 The audit log (`AuditStore`, the SOC 2 evidence chain) moves from the SQLite
@@ -1092,9 +1131,21 @@ metrics.md` and the shipped `YuzuCustomPropertiesReadDegraded` alert).
 `yuzu_server_custom_properties_backfill_total{result}` records the one-time
 backfill outcome.
 
-**Not affected:** the `props.<key>` scope-DSL syntax, the REST API request/
-response shapes, and property/schema semantics are unchanged — only the
-storage substrate and the fail-closed read posture change.
+**Operator-visible behaviour change (fail-closed writes, 2026-08-14 follow-up).**
+`PUT /api/agents/:id/properties/:key` and `POST /api/property-schemas` now return
+**503** (instead of `400`) when the failure is a genuine database/store outage rather
+than caller-input or schema-validation error — previously every failure from either
+write, including a transient Postgres blip, surfaced as the same `400` a caller could
+not distinguish from their own bad input. A caller that branches specifically on `400`
+to mean "don't retry" should treat the new `503`s the same as any other transient
+server error (retry with backoff); a caller that already treats any `5xx` as retryable
+is unaffected. See `docs/user-manual/rest-api.md`'s per-route notes for the exact
+response shapes.
+
+**Not affected:** the `props.<key>` scope-DSL syntax and property/schema semantics are
+unchanged; the `GET`/`DELETE` property routes and `GET` schema route keep their prior
+response shapes — only the two write routes' failure-mode status codes changed, as
+described above.
 
 ## Network-discovered device data migrates to Postgres (mandatory backfill, DiscoveryStore, ADR-0044)
 

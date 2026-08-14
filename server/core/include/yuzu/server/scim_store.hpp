@@ -92,6 +92,22 @@ struct SamlLinkedIdentity {
     std::string name_id;
 };
 
+/// Distinguishes a store error from a genuine no-match/ambiguous outcome for
+/// `find_unique_active_by_external_id_checked` (ADR-2001 #3072, SAML D2
+/// observability store layer) — the same tri-state motivation as
+/// `resource_exists`/`get_by_username_checked`: a caller that needs to tell
+/// "no active resource claims this externalId" apart from "the store could
+/// not answer" (rather than folding both into a bare `nullopt`) uses this
+/// variant instead of the plain `find_unique_active_by_external_id`.
+enum class ActiveExternalIdLookupStatus { matched, no_match, ambiguous, store_error };
+
+/// Result of `find_unique_active_by_external_id_checked`. `resource` is only
+/// ever set when `status == matched`.
+struct ActiveExternalIdLookupResult {
+    ActiveExternalIdLookupStatus status;
+    std::optional<ScimResource> resource;
+};
+
 /// The deny-at-login backstop's resolved state for one `(iss, sub)` (ADR-2001
 /// §4), returned engaged (see `linked_resource_active`'s doc comment for the
 /// full tri-state contract — this struct only carries what an ENGAGED result
@@ -207,7 +223,28 @@ public:
     /// the layer that still holds even if the index is ever bypassed or
     /// absent. Does NOT change `find_by_external_id`'s existing contract —
     /// other callers keep using that one.
+    ///
+    /// Thin COMPATIBILITY WRAPPER over `find_unique_active_by_external_id_checked`
+    /// (ADR-2001 #3072 store-layer task): returns the resource for `matched`,
+    /// `nullopt` for every other status (`no_match`, `ambiguous`,
+    /// `store_error`). Byte-unchanged signature/behaviour — every existing
+    /// caller (OIDC link formation, OIDC + SAML orphan/reprovision checks,
+    /// SAML link formation, deny-at-login) keeps collapsing store-error and
+    /// no-match/ambiguous into the same `nullopt`, exactly as before this
+    /// checked variant was added.
     std::optional<ScimResource> find_unique_active_by_external_id(const std::string& external_id) const;
+
+    /// CHECKED variant of `find_unique_active_by_external_id` that
+    /// distinguishes a store error from a genuine no-match/ambiguous outcome
+    /// (ADR-2001 #3072). Same underlying query/logic as the wrapper above:
+    /// `matched` = exactly one active row (`resource` populated);
+    /// `no_match` = zero rows; `ambiguous` = more than one active row (the
+    /// mis-link guard, ADR-2001 §2); `store_error` = store not open, lease
+    /// timeout, or a failed statement. An empty `external_id` is `no_match`
+    /// (not a store error), matching `find_unique_active_by_external_id`'s
+    /// existing empty-input contract.
+    ActiveExternalIdLookupResult
+    find_unique_active_by_external_id_checked(const std::string& external_id) const;
 
     /// 1-based `start_index` per the SCIM list-response convention (RFC 7644
     /// §3.4.2 `startIndex`). `total_out` receives the total resource count
@@ -492,6 +529,52 @@ public:
     /// "cannot tell" as "no candidate seen" is the safe direction for a
     /// signal that only ever ADDS a human-facing hint, never gates access.
     bool observation_matches(const std::string& claim_value) const;
+
+    // ── SAML login observations (ADR-2001 #3072, D2-style SAML detector) ──
+    //
+    // Records every SAML login's NameID observation (`saml_login_observations`
+    // table, migration v5) — the SAML analogue of `record_login_observation`/
+    // `observation_matches` above. Unlike the OIDC surface there is no
+    // multi-candidate-claim shape to preserve: a SAML assertion carries
+    // exactly one NameID, so this is keyed `(entity_id, name_id,
+    // name_id_format)` rather than `(iss, sub, claim_name)`.
+    // `name_id_format` is deliberately IN the uniqueness key (not folded
+    // into `(entity_id, name_id)` alone): a later login presenting the same
+    // NameID value under a STABLE format (`persistent`/`emailAddress`,
+    // `saml::is_linkable_name_id_format`) must not silently overwrite — and
+    // so erase — an earlier observation recorded under an unstable format
+    // (`transient`/`unspecified`); each `(entity_id, name_id, format)`
+    // triple is its own row.
+
+    /// Idempotent upsert keyed `(entity_id, name_id, name_id_format)` — one
+    /// observation per distinct NameID+format pair, refreshed (`seen_at`) on
+    /// every login. Returns false on db failure or an empty
+    /// `entity_id`/`name_id`. An IdP that omits the NameID Format attribute
+    /// is a common, legitimate configuration — `name_id_format` MAY be
+    /// empty and is recorded as `""` (the column is NOT NULL; an empty
+    /// string is a valid, distinct key component), so that population is
+    /// never silently dropped from the D2 detector. The caller
+    /// (`link_saml_login_to_scim`) is responsible for bounding/normalizing
+    /// an oversized or malformed `name_id_format` before it reaches here —
+    /// this method itself does not cap it.
+    bool record_saml_login_observation(const std::string& entity_id, const std::string& name_id,
+                                       const std::string& name_id_format);
+
+    /// TRI-STATE (deliberately, unlike `observation_matches`'s bool — ADR-2001
+    /// #3072 design): whether any recorded SAML login observation carries
+    /// this exact `name_id`, distinguishing "no login ever presented it" from
+    /// "the store could not answer". A store-unusable read collapses to
+    /// `nullopt`, not `false` — this is a detector feeding a caller that
+    /// SKIPS on `nullopt` rather than reporting a false-positive "never
+    /// seen" on a transient blip.
+    ///  - `nullopt`: the store could not answer (closed, lease timeout, or a
+    ///    failed statement) — the caller MUST skip (treat as "cannot tell"),
+    ///    never as a negative match.
+    ///  - engaged `true`: at least one observation row carries this
+    ///    `name_id`.
+    ///  - engaged `false`: the store answered and genuinely has no
+    ///    observation for this `name_id`.
+    std::optional<bool> saml_observation_matches(const std::string& name_id) const;
 
 private:
     pg::PgPool& pool_;

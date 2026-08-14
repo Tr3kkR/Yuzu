@@ -3528,16 +3528,22 @@ Set or update a custom property value on an agent. If a property schema exists f
 }
 ```
 
-**Note on database degrade:** unlike `GET /api/agents/:id/properties` above, a transient
-database failure during this write currently surfaces as this same `400` (`"database error"` /
-`"database write failed"`) rather than a distinguishable `503` — not yet type-widened. Most of
-this predates the Postgres migration (the SQLite original had the identical
-collapse-to-generic-error shape on an INSERT failure); it is called out here because a Postgres
-pool/query failure is a more routine occurrence than a local SQLite file error ever was. One
-sub-case is new in this release: a transient failure on the schema-validation lookup itself
-(rather than the property write) used to be silently treated as "no schema, accept any value" by
-the SQLite original — that fail-open is now closed, and this sub-case also surfaces as `400`
-(`"database error"`), correctly rejecting the write rather than accepting it unvalidated.
+**Error (503) -- store outage:**
+
+```json
+{"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}}
+```
+
+**Note on database degrade:** a transient database failure during this write — store not open, a
+pool/query failure on the property INSERT, or a failure on the schema-validation lookup itself —
+now surfaces as this distinguishable `503`, matching `GET /api/agents/:id/properties` above.
+Caller-input validation failures (invalid key/value shape, or a value rejected against an existing
+schema) stay `400`. This closes a gap where every failure, including a genuine store outage,
+collapsed to the same `400` a caller couldn't distinguish from their own bad input (gov Gate 8
+finding, fjarvis re-review of PR #3065). A transient failure on the schema-validation lookup used
+to be silently treated by the SQLite original as "no schema, accept any value" — that fail-open
+was already closed by the original Postgres migration (it correctly rejects the write instead of
+accepting it unvalidated); this change only affects which status code that rejection now uses.
 
 ---
 
@@ -3558,7 +3564,10 @@ Delete a custom property from an agent.
 
 **Note on database degrade:** a transient database failure during this delete currently surfaces
 as the same `404` ("property not found") a genuine miss would return — not yet type-widened,
-predates the Postgres migration. See the `PUT` note above.
+predates the Postgres migration. Unlike `PUT`/`POST` above (fixed to a distinguishable `503`),
+this route's underlying `delete_property` was deliberately left unwidened — it's an
+admin/operator-driven delete, not a scope/dispatch-feeding read, matching `custom_properties_store.hpp`'s
+documented posture — so this stays a tracked gap rather than a fixed one.
 
 ---
 
@@ -3570,7 +3579,10 @@ List all property schemas. Schemas define the allowed keys, types, and validatio
 
 **Note on database degrade:** a transient database failure during this list currently surfaces as
 a `200` with an empty `data` array — indistinguishable from "no schemas configured." Not yet
-type-widened, predates the Postgres migration. See the `PUT` note above.
+type-widened, predates the Postgres migration. Unlike `PUT`/`POST` above (fixed to a
+distinguishable `503`), this route's underlying `list_schemas` was deliberately left unwidened —
+it's an admin-surface read, not scope/dispatch-feeding, matching `custom_properties_store.hpp`'s
+documented posture — so this stays a tracked gap rather than a fixed one.
 
 **Response:**
 
@@ -3634,6 +3646,18 @@ Create or update a property schema. If a schema with the given key already exist
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Error (503) -- store outage:**
+
+```json
+{"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}}
+```
+
+**Note on database degrade:** a transient database failure during this write (store not open, a
+pool lease timeout, or a query failure) surfaces as this distinguishable `503`. Caller-input
+validation failures (invalid key, unrecognized type, an invalid/oversized validation regex) stay
+`400` (gov Gate 8 finding, fjarvis re-review of PR #3065 — the same fix as `PUT
+/api/agents/:id/properties/:key` above).
 
 ---
 
@@ -7757,6 +7781,8 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.user.deprovision_role_refused_with_link` | `failure` | ADR-2001 D1: a role-refused deprovision (`deprovision_role_ok` 404 — the slug's role is not `user`) for a slug with ≥1 active linked OIDC identity, whose tokens are therefore NOT auto-revoked. Always written alongside `yuzu_scim_deprovision_role_refused_with_active_link_total` — see `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
 | `auth.oidc.deprovisioned_denied` | `failure` | ADR-2001 §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the store could not answer — fail-closed). Emitted from `GET /auth/callback`, not a `/scim/v2/*` route — listed here because it is part of the same ADR-2001 linkage. `detail` carries `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource (deactivated, or orphaned by a hard-deleted `scim_resources` row) drove the denial, or `reason=scim_store_unavailable` when the store could not answer (fail-closed — no `scim_id` to name); and — only on the post-mint re-check path (a concurrent deprovision landed after the primary check) — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). The two `reason` values keep a genuine deprovision (CC6.8 evidence) distinguishable from a store outage. Pairs with `yuzu_auth_oidc_deprovisioned_denied_total`. |
 | `auth.saml.deprovisioned_denied` | `failure` | ADR-2001 §4/PR4b, the SAML analogue of the row above: a SAML login was refused at `POST /saml/acs` because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row) or because `ScimStore` could not answer at all (fail-closed). Principal is the `saml:<entity_id>#<NameID>` string. `detail` uses the identical shape the OIDC row above uses: `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource drove the denial, or `reason=scim_store_unavailable` (no `scim_id`) when the store itself could not be asked; and — only on the post-mint re-check path — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). Pairs with `yuzu_auth_saml_deprovisioned_denied_total`. |
+| `auth.saml.link_unmatched` | `failure` | ADR-2001 #3072: on a SAML login with a linkable (stable-Format) NameID, the identity-link lookup ran but found either zero active SCIM resources matching the NameID as an `externalId` (`reason=no_active_external_id_match;name_id_format=<format>`) or more than one (`reason=ambiguous_active_external_id_match;name_id_format=<format>`, ADR-2001 §2 mis-link guard). **Observe-and-proceed — the SAML login still succeeds** (login-time linking is fail-open by contract; this is not the PR4b deny-at-login path). The two causes pair with separate counters, `yuzu_scim_saml_link_unmatched_total` and `yuzu_scim_saml_link_ambiguous_total` respectively, despite sharing one audit action. Emitted from `POST /saml/acs`. See `docs/auth-architecture.md` "SAML D2 observability (#3072)". |
+| `auth.saml.link_lookup_failed` | `failure` | ADR-2001 #3072: on a SAML login with a linkable NameID, the `ScimStore` active-`externalId` lookup itself could not answer (`reason=scim_store_unavailable`) — distinct from `auth.saml.link_unmatched`'s genuine zero-match answer. **Observe-and-proceed — the SAML login still succeeds.** Pairs with `yuzu_scim_saml_link_lookup_failures_total`. Emitted from `POST /saml/acs`. |
 
 #### Metrics
 
@@ -7784,6 +7810,22 @@ refused a SAML re-login against a deprovisioned linked identity); see the
 audit actions above and `docs/user-manual/metrics.md` "SSO login metrics".
 Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
 Metrics and "SCIM ↔ OIDC identity linkage for deprovision" § New metrics.
+
+**ADR-2001 #3072 (SAML D2 observability):**
+`yuzu_scim_saml_link_unmatched_total` /
+`yuzu_scim_saml_link_ambiguous_total` (login-time: a linkable-Format SAML
+NameID matched zero / more than one active SCIM resource — pairs with
+`auth.saml.link_unmatched` above), `yuzu_scim_saml_link_lookup_failures_total`
+(login-time: the active-`externalId` lookup itself could not answer — pairs
+with `auth.saml.link_lookup_failed` above), and
+`yuzu_scim_deprovision_saml_unlinked_total` (deprovision-time: the SAML
+analogue of `yuzu_scim_deprovision_unlinked_total` above — a deprovision
+found a SAML login observation matching the slug's `externalId` but no
+formed `saml_identity_links` row). See
+`docs/auth-architecture.md` "SAML D2 observability (#3072)" for the honest
+scope of what each half (login-time vs. deprovision-time) can and cannot
+attribute, and `docs/user-manual/metrics.md` "SCIM deprovision-linkage
+metrics" for the operator-facing description.
 
 ---
 
