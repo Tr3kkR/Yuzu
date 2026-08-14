@@ -66,6 +66,7 @@ using yuzu::server::SqliteStmt;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
+using yuzu::server::pg::PgTxn;
 
 namespace {
 
@@ -569,6 +570,10 @@ TEST_CASE("validate: SELECT ... FOR UPDATE serializes overlapping status transit
     REQUIRE(locker);
     PgResult begin{PQexec(locker.get(), "BEGIN")};
     REQUIRE(begin.ok());
+    // PgTxn (defense-in-depth per gov Gate 8 cpp-safety SHOULD): rolls back on any exception
+    // anywhere below, rather than relying solely on PgPool::release()'s own fallback rollback
+    // for a not-PQTRANS_IDLE connection.
+    PgTxn locker_txn{locker.get()};
     PgResult lock{PQexec(locker.get(), "SELECT id FROM license_store.licenses "
                                        "WHERE status = 'active' FOR UPDATE")};
     REQUIRE(lock.ok());
@@ -578,16 +583,26 @@ TEST_CASE("validate: SELECT ... FOR UPDATE serializes overlapping status transit
     std::thread validator([&] {
         result_promise.set_value(store.validate(15)); // 15 exceeds the 10-seat limit
     });
+    // Gov Gate 8 cpp-safety (BLOCKING, policy floor): a bare std::thread left joinable when a
+    // REQUIRE between here and the explicit join() throws (Catch2 unwinds via exception) calls
+    // std::terminate() in ~thread(), crashing the whole test binary instead of failing red.
+    // Not std::jthread — that exact substitution broke Apple Clang's libc++ once already in
+    // this codebase (CLAUDE.md Gate 8 history) — a plain RAII join-guard is portable.
+    struct JoinGuard {
+        std::thread& t;
+        ~JoinGuard() {
+            if (t.joinable())
+                t.join();
+        }
+    } join_guard{validator};
 
     // The concurrent validate() must still be blocked on the row lock — it must NOT have
     // raced ahead and read/written the row while the manual lock is held.
     CHECK(result_future.wait_for(std::chrono::milliseconds(300)) != std::future_status::ready);
 
-    PgResult commit{PQexec(locker.get(), "COMMIT")};
-    REQUIRE(commit.ok());
+    REQUIRE(locker_txn.commit());
 
     REQUIRE(result_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
-    validator.join();
     REQUIRE(result_future.get().has_value());
 
     auto status = store.get_status();

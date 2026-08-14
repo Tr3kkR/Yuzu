@@ -536,7 +536,13 @@ bool LicenseStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pa
                 const char* sql =
                     "SELECT id, license_key_hash, organization, seat_count, issued_at, "
                     "expires_at, edition, features_json, status, activated_at FROM licenses "
-                    "ORDER BY activated_at ASC, id ASC;";
+                    // gov Gate 8 architect (SHOULD): PK order, not a content-dependent column —
+                    // canonicalize_legacy() re-sorts before fingerprinting regardless (verified
+                    // std::sort call sites), so this can't change any fingerprint, and PK order
+                    // means two replicas scanning the same id set always acquire Postgres row
+                    // locks in the SAME order during backfill INSERT, closing the deadlock class
+                    // this store's own gov Gate 4 unhappy-path UP-3 flagged.
+                    "ORDER BY id ASC;";
                 if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
                     spdlog::error(
                         "LicenseStore::migrate_from_sqlite: legacy licenses query failed: {}",
@@ -607,7 +613,9 @@ bool LicenseStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_pa
                 SqliteStmt s;
                 const char* sql =
                     "SELECT license_id, alert_type, message, triggered_at, acknowledged FROM "
-                    "license_alerts ORDER BY triggered_at ASC, id ASC;";
+                    // gov Gate 8 architect (SHOULD): PK order — same rationale as the licenses
+                    // scan above. `id` need not be in the SELECT list to ORDER BY it.
+                    "license_alerts ORDER BY id ASC;";
                 if (sqlite3_prepare_v2(legacy.get(), sql, -1, s.addr(), nullptr) != SQLITE_OK) {
                     spdlog::error(
                         "LicenseStore::migrate_from_sqlite: legacy license_alerts query "
@@ -1074,7 +1082,10 @@ std::expected<void, std::string> LicenseStore::validate(std::int64_t current_age
         pg::PgResult res = pg::exec_params(
             conn,
             "SELECT id, seat_count, expires_at, status FROM license_store.licenses "
-            "WHERE status = 'active' FOR UPDATE",
+            // gov Gate 8 architect (SHOULD): PK order — two overlapping validate() passes
+            // locking more than one row now acquire Postgres row locks in the same order,
+            // closing the same deadlock class as the backfill loops' ORDER BY above.
+            "WHERE status = 'active' ORDER BY id ASC FOR UPDATE",
             std::vector<std::string>{});
         if (res.status() != PGRES_TUPLES_OK) {
             db_err = PQerrorMessage(conn);

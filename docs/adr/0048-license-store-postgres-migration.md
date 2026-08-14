@@ -134,14 +134,14 @@ review (2026-08-14).
   with no re-check on the `UPDATE` tying it back to what was read — the later `COMMIT` would
   silently clobber the earlier one's write. `FOR UPDATE` makes the second transaction's `SELECT`
   block until the first commits, so it always computes from the freshest state. This locks the
-  WHOLE active-license row set for one `validate()` pass, not per-row, and carries no `ORDER BY`
-  — capacity note for whoever wires a periodic scheduler onto this later (gov Gate 6 sre): under a
-  large active-license count, overlapping passes across replicas fully serialize rather than
-  interleave, and — same ordering-deadlock class as the backfill loops above — two overlapping
-  passes locking multiple rows could in principle deadlock each other absent a defined lock
-  order. Bounded either way by libpq's connection-level `statement_timeout`/`lock_timeout` GUCs
-  (`pg/pg_pool.cpp`), not an unbounded pile-up; folded into the same follow-up issue as the
-  backfill ordering above.
+  WHOLE active-license row set for one `validate()` pass, not per-row — capacity note for whoever
+  wires a periodic scheduler onto this later (gov Gate 6 sre): under a large active-license count,
+  overlapping passes across replicas fully serialize rather than interleave. Bounded by libpq's
+  connection-level `statement_timeout`/`lock_timeout` GUCs (`pg/pg_pool.cpp`) regardless, not an
+  unbounded pile-up. The SELECT also takes `ORDER BY id ASC` (gov Gate 8 architect, SHOULD — see
+  the Backfill section's matching fix below): without a defined lock order, two overlapping
+  passes locking multiple rows could in principle deadlock each other; PK order makes every
+  overlapping pass acquire locks in the same sequence.
 - `has_feature`/`seat_count`/`days_remaining`/`get_status` are converted to
   `std::expected<T, std::string>` even though nothing in the current tree calls them outside
   `rest_api_v1.cpp` (the first two) and tests (all four) — `has_feature` in particular is
@@ -256,19 +256,24 @@ no small-human-chosen-identifier collision risk `RbacStore` has to guard against
 - The mid-scan-corruption guard is the same shape as `DeploymentStore`'s: the terminal SQLite
   step code for each table's scan must be `SQLITE_DONE`, never merely "loop exited", so a
   corrupt page is never silently treated as an empty/complete table.
-- **Known, deferred, non-blocking: both backfill loops iterate in a content-dependent order**
-  (`activated_at ASC, id ASC` for licenses; `triggered_at ASC, id ASC` for alerts), not primary-key
-  order (gov Gate 4 unhappy-path UP-3, MEDIUM; gov Gate 5 chaos CH-1 additionally notes the UP-2
-  fix's `DO UPDATE` and the `validate()` `FOR UPDATE` scan below widen the same exposure class,
-  since both now take real row locks where the pre-fix code did not). Two replicas whose legacy
-  files order the same set of rows differently can acquire Postgres row locks in opposite order
-  and hit the deadlock detector, aborting one replica's transaction. This is self-terminating, not
-  a wedge: the aborted transaction leaves no partial writes (single `with_txn`), the fingerprint
-  marker is unstamped, and the next boot retries and resolves normally via the identity/lifecycle
-  or OR-merge conflict path. Deferred rather than fixed in this PR because it requires touching
-  `deployment_store.cpp`'s identical pattern too, not a `license_store`-local fix — tracked as a
-  follow-up issue (`ORDER BY id ASC` on both backfill loops, both stores, plus the `validate()`
-  scan below).
+- **Fixed in this PR (gov Gate 8 architect, SHOULD): both backfill loops originally iterated in
+  a content-dependent order** (`activated_at ASC, id ASC` for licenses; `triggered_at ASC, id ASC`
+  for alerts), not primary-key order (gov Gate 4 unhappy-path UP-3, MEDIUM; gov Gate 5 chaos CH-1
+  additionally noted the UP-2 fix's `DO UPDATE` and the `validate()` `FOR UPDATE` scan above widen
+  the same exposure class, since both now take real row locks where the pre-fix code did not).
+  Two replicas whose legacy files order the same set of rows differently could acquire Postgres
+  row locks in opposite order and hit the deadlock detector, aborting one replica's transaction —
+  self-terminating (the aborted transaction leaves no partial writes, single `with_txn`; the
+  fingerprint marker stays unstamped; the next boot retries and resolves normally), never a wedge,
+  but a needless liveness stall. Initially deferred on the assumption that a fix here would need
+  to touch `deployment_store.cpp`'s identical pattern too — disproven on inspection:
+  `canonicalize_legacy()` (above) re-sorts both tables' rows via `std::sort` before fingerprinting,
+  independent of SQL scan order, so changing the `SELECT`'s `ORDER BY` to `id ASC` cannot change
+  any fingerprint, for this store or any legacy file already migrated. Both backfill loops and
+  `validate()`'s scan now use `ORDER BY id ASC`. `deployment_store.cpp:383`'s identical
+  `ORDER BY created_at ASC, id ASC` shape is UNCHANGED by this PR (confirmed, gov Gate 8
+  architect) — that file's own gap should be filed as a follow-up issue against it specifically,
+  since it isn't otherwise touched here.
 
 ## Considered and rejected
 

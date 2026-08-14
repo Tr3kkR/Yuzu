@@ -4987,6 +4987,7 @@ Activate a license.
 
 | Condition | Response |
 |---|---|
+| Malformed JSON body | `400` — `invalid JSON` |
 | `license_key` or `organization` empty | `400` |
 | `license_key` already activated on another license | `400` — `license key already activated` |
 | A genuine database write failure | `503` |
