@@ -2481,6 +2481,18 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "user", "User", username, deny_detail);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+                // #3069 split: the total above conflates a genuine
+                // deprovision deny with a store-unavailable fail-closed
+                // deny, which lets a Postgres outage inflate the counter
+                // operators alert on. `decision.scim_id` is the SAME
+                // predicate the audit `reason=` string above already
+                // switches on — absent means the store couldn't be asked
+                // (`scim_store_unavailable`), never a genuine deny.
+                if (!decision.scim_id)
+                    m->counter("yuzu_auth_oidc_deprovision_denied_store_unavailable_total")
+                        .increment();
+                else
+                    m->counter("yuzu_auth_oidc_deprovisioned_denied_genuine_total").increment();
                 // Also bump the established general OIDC login counter so
                 // dashboards keyed on it don't undercount during a deny
                 // episode — every other /auth/callback failure path bumps
@@ -2738,6 +2750,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "user", "User", username, recheck_detail);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+                // #3069 split — see the primary check above; same
+                // `decision.scim_id` predicate the recheck's `reason=`
+                // string already switches on.
+                if (!decision.scim_id)
+                    m->counter("yuzu_auth_oidc_deprovision_denied_store_unavailable_total")
+                        .increment();
+                else
+                    m->counter("yuzu_auth_oidc_deprovisioned_denied_genuine_total").increment();
                 // Also bump the established general OIDC login counter — see
                 // the primary check above.
                 m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
@@ -3068,6 +3088,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                         deny_detail);
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+                    // #3069 split: same predicate the audit `reason=`
+                    // string above already switches on — see the OIDC
+                    // primary check for the full rationale.
+                    if (!decision.scim_id)
+                        m->counter("yuzu_auth_saml_deprovision_denied_store_unavailable_total")
+                            .increment();
+                    else
+                        m->counter("yuzu_auth_saml_deprovisioned_denied_genuine_total").increment();
                     // Also bump the established general SAML login counter
                     // so dashboards keyed on it don't undercount during a
                     // deny episode — every other /saml/acs failure path
@@ -3183,6 +3211,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                         recheck_detail);
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+                    // #3069 split — see the primary check above; same
+                    // `decision.scim_id` predicate the recheck's `reason=`
+                    // string already switches on.
+                    if (!decision.scim_id)
+                        m->counter("yuzu_auth_saml_deprovision_denied_store_unavailable_total")
+                            .increment();
+                    else
+                        m->counter("yuzu_auth_saml_deprovisioned_denied_genuine_total").increment();
                     // Also bump the established general SAML login counter
                     // — see the primary check above.
                     m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
