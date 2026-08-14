@@ -14,6 +14,12 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <string>
+#include <vector>
+
 using namespace yuzu::profiles;
 
 namespace {
@@ -266,4 +272,279 @@ TEST_CASE("render_profile_row: exhaustive over every HiveState", "[profiles]") {
     CHECK(hive_state_name(HiveState::loaded) == "loaded");
     CHECK(hive_state_name(HiveState::loaded_classes_only) == "loaded_classes_only");
     CHECK(hive_state_name(HiveState::not_loaded) == "not_loaded");
+}
+
+// ── #2771: hive-access + user-key output rendering ─────────────────────────
+//
+// qa-S2 waived a positive test for the unload-failure control flow because it
+// was inlined in Win32-dependent code. The renderers below ARE that control
+// flow, extracted, so these run on every host. Assertions are exact
+// whole-string equality plus an explicit line count: the hp-B1 column-shift
+// defect survived a review precisely because the tests used substring
+// containment, which cannot see a field landing in the wrong place.
+
+TEST_CASE("render_hive_access_lines: clean success emits nothing", "[profiles]") {
+    const auto lines = render_hive_access_lines(HiveAccessStatus::ok, false, "", kAliceSid);
+    CHECK(lines.empty());
+}
+
+TEST_CASE("render_hive_access_lines: each failure emits exactly one error line", "[profiles]") {
+    const std::string sid{kAliceSid};
+
+    auto nf = render_hive_access_lines(HiveAccessStatus::not_found, false, "", kAliceSid);
+    REQUIRE(nf.size() == 1);
+    CHECK(nf[0] == "error|no reachable hive for sid '" + sid +
+                       "' (not logged in and no profile path)");
+
+    auto pm = render_hive_access_lines(HiveAccessStatus::privilege_missing, false, "", kAliceSid);
+    REQUIRE(pm.size() == 1);
+    CHECK(pm[0] ==
+          "error|privilege_missing: SeBackupPrivilege/SeRestorePrivilege could not be enabled");
+
+    auto mf = render_hive_access_lines(HiveAccessStatus::mount_failed, false, "M", kAliceSid);
+    REQUIRE(mf.size() == 1);
+    CHECK(mf[0] == "error|failed to load hive for sid '" + sid + "'");
+}
+
+TEST_CASE("render_hive_access_lines: the unload warning names the ACTUAL mount", "[profiles]") {
+    // The mount name is salted per call (up-S1), so reconstructing
+    // "YUZU_HIVE_<sid>" would print a name that was never mounted and a
+    // remediation command that does nothing.
+    const auto lines =
+        render_hive_access_lines(HiveAccessStatus::ok, true, "YUZU_HIVE_S-1-5-21-9_beef_7",
+                                 kAliceSid);
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] ==
+          "warning|hive_unload_failed: HKU\\YUZU_HIVE_S-1-5-21-9_beef_7 for sid '" +
+              std::string{kAliceSid} +
+              "' may remain mounted; retry `reg unload HKU\\YUZU_HIVE_S-1-5-21-9_beef_7` once any "
+              "process holding the branch (Search Indexer, AV, System Restore) releases it");
+}
+
+TEST_CASE("render_hive_access_lines: warning precedes the error on a failed mount", "[profiles]") {
+    // unload_failed can be true even on mount_failed — RegLoadKeyW can succeed
+    // while the subsequent root re-open fails — so a status-first switch that
+    // returned early would drop the warning entirely. Order is part of the
+    // contract, not incidental.
+    const auto lines =
+        render_hive_access_lines(HiveAccessStatus::mount_failed, true, "MNT", kAliceSid);
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0].starts_with("warning|hive_unload_failed: HKU\\MNT "));
+    CHECK(lines[1] == "error|failed to load hive for sid '" + std::string{kAliceSid} + "'");
+}
+
+TEST_CASE("render_hive_access_lines: all 8 status x unload combinations", "[profiles]") {
+    // Exhaustive so a future enumerator cannot be added without a decision
+    // about what it prints.
+    struct Case {
+        HiveAccessStatus status;
+        bool unload_failed;
+        std::size_t expected_lines;
+    };
+    const Case cases[] = {
+        {HiveAccessStatus::ok, false, 0},
+        {HiveAccessStatus::ok, true, 1},
+        {HiveAccessStatus::not_found, false, 1},
+        {HiveAccessStatus::not_found, true, 2},
+        {HiveAccessStatus::privilege_missing, false, 1},
+        {HiveAccessStatus::privilege_missing, true, 2},
+        {HiveAccessStatus::mount_failed, false, 1},
+        {HiveAccessStatus::mount_failed, true, 2},
+    };
+    for (const auto& c : cases) {
+        const auto lines = render_hive_access_lines(c.status, c.unload_failed, "M", kAliceSid);
+        CHECK(lines.size() == c.expected_lines);
+        for (const auto& l : lines)
+            CHECK((l.starts_with("warning|") || l.starts_with("error|")));
+    }
+}
+
+TEST_CASE("render_hive_access_lines: a hostile sid cannot forge a column", "[profiles]") {
+    const auto lines = render_hive_access_lines(HiveAccessStatus::not_found, false, "", "S-1|evil");
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0].find("S-1|evil") == std::string::npos);
+    CHECK(lines[0] == "error|no reachable hive for sid 'S-1_evil' (not logged in and no profile "
+                      "path)");
+}
+
+TEST_CASE("render_user_key_error: every status, exact strings", "[profiles]") {
+    CHECK(render_user_key_error(UserKeyStatus::ok, "K").empty());
+    // up-S4: an ACL'd key is now distinguishable from an absent one.
+    CHECK(render_user_key_error(UserKeyStatus::key_access_denied, "Software\\X") ==
+          "error|access denied opening key 'Software\\X' in user hive");
+    CHECK(render_user_key_error(UserKeyStatus::value_oversized, "K") ==
+          "error|value exceeds 1 MiB limit");
+    CHECK(render_user_key_error(UserKeyStatus::value_malformed, "K") ==
+          "error|value size too small for its declared type");
+    // Key-absent and value-absent stay deliberately identical: up-S4 asks only
+    // that INFRASTRUCTURE errors be separated from absence.
+    CHECK(render_user_key_error(UserKeyStatus::key_not_found, "K") ==
+          "error|key or value not found in user hive");
+    CHECK(render_user_key_error(UserKeyStatus::value_not_found, "K") ==
+          "error|key or value not found in user hive");
+}
+
+TEST_CASE("render_user_key_error: a hostile key name cannot forge a column", "[profiles]") {
+    CHECK(render_user_key_error(UserKeyStatus::key_access_denied, "a|b") ==
+          "error|access denied opening key 'a_b' in user hive");
+}
+
+// ── #2771 up-S3: registry value decoding primitives ────────────────────────
+
+TEST_CASE("reg_type_name: every named type, including the three up-S3 added", "[profiles]") {
+    CHECK(reg_type_name(kRegNone) == "REG_NONE");
+    CHECK(reg_type_name(kRegSz) == "REG_SZ");
+    CHECK(reg_type_name(kRegExpandSz) == "REG_EXPAND_SZ");
+    CHECK(reg_type_name(kRegBinary) == "REG_BINARY");
+    CHECK(reg_type_name(kRegDword) == "REG_DWORD");
+    CHECK(reg_type_name(kRegDwordBigEndian) == "REG_DWORD_BIG_ENDIAN");
+    CHECK(reg_type_name(kRegLink) == "REG_LINK");
+    CHECK(reg_type_name(kRegMultiSz) == "REG_MULTI_SZ");
+    CHECK(reg_type_name(kRegQword) == "REG_QWORD");
+    CHECK(reg_type_name(9999) == "REG_UNKNOWN");
+}
+
+TEST_CASE("reg_type_name: the constants match the Windows ABI", "[profiles]") {
+    // These are mirrored from winnt.h so the header stays windows.h-free; the
+    // values are fixed by the ABI and a typo would silently mislabel values.
+    CHECK(kRegNone == 0u);
+    CHECK(kRegSz == 1u);
+    CHECK(kRegExpandSz == 2u);
+    CHECK(kRegBinary == 3u);
+    CHECK(kRegDword == 4u);
+    CHECK(kRegDwordBigEndian == 5u);
+    CHECK(kRegLink == 6u);
+    CHECK(kRegMultiSz == 7u);
+    CHECK(kRegQword == 11u);
+}
+
+namespace {
+/// Renders multi_sz_records' output as "a|b|c" for compact assertions.
+std::string join_records(std::span<const char16_t> data) {
+    std::string out;
+    bool first = true;
+    for (const auto& [off, len] : multi_sz_records(data)) {
+        if (!first)
+            out += '|';
+        first = false;
+        for (std::size_t i = 0; i < len; ++i)
+            out += static_cast<char>(data[off + i]);
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("multi_sz_records: well-formed list", "[profiles]") {
+    const char16_t data[] = {u'a', u'b', 0, u'c', 0, 0};
+    CHECK(join_records(std::span<const char16_t>(data, 6)) == "ab|c");
+}
+
+TEST_CASE("multi_sz_records: empty payload yields no records", "[profiles]") {
+    CHECK(multi_sz_records(std::span<const char16_t>()).empty());
+}
+
+TEST_CASE("multi_sz_records: a lone terminator yields no records", "[profiles]") {
+    const char16_t data[] = {0};
+    CHECK(multi_sz_records(std::span<const char16_t>(data, 1)).empty());
+}
+
+TEST_CASE("multi_sz_records: single record", "[profiles]") {
+    const char16_t data[] = {u'x', 0, 0};
+    CHECK(join_records(std::span<const char16_t>(data, 3)) == "x");
+}
+
+TEST_CASE("multi_sz_records: an unterminated final record is kept, not dropped", "[profiles]") {
+    // Malformed but observed. Reporting the last entry is more honest than
+    // silently losing it.
+    const char16_t data[] = {u'a', 0, u'b'};
+    CHECK(join_records(std::span<const char16_t>(data, 3)) == "a|b");
+}
+
+TEST_CASE("multi_sz_records: an embedded empty record terminates the list", "[profiles]") {
+    // Per the REG_MULTI_SZ contract the first empty record closes the list —
+    // trailing bytes after it are padding, not data.
+    const char16_t data[] = {u'a', 0, 0, u'b', 0, 0};
+    CHECK(join_records(std::span<const char16_t>(data, 6)) == "a");
+}
+
+TEST_CASE("hex_encode: empty, low and high-bit bytes", "[profiles]") {
+    CHECK(hex_encode(std::span<const std::uint8_t>()).empty());
+    const std::uint8_t one[] = {0x00};
+    CHECK(hex_encode(one) == "00");
+    const std::uint8_t two[] = {0x0f, 0xa0};
+    CHECK(hex_encode(two) == "0fa0");
+    const std::uint8_t high[] = {0xff};
+    CHECK(hex_encode(high) == "ff");
+}
+
+// ── #2771 up-S2: the unreadable-path signal ────────────────────────────────
+
+TEST_CASE("build_profile_list: carries profile_path_unreadable through", "[profiles]") {
+    // Before up-S2 an over-long ProfileImagePath left the path empty, which was
+    // indistinguishable from the value being absent. The flag is what makes
+    // list_profiles able to say which happened.
+    RawProfileRecord absent{std::string{kAliceSid}, "", false};
+    RawProfileRecord unreadable{std::string{kBobSid}, "", true};
+    const RawProfileRecord recs[] = {absent, unreadable};
+    const auto list = build_profile_list(recs, {});
+    REQUIRE(list.size() == 2);
+    CHECK_FALSE(list[0].profile_path_unreadable);
+    CHECK(list[1].profile_path_unreadable);
+    // Neither may invent a name from the SID (ADR-0024 D11).
+    CHECK(list[0].profile_name.empty());
+    CHECK(list[1].profile_name.empty());
+}
+
+// ── Column-alignment guard (the hp-B1 lesson) ──────────────────────────────
+
+namespace {
+/// Splits on every unescaped '|', mirroring result_parsing.hpp's generic
+/// split_fields path — the one registry rows actually take.
+std::vector<std::string> split_all_pipes(const std::string& s) {
+    std::vector<std::string> out;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= s.size(); ++i) {
+        if (i == s.size() || s[i] == '|') {
+            out.push_back(s.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    return out;
+}
+} // namespace
+
+TEST_CASE("render_profile_row: field COUNT and INDEX, not containment", "[profiles]") {
+    // hp-B1 was a leading discriminator tag that shifted every column one
+    // position right of its header. Substring-containment assertions passed
+    // throughout. Assert position.
+    ProfileInfo info{std::string{kAliceSid}, "alice", "C:\\Users\\alice", HiveState::loaded};
+    const auto fields = split_all_pipes(render_profile_row(info));
+    REQUIRE(fields.size() == 4);
+    CHECK(fields[0] == std::string{kAliceSid});
+    CHECK(fields[1] == "alice");
+    CHECK(fields[2] == "C:\\Users\\alice");
+    CHECK(fields[3] == "loaded");
+}
+
+TEST_CASE("render_profile_row: a pipe in a field cannot add a column", "[profiles]") {
+    ProfileInfo info{std::string{kAliceSid}, "a|b", "c|d", HiveState::loaded};
+    CHECK(split_all_pipes(render_profile_row(info)).size() == 4);
+}
+
+TEST_CASE("installed_apps user_app row keeps its leading tag and 6 fields", "[profiles]") {
+    // The inverse of the registry case, and a live trap: installed_apps is in
+    // result_parsing.hpp's kKeyValuePlugins, so the dashboard splits these
+    // rows into (key, rest) and the leading "user_app|" tag is LOAD-BEARING.
+    // Stripping it — the "fix" hp-B1 might suggest by analogy — would break
+    // rendering. This pins the shape the migrated do_list_per_user emits.
+    const std::string row = "user_app|alice|Widget|1.0|Acme|20240101";
+    const auto fields = split_all_pipes(row);
+    REQUIRE(fields.size() == 6);
+    CHECK(fields[0] == "user_app");
+    CHECK(fields[1] == "alice");
+    // An unresolvable profile name renders "-", never the SID (ADR-0024 D11)
+    // and never "" (indistinguishable from a rendering fault).
+    const auto anon = split_all_pipes("user_app|-|Widget|1.0|Acme|20240101");
+    REQUIRE(anon.size() == 6);
+    CHECK(anon[1] == "-");
 }
