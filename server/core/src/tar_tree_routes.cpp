@@ -5,6 +5,7 @@
 #include "tar_tree_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "rest_a4_envelope.hpp" // detail::error_json_a4, make_correlation_id
 #include "rest_audit.hpp"     // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "secure_random.hpp" // random_hex (CSPRNG cache token, #801)
 #include "web_utils.hpp"      // html_escape, audit_token, now_epoch_seconds
@@ -329,6 +330,24 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             res.set_content("auth required", "text/plain");
             return;
         }
+        // Fleet-wide device-enumeration disclosure (SEC-2/SEC-3 confinement-gap
+        // class, found during a docs sweep): devices_fn_ below is username-keyed
+        // and does not confine a service-scoped API token whose principal
+        // resolves to an unscoped grant.
+        if (!session->token_scope_service.empty()) {
+            const auto cid = detail::make_correlation_id();
+            (void)detail::try_persist_audit(
+                audit_fn_, req, "tar.device_picker.view", "denied", "Infrastructure", "",
+                "fleet-wide TAR device picker denied to a service-scoped token "
+                "(path=" + req.path + ")");
+            res.status = 403;
+            res.set_content(
+                detail::error_json_a4(
+                    403, "service-scoped tokens may not read the fleet-wide device list", cid,
+                    detail::A4ErrorOpts{.permission = "Infrastructure:Read"}),
+                "application/json");
+            return;
+        }
         if (!perm_fn_(req, res, "Infrastructure", "Read"))
             return;
         std::vector<DeviceRow> devices =
@@ -648,6 +667,24 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         if (!session) {
             res.status = 401;
             res.set_content("auth required", "text/plain");
+            return;
+        }
+        // Fleet-wide device-enumeration disclosure (SEC-2/SEC-3 confinement-gap
+        // class): same gap and same verb as /fragments/tar/process-tree above —
+        // devices_fn_ is username-keyed and does not confine a service-scoped
+        // API token whose principal resolves to an unscoped grant.
+        if (!session->token_scope_service.empty()) {
+            const auto cid = detail::make_correlation_id();
+            (void)detail::try_persist_audit(
+                audit_fn_, req, "tar.device_picker.view", "denied", "Infrastructure", "",
+                "fleet-wide TAR device picker denied to a service-scoped token "
+                "(path=" + req.path + ")");
+            res.status = 403;
+            res.set_content(
+                detail::error_json_a4(
+                    403, "service-scoped tokens may not read the fleet-wide device list", cid,
+                    detail::A4ErrorOpts{.permission = "Infrastructure:Read"}),
+                "application/json");
             return;
         }
         if (!perm_fn_(req, res, "Infrastructure", "Read"))

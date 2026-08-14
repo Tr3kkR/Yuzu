@@ -273,6 +273,7 @@ struct InvHarness {
     bool degrade = false;            // make every store provider return nullopt
     bool audit_should_fail = false;  // simulate an audit-persist failure (Sec-Audit-Failed)
     bool unwire_devices = false;     // register with an empty DevicesFn{} (unwired closure)
+    bool service_scoped = false;     // simulate a service-scoped API token session
     std::optional<DeviceCiRecord> ci_record; // nullopt (default) = "absent, not yet synced"
     std::vector<SoftwareFleetRow> fleet_rows;
     std::vector<std::string> in_scope_agents; // FIND per-row scope predicate allow-list
@@ -284,8 +285,11 @@ struct InvHarness {
     // `register_routes` (below) runs once, here, so the DevicesFn choice is baked in at
     // construction time (unlike `degrade`, which every provider lambda re-checks per-call).
     explicit InvHarness(bool unwire_devices_ = false) : unwire_devices(unwire_devices_) {
-        auto auth = [](const httplib::Request&, httplib::Response&) {
-            return std::optional<auth::Session>(auth::Session{});
+        auto auth = [this](const httplib::Request&, httplib::Response&) {
+            auth::Session s;
+            if (service_scoped)
+                s.token_scope_service = "printers";
+            return std::optional<auth::Session>(s);
         };
         auto perm = [this](const httplib::Request&, httplib::Response& res, const std::string&,
                            const std::string&) {
@@ -615,6 +619,28 @@ TEST_CASE("route: devices list — deny vs success (offline-inclusive, audited)"
                 audited = true;
         REQUIRE(audited);
     }
+}
+
+// SEC-2/SEC-3 confinement-gap class (found during a docs sweep): devices_fn
+// on /fragments/inventory/devices is username-keyed and does not confine a
+// service-scoped API token whose principal resolves to an unscoped grant —
+// the GDPR-personal-data roster (serial/system_uuid/primary_mac) would still
+// be fleet-wide.
+TEST_CASE("route: devices list — service-scoped token denied, denial audited",
+          "[inventory][route][security]") {
+    InvHarness h;
+    h.service_scoped = true;
+    auto res = h.sink.Get("/fragments/inventory/devices");
+    REQUIRE(res);
+    REQUIRE(res->status == 403);
+    REQUIRE_FALSE(contains(res->body, "WIN-1"));
+    bool denied = false;
+    for (const auto& a : h.audits) {
+        if (a == "inventory.devices|denied")
+            denied = true;
+        REQUIRE(a != "inventory.devices|success");
+    }
+    REQUIRE(denied);
 }
 
 TEST_CASE("route: devices list — CI enrichment degrade audits failure, roster still renders",
