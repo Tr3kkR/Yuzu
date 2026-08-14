@@ -178,10 +178,10 @@ struct RestGsHarness {
     // fleet-wide /guaranteed-state/events branch denies these outright, since
     // require_permission's service-token branch checks only the ITServiceOwner
     // role and never the token's own service-tag scope). Default empty
-    // preserves every other test's ordinary-operator session. Also used by
-    // the /guaranteed-state/status service-token-denial test below (#2298
-    // item 6d) — same underlying mechanism, one field, not a per-route
-    // duplicate.
+    // preserves every other test's ordinary-operator session. NOT dead code:
+    // still live and used by many tests below (the events-route tests, and —
+    // before the fleet /status route migrated to real tokens via
+    // service_scoped_token_headers() — its own service-token-denial test).
     std::string session_token_scope_service;
 
     // When false, perm_fn denies (403) — lets a test prove the permission gate
@@ -480,11 +480,11 @@ struct RestGsHarness {
     // The fleet /status route's real AuthRoutes::require_list_read gate needs
     // an actual authenticated request — unlike every other route in this
     // harness, still gated by the stub auth_fn/perm_fn above (the
-    // session_user/session_scope_service stub fields do NOT reach this
-    // route). Mints a cookie session for the CURRENT session_user/
-    // session_role and returns headers carrying it; a test that reassigns
-    // session_user before calling this (the DenyAll/AdmitAll/AdmitScoped
-    // [adr0017] cases) gets a session for the new principal.
+    // session_user stub field does NOT reach this route). Mints a cookie
+    // session for the CURRENT session_user/session_role and returns headers
+    // carrying it; a test that reassigns session_user before calling this
+    // (the DenyAll/AdmitAll/AdmitScoped [adr0017] cases) gets a session for
+    // the new principal.
     std::unordered_map<std::string, std::string> status_route_headers() {
         REQUIRE(!session_user.empty());
         REQUIRE(auth_mgr_.upsert_user(session_user, "password1234", session_role));
@@ -507,9 +507,9 @@ struct RestGsHarness {
     }
 
     // A real service-scoped API token (Bearer) for the fleet route's
-    // service-scoped-token denial test — the stub auth_fn's
-    // session_scope_service knob doesn't reach this route once list_read_fn
-    // resolves its own session from headers instead.
+    // service-scoped-token denial test — this route resolves its own
+    // session from headers via list_read_fn, so a stub session has no way
+    // to carry a service scope onto it.
     std::unordered_map<std::string, std::string>
     service_scoped_token_headers(const std::string& service) {
         REQUIRE(!session_user.empty());
@@ -1326,20 +1326,24 @@ TEST_CASE("REST gs.status: a service-scoped token is denied outright (World-A / 
     // so a bare perm_fn pass alone would let a token scoped to one service read the
     // fleet-wide aggregate. require_list_read (the route's SOLE gate since the #3038
     // fix) denies a service-scoped token outright, regardless of role. A REAL token
-    // now (not the session_token_scope_service stub) — the stub session never
-    // reaches this route once list_read_fn resolves its own session from headers.
+    // now — this route resolves its own session from headers via list_read_fn, so a
+    // stub session has no way to carry a service scope onto it.
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/guaranteed-state/status",
                           h.service_scoped_token_headers("printers"));
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(res->body.find("errored_rules") == std::string::npos);
-    // Audit coverage for require_list_read's own denial path (via
-    // AuthRoutes::audit_log, action "auth.permission_required") is exercised
-    // directly in test_auth_list_read_gate.cpp / test_authz_topology_floor.cpp's
-    // sibling methods — this harness's audit_log vector is fed by a SEPARATE
-    // stub audit_fn used by every OTHER route, which the fleet route no longer
-    // calls (require_list_read renders its own denial + audit row internally).
+    // KNOWN GAP, stated honestly rather than cited against coverage that
+    // doesn't exist: this test does NOT assert on require_list_read's own
+    // audit row (AuthRoutes::audit_log, action "auth.permission_required")
+    // — this harness's audit_log vector is fed by a SEPARATE stub audit_fn
+    // used by every OTHER route, which the fleet route no longer calls.
+    // test_auth_list_read_gate.cpp's ladder tests ALSO don't assert audit
+    // content (they construct AuthRoutes with audit_store=nullptr, a no-op
+    // audit sink) — asserting real audit-row content here would need a
+    // real PG-backed AuditStore wired into this harness's auth_routes_
+    // (mirrors test_authz_topology_floor.cpp's FloorFixture), not yet done.
 }
 
 // ── ADR-0017 authorize_list_read confinement on the fleet route (adversarial-
