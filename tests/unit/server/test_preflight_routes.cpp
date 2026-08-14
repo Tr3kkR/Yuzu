@@ -15,14 +15,17 @@
 #include "preflight_routes.hpp"
 #include "preflight_run_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <chrono>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 using yuzu::server::pg::PgPool;
@@ -171,4 +174,115 @@ TEST_CASE("render_run: a genuinely pending (not degraded) live read still "
     auto devices = run_store.get_devices(run_id);
     REQUIRE(devices.size() == 1);
     CHECK(devices[0].bucket == "inc"); // genuinely incomplete, correctly persisted
+}
+
+// SEC-2/SEC-3 confinement-gap class (found during Gate 2 governance review):
+// resolve_targets() feeds devices_fn_(username) — the same username-keyed
+// provider fixed elsewhere in this branch — into a DISPATCH (not just a
+// read), via the shared command_dispatch_fn. Denied here, unlike the pure
+// reads elsewhere in this branch, because /fragments/auto/run mutates
+// (creates a run + dispatches commands) even though every dispatched check
+// is itself read-only.
+TEST_CASE("preflight routes: /fragments/auto/run denies a service-scoped "
+          "token, denial audited, nothing dispatched",
+          "[preflight][routes][security]") {
+    auto serviceScopedAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.token_scope_service = "printers";
+        return std::optional<auth::Session>(s);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    int devices_fn_calls = 0;
+    auto devices = [&](const std::string&) {
+        ++devices_fn_calls;
+        DeviceRow d;
+        d.agent_id = "WS-1";
+        d.hostname = "WS-1-host";
+        return std::vector<DeviceRow>{d};
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string&, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&,
+                                  const std::string&) -> std::pair<std::string, int> {
+        ++dispatched;
+        return {"cmd-1", 1};
+    };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+
+    yuzu::server::test::TestRouteSink sink;
+    PreflightRoutes routes;
+    routes.register_routes(sink, serviceScopedAuth, okPerm, devices,
+                           /*groups_fn=*/{}, /*group_members_fn=*/{}, dispatch,
+                           /*collect_fn=*/{}, audit, /*run_store=*/nullptr);
+
+    auto res = sink.Post("/fragments/auto/run", "", "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    // The deny fires before resolve_targets() is ever called — no fleet
+    // enumeration and no dispatch reach a service-scoped token at all.
+    CHECK(devices_fn_calls == 0);
+    CHECK(dispatched == 0);
+    REQUIRE(audit_log.size() == 1);
+    CHECK(audit_log[0] == "preflight.run|denied");
+}
+
+TEST_CASE("preflight routes: /fragments/auto/run reaches resolve_targets + "
+          "dispatch for an ordinary session",
+          "[pg][preflight][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, preflight_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PreflightRunStore run_store{pool};
+    REQUIRE(run_store.is_open());
+
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    int devices_fn_calls = 0;
+    auto devices = [&](const std::string&) {
+        ++devices_fn_calls;
+        DeviceRow d;
+        d.agent_id = "WS-1";
+        d.hostname = "WS-1-host";
+        d.os = "windows";
+        return std::vector<DeviceRow>{d};
+    };
+    int dispatched = 0;
+    auto dispatch = [&dispatched](const std::string&, const std::string&,
+                                  const std::vector<std::string>&, const std::string&,
+                                  const std::unordered_map<std::string, std::string>&,
+                                  const std::string&) -> std::pair<std::string, int> {
+        ++dispatched;
+        return {"cmd-1", 1};
+    };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+
+    yuzu::server::test::TestRouteSink sink;
+    PreflightRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, devices, /*groups_fn=*/{},
+                           /*group_members_fn=*/{}, dispatch, /*collect_fn=*/{}, audit, &run_store);
+
+    auto res = sink.Post("/fragments/auto/run", "", "application/x-www-form-urlencoded");
+    REQUIRE(res);
+    CHECK(res->status != 403); // not denied — reaches resolve_targets, creates the run, dispatches
+    CHECK(devices_fn_calls == 1);
+    CHECK(dispatched >= 1); // at least one applicable check dispatched
+    bool saw_success = false;
+    for (const auto& a : audit_log)
+        if (a == "preflight.run|success")
+            saw_success = true;
+    CHECK(saw_success);
 }

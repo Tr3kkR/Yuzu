@@ -86,6 +86,7 @@ std::string render_auto_note(const std::string& message);
 
 class PreflightRunStore; // server/core/src/preflight_run_store.hpp
 struct PreflightRunRow;  //   "
+class HttpRouteSink;     // server/core/src/http_route_sink.hpp
 
 /// `/auto` routes — page shell + config/rail fragment + run creation + result
 /// poll. Runs persist (PreflightRunStore); a running run renders live, a complete
@@ -115,6 +116,12 @@ public:
     using AuditFn = DexRoutes::AuditFn;
 
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
+                         GroupsFn groups_fn, GroupMembersFn group_members_fn, DispatchFn dispatch_fn,
+                         CollectFn collect_fn, AuditFn audit_fn, PreflightRunStore* run_store);
+
+    /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
+    /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, DevicesFn devices_fn,
                          GroupsFn groups_fn, GroupMembersFn group_members_fn, DispatchFn dispatch_fn,
                          CollectFn collect_fn, AuditFn audit_fn, PreflightRunStore* run_store);
 

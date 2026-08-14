@@ -577,8 +577,10 @@ static const ToolDef kTools[] = {
     {"list_dex_perf_devices",
      "The device list behind every fleet-performance drill: worst devices by a metric (default), "
      "devices NOT reporting perf (filter=not_reporting), or one cohort's members (cohort_key + "
-     "cohort_value; empty value = untagged). Machine-health telemetry (device state, not "
-     "behavioral data). Mirrors GET /api/v1/dex/perf/devices. Requires GuaranteedState:Read.",
+     "cohort_value; empty value = untagged). Each row names an agent_id fleet-wide, so every call "
+     "is audit-logged (dex.perf.device.view); a service-scoped API token is denied (403) — no "
+     "single agent_id to confine against. Mirrors GET /api/v1/dex/perf/devices. Requires "
+     "GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("metric":{"type":"string","enum":["cpu","commit","disk_lat"],"default":"cpu"},)j"
      R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = Windows devices with no perf sample this cycle"},)j"
@@ -714,7 +716,10 @@ static const ToolDef kTools[] = {
      "devices NOT reporting network (filter=not_reporting), a co-occurrence band "
      "(cooc=device|app|network_only|degraded), or one cohort's members (key + cohort_value; empty "
      "value = untagged). Rows carry the co-occurring facts (under_pressure, app_unstable) — "
-     "evidence, never a verdict. Mirrors GET /api/v1/network/devices. Requires GuaranteedState:Read.",
+     "evidence, never a verdict. Each row names an agent_id fleet-wide, so every call is "
+     "audit-logged (network.device.view); a service-scoped API token is denied (403) — no single "
+     "agent_id to confine against. Mirrors GET /api/v1/network/devices. Requires "
+     "GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("metric":{"type":"string","enum":["rtt","retrans","throughput"],"default":"rtt"},)j"
      R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = devices with no network sample this cycle"},)j"
@@ -5898,12 +5903,6 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     const int limit = (std::min)(raw_limit, 500);
-                    // Behavioral-PII access audit — same verb/target as the
-                    // REST sibling GET /api/v1/dex/perf/devices. MCP
-                    // convention: set-and-proceed (audit_persisted:false
-                    // appended below on failure), not REST's fail-closed —
-                    // JSON-RPC has no response-header channel, matching
-                    // get_dex_signal_detail's own established posture.
                     // Behavioral-PII access audit — same verb/target as the
                     // REST sibling GET /api/v1/dex/perf/devices. MCP
                     // convention: set-and-proceed (audit_persisted:false

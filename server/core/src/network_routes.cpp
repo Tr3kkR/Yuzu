@@ -149,10 +149,6 @@ void NetworkRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         // GET /api/v1/network/devices. Set-and-proceed (HTML dashboard
         // fragment, not REST's fail-closed): a transient audit hiccup must
         // not blank this operator's view.
-        // Behavioral-PII access audit — same verb/target as the REST sibling
-        // GET /api/v1/network/devices. Set-and-proceed (HTML dashboard
-        // fragment, not REST's fail-closed): a transient audit hiccup must
-        // not blank this operator's view.
         (void)detail::try_persist_audit(audit_fn_, req, "network.device.view", "success",
                                         "GuaranteedState", "",
                                         "fleet-wide network device list via dashboard fragment");

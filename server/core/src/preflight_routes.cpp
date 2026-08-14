@@ -18,6 +18,9 @@
 #include "preflight_eval.hpp"       // collect/applicable/dispatch_params/check_*/config_*/checks_from_json
 #include "preflight_parse.hpp"      // kPreflightChecks, compute_device_results, bucket_from_token
 #include "preflight_run_store.hpp"  // PreflightRunStore + rows
+#include "http_route_sink.hpp"
+#include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
+#include "rest_audit.hpp"           // detail::try_persist_audit
 #include "web_utils.hpp"            // html_escape
 
 #include <yuzu/server/auth.hpp> // auth::AuthManager (run-id bytes)
@@ -210,6 +213,17 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
                                       GroupMembersFn group_members_fn, DispatchFn dispatch_fn,
                                       CollectFn collect_fn, AuditFn audit_fn,
                                       PreflightRunStore* run_store) {
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(devices_fn),
+                    std::move(groups_fn), std::move(group_members_fn), std::move(dispatch_fn),
+                    std::move(collect_fn), std::move(audit_fn), run_store);
+}
+
+void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
+                                      DevicesFn devices_fn, GroupsFn groups_fn,
+                                      GroupMembersFn group_members_fn, DispatchFn dispatch_fn,
+                                      CollectFn collect_fn, AuditFn audit_fn,
+                                      PreflightRunStore* run_store) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     devices_fn_ = std::move(devices_fn);
@@ -221,7 +235,7 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
     run_store_ = run_store;
 
     // ── Page shell — auth-only chrome ────────────────────────────────────────
-    svr.Get("/auto", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/auto", [this](const httplib::Request& req, httplib::Response& res) {
         if (!auth_fn_ || !auth_fn_(req, res)) {
             res.status = 401;
             res.set_content("auth required", "text/plain");
@@ -232,7 +246,7 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
     });
 
     // ── Config + saved-runs rail ─────────────────────────────────────────────
-    svr.Get("/fragments/auto", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/auto", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
             res.status = 401;
@@ -249,7 +263,7 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
     });
 
     // ── Delete a run (owner-scoped, confirm-guarded on the client) ───────────
-    svr.Post("/fragments/auto/delete", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/fragments/auto/delete", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
             res.status = 401;
@@ -282,11 +296,34 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
     });
 
     // ── Run — freeze cohort, create run, first dispatch, render live ─────────
-    svr.Post("/fragments/auto/run", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Post("/fragments/auto/run", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
             res.status = 401;
             res.set_content("auth required", "text/plain");
+            return;
+        }
+        // Fleet-wide dispatch (SEC-2/SEC-3 confinement-gap class, found during
+        // Gate 2 review): resolve_targets() below calls devices_fn_ — the same
+        // username-keyed provider fixed elsewhere in this branch, which does not
+        // confine a service-scoped API token whose principal resolves to an
+        // unscoped grant — then DISPATCHES the resolved checks via
+        // command_dispatch_fn (unconfined). Denied here, ahead of/independent
+        // from perm_fn_, unlike the read-only fixes elsewhere in this branch
+        // because this route MUTATES (creates a run + dispatches commands, even
+        // though every dispatched check is itself read-only per the /auto
+        // Pre-flight routed-concern's own safety invariant).
+        if (!session->token_scope_service.empty()) {
+            const auto cid = detail::make_correlation_id();
+            (void)detail::try_persist_audit(
+                audit_fn_, req, "preflight.run", "denied", "Scope", "",
+                "fleet-wide pre-flight dispatch denied to a service-scoped token");
+            res.status = 403;
+            res.set_content(
+                detail::error_json_a4(
+                    403, "service-scoped tokens may not start a fleet-wide pre-flight run", cid,
+                    detail::A4ErrorOpts{.permission = "Infrastructure:Read"}),
+                "application/json");
             return;
         }
         // Run dispatches AND renders the (Infrastructure:Read) result grid +
@@ -375,7 +412,7 @@ void PreflightRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Perm
     });
 
     // ── Result poll / revisit ── ?run=<id> (owner-scoped) ────────────────────
-    svr.Get("/fragments/auto/result", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/auto/result", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_ ? auth_fn_(req, res) : std::optional<auth::Session>{};
         if (!session) {
             res.status = 401;
