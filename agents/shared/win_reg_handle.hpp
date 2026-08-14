@@ -24,10 +24,58 @@
 #endif
 #include <windows.h>
 
+#include <atomic>
+#include <cstdint>
+#include <random>
 #include <string>
 #include <utility>
 
 namespace yuzu::win {
+
+/// A process-unique HKEY_USERS mount name for `sid`, of the shape
+/// `YUZU_HIVE_<sid>_<16 hex>_<n>`.
+///
+/// Salt scheme mirrors agents/core/src/agent_csr.cpp's random_suffix(): a
+/// one-time random_device base (seeded once, no per-call fd churn) XORed with
+/// a monotonic atomic counter — unique within the process, unpredictable
+/// across processes, and not solely dependent on random_device entropy, which
+/// degrades on some virtualised hosts. Deliberately NOT salted with a clock
+/// or a thread id (CLAUDE.md standing rule; flake #473). The tests-only
+/// yuzu::test::process_random_salt() is not reachable from agents/shared/, so
+/// the idiom is mirrored rather than shared.
+///
+/// WHAT THIS FIXES, precisely (#2771 up-S1): two callers can no longer ALIAS
+/// each other's mount, one caller's unload can no longer yank the hive out
+/// from under another's open handles, and a crashed process's stale mount no
+/// longer poisons a fixed name forever.
+///
+/// WHAT IT DOES NOT FIX: two concurrent OFFLINE reads of the same logged-out
+/// profile still cannot both succeed. RegLoadKeyW opens the hive FILE with
+/// exclusive access, so the loser now fails with ERROR_SHARING_VIOLATION
+/// instead of a name collision — a different error, not a working read. Do
+/// not describe the collision as resolved.
+[[nodiscard]] inline std::wstring unique_hive_mount_name(std::wstring_view sid) {
+    static constexpr wchar_t kHex[] = L"0123456789abcdef";
+    static const std::uint64_t base = [] {
+        std::random_device rd;
+        return (static_cast<std::uint64_t>(rd()) << 32) ^ rd();
+    }();
+    static std::atomic<std::uint64_t> counter{0};
+
+    const std::uint64_t n = counter.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t v = base ^ n;
+
+    std::wstring out = L"YUZU_HIVE_";
+    out += sid;
+    out += L'_';
+    for (int i = 0; i < 16; ++i) {
+        out += kHex[v & 0xF];
+        v >>= 4;
+    }
+    out += L'_';
+    out += std::to_wstring(n);
+    return out;
+}
 
 // RAII owner for a HKEY obtained from RegOpenKeyExW / RegCreateKeyExW /
 // RegLoadKeyW's mount root. Closes via RegCloseKey on destruction.
@@ -91,6 +139,11 @@ private:
 // caller a borrowed HKEY for the duration of one callback and closes that
 // handle before returning, so a handle into the mount cannot accidentally
 // outlive the mount -- there is no other way to obtain one.
+//
+// Callers should derive `mount_name` from unique_hive_mount_name() rather
+// than a fixed string, so two callers cannot alias one another's mount. That
+// does NOT let two concurrent offline reads of the SAME profile both succeed
+// -- RegLoadKeyW holds the hive file exclusively; see that function's note.
 class ScopedUserHive {
 public:
     /// Attempts RegLoadKeyW(HKEY_USERS, mount_name, hive_file_path) immediately.
