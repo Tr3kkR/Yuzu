@@ -839,6 +839,45 @@ for lockout/break-glass recovery — that runbook has been rewritten for this
 cutover and is Postgres-native throughout (`psql "$YUZU_POSTGRES_DSN"` against
 the `auth` schema).
 
+## Notification feed moves to PostgreSQL — history preserved (NotificationStore, ADR-0046)
+
+`NotificationStore` — the dashboard toast/badge feed — moves from the SQLite
+`notifications.db` file to the server's PostgreSQL substrate in this release
+(ADR-0006 Wave 2, ADR-0046), schema `notification_store`. **Unread/dismissed
+state is preserved by a mandatory backfill, not a fresh start.** No new flag
+or environment variable is added (it reuses the shared server `PgPool`).
+
+**What happens on first PG boot:**
+
+- A one-time, idempotent, **fail-closed** backfill copies every notification
+  out of the legacy `notifications.db` into `notification_store`, preserving
+  ids (so any bookmarked/linked notification id stays valid) and read/dismissed
+  state. The legacy file is moved aside once the backfill is verified.
+- **Startup failure mode changed.** Previously, a broken or unreadable
+  `notifications.db` degraded only the notification feature — the store ran
+  closed and `/api/notifications*` returned 503. **It now fails the whole
+  server boot** (matching every other Postgres-migrated store's fail-closed
+  contract): if the schema can't open, or the backfill can't complete, the
+  server logs `[PG] Refusing to start` and refuses to serve at all. If you
+  hit this, the log line names the legacy file and states the remediation:
+  repair it, or move it aside to skip the backfill (unread/dismissed history
+  in it will **not** carry over if you do).
+- **Multi-instance consolidation — boot the authoritative replica first.**
+  If you are consolidating multiple previously-independent server instances
+  (each with genuinely different local `notifications.db` content) onto one
+  shared Postgres for the first time, whichever instance boots first and
+  completes the backfill becomes the fleet's sole notification history — every
+  other instance's own legacy file will permanently fail closed (a
+  holder-side fingerprint mismatch) on every subsequent boot, requiring manual
+  reconciliation (move the losing instances' legacy files aside once you've
+  confirmed their content is disposable). This is the intended fail-loud
+  behavior, not a bug — there is no automated merge across independent legacy
+  files. Boot the instance holding the notification history you want to keep
+  first, same guidance as the RBAC store migration above.
+
+**Not affected:** `/api/notifications*` request/response behavior is
+unchanged — this is a storage-engine swap only, no API change.
+
 ## Audit trail migrates to PostgreSQL — history preserved (AuditStore, ADR-0040)
 
 The audit log (`AuditStore`, the SOC 2 evidence chain) moves from the SQLite

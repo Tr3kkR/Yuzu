@@ -532,7 +532,10 @@ one of:
 and its value equals the SCIM resource's `externalId`. A missing, empty, or
 any other `Format` — including the SAML 2.0 `transient` format — is treated
 conservatively as **not linkable**; no link forms and no error is raised
-(the login still succeeds).
+(the login still succeeds). That login is still recorded as a durable
+observation for [D2](#d2--a-saml-user-logged-in-but-their-access-wasnt-revoked-on-deprovision)
+below — including an empty/absent Format, which is observed as-is, not
+dropped — the observation just never promotes into a link.
 
 > **Warning — many IdPs default to `transient` NameID.** If your IdP issues
 > a `transient` NameID (a common out-of-the-box default for a SAML 2.0
@@ -545,7 +548,13 @@ conservatively as **not linkable**; no link forms and no error is raised
 > the SCIM `externalId` you push for the same user, and verify the link is
 > forming (watch `yuzu_scim_saml_link_write_failures_total`, below, and
 > confirm no unexpected `0`-link population) before relying on this for
-> offboarding evidence.
+> offboarding evidence. If you can't fix the IdP's NameID Format
+> immediately, `yuzu_scim_deprovision_saml_unlinked_total` (see
+> [D2](#d2--a-saml-user-logged-in-but-their-access-wasnt-revoked-on-deprovision)
+> below) is the deprovision-time backstop for exactly this
+> unlinkable-NameID population — a bump there confirms an affected user
+> was deprovisioned while still holding a live, unrevoked SAML session,
+> even though no link ever formed to catch it directly.
 
 **What deprovision-revoke actually does.** The linked-SAML-identity revoke
 invalidates the user's active SAML session cookie(s), forcing
@@ -554,12 +563,27 @@ under a SAML principal is revoked with that principal on deprovision the
 same way an OIDC-linked token is, so in practice a SAML deprovision's
 observable effect is the session teardown described above.
 
-**Metric.** `yuzu_scim_saml_link_write_failures_total` (counter, no labels)
-bumps when a SAML login's identity-link *write* fails (a ScimStore outage
-during the login window) — the login itself always succeeds; link writes
-are fail-OPEN by design. A sustained non-zero rate means SAML identities are
-silently not linking during that window; correlate with ScimStore/Postgres
-health. See [Metrics reference](metrics.md) for the full row.
+**Metrics and audit verbs — SAML link health.** One existing write-failure
+counter, plus four new #3072 counters and two new audit verbs (see
+[D2](#d2--a-saml-user-logged-in-but-their-access-wasnt-revoked-on-deprovision)
+below for how the latter six fit together):
+
+- `yuzu_scim_saml_link_write_failures_total` (counter, no labels) — bumps
+  when a SAML login's identity-link write **or** its D2 login-observation
+  write fails (a ScimStore outage during the login window). The login
+  itself always succeeds; both writes are fail-OPEN by design. A sustained
+  non-zero rate means SAML identities are silently not linking, **and**
+  D2's own detection is blind for those logins, during that window;
+  correlate with ScimStore/Postgres health.
+- `yuzu_scim_saml_link_unmatched_total`, `yuzu_scim_saml_link_ambiguous_total`,
+  `yuzu_scim_saml_link_lookup_failures_total` — login-time D2 signals,
+  backed by the `auth.saml.link_unmatched` / `auth.saml.link_lookup_failed`
+  audit verbs.
+- `yuzu_scim_deprovision_saml_unlinked_total` — the deprovision-time D2
+  tripwire.
+
+See [Metrics reference](metrics.md) for the full metric rows and [REST API
+Reference](rest-api.md) for the audit-action table.
 
 ### Deny-at-login: a deprovisioned SAML identity cannot re-authenticate
 
@@ -608,6 +632,74 @@ sustained non-zero rate with no matching recent SCIM deprovision more likely
 indicates a `ScimStore`/Postgres availability problem than a wave of
 terminated users trying to log back in — correlate with Postgres health
 before assuming every increment is a legitimate deny.
+
+### D2 — a SAML user logged in but their access wasn't revoked on deprovision
+
+Unlike OIDC's [D2](#d2--a-federated-user-logged-in-but-their-tokens-werent-revoked)
+above — one detector, because OIDC has several candidate claims to
+re-check after the fact — SAML's D2 (#3072) is a **pair** of complementary
+signals, because SAML has only one candidate join key (the NameID). Every
+SAML login is recorded as a durable observation, including one whose
+NameID `Format` isn't linkable (see the NameID-Format contract above) —
+this is what makes both signals below possible.
+
+**Login-time signals (fire immediately; the login still succeeds).** For a
+**stable**-Format NameID, the login-time link attempt already runs the
+active-`externalId` lookup, so a failure to link is caught right away:
+
+- `auth.saml.link_unmatched` (audit, `result=failure`) fires when the
+  lookup found **no** active `externalId` match
+  (`reason=no_active_external_id_match`) or **more than one**
+  (`reason=ambiguous_active_external_id_match`) — check the audit
+  `detail`'s `reason=` to tell them apart. Counted separately:
+  `yuzu_scim_saml_link_unmatched_total` (no match) and
+  `yuzu_scim_saml_link_ambiguous_total` (ambiguous — usually duplicate or
+  stale `externalId` data in SCIM, a more actionable misconfiguration than
+  ordinary IdP/SCIM drift).
+- `auth.saml.link_lookup_failed` (audit, `result=failure`,
+  `reason=scim_store_unavailable`) fires when the lookup itself couldn't
+  be answered (a `ScimStore`/Postgres blip) — distinct from the above so a
+  store outage is never misread as "this identity has no matching SCIM
+  user." Counted by `yuzu_scim_saml_link_lookup_failures_total`.
+
+**Deprovision-time tripwire.** `yuzu_scim_deprovision_saml_unlinked_total`
+fires when a deprovisioned resource has **zero** linked SAML identities but
+a recorded login observation shows a NameID matching its `externalId` —
+this is the detector that catches an **unstable**-Format NameID (one that
+never reached the login-time lookup above, because the Format gate skipped
+it) whose *value* nonetheless matches. **This is the tripwire for "my
+CC6.8 coverage for SAML users is a false green."**
+
+**Diagnosing "why didn't deprovisioning this user revoke their SAML
+access":**
+
+1. Check `yuzu_scim_deprovision_saml_unlinked_total` for a bump at
+   deprovision time — it means the user's SAML NameID *value* matched
+   their `externalId`, but their IdP's NameID `Format` was never stable
+   enough to link (see the warning box above; the most common cause is a
+   `transient` default).
+2. If that counter is flat, check the three login-time counters for the
+   affected window: `yuzu_scim_saml_link_unmatched_total` /
+   `_ambiguous_total` mean a stable-Format login *did* attempt to link and
+   failed (a stale/duplicate `externalId`, or the IdP's NameID value
+   genuinely doesn't match what SCIM pushed); `yuzu_scim_saml_link_lookup_failures_total`
+   means the check itself couldn't run that time — correlate with
+   Postgres health rather than treating it as a linkage misconfiguration.
+3. If none of the four counters moved for the user in question, their
+   SAML login was never observed in the relevant window at all — either
+   they didn't sign in via SAML in that window, or the observation write
+   itself silently failed (see `yuzu_scim_saml_link_write_failures_total`
+   above).
+
+**What this does not do.** As with OIDC's D2, both signals are conditioned
+on a login-then-deprovision pair actually occurring in the window you're
+checking — a flat set of counters means "nothing detected yet," not
+"every SAML user is provably linked." Neither signal attributes a
+**stable**-Format NameID that never matches any `externalId`, if that fact
+is only discovered at deprovision time — that specific case is caught by
+the login-time signals above instead (they fire the moment the mismatch
+is observable); true deprovision-time attribution of it is deferred to
+[#3098](https://github.com/Tr3kkR/Yuzu/issues/3098).
 
 **Rotating your IdP's entity ID strands existing links.** `saml_identity_links`
 rows are keyed on `(entity_id, NameID)`. If you rotate

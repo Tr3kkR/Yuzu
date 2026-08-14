@@ -11,16 +11,10 @@
 /// itself is instead covered end-to-end in test_saml_routes.cpp, which DOES
 /// have a signing harness, unlike the OIDC side).
 ///
-/// Deliberately `void` and never throws: this is the fail-OPEN half of
-/// ADR-2001's login-time linking contract — a link-write/lookup failure
-/// never fails the login. Every `ScimStore` call failure is logged and
-/// swallowed here, mirroring `link_oidc_login_to_scim` exactly. Unlike the
-/// OIDC side, there is no login-observation/D2 analogue here: OIDC's D2
-/// detector exists specifically to catch a MISCONFIGURED
-/// `--oidc-scim-link-claim` (the operator chose the wrong claim among
-/// several candidates); SAML has exactly one candidate join key (the
-/// NameID) and no equivalent claim-selection knob, so there is no
-/// "should-have-matched-a-different-candidate" case to detect.
+/// Never throws: this is the fail-OPEN half of ADR-2001's login-time
+/// linking contract — a link-write/lookup failure never fails the login.
+/// Every `ScimStore` call failure is logged and swallowed here, mirroring
+/// `link_oidc_login_to_scim` exactly.
 ///
 /// NameID Format gate (architect BLOCK fix, ADR-2001 PR4a plan review): a
 /// SAML NameID is only a safe join key when it is STABLE across logins and
@@ -34,6 +28,18 @@
 /// succeeds); the identity is simply unlinkable/unrevocable-via-SCIM for
 /// that login — the documented residual (see docs/adr/2001-scim-oidc-
 /// identity-linkage.md).
+///
+/// ADR-2001 #3072 — SAML D2 observability: unlike the historical posture
+/// above ("SAML has no login-observation/D2 analogue"), this function now
+/// records a SAML login observation (`ScimStore::record_saml_login_observation`)
+/// UNCONDITIONALLY, before the NameID-Format-linkable gate — even a
+/// transient/unspecified-Format login is observed, so a later deprovision's
+/// `saml_observation_matches` can still surface "a SAML login WAS attempted
+/// under this externalId, but the NameID Format made it unlinkable" (SAML's
+/// own D2-style tripwire, `scim_routes.cpp`'s `maybe_flag_saml_d2_unlinked`).
+/// This is OBSERVE-ONLY: the observation is never normalized/promoted into a
+/// link, and an unstable-format NameID is still never linked — see
+/// `SamlScimLinkOutcome::not_linkable` below.
 
 #include <optional>
 #include <string>
@@ -57,6 +63,40 @@ namespace yuzu::server::saml {
 /// `transient` — is conservatively treated as NOT linkable.
 [[nodiscard]] bool is_linkable_name_id_format(const std::string& name_id_format);
 
+/// ADR-2001 #3072 — the typed outcome `link_saml_login_to_scim` resolves to.
+/// This is an OBSERVABILITY signal only — every value below is a PROCEED
+/// outcome for the login itself (login-time linking is fail-OPEN by
+/// contract; see the file header). The caller uses this to decide what to
+/// audit/count, never whether to deny the login.
+///  - `not_linkable`: the NameID Format was not one of the STABLE formats
+///    (`is_linkable_name_id_format` false) — no lookup was attempted, no
+///    link formed. The observation was still recorded (unconditionally,
+///    before this gate).
+///  - `linked`: exactly one active SCIM resource matched `name_id` and the
+///    `saml_identity_links` upsert succeeded.
+///  - `no_active_match`: the NameID Format was linkable, but zero active
+///    SCIM resources matched `name_id`.
+///  - `ambiguous_match`: the NameID Format was linkable, but MORE THAN ONE
+///    active SCIM resource matched `name_id` (ADR-2001 §2 mis-link guard —
+///    an ambiguous externalId is never resolved arbitrarily).
+///  - `lookup_store_error`: the NameID Format was linkable, but the
+///    `ScimStore` lookup itself could not answer (closed store, lease
+///    timeout, or a failed statement) — distinct from `no_active_match`
+///    (a genuine zero-match answer) so the caller can tell "no match" from
+///    "could not ask".
+///  - `link_write_error`: exactly one active match was found, but the
+///    `upsert_saml_link` write failed — the existing
+///    `yuzu_scim_saml_link_write_failures_total` counter still fires for
+///    this case (unchanged behaviour).
+enum class SamlScimLinkOutcome {
+    not_linkable,
+    linked,
+    no_active_match,
+    ambiguous_match,
+    lookup_store_error,
+    link_write_error,
+};
+
 /// Resolves `name_id` (the caller MUST have already sanitised it — see
 /// `saml_principal.hpp`'s `is_valid_saml_component`, applied at the ACS
 /// handler before either this call or session mint) against `scim_store`'s
@@ -67,21 +107,38 @@ namespace yuzu::server::saml {
 ///  - Zero or more-than-one match, OR a non-linkable Format: forms NO link
 ///    — an ambiguous `externalId` (or an unstable NameID) is never resolved
 ///    arbitrarily (ADR-2001 §2 mis-link guard, mirrored from the OIDC side;
-///    `ScimStore::find_unique_active_by_external_id` already encodes the
-///    ambiguity rule, this function just consumes it).
+///    `ScimStore::find_unique_active_by_external_id_checked` already encodes
+///    the ambiguity rule, this function just consumes it).
+///
+/// ADR-2001 #3072: records a SAML login observation
+/// (`ScimStore::record_saml_login_observation`) UNCONDITIONALLY, first —
+/// before the NameID-Format-linkable gate — so even an unstable-format
+/// login is observed (needed for the SAML D2 detector,
+/// `scim_routes.cpp`'s `maybe_flag_saml_d2_unlinked`). The NameID itself is
+/// never normalized here — only observed as-is. `name_id_format`, unlike
+/// the NameID, IS bounded before it is recorded (Gate 7 fix): a value
+/// exceeding 255 bytes or containing a control byte (<0x20 or ==0x7F)
+/// collapses to `""` ("format unspecified") rather than being stored
+/// as-is — defense-in-depth against a hostile/misconfigured pinned IdP
+/// growing the observations table's index unbounded. A missing/empty
+/// Format is a normal, legitimate IdP configuration and is recorded as
+/// `""` either way — it is never treated as a reason to skip the
+/// observation write (see `ScimStore::record_saml_login_observation`'s own
+/// doc comment).
 ///
 /// `metrics` may be null (test/CLI contexts) — bumps
 /// `yuzu_scim_saml_link_write_failures_total` on an `upsert_saml_link`
 /// failure; a no-op counter otherwise.
 ///
 /// `scim_store` may be null (no PG configured, or the store failed to open
-/// at boot) — a safe no-op in that case, same fail-OPEN posture as every
-/// other failure this function absorbs. Never fails/throws — the caller's
-/// login has already succeeded (or is about to) by the time this runs and
-/// must not be undone by a store hiccup here.
-void link_saml_login_to_scim(ScimStore* scim_store, const std::string& entity_id,
-                             const std::string& name_id, const std::string& name_id_format,
-                             yuzu::MetricsRegistry* metrics = nullptr);
+/// at boot) — a safe no-op in that case (returns `not_linkable`), same
+/// fail-OPEN posture as every other failure this function absorbs. Never
+/// fails/throws — the caller's login has already succeeded (or is about to)
+/// by the time this runs and must not be undone by a store hiccup here.
+SamlScimLinkOutcome link_saml_login_to_scim(ScimStore* scim_store, const std::string& entity_id,
+                                            const std::string& name_id,
+                                            const std::string& name_id_format,
+                                            yuzu::MetricsRegistry* metrics = nullptr);
 
 /// ADR-2001 §4 (PR4b) — the deny-at-login backstop's resolve-and-decide
 /// result. SAML analogue of `oidc_scim_link.hpp`'s `OidcLoginDenyDecision`

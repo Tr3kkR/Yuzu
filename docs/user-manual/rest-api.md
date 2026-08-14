@@ -7738,6 +7738,8 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.user.deprovision_role_refused_with_link` | `failure` | ADR-2001 D1: a role-refused deprovision (`deprovision_role_ok` 404 — the slug's role is not `user`) for a slug with ≥1 active linked OIDC identity, whose tokens are therefore NOT auto-revoked. Always written alongside `yuzu_scim_deprovision_role_refused_with_active_link_total` — see `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
 | `auth.oidc.deprovisioned_denied` | `failure` | ADR-2001 §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the store could not answer — fail-closed). Emitted from `GET /auth/callback`, not a `/scim/v2/*` route — listed here because it is part of the same ADR-2001 linkage. `detail` carries `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource (deactivated, or orphaned by a hard-deleted `scim_resources` row) drove the denial, or `reason=scim_store_unavailable` when the store could not answer (fail-closed — no `scim_id` to name); and — only on the post-mint re-check path (a concurrent deprovision landed after the primary check) — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). The two `reason` values keep a genuine deprovision (CC6.8 evidence) distinguishable from a store outage. Pairs with `yuzu_auth_oidc_deprovisioned_denied_total`. |
 | `auth.saml.deprovisioned_denied` | `failure` | ADR-2001 §4/PR4b, the SAML analogue of the row above: a SAML login was refused at `POST /saml/acs` because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row) or because `ScimStore` could not answer at all (fail-closed). Principal is the `saml:<entity_id>#<NameID>` string. `detail` uses the identical shape the OIDC row above uses: `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource drove the denial, or `reason=scim_store_unavailable` (no `scim_id`) when the store itself could not be asked; and — only on the post-mint re-check path — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). Pairs with `yuzu_auth_saml_deprovisioned_denied_total`. |
+| `auth.saml.link_unmatched` | `failure` | ADR-2001 #3072: on a SAML login with a linkable (stable-Format) NameID, the identity-link lookup ran but found either zero active SCIM resources matching the NameID as an `externalId` (`reason=no_active_external_id_match;name_id_format=<format>`) or more than one (`reason=ambiguous_active_external_id_match;name_id_format=<format>`, ADR-2001 §2 mis-link guard). **Observe-and-proceed — the SAML login still succeeds** (login-time linking is fail-open by contract; this is not the PR4b deny-at-login path). The two causes pair with separate counters, `yuzu_scim_saml_link_unmatched_total` and `yuzu_scim_saml_link_ambiguous_total` respectively, despite sharing one audit action. Emitted from `POST /saml/acs`. See `docs/auth-architecture.md` "SAML D2 observability (#3072)". |
+| `auth.saml.link_lookup_failed` | `failure` | ADR-2001 #3072: on a SAML login with a linkable NameID, the `ScimStore` active-`externalId` lookup itself could not answer (`reason=scim_store_unavailable`) — distinct from `auth.saml.link_unmatched`'s genuine zero-match answer. **Observe-and-proceed — the SAML login still succeeds.** Pairs with `yuzu_scim_saml_link_lookup_failures_total`. Emitted from `POST /saml/acs`. |
 
 #### Metrics
 
@@ -7765,6 +7767,22 @@ refused a SAML re-login against a deprovisioned linked identity); see the
 audit actions above and `docs/user-manual/metrics.md` "SSO login metrics".
 Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
 Metrics and "SCIM ↔ OIDC identity linkage for deprovision" § New metrics.
+
+**ADR-2001 #3072 (SAML D2 observability):**
+`yuzu_scim_saml_link_unmatched_total` /
+`yuzu_scim_saml_link_ambiguous_total` (login-time: a linkable-Format SAML
+NameID matched zero / more than one active SCIM resource — pairs with
+`auth.saml.link_unmatched` above), `yuzu_scim_saml_link_lookup_failures_total`
+(login-time: the active-`externalId` lookup itself could not answer — pairs
+with `auth.saml.link_lookup_failed` above), and
+`yuzu_scim_deprovision_saml_unlinked_total` (deprovision-time: the SAML
+analogue of `yuzu_scim_deprovision_unlinked_total` above — a deprovision
+found a SAML login observation matching the slug's `externalId` but no
+formed `saml_identity_links` row). See
+`docs/auth-architecture.md` "SAML D2 observability (#3072)" for the honest
+scope of what each half (login-time vs. deprovision-time) can and cannot
+attribute, and `docs/user-manual/metrics.md` "SCIM deprovision-linkage
+metrics" for the operator-facing description.
 
 ---
 

@@ -95,14 +95,27 @@ for the full operator runbook. Two further ADR-2001 counters,
 `yuzu_auth_saml_deprovisioned_denied_total` (§4/PR4b) — the deny-at-login
 backstops firing at OIDC/SAML login rather than at SCIM deprovision time —
 live in "SSO login metrics" above, next to their siblings
-`yuzu_auth_oidc_login_total`/`yuzu_auth_saml_login_total`.
+`yuzu_auth_oidc_login_total`/`yuzu_auth_saml_login_total`. Four more
+(#3072, SAML D2 observability) are below, alongside their OIDC D2 sibling
+`yuzu_scim_deprovision_unlinked_total` —
+`yuzu_scim_saml_link_unmatched_total`,
+`yuzu_scim_saml_link_ambiguous_total`,
+`yuzu_scim_saml_link_lookup_failures_total` (all three login-time, `POST
+/saml/acs`), and `yuzu_scim_deprovision_saml_unlinked_total`
+(deprovision-time). See `docs/auth-architecture.md` "SAML D2 observability
+(#3072)" for the honest split between what the login-time signals and the
+deprovision-time tripwire can each attribute.
 
 | Metric | Type | Meaning |
 |---|---|---|
 | `yuzu_scim_deprovision_role_refused_with_active_link_total` | counter, no labels | D1: a deprovision was refused (the slug's role is not `user`, per the #2021 provenance guard) for a slug with an active linked federated identity — that identity's tokens were deliberately **not** auto-revoked (auto-revoking on an IdP's unilateral say-so would reopen the #2021 hazard). A human must terminate the linked identity's credentials manually. |
 | `yuzu_scim_deprovision_unlinked_total` | counter, no labels | D2: a deprovision resolved a principal set of one (slug only) but found a recorded OIDC login observation (`sub` or `oid` candidate) matching the slug's `externalId` — the user demonstrably authenticated via OIDC, but no link had formed to catch their tokens. Almost always a misconfigured `--oidc-scim-link-claim` (Entra left on the default `sub` is the common case), or an IdP whose `externalId` has no matching OIDC claim at all. A non-zero rate means some federated population's tokens are **not** being revoked by SCIM deprovision — investigate before trusting the CC6.8 claim for that population. |
 | `yuzu_scim_oidc_link_write_failures_total` | counter, no labels | An OIDC login's identity-link upsert and/or login-observation write failed (a ScimStore outage during the login window). The login itself always succeeds — link/observation writes are fail-OPEN by design — so this is the only signal that identity links and D2 observations were **not** recorded for some logins. A sustained non-zero rate means links formed during the window are missing (their tokens won't be caught on deprovision) and D2's own detection is blind for those users; correlate with ScimStore/Postgres availability. |
-| `yuzu_scim_saml_link_write_failures_total` | counter, no labels | A SAML login's `saml_identity_links` upsert failed (a ScimStore outage during the login window) — the SAML analogue of `yuzu_scim_oidc_link_write_failures_total` (ADR-2001 PR4a). The login itself always succeeds — link writes are fail-OPEN by design — so this is the only signal that a SAML identity link was **not** recorded for that login. A sustained non-zero rate means SAML identities are silently not linking, so those users' sessions won't be caught on SCIM deprovision; correlate with ScimStore/Postgres availability. See `docs/user-manual/scim-provisioning.md` "SCIM ↔ SAML identity linkage" for the operator runbook. |
+| `yuzu_scim_saml_link_write_failures_total` | counter, no labels | A SAML login's `saml_identity_links` upsert **or** its `saml_login_observations` write failed (a ScimStore outage during the login window) — the SAML analogue of `yuzu_scim_oidc_link_write_failures_total` (ADR-2001 PR4a/#3072). The login itself always succeeds — both writes are fail-OPEN by design — so this is the signal that a SAML identity link and/or its D2 login-observation was **not** recorded for that login (the latter blinds the deprovision-time `yuzu_scim_deprovision_saml_unlinked_total` tripwire for that login). A sustained non-zero rate means SAML identities are silently not linking, so those users' sessions won't be caught on SCIM deprovision; correlate with ScimStore/Postgres availability. See `docs/user-manual/scim-provisioning.md` "SCIM ↔ SAML identity linkage" for the operator runbook. |
+| `yuzu_scim_saml_link_unmatched_total` | counter, no labels | ADR-2001 #3072, login-time: a SAML login presented a linkable (stable-Format) NameID for which **zero** active SCIM resources matched it as an `externalId`. This is **drift**, not a store fault — the identity authenticated but no SCIM resource claims that `externalId` (no such SCIM user, or the IdP/SCIM `externalId` values have diverged). Pairs with the `auth.saml.link_unmatched` audit row (`reason=no_active_external_id_match`). Observe-and-proceed: the login is never denied by this signal. |
+| `yuzu_scim_saml_link_ambiguous_total` | counter, no labels | ADR-2001 #3072, login-time: the same lookup as the row above, but **more than one** active SCIM resource matched the NameID as an `externalId` (the ADR-2001 §2 mis-link guard — an ambiguous match is never resolved arbitrarily). Kept in its own series rather than folded into `yuzu_scim_saml_link_unmatched_total` because a duplicate/stale `externalId` is a more actionable, distinct misconfiguration than ordinary drift. Pairs with `auth.saml.link_unmatched` (`reason=ambiguous_active_external_id_match`). Observe-and-proceed. |
+| `yuzu_scim_saml_link_lookup_failures_total` | counter, no labels | ADR-2001 #3072, login-time: a SAML login with a linkable NameID for which the `ScimStore` active-`externalId` lookup itself could not answer (store outage, lease timeout, failed statement) — distinct from `yuzu_scim_saml_link_unmatched_total`'s genuine zero-match answer. A sustained non-zero rate means SAML link formation cannot even be *attempted*, not merely that it is failing to match. Pairs with the `auth.saml.link_lookup_failed` audit row. Observe-and-proceed. |
+| `yuzu_scim_deprovision_saml_unlinked_total` | counter, no labels | ADR-2001 #3072, deprovision-time: the SAML analogue of `yuzu_scim_deprovision_unlinked_total` above — a deprovision resolved **zero** linked SAML identities (`saml_identity_links`, queried specifically — never the OIDC link table) for a slug, but a recorded `saml_login_observations` row shows a NameID matching that slug's `externalId`. The user demonstrably attempted a SAML login under that identity, but no link ever formed — most often an unstable-Format (`transient`/`unspecified`) NameID whose *value* nonetheless matches. **Does not** catch a stable-Format NameID that never matched any `externalId` at all — that case is caught at login time instead (`yuzu_scim_saml_link_unmatched_total`), not here; see `docs/auth-architecture.md` "SAML D2 observability (#3072)" "Honest scope" for why deprovision-time attribution of that case is deferred (issue #3098). |
 
 ## DEX live-read metrics
 
@@ -1196,6 +1209,12 @@ PostgreSQL store (authoritative posture).
 | `yuzu_server_custom_properties_read_degrade_total{reason}` | counter | A `props.<key>` scope-feeding read (the bulk `get_values_for_keys` preload `AgentRegistry::evaluate_scope` uses, or a direct property read) degraded instead of returning a result. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection available in time — correlates with `yuzu_pg_acquire_*` saturation), `query_error` (the query failed). **A non-zero rate means a `props.<key>`-scoped dispatch/policy/push rule is aborting scope evaluation** — every caller collapses that abort to "zero targets matched," so this is NOT the same as "operators removed the properties." |
 | `yuzu_server_custom_properties_backfill_total{result}` | counter | Outcome of the one-time SQLite→Postgres backfill at boot (ADR-0045). `result` ∈ `success` (legacy `custom-properties.db` found and backfilled, then moved aside), `fresh` (no legacy DB — a clean install, nothing to migrate), `failed` (backfill could not complete — write error, unreadable legacy file, or a holder-side fingerprint-verification refusal on a multi-replica boot with divergent legacy content; the server **fails closed at boot** and retries on next start). Emitted once per boot; a `failed` sample is the signal that the server refused to come up. |
 
+## Notification store metrics (dashboard feed, ADR-0046)
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_notification_backfill_total{result}` | counter | Outcome of the one-time legacy `notifications.db` → PostgreSQL backfill, emitted on **every** boot (not just first boot — unlike the sibling stores' *three-way* fresh/completed/failed split, this store's backfill is a single transaction with no separate fresh/completed outcome, so "fresh install" and "already-migrated skip" both collapse into `result="success"`, and the wrapper always emits it). `result` ∈ `success` (fresh install, an already-migrated skip, or a completed migration), `failed` (backfill could not complete — the server **fails the boot closed** and retries on the next start). |
+
 **Useful PromQL queries:**
 
 ```promql
@@ -1205,6 +1224,9 @@ sum(rate(yuzu_server_custom_properties_read_degrade_total[5m])) by (reason) > 0
 
 # One-time custom-properties backfill failed → server refused to boot (ADR-0045).
 sum(rate(yuzu_server_custom_properties_backfill_total{result="failed"}[15m])) > 0
+
+# One-time notification backfill failed → server refused to boot (ADR-0046).
+sum(rate(yuzu_server_notification_backfill_total{result="failed"}[15m])) > 0
 ```
 
 ## RBAC store metrics (authorization substrate, ADR-0041)
