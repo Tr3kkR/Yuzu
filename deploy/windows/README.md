@@ -15,6 +15,7 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 | `toolchain-contract.json` | Reviewable schema for host pins/probes and the separate job-scoped vcpkg baseline. Provisioning parameters must match it. |
 | `Toolchain-Contract.psm1` | Fail-closed schema/pin/probe adapter shared by the assertion and its hermetic tests. |
 | `Assert-Toolchain.ps1` | Runner self-test: verifies the manifest schema and live versions, contract env, and every per-agent PostgreSQL binary/service/health check. Run at provision time **and** as a registration/preflight gate. |
+| `Update-ToolchainManifest.ps1` | Drained-host, manifest-only migration for an already-installed reviewed contract change. Preserves each host's recorded runner/PostgreSQL/telemetry topology, live-asserts a candidate, then atomically replaces the manifest with a backup. |
 | `Assert-VcpkgCheckout.ps1` | Job self-test: after `lukka/run-vcpkg`, verifies the workspace checkout HEAD, clean tracked tree, and executable release against the checkout metadata before CI installs ports. |
 | `Test-ToolchainContract.ps1` | Hermetic schema/version regression tests, also registered in Meson's `docs` suite when `pwsh` exists. Safe anywhere; reads no service or registry state. |
 | `Test-ProvisionLogic.ps1` | Regression tests for the provisioning script's decision logic (maintenance gate, `-D` handling, `ImagePath` rewrite). Safe anywhere — no elevation, no machine state. Run after editing `Provision-Windows-Runner.ps1`. |
@@ -46,9 +47,24 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 
    Adding a newly required manifest item is stricter than widening an existing
    pin list: an older manifest cannot claim an artifact it never recorded.
-   Keep the PR draft while every drained Windows host is reprovisioned from the
+   Keep the PR draft while every Windows host is drained and migrated from the
    reviewed branch, and do not enable its runners until `Assert-Toolchain.ps1`
-   passes against that branch's contract.
+   passes against that branch's contract. For an already-installed toolchain
+   change, use the manifest-only migration rather than the Wee Tam provisioner:
+
+   ```powershell
+   pwsh -NoProfile -File deploy\windows\Update-ToolchainManifest.ps1
+   ```
+
+   It refuses to run while an Actions worker/job is live, preserves
+   the prior manifest's one-runner or multi-runner topology, validates the
+   candidate against live host state, and only then replaces the manifest
+   atomically. It rechecks for a worker immediately before replacement. An idle
+   listener may remain online because no service or toolchain state is mutated;
+   a racing job sees either the old fail-closed manifest or the fully asserted
+   candidate. The prior manifest is retained as a timestamped backup. Never
+   hand-edit the JSON, and never run the four-runner Wee Tam provisioner on
+   single-runner Shulgi merely to regenerate a manifest.
 
    The schema introduction has one separately bounded bridge for manifests
    emitted by the immediately preceding provisioner: a missing `schema` is
@@ -238,7 +254,8 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 
 ## `toolchain-manifest.json`
 
-Emitted by provisioning (default `C:\actions-runner\toolchain-manifest.json`),
+Emitted by provisioning or the drained-host manifest-only migration (default
+`C:\actions-runner\toolchain-manifest.json`),
 verified by `Assert-Toolchain.ps1`:
 
 ```json

@@ -307,7 +307,7 @@ Step 'Persistent per-runner CI telemetry databases' {
 Step 'Deploy versioned runner control scripts' {
   $controlRoot = Split-Path $ManifestPath
   New-Item -ItemType Directory -Force $controlRoot | Out-Null
-  foreach($name in @('Start-PinnedRunner.ps1','Assert-Toolchain.ps1','Toolchain-Contract.psm1','toolchain-contract.json')){
+  foreach($name in @('Start-PinnedRunner.ps1','Assert-Toolchain.ps1','Update-ToolchainManifest.ps1','Toolchain-Contract.psm1','toolchain-contract.json')){
     $source = Join-Path $PSScriptRoot $name
     if(-not (Test-Path $source)){ throw "runner control script missing at $source" }
     Copy-Item -LiteralPath $source -Destination (Join-Path $controlRoot $name) -Force
@@ -978,7 +978,7 @@ Step "emit toolchain manifest -> $ManifestPath" {
       pg_isready=(Join-Path $clusterBin 'pg_isready.exe')
     }
   })
-  $manifest = [ordered]@{
+  $manifestSource = [pscustomobject][ordered]@{
     schema    = [string]$toolchainContract.schema
     generated = (Get-Date).ToUniversalTime().ToString('o')
     host      = $env:COMPUTERNAME
@@ -1000,6 +1000,8 @@ Step "emit toolchain manifest -> $ManifestPath" {
     postgres_clusters = $postgresClusters
     tools     = $tools
   }
+  $manifest = New-YuzuToolchainManifestDocument `
+      -PriorManifest $manifestSource -Contract $toolchainContract -HostName $env:COMPUTERNAME
   New-Item -ItemType Directory -Force (Split-Path $ManifestPath) | Out-Null
   $manifest | ConvertTo-Json -Depth 6 | Set-Content -Path $ManifestPath -Encoding UTF8
   "wrote $ManifestPath ($($tools.Count) tools)"
