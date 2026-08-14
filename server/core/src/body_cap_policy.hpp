@@ -192,6 +192,23 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     // default (the catch-all below) would break this route outright — do
     // not "simplify" this entry away.
     {"POST", "/api/v1/bundles", 70u * 1024 * 1024, false, "bundles"},
+    // /api/v1/uploads — the PR1.6a authenticated chunked-receive surface
+    // (session open POST, chunk PUT, status GET, commit POST, cancel DELETE).
+    // ANY method: only the chunk PUT carries a large body, but scoping to PUT
+    // would silently drop every sibling verb on this prefix to the catch-all
+    // (rule 4 in the routed-concern row — prefer any-method rows). Cap = the
+    // protocol's own per-chunk maximum, `upload_grant::kDefaultChunkMaxBytes`
+    // (upload_grant_parsers.hpp; bound by a static_assert in
+    // file_retrieval_routes.cpp so the two cannot drift). requires_measurable
+    // = true: the chunk route's session gate lives in the HANDLER, after
+    // httplib buffers the body, so without a pre-read bound an
+    // UNAUTHENTICATED caller could make the server buffer up to httplib's
+    // 100 MB default per connection — and the agent uploader always sends an
+    // identity-encoded body with a Content-Length (it needs one to build the
+    // protocol's Content-Range header), so this refuses no conforming client.
+    // Bodyless GET/DELETE on this prefix are unaffected: the measurability
+    // rule fires only for POST/PUT/PATCH (web_utils.hpp body_unmeasurable).
+    {kBodyCapAnyMethod, "/api/v1/uploads", 8u * 1024 * 1024, true, "upload_session"},
     // /api/v1/plugin-config — the PR1.5 config/secret/kill-switch plane. The
     // store's own grammar caps a config value at 8 KiB and a secret plaintext
     // at 64 KiB (plugin_config_parsers.hpp kMaxConfigValueBytes/
