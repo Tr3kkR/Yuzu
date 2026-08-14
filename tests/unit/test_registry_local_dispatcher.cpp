@@ -45,6 +45,8 @@
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/plugin.h>
 
+#include <win_reg_handle.hpp> // unique_hive_mount_name (#2771 code-review CFX-2)
+
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp" // process_random_salt -- Wee Tam runs 4 runner
                             // agents as ONE shared LOCAL SYSTEM identity, so
@@ -55,6 +57,7 @@
                             // "Test conventions" section) -- match it rather
                             // than rely on PID non-reuse alone.
 
+#include <algorithm>
 #include <cstdlib>
 #include <cwchar>
 #include <filesystem>
@@ -283,6 +286,38 @@ TEST_CASE("registry plugin: list_profiles + get_user_value live-hive round-trip 
         CHECK(result.rc != 0);
         CHECK(result.captured.find("not found in enumerated profiles") != std::string::npos);
     }
+}
+
+TEST_CASE("unique_hive_mount_name: produces distinct, well-formed names",
+         "[registry][windows]") {
+    // #2771 code-review CFX-2: the salted-name behaviour that #2771 up-S1
+    // exists to fix had no test against the REAL production function -- only
+    // against a literal string passed into render_hive_access_lines. This
+    // calls the actual yuzu::win::unique_hive_mount_name, which is only
+    // reachable from a Windows-gated TU (it lives in an #ifdef _WIN32
+    // header), which is why it lives here rather than in the portable
+    // test_user_profile_model.cpp.
+    const std::wstring sid = L"S-1-5-21-1111111111-2222222222-3333333333-1001";
+
+    const auto m1 = yuzu::win::unique_hive_mount_name(sid);
+    const auto m2 = yuzu::win::unique_hive_mount_name(sid);
+
+    CHECK(m1 != m2);
+    CHECK(m1.rfind(L"YUZU_HIVE_" + sid + L"_", 0) == 0);
+    CHECK(m2.rfind(L"YUZU_HIVE_" + sid + L"_", 0) == 0);
+    // Registry key names are capped at 255 chars; a typical SID leaves ample
+    // headroom, but this pins that the salt scheme doesn't blow the budget.
+    CHECK(m1.size() < 255);
+    CHECK(m2.size() < 255);
+
+    // 1000 calls, no collisions -- exercises the counter wraparound path too
+    // (the same check the orchestrator ran manually during code review).
+    std::vector<std::wstring> names;
+    names.reserve(1000);
+    for (int i = 0; i < 1000; ++i)
+        names.push_back(yuzu::win::unique_hive_mount_name(sid));
+    std::sort(names.begin(), names.end());
+    CHECK(std::adjacent_find(names.begin(), names.end()) == names.end());
 }
 
 #endif // _WIN32

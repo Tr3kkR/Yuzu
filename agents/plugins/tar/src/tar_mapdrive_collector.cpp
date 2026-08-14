@@ -878,9 +878,21 @@ void read_user_outbound_history(HKEY user_root, const std::string& profile_user,
 // reports a failed unload instead of swallowing it.
 void enum_registry_outbound_history(std::vector<MapDriveHistoryRow>& out) {
     bool profiles_ok = false;
-    const auto raw_profiles = yuzu::win::enumerate_profile_records(profiles_ok);
+    bool profiles_truncated = false;
+    const auto raw_profiles = yuzu::win::enumerate_profile_records(profiles_ok, &profiles_truncated);
     if (!profiles_ok)
         return;
+    // #2771 code-review Standards S5: the shared ladder caps the walk at
+    // kMaxProfiles, where this collector's own pre-migration walk was
+    // unbounded; the other two migrated consumers (registry, installed_apps)
+    // already surface the cap via profile_list_truncated. This collector has
+    // no per-row diagnostic channel either, so it rides the log, same as the
+    // unload-failure warning below.
+    if (profiles_truncated) {
+        spdlog::warn("TAR mapdrive: profile list truncated at {} entries — outbound history for "
+                     "profiles beyond that is not collected this cycle",
+                     yuzu::win::kMaxProfiles);
+    }
     const auto profiles =
         yuzu::profiles::build_profile_list(raw_profiles, yuzu::win::enumerate_hku_subkeys());
 

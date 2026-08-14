@@ -473,8 +473,8 @@ private:
             ctx.write_output(yuzu::profiles::render_profile_row(info));
         }
         if (truncated) {
-            ctx.write_output(std::format("warning|profile_list_truncated at {} entries",
-                                          yuzu::win::kMaxProfiles));
+            ctx.write_output(yuzu::profiles::render_profile_list_truncated_warning(
+                yuzu::win::kMaxProfiles));
         }
         // #2771 up-S2: a ProfileImagePath that exists but cannot be read or
         // decoded now says so. Reported as ONE aggregate line rather than a

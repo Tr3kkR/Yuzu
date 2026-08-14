@@ -684,8 +684,8 @@ private:
         // Both caps/failures are reported honestly rather than silently
         // shrinking the result, matching registry.list_profiles' precedent.
         if (truncated) {
-            ctx.write_output(std::format("warning|profile_list_truncated at {} entries",
-                                         yuzu::win::kMaxProfiles));
+            ctx.write_output(yuzu::profiles::render_profile_list_truncated_warning(
+                yuzu::win::kMaxProfiles));
         }
         if (privilege_missing > 0) {
             ctx.write_output(std::format(

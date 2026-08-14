@@ -343,7 +343,14 @@ void stamp_user_records(std::vector<LicRecord>& records, std::size_t from,
                         const std::string& profile_name) {
     for (std::size_t i = from; i < records.size(); ++i) {
         records[i].user_scope = "user";
-        records[i].user_ref = profile_name; // may be EMPTY — never a SID (D11)
+        // Stays EMPTY, never "-" -- deliberately DIFFERENT from
+        // installed_apps' operator-facing row, which renders "-" for
+        // display (code-review Standards question). user_ref feeds
+        // sync_source_software_licensing.cpp's HMAC pseudonym; a cosmetic
+        // "-" substituted here would change what gets hashed for every
+        // profile with an unresolvable name, not just how it displays.
+        // Never a SID either way (D11).
+        records[i].user_ref = profile_name;
     }
 }
 

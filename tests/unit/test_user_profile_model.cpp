@@ -333,29 +333,41 @@ TEST_CASE("render_hive_access_lines: warning precedes the error on a failed moun
     CHECK(lines[1] == "error|failed to load hive for sid '" + std::string{kAliceSid} + "'");
 }
 
-TEST_CASE("render_hive_access_lines: all 8 status x unload combinations", "[profiles]") {
+TEST_CASE("render_hive_access_lines: all 8 status x unload combinations, exact strings",
+         "[profiles]") {
     // Exhaustive so a future enumerator cannot be added without a decision
-    // about what it prints.
+    // about what it prints. code-review Spec F4: the plan called for exact
+    // whole-string equality on all 8 combinations, not just line count plus
+    // a prefix check -- this asserts the full expected vector per case.
+    const std::string sid{kAliceSid};
+    const std::string warning =
+        "warning|hive_unload_failed: HKU\\M for sid '" + sid +
+        "' may remain mounted; retry `reg unload HKU\\M` once any process holding the branch "
+        "(Search Indexer, AV, System Restore) releases it";
+    const std::string not_found_err =
+        "error|no reachable hive for sid '" + sid + "' (not logged in and no profile path)";
+    const std::string privilege_missing_err =
+        "error|privilege_missing: SeBackupPrivilege/SeRestorePrivilege could not be enabled";
+    const std::string mount_failed_err = "error|failed to load hive for sid '" + sid + "'";
+
     struct Case {
         HiveAccessStatus status;
         bool unload_failed;
-        std::size_t expected_lines;
+        std::vector<std::string> expected;
     };
     const Case cases[] = {
-        {HiveAccessStatus::ok, false, 0},
-        {HiveAccessStatus::ok, true, 1},
-        {HiveAccessStatus::not_found, false, 1},
-        {HiveAccessStatus::not_found, true, 2},
-        {HiveAccessStatus::privilege_missing, false, 1},
-        {HiveAccessStatus::privilege_missing, true, 2},
-        {HiveAccessStatus::mount_failed, false, 1},
-        {HiveAccessStatus::mount_failed, true, 2},
+        {HiveAccessStatus::ok, false, {}},
+        {HiveAccessStatus::ok, true, {warning}},
+        {HiveAccessStatus::not_found, false, {not_found_err}},
+        {HiveAccessStatus::not_found, true, {warning, not_found_err}},
+        {HiveAccessStatus::privilege_missing, false, {privilege_missing_err}},
+        {HiveAccessStatus::privilege_missing, true, {warning, privilege_missing_err}},
+        {HiveAccessStatus::mount_failed, false, {mount_failed_err}},
+        {HiveAccessStatus::mount_failed, true, {warning, mount_failed_err}},
     };
     for (const auto& c : cases) {
         const auto lines = render_hive_access_lines(c.status, c.unload_failed, "M", kAliceSid);
-        CHECK(lines.size() == c.expected_lines);
-        for (const auto& l : lines)
-            CHECK((l.starts_with("warning|") || l.starts_with("error|")));
+        CHECK(lines == c.expected);
     }
 }
 
@@ -531,12 +543,19 @@ TEST_CASE("render_profile_row: a pipe in a field cannot add a column", "[profile
     CHECK(split_all_pipes(render_profile_row(info)).size() == 4);
 }
 
-TEST_CASE("installed_apps user_app row keeps its leading tag and 6 fields", "[profiles]") {
-    // The inverse of the registry case, and a live trap: installed_apps is in
-    // result_parsing.hpp's kKeyValuePlugins, so the dashboard splits these
-    // rows into (key, rest) and the leading "user_app|" tag is LOAD-BEARING.
-    // Stripping it — the "fix" hp-B1 might suggest by analogy — would break
-    // rendering. This pins the shape the migrated do_list_per_user emits.
+TEST_CASE("installed_apps user_app row: the kKeyValuePlugins contract", "[profiles]") {
+    // NOT a pin on installed_apps_plugin.cpp's do_list_per_user -- that
+    // formatting call (std::format("user_app|{}|...", ...)) lives inside an
+    // #ifdef _WIN32 block in a plugin .cpp this portable test cannot link
+    // against or execute, so nothing here would fail if that call site
+    // changed. This documents and guards the CONTRACT instead: installed_apps
+    // is in result_parsing.hpp's kKeyValuePlugins, so the dashboard's generic
+    // splitter treats every row as (key, rest) — the opposite of the registry
+    // list_profiles case, where a leading tag caused the hp-B1 column shift.
+    // A leading "user_app|" tag is therefore LOAD-BEARING here and must never
+    // be stripped by analogy with that fix. Real coverage of the plugin's own
+    // output is a Windows-only gap tracked for a follow-up (code-review
+    // Functional axis, [F5]/[CFX-5]).
     const std::string row = "user_app|alice|Widget|1.0|Acme|20240101";
     const auto fields = split_all_pipes(row);
     REQUIRE(fields.size() == 6);

@@ -208,8 +208,10 @@ machine-scope surfaces (SLP, C2R, ProbeSpec) still report normally; only the per
 surface reports `privilege_missing` through the live diagnostics. (The same diagnostic
 channel reports `hive_unload_failed` in the exotic case where a probed offline hive
 cannot be unmounted afterwards — the probe's rows are still valid, but that profile's
-`NTUSER.DAT` stays locked until reboot.) Per-user hives are
-**never a primary surface**, so neither condition skips nor wipes the sync
+`NTUSER.DAT` stays locked until reboot.) The profile walk is also capped at 512
+profiles (#2771; previously unbounded), reported as `profile_list_truncated` through
+the same channel if a host has more. Per-user hives are
+**never a primary surface**, so none of these three conditions skips or wipes the sync
 cycle — the machine-scope detections proceed. See
 [`docs/agent-privilege-model.md`](../agent-privilege-model.md) (the `license_scan` row).
 

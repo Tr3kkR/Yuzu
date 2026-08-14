@@ -36,6 +36,12 @@
 #include "win_reg_handle.hpp"
 #include "win_str.hpp"
 
+// Process-wide offline-mount serialisation, exported from the single
+// yuzu_agent_core shared library every plugin links against -- see
+// offline_hive_mutex() below and the header's own doc comment for why a
+// header-local static cannot do this job (#2771 code-review CFX-1).
+#include <yuzu/agent/offline_hive_mutex.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -153,9 +159,17 @@ inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
                 }
             } else if (size_rc == ERROR_SUCCESS) {
                 // Present but unusable: over the cap, zero-length, or a type
-                // that is not a string. Absent (any other size_rc) stays
-                // silent -- a profile with no ProfileImagePath is not an
-                // error, it just has no offline path.
+                // that is not a string.
+                rec.profile_image_path_unreadable = true;
+            } else if (size_rc != ERROR_FILE_NOT_FOUND) {
+                // The sizing call itself failed for a reason other than
+                // genuine absence -- e.g. ERROR_ACCESS_DENIED on the value.
+                // #2771 code-review Spec F8: this branch previously stayed
+                // silent for ANY non-SUCCESS size_rc, which contradicted the
+                // documented behaviour ("exists but cannot be read or
+                // decoded") for exactly this case. Only a genuinely absent
+                // value (ERROR_FILE_NOT_FOUND) stays silent below -- a
+                // profile with no ProfileImagePath is not an error.
                 rec.profile_image_path_unreadable = true;
             }
         }
@@ -214,8 +228,19 @@ public:
         tp.Privileges[0].Luid = luid;
         tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
-        const BOOL adjusted =
-            AdjustTokenPrivileges(token_, FALSE, &tp, sizeof(previous_), &previous_, nullptr);
+        // BUG FIX (code-review CFX/functional-BLOCK, orchestrator probe): when
+        // PreviousState (the 5th arg) is non-NULL, ReturnLength (the 6th) MUST
+        // also be non-NULL -- passing nullptr here made AdjustTokenPrivileges
+        // fail outright with ERROR_NOACCESS on every call, so ok_ was FALSE
+        // unconditionally and the offline-hive fallback has never actually
+        // enabled the privilege since it shipped. Reproduced directly against
+        // a real token: the identical call with ReturnLength=nullptr returns
+        // adjusted=FALSE/gle=998 (ERROR_NOACCESS); with &returned_len it
+        // returns adjusted=TRUE/gle=ERROR_SUCCESS. previous_len is otherwise
+        // unused -- the buffer size that matters is BufferLength (sizeof(previous_)).
+        DWORD previous_len = 0;
+        const BOOL adjusted = AdjustTokenPrivileges(token_, FALSE, &tp, sizeof(previous_),
+                                                    &previous_, &previous_len);
         ok_ = adjusted && GetLastError() == ERROR_SUCCESS;
         have_previous_ = adjusted;
     }
@@ -278,10 +303,19 @@ struct HiveAccessReport {
 /// otherwise contend for. The offline path is already file-I/O bound, so the
 /// serialisation costs nothing measurable; the LIVE path (the common case)
 /// never takes the lock.
-inline std::mutex& offline_hive_mutex() {
-    static std::mutex m;
-    return m;
-}
+///
+/// This is `yuzu::agent::offline_hive_mutex()` from
+/// agents/core/include/yuzu/agent/offline_hive_mutex.hpp, NOT a header-local
+/// static (code-review CFX-1). Each plugin is a SEPARATE .dll/.so; a
+/// function-local static `inline` mutex defined here would be instantiated
+/// once per plugin binary -- four independent mutexes, not one process-wide
+/// lock, confirmed by inspecting each built plugin's export table (each
+/// exports only its required `yuzu_plugin_descriptor` symbol). Defining it in
+/// agents/core -- the one shared library every plugin links against -- and
+/// exporting it via YUZU_EXPORT (the fork_lock.hpp precedent) makes every
+/// plugin's import resolve to the same address in the same already-loaded
+/// module.
+using yuzu::agent::offline_hive_mutex;
 
 // The live-hive-first, offline-mount-fallback ladder (C-1): tries
 // HKU\<sid> first; only if that is absent does it enable
@@ -430,6 +464,15 @@ inline ReadValueStatus read_reg_value(HKEY root, const std::string& value_name,
         // operator error/type taxonomy rather than silently accepted.
         static_assert(sizeof(wchar_t) == sizeof(char16_t),
                       "REG_MULTI_SZ decoding assumes UTF-16 wchar_t (Windows)");
+        // reinterpret_cast justification (code-review Standards S7): `data`
+        // is a std::vector<BYTE> sized/filled directly by RegQueryValueExW
+        // for a REG_MULTI_SZ value, which the Win32 ABI guarantees is
+        // 2-byte-aligned UTF-16 -- vector's own allocator already gives
+        // >=alignof(char16_t) for any non-trivial size, so this differs from
+        // an arbitrary byte buffer. Read-only (const), no ownership transfer
+        // -- `chars` borrows `data`'s lifetime for this function's duration
+        // only. Same shape as the pre-existing, unchanged REG_SZ branch two
+        // cases above.
         const auto* chars = reinterpret_cast<const char16_t*>(data.data());
         const std::size_t nch = size / sizeof(wchar_t);
         out_value.clear();

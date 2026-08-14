@@ -333,8 +333,9 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | Action | Description |
 |---|---|
-| `list` | All installed applications with name, version, publisher, and install date. |
+| `list` | All installed applications with name, version, publisher, and install date. Windows machine-scope only — the `HKCU` read is the agent's own service-account hive, never a logged-in user's; see `list_per_user` for per-user apps. |
 | `query` | Search installed applications by name pattern. |
+| `list_per_user` (Windows) | Per-profile applications, walking each local profile's registry hive via the shared ladder in `agents/shared/win_profiles.hpp` (#2771) — loaded `HKU\<SID>` hives read live, logged-out profiles mounted offline. Rows: `user_app\|<username>\|<name>\|<version>\|<publisher>\|<install_date>`; `username` is the resolved profile name or `-` when unresolvable (never the SID, ADR-0024 D11). May also emit `error\|profile_list_unreadable`, `warning\|profile_list_truncated at 512 entries`, `warning\|privilege_missing: …` (a logged-out profile's apps could not be read because the offline-mount privileges could not be enabled), and `warning\|hive_unload_failed: …` (a leaked offline mount). |
 
 ### msi_packages
 
@@ -797,6 +798,8 @@ Every non-success outcome is reported as its own line rather than an empty resul
 
 | Line | Meaning | Operator action |
 |---|---|---|
+| `error\|missing required parameters: username or sid` | Neither `username` nor `sid` was supplied. | Supply one; `sid` takes precedence if both are given. |
+| `error\|missing required parameter: key` | `key` was not supplied. | Supply the registry key path to read. |
 | `error\|profile_list_unreadable` | `HKLM\...\ProfileList` itself could not be opened. | Check the agent account can read ProfileList; this is not a per-profile fault. |
 | `error\|sid '<x>' not found in enumerated profiles` | The supplied `sid` is not a non-system profile on this host. | Run `list_profiles` and use a SID it reports. |
 | `error\|no profile found for username '<x>'` | No profile folder name matched (case-insensitively). | Use `list_profiles`; the profile *folder* name is not always the account name. |
@@ -811,7 +814,9 @@ Every non-success outcome is reported as its own line rather than an empty resul
 
 `list_profiles` additionally emits `warning|profile_list_truncated at 512 entries` when the profile cap is hit, and `warning|profile_path_unreadable for N profile(s)` when a `ProfileImagePath` exists but cannot be read or decoded — both report a shortfall rather than silently returning less.
 
-**Value-type notes.** `REG_MULTI_SZ` values are decoded into their records and joined with `;`. A record containing `;`, `|`, CR or LF is lossy: `|`/CR/LF are replaced with `_` so a value cannot forge a column or row in the output protocol, and `;` is indistinguishable from the join. `REG_LINK` is decoded as its target string. `REG_NONE`, `REG_BINARY` and anything unrecognised are hex-encoded, and are now reported under their real type name rather than a blanket `REG_UNKNOWN`.
+**Value-type notes (`get_user_value`).** `REG_MULTI_SZ` values are decoded into their records and joined with `;`. A record containing `;`, `|`, CR or LF is lossy: `|`/CR/LF are replaced with `_` so a value cannot forge a column or row in the output protocol, and `;` is indistinguishable from the join. `REG_LINK` is decoded as its target string. `REG_NONE`, `REG_BINARY` and anything unrecognised are hex-encoded.
+
+**`get_value` / `enumerate_values` — type naming only, not value decoding.** These two actions share `get_user_value`'s type-naming table, so `type|` now correctly reports `REG_NONE`, `REG_LINK` and `REG_DWORD_BIG_ENDIAN` instead of the previous blanket `REG_UNKNOWN`. They do **not** share its value decoding: `REG_MULTI_SZ` and `REG_LINK` **values** are still hex-encoded on these two actions, unlike `get_user_value`, which decodes both. This is a real, declared inconsistency between actions in the same plugin, not an oversight — closing it means changing `get_value`'s output for existing callers, which is out of scope for this change.
 
 ### wmi
 

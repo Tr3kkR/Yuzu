@@ -19,6 +19,7 @@
  */
 
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <optional>
@@ -252,20 +253,6 @@ enum class HiveAccessStatus {
                        // RegLoadKeyW (or the subsequent root open) failed
 };
 
-[[nodiscard]] constexpr std::string_view hive_access_status_name(HiveAccessStatus s) {
-    switch (s) {
-    case HiveAccessStatus::ok:
-        return "ok";
-    case HiveAccessStatus::not_found:
-        return "not_found";
-    case HiveAccessStatus::privilege_missing:
-        return "privilege_missing";
-    case HiveAccessStatus::mount_failed:
-        return "mount_failed";
-    }
-    return "not_found"; // unreachable — cases are exhaustive so -Wswitch flags enum drift
-}
-
 /// Outcome of resolving one value inside a reached user hive. Folds the
 /// key-OPEN result into the value-READ result so a caller renders one honest
 /// reason. `key_access_denied` is the #2771 up-S4 distinction: before it,
@@ -353,6 +340,15 @@ enum class UserKeyStatus {
         return "error|key or value not found in user hive";
     }
     return "error|key or value not found in user hive"; // unreachable — see -Wswitch note above
+}
+
+/// Renders the `profile_list_truncated` warning every ProfileList-walking
+/// consumer emits when enumerate_profile_records hits kMaxProfiles.
+/// Deduplicated (#2771 code-review Standards S6): registry.list_profiles and
+/// installed_apps.list_per_user previously carried byte-identical
+/// `std::format` calls independently.
+[[nodiscard]] inline std::string render_profile_list_truncated_warning(std::size_t max_profiles) {
+    return std::format("warning|profile_list_truncated at {} entries", max_profiles);
 }
 
 // ---------------------------------------------------------------------------
