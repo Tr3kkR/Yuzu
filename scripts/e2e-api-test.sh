@@ -267,6 +267,8 @@ assert_contains "GET /metrics body contains 'yuzu_'" "yuzu_" "$HTTP_BODY"
 # private ServerImpl member with no live-Session-free construction path, so a
 # unit test cannot reach them — only a real boot, which this e2e run against a
 # freshly-started stack (no schedule/dispatch/gateway denial has fired yet) is.
+assert_contains "GET /metrics pre-registers yuzu_schedule_arming_denied_total at boot" \
+    "yuzu_schedule_arming_denied_total" "$HTTP_BODY"
 assert_contains "GET /metrics pre-registers yuzu_server_dispatch_denied_total at boot" \
     "yuzu_server_dispatch_denied_total" "$HTTP_BODY"
 assert_contains "GET /metrics pre-registers yuzu_server_dispatch_tag_invalid_total at boot" \
