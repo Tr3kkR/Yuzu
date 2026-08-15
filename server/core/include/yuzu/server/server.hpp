@@ -211,6 +211,8 @@ struct Config {
     std::string saml_idp_cert;      // Filesystem path to IdP signing cert PEM (pinned key)
     std::string saml_sp_entity_id;  // SP entityID (used as AudienceRestriction)
     std::string saml_sp_acs_url;    // SP Assertion Consumer Service URL (POST binding)
+    std::string saml_sp_key;        // Filesystem path to SP AuthnRequest signing key PEM (RSA);
+                                     // empty means AuthnRequests are unsigned (backward-compatible)
     std::string saml_group_attribute; // <Attribute Name="..."> carrying group values
     std::string saml_admin_group;     // Group value (from saml_group_attribute) that maps to admin
 

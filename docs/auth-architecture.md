@@ -929,6 +929,7 @@ mapping below).
 | `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full URL of this server's Assertion Consumer Service (`POST /saml/acs`) |
 | `--saml-group-attribute` *(optional)* | `YUZU_SAML_GROUP_ATTRIBUTE` | `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers (e.g. Entra's `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`) |
 | `--saml-admin-group` *(optional)* | `YUZU_SAML_ADMIN_GROUP` | Group value (from `--saml-group-attribute`) that grants `role=admin` |
+| `--saml-sp-key` *(optional)* | `YUZU_SAML_SP_KEY` | Filesystem path to an SP AuthnRequest signing private key (PEM, **RSA only**); when set, AuthnRequests are signed (see AuthnRequest signing below) |
 
 Example startup:
 
@@ -959,8 +960,10 @@ binding.
 2. The server builds a `<samlp:AuthnRequest>` (SP entity ID, ACS URL,
    `ID`=random, `IssueInstant`, `ForceAuthn=false`) and redirects the browser
    to the IdP's SSO URL via HTTP-Redirect binding (deflate-compressed,
-   URL-encoded `SAMLRequest` query parameter). **AuthnRequest signing is not
-   implemented in this slice** — the request is unsigned.
+   URL-encoded `SAMLRequest` query parameter). When `--saml-sp-key` is
+   configured, the request is signed (see AuthnRequest signing below);
+   otherwise it is unsigned — the IdP must be configured to accept unsigned
+   requests in that case.
 3. The user authenticates at the IdP.
 4. The IdP POSTs a `<samlp:Response>` containing a signed `<saml:Assertion>`
    to the ACS endpoint (`POST /saml/acs`).
@@ -1102,13 +1105,40 @@ its in-process PKCE state.
 Update `--saml-idp-cert` and **restart the server** — there is no hot-reload
 for the IdP cert in this release.
 
+### AuthnRequest signing
+
+Optional and independent of the five-flag enable gate: `--saml-sp-key`
+points at a filesystem PEM containing the SP's AuthnRequest signing private
+key. Design:
+
+- **Binding and algorithm.** Signs over the **HTTP-Redirect binding** only
+  (the only binding the SP uses for AuthnRequest) with **RSA PKCS#1 v1.5 +
+  SHA-256** (`SigAlg` `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`),
+  carried as the `SigAlg`/`Signature` query parameters alongside
+  `SAMLRequest` — per the standard query-string signing scheme for this
+  binding.
+- **RSA only.** EC and RSA-PSS keys are rejected; only a plain RSA key
+  parses.
+- **Pinned single signing key, parsed once at boot.** `server.cpp` reads the
+  key file, and `SamlProvider`'s constructor parses it once into an owned
+  `EVP_PKEY`, retained for the process lifetime — mirrors the IdP cert's
+  pinned-at-boot posture (N1 above), applied here to the SP's own key
+  instead of the IdP's — the key is not re-read per request.
+- **Fail-closed, never a silent downgrade.** The key file passes the same
+  private-key permission check used for the HTTPS/gateway TLS keys (not
+  group/other-readable), then the same 64 KiB read-and-cap the IdP cert PEM
+  uses. A permission failure, unreadable file, oversize file, malformed PEM,
+  or non-RSA key disables SAML **entirely** at startup (the provider is not
+  constructed / is reset) rather than silently falling back to unsigned
+  AuthnRequests. A per-request signing failure fails `/auth/saml/start`
+  rather than emitting an unsigned redirect.
+- **Backward-compatible default.** Left unset, AuthnRequests remain
+  unsigned, same as prior releases.
+
 ### Deferred items (not in this slice)
 
 - **Login-page SSO button.** There is no "Sign in with SAML" button on the
   login page; users must navigate directly to `GET /auth/saml/start`.
-- **AuthnRequest signing.** The SP does not sign its `<samlp:AuthnRequest>`; the
-  IdP must be configured to accept unsigned requests. If the IdP requires signed
-  AuthnRequests, use OIDC.
 - **`--auth-mode=sso-only` for SAML.** A SAML-only deployment cannot disable
   local-password login. Compliance impact: CC6.3 (local-password fallback
   remains active). OIDC is the path to `sso-only`.

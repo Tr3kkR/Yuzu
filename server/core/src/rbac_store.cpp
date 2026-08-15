@@ -968,7 +968,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 23> types = {
+    const std::array<std::string_view, 26> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -985,7 +985,12 @@ void RbacStore::seed_defaults() {
         // Seeded to Administrator (CRUD via the loop below) + Viewer (Read,
         // below) — the same two roles that reached the migrated routes via
         // Security:Read before this cut.
-        "SoftwareLicensing", "EnginePrincipal"};
+        "SoftwareLicensing", "EnginePrincipal",
+        // PR1.5/1.6 (ADR-3005/ADR-3004 operator surface): the plugin
+        // config/secret/kill-switch plane and the upload-grant lifecycle.
+        "PluginConfig",   // plugin kill-switch config (PluginConfig:Write)
+        "PluginSecret",   // plugin secret material — never Operator-readable
+        "UploadGrant"};   // upload-grant mint/revoke lifecycle
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
              "ON CONFLICT (name) DO NOTHING",
@@ -1097,6 +1102,11 @@ void RbacStore::seed_defaults() {
         grant("PlatformEngineer", "Policy", o);
     for (std::string_view o : {"Read", "Write", "Delete", "Push"})
         grant("PlatformEngineer", "GuaranteedState", o);
+    // PR1.5/1.6: PlatformEngineer manages the plugin config/secret plane and
+    // the upload-grant lifecycle (no Execute exists on any of the three).
+    for (std::string_view t : {"PluginConfig", "PluginSecret", "UploadGrant"})
+        for (std::string_view o : {"Read", "Write", "Delete"})
+            grant("PlatformEngineer", t, o);
 
     // Operator.
     for (std::string_view t : {"InstructionDefinition", "InstructionSet", "Execution", "Schedule",
@@ -1121,6 +1131,11 @@ void RbacStore::seed_defaults() {
     grant("Operator", "FileRetrieval", "Write");
     grant("Operator", "GuaranteedState", "Read");
     grant("Operator", "GuaranteedState", "Push");
+    // PR1.5/1.6: read visibility only — config and grant LIFECYCLE stay
+    // privileged operations, and PluginSecret is deliberately absent here
+    // (secret material is never Operator-readable).
+    grant("Operator", "PluginConfig", "Read");
+    grant("Operator", "UploadGrant", "Read");
 
     // ApiTokenManager. "Rotate" merged from origin/dev (P2 #11, SOC 2 CC6.3
     // — self-service human token rotation; same population that already

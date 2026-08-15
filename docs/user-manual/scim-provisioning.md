@@ -427,12 +427,19 @@ fleet-wide** — not just deprovisioned users, but anyone signing in via SSO,
 including a user who was never SCIM-linked at all. **Password login is not
 affected** — this coupling is OIDC-only.
 
-If you see a spike in `yuzu_auth_oidc_deprovisioned_denied_total` that does
-not correspond to actual terminations, correlate it with Postgres health —
-`yuzu_pg_acquire_wait_seconds` and `yuzu_pg_acquire_timeout_total` — before
-assuming it's legitimate deny-at-login activity; a sustained spike with no
-matching offboarding is more likely `ScimStore`/Postgres struggling to
-answer the check than a wave of terminated users trying to log back in.
+`yuzu_auth_oidc_deprovisioned_denied_total` is the **sum** of two sub-counters
+(#3069): `yuzu_auth_oidc_deprovisioned_denied_genuine_total` (a real
+deprovisioned identity was refused re-login — the CC6.8-alertable signal) and
+`yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total` (a fail-closed
+deny while `ScimStore`/Postgres could not answer the check — an *availability*
+event, not a termination). **Alert on the `_genuine_total` sub-counter, not the
+total** — the shipped sample rule `YuzuAuthOidcDeprovisionedDeniedGenuine`
+(`docs/prometheus/yuzu-alerts.yml`) does exactly this, so a Postgres outage can
+never trip it. The SAML side has the identical split
+(`yuzu_auth_saml_deprovisioned_denied_{genuine,store_unavailable}_total`). If
+you are only watching the total, still correlate a spike with Postgres health —
+`yuzu_pg_acquire_wait_seconds` / `yuzu_pg_acquire_timeout_total` — before
+assuming a wave of terminated users is trying to log back in.
 
 ### The ~60 second window
 

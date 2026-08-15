@@ -356,6 +356,7 @@ SAML is enabled via CLI flags (or the matching environment variables). All five 
 | `--saml-idp-cert` | `YUZU_SAML_IDP_CERT` | Path to the IdP signing certificate PEM file on the server host |
 | `--saml-sp-entity-id` | `YUZU_SAML_SP_ENTITY_ID` | Entity ID URI this SP advertises to the IdP |
 | `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full public URL of the ACS endpoint (`https://<host>/saml/acs`) |
+| `--saml-sp-key` | `YUZU_SAML_SP_KEY` | Optional. Path to an SP AuthnRequest signing private key PEM (**RSA only**). When set, AuthnRequests are signed — see [AuthnRequest Signing](#authnrequest-signing) below. Left unset (the default), AuthnRequests remain unsigned |
 
 Example startup:
 
@@ -427,6 +428,59 @@ same as the other SAML flags).
 > to SAML principals) — deferred pending source-aware group resolution, see
 > issue #1832.
 
+### AuthnRequest Signing
+
+One additional flag, optional and independent of the five required SAML
+flags above, signs SP-initiated AuthnRequests over the HTTP-Redirect
+binding:
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-sp-key` | `YUZU_SAML_SP_KEY` | Path to the SP AuthnRequest signing private key PEM (**RSA only, 2048–16384 bits** — EC, RSA-PSS, and out-of-range keys are rejected) |
+
+When configured, AuthnRequests are signed with RSA PKCS#1 v1.5 + SHA-256
+(`SigAlg` `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`), carried as
+the `SigAlg`/`Signature` query parameters on the redirect. The key file must
+satisfy the same private-key permission check as the HTTPS/gateway TLS keys
+(not group/other-readable). Left unset (the default), AuthnRequests remain
+**unsigned** — a compliant IdP that accepts unsigned requests keeps working
+unchanged.
+
+**Fail-closed:** a configured key that is unreadable, over-permissioned,
+exceeds 64 KiB, is malformed, encrypted/passphrase-protected, is not RSA, or
+is outside the 2048–16384-bit range disables SAML **entirely** at startup (loudly — an `ERROR` log line, never a
+silent fall-back to unsigned requests). A per-request signing failure fails
+`/auth/saml/start` rather than emitting an unsigned redirect. Changing
+`--saml-sp-key` requires a server restart (no hot-reload, same as the other
+SAML flags).
+
+**Registering the signing certificate with your IdP.** Yuzu does not yet
+publish an SP metadata endpoint, so the IdP must be told about the signing
+key's public half manually — otherwise the IdP receives a signed request it
+cannot verify and rejects (or silently ignores) the signature even though
+Yuzu booted cleanly. Generate an **unencrypted** RSA private key and a
+self-signed public certificate, then register the certificate in your IdP's
+SP/relying-party application as the **request-signing (AuthnRequest)
+verification certificate**:
+
+```bash
+# Unencrypted RSA-2048 key (--saml-sp-key) + a self-signed public cert to hand the IdP
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout /etc/yuzu/saml-sp-key.pem -out /etc/yuzu/saml-sp-cert.pem \
+  -days 730 -subj "/CN=<your-sp-entity-id>"
+chmod 600 /etc/yuzu/saml-sp-key.pem   # must not be group/other-readable
+```
+
+Point `--saml-sp-key` at `saml-sp-key.pem` and upload `saml-sp-cert.pem` to
+the IdP (Okta, Entra ID, and PingFederate each expose a "request signature"
+or "signing certificate" field in the SP app config). The key **must be
+unencrypted** — a passphrase-protected key is rejected at boot rather than
+prompting for the passphrase.
+
+SAML is Linux/macOS only; AuthnRequest signing follows that same platform
+scope — there is no signing support on Windows (SAML is disabled there
+regardless of flag values).
+
 ### SAML Login Flow
 
 1. The operator navigates directly to `GET /auth/saml/start`. There is no "Sign in with SAML" button on the login page in this release — the login-page SSO button for SAML is deferred.
@@ -463,7 +517,7 @@ The resulting session behaves identically to an OIDC session — it is subject t
 | MFA step-up at high-risk endpoints | Not supported — SAML sessions receive 403 at all step-up-gated endpoints regardless of `--mfa-enforcement`; rely on IdP MFA |
 | `--auth-mode=sso-only` with SAML-only | Not supported — `sso-only` requires OIDC configuration; local-password login cannot be disabled with SAML alone |
 | Multi-replica / HA without sticky sessions | Not supported — pending AuthnRequest state is in-process; configure load-balancer session affinity on `/auth/saml/start` and `/saml/acs` |
-| AuthnRequest signing | Not in this release — the IdP must accept unsigned requests; use OIDC if the IdP requires signed requests |
+| AuthnRequest signing | Supported — set `--saml-sp-key` to an RSA private key PEM; AuthnRequests are then signed over the HTTP-Redirect binding with RSA PKCS#1 v1.5 + SHA-256 (see [AuthnRequest Signing](#authnrequest-signing) above). Left unset (the default), AuthnRequests remain unsigned |
 | AttributeStatement parsing | Only the configured `--saml-group-attribute` is read (for group-to-role mapping); no other assertion attributes are stored or surfaced beyond `NameID` |
 | IdP-metadata auto-fetch | Not in this release — cert and SSO URL are configured statically |
 | IdP cert hot-reload | Not supported — update `--saml-idp-cert` and restart the server |
