@@ -20,10 +20,14 @@
 #include "auth_routes.hpp"
 
 #include "api_token_store.hpp"
+#include "audit_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — shared PG-backed ApiTokenStore helper
 #include "oidc_provider.hpp"
+#include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 #include "test_rbac_store_pg_helper.hpp" // RbacStorePg — RbacStore is PG-only (ADR-0041)
+
+#include "../test_helpers.hpp" // PgTestTemplate, pg_admin_dsn_env
 
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
@@ -46,6 +50,19 @@ std::int64_t now_epoch() {
                std::chrono::system_clock::now().time_since_epoch())
         .count();
 }
+
+// AuditStore, for the ONE test below that asserts on require_list_read's own
+// denial audit-row content — every other test in this file passes
+// audit_store=nullptr (a no-op audit sink), which is deliberate (the ladder
+// logic under test doesn't depend on audit persistence). Mirrors
+// test_authz_topology_floor.cpp's FloorFixture/authz_floor_audit_tpl pattern.
+yuzu::test::PgTestTemplate list_read_gate_audit_tpl{
+    "listreadgateaudit", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::AuditStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("listreadgateaudit template: store failed to migrate");
+    }};
 
 /// Wires a real AuthRoutes with a real (PG-backed, ADR-0041) RbacStore
 /// (present, RBAC disabled by default — tests toggle via
@@ -215,4 +232,47 @@ TEST_CASE("require_list_read — ordinary RBAC delegate: no grant denies, a glob
         CHECK(gate.admitted);
         CHECK_FALSE(gate.scope.has_value());
     }
+}
+
+TEST_CASE("require_list_read — a DenyAll denial writes a real audit row (governance "
+          "Gate 6 follow-up: every other test in this file uses a no-op audit_store, "
+          "so nothing previously asserted on require_list_read's own audit content)",
+          "[pg][auth_routes][adr0017][audit]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    }
+    yuzu::test::PostgresTestDb audit_db{list_read_gate_audit_tpl};
+    INFO("[audit db] status (blank == ok): " << audit_db.error());
+    REQUIRE(audit_db.available());
+    yuzu::server::pg::PgPool audit_pool{{.conninfo = audit_db.dsn(), .size = 2}};
+    AuditStore audit_store{audit_pool};
+    REQUIRE(audit_store.is_open());
+
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    RbacStore rbac_store{":memory:"};
+    REQUIRE(rbac_store.is_open());
+    rbac_store.set_rbac_enabled(true); // enforcement in effect; no roles/grants created
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    AuthRoutes ar(cfg, auth_mgr, &rbac_store, /*api_token_store=*/nullptr, &audit_store,
+                 /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                 /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+
+    REQUIRE(auth_mgr.upsert_user("audited_no_grant_user", "password1234", auth::Role::user));
+    auto token = auth_mgr.create_local_session("audited_no_grant_user", auth::Role::user,
+                                               /*mfa_verified=*/true);
+    httplib::Request req;
+    req.headers.emplace("Cookie", "yuzu_session=" + token);
+    httplib::Response res;
+    auto gate = ar.require_list_read(req, res, "GuaranteedState", "Read");
+    REQUIRE_FALSE(gate.admitted);
+    REQUIRE(res.status == 403);
+
+    auto rows = audit_store.query(
+        AuditQuery{.action = "auth.permission_required", .limit = 1});
+    REQUIRE(rows.has_value());
+    REQUIRE_FALSE(rows->empty());
+    CHECK(rows->front().result == "denied");
+    CHECK(rows->front().detail.find("GuaranteedState:Read") != std::string::npos);
 }

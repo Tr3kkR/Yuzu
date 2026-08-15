@@ -5595,11 +5595,15 @@ management-group-confined grant sees `errored_rules` scoped to that operator's
 visible agents only (applied in SQL before the aggregate, ADR-0017 INV-3), and a
 caller with no grant anywhere is refused with `403`. `total_rules` is never
 confined — it is the size of the global rule catalogue, which has no agent or
-management-group dimension.
+management-group dimension. **A real grant that resolves to ZERO visible agents
+(an empty or agent-less management group) is still `200` with `errored_rules: 0`**
+(ADR-0017 INV-2 — a narrow-but-real grant is not a denial); do not read a `0` as
+"fleet healthy" without also confirming the caller's management-group scope
+actually covers the agents it should.
 
 - **Permission:** `GuaranteedState:Read` (non-service-scoped; management-group confined via `AuthRoutes::require_list_read`, ADR-0017)
 - **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
-- **4xx/5xx:** `403` for a service-scoped token or a caller with no `GuaranteedState:Read` grant anywhere; `503` if the Guaranteed State store or the list-read gate is unwired or degraded — never a silent `0`.
+- **4xx/5xx:** `403` for a service-scoped token, a caller with no `GuaranteedState:Read` grant anywhere, **or an unreachable/corrupt RBAC or management-group store for an ordinary caller** — `authorize_list_read` fails closed to the SAME `403` as a genuine no-grant denial, not a `503`, for every non-engine caller (the two are not currently distinguished in the response code). `503` only for: an unwired list-read gate or a null Guaranteed State store (server misconfiguration, no `retry_after_ms`); a Guaranteed State store query-time degrade (transient, `retry_after_ms: 5000`); or, for an **engine-principal** caller specifically, an unreachable/unopened RBAC store (engine sessions get a distinct `503` here, unlike human/service sessions) — never a silent `0`.
 
 #### `GET /api/v1/guaranteed-state/status/{agent_id}`
 

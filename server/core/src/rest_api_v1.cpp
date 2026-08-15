@@ -10784,8 +10784,13 @@ void RestApiV1::register_routes(
             auto errored_result = guaranteed_state_store->errored_rule_count(gate.scope);
             if (!rule_names_result || !errored_result) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                // Transient (unlike the unwired-gate/null-store 503s above, which
+                // are misconfiguration and stay retry_after_ms=null) — a query-time
+                // degrade may well clear on the next attempt.
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          /*retry_after_ms=*/5000, /*remediation=*/{}),
+                    "application/json");
                 spdlog::warn("guaranteed-state.status store degraded (503) cid={}", cid);
                 return;
             }

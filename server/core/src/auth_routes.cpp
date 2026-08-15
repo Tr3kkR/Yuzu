@@ -1062,8 +1062,8 @@ ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib:
         return gate;
     }
 
-    const auto decision = rbac_store_->authorize_list_read(session->username, securable_type,
-                                                            operation, mgmt_group_store_);
+    auto decision = rbac_store_->authorize_list_read(session->username, securable_type,
+                                                      operation, mgmt_group_store_);
     switch (decision.decision) {
     case ListReadDecision::DenyAll:
         audit_log(req, "auth.permission_required", "denied", "", "",

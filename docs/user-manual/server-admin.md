@@ -1046,7 +1046,13 @@ pending full status ingest, tracked separately.
   fleet-wide count) to `AuthRoutes::require_list_read` — the route's SOLE
   gate (ADR-0017 admit-then-filter; never stacked with the flat
   `require_permission`, which does not consult management groups and
-  cannot compose with a separate confinement check bolted on afterward). A
+  cannot compose with a separate confinement check bolted on afterward). An
+  earlier, unreleased attempt at this exact fix stacked a direct
+  `authorize_list_read` call BEHIND the flat `require_permission` gate
+  instead of replacing it — that composition never actually confined
+  anyone (a confined caller was denied by the flat gate before the
+  confinement check ever ran) and was corrected before shipping; nothing
+  described below was ever live under that broken attempt. A
   caller with no `GuaranteedState:Read` grant at all
   (global or via any management group) now gets `403` instead of `200`. A
   caller whose grant is confined to specific management groups now sees

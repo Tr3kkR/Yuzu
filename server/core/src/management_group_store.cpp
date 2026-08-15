@@ -734,11 +734,20 @@ ManagementGroupStore::get_group_roles(const std::string& group_id) const {
 std::expected<std::vector<GroupRoleAssignment>, std::string>
 ManagementGroupStore::get_assignments_for_principal(
     const std::string& user, const std::vector<std::string>& rbac_groups) const {
-    if (!open_)
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("ManagementGroupStore::get_assignments_for_principal: store not open — DENY");
         return std::unexpected("management group store not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn(
+                "ManagementGroupStore::get_assignments_for_principal: pool acquire timed out — DENY");
         return std::unexpected("management group store: pool acquire timed out");
+    }
 
     // (principal_type='user' AND principal_id=$1) OR
     // (principal_type='group' AND principal_id IN ($2,$3,...))
@@ -756,8 +765,13 @@ ManagementGroupStore::get_assignments_for_principal(
     }
 
     pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (r.status() != PGRES_TUPLES_OK)
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("ManagementGroupStore::get_assignments_for_principal: query failed: {} — DENY",
+                         PQerrorMessage(lease.get()));
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    }
     std::vector<GroupRoleAssignment> result;
     for (int i = 0; i < PQntuples(r.get()); ++i) {
         GroupRoleAssignment a;
@@ -775,11 +789,20 @@ ManagementGroupStore::get_member_agents_in_subtrees(
     const std::vector<std::string>& seed_groups) const {
     if (seed_groups.empty())
         return std::vector<std::string>{}; // no seeds → empty (no query)
-    if (!open_)
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonStoreClosed, sampler))
+            spdlog::warn("ManagementGroupStore::get_member_agents_in_subtrees: store not open — DENY");
         return std::unexpected("management group store not open");
+    }
     auto lease = pool_.try_acquire_for(kReadTimeout);
-    if (!lease)
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonPoolTimeout, sampler))
+            spdlog::warn(
+                "ManagementGroupStore::get_member_agents_in_subtrees: pool acquire timed out — DENY");
         return std::unexpected("management group store: pool acquire timed out");
+    }
 
     // Recursive CTE: seeds ∪ descendants (depth bound → cycle-safe), joined to
     // members. One query (INV-10), descendant-ward (INV-4). The depth bound
@@ -806,8 +829,13 @@ ManagementGroupStore::get_member_agents_in_subtrees(
         ") SELECT DISTINCT m.agent_id FROM management_group_store.management_group_members m"
         "  JOIN subtree ON m.group_id = subtree.id";
     pg::PgResult r = pg::exec_params(lease.get(), sql.c_str(), params);
-    if (r.status() != PGRES_TUPLES_OK)
+    if (r.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (note_read_degrade(metrics_, kReasonQueryError, sampler))
+            spdlog::warn("ManagementGroupStore::get_member_agents_in_subtrees: query failed: {} — DENY",
+                         PQerrorMessage(lease.get()));
         return std::unexpected(std::string("query failed: ") + PQerrorMessage(lease.get()));
+    }
     std::vector<std::string> result;
     for (int i = 0; i < PQntuples(r.get()); ++i)
         result.push_back(text_col(r.get(), i, 0));
