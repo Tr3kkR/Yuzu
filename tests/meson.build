@@ -889,11 +889,25 @@ if build_server
   # left out because it also tags test_props_scope_authz.cpp (a scope-authz
   # suite, not pure store CRUD), so its per-case PG cost isn't confirmed uniform
   # with the others. Partition preserved: N([pg]) == N(A) + N(B).
+  #
+  # RE-BALANCED (ADR-0048, LicenseStore): B had grown to 1193 by the time this
+  # store's PR landed (several sibling Wave 2 stores merged in the interim,
+  # each defaulting into B same as this one would have) and was TIMEOUT-ing at
+  # 600s on Windows twice in a row — reproduced on an unrelated dev merge
+  # commit around the same time, so B was already over budget before this
+  # store's own 33 cases were added. [license_store] moved to A by the same
+  # AUDIT_STORE precedent (confined to one file, verified: `grep -rl
+  # '\[license_store\]' tests/unit/` matches only test_license_store.cpp).
+  # Moves 33 cases, landing at 826 (A) / 1160 (B). This does not fix B's
+  # underlying imbalance (still the heavier half by a wide margin) — it only
+  # keeps this store's own cases from adding to an already-strained shard;
+  # a real rebalance across all of B's stores is out of scope for a single
+  # store's migration PR. Partition preserved: N([pg]) == N(A) + N(B).
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store]'],
+       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store],[pg][license_store]'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]'], suite: 'server', timeout: 600)
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[license_store]'], suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
