@@ -36,14 +36,22 @@ of these require engineering escalation on their own.
   boot for its full duration). The cap counts every legacy record, active
   **and released** — this store's retention is unbounded by design, so a
   long-lived fleet's full history could plausibly approach this over years.
-  Two ways forward: (a) prune released records you no longer need evidence
-  for out of the legacy `quarantine.db` directly with a SQLite client before
-  retrying (multi-replica caveat: do this on every replica's own legacy file
-  identically, or the replicas will fingerprint-diverge — see below); or (b)
-  raise `kMaxBackfillRows` in `quarantine_store.cpp` and rebuild — this is a
-  compile-time constant, there is no runtime flag. Engage engineering for
-  (b); do not raise it without re-checking it stays inside
-  `kBackfillTxnTimeout`'s budget.
+  **Do not prune the legacy file to get under the cap.** A `quarantine_records`
+  row is evidence a specific containment decision was made, by whom, and why;
+  ADR-0047 states outright that deleting it would be "a REGRESSION for a SOC 2
+  security-containment control," and a self-service prune here discards rows
+  before they ever reach Postgres — the backfill then fingerprints the
+  *reduced* set as complete, and nothing later detects what was lost. The
+  supported path is: raise `kMaxBackfillRows` in `quarantine_store.cpp` and
+  rebuild — this is a compile-time constant, there is no runtime flag. Engage
+  engineering; do not raise it without re-checking it stays inside
+  `kBackfillTxnTimeout`'s budget. If the row count is inflated by content you
+  are certain is safe to drop (e.g. confirmed test/lab data on a fleet that
+  never had real containment history), that is an engineering-reviewed
+  decision, not an operator one: engage engineering, who will archive a full
+  copy of anything to be dropped before any reduced backfill is accepted —
+  matching `RbacStore`'s equivalent "engage engineering before touching
+  anything" posture for its own comparable case.
 - **`has an unrecognised status 'X'`** — the `status` column is only ever
   `active` or `released`; something else (hand-edited row, external tooling)
   needs correcting to one of those two values in the legacy file before

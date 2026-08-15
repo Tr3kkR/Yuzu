@@ -1324,9 +1324,11 @@ which is itself the signal to investigate before upgrading.
   active and released — this store's retention is unbounded by design (no prune pass), so a
   long-lived fleet's full quarantine history could plausibly approach this over years, unlike
   a purely never-expected-to-bind DoS guard. `kMaxBackfillRows` is a compile-time constant,
-  not a runtime flag — see `docs/ops-runbooks/quarantine-store-backfill-recovery.md` for both
-  ways forward (prune released records out of the legacy file yourself, or engage engineering
-  to raise the constant and rebuild) before you hit it.
+  not a runtime flag, and the legacy file must never be pruned to get under this cap —
+  a `quarantine_records` row is SOC 2 containment evidence, and this store's retention is
+  unbounded by design specifically so that evidence is never lost. See
+  `docs/ops-runbooks/quarantine-store-backfill-recovery.md` for the supported path (engage
+  engineering to raise the constant and rebuild) before you hit it.
 - **Legacy file moved aside after a verified backfill.** Once the backfill is
   confirmed complete, `quarantine.db` is renamed to
   `quarantine.db.migrated-<epoch>` (the server never reads it again). If the rename
