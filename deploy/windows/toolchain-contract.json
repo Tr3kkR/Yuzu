@@ -1,6 +1,6 @@
 {
   "schema": "yuzu/windows-toolchain/v1",
-  "legacy_schema_compatibility_until": "2026-08-14T23:59:59Z",
+  "legacy_schema_compatibility_until": "2026-09-14T23:59:59Z",
   "probe_timeout_seconds": 10,
   "pins": {
     "python": "3.14.6",
