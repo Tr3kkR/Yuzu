@@ -35,6 +35,7 @@
 ///    `"offset"` key into the SAME `error` object (never top-level).
 ///    `reason` is one of the closed 10-value set below.
 
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <optional>
@@ -42,6 +43,42 @@
 #include <string_view>
 
 namespace yuzu::content_dist::upload {
+
+// ── Credential grammar ────────────────────────────────────────────────────
+//
+// #3136 minor: the frozen `<id>.<secret>` grammar `X-Yuzu-Upload-Grant`/
+// `X-Yuzu-Upload-Session` both use — duplicated from
+// server/core/src/upload_grant_parsers.hpp's `kCredentialIdHexLen`/
+// `kCredentialSecretHexLen`/`is_lowercase_hex` (never included: the
+// agents/plugins/* <-> server/core/* layering split this file's header
+// already documents). The server already fails closed on a malformed
+// credential (grant_unknown/session_unknown), so this is a LOCAL,
+// clarity-of-error precheck only — a malformed grant_id/grant_secret
+// parameter is caught before a doomed network round-trip, with a message
+// naming the actual problem instead of a generic 401.
+
+inline constexpr std::size_t kCredentialIdHexLen = 32;
+inline constexpr std::size_t kCredentialSecretHexLen = 64;
+
+[[nodiscard]] inline bool is_lowercase_hex(std::string_view s, std::size_t len) noexcept {
+    if (s.size() != len)
+        return false;
+    for (char c : s) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+/// True iff `id` is exactly `kCredentialIdHexLen` lowercase hex chars and
+/// `secret` is exactly `kCredentialSecretHexLen` lowercase hex chars — the
+/// shape both `grant_id`/`grant_secret` (mint-time) and the server-returned
+/// `upload_id`/`session_secret` (session-open time) must satisfy.
+[[nodiscard]] inline bool is_valid_credential_parts(std::string_view id,
+                                                    std::string_view secret) noexcept {
+    return is_lowercase_hex(id, kCredentialIdHexLen) &&
+          is_lowercase_hex(secret, kCredentialSecretHexLen);
+}
 
 // ── Chunk planning ──────────────────────────────────────────────────────
 
@@ -391,8 +428,16 @@ struct SessionOpenResponse {
 
 /// Parses `{"upload_id","session_secret","chunk_max_bytes","offset","expires_at"}`
 /// (session-open success body). `nullopt` on any missing/malformed field, or
-/// a structurally impossible value (`chunk_max_bytes <= 0`, negative offset)
-/// — never a partially-populated result.
+/// a structurally impossible value (`chunk_max_bytes <= 0`, `offset != 0`) —
+/// never a partially-populated result. `offset` must be EXACTLY 0: this is
+/// the fresh-session response, and server/core/src/upload_grant_parsers.hpp's
+/// frozen protocol text states a successful session open always returns
+/// `offset 0` (never merely non-negative) — the resume-poll case where a
+/// non-zero offset is legitimate is `StatusResponse`/`parse_status_response`
+/// below, a separate type used at the one distinct call site that polls an
+/// already-open session (#3136 review: this parser's own file header claims
+/// to implement the frozen text "verbatim", so it must actually reject what
+/// that text calls impossible, not merely non-negative).
 [[nodiscard]] inline std::optional<SessionOpenResponse>
 parse_session_open_response(std::string_view body) {
     auto upload_id = detail::extract_string(body, "upload_id");
@@ -401,7 +446,7 @@ parse_session_open_response(std::string_view body) {
     auto offset = detail::extract_int(body, "offset");
     auto expires = detail::extract_int(body, "expires_at");
     if (!upload_id || upload_id->empty() || !secret || secret->empty() || !chunk_max ||
-        *chunk_max <= 0 || !offset || *offset < 0 || !expires)
+        *chunk_max <= 0 || !offset || *offset != 0 || !expires)
         return std::nullopt;
     return SessionOpenResponse{*upload_id, *secret, *chunk_max, *offset, *expires};
 }

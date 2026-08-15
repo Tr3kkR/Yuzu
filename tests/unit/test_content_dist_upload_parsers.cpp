@@ -29,6 +29,28 @@
 
 using namespace yuzu::content_dist::upload;
 
+// ── Credential grammar (#3136 minor) ─────────────────────────────────────
+
+TEST_CASE("is_valid_credential_parts accepts well-formed 32/64 lowercase hex",
+         "[agent][content_dist][upload]") {
+    const std::string id(32, 'a');
+    const std::string secret(64, 'f');
+    CHECK(is_valid_credential_parts(id, secret));
+}
+
+TEST_CASE("is_valid_credential_parts rejects wrong length, case, or non-hex",
+         "[agent][content_dist][upload]") {
+    const std::string good_id(32, 'a');
+    const std::string good_secret(64, 'f');
+    CHECK_FALSE(is_valid_credential_parts(std::string(31, 'a'), good_secret)); // short id
+    CHECK_FALSE(is_valid_credential_parts(std::string(33, 'a'), good_secret)); // long id
+    CHECK_FALSE(is_valid_credential_parts(good_id, std::string(63, 'f')));    // short secret
+    CHECK_FALSE(is_valid_credential_parts(std::string(32, 'A'), good_secret)); // uppercase
+    CHECK_FALSE(is_valid_credential_parts(std::string(32, 'g'), good_secret)); // non-hex
+    CHECK_FALSE(is_valid_credential_parts("", good_secret));
+    CHECK_FALSE(is_valid_credential_parts(good_id, ""));
+}
+
 // ── Chunk planning ───────────────────────────────────────────────────────
 
 TEST_CASE("plan_next_chunk: a successful multi-chunk plan walks the whole file",
@@ -327,6 +349,14 @@ TEST_CASE("parse_session_open_response rejects a malformed or incomplete body",
     CHECK_FALSE(parse_session_open_response(
                     R"({"upload_id":"a","session_secret":"b","chunk_max_bytes":0,)"
                     R"("offset":0,"expires_at":1})")
+                    .has_value());
+    // #3136 should-fix: a fresh session-open ALWAYS returns offset 0 per the
+    // frozen protocol text (server/core/src/upload_grant_parsers.hpp) — a
+    // non-zero offset here is a server-contract violation this parser must
+    // not trust, not a resume-poll value (that's StatusResponse's job).
+    CHECK_FALSE(parse_session_open_response(
+                    R"({"upload_id":"a","session_secret":"b","chunk_max_bytes":8388608,)"
+                    R"("offset":1,"expires_at":1700000900})")
                     .has_value());
 }
 

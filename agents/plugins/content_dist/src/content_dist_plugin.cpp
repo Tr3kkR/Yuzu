@@ -766,6 +766,14 @@ private:
                 "error|missing required parameters: path, grant_id, grant_secret");
             return 1;
         }
+        // #3136 minor: local grammar precheck. The server already fails
+        // closed (grant_unknown) on a malformed credential, so this only
+        // improves the error the caller sees before a doomed round-trip.
+        if (!up::is_valid_credential_parts(grant_id, grant_secret)) {
+            ctx.write_output("error|grant_id/grant_secret do not match the expected credential "
+                             "shape (32/64 lowercase hex)");
+            return 1;
+        }
 
         fs::path file_path{std::string{path_str}};
         std::error_code ec;
@@ -792,6 +800,15 @@ private:
             }
             auto file_str = file_path.string();
             auto base_str = canon_base.string();
+            // #3136 minor: a base_dir that IS the filesystem root (e.g. "/")
+            // canonicalizes to a string already ending in a separator, so
+            // requiring file_str[base_str.size()] to ALSO be a separator
+            // rejected every child path — index base_str.size() lands one
+            // character past the separator base_str already carries. Strip
+            // one trailing separator first so the boundary check below is
+            // uniform regardless of whether the base itself ends in one.
+            if (!base_str.empty() && (base_str.back() == '/' || base_str.back() == '\\'))
+                base_str.pop_back();
             if (file_str.size() < base_str.size() ||
                 file_str.compare(0, base_str.size(), base_str) != 0 ||
                 (file_str.size() > base_str.size() && file_str[base_str.size()] != '/' &&
@@ -813,6 +830,12 @@ private:
         try {
             max_mb = std::stoi(std::string{max_str});
         } catch (...) {}
+        // #3136 minor: clamp to the [1,1000] range t2_capabilities.yaml
+        // declares for this parameter. The server's own declared-size
+        // enforcement is authoritative regardless, but a caller bypassing
+        // YAML validation should still get a locally-consistent precheck
+        // rather than an unbounded or non-positive local cap.
+        max_mb = std::clamp(max_mb, 1, 1000);
         if (static_cast<std::uintmax_t>(file_size) > static_cast<std::uintmax_t>(max_mb) * 1024 * 1024) {
             ctx.write_output(
                 std::format("error|file too large ({} bytes, max {} MB)", file_size, max_mb));
@@ -900,6 +923,13 @@ private:
 
         if (session->chunk_max_bytes <= 0) {
             ctx.write_output("error|server returned an invalid chunk_max_bytes");
+            return 1;
+        }
+        // #3136 minor: same local grammar precheck as the grant credential
+        // above, applied to the server-returned session credential before
+        // it's used to build every subsequent request's session header.
+        if (!up::is_valid_credential_parts(session->upload_id, session->session_secret)) {
+            ctx.write_output("error|server returned a session credential of unexpected shape");
             return 1;
         }
 
