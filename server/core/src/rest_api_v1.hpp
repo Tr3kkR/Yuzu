@@ -9,6 +9,7 @@
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
 #include "authz_model.hpp"
+#include "dispatch_caller.hpp"
 #include "device_token_store.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
@@ -270,8 +271,8 @@ public:
     /// Command dispatch callback — sends a CommandRequest to agents via gRPC
     /// and returns (command_id, agents_reached). Identical signature to
     /// `WorkflowRoutes::CommandDispatchFn`; the server threads the SAME hoisted
-    /// CONFINED closure (`command_dispatch_confined_fn`) into both, so every
-    /// REST dispatch surface narrows to the caller's reach through the one
+    /// caller-carrying closure (`command_dispatch_caller_fn`) into both, so
+    /// every REST dispatch surface narrows to the caller's reach through the one
     /// `dispatch_confined_arms` seam. The trailing `execution_id` is registered
     /// command_id→execution_id BEFORE any RPC so FAST loopback agents can't
     /// reply before the mapping lands (UP2-4). Empty callback leaves the async
@@ -292,11 +293,20 @@ public:
     /// header's docstring on why a second copy is the drift class). Broadcast
     /// and scope arms could not be confined route-locally in any case: the
     /// candidate set lives in the server's AgentRegistry, not in this file.
+    /// PR1.9c: the trailing parameter carries the CALLER (identity + visible
+    /// set), not the visible set alone. It has to:
+    /// `ServerImpl::build_classified_command` refuses an empty
+    /// `DispatchCaller::principal` as `AnonymousOperator` BEFORE the
+    /// legacy-open/RBAC-off bypass, so a VisibleSet-only signature left every
+    /// REST dispatch here undeliverable — reported as `503 "device offline"` on
+    /// a healthy connected agent. The other three dispatch surfaces (MCP,
+    /// dashboard, workflow) were widened by PR1.9b′; this one was deferred at
+    /// the time, and that deferral WAS the defect rather than a boundary.
     using CommandDispatchFn = std::function<std::pair<std::string, int>(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
-        const std::string& execution_id, const yuzu::server::authz::VisibleSet& exec_visible)>;
+        const std::string& execution_id, const yuzu::server::DispatchCaller& caller)>;
 
     /// Production overload — constructs an HttplibRouteSink and delegates
     /// to the sink-based overload below.

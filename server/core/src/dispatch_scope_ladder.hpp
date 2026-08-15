@@ -212,7 +212,7 @@ inline std::pair<std::string, int> wire_and_dispatch_confined(
     const std::string& command_id, const std::string& execution_id,
     const std::string& principal_role, const std::vector<std::string>& agent_ids,
     const std::string& scope_expr, const yuzu::server::authz::VisibleSet& exec_visible,
-    bool broadcast_on_none, const yuzu::server::detail::pb::CommandRequest& cmd) {
+    bool broadcast_on_none, const yuzu::server::detail::ClassifiedCommand& cmd) {
     DispatchResolvers resolvers;
     resolvers.group_members_fn = [mgmt_group_store](const std::string& group_id) {
         std::vector<std::string> members;

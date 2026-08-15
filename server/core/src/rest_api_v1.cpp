@@ -1363,6 +1363,38 @@ void RestApiV1::register_routes(
         return yuzu::server::authz::deny_all();
     };
 
+    // PR1.9c: the caller-carrying sibling of the above. Same resolution, same
+    // fail-closed posture — it just stops throwing the identity away.
+    // `build_classified_command` refuses an empty `DispatchCaller::principal`
+    // as `AnonymousOperator` before the legacy-open bypass, so the routes that
+    // dispatch MUST supply one; the visible-set-only resolver resolved a full
+    // `auth::Session` and discarded everything but the set six lines before
+    // that dispatch, which is what made every REST dispatch undeliverable.
+    //
+    // The unwired-`auth_fn` arm deliberately keeps an EMPTY principal: with no
+    // authenticator there is no identity to claim, and `AnonymousOperator` is
+    // the correct fail-closed answer rather than a fabricated one. It pairs
+    // with `deny_all()` (present-empty), never a defaulted VisibleSet — that
+    // default is nullopt, which reads as UNFILTERED.
+    auto resolve_secondary_caller =
+        [auth_fn, exec_visible_fn](const httplib::Request& req, httplib::Response& res)
+        -> std::optional<yuzu::server::DispatchCaller> {
+        std::optional<auth::Session> sess;
+        if (auth_fn) {
+            sess = auth_fn(req, res);
+            if (!sess)
+                return std::nullopt;
+        }
+        yuzu::server::DispatchCaller caller;
+        if (sess) {
+            caller.principal = sess->username;
+            caller.principal_role = auth::role_to_string(sess->role);
+        }
+        caller.exec_visible = (exec_visible_fn && sess) ? exec_visible_fn(*sess)
+                                                        : yuzu::server::authz::deny_all();
+        return caller;
+    };
+
     // ── CORS preflight handler for /api/v1/* ─────────────────────────────
     // Actual CORS headers are added by the post-routing handler in server.cpp
     // with origin allowlist validation.
@@ -1442,14 +1474,14 @@ void RestApiV1::register_routes(
                                   const std::string& scope,
                                   const std::unordered_map<std::string, std::string>& params,
                                   const std::string& correlation_id,
-                                  const yuzu::server::authz::VisibleSet& exec_visible)
+                                  const yuzu::server::DispatchCaller& caller)
                 -> std::pair<std::string, int> {
                 for (const auto& id : agent_ids) {
-                    if (!yuzu::server::authz::in_scope(exec_visible, id))
+                    if (!yuzu::server::authz::in_scope(caller.exec_visible, id))
                         return {correlation_id, 0};
                 }
                 return command_dispatch_fn(plugin, action, agent_ids, scope, params,
-                                           correlation_id, exec_visible);
+                                           correlation_id, caller);
             },
             response_store,
             [] {
@@ -1600,7 +1632,7 @@ void RestApiV1::register_routes(
     sink.Post(
         "/api/v1/tar/retention-paused/purge",
         [scoped_perm_fn, command_dispatch_fn, audit_fn, metrics_registry,
-         resolve_secondary_exec_visible](const httplib::Request& req, httplib::Response& res) {
+         resolve_secondary_caller](const httplib::Request& req, httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             auto bump = [&](const char* result) {
@@ -1675,14 +1707,14 @@ void RestApiV1::register_routes(
             // and has already authorized this exact device_id, so the seam's
             // intersection is a second, independent check rather than the thing
             // standing between this caller and the fleet.
-            const auto exec_visible = resolve_secondary_exec_visible(req, res);
-            if (!exec_visible) {
+            const auto caller = resolve_secondary_caller(req, res);
+            if (!caller) {
                 bump("denied");
                 return;
             }
             const auto [command_id, sent] =
                 command_dispatch_fn("tar", "purge_source", {device_id}, "", {{"source", source}},
-                                    /*execution_id=*/"", *exec_visible);
+                                    /*execution_id=*/"", *caller);
             if (sent == 0) {
                 // NOTE: a confinement drop also lands here and is reported as
                 // "offline" + counted as agent_not_connected. The RESPONSE
@@ -6805,6 +6837,12 @@ void RestApiV1::register_routes(
                 return;
             }
             const yuzu::server::authz::VisibleSet exec_visible = exec_visible_fn(session);
+            // PR1.9c: the chokepoint needs the identity too, and `session` is
+            // this lambda's own parameter — no extra resolution required.
+            const yuzu::server::DispatchCaller caller{
+                .principal = session.username,
+                .principal_role = auth::role_to_string(session.role),
+                .exec_visible = exec_visible};
             // Resolve the parent scope. parent_id present → dispatch is scoped
             // to that set's CURRENT members via the `from_result_set:` scope
             // kind; absent → broadcast to all connected agents (__all__).
@@ -6912,7 +6950,7 @@ void RestApiV1::register_routes(
                 // lives in the server's AgentRegistry, and a second copy of the
                 // intersection is the drift that seam exists to prevent.
                 std::tie(command_id, sent) = command_dispatch_fn(plugin, action, {}, dispatch_scope,
-                                                                 params, exec_id, exec_visible);
+                                                                 params, exec_id, caller);
             } catch (const std::exception& e) {
                 spdlog::error("result-set async producer dispatch failed: {}", e.what());
                 execution_tracker->mark_cancelled(exec_id, owner);
@@ -9023,7 +9061,7 @@ void RestApiV1::register_routes(
     sink.Post(
         R"(/api/v1/dex/devices/([^/]+)/live)",
         [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn, metrics_registry,
-         resolve_secondary_exec_visible](const httplib::Request& req, httplib::Response& res) {
+         resolve_secondary_caller](const httplib::Request& req, httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             // Echo the correlation id on EVERY response path (A3), parity with the
@@ -9088,8 +9126,8 @@ void RestApiV1::register_routes(
             // audit was the original shape and is the ordering defect this
             // moves; the scope gate above has already answered 401, so this
             // still cannot fail in practice and no status ordering shifts.)
-            const auto exec_visible = resolve_secondary_exec_visible(req, res);
-            if (!exec_visible)
+            const auto caller = resolve_secondary_caller(req, res);
+            if (!caller)
                 return;
             // Concurrency cap (UP-1/2/3): acquire an in-flight slot BEFORE dispatch so
             // an over-budget caller gets 429 without orphaning a command. RAII releases
@@ -9132,7 +9170,7 @@ void RestApiV1::register_routes(
                 return;
             }
             const auto [command_id, sent] = command_dispatch_fn(plugin, action, {agent_id}, "", {},
-                                                                /*execution_id=*/"", *exec_visible);
+                                                                /*execution_id=*/"", *caller);
             if (sent == 0) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(

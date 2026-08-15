@@ -37,6 +37,8 @@
 /// never retried into a backlog). Only a pending approval holds a schedule
 /// at its due time.
 
+#include "dispatch_caller.hpp"
+
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -61,12 +63,30 @@ class ScheduleRunner {
 public:
     /// Same shape as WorkflowRoutes::CommandDispatchFn — the server hands the
     /// runner the one shared dispatch lambda so scheduled fires travel the
-    /// exact same path as operator-initiated commands.
+    /// exact same path as operator-initiated commands. Review finding
+    /// (external PR review, #3133): this used to be narrower than its
+    /// sibling — no `caller` parameter at all — so every fire went through
+    /// `command_dispatch_fn`'s hardcoded `DispatchCaller{.system = true}`,
+    /// bypassing the classify+authorize chokepoint's per-action check
+    /// entirely. Widened to actually match the shape this comment always
+    /// claimed.
     using CommandDispatchFn = std::function<std::pair<std::string, int>(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
-        const std::string& execution_id)>;
+        const std::string& execution_id, const yuzu::server::DispatchCaller& caller)>;
+
+    /// Resolves the CURRENT `DispatchCaller` for a stored username at fire
+    /// time — re-resolving live permissions, never trusting a stale
+    /// creation-time snapshot (a schedule's creator may have gained or lost
+    /// grants since `s.created_by` was recorded). A schedule fire has no
+    /// live HTTP session to derive from, unlike every other dispatch
+    /// surface's `CallerFn` — server.cpp wires this to a lookup against the
+    /// current auth/RBAC state. REQUIRED: an unwired resolver would
+    /// reproduce exactly the system-caller bypass this field exists to
+    /// close, so `dispatch_tracked` calls it unconditionally rather than
+    /// falling back to an unfiltered default.
+    using ResolveCallerFn = std::function<yuzu::server::DispatchCaller(const std::string& username)>;
 
     struct Deps {
         ScheduleEngine* schedule_engine{nullptr};       // required
@@ -76,6 +96,7 @@ public:
         AuditStore* audit_store{nullptr};               // optional forensic sink
         yuzu::MetricsRegistry* metrics{nullptr};        // optional observability sink
         CommandDispatchFn dispatch_fn;                  // required
+        ResolveCallerFn resolve_caller;                 // required
     };
 
     explicit ScheduleRunner(Deps deps);
