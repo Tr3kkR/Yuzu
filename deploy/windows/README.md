@@ -66,12 +66,10 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    hand-edit the JSON, and never run the four-runner Wee Tam provisioner on
    single-runner Shulgi merely to regenerate a manifest.
 
-   The schema introduction has one separately bounded bridge for manifests
-   emitted by the immediately preceding provisioner: a missing `schema` is
-   accepted through **2026-08-14 23:59:59 UTC**, but every v1 pin, path, and
-   live-version probe still runs. Drain and reprovision every Windows runner
-   from merged code before that deadline. Unknown explicit schemas and a
-   missing manifest always fail.
+   The schema introduction's bounded compatibility bridge (a missing `schema`
+   accepted through a deadline) has been retired: every Windows runner emits a
+   schema-tagged manifest, verified live. A missing or unknown manifest schema
+   now always fails.
 
    **On an existing shared box, stop all four runners first.** Provisioning
    restarts shared PostgreSQL services and rewrites machine PATH/env under
