@@ -36,6 +36,16 @@
 /// (fire-and-advance — a missed/failed occurrence is recorded and skipped,
 /// never retried into a backlog). Only a pending approval holds a schedule
 /// at its due time.
+///
+/// Arming re-check (D7, PLAN-003) — a schedule can sit dormant for months
+/// between occurrences, long enough for the authority it was armed under to
+/// have changed (a role revoked, a definition re-pointed). `fire()` re-
+/// verifies the arming principal via `Deps::arming_check` BEFORE branching
+/// on approval, so the check covers the direct-dispatch arm exactly as much
+/// as the approval-gated arm. It is an ADDITIONAL gate in front of the
+/// approval-ticket flow (ApprovalManager / fire_with_approval, M-02/#1806),
+/// not a second copy of it — a denial here means fire_with_approval never
+/// runs at all for that occurrence.
 
 #include "dispatch_caller.hpp"
 
@@ -88,6 +98,18 @@ public:
     /// falling back to an unfiltered default.
     using ResolveCallerFn = std::function<yuzu::server::DispatchCaller(const std::string& username)>;
 
+    /// Re-verify the arming principal's current authority to fire ONE
+    /// plugin.action (D7, peer finding PLAN-003). Checked in `fire()`
+    /// BEFORE the approval/direct branch, so it covers both the
+    /// `approval_mode == "auto"` direct-dispatch arm AND the approval-gated
+    /// arm — a check reachable only from inside `fire_with_approval` would
+    /// leave every auto schedule dispatching under stale authority. This
+    /// package owns only the fail-closed seam and its tests: an UNSET
+    /// callback denies every fire. p14 wires the real RBAC/arming lookup.
+    using ArmingCheckFn = std::function<bool(const std::string& principal,
+                                             const std::string& plugin,
+                                             const std::string& action)>;
+
     struct Deps {
         ScheduleEngine* schedule_engine{nullptr};       // required
         InstructionStore* instruction_store{nullptr};   // required
@@ -97,6 +119,7 @@ public:
         yuzu::MetricsRegistry* metrics{nullptr};        // optional observability sink
         CommandDispatchFn dispatch_fn;                  // required
         ResolveCallerFn resolve_caller;                 // required
+        ArmingCheckFn arming_check;                      // fail-closed when unset — see above
     };
 
     explicit ScheduleRunner(Deps deps);

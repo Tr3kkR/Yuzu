@@ -12,12 +12,17 @@
  */
 
 #include "approval_manager.hpp"
+#include "audit_store.hpp"
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "schedule_engine.hpp"
+#include "schedule_params_parsers.hpp"
 #include "schedule_runner.hpp"
 
 #include "../test_helpers.hpp"
+#include "pg/pg_pool.hpp"
+
+#include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <sqlite3.h>
@@ -25,6 +30,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -46,6 +52,7 @@ struct DispatchCall {
     std::string scope;
     std::string execution_id;
     DispatchCaller caller;
+    std::unordered_map<std::string, std::string> params;
 };
 
 struct Harness {
@@ -63,23 +70,31 @@ struct Harness {
 
     ScheduleRunner runner;
 
-    Harness()
+    // D7 (PLAN-003): default arming_check allows every fire, matching every
+    // pre-D7 test's assumption that the schedule fires whenever nothing else
+    // blocks it. D7-specific test cases pass `false` or an explicitly empty
+    // ScheduleRunner::ArmingCheckFn{} to prove the deny/unset paths.
+    explicit Harness(ScheduleRunner::ArmingCheckFn arming =
+                          [](const std::string&, const std::string&, const std::string&) {
+                              return true;
+                          },
+                      AuditStore* audit = nullptr, yuzu::MetricsRegistry* metrics_reg = nullptr)
         : runner(ScheduleRunner::Deps{
               .schedule_engine = &engine,
               .instruction_store = &is,
               .execution_tracker = &tracker,
               .approval_manager = &approvals,
-              .audit_store = nullptr,
-              .metrics = nullptr,
+              .audit_store = audit,
+              .metrics = metrics_reg,
               .dispatch_fn =
                   [this](const std::string& plugin, const std::string& action,
                          const std::vector<std::string>&, const std::string& scope,
-                         const std::unordered_map<std::string, std::string>&,
+                         const std::unordered_map<std::string, std::string>& params,
                          const std::string& execution_id,
                          const DispatchCaller& caller) -> std::pair<std::string, int> {
                       if (throw_on_dispatch)
                           throw std::runtime_error("dispatch boom");
-                      calls.push_back({plugin, action, scope, execution_id, caller});
+                      calls.push_back({plugin, action, scope, execution_id, caller, params});
                       return {"cmd-" + std::to_string(calls.size()), reach};
                   },
               // #3133 review fix: resolve_caller re-resolves a real,
@@ -91,6 +106,7 @@ struct Harness {
                   [](const std::string& username) {
                   return DispatchCaller{.principal = username, .system = false};
               },
+              .arming_check = std::move(arming),
           }) {
         engine.create_tables();
         tracker.create_tables();
@@ -115,7 +131,8 @@ struct Harness {
 
     // A schedule that is due NOW (next_execution_at forced into the past).
     std::string make_due(const std::string& def_id, const std::string& freq,
-                         bool requires_approval = false) {
+                         bool requires_approval = false,
+                         const std::string& parameters_json = "") {
         InstructionSchedule s;
         s.name = "sched-" + def_id + "-" + freq;
         s.definition_id = def_id;
@@ -126,6 +143,7 @@ struct Harness {
         s.enabled = true;
         s.created_by = "admin";
         s.next_execution_at = 1; // long past — due immediately
+        s.parameter_values = parameters_json;
         auto id = engine.create_schedule(s);
         REQUIRE(id.has_value());
         return *id;
@@ -422,4 +440,149 @@ TEST_CASE("ScheduleEngine: interval floor rejected at create, clamped on legacy 
                    std::chrono::system_clock::now().time_since_epoch())
                    .count();
     CHECK(s.next_execution_at > now); // clamped forward, not re-armed at now
+}
+
+// ── PR1.5a: typed schedule parameters ───────────────────────────────────────
+
+TEST_CASE("ScheduleRunner: a schedule's parameters round-trip to the dispatch fn and "
+          "exec.parameter_values",
+          "[schedule][runner][params]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/false,
+                         R"({"target":"prod","retries":3})");
+
+    h.runner.tick();
+
+    REQUIRE(h.calls.size() == 1);
+    // Canonical (sorted-key) form reaches the dispatch fn's parameter map —
+    // never empty, never the raw caller order.
+    CHECK(h.calls[0].params.at("target") == "prod");
+    CHECK(h.calls[0].params.at("retries") == "3");
+
+    auto exec = h.tracker.get_execution(h.calls[0].execution_id);
+    REQUIRE(exec.has_value());
+    // exec.parameter_values equals the stored canonical JSON — never the
+    // literal "{}" that dispatch_tracked hardcoded before this package.
+    CHECK(exec->parameter_values == h.get(id).parameter_values);
+    CHECK(exec->parameter_values != "{}");
+}
+
+TEST_CASE("ScheduleRunner: a schedule created with no parameters defaults to the canonical "
+          "empty object and dispatches an empty parameter map",
+          "[schedule][runner][params]") {
+    Harness h;
+    auto id = h.make_due("test.def", "interval");
+
+    CHECK(h.get(id).parameter_values == "{}");
+
+    h.runner.tick();
+
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.calls[0].params.empty());
+}
+
+// ── D7 (PLAN-003): arming re-check on EVERY fire path ───────────────────────
+
+TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the auto (no-approval) fire path",
+          "[schedule][runner][d7]") {
+    Harness h([](const std::string&, const std::string&, const std::string&) { return false; });
+    auto id = h.make_due("test.def", "interval");
+
+    h.runner.tick();
+
+    CHECK(h.calls.empty()); // dispatch_fn never reached
+    CHECK(h.get(id).next_execution_at > 1); // advanced — must not spin
+}
+
+TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fire path",
+          "[schedule][runner][d7][approval]") {
+    Harness h([](const std::string&, const std::string&, const std::string&) { return false; });
+    auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick();
+
+    // Denied BEFORE the approval branch — no ticket is even submitted, so
+    // this proves arming_check gates IN FRONT OF fire_with_approval rather
+    // than duplicating one of its checks.
+    CHECK(h.calls.empty());
+    CHECK(h.approvals.query({.status = "pending"}).empty());
+    CHECK(h.get(id).next_execution_at > 1);
+}
+
+TEST_CASE("ScheduleRunner: D7 an UNSET arming_check denies both the auto and approval-gated "
+          "paths",
+          "[schedule][runner][d7]") {
+    Harness h(ScheduleRunner::ArmingCheckFn{}); // deliberately empty — p14 not wired
+    auto auto_id = h.make_due("test.def", "interval");
+    auto gated_id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+
+    h.runner.tick();
+
+    CHECK(h.calls.empty());
+    CHECK(h.approvals.query({.status = "pending"}).empty());
+    CHECK(h.get(auto_id).next_execution_at > 1);
+    CHECK(h.get(gated_id).next_execution_at > 1);
+}
+
+TEST_CASE("ScheduleRunner: D7 true arming_check still lets the auto and approved-ticket paths "
+          "fire (existing approval behaviour unchanged)",
+          "[schedule][runner][d7][approval]") {
+    Harness h([](const std::string&, const std::string&, const std::string&) { return true; });
+
+    auto auto_id = h.make_due("test.def", "interval");
+    h.runner.tick();
+    REQUIRE(h.calls.size() == 1);
+    CHECK(h.get(auto_id).execution_count == 1);
+
+    auto gated_id = h.make_due("test.def", "interval", /*requires_approval=*/true);
+    h.runner.tick(); // submits
+    auto pending = h.approvals.query({.status = "pending"});
+    REQUIRE(pending.size() == 1);
+    REQUIRE(h.approvals.approve(pending[0].id, "boss", "ok").has_value());
+    h.runner.tick(); // fires
+
+    REQUIRE(h.calls.size() == 2);
+    CHECK(h.get(gated_id).execution_count == 1);
+}
+
+namespace {
+// AuditStore is Postgres-backed now — pre-migrated template for the single
+// audit-consuming case below (everything else in this file stays hermetic
+// SQLite via the runner's own stores).
+yuzu::test::PgTestTemplate schedrunner_audit_tpl{"schedrunneraudit", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    AuditStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("schedrunner audit template: store failed to migrate");
+}};
+} // namespace
+
+TEST_CASE("ScheduleRunner: D7 a denied arming check audits the principal + target and counts "
+          "the deny",
+          "[schedule][runner][d7][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, schedrunner_audit_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    yuzu::MetricsRegistry metrics;
+    Harness h([](const std::string&, const std::string&, const std::string&) { return false; },
+             &audit, &metrics);
+    h.make_due("test.def", "interval");
+
+    h.runner.tick();
+
+    CHECK(metrics.counter("yuzu_schedule_arming_denied_total").value() == 1.0);
+
+    auto rows = audit.query({.action = "instruction.schedule_fired"});
+    REQUIRE(rows.has_value()); // PG store: query reports availability, not just rows
+    bool found = false;
+    for (const auto& e : *rows) {
+        if (e.result == "denied" && e.principal == "admin" &&
+            e.detail.find("plugin=procs") != std::string::npos &&
+            e.detail.find("action=list") != std::string::npos) {
+            found = true;
+        }
+    }
+    CHECK(found);
 }

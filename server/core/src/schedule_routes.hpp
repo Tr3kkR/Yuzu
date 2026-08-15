@@ -13,6 +13,14 @@
 /// no approval gate); every other execution-producing route in server.cpp
 /// (POST /api/command, the instruction-execute routes) gates
 /// `Execution:Execute`, and schedule creation must match.
+///
+/// CREATE-ONLY (PR1.5a): this file declares and defines exactly one handler.
+/// A schedule's `parameters` (schedule_params_parsers.hpp) are set at
+/// creation and are immutable thereafter — there is no update route, and
+/// none should be added here without a deliberate design pass (parameters
+/// feed p8's plan hash, so an in-place mutation path needs its own
+/// re-validation and audit story). Changing a schedule's parameters today
+/// means delete-and-recreate.
 
 #include <httplib.h>
 

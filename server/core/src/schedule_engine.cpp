@@ -1,5 +1,6 @@
 #include "schedule_engine.hpp"
 #include "migration_runner.hpp"
+#include "schedule_params_parsers.hpp"
 
 #include <spdlog/spdlog.h>
 
@@ -51,13 +52,14 @@ InstructionSchedule row_to_schedule(sqlite3_stmt* stmt) {
     s.execution_count = sqlite3_column_int(stmt, 13);
     s.created_by = col_text(stmt, 14);
     s.created_at = sqlite3_column_int64(stmt, 15);
+    s.parameter_values = col_text(stmt, 16);
     return s;
 }
 
 const char* kSelectAllCols = "id, name, definition_id, frequency_type, interval_minutes, "
                              "time_of_day, day_of_week, day_of_month, scope_expression, "
                              "requires_approval, enabled, next_execution_at, last_executed_at, "
-                             "execution_count, created_by, created_at";
+                             "execution_count, created_by, created_at, parameter_values";
 
 bool is_valid_frequency(const std::string& freq) {
     return freq == "once" || freq == "interval" || freq == "daily" || freq == "weekly" ||
@@ -118,6 +120,14 @@ void ScheduleEngine::create_tables() {
                 created_by TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL DEFAULT 0
             );
+        )"},
+        // PR1.5a: typed schedule parameters (schedule_params_parsers.hpp).
+        // ADD COLUMN with a DEFAULT back-fills every pre-existing row with
+        // the canonical "no parameters" object in place — no separate
+        // UPDATE pass, and no row is ever NULL here for row_to_schedule to
+        // mis-decode as an empty std::string that then fails validation.
+        {2, R"(
+            ALTER TABLE schedules ADD COLUMN parameter_values TEXT NOT NULL DEFAULT '{}';
         )"},
     };
     if (!MigrationRunner::run(db_, "schedule_engine", kMigrations)) {
@@ -190,6 +200,16 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
     // same way for pre-floor legacy rows.
     if (sched.frequency_type == "interval" && sched.interval_minutes < 1)
         return std::unexpected("interval_minutes must be >= 1");
+    // Persistence-layer backstop (PR1.5a): schedule_routes.cpp already
+    // validates+canonicalizes the caller-supplied `parameters` field before
+    // it reaches here, but this call is what makes that guarantee hold for
+    // EVERY caller of create_schedule, not just the REST route — including
+    // an empty sched.parameter_values, which canonicalizes to "{}" rather
+    // than being stored as truly empty. Re-canonicalizing an
+    // already-canonical string is a cheap no-op re-serialization.
+    auto canon_params = validate_and_canonicalize_schedule_params(sched.parameter_values);
+    if (!canon_params)
+        return std::unexpected(std::string(to_string(canon_params.error())));
 
     std::unique_lock lock(mtx_);
 
@@ -204,8 +224,8 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
         (id, name, definition_id, frequency_type, interval_minutes,
          time_of_day, day_of_week, day_of_month, scope_expression,
          requires_approval, enabled, next_execution_at, last_executed_at,
-         execution_count, created_by, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+         execution_count, created_by, created_at, parameter_values)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     )";
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
@@ -228,6 +248,7 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
     sqlite3_bind_int(stmt, i++, sched.execution_count);
     sqlite3_bind_text(stmt, i++, sched.created_by.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, i++, sched.created_at > 0 ? sched.created_at : now);
+    sqlite3_bind_text(stmt, i++, canon_params->c_str(), -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         auto err = std::string(sqlite3_errmsg(db_));
