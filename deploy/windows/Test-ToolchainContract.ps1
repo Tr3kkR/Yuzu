@@ -978,10 +978,6 @@ Check 'Windows nightly requires the host manifest without an optional guard' {
     $disabledFixture -match '(?im)^\s*if\s*:' -and
     $suppressedFixture -match '(?im)^\s*continue-on-error\s*:|\|\|\s*true\b'
 }
-Check 'schema-less compatibility is explicit and time-bounded' {
-  $deadline = [DateTimeOffset]$contract.legacy_schema_compatibility_until
-  $deadline -eq [DateTimeOffset]::Parse('2026-08-14T23:59:59Z')
-}
 Check 'the baseline updater covers every active tracked SHA reference' {
   $workflow = Get-Content -LiteralPath $BaselineWorkflowPath -Raw
   $filesMatch = [regex]::Match($workflow, '(?ms)^\s+files=\(\r?\n(?<body>.*?)^\s+\)')
@@ -997,9 +993,8 @@ Check 'the baseline updater covers every active tracked SHA reference' {
 }
 
 # Exercise the real Assert script's schema seams in child processes. An unknown
-# schema must stop before any fake tool, service, registry, or PG probe; the
-# immediately preceding schema-less shape must enter the bounded compatibility
-# path and proceed to the normal checks.
+# or missing schema must stop before any fake tool, service, registry, or PG
+# probe.
 $work = Join-Path ([IO.Path]::GetTempPath()) "yuzu_test_toolchain_$([guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Path $work | Out-Null
 try {
@@ -1017,7 +1012,7 @@ try {
   $output = & pwsh -NoProfile -File $AssertPath -ManifestPath $badManifestPath -ContractPath $ContractPath 2>&1 | Out-String
   $exitCode = $LASTEXITCODE
   Check 'Assert-Toolchain exits 1 at the incompatible-schema seam' {
-    $exitCode -eq 1 -and $output -match 'manifest/tool versions do not satisfy the repository contract' -and
+    $exitCode -eq 1 -and $output -match "manifest schema 'yuzu/windows-toolchain/v999' is incompatible" -and
     $output -notmatch '-- tools --'
   }
 
@@ -1026,9 +1021,10 @@ try {
   $legacyManifest.PSObject.Properties.Remove('schema')
   $legacyManifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $legacyManifestPath -Encoding UTF8
   $output = & pwsh -NoProfile -File $AssertPath -ManifestPath $legacyManifestPath -ContractPath $ContractPath 2>&1 | Out-String
-  Check 'Assert-Toolchain carries a schema-less manifest through the bounded compatibility seam' {
-    $output -match 'schema-less legacy manifest accepted through' -and
-    $output -match 'Toolchain contract:'
+  $exitCode = $LASTEXITCODE
+  Check 'Assert-Toolchain exits 1 at the schema-less seam (bridge retired)' {
+    $exitCode -eq 1 -and $output -match "manifest schema '<unset>' is incompatible" -and
+    $output -notmatch '-- tools --'
   }
 } finally {
   Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
