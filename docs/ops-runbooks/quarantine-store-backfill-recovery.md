@@ -52,11 +52,13 @@ sanity cap** below, which always does.
   decision, not an operator one — and it must not produce evidence
   indistinguishable from a genuinely complete backfill: engage engineering,
   who will (1) archive a full copy of anything to be dropped, and (2) record
-  the decision (a linked issue or ticket) somewhere `quarantine_meta` or the
-  boot log can reference, before any reduced backfill is accepted. Today
-  `backfill_row_count` cannot itself distinguish a sanctioned reduction from
-  a complete backfill — closing that gap is tracked in #3149, not solved by
-  this runbook alone.
+  the decision as a linked issue or ticket with a stable ID, before any
+  reduced backfill is accepted. **There is no `quarantine_meta` field or
+  boot-log line that references this ticket today** — `backfill_row_count`
+  cannot itself distinguish a sanctioned reduction from a complete backfill,
+  and until #3149 adds that marker, the ticket itself is the only record;
+  keep it findable (note the boot time and row count in it for later
+  cross-reference).
 - **`has an unrecognised status 'X'`** — the `status` column is only ever
   `active` or `released`; something else (hand-edited row, external tooling)
   needs correcting to one of those two values in the legacy file before
