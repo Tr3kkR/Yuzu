@@ -65,9 +65,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* execution_event_bus = deps.execution_event_bus;
     auto* metrics = deps.metrics;
     auto cmd_dispatch = std::move(deps.command_dispatch_fn);
-    // K-R7-02: per-request Execution:Execute visible-set derivation. A missing
-    // callback fails CLOSED at each dispatch site (present-empty set, deny all).
-    auto exec_visible_fn = std::move(deps.exec_visible_fn);
+    // K-R7-02 / PLAN-006: per-request DispatchCaller derivation. A missing
+    // callback fails CLOSED on visibility at each dispatch site (empty
+    // principal, present-empty set, deny all).
+    auto caller_fn = std::move(deps.caller_fn);
 
     // -- HTMX fragments --------------------------------------------------------
 
@@ -1158,7 +1159,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/workflows/:id/execute -- execute workflow against agents
     sink.Post(R"(/api/workflows/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                     workflow_engine, instruction_store,
-                                                    cmd_dispatch, exec_visible_fn,
+                                                    cmd_dispatch, caller_fn,
                                                     approval_manager](const httplib::Request& req,
                                                                       httplib::Response& res) {
         if (!perm_fn(req, res, "Workflow", "Execute"))
@@ -1197,13 +1198,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        // K-R7-02: derive the operator's Execution:Execute visible set ONCE for
-        // this request and thread it into every step dispatch below, so a
-        // workflow step is confined exactly as /api/command and MCP are. An
-        // UNWIRED derivation fails CLOSED (present-empty set → reaches nobody).
-        const yuzu::server::authz::VisibleSet exec_visible =
-            exec_visible_fn ? exec_visible_fn(req)
-                            : yuzu::server::authz::deny_all();
+        // K-R7-02 / PLAN-006: derive the operator's DispatchCaller ONCE for this
+        // request and thread it into every step dispatch below, so a workflow
+        // step is confined AND identified exactly as /api/command and MCP are.
+        // An UNWIRED derivation fails CLOSED on visibility (present-empty set →
+        // reaches nobody).
+        const yuzu::server::DispatchCaller caller =
+            caller_fn ? caller_fn(req)
+                      : yuzu::server::DispatchCaller{
+                            .exec_visible = yuzu::server::authz::deny_all()};
 
         // --- Pre-validate approval gates on all workflow steps ---------------
         // If any instruction in the workflow requires approval, reject the
@@ -1262,11 +1265,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         // Create a dispatch function that uses the real command dispatch.
-        // exec_visible is captured by value (workflow_engine->execute invokes
-        // this synchronously below, but a value capture is lifetime-safe
-        // regardless) so every step narrows to the operator's visible set.
+        // caller is captured by value (workflow_engine->execute invokes this
+        // synchronously below, but a value capture is lifetime-safe
+        // regardless) so every step narrows to AND identifies the operator.
         auto dispatch_fn =
-            [instruction_store, &cmd_dispatch, exec_visible](
+            [instruction_store, &cmd_dispatch, caller](
                 const std::string& instruction_id, const std::string& agent_ids_json,
                 const std::string& parameters_json) -> std::expected<std::string, std::string> {
             // Look up the instruction definition to get plugin + action
@@ -1325,7 +1328,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // the legacy sentinel (legacy fallback in detail handler
             // covers the rendering).
             auto [command_id, sent] = cmd_dispatch(def->plugin, def->action, target_ids, "", params,
-                                                   /*execution_id=*/"", exec_visible);
+                                                   /*execution_id=*/"", caller);
 
             if (sent == 0)
                 return std::unexpected<std::string>("no agents reached for " + instruction_id);
@@ -1413,7 +1416,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // POST /api/instructions/:id/execute — dispatch a single instruction definition
     sink.Post(R"(/api/instructions/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                        instruction_store, cmd_dispatch,
-                                                       exec_visible_fn, execution_tracker,
+                                                       caller_fn, execution_tracker,
                                                        approval_manager,
                                                        metrics](const httplib::Request& req,
                                                                 httplib::Response& res) {
@@ -1646,16 +1649,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const std::string dispatch_scope = (agent_ids.empty() && scope_expr.empty())
                                                    ? std::string(kBroadcastScope)
                                                    : scope_expr;
-            // K-R7-02: confine to the operator's Execution:Execute visible set
-            // via the shared dispatch_confined seam. `session` is already
-            // resolved above; re-derive from the request (fail CLOSED if the
-            // callback is unwired — present-empty set → reaches nobody).
-            const yuzu::server::authz::VisibleSet exec_visible =
-                exec_visible_fn ? exec_visible_fn(req)
-                                : yuzu::server::authz::deny_all();
+            // K-R7-02 / PLAN-006: confine to AND identify the operator via the
+            // shared dispatch_confined seam. `session` is already resolved
+            // above; re-derive from the request (fail CLOSED on visibility if
+            // the callback is unwired — present-empty set → reaches nobody).
+            const yuzu::server::DispatchCaller caller =
+                caller_fn ? caller_fn(req)
+                          : yuzu::server::DispatchCaller{
+                                .exec_visible = yuzu::server::authz::deny_all()};
             std::tie(command_id, sent) = cmd_dispatch(def->plugin, def->action, agent_ids,
                                                       dispatch_scope, params, execution_id,
-                                                      exec_visible);
+                                                      caller);
         } catch (const std::exception& e) {
             spdlog::error("instruction dispatch failed: {}", e.what());
             // Pattern C / hardening regression close: the pre-created

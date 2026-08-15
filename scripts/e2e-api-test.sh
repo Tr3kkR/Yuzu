@@ -258,6 +258,24 @@ http_get_noauth "$SERVER_URL/metrics"
 assert_eq "GET /metrics returns 200" "200" "$HTTP_STATUS"
 assert_contains "GET /metrics body contains 'yuzu_'" "yuzu_" "$HTTP_BODY"
 
+# L9 (wave1 remediation): these deny counters are PRE-REGISTERED at boot
+# (server.cpp) with a concrete zero-value series, deliberately never left to
+# spring into existence on first increment — for a fail-closed check, "absent"
+# (never ran) and "zero" (ran, denied nothing) are different facts, and only
+# pre-registration keeps them distinguishable on a fresh dashboard. This is
+# the one place that boot-time wiring is provable: the counters are set on a
+# private ServerImpl member with no live-Session-free construction path, so a
+# unit test cannot reach them — only a real boot, which this e2e run against a
+# freshly-started stack (no schedule/dispatch/gateway denial has fired yet) is.
+assert_contains "GET /metrics pre-registers yuzu_schedule_arming_denied_total at boot" \
+    "yuzu_schedule_arming_denied_total" "$HTTP_BODY"
+assert_contains "GET /metrics pre-registers yuzu_server_dispatch_denied_total at boot" \
+    "yuzu_server_dispatch_denied_total" "$HTTP_BODY"
+assert_contains "GET /metrics pre-registers yuzu_server_dispatch_tag_invalid_total at boot" \
+    "yuzu_server_dispatch_tag_invalid_total" "$HTTP_BODY"
+assert_contains "GET /metrics pre-registers yuzu_server_gateway_capability_denied_total at boot" \
+    "yuzu_server_gateway_capability_denied_total" "$HTTP_BODY"
+
 log ""
 
 # ══════════════════════════════════════════════════════════════════════

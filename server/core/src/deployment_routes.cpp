@@ -87,8 +87,19 @@ deployment::DeploymentConfig config_from_row(const DeploymentRow& r) {
 
 } // namespace
 
+yuzu::server::DispatchCaller
+DeploymentRoutes::caller_from_session(const auth::Session& session) const {
+    return yuzu::server::DispatchCaller{
+        .principal = session.username,
+        .principal_role = auth::role_to_string(session.role),
+        .exec_visible = exec_visible_fn_ ? exec_visible_fn_(session)
+                                         : yuzu::server::authz::deny_all()};
+}
+
 std::string DeploymentRoutes::advance_and_render(const std::string& deployment_id,
-                                                 const std::string& viewer, int attempt) {
+                                                 const yuzu::server::DispatchCaller& caller,
+                                                 int attempt) {
+    const std::string& viewer = caller.principal;
     if (!deploy_store_)
         return render_deploy_note("Deployment store is unavailable on this server.");
     // OWNER-SCOPED read at the seam: a not-yours deployment reads as not-found.
@@ -99,14 +110,17 @@ std::string DeploymentRoutes::advance_and_render(const std::string& deployment_i
     // Re-authorization boundary: the engine may dispatch the MUTATING execute step,
     // so it only ever acts on devices the operator CURRENTLY sees. Build the live
     // visible set from devices_fn(viewer); the engine intersects it with the frozen
-    // cohort, skips the rest, and dispatches execute once per device.
+    // cohort, skips the rest, and dispatches execute once per device. This is
+    // TARGETING confinement — a separate question from `caller`, which is the
+    // DISPATCH identity the chokepoint authorizes against (see `DispatchFn`'s
+    // doc comment, deployment_engine.hpp).
     std::unordered_set<std::string> authorized;
     if (devices_fn_)
         for (const auto& d : devices_fn_(viewer))
             authorized.insert(d.agent_id);
 
     const auto cfg = config_from_row(*dep);
-    deployment::advance(engine_, deployment_id, cfg, authorized);
+    deployment::advance(engine_, deployment_id, cfg, authorized, caller);
 
     // Re-read fresh state for the render.
     dep = deploy_store_->get_deployment(deployment_id, viewer);
@@ -124,11 +138,13 @@ std::string DeploymentRoutes::advance_and_render(const std::string& deployment_i
 void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                        DevicesFn devices_fn, DispatchFn dispatch_fn, PollFn poll_fn,
                                        AuditFn audit_fn, PreflightRunStore* preflight_store,
-                                       DeploymentRunStore* deploy_store) {
+                                       DeploymentRunStore* deploy_store,
+                                       ExecVisibleFn exec_visible_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     devices_fn_ = std::move(devices_fn);
     audit_fn_ = std::move(audit_fn);
+    exec_visible_fn_ = std::move(exec_visible_fn);
     preflight_store_ = preflight_store;
     deploy_store_ = deploy_store;
     engine_.store = deploy_store;
@@ -217,7 +233,8 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
             if (audit_fn_)
                 audit_fn_(req, "deployment.create", "resumed", "SoftwareDeployment", *existing,
                           "run=" + run_id);
-            res.set_content(advance_and_render(*existing, session->username, /*attempt=*/0),
+            res.set_content(advance_and_render(*existing, caller_from_session(*session),
+                                                /*attempt=*/0),
                             "text/html; charset=utf-8");
             return;
         }
@@ -270,7 +287,8 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
             // A concurrent create won the partial unique index race — resume the
             // winner rather than error (#governance security HIGH-1 backstop).
             if (auto existing = deploy_store_->find_running_for_run(run_id, session->username)) {
-                res.set_content(advance_and_render(*existing, session->username, /*attempt=*/0),
+                res.set_content(advance_and_render(*existing, caller_from_session(*session),
+                                                    /*attempt=*/0),
                                 "text/html; charset=utf-8");
                 return;
             }
@@ -287,8 +305,9 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
 
         // First advance (stage dispatch) + render — advance_and_render re-resolves
         // the live authorized set and ticks the engine once.
-        res.set_content(advance_and_render(dep.deployment_id, session->username, /*attempt=*/0),
-                        "text/html; charset=utf-8");
+        res.set_content(
+            advance_and_render(dep.deployment_id, caller_from_session(*session), /*attempt=*/0),
+            "text/html; charset=utf-8");
     });
 
     // ── Result poll: advance one tick, render (owner-scoped) ─────────────────
@@ -317,7 +336,7 @@ void DeploymentRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, Per
         }
         if (audit_fn_)
             audit_fn_(req, "deployment.advance", "success", "SoftwareDeployment", dep_id, "");
-        res.set_content(advance_and_render(dep_id, session->username, attempt),
+        res.set_content(advance_and_render(dep_id, caller_from_session(*session), attempt),
                         "text/html; charset=utf-8");
     });
 
