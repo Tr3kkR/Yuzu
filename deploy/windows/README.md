@@ -66,12 +66,10 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
    hand-edit the JSON, and never run the four-runner Wee Tam provisioner on
    single-runner Shulgi merely to regenerate a manifest.
 
-   The schema introduction has one separately bounded bridge for manifests
-   emitted by the immediately preceding provisioner: a missing `schema` is
-   accepted through **2026-08-14 23:59:59 UTC**, but every v1 pin, path, and
-   live-version probe still runs. Drain and reprovision every Windows runner
-   from merged code before that deadline. Unknown explicit schemas and a
-   missing manifest always fail.
+   The schema introduction's bounded compatibility bridge (a missing `schema`
+   accepted through a deadline) has been retired: every Windows runner emits a
+   schema-tagged manifest, verified live. A missing or unknown manifest schema
+   now always fails.
 
    **On an existing shared box, stop all four runners first.** Provisioning
    restarts shared PostgreSQL services and rewrites machine PATH/env under
@@ -303,9 +301,9 @@ The assertion is deliberately package-manager-agnostic: Chocolatey, WinGet,
 and reviewed direct installs are all acceptable only when their effective
 paths, versions, and live artifacts satisfy this contract. A package manager's
 inventory entry is not validation evidence by itself.
-`Assert-Toolchain.ps1` accepts a missing schema only during the dated rollout
-bridge above, rejects an unknown explicit schema, rejects a host pin outside
-its committed `accepted_host_pins` list, then executes version probes
+`Assert-Toolchain.ps1` rejects a missing or unknown manifest schema outright,
+rejects a host pin outside its committed `accepted_host_pins` list, then
+executes version probes
 for Python, Meson, Erlang OTP, rebar3, and PostgreSQL. The Windows SDK artifact
 probes require the reviewed target in every recorded artifact version and path;
 the live assertion then requires each recorded file to exist. It also proves the
