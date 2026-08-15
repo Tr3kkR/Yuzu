@@ -156,10 +156,13 @@
       "failed_after_fixes": 2,
       "results": [
         "server pg unit tests shard B \u2014 TIMEOUT (600s, SIGKILL) BEFORE the pg_signal_backend grant; OK in 523s after. Root cause was this recipe, now fixed in setup-rhel9.sh.",
-        "server unit tests shard A \u2014 499/500 cases, 9915/9916 assertions. The single failure is test_mcp_server.cpp:2270 (MCP tools/list visibility), which fails IDENTICALLY on main @88f9397d and dev @c01493d3 \u2014 2688 commits apart \u2014 supporting a pre-existing, platform-independent defect rather than a RHEL/GCC-14 artifact. NOT cross-checked against a CI run (no gh CLI at the time), so it remains an open item to confirm.",
+        "server unit tests shard A \u2014 499/500 cases, 9915/9916 assertions. The single failure is test_mcp_server.cpp:2270 (MCP tools/list visibility) and is KNOWN issue #2610, a Linux-only deterministic failure first seen on WSL2/gcc that passes on Windows MSVC. This run supplied that issue's stated first triage step: it fails on dev @c01493d3 AND main @88f9397d under Rocky 9.8 / GCC 14.2.1, so it does pre-exist on dev and is not a RHEL-family artifact.",
         "docs ci telemetry selftest \u2014 FAILS on RHEL 9: system SQLite is 3.34.1 and the tooling uses RETURNING (needs 3.35+). Python-only; the C++ suites use vcpkg SQLite 3.52.0."
       ],
-      "note_pg_shard_headroom": "Even healthy, the pg shard takes 523s against a 600s meson timeout on this box. A slower machine may need the timeout raised rather than assuming a real hang."
+      "note_pg_shard_headroom": "Even healthy, the pg shard takes 523s against a 600s meson timeout on this box. A slower machine may need the timeout raised rather than assuming a real hang.",
+      "known_issues": {
+        "test_mcp_server.cpp:2270": "https://github.com/Tr3kkR/Yuzu/issues/2610"
+      }
     },
     "deviations_from_expectation": [
       {

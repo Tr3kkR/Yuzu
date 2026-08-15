@@ -325,13 +325,15 @@ above. Platform-specific, understood, not fixable from the setup script.
 phantom mode and never steers to a write tool (G-S5/G-S6)"*, `CHECK(checked)`. One case out of 500 in
 shard A; one assertion out of 9916.
 
-Assessed as pre-existing and platform-independent rather than a RHEL/GCC-14 artifact. The evidence:
-it fails **identically on `main` @ `88f9397d` and on `dev` @ `c01493d3`** — 2688 commits apart — and
-reproduces with and without the Postgres test environment. The assertion is pure MCP `tools/list`
-visibility logic: the test harness's permission mock always allows, the tool table is a static array
-with a `sizeof`-derived count, and no `#ifdef` or OS/compiler-dependent code sits on the path. It was
-**not** cross-checked against a CI run, so treat it as an open item to confirm rather than an
-established known-failure.
+**This is [issue #2610](https://github.com/Tr3kkR/Yuzu/issues/2610), not a RHEL problem** — a known
+Linux-only deterministic failure where `classify_operational_question` is missing from `tools/list`
+in a readonly session. It was first seen on WSL2/gcc and passes on Windows MSVC at the same commit.
+
+This box supplied the issue's stated first triage step ("run the case on dev HEAD on any Linux box"),
+on an independent distro and compiler: it fails on **`dev` @ `c01493d3`** and on **`main` @
+`88f9397d`** under Rocky 9.8 / GCC 14.2.1, and reproduces with and without the Postgres test
+environment. So it **does** pre-exist on dev, and the platform split is Linux-vs-Windows rather than
+anything specific to the RHEL family.
 
 ---
 
