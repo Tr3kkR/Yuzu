@@ -10282,6 +10282,14 @@ private:
             // it into both from the start rather than shipping the gap and
             // fixing it in a later governance round (Gate 3 sre, Pattern E).
             bool notification_ok = notification_store_ && notification_store_->is_open();
+            // UploadGrantStore (ADR-3004, PR1.6a) — review finding (#3135):
+            // constructed fail-closed at boot (server.cpp startup_failed_ flip
+            // if migration/open fails) but was absent from both /healthz and
+            // /readyz, the same readyz-vs-healthz drift class the rows above
+            // document. Startup fail-closed limits the immediate blast radius,
+            // but if is_open() ever flips false post-startup, /api/v1/upload-
+            // grants* would 503 while both probes still reported healthy.
+            bool upload_grant_ok = upload_grant_store_ && upload_grant_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -10290,7 +10298,7 @@ private:
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok && quarantine_ok && notification_ok;
+                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -10320,7 +10328,8 @@ private:
                   {"discovery_store", discovery_ok ? "ok" : "error"},
                   {"deployment_store", deployment_ok ? "ok" : "error"},
                   {"quarantine_store", quarantine_ok ? "ok" : "error"},
-                  {"notification_store", notification_ok ? "ok" : "error"}}},
+                  {"notification_store", notification_ok ? "ok" : "error"},
+                  {"upload_grant_store", upload_grant_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -10591,6 +10600,13 @@ private:
                 // Pattern E).
                 {"notification_store",
                  notification_store_ && notification_store_->is_open()},
+                // ADR-3004 (PR1.6a) — review finding (#3135): same
+                // readyz-vs-healthz drift class as the rows above.
+                // Fail-closed at boot, but a not-open post-boot state would
+                // leave /api/v1/upload-grants* silently 503ing while
+                // /readyz still reported "ready".
+                {"upload_grant_store",
+                 upload_grant_store_ && upload_grant_store_->is_open()},
             };
 
             std::string failed_list;
@@ -17660,6 +17676,40 @@ private:
             // was null while the REST twins worked fine — two surfaces
             // disagreeing about whether the same capability exists (ADR-1005 A1).
             mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
+            // Review finding (#3135): the operator upload-grant mint/list/
+            // revoke routes shipped REST-only, with no MCP twin — an
+            // ADR-1005 gap for an ordinary authenticated operator action.
+            // Wired UNCONDITIONALLY, same reasoning as kek_ops above: gating
+            // this behind a conditional would let the MCP tool answer
+            // "unavailable" while the REST route works, two surfaces
+            // disagreeing about whether the capability exists (ADR-1005 A1).
+            mcp_server_->set_upload_grant_ops(
+                upload_grant_store_.get(),
+                // SAME logic as the REST list_read_fn wired at the
+                // /api/v1/upload-grants registration site below — not the
+                // same std::function instance, but the identical
+                // RbacStore::authorize_list_read call with the identical
+                // (securable, operation), so the two surfaces cannot
+                // observe a different admit decision for the same caller.
+                [this](const std::string& username) -> UploadGrantListAuthorization {
+                    UploadGrantListAuthorization out;
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return out;
+                    auto authz = rbac_store_->authorize_list_read(username, "UploadGrant", "Read",
+                                                                  mgmt_group_store_.get());
+                    switch (authz.decision) {
+                    case ListReadDecision::AdmitAll:
+                        out.decision = UploadGrantListDecision::kAdmitAll;
+                        break;
+                    case ListReadDecision::AdmitScoped:
+                        out.decision = UploadGrantListDecision::kAdmitScoped;
+                        out.visible_agents = std::move(authz.visible_agents);
+                        break;
+                    case ListReadDecision::DenyAll:
+                        break; // out already kDenyAll (default)
+                    }
+                    return out;
+                });
             if (engine_principal_store_) {
                 mcp_server_->set_engine_principal_store(engine_principal_store_.get());
                 mcp_server_->set_engine_credential_store(api_token_store_.get());

@@ -8,6 +8,13 @@
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_store.hpp"
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
+// ADR-0031 operator surface (PR1.6c) — MCP twins of the operator
+// mint/list/revoke upload-grant routes. Reuses UploadGrantListAuthorization/
+// UploadGrantListDecision verbatim (not redefined) so the REST list-admit
+// gate (GET /api/v1/upload-grants) and this MCP twin cannot drift — same
+// reuse discipline as kek_routes.hpp above. Also brings in UploadGrantStore
+// fully defined, so no separate include is needed for that.
+#include "file_retrieval_routes.hpp"
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_perf_model.hpp"
@@ -288,6 +295,26 @@ public:
     /// to KekRoutes::register_routes.
     void set_kek_ops(KekOps ops) { kek_ops_ = std::move(ops); }
 
+    /// ADR-0031 operator surface (PR1.6c) — upload-grant store + the
+    /// ADR-0017 list-admit resolver for list_upload_grants, backing
+    /// mint/list/revoke_upload_grant. `list_read_fn` is the SAME shape as
+    /// `yuzu::server::Deps::ListReadFn` (file_retrieval_routes.hpp) reused
+    /// verbatim, not redefined, so the REST GET /api/v1/upload-grants list
+    /// gate and this MCP twin cannot drift — server.cpp wires both from the
+    /// identical `RbacStore::authorize_list_read` call. Unset store ⇒ every
+    /// upload-grant tool answers "unavailable"; unset (default-constructed)
+    /// `list_read_fn` fails CLOSED (kDenyAll), matching the REST twin's own
+    /// unwired default (file_retrieval_routes.hpp's Deps doc comment) — NOT
+    /// the fail-open-when-unwired contract ResponseScopeFn/InventoryScopeFn
+    /// above use, because this is the sole admit decision for the route, not
+    /// a defense-in-depth filter over an already-gated read.
+    using UploadGrantListReadFn =
+        std::function<UploadGrantListAuthorization(const std::string& username)>;
+    void set_upload_grant_ops(UploadGrantStore* store, UploadGrantListReadFn list_read_fn) {
+        upload_grant_store_ = store;
+        upload_grant_list_read_fn_ = std::move(list_read_fn);
+    }
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -491,6 +518,13 @@ private:
     // handlers use these MEMBERS (set via the setters above). server.cpp wires
     // BOTH to the same store. Follow-up: unify onto the member. Nullable;
     // every tool checks before use and answers a clean "unavailable" error.
+    // ADR-0031 operator surface (PR1.6c, p14) — see set_upload_grant_ops
+    // above. Nullable; every backed tool checks before use and answers a
+    // clean "unavailable" error, matching engine_principal_store_'s contract
+    // above.
+    UploadGrantStore* upload_grant_store_{nullptr};
+    UploadGrantListReadFn upload_grant_list_read_fn_;
+
     EnginePrincipalStore* engine_principal_store_{nullptr};
     ApiTokenStore* engine_credential_store_{nullptr};
     OwnerExistsFn owner_exists_fn_;

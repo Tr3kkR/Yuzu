@@ -797,6 +797,21 @@ void register_status(HttpRouteSink& sink, Deps deps) {
                     return;
                 }
 
+                // Review finding (#3135): this handler used to call
+                // authenticate_session directly, with no
+                // upload_write_locks().acquire(...) anywhere in the
+                // function — the sole exception among the four handlers
+                // that can reach expire_now+discard_blob. A concurrent
+                // chunk write in flight on a session whose expires_at has
+                // just passed could have its partial blob unlinked out
+                // from under it by a racing status poll. Same admission +
+                // lock + re-authenticate-in-critical-section shape as
+                // register_chunk/register_commit/register_cancel now.
+                if (!admit_to_write_lock(deps, url_upload_id, cred->secret, res))
+                    return;
+
+                auto write_lock = upload_write_locks().acquire(url_upload_id);
+
                 const auto now = resolve_now(deps);
                 auto ar = deps.store->authenticate_session(url_upload_id, cred->secret, now);
                 switch (ar.outcome) {
@@ -820,7 +835,9 @@ void register_status(HttpRouteSink& sink, Deps deps) {
                     // and cancel all fail earlier on the terminal state. The
                     // partial would then be orphaned on disk permanently, and
                     // there is no sweep to collect it. Discard on the same
-                    // condition the other three expiry handlers use.
+                    // condition the other three expiry handlers use — now
+                    // under the SAME write lock those three take, so this
+                    // discard cannot race a concurrent chunk write.
                     auto expired = deps.store->expire_now(url_upload_id);
                     if (expired && *expired)
                         discard_blob(deps.blob_root / ar.info.destination_key);
