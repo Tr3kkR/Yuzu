@@ -1648,7 +1648,7 @@ TEST_CASE("SAML: empty group_attribute parses no groups (thin-slice-compatible d
     CHECK(result->groups.empty());
 }
 
-TEST_CASE("SAML: group values are capped at 64 entries (DoS guard)", "[saml]") {
+TEST_CASE("SAML: group values are capped at kMaxGroupValues entries (DoS guard)", "[saml]") {
     const auto& f  = fixture();
     auto cfg       = f.make_config();
     cfg.group_attribute = "groups";
@@ -1659,8 +1659,15 @@ TEST_CASE("SAML: group values are capped at 64 entries (DoS guard)", "[saml]") {
     const auto& cookie_secret = authn_result.cookie_secret;
     REQUIRE_FALSE(request_id.empty());
 
+    // This calls SamlProvider::validate_response DIRECTLY (no HTTP layer —
+    // unlike test_saml_routes.cpp's TestRouteSink-mediated tests, there is
+    // no httplib CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH=8192 wire
+    // cap to fit under here), so this is the right place to exercise the
+    // full DoS-cap boundary at kMaxGroupValues=200 (aligned with
+    // RbacStore::kMaxIdpGroupsPerLogin — SAML fine-grained RBAC).
+    const auto cap = yuzu::server::saml::kMaxGroupValues;
     std::vector<std::string> many_values;
-    for (int i = 0; i < 100; ++i) many_values.push_back("group" + std::to_string(i));
+    for (std::size_t i = 0; i < cap + 50; ++i) many_values.push_back("group" + std::to_string(i));
     const auto attr_stmt = SamlTestFixture::make_attribute_statement("groups", many_values);
     const auto response_b64 = f.make_response(
         request_id, "user@example.com", 3600, {}, {}, false, nullptr, false, false, attr_stmt);
@@ -1668,9 +1675,9 @@ TEST_CASE("SAML: group values are capped at 64 entries (DoS guard)", "[saml]") {
     const auto result = p.validate_response(response_b64, cookie_secret);
 
     REQUIRE(result.has_value());
-    CHECK(result->groups.size() == 64);
+    CHECK(result->groups.size() == cap);
     CHECK(result->groups.front() == "group0");
-    CHECK(result->groups.back() == "group63");
+    CHECK(result->groups.back() == "group" + std::to_string(cap - 1));
 }
 
 TEST_CASE("SAML: empty <AttributeValue/> is skipped, not pushed (UP-8)", "[saml]") {
