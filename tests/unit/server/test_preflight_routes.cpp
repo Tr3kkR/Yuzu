@@ -20,6 +20,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <optional>
@@ -360,6 +361,12 @@ TEST_CASE("preflight routes: rail/result/delete deny a service-scoped token "
     CHECK(del->status == 403);
     // The run survives — the deny fires before delete_run is ever called.
     REQUIRE(run_store.get_run(run_id, "alice").has_value());
+    // Gate 8 (GC-7): delete is gated on Execution:Execute in production, not
+    // Infrastructure:Read (deny_service_scoped_'s default) — the A4
+    // .permission hint must name the grant actually missing, not a sibling's.
+    auto del_body = nlohmann::json::parse(del->body, nullptr, false);
+    REQUIRE_FALSE(del_body.is_discarded());
+    CHECK(del_body["error"]["permission"] == "Execution:Execute");
 
     REQUIRE(audit_log.size() == 3);
     CHECK(audit_log[0] == "preflight.run|denied");         // rail

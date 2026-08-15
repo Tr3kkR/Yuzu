@@ -11,7 +11,7 @@ namespace yuzu::server {
 
 bool deny_service_scoped_schedule(AuthRoutes& auth_routes, const httplib::Request& req,
                                   httplib::Response& res, const std::string& action,
-                                  const std::string& audit_detail) {
+                                  const std::string& audit_detail, const std::string& permission) {
     auto session = auth_routes.resolve_session(req);
     if (!session || session->token_scope_service.empty())
         return false;
@@ -23,7 +23,7 @@ bool deny_service_scoped_schedule(AuthRoutes& auth_routes, const httplib::Reques
     res.set_content(
         detail::error_json_a4(
             403, "service-scoped tokens may not access this fleet-wide schedule surface", cid,
-            detail::A4ErrorOpts{.permission = "Schedule:Read"}),
+            detail::A4ErrorOpts{.permission = permission}),
         "application/json");
     // target_type "schedule" (lowercase) matches every existing schedule.*
     // success-path audit row in this file and server.cpp — a capitalized
@@ -57,7 +57,8 @@ void handle_create_schedule(AuthRoutes& auth_routes, ScheduleEngine* schedule_en
     // both gates above via the ITServiceOwner role, which carries neither
     // gate's confinement, so it must be stopped before it can arm a
     // recurring, unconfined-dispatch schedule.
-    if (deny_service_scoped_schedule(auth_routes, req, res, "schedule.create", ""))
+    if (deny_service_scoped_schedule(auth_routes, req, res, "schedule.create", "",
+                                     "Schedule:Write"))
         return;
     if (!schedule_engine) {
         res.status = 503;

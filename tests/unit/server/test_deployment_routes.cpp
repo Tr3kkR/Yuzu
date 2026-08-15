@@ -25,6 +25,7 @@
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <optional>
@@ -179,6 +180,12 @@ TEST_CASE("deployment routes: config/result/delete deny a service-scoped "
     CHECK(del->status == 403);
     // The deployment survives — the deny fires before delete_deployment.
     REQUIRE(deploy_store.get_deployment(dep_id, "alice").has_value());
+    // Gate 8 (GC-7): delete is gated on SoftwareDeployment:Execute in
+    // production, not the helper's :Read default — the A4 .permission hint
+    // must name the grant actually missing.
+    auto del_body = nlohmann::json::parse(del->body, nullptr, false);
+    REQUIRE_FALSE(del_body.is_discarded());
+    CHECK(del_body["error"]["permission"] == "SoftwareDeployment:Execute");
 
     REQUIRE(audit_log.size() == 3);
     CHECK(audit_log[0] == "deployment.config.view|denied");

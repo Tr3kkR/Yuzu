@@ -142,7 +142,9 @@ private:
     /// denied (caller returns immediately).
     [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
                                             const std::string& action,
-                                            const std::string& audit_detail) const;
+                                            const std::string& audit_detail,
+                                            const std::string& permission =
+                                                "Infrastructure:Read") const;
 
     AuthFn auth_fn_;
     PermFn perm_fn_;

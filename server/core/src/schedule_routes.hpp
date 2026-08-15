@@ -63,7 +63,8 @@ void handle_create_schedule(AuthRoutes& auth_routes, ScheduleEngine* schedule_en
                                                 const httplib::Request& req,
                                                 httplib::Response& res,
                                                 const std::string& action,
-                                                const std::string& audit_detail);
+                                                const std::string& audit_detail,
+                                                const std::string& permission = "Schedule:Read");
 
 /// Parses the `enabled` field of a `POST /api/schedules/{id}/enable` body.
 /// Extracted from the inline server.cpp lambda (guardian-confinement-2298

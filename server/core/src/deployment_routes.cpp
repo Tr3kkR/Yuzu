@@ -127,7 +127,8 @@ std::string DeploymentRoutes::advance_and_render(const std::string& deployment_i
 bool DeploymentRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
                                             const std::string& action,
                                             const std::string& audit_detail,
-                                            const std::string& target_type) const {
+                                            const std::string& target_type,
+                                            const std::string& permission) const {
     auto session = auth_fn_(req, res);
     if (!session)
         return true; // auth_fn_ already wrote the response (401/etc).
@@ -141,7 +142,7 @@ bool DeploymentRoutes::deny_service_scoped_(const httplib::Request& req, httplib
     res.set_content(
         detail::error_json_a4(
             403, "service-scoped tokens may not access this fleet-wide deployment surface", cid,
-            detail::A4ErrorOpts{.permission = "SoftwareDeployment:Read"}),
+            detail::A4ErrorOpts{.permission = permission}),
         "application/json");
     (void)detail::try_persist_audit(audit_fn_, req, action, "denied", target_type, "",
                                     audit_detail);
@@ -390,7 +391,8 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
         // it could otherwise delete evidence for a fleet-wide deployment
         // outside its own service (SEC-2/SEC-3 class).
         if (deny_service_scoped_(req, res, "deployment.delete",
-                                 "deployment delete denied to a service-scoped token"))
+                                 "deployment delete denied to a service-scoped token",
+                                 "SoftwareDeployment", "SoftwareDeployment:Execute"))
             return;
         if (!perm_fn_ || !perm_fn_(req, res, "SoftwareDeployment", "Execute"))
             return;

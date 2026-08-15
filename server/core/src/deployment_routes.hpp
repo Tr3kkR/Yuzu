@@ -121,7 +121,9 @@ private:
                                             const std::string& action,
                                             const std::string& audit_detail,
                                             const std::string& target_type =
-                                                "SoftwareDeployment") const;
+                                                "SoftwareDeployment",
+                                            const std::string& permission =
+                                                "SoftwareDeployment:Read") const;
 
     AuthFn auth_fn_;
     PermFn perm_fn_;

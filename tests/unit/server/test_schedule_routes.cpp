@@ -278,6 +278,12 @@ TEST_CASE("POST /api/schedules: a service-scoped token is denied even holding "
 
     CHECK(res.status == 403);
     CHECK(h.schedule_engine.query_schedules().empty());
+    // Gate 8 (GC-7): create is gated on Schedule:Write in production, not the
+    // shared helper's Schedule:Read default — the A4 .permission hint must
+    // name the grant actually missing.
+    auto body = nlohmann::json::parse(res.body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["permission"] == "Schedule:Write");
 }
 
 TEST_CASE("deny_service_scoped_schedule: denies a service-scoped session, writes 403, "

@@ -210,7 +210,8 @@ std::vector<std::pair<std::string, std::string>> recent_runs(PreflightRunStore* 
 
 bool PreflightRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
                                            const std::string& action,
-                                           const std::string& audit_detail) const {
+                                           const std::string& audit_detail,
+                                           const std::string& permission) const {
     auto session = auth_fn_(req, res);
     if (!session)
         return true; // auth_fn_ already wrote the response (401/etc).
@@ -223,7 +224,7 @@ bool PreflightRoutes::deny_service_scoped_(const httplib::Request& req, httplib:
     res.set_content(
         detail::error_json_a4(
             403, "service-scoped tokens may not access this fleet-wide pre-flight surface", cid,
-            detail::A4ErrorOpts{.permission = "Infrastructure:Read"}),
+            detail::A4ErrorOpts{.permission = permission}),
         "application/json");
     (void)detail::try_persist_audit(audit_fn_, req, action, "denied", "Scope", "", audit_detail);
     return true;
@@ -303,7 +304,8 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
         // delete evidence for a fleet-wide run outside its own service
         // (SEC-2/SEC-3 class).
         if (deny_service_scoped_(req, res, "preflight.run.delete",
-                                 "pre-flight run delete denied to a service-scoped token"))
+                                 "pre-flight run delete denied to a service-scoped token",
+                                 "Execution:Execute"))
             return;
         // A destructive mutation → the Execute tier (you needed Execute to create
         // the run), not a read tier (#governance least-privilege).
