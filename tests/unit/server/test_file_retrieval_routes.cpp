@@ -15,6 +15,7 @@
 #include "file_retrieval_routes.hpp"
 #include "rest_api_v1.hpp"
 #include "test_route_sink.hpp"
+#include "upload_grant_parsers.hpp" // kCredentialIdHexLen — the credential grammar
 #include "upload_grant_store.hpp"
 
 #include "pg/pg_pool.hpp"
@@ -566,7 +567,12 @@ TEST_CASE("unauthenticated chunk/commit/cancel requests never grow the write-loc
     const auto before = yuzu::server::upload_write_lock_count_for_test();
 
     for (int i = 0; i < 50; ++i) {
-        const std::string fake_id(16, static_cast<char>('a' + (i % 6)));
+        // kCredentialIdHexLen (32), not 16: a short id fails parse_credential's
+        // grammar and 401s at the parse gate, which would still satisfy the
+        // assertions below while never reaching the acquire-vs-authenticate
+        // ordering this case exists to pin. Full-length ids drive the real path.
+        const std::string fake_id(yuzu::server::upload_grant::kCredentialIdHexLen,
+                                  static_cast<char>('a' + (i % 6)));
         const std::string fake_cred = fake_id + "." + std::string(64, 'f');
         const std::unordered_map<std::string, std::string> hdr{
             {"X-Yuzu-Upload-Session", fake_cred}};
@@ -628,7 +634,12 @@ TEST_CASE("M3: a degraded store answers 503 for the write-lock admission gate, a
     auto held_lease = pool.acquire();
     REQUIRE(held_lease);
 
-    const std::string fake_id(16, 'd');
+    // kCredentialIdHexLen (32), not 16 — a short id is rejected by
+    // parse_credential's grammar and 401s BEFORE authenticate_session is
+    // ever called, so the degraded-store path asserted below (kUnavailable
+    // -> 503) never executed and this case failed claiming a 401-vs-503
+    // mismatch it had itself created.
+    const std::string fake_id(yuzu::server::upload_grant::kCredentialIdHexLen, 'd');
     const std::string fake_cred = fake_id + "." + std::string(64, 'f');
     const std::unordered_map<std::string, std::string> hdr{
         {"X-Yuzu-Upload-Session", fake_cred}};
