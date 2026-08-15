@@ -14533,6 +14533,14 @@ private:
                 auto session = require_auth(req, res);
                 if (!session)
                     return;
+                // Gate on Approval:Read, mirroring the REST sibling GET /api/approvals
+                // (#3040): this fragment renders the full approvals population
+                // (submitted_by / status / scope_expression) and must not disclose it
+                // to any authenticated session, only to Approval:Read holders (seeded
+                // to Viewer). Approvals are workflow rows, not per-agent fleet data, so
+                // a bare require_permission is correct here (not authorize_list_read).
+                if (!require_permission(req, res, "Approval", "Read"))
+                    return;
                 if (!approval_manager_) {
                     res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
                     return;
