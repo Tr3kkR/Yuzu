@@ -7,6 +7,7 @@
 #include "audit_store.hpp"
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
 #include "ca_store.hpp"
+#include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_perf_model.hpp"
@@ -201,24 +202,33 @@ public:
     /// `WorkflowRoutes::CommandDispatchFn` (the REST sibling). Added for
     /// issue #1088 so MCP `execute_instruction` can return `execution_id`
     /// in its response and let agentic workers bridge to `/api/v1/events`.
+    ///
+    /// PLAN-006: the trailing param carries the caller's IDENTITY as well as
+    /// its `exec_visible` filter (`yuzu::server::DispatchCaller`, formerly a
+    /// bare `VisibleSet`) so the shared `dispatch_confined` seam has a
+    /// principal to work with, not only a visibility filter.
     using DispatchFn = std::function<std::pair<std::string, int>(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id,
-        // #1788: the caller's Execution:Execute visible set (nullopt == unfiltered).
-        // Every dispatch arm intersects against it, mirroring /api/command.
-        const yuzu::server::authz::VisibleSet& exec_visible)>;
+        // #1788 / PLAN-006: every dispatch arm intersects `caller.exec_visible`
+        // against its targets, mirroring /api/command; `caller.principal`
+        // identifies who asked.
+        const yuzu::server::DispatchCaller& caller)>;
 
-    /// #1788: derives the per-request Execution:Execute visible set the DispatchFn
-    /// intersects against. Injected because the handler has the session but the
-    /// dispatch lambda (server.cpp) does not. When this std::function is UNSET,
-    /// the execute_instruction / execute_bundle handlers substitute a PRESENT-EMPTY
-    /// VisibleSet (deny-all), NOT nullopt — an unwired derivation fails CLOSED
-    /// (ADR-0033 §1: a missing applicable filter denies; CDX-R6-02). A caller that
-    /// genuinely wants full-fleet dispatch must wire a callback returning
-    /// std::nullopt; production wires server.cpp's derive_exec_visible.
-    using ExecVisibleFn = std::function<yuzu::server::authz::VisibleSet(const auth::Session&)>;
+    /// #1788 / PLAN-006: derives the per-request DispatchCaller (identity +
+    /// Execution:Execute visible set) the DispatchFn consults. Injected because
+    /// the handler has the session but the dispatch lambda (server.cpp) does
+    /// not. When this std::function is UNSET, the execute_instruction /
+    /// execute_bundle handlers substitute an EMPTY principal alongside a
+    /// PRESENT-EMPTY `exec_visible` (deny-all), NOT nullopt — an unwired
+    /// derivation fails CLOSED on visibility exactly as before this struct
+    /// existed (ADR-0033 §1: a missing applicable filter denies; CDX-R6-02). A
+    /// caller that genuinely wants full-fleet dispatch must wire a callback
+    /// whose `exec_visible` is std::nullopt; production wires server.cpp's
+    /// derive_dispatch_caller (which wraps derive_exec_visible).
+    using CallerFn = std::function<yuzu::server::DispatchCaller(const auth::Session&)>;
 
     /// Owner-FK existence check for engine-principal create/transfer-owner
     /// (design doc `docs/auth-engine-principals-design.md` §3.1:
@@ -356,13 +366,20 @@ public:
                             // whole access-review tool family answering "unavailable".
                             AccessReviewStore* access_review_store = nullptr,
                             AuthDB* auth_db = nullptr, DirectorySync* directory_sync = nullptr,
-                            // #1788: derives the per-request Execution:Execute visible
-                            // set for the execute_instruction / execute_bundle dispatch
-                            // confinement. Trailing optional, but UNSET fails CLOSED —
-                            // the handlers substitute a present-empty (deny-all) VisibleSet,
-                            // not unfiltered (CDX-R6-02); a test seam wanting full fleet
-                            // wires a callback returning std::nullopt.
-                            ExecVisibleFn exec_visible_fn = {},
+                            // #1788 / PLAN-006: derives the per-request DispatchCaller
+                            // (identity + Execution:Execute visible set) for the
+                            // execute_instruction / execute_bundle dispatch confinement.
+                            // Trailing optional, but UNSET fails CLOSED on exec_visible —
+                            // the handlers substitute an empty principal alongside a
+                            // present-empty (deny-all) VisibleSet, not unfiltered
+                            // (CDX-R6-02); a test seam wanting full fleet wires a callback
+                            // whose exec_visible is std::nullopt.
+                            //
+                            // ORDER (merge with 2f PR 3b): this parameter occupies the
+                            // slot #2689's positional call sites use — it REPLACES the
+                            // former ExecVisibleFn, whose visible set DispatchCaller now
+                            // carries — so the streaming trio still appends after it.
+                            CallerFn caller_fn = {},
                             // 2f PR 3b (streamed POST): the SAME shared held-open
                             // budget the GET channel leases from - a streamed POST
                             // pins an HTTP worker exactly as a GET SSE stream does,
@@ -377,10 +394,6 @@ public:
                             // already be gone. Absent any of them the POST simply
                             // never streams - it answers plain JSON, byte-identical
                             // to today, which is the correct degradation.
-                            //
-                            // ORDER: exec_visible_fn stays FIRST so #2689's positional
-                            // call sites are untouched by this branch; the streaming
-                            // trio is appended after it.
                             yuzu::server::detail::StreamBudget* stream_budget = nullptr,
                             StreamRevalidateFn revalidate_fn = {},
                             StreamPrincipalAuditFn principal_audit_fn = {});
@@ -467,9 +480,9 @@ public:
                          // Explicit-principal audit sink for mcp.stream.close (see
                          // StreamPrincipalAuditFn). Empty falls back to the generic sink.
                          StreamPrincipalAuditFn principal_audit_fn = {},
-                         // #1788: per-request Execution:Execute visible-set deriver,
+                         // #1788 / PLAN-006: per-request DispatchCaller deriver,
                          // forwarded to build_handler for MCP dispatch confinement.
-                         ExecVisibleFn exec_visible_fn = {});
+                         CallerFn caller_fn = {});
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
