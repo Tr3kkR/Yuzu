@@ -301,9 +301,9 @@ The assertion is deliberately package-manager-agnostic: Chocolatey, WinGet,
 and reviewed direct installs are all acceptable only when their effective
 paths, versions, and live artifacts satisfy this contract. A package manager's
 inventory entry is not validation evidence by itself.
-`Assert-Toolchain.ps1` accepts a missing schema only during the dated rollout
-bridge above, rejects an unknown explicit schema, rejects a host pin outside
-its committed `accepted_host_pins` list, then executes version probes
+`Assert-Toolchain.ps1` rejects a missing or unknown manifest schema outright,
+rejects a host pin outside its committed `accepted_host_pins` list, then
+executes version probes
 for Python, Meson, Erlang OTP, rebar3, and PostgreSQL. The Windows SDK artifact
 probes require the reviewed target in every recorded artifact version and path;
 the live assertion then requires each recorded file to exist. It also proves the

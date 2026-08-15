@@ -1012,7 +1012,7 @@ try {
   $output = & pwsh -NoProfile -File $AssertPath -ManifestPath $badManifestPath -ContractPath $ContractPath 2>&1 | Out-String
   $exitCode = $LASTEXITCODE
   Check 'Assert-Toolchain exits 1 at the incompatible-schema seam' {
-    $exitCode -eq 1 -and $output -match 'manifest/tool versions do not satisfy the repository contract' -and
+    $exitCode -eq 1 -and $output -match "manifest schema 'yuzu/windows-toolchain/v999' is incompatible" -and
     $output -notmatch '-- tools --'
   }
 
@@ -1023,7 +1023,7 @@ try {
   $output = & pwsh -NoProfile -File $AssertPath -ManifestPath $legacyManifestPath -ContractPath $ContractPath 2>&1 | Out-String
   $exitCode = $LASTEXITCODE
   Check 'Assert-Toolchain exits 1 at the schema-less seam (bridge retired)' {
-    $exitCode -eq 1 -and $output -match 'manifest/tool versions do not satisfy the repository contract' -and
+    $exitCode -eq 1 -and $output -match "manifest schema '<unset>' is incompatible" -and
     $output -notmatch '-- tools --'
   }
 } finally {
