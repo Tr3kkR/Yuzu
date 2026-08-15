@@ -23,6 +23,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -928,10 +929,9 @@ int64_t failures_of(const yuzu::tar::RetentionGuardState& g, const std::string& 
     auto it = c.failures.find(table);
     return it == c.failures.end() ? 0 : it->second;
 }
-bool latched_of(const yuzu::tar::RetentionGuardState& g, const std::string& table) {
+bool reported_of(const yuzu::tar::RetentionGuardState& g, const std::string& table) {
     std::lock_guard lock(g.mu);
-    auto it = g.latched.find(table);
-    return it != g.latched.end() && it->second;
+    return g.last_reported.contains(table);
 }
 
 // A fixed "now" far from both the epoch and the real clock.
@@ -952,7 +952,7 @@ TEST_CASE("TAR #2361: a pass that would delete every datable row declines once",
     CHECK(declines_of(f.guard, "process_hourly") == 1);
 }
 
-TEST_CASE("TAR #2361: the decline is latched, so a genuine backlog still drains",
+TEST_CASE("TAR #2361: an identical repeat is suppressed, so a genuine backlog still drains",
           "[tar][retention][clock-guard]") {
     // Declining every pass would turn the guard into a permanent retention leak
     // on any endpoint whose warehouse is legitimately all-expired.
@@ -962,19 +962,19 @@ TEST_CASE("TAR #2361: the decline is latched, so a genuine backlog still drains"
     run_retention(*f.db, kT0, f.guard);
     REQUIRE(row_count(*f.db, "process_hourly") == 20);
 
-    run_retention(*f.db, kT0 + 1, f.guard); // latched: accepted this time
+    run_retention(*f.db, kT0 + 1, f.guard); // suppressed repeat: accepted this time
     CHECK(row_count(*f.db, "process_hourly") == 0);
     CHECK(declines_of(f.guard, "process_hourly") == 1); // not counted twice
 }
 
-TEST_CASE("TAR #2361: the latch clears once the backlog drains, re-arming the guard",
+TEST_CASE("TAR #2361: the recorded fact set clears once the backlog drains, re-arming the guard",
           "[tar][retention][clock-guard]") {
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
 
     run_retention(*f.db, kT0, f.guard);     // decline #1
     run_retention(*f.db, kT0 + 1, f.guard); // drain
-    run_retention(*f.db, kT0 + 2, f.guard); // nothing expired -> latch clears
+    run_retention(*f.db, kT0 + 2, f.guard); // nothing expired -> entry clears
     REQUIRE(row_count(*f.db, "process_hourly") == 0);
 
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5); // fresh anomaly
@@ -1079,12 +1079,12 @@ TEST_CASE("TAR #2361: a month-long jump fires on the MONTHLY tier",
     CHECK(declines_of(f.guard, "process_monthly") == 1);
 }
 
-TEST_CASE("TAR #2361: an ordinary over-cap backlog does NOT arm the latch",
+TEST_CASE("TAR #2361: an ordinary over-cap backlog records no fact set",
           "[tar][retention][clock-guard]") {
-    // The latch tracks the WIPE condition, not the backlog. Arming it on any
-    // capped pass would leave a busy endpoint permanently latched, and a real
-    // clock anomaly arriving next would then delete with no decline and no
-    // counter. kSurplus is deliberately independent of the cap.
+    // The recorded entry tracks the WIPE condition, not the backlog. Recording
+    // one on any capped pass would leave a busy endpoint permanently reported,
+    // and a real clock anomaly arriving next would then delete with no decline
+    // and no counter. kSurplus is deliberately independent of the cap.
     constexpr int64_t kSurplus = 7;
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec,
@@ -1099,7 +1099,7 @@ TEST_CASE("TAR #2361: an ordinary over-cap backlog does NOT arm the latch",
     CHECK(row_count(*f.db, "process_hourly") == 1);
     CHECK(declines_of(f.guard, "process_hourly") == 0);
 
-    // Now a real anomaly. An armed latch would let this delete silently.
+    // Now a real anomaly. A recorded entry would let this delete silently.
     REQUIRE(f.db->execute_sql("DELETE FROM process_hourly"));
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 3);
     run_retention(*f.db, kT0 + 2, f.guard);
@@ -1152,14 +1152,14 @@ TEST_CASE("TAR #2361: row-count retention still trims, unguarded, under a bad cl
 
     CHECK(row_count(*f.db, "netqual_boot") == kBootCeiling);
     CHECK(declines_of(f.guard, "netqual_boot") == 0);
-    CHECK(latched_of(f.guard, "netqual_boot") == false);
+    CHECK(reported_of(f.guard, "netqual_boot") == false);
 }
 
 TEST_CASE("TAR #2361: a table whose count cannot be read is skipped, not declined",
           "[tar][retention][clock-guard]") {
     // Fail closed on an unreadable count: a count we could not read is not
     // evidence that deleting is safe. The table is skipped for the pass, its
-    // latch is CLEARED (re-armed, so a failed pass cannot spend the guard), no
+    // entry is CLEARED (re-armed, so a failed pass cannot spend the guard), no
     // decline is recorded against it, and the rest of the sweep still runs.
     //
     // Dropping the table is the cheap way to force the count to error. Note this
@@ -1180,7 +1180,7 @@ TEST_CASE("TAR #2361: a table whose count cannot be read is skipped, not decline
     run_retention(*f.db, kT0, f.guard);
 
     CHECK(declines_of(f.guard, "process_hourly") == 0); // unreadable, not "anomalous"
-    CHECK(latched_of(f.guard, "process_hourly") == false);
+    CHECK(reported_of(f.guard, "process_hourly") == false);
     // The sweep kept going: tcp_hourly is all-expired, so it declines normally.
     CHECK(declines_of(f.guard, "tcp_hourly") == 1);
     CHECK(row_count(*f.db, "tcp_hourly") == 20);
@@ -1195,15 +1195,15 @@ TEST_CASE("TAR #2361: concurrent rollup passes are race-free when the caller ser
     // mutex, so the raw data race on the maps is gone: removing the lock_guard
     // below does NOT make TSan report (verified, not assumed). What the caller's
     // lock still buys is PASS-level atomicity -- each table's probe / decide /
-    // update-latch sequence spans several statements, so two interleaved passes
-    // could both see an unlatched table and both decline it, or both queue a
+    // update-entry sequence spans several statements, so two interleaved passes
+    // could both see an unreported table and both decline it, or both queue a
     // delete for it. TSan cannot see that; it is a logical race, not a data race.
     //
     // So this case is a coherence check under real concurrency, NOT a proof of
     // the plugin's locking. TarPlugin is translation-unit-local and unreachable
     // from a test, so `rollup_mu_` itself has no direct coverage. The audit
-    // store's sibling test IS a genuine TSan target, because its latch is a plain
-    // bool guarded only by the store mutex (verified: removing it reports).
+    // store's sibling test IS a genuine TSan target, because its dedup state is
+    // guarded only by the store mutex (verified: removing it reports).
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 200);
 
@@ -1237,7 +1237,7 @@ TEST_CASE("TAR #2361: a status reader racing a rollup is safe (guard.mu has teet
     // The production race it should model is real: `tar status` calls
     // format_retention_guard_lines -> retention_guard_counters (taking guard.mu)
     // on the command-dispatch thread, while do_rollup -> run_retention writes
-    // guard.declines / guard.failures / guard.latched on the rollup thread.
+    // guard.declines / guard.failures / guard.last_reported on the rollup thread.
     // do_status deliberately does NOT take rollup_mu_, precisely so a diagnostic
     // cannot block behind a rollup -- so guard.mu is the ONLY thing making that
     // std::map access safe.
@@ -1348,30 +1348,30 @@ TEST_CASE("TAR #2361: the clock-step check survives an agent restart",
 
 TEST_CASE("TAR #2361: an unreadable table re-arms the guard and is counted separately",
           "[tar][retention][clock-guard]") {
-    // Two contracts in one. (1) A failed probe must RE-ARM the latch, not carry
-    // it: the audit store learned this and the TAR sibling originally did not, so
-    // a table that declined, then failed to read for a while, would delete the
-    // next real anomaly silently. (2) A read failure is NOT a clock anomaly, so
-    // it gets its own counter -- otherwise `retention_guard_declines_total|0`
-    // reports "this endpoint's clock is fine" about a table whose retention has
-    // actually stopped.
+    // Two contracts in one. (1) A failed probe must RE-ARM the guard -- clear
+    // any recorded fact set, not carry it: the audit store learned this and the
+    // TAR sibling originally did not, so a table that declined, then failed to
+    // read for a while, would delete the next real anomaly silently. (2) A read
+    // failure is NOT a clock anomaly, so it gets its own counter -- otherwise
+    // `retention_guard_declines_total|0` reports "this endpoint's clock is
+    // fine" about a table whose retention has actually stopped.
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
 
-    run_retention(*f.db, kT0, f.guard); // decline #1, latch set
+    run_retention(*f.db, kT0, f.guard); // decline #1, fact set recorded
     REQUIRE(declines_of(f.guard, "process_hourly") == 1);
-    REQUIRE(latched_of(f.guard, "process_hourly"));
+    REQUIRE(reported_of(f.guard, "process_hourly"));
 
     // Probes fail for exactly one pass.
     REQUIRE(f.db->execute_sql("ALTER TABLE process_hourly RENAME TO process_hourly_hidden"));
     run_retention(*f.db, kT0 + 1, f.guard);
     CHECK(failures_of(f.guard, "process_hourly") == 1);
     CHECK(declines_of(f.guard, "process_hourly") == 1); // NOT counted as a clock anomaly
-    CHECK_FALSE(latched_of(f.guard, "process_hourly")); // re-armed
+    CHECK_FALSE(reported_of(f.guard, "process_hourly")); // re-armed
     REQUIRE(f.db->execute_sql("ALTER TABLE process_hourly_hidden RENAME TO process_hourly"));
 
     // The same wipe condition, still unresolved: must decline again rather than
-    // delete on a latch spent by the failure.
+    // delete on an entry the failure had erased.
     run_retention(*f.db, kT0 + 2, f.guard);
     CHECK(row_count(*f.db, "process_hourly") == 20);
     CHECK(declines_of(f.guard, "process_hourly") == 2);
@@ -1466,22 +1466,22 @@ TEST_CASE("TAR #2361: a poisoned last-pass reading declines once and re-anchors"
     CHECK(declines_of(f.guard, "process_hourly") == 1);
 }
 
-TEST_CASE("TAR #2361: pausing a source clears its latches so the guard is not spent",
+TEST_CASE("TAR #2361: pausing a source clears its recorded fact sets so the guard is not spent",
           "[tar][retention][clock-guard][issue539]") {
     // Governance UP-9. The #539 gate skips a paused source before any guard
-    // bookkeeping, so a latch armed by a live anomaly used to survive the pause
-    // untouched -- and the first pass after the operator re-enabled the source
-    // would delete capped, with no decline, no counter and no warn, even though
-    // the anomaly was still live.
+    // bookkeeping, so an entry recorded by a live anomaly used to survive the
+    // pause untouched -- and the first pass after the operator re-enabled the
+    // source would delete capped, with no decline, no counter and no warn,
+    // even though the anomaly was still live.
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
 
-    run_retention(*f.db, kT0, f.guard); // decline #1, latch armed
-    REQUIRE(latched_of(f.guard, "process_hourly"));
+    run_retention(*f.db, kT0, f.guard); // decline #1, fact set recorded
+    REQUIRE(reported_of(f.guard, "process_hourly"));
 
     f.db->set_config("process_enabled", "false");
     run_retention(*f.db, kT0 + 1, f.guard);
-    CHECK_FALSE(latched_of(f.guard, "process_hourly")); // cleared while paused
+    CHECK_FALSE(reported_of(f.guard, "process_hourly")); // cleared while paused
     CHECK(row_count(*f.db, "process_hourly") == 20);
 
     f.db->set_config("process_enabled", "true");
@@ -1509,20 +1509,20 @@ TEST_CASE("TAR #2361: a failed delete is counted, so the totals stay honest",
     CHECK(declines_of(f.guard, "process_hourly") == 0); // not misreported as a clock anomaly
 }
 
-TEST_CASE("TAR #2361: a clean drain clears the latch in the SAME pass",
+TEST_CASE("TAR #2361: a clean drain clears the recorded fact set in the SAME pass",
           "[tar][retention][clock-guard]") {
-    // Sol / Gate 8, the agent twin. Latching purely on the pre-delete
-    // `would_wipe` left the latch armed after a pass that drained the whole
+    // Sol / Gate 8, the agent twin. Keying purely on the pre-delete
+    // `would_wipe` left an entry recorded after a pass that drained the whole
     // backlog, so an anomaly arriving before the next 900s tick deleted with no
     // decline and no counter.
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20); // under the cap
 
-    run_retention(*f.db, kT0, f.guard); // decline, latch armed
+    run_retention(*f.db, kT0, f.guard); // decline, fact set recorded
     REQUIRE(declines_of(f.guard, "process_hourly") == 1);
     run_retention(*f.db, kT0 + 1, f.guard); // drains it entirely
     REQUIRE(row_count(*f.db, "process_hourly") == 0);
-    CHECK_FALSE(latched_of(f.guard, "process_hourly")); // cleared by the drain itself
+    CHECK_FALSE(reported_of(f.guard, "process_hourly")); // cleared by the drain itself
 
     // A fresh anomaly with no intervening empty pass must still decline.
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 4);
@@ -1770,11 +1770,11 @@ TEST_CASE("TAR #2361: a batch rolls back as a unit, and does not reach outside i
     CHECK(f.db->get_config("pre_batch_write", "") == "kept"); // rollback stayed inside the batch
 }
 
-TEST_CASE("TAR #2361: the latch is HELD through a capped drain, then released",
+TEST_CASE("TAR #2361: the recorded fact set is HELD through a capped drain, then released",
           "[tar][retention][clock-guard]") {
     // Gate 8 coverage gap: every prior over-cap test used a survivor, so
-    // `would_wipe` was false and the latch was trivially clear. This is the
-    // transition the latch rewrite actually governs -- an all-expired backlog
+    // `would_wipe` was false and no entry was recorded. This is the transition
+    // the fact-set entry lifecycle actually governs -- an all-expired backlog
     // larger than one pass can delete.
     constexpr int64_t kSurplus = 3;
     TarGuardFixture f;
@@ -1783,33 +1783,33 @@ TEST_CASE("TAR #2361: the latch is HELD through a capped drain, then released",
 
     run_retention(*f.db, kT0, f.guard); // decline #1
     REQUIRE(declines_of(f.guard, "process_hourly") == 1);
-    REQUIRE(latched_of(f.guard, "process_hourly"));
+    REQUIRE(reported_of(f.guard, "process_hourly"));
 
-    // Accepted, capped: a backlog remains, so the latch must STAY armed or the
-    // next pass would decline a second time for the same anomaly.
+    // Accepted, capped: a backlog remains, so the entry must STAY recorded or
+    // the next pass would decline a second time for the same anomaly.
     run_retention(*f.db, kT0 + 1, f.guard);
     CHECK(row_count(*f.db, "process_hourly") == kSurplus);
-    CHECK(latched_of(f.guard, "process_hourly"));
+    CHECK(reported_of(f.guard, "process_hourly"));
     CHECK(declines_of(f.guard, "process_hourly") == 1);
 
-    // Final pass clears the backlog, so the latch releases in that same pass.
+    // Final pass clears the backlog, so the entry releases in that same pass.
     run_retention(*f.db, kT0 + 2, f.guard);
     CHECK(row_count(*f.db, "process_hourly") == 0);
-    CHECK_FALSE(latched_of(f.guard, "process_hourly"));
+    CHECK_FALSE(reported_of(f.guard, "process_hourly"));
     CHECK(declines_of(f.guard, "process_hourly") == 1);
 }
 
-TEST_CASE("TAR #2361: the latch does NOT survive an agent restart",
+TEST_CASE("TAR #2361: the recorded fact set does NOT survive an agent restart",
           "[tar][retention][clock-guard]") {
-    // Gate 8 coverage gap. The clock reading is persisted; the latch deliberately
-    // is not, so a reboot re-declines. Nothing pinned that, so persisting the
-    // latch by mistake would have left the whole suite green.
+    // Gate 8 coverage gap. The clock reading is persisted; the recorded entry
+    // deliberately is not, so a reboot re-declines. Nothing pinned that, so
+    // persisting the entry by mistake would have left the whole suite green.
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 10);
 
     run_retention(*f.db, kT0, f.guard);
     REQUIRE(declines_of(f.guard, "process_hourly") == 1);
-    REQUIRE(latched_of(f.guard, "process_hourly"));
+    REQUIRE(reported_of(f.guard, "process_hourly"));
 
     yuzu::tar::RetentionGuardState fresh; // agent restarts
     run_retention(*f.db, kT0 + 1, fresh);
@@ -1817,35 +1817,36 @@ TEST_CASE("TAR #2361: the latch does NOT survive an agent restart",
     CHECK(declines_of(fresh, "process_hourly") == 1);
 }
 
-TEST_CASE("TAR #2361: a failed delete re-arms the latch, matching the audit sibling",
+TEST_CASE("TAR #2361: a failed delete re-arms the guard, matching the audit sibling",
           "[tar][retention][clock-guard]") {
     // Kimi / Gate 8 found the two stores had diverged here: audit re-arms on a
-    // delete failure, TAR left the latch at its read-phase value. A failed pass
-    // learned nothing about the clock, so carrying an armed latch forward lets
+    // delete failure, TAR left the entry at its read-phase value. A failed pass
+    // learned nothing about the clock, so carrying a recorded entry forward lets
     // the NEXT pass accept a still-live anomaly with no decline and no counter.
-    // The backlog must EXCEED the per-pass cap. Below it, the latch rule itself
-    // (`would_wipe && cap_will_bind`) already clears the latch on the accepting
-    // pass, so the re-arm would be redundant and the test would pass without it.
+    // The backlog must EXCEED the per-pass cap. Below it, the entry-lifecycle
+    // rule itself (`would_wipe && cap_will_bind`) already erases the entry on
+    // the accepting pass, so the re-arm would be redundant and the test would
+    // pass without it.
     constexpr int64_t kSurplus = 3;
     TarGuardFixture f;
     seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec,
                            static_cast<int>(yuzu::tar::kMaxTarDeletesPerTablePerPass + kSurplus));
 
-    run_retention(*f.db, kT0, f.guard); // decline #1, latch armed
+    run_retention(*f.db, kT0, f.guard); // decline #1, fact set recorded
     REQUIRE(declines_of(f.guard, "process_hourly") == 1);
-    REQUIRE(latched_of(f.guard, "process_hourly"));
+    REQUIRE(reported_of(f.guard, "process_hourly"));
 
-    // Latched, so this pass ACCEPTS -- and the delete fails.
+    // Recorded, so this pass ACCEPTS -- and the delete fails.
     REQUIRE(f.db->execute_sql("CREATE TRIGGER block_del BEFORE DELETE ON process_hourly "
                               "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
     run_retention(*f.db, kT0 + 1, f.guard);
     CHECK(row_count(*f.db, "process_hourly") ==
           yuzu::tar::kMaxTarDeletesPerTablePerPass + kSurplus);
     CHECK(failures_of(f.guard, "process_hourly") >= 1);
-    CHECK_FALSE(latched_of(f.guard, "process_hourly")); // re-armed
+    CHECK_FALSE(reported_of(f.guard, "process_hourly")); // re-armed
 
     // Same wipe condition, still unresolved: it must decline again rather than
-    // delete on a latch the failure had spent.
+    // delete on an entry the failure had erased.
     REQUIRE(f.db->execute_sql("DROP TRIGGER block_del"));
     run_retention(*f.db, kT0 + 2, f.guard);
     CHECK(row_count(*f.db, "process_hourly") ==
@@ -1999,4 +2000,253 @@ TEST_CASE("TAR #2361: the FIRST pass with no stored anchor declines instead of d
     run_retention(*f.db, kT0 + 1, f.guard);
     CHECK(row_count(*f.db, "process_hourly") == 1);
     CHECK(declines_of(f.guard, "process_hourly") == 1); // not counted twice
+}
+
+TEST_CASE("TAR #2573: a DIFFERENT anomaly while a decline is still latched deletes instead of "
+          "declining",
+          "[tar][retention][clock-guard]") {
+    // MEASURED (#2573): the bool latch cannot carry anomaly IDENTITY. Pass 1
+    // declines on a corrupt stored reading (BadState) and latches. The reading
+    // self-heals (the anchor is re-persisted every pass, before the decide
+    // step), but the SURVIVOR is then deleted out from under the table by
+    // something else entirely -- here, directly via SQL, standing in for
+    // whatever emptied it -- so pass 2 presents a DISTINCT anomaly (Wipe) while
+    // the latch from pass 1 is still set. The latch has no way to tell "still
+    // the same problem" from "a new one arrived"; it deletes with the declines
+    // counter stuck at 1. A fact-set guard must decline again, because the fact
+    // set changed.
+    TarGuardFixture f;
+    f.db->set_config("retention_guard_last_pass", "not-a-number"); // BadState
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor
+
+    run_retention(*f.db, kT0, f.guard); // decline #1 (BadState), nothing deleted
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(row_count(*f.db, "process_hourly") == 21);
+
+    REQUIRE(f.db->execute_sql(
+        std::format("DELETE FROM process_hourly WHERE hour_ts = {}", kT0 - 3600)));
+
+    run_retention(*f.db, kT0 + 1, f.guard); // now Wipe: a DIFFERENT fact set
+
+    CHECK(declines_of(f.guard, "process_hourly") == 2); // must decline again
+    CHECK(row_count(*f.db, "process_hourly") == 20);     // and must NOT delete
+}
+
+TEST_CASE("TAR #2573: an implausible caller clock declines the whole pass and does not poison "
+          "the anchor",
+          "[tar][retention][clock-guard]") {
+    // `run_retention`'s `now_epoch` parameter feeds `horizon = now_epoch +
+    // kTarRetentionFutureSlackSec` (one addition from signed overflow) AND the
+    // durable anchor write, which is unconditional and runs before any
+    // per-table decision -- so an implausible `now` would otherwise poison the
+    // comparison point for every future pass, not just this one. Same role as
+    // the audit sibling's kMaxPlausibleNow clamp; see kTarMaxPlausibleNow.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1);
+
+    constexpr int64_t kImplausibleNow = std::numeric_limits<int64_t>::max() / 2;
+    run_retention(*f.db, kImplausibleNow, f.guard);
+
+    // The pass must decline outright and leave the anchor exactly as primed.
+    CHECK(f.db->get_config("retention_guard_last_pass", "") == std::to_string(kT0));
+    CHECK(row_count(*f.db, "process_hourly") == 6); // nothing deleted
+    CHECK(declines_of(f.guard, "process_hourly") == 0); // not a per-table decline
+    CHECK(failures_of(f.guard, "__implausible_now__") == 1);
+
+    // And it costs exactly one pass: a plausible `now` right after proceeds
+    // normally, using the still-good anchor.
+    run_retention(*f.db, kT0 + 1, f.guard);
+    CHECK(row_count(*f.db, "process_hourly") == 1);
+}
+
+TEST_CASE("TAR #2573: a cap-paced wipe drains with exactly ONE decline, then re-arms for a "
+          "fresh anomaly",
+          "[tar][retention][clock-guard]") {
+    // Pins the property the retired `latched = would_wipe && cap_will_bind`
+    // write existed to provide (#2361 Gate 8 / Sol): a legitimately all-expired
+    // table larger than one pass's cap must decline ONCE, then drain silently
+    // across as many capped passes as it takes. NOTE (Gate 3 / quality-
+    // engineer): this scenario's Facts never CHANGE while the backlog is
+    // being worked off, so it holds equally under the old bool latch and the
+    // new fact-set equality -- it does NOT by itself discriminate the two.
+    // The measured #2573 defect (a DISTINCT anomaly deleting silently under a
+    // still-set latch) is pinned by the adjacent test above, which DOES
+    // change the fact set mid-sequence and fails under the old latch. This
+    // test's own job is the re-arm proof: once the entry releases, a FRESH
+    // wipe on the same table must decline again, proving release is real
+    // re-arming and not just a stuck bit.
+    constexpr int64_t kSurplus = 3;
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec,
+                           static_cast<int>(yuzu::tar::kMaxTarDeletesPerTablePerPass + kSurplus));
+
+    run_retention(*f.db, kT0, f.guard); // decline #1
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(reported_of(f.guard, "process_hourly"));
+
+    run_retention(*f.db, kT0 + 1, f.guard); // suppressed repeat: drains, capped
+    CHECK(row_count(*f.db, "process_hourly") == kSurplus);
+    CHECK(reported_of(f.guard, "process_hourly"));
+    CHECK(declines_of(f.guard, "process_hourly") == 1); // still ONE
+
+    run_retention(*f.db, kT0 + 2, f.guard); // backlog clears in this pass
+    CHECK(row_count(*f.db, "process_hourly") == 0);
+    CHECK_FALSE(reported_of(f.guard, "process_hourly"));
+    CHECK(declines_of(f.guard, "process_hourly") == 1); // still ONE
+
+    // Proof the entry actually released: a fresh anomaly declines again.
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 4);
+    run_retention(*f.db, kT0 + 3, f.guard);
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+    CHECK(row_count(*f.db, "process_hourly") == 4); // declined, not deleted
+}
+
+TEST_CASE("TAR #2573: a missing anchor that cannot be persisted declines every pass and never "
+          "drains",
+          "[tar][retention][clock-guard]") {
+    // The one case a naive audit-pure port (record every fact set, including
+    // NoAnchor) gets wrong. The audit store's bootstrap-settled marker is
+    // written in the SAME transaction as the verdict, so a persist failure
+    // there rolls back the whole pass, including the decline record. TAR's
+    // anchor write is a plain `set_config` that runs independently of the
+    // guard's in-memory bookkeeping -- so if it keeps failing, `no_anchor`
+    // stays true forever, and RECORDING that fact set would make every
+    // subsequent identical pass a suppressed repeat that drains. That would
+    // silently defeat the exact fail-safe #2361 added the no-anchor trigger
+    // for. NoAnchor is therefore never recorded, and the pass must decline
+    // every single time this condition holds.
+    TarGuardFixture f{/*prime_anchor=*/false};
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor -> would_wipe stays false
+
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_cfg_ins BEFORE INSERT ON tar_config "
+                              "WHEN NEW.key = 'retention_guard_last_pass' "
+                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_cfg_upd BEFORE UPDATE ON tar_config "
+                              "WHEN NEW.key = 'retention_guard_last_pass' "
+                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    run_retention(*f.db, kT0, f.guard);
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
+    CHECK(row_count(*f.db, "process_hourly") == 21);
+
+    run_retention(*f.db, kT0 + 1, f.guard); // anchor still unwritable: NOT a suppressed repeat
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+    CHECK(row_count(*f.db, "process_hourly") == 21); // never deletes
+
+    CHECK(failures_of(f.guard, "__clock_state__") >= 2);
+}
+
+TEST_CASE("TAR #2573: a wipe first seen without an anchor re-reports once the anchor lands",
+          "[tar][retention][clock-guard]") {
+    // A deliberate delta from the old latch's behaviour, and audit-parity: the
+    // dedup key is the WHOLE fact set, so a Wipe recorded with no_anchor=true
+    // and the identical Wipe with no_anchor=false (the very next pass, once
+    // the anchor self-heals) are two DIFFERENT fact sets and each reports on
+    // its own merits (`audit_retention_rules.hpp`). The old latch declined once
+    // then silently drained on pass 2; this costs one extra 900s-tick delay on
+    // the upgrade/restore bootstrap path in exchange for never conflating two
+    // distinct anomalies.
+    TarGuardFixture f{/*prime_anchor=*/false};
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5); // well under the cap
+
+    run_retention(*f.db, kT0, f.guard); // Wipe, no_anchor=true
+    CHECK(declines_of(f.guard, "process_hourly") == 1);
+    CHECK(row_count(*f.db, "process_hourly") == 5);
+
+    run_retention(*f.db, kT0 + 1, f.guard); // Wipe, no_anchor=false: a DIFFERENT fact set
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+    CHECK(row_count(*f.db, "process_hourly") == 5);
+
+    run_retention(*f.db, kT0 + 2, f.guard); // identical to pass 2: suppressed, drains
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+    CHECK(row_count(*f.db, "process_hourly") == 0);
+}
+
+TEST_CASE("TAR #2573: an implausible-now bail clears every table's recorded fact set",
+          "[tar][retention][clock-guard]") {
+    // Governance Gate 4 (UP-1). The two whole-pass early returns -- this one
+    // and the closed-store twin below -- sit BEFORE the per-table loop that
+    // otherwise clears a stale entry on disable / empty / probe failure /
+    // delete failure. Left unclosed, a recorded fact set could survive the
+    // bail and later coincide with a genuinely NEW anomaly's fact set on a
+    // later pass -- reporting nothing when something changed, the exact class
+    // of bug #2573 exists to close. Both bails now clear the whole map.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+
+    run_retention(*f.db, kT0, f.guard); // decline #1, fact set recorded
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(reported_of(f.guard, "process_hourly"));
+
+    run_retention(*f.db, std::numeric_limits<int64_t>::max() / 2, f.guard); // bails
+    CHECK_FALSE(reported_of(f.guard, "process_hourly")); // cleared by the bail
+
+    // The same still-live anomaly must decline again, not silently drain --
+    // proving the clear is real, not just an unobserved no-op.
+    run_retention(*f.db, kT0 + 1, f.guard);
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+    CHECK(row_count(*f.db, "process_hourly") == 20);
+}
+
+TEST_CASE("TAR #2573: a closed-store bail clears every table's recorded fact set",
+          "[tar][retention][clock-guard]") {
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 20);
+
+    run_retention(*f.db, kT0, f.guard); // decline #1, fact set recorded
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(reported_of(f.guard, "process_hourly"));
+
+    TarDatabase live = std::move(*f.db); // *f.db is now the closed store
+    REQUIRE_FALSE(f.db->is_open());
+
+    run_retention(*f.db, kT0 + 1, f.guard); // bails on the closed store
+    CHECK_FALSE(reported_of(f.guard, "process_hourly")); // cleared by the bail
+
+    // Reopen (the restart the warning names) and confirm the same still-live
+    // anomaly declines again rather than draining silently.
+    f.db.emplace(std::move(live));
+    run_retention(*f.db, kT0 + 2, f.guard);
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+    CHECK(row_count(*f.db, "process_hourly") == 20);
+}
+
+TEST_CASE("TAR #2573: a stale Wipe entry is erased, not left dangling, when NoAnchor "
+          "overtakes it",
+          "[tar][retention][clock-guard]") {
+    // Governance Gate 3 (quality-engineer). Pins the erase arm in the decide
+    // block reached when classify() returns NoAnchor while a DIFFERENT
+    // (non-NoAnchor) entry is already recorded for the table --
+    // `tar_aggregator.hpp`'s doc comment calls this out explicitly, but no
+    // existing test reached it: every prior no-anchor test starts from an
+    // EMPTY map. Reaching it needs `no_anchor=true` and `would_wipe=false` to
+    // hold SIMULTANEOUSLY (else Wipe outranks NoAnchor in classify's
+    // precedence) with a prior Wipe entry still on record.
+    TarGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 5); // all-expired: Wipe
+
+    run_retention(*f.db, kT0, f.guard); // Wipe, recorded
+    REQUIRE(declines_of(f.guard, "process_hourly") == 1);
+    REQUIRE(reported_of(f.guard, "process_hourly"));
+
+    // Force no_anchor=true (drop the stored reading) AND would_wipe=false (add
+    // a survivor) in one shot, ahead of the next pass.
+    REQUIRE(f.db->execute_sql(
+        "DELETE FROM tar_config WHERE key = 'retention_guard_last_pass'"));
+    seed_process_hourly_at(*f.db, kT0 - 3600, 1); // survivor: defeats would_wipe
+
+    run_retention(*f.db, kT0 + 1, f.guard); // NoAnchor overtakes the stale Wipe entry
+    CHECK(declines_of(f.guard, "process_hourly") == 2); // reports on its own merits
+    CHECK_FALSE(reported_of(f.guard, "process_hourly")); // erased, not leaked
+
+    // A fresh, independent Wipe must still decline -- proving the erase was
+    // real and nothing suppressed it by residue.
+    REQUIRE(f.db->execute_sql(std::format("DELETE FROM process_hourly WHERE hour_ts = {}",
+                                          kT0 - 3600)));
+    run_retention(*f.db, kT0 + 2, f.guard);
+    CHECK(declines_of(f.guard, "process_hourly") == 3);
+    CHECK(row_count(*f.db, "process_hourly") == 5);
 }

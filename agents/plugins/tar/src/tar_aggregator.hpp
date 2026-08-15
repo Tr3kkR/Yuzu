@@ -10,6 +10,8 @@
 
 #include "tar_db.hpp"
 
+#include <yuzu/audit_retention_rules.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -125,7 +127,8 @@ inline constexpr int64_t kTarMinBigStepSec = 30 * 86400;
 
 /**
  * Per-table clock-guard state for time-based retention. Owned by the plugin and
- * passed into every `run_retention` call so the latch survives across passes.
+ * passed into every `run_retention` call so recorded fact sets survive across
+ * passes.
  *
  * Deliberately IN-MEMORY, not persisted: a reboot re-declines, which is the
  * right behaviour for the wrong-RTC-at-boot case this exists to catch.
@@ -136,7 +139,7 @@ inline constexpr int64_t kTarMinBigStepSec = 30 * 86400;
  * step -- which is safe because no TarDatabase path ever takes this mutex, so
  * no cycle exists; an earlier version of this comment claimed it was never held
  * across a database call at all, which stopped being true in round 4. That does NOT
- * make a pass atomic: each table's probe / decide / update-latch sequence spans
+ * make a pass atomic: each table's probe / decide / update-entry sequence spans
  * several statements, so the CALLER must still serialise whole rollup passes
  * against each other -- a manual `tar rollup` can arrive while the 900-second
  * trigger is mid-pass. TarPlugin holds `rollup_mu_` for exactly that.
@@ -148,13 +151,32 @@ struct RetentionGuardState {
     /// themselves is a separate obligation the caller still owns (TarPlugin's
     /// `rollup_mu_`); this mutex does not provide it.
     mutable std::mutex mu;
-    /// "This table already declined for the current anomaly." Keyed by real
-    /// table name. Cleared once the wipe condition stops holding.
-    /// VOCABULARY, because this file uses both words: the latch is SET or
-    /// CLEAR. A SET latch means "already declined for the current anomaly", so
-    /// it PERMITS the next pass to delete. "Re-arm the guard" means CLEARING it
-    /// -- restoring the ability to decline. Set != armed; they are opposites.
-    std::map<std::string, bool> latched;
+    /// The Facts most recently reported for this table (#2573), keyed by real
+    /// table name. PRESENCE is the dedup key, not a bool: a table with an entry
+    /// has already declined for the CURRENT fact set, so an identical repeat is
+    /// a suppressed drain; a table with NO entry declines on its next anomaly.
+    /// Absence means either nothing has been reported yet, or the anomaly the
+    /// last entry covered is over -- the two are indistinguishable and don't
+    /// need to be, because both mean "the next anomaly should be reported".
+    ///
+    /// A bool cannot carry anomaly IDENTITY: a DIFFERENT anomaly arriving while
+    /// a bool latch was still set was neither declined nor counted, and the
+    /// pass deleted (#2573, measured). Comparing the whole Facts set fixes
+    /// that -- a Wipe arriving under a standing BadState is a different set
+    /// from the BadState alone, and reports on its own merits
+    /// (`audit_retention_rules.hpp`).
+    ///
+    /// One deliberate TAR-specific rule the audit sibling does not need:
+    /// Anomaly::NoAnchor is NEVER recorded here. The audit store's durable
+    /// `bootstrap_settled` marker is written in the SAME transaction as its
+    /// verdict, so a persist failure there rolls back the whole pass, decline
+    /// included. TAR's anchor write (`kRetentionLastPassKey`) is a plain
+    /// `set_config` that runs independently of this map -- if it keeps
+    /// failing, `no_anchor` stays true forever, and RECORDING that fact set
+    /// would turn every later identical pass into a suppressed drain, quietly
+    /// defeating the exact fail-safe the no-anchor trigger exists to provide.
+    /// See `run_retention`'s decide step.
+    std::map<std::string, yuzu::server::audit_retention::Facts> last_reported;
     /// Cumulative declines per table, surfaced through the `tar status` action.
     /// The agent has no /metrics endpoint, so this is the operator's only
     /// fleet-readable signal that an endpoint's clock is wrong.
@@ -200,16 +222,27 @@ format_retention_guard_lines(const RetentionGuardState& guard);
  * would delete every datable row of a table, that follows a wall-clock jump
  * larger than kTarMinBigStepSec (an ABSOLUTE threshold -- NOT the tier's
  * retention window), that finds the stored reading IMPLAUSIBLE (ahead of the
- * current clock, negative, or unparseable),
- * or that finds NO stored reading at all (the elapsed-time check cannot run
- * without one -- the first pass after an agent upgrade or a restore), declines
- * and is counted instead. The first three LATCH, so a table that is genuinely
- * all-expired still ages out on the next pass; the fourth deliberately does
- * NOT, because a missing comparison point is not an anomaly and spending the
- * latch on it would let a real one on the very next pass go undeclined.
- * Every accepted pass
- * deletes at most kMaxTarDeletesPerTablePerPass rows per table, oldest first --
- * that cap applies to BOTH retention kinds.
+ * current clock, negative, or unparseable), or that finds NO stored reading at
+ * all (the elapsed-time check cannot run without one -- the first pass after
+ * an agent upgrade or a restore), declines and is counted instead.
+ *
+ * The dedup key is the WHOLE fact set (#2573), not a per-table bool: a decline
+ * is recorded and reported only when it differs from what was last reported
+ * for that table, so a table that is genuinely all-expired still ages out on
+ * later passes (an identical repeat is a suppressed, capped drain), while a
+ * DIFFERENT anomaly arriving under a standing one reports on its own merits
+ * instead of deleting silently. The no-anchor trigger is never recorded --
+ * see `RetentionGuardState::last_reported` for why -- so a missing comparison
+ * point declines every pass until the anchor heals rather than spending a
+ * one-shot decline that would let a real anomaly on the very next pass go
+ * unreported.
+ *
+ * The caller's own `now_epoch` is also refused outright, before anything is
+ * persisted, when implausibly large (kTarMaxPlausibleNow) -- see the top of
+ * the implementation.
+ *
+ * Every accepted pass deletes at most kMaxTarDeletesPerTablePerPass rows per
+ * table, oldest first -- that cap applies to BOTH retention kinds.
  *
  * @param db        The TAR database.
  * @param now_epoch Current epoch seconds.

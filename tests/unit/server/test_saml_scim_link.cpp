@@ -16,6 +16,7 @@
 
 #include "saml_scim_link.hpp"
 
+#include "deprovision_deny_split.hpp"
 #include "yuzu/server/scim_store.hpp"
 
 #include "pg/pg_exec.hpp"
@@ -42,6 +43,8 @@ using yuzu::server::saml::is_linkable_name_id_format;
 using yuzu::server::saml::link_saml_login_to_scim;
 using yuzu::server::saml::saml_login_denied_deprovisioned;
 using yuzu::server::saml::SamlLoginDenyDecision;
+using yuzu::server::saml::SamlScimLinkOutcome;
+using yuzu::server::record_deprovision_deny_split;
 
 namespace {
 
@@ -91,8 +94,9 @@ TEST_CASE("link_saml_login_to_scim: exactly-one active match with a persistent F
     auto resource = store.create_resource("alice", "alice@example.com");
     REQUIRE(resource.has_value());
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "alice@example.com",
-                            kPersistent);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "alice@example.com", kPersistent);
+    CHECK(outcome == SamlScimLinkOutcome::linked);
 
     auto links = store.saml_links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
@@ -113,8 +117,9 @@ TEST_CASE("link_saml_login_to_scim: exactly-one active match with the SAML 1.1 e
     auto resource = store.create_resource("bob", "bob@example.com");
     REQUIRE(resource.has_value());
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "bob@example.com",
-                            kEmail11);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "bob@example.com", kEmail11);
+    CHECK(outcome == SamlScimLinkOutcome::linked);
 
     auto links = store.saml_links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
@@ -137,8 +142,9 @@ TEST_CASE("link_saml_login_to_scim: a transient NameID Format forms NO link — 
     // externalId matches EXACTLY — only the Format is unstable. If the
     // Format gate were removed, this would form a link (mis-linking a
     // per-login-reassigned identifier into a durable row).
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "carol@example.com",
-                            kTransient);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "carol@example.com", kTransient);
+    CHECK(outcome == SamlScimLinkOutcome::not_linkable);
 
     // MUTATION-CHECK (manually verified during development): removing the
     // `if (!is_linkable_name_id_format(name_id_format)) return;` guard in
@@ -148,6 +154,18 @@ TEST_CASE("link_saml_login_to_scim: a transient NameID Format forms NO link — 
     auto links = store.saml_links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
     CHECK(links->empty());
+
+    // ADR-2001 #3072 — the observation is still recorded UNCONDITIONALLY,
+    // before this gate, even though the format is unstable/unlinkable.
+    // MUTATION-CHECK (task spec): moving the
+    // `record_saml_login_observation` call to AFTER the
+    // `is_linkable_name_id_format` gate makes this assertion fail (a
+    // transient-format login would then record nothing) — confirming this
+    // is the D2-observability half of the fix, not just the link-formation
+    // guard above.
+    auto observed = store.saml_observation_matches("carol@example.com");
+    REQUIRE(observed.has_value());
+    CHECK(*observed);
 
     // The login itself is independent of this call — mirrors
     // test_oidc_scim_link.cpp's fail-OPEN pattern: a session minted before
@@ -161,7 +179,9 @@ TEST_CASE("link_saml_login_to_scim: a transient NameID Format forms NO link — 
     REQUIRE(session.has_value());
 }
 
-TEST_CASE("link_saml_login_to_scim: a missing/empty NameID Format forms NO link",
+TEST_CASE("link_saml_login_to_scim: a missing/empty NameID Format forms NO link, BUT the "
+          "observation IS recorded (Gate 7 fix — a common, legitimate IdP config must not "
+          "be dropped from the D2 detector) and does not bump the write-failure counter",
           "[pg][saml][scim][2001][failclosed]") {
     YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -172,12 +192,83 @@ TEST_CASE("link_saml_login_to_scim: a missing/empty NameID Format forms NO link"
     auto resource = store.create_resource("dave", "dave@example.com");
     REQUIRE(resource.has_value());
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "dave@example.com",
-                            /*name_id_format=*/"");
+    MetricsRegistry metrics;
+    const double before = metrics.counter("yuzu_scim_saml_link_write_failures_total").value();
+
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "dave@example.com", /*name_id_format=*/"", &metrics);
+    CHECK(outcome == SamlScimLinkOutcome::not_linkable);
 
     auto links = store.saml_links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
     CHECK(links->empty());
+
+    // MUTATION-CHECK (task spec): restoring the
+    // `name_id_format.empty()` guard in
+    // `ScimStore::record_saml_login_observation` makes this assertion fail
+    // — an empty-format login (a common, legitimate IdP omitting the
+    // NameID Format attribute) would then record NOTHING, defeating the D2
+    // detector for that population.
+    auto observed = store.saml_observation_matches("dave@example.com");
+    REQUIRE(observed.has_value());
+    CHECK(*observed);
+
+    // The empty-format case is an ordinary, successfully-recorded
+    // observation — it must never be conflated with a genuine store
+    // write failure.
+    const double after = metrics.counter("yuzu_scim_saml_link_write_failures_total").value();
+    CHECK(after == before);
+}
+
+TEST_CASE("link_saml_login_to_scim: an oversized/control-byte NameID Format is normalized to "
+          "\"\" before it reaches the store — bounded, and the login/observation still "
+          "proceed",
+          "[pg][saml][scim][2001][failclosed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ScimStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto resource = store.create_resource("heidi", "heidi@example.com");
+    REQUIRE(resource.has_value());
+
+    // Two malformed shapes: over the 255-byte cap, and control bytes.
+    const std::string oversized_format(300, 'x');
+    const std::string control_byte_format = "urn:oasis:names:tc:SAML:2.0:nameid-format:\x01x";
+
+    auto outcome1 = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                            "heidi@example.com", oversized_format);
+    CHECK(outcome1 == SamlScimLinkOutcome::not_linkable);
+
+    auto outcome2 = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                            "heidi@example.com", control_byte_format);
+    CHECK(outcome2 == SamlScimLinkOutcome::not_linkable);
+
+    // The login proceeds (no deny) regardless — mirrors every other
+    // non-linkable-format case.
+    auto links = store.saml_links_for_scim_id(resource->scim_id);
+    REQUIRE(links.has_value());
+    CHECK(links->empty());
+
+    // The observation was still recorded (bounded, not dropped).
+    auto observed = store.saml_observation_matches("heidi@example.com");
+    REQUIRE(observed.has_value());
+    CHECK(*observed);
+
+    // Raw-SQL peek: the stored row's format is the normalized "" — bounded
+    // even though two malformed formats were presented (both collapse to
+    // the same normalized row under the (entity_id, name_id, name_id_format)
+    // upsert key).
+    PgConn conn{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult res = yuzu::server::pg::exec_params(
+        conn.get(),
+        "SELECT name_id_format FROM scim_store.saml_login_observations WHERE name_id = $1",
+        std::vector<std::string>{"heidi@example.com"});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    CHECK(std::string(PQgetvalue(res.get(), 0, 0)).empty());
 }
 
 TEST_CASE("link_saml_login_to_scim: zero matches forms no link", "[pg][saml][scim][2001]") {
@@ -192,12 +283,20 @@ TEST_CASE("link_saml_login_to_scim: zero matches forms no link", "[pg][saml][sci
     auto resource = store.create_resource("erin", "erin@example.com");
     REQUIRE(resource.has_value());
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
-                            "no-such-name-id@example.com", kPersistent);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "no-such-name-id@example.com", kPersistent);
+    CHECK(outcome == SamlScimLinkOutcome::no_active_match);
 
     auto links = store.saml_links_for_scim_id(resource->scim_id);
     REQUIRE(links.has_value());
     CHECK(links->empty());
+
+    // ADR-2001 #3072 — the observation is recorded even though no link
+    // formed (the D2 signal fires regardless of match outcome, mirroring
+    // the OIDC side's zero-match test).
+    auto observed = store.saml_observation_matches("no-such-name-id@example.com");
+    REQUIRE(observed.has_value());
+    CHECK(*observed);
 }
 
 // Mutation-check (ADR-2001 PR4a spec, mirrors test_oidc_scim_link.cpp's own
@@ -227,8 +326,9 @@ TEST_CASE("link_saml_login_to_scim: TWO active matches forms NO link (mis-link g
     REQUIRE(r2.has_value());
     REQUIRE(r1->scim_id != r2->scim_id);
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
-                            "dup-name-id@example.com", kPersistent);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "dup-name-id@example.com", kPersistent);
+    CHECK(outcome == SamlScimLinkOutcome::ambiguous_match);
 
     auto links1 = store.saml_links_for_scim_id(r1->scim_id);
     auto links2 = store.saml_links_for_scim_id(r2->scim_id);
@@ -240,13 +340,14 @@ TEST_CASE("link_saml_login_to_scim: TWO active matches forms NO link (mis-link g
 
 TEST_CASE("link_saml_login_to_scim: a null ScimStore is a safe no-op", "[saml][scim][2001]") {
     // Mirrors the "no PG configured" boot posture — must not crash.
-    link_saml_login_to_scim(nullptr, "https://idp.example.com/saml/metadata", "x@example.com",
-                            kPersistent);
+    auto outcome = link_saml_login_to_scim(nullptr, "https://idp.example.com/saml/metadata",
+                                           "x@example.com", kPersistent);
+    CHECK(outcome == SamlScimLinkOutcome::not_linkable);
     SUCCEED("did not throw");
 }
 
 TEST_CASE("link_saml_login_to_scim: a closed/unusable ScimStore is fail-OPEN — call returns "
-          "normally and a SAML session minted independently stays valid",
+          "normally (lookup_store_error) and a SAML session minted independently stays valid",
           "[pg][saml][scim][2001][failopen]") {
     // A store whose pool cannot deliver a connection (invalid conninfo)
     // reports !is_open(), so every ScimStore accessor called through it
@@ -256,9 +357,13 @@ TEST_CASE("link_saml_login_to_scim: a closed/unusable ScimStore is fail-OPEN —
     ScimStore broken_store{broken_pool};
     REQUIRE_FALSE(broken_store.is_open());
 
-    // Must not throw despite every underlying write failing.
-    link_saml_login_to_scim(&broken_store, "https://idp.example.com/saml/metadata",
-                            "failopen@example.com", kPersistent);
+    // Must not throw despite every underlying write failing. The store is
+    // non-null (unlike the null-store test above) so this reaches the
+    // linkable-format branch and the lookup itself reports store_error —
+    // distinguishable from a genuine no_active_match.
+    auto outcome = link_saml_login_to_scim(&broken_store, "https://idp.example.com/saml/metadata",
+                                           "failopen@example.com", kPersistent);
+    CHECK(outcome == SamlScimLinkOutcome::lookup_store_error);
     SUCCEED("did not throw despite a closed store");
 
     // The login itself is independent of this call (mint-then-link at the
@@ -314,8 +419,9 @@ TEST_CASE("link_saml_login_to_scim: yuzu_scim_saml_link_write_failures_total inc
     // pre-seed wiring in a unit test.
     const double before = metrics.counter("yuzu_scim_saml_link_write_failures_total").value();
 
-    link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata", "frank@example.com",
-                            kPersistent, &metrics);
+    auto outcome = link_saml_login_to_scim(&store, "https://idp.example.com/saml/metadata",
+                                           "frank@example.com", kPersistent, &metrics);
+    CHECK(outcome == SamlScimLinkOutcome::link_write_error);
 
     // The read succeeded (a real match existed) and the write failed (the
     // table is gone) — confirms this test exercises the WRITE-failure path,
@@ -592,4 +698,84 @@ TEST_CASE("saml_login_denied_deprovisioned: a closed/unusable ScimStore fails CL
     // regression ADR-2001 §4 exists to prevent (a ScimStore outage must
     // never let a deprovisioned identity re-authenticate by luck of
     // timing).
+}
+
+// ── #3069 — deny-counter split: genuine vs store-unavailable ──
+//
+// Both `/saml/acs` deny sites in auth_routes.cpp (primary check + post-mint
+// recheck) bump the TOTAL counter (`yuzu_auth_saml_deprovisioned_denied_total`)
+// unconditionally, then call the SHARED `record_deprovision_deny_split`
+// helper (deprovision_deny_split.hpp, Gate 7 quality-engineer fix — the same
+// helper the OIDC side uses in test_oidc_scim_link.cpp) to split into
+// `yuzu_auth_saml_deprovisioned_denied_genuine_total` (scim_id present) vs
+// `yuzu_auth_saml_deprovisioned_denied_store_unavailable_total` (scim_id
+// absent) — a Postgres outage must never inflate the genuine/alertable
+// sub-counter. Both sites call the IDENTICAL helper, so ONE TEST_CASE
+// pinning the helper directly (rather than a hand-copied mirror of the
+// increment logic, which could not catch a predicate flip at a real call
+// site) covers both — there is no second, site-specific behaviour left to
+// pin separately.
+TEST_CASE("#3069: record_deprovision_deny_split bumps genuine XOR "
+          "store-unavailable, never both",
+          "[pg][saml][scim][2001][deny-at-login][3069]") {
+    SECTION("store-unavailable DENY (scim_id absent) -> store_unavailable_total, "
+           "NOT genuine_total") {
+        PgPool broken_pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1}};
+        ScimStore broken_store{broken_pool};
+        REQUIRE_FALSE(broken_store.is_open());
+
+        auto decision = saml_login_denied_deprovisioned(
+            &broken_store, "https://idp.example.com/saml/metadata", "name-3069-unavailable");
+        REQUIRE(decision.denied);
+        REQUIRE_FALSE(decision.scim_id.has_value());
+
+        MetricsRegistry m;
+        m.counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+        // MUTATION-CHECK target: flipping the predicate inside
+        // record_deprovision_deny_split (`scim_id_present` instead of
+        // `!scim_id_present`) makes the SECTIONs below fail — verified by
+        // hand during review, reverted before merge (see the junior task's
+        // VERIFY report).
+        record_deprovision_deny_split(
+            &m, "yuzu_auth_saml_deprovisioned_denied_genuine_total",
+            "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
+            decision.scim_id.has_value());
+
+        CHECK(m.counter("yuzu_auth_saml_deprovisioned_denied_total").value() == 1.0);
+        CHECK(m.counter("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total").value() ==
+              1.0);
+        CHECK(m.counter("yuzu_auth_saml_deprovisioned_denied_genuine_total").value() == 0.0);
+    }
+
+    SECTION("resolved-deprovisioned DENY (scim_id present) -> genuine_total, "
+           "NOT store_unavailable_total") {
+        YUZU_REQUIRE_PG_DB_TPL(db, saml_scim_link_tpl);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        ScimStore store{pool};
+        REQUIRE(store.is_open());
+
+        auto r = store.create_resource("u3069-saml-inactive-user", "ext-3069-saml-inactive");
+        REQUIRE(r.has_value());
+        REQUIRE(store.upsert_saml_link("https://idp.example.com/saml/metadata",
+                                       "ext-3069-saml-inactive", r->scim_id));
+        REQUIRE(store.set_active(r->scim_id, false));
+
+        auto decision = saml_login_denied_deprovisioned(
+            &store, "https://idp.example.com/saml/metadata", "ext-3069-saml-inactive");
+        REQUIRE(decision.denied);
+        REQUIRE(decision.scim_id.has_value());
+
+        MetricsRegistry m;
+        m.counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+        record_deprovision_deny_split(
+            &m, "yuzu_auth_saml_deprovisioned_denied_genuine_total",
+            "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
+            decision.scim_id.has_value());
+
+        CHECK(m.counter("yuzu_auth_saml_deprovisioned_denied_total").value() == 1.0);
+        CHECK(m.counter("yuzu_auth_saml_deprovisioned_denied_genuine_total").value() == 1.0);
+        CHECK(m.counter("yuzu_auth_saml_deprovisioned_denied_store_unavailable_total").value() ==
+              0.0);
+    }
 }

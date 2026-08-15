@@ -64,7 +64,12 @@ void NotificationRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, P
                      return;
                  }
                  auto id = std::stoll(req.matches[1].str());
-                 notification_store->mark_read(id);
+                 if (!notification_store->mark_read(id)) {
+                     res.status = 404;
+                     res.set_content(R"({"error":{"code":404,"message":"notification not found"},"meta":{"api_version":"v1"}})",
+                                     "application/json");
+                     return;
+                 }
                  res.set_content(R"({"status":"ok"})", "application/json");
              });
 
@@ -82,7 +87,14 @@ void NotificationRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, P
                      return;
                  }
                  auto id = std::stoll(req.matches[1].str());
-                 notification_store->dismiss(id);
+                 if (!notification_store->dismiss(id)) {
+                     audit_fn(req, "notification.dismiss", "failure", "notification",
+                              std::to_string(id), "");
+                     res.status = 404;
+                     res.set_content(R"({"error":{"code":404,"message":"notification not found"},"meta":{"api_version":"v1"}})",
+                                     "application/json");
+                     return;
+                 }
                  audit_fn(req, "notification.dismiss", "success", "notification",
                           std::to_string(id), "");
                  res.set_content(R"({"status":"ok"})", "application/json");

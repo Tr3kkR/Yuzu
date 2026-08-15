@@ -95,8 +95,17 @@ BundleOrchestrator::dispatch(const std::string& agent_id, const std::vector<Bund
                 // wrapper (REST scoped_perm_fn / MCP in_scope) already confined
                 // `agent_id` against it, so this is a defense-in-depth pass-
                 // through, not a re-decision.
+                //
+                // PR1.9c: the same pass-through reasoning now covers the whole
+                // caller. `principal` is this method's own parameter (the bundle
+                // owner the wrapper authenticated), so the chokepoint sees a real
+                // identity instead of the empty one that made every bundle step
+                // fail `AnonymousOperator`. `principal_role` stays empty: the
+                // chokepoint requires only a non-empty principal, and the
+                // orchestrator has no role to report without re-deriving one.
                 dispatch_(s.plugin, s.action, {agent_id}, /*scope=*/"", params, correlation,
-                          exec_visible);
+                          yuzu::server::DispatchCaller{.principal = principal,
+                                                       .exec_visible = exec_visible});
             ok = sent > 0 && !command_id.empty();
         } catch (const std::exception& e) {
             spdlog::warn("BundleOrchestrator: dispatch threw for step {}.{} ({}): {}", s.plugin,

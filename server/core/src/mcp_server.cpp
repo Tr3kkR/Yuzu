@@ -1698,13 +1698,19 @@ constexpr std::string_view kRbacOps[] = {"Read",   "Write",  "Execute", "Delete"
 // type and requires_approval() exact-matches type strings, so e.g.
 // {"quarantine_device", {"Securty", "Execute"}} would silently skip its
 // approval rule (governance UP-6).
+//
+// PR1.9a adds PluginConfig, PluginSecret and UploadGrant here because rbac_store.cpp's `types[]`
+// seeds them for the new plugin/upload securables, and letting this mirror drift would fail the
+// seeded-catalogues binding test in test_rbac_store.cpp or, for a typo'd entry, silently fail open
+// exactly as above.
 constexpr std::string_view kRbacSecurables[] = {
     "Infrastructure", "UserManagement",     "InstructionDefinition", "InstructionSet",
     "Execution",      "Schedule",           "Approval",              "Tag",
     "AuditLog",       "Response",           "ManagementGroup",       "ApiToken",
     "Security",       "Policy",             "DeviceToken",           "SoftwareDeployment",
     "License",        "FileRetrieval",      "GuaranteedState",       "Inventory",
-    "AccessReview",   "SoftwareLicensing",  "EnginePrincipal"};
+    "AccessReview",   "SoftwareLicensing",  "EnginePrincipal",       "PluginConfig",
+    "PluginSecret",   "UploadGrant"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -2453,7 +2459,7 @@ McpServer::HandlerFn McpServer::build_handler(
     const bool* mcp_streamed_post_enabled,
     std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
-    AuthDB* auth_db, DirectorySync* directory_sync, ExecVisibleFn exec_visible_fn,
+    AuthDB* auth_db, DirectorySync* directory_sync, CallerFn caller_fn,
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
     StreamPrincipalAuditFn principal_audit_fn) {
 
@@ -2492,6 +2498,18 @@ McpServer::HandlerFn McpServer::build_handler(
     // the handler below; outlives every request.
     std::shared_ptr<BundleOrchestrator> bundle_orch;
     if (dispatch_fn && response_store) {
+        // PR1.9c: `BundleOrchestrator::DispatchFn` now carries the whole
+        // `DispatchCaller`, so it is signature-identical to `McpServer::
+        // DispatchFn` and `dispatch_fn` feeds it directly — the adapter that
+        // used to sit here is gone.
+        //
+        // That adapter was the defect, not the boilerplate: it manufactured a
+        // `DispatchCaller{.exec_visible = ...}` with an EMPTY principal, and
+        // `build_classified_command` refuses an empty principal as
+        // `AnonymousOperator` before the legacy-open bypass — so every
+        // `execute_bundle` step was already being denied. The orchestrator
+        // supplies the real principal now (it has always received one; it just
+        // had nowhere to put it).
         bundle_orch = std::make_shared<BundleOrchestrator>(
             dispatch_fn, response_store,
             [] {
@@ -6942,24 +6960,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 // forever AND the JSON-RPC client sees a connection
                 // drop instead of a structured error envelope. Mirrors
                 // the REST sibling at workflow_routes.cpp:1427-1444.
-                // #1788: confine the dispatch to the caller's Execution:Execute
-                // visible device set, mirroring /api/command. Fail closed when
-                // the derivation is unwired (CDX-R6-02, see below).
-                auto exec_visible =
-                    exec_visible_fn ? exec_visible_fn(*session)
-                                    // CDX-R6-02: unwired == FAIL CLOSED. A present EMPTY set
-                                    // (not nullopt) means "no target visible" -> nothing
-                                    // dispatched. ADR-0033 §1 forbids inferring unfiltered
-                                    // authority from an omitted applicable filter (same
-                                    // posture as the tag ScopedPermFn, K-06). Production
-                                    // always wires it (server.cpp); a test wanting unfiltered
-                                    // wires a callback that returns nullopt.
-                                    : yuzu::server::authz::deny_all();
+                // #1788 / PLAN-006: confine the dispatch to the caller's
+                // Execution:Execute visible device set AND identify who asked,
+                // mirroring /api/command. Fail closed on visibility when the
+                // derivation is unwired (CDX-R6-02, see below).
+                auto caller =
+                    caller_fn ? caller_fn(*session)
+                                    // CDX-R6-02: unwired == FAIL CLOSED on exec_visible. A
+                                    // present EMPTY set (not nullopt) means "no target
+                                    // visible" -> nothing dispatched. ADR-0033 §1 forbids
+                                    // inferring unfiltered authority from an omitted
+                                    // applicable filter (same posture as the tag
+                                    // ScopedPermFn, K-06). Production always wires it
+                                    // (server.cpp); a test wanting unfiltered wires a
+                                    // callback whose exec_visible is nullopt.
+                              : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
                 std::string command_id;
                 int agents_reached = 0;
                 try {
                     std::tie(command_id, agents_reached) = dispatch_fn(
-                        plugin, action, agent_ids, scope, params, execution_id, exec_visible);
+                        plugin, action, agent_ids, scope, params, execution_id, caller);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_instruction: dispatch failed: {}", e.what());
                     // 2f PR 3a: unwind the bridge record FIRST (unsubscribe waits
@@ -7721,15 +7741,34 @@ McpServer::HandlerFn McpServer::build_handler(
             // quarantine (mirror POST /api/v1/quarantine) AND dispatches the live
             // quarantine-plugin isolation via the same DispatchFn chain.
             if (tool_name == "quarantine_device") {
-                if (!quarantine_store) {
-                    res.set_content(
-                        error_response(id, kInternalError, "Quarantine store unavailable"),
-                        "application/json");
-                    return;
-                }
+                // Parsed before the is_open() check below (pure arg-map
+                // reads, no failure mode) so a store-outage audit row can
+                // still carry the target agent_id (gov-fix compliance-officer
+                // C-2) instead of the audit call being skipped for lack of
+                // one.
                 auto agent_id = param_str(args, "agent_id");
                 auto reason = param_str(args, "reason");
                 auto whitelist = param_str(args, "whitelist");
+                if (!quarantine_store || !quarantine_store->is_open()) {
+                    // gov-fix(consistency-auditor, Gate 8.2): "agent_id=<id>,
+                    // <message>" — same shape as the other two mcp_audit
+                    // calls in this handler, so one grep pattern extracts
+                    // agent_id from every quarantine_device audit row. The
+                    // prior round's fix only touched the write-failure call
+                    // site below; this one and the scope-gate-unwired call
+                    // still used the old "<message>, agent_id=<id>" shape.
+                    mcp_audit("failure",
+                              "agent_id=" + agent_id + ", service unavailable — store not open");
+                    // gov-fix(enterprise-readiness F5): A5 requires a
+                    // transient failure to carry an honest retry_after_ms,
+                    // matching the engine-principal-store/software-licensing
+                    // store-unavailable siblings above.
+                    res.set_content(
+                        a4_error(kInternalError, "Quarantine store unavailable",
+                                 "retry the request", /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
                 if (agent_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
                                     "application/json");
@@ -7741,7 +7780,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 // matching set_tag/delete_tag above — this was the last write tool
                 // still widening to the global perm_fn on an unwired scope gate.
                 if (!scoped_perm_fn) {
-                    mcp_audit("failure", "scope gate not configured");
+                    // gov-fix(compliance-officer C-3): carry agent_id in the
+                    // detail — mcp_audit's target_id is fixed to the tool
+                    // name, not the agent, for every MCP audit row.
+                    // gov-fix(consistency-auditor, Gate 8.2): "agent_id=<id>,
+                    // <message>" shape, matching the other two mcp_audit
+                    // calls in this handler (see the is_open() branch above).
+                    mcp_audit("failure", "agent_id=" + agent_id + ", scope gate not configured");
                     res.set_content(error_response(id, kInternalError, "scope gate not configured"),
                                     "application/json");
                     return;
@@ -7816,9 +7861,35 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
                 if (!quar_res) {
-                    mcp_audit("failure", agent_id);
-                    res.set_content(error_response(id, kInvalidParams, quar_res.error()),
-                                    "application/json");
+                    // gov-fix(compliance-officer C-3): carry the actual store
+                    // error, not just agent_id — REST's audit_fn call passes
+                    // result.error() as a distinct field from the target id;
+                    // mcp_audit only has one free-text `detail` slot, so both
+                    // go in it rather than dropping the error message.
+                    // gov-fix(consistency-auditor, Gate 8): "agent_id=<id>,
+                    // <message>" matches this handler's other two mcp_audit
+                    // detail strings (is_open()/scope-gate-unwired above) so
+                    // one grep pattern extracts agent_id from every
+                    // quarantine_device audit row.
+                    mcp_audit("failure", "agent_id=" + agent_id + ", " + quar_res.error());
+                    // Mirrors the REST twin's 503-vs-400 classification
+                    // (is_quarantine_db_error, rest_api_v1.cpp): a genuine
+                    // store/pool/query failure is kInternalError, a
+                    // business/state error ("already quarantined") is
+                    // kInvalidParams.
+                    // gov-fix(enterprise-readiness F5): a genuine store/pool
+                    // failure is retryable (A5) — carry retry_after_ms only
+                    // on that branch, matching the engine-principal-store
+                    // sibling above; a business/state error stays
+                    // non-retryable (null).
+                    if (quar_res.error().starts_with(kQuarantineDbErrorPrefix)) {
+                        res.set_content(a4_error(kInternalError, quar_res.error(),
+                                                 "retry the request", /*retry_after_ms=*/5000),
+                                        "application/json");
+                    } else {
+                        res.set_content(a4_error(kInvalidParams, quar_res.error()),
+                                        "application/json");
+                    }
                     return;
                 }
                 // 2. Dispatch the live isolation command (plugin quarantine,
@@ -7838,10 +7909,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         // defense in depth matching the bundle/execute_instruction
                         // dispatch arms (this was the last arm still passing
                         // unfiltered on a single already-authorized target).
+                        // PLAN-006: `session` was authenticated at handler entry and
+                        // is already used for the store write above — identify the
+                        // caller to dispatch_confined too, not just its visible set.
                         std::tie(command_id, agents_reached) = dispatch_fn(
                             "quarantine", "quarantine", {agent_id}, /*scope=*/"", qparams,
                             /*execution_id=*/"",
-                            yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{agent_id}});
+                            DispatchCaller{
+                                .principal = session->username,
+                                .principal_role = auth::role_to_string(session->role),
+                                .exec_visible = yuzu::server::authz::VisibleSet{
+                                    std::unordered_set<std::string>{agent_id}}});
                     } catch (const std::exception& e) {
                         spdlog::error("MCP quarantine_device: isolation dispatch failed: {}",
                                       e.what());
@@ -7878,7 +7956,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // kToolSecurity).
             //
             // governance C4/sec-4: a bundle targets ONE device, so authorization is
-            // the per-target confinement below (exec_visible_fn + in_scope) — NOT
+            // the per-target confinement below (caller_fn + in_scope) — NOT
             // ALSO a targetless global Execution:Execute perm_fn gate. Keeping both
             // (as this handler previously did) is STRICTER than REST's
             // /api/v1/bundles twin (scoped_perm_fn only, no global gate), so a
@@ -7927,17 +8005,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #1788: a bundle targets ONE device, so confine it HERE (not in the
                 // orchestrator) — the single target must be in the caller's
                 // Execution:Execute visible set. Fail closed when unwired (CDX-R6-02).
-                auto exec_visible =
-                    exec_visible_fn ? exec_visible_fn(*session)
-                                    // CDX-R6-02: unwired == FAIL CLOSED. A present EMPTY set
-                                    // (not nullopt) means "no target visible" -> nothing
-                                    // dispatched. ADR-0033 §1 forbids inferring unfiltered
-                                    // authority from an omitted applicable filter (same
-                                    // posture as the tag ScopedPermFn, K-06). Production
-                                    // always wires it (server.cpp); a test wanting unfiltered
-                                    // wires a callback that returns nullopt.
-                                    : yuzu::server::authz::deny_all();
-                if (!yuzu::server::authz::in_scope(exec_visible, agent_id)) {
+                // PLAN-006: BundleOrchestrator's own DispatchFn is a separate,
+                // REST-shared typedef with no principal concept (see the adapter
+                // above) — this handler only needs `caller.exec_visible` here.
+                auto caller =
+                    caller_fn ? caller_fn(*session)
+                                    // CDX-R6-02: unwired == FAIL CLOSED on exec_visible. A
+                                    // present EMPTY set (not nullopt) means "no target
+                                    // visible" -> nothing dispatched. ADR-0033 §1 forbids
+                                    // inferring unfiltered authority from an omitted
+                                    // applicable filter (same posture as the tag
+                                    // ScopedPermFn, K-06). Production always wires it
+                                    // (server.cpp); a test wanting unfiltered wires a
+                                    // callback whose exec_visible is nullopt.
+                              : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+                if (!yuzu::server::authz::in_scope(caller.exec_visible, agent_id)) {
                     mcp_audit("failure", "agent_id=" + agent_id + " out_of_scope");
                     res.set_content(
                         error_response(id, kInvalidParams, "target agent not in your visible scope"),
@@ -7951,7 +8033,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // default to unfiltered — defense in depth if a future dispatch_fn
                     // starts consulting it itself.
                     r = bundle_orch->dispatch(agent_id, *specs, session->username, bundle_audit,
-                                              exec_visible);
+                                              caller.exec_visible);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_bundle: dispatch failed: {}", e.what());
                     mcp_audit("failure", std::string("dispatch_exception: ") + e.what());
@@ -10828,7 +10910,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 StreamRevalidateFn revalidate_fn,
                                 std::size_t mcp_max_streams_per_principal,
                                 StreamPrincipalAuditFn principal_audit_fn,
-                                ExecVisibleFn exec_visible_fn) {
+                                CallerFn caller_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -10854,7 +10936,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
                            std::move(allowed_origins),
                            software_licensing_store, engine_principal_store, access_review_store,
-                           auth_db, directory_sync, std::move(exec_visible_fn),
+                           auth_db, directory_sync, std::move(caller_fn),
                            // 2f PR 3b: the streamed-POST arm leases from the SAME
                            // budget as the GET channel above (which COPIED these, so
                            // moving here is safe) - one arithmetic for every

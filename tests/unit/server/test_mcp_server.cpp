@@ -696,15 +696,18 @@ struct McpTestServer {
     /// dispatch_fn (the confinement the production dispatch lambda applies).
     yuzu::server::authz::VisibleSet last_dispatch_exec_visible;
 
-    /// CDX-R5-02: the per-caller exec-visible derivation for MCP dispatch
-    /// confinement. CDX-R6-02: an UNWIRED callback now fails CLOSED in the
-    /// handlers (a present-empty visible set denies every target), so the
-    /// harness DEFAULT wires a callback that explicitly returns nullopt
-    /// (unfiltered) -- that keeps every existing MCP test on the pre-#1788
-    /// full-fleet path. A confinement test overrides this with a specific set;
-    /// a fail-closed test sets it to `{}` (genuinely unwired).
-    yuzu::server::mcp::McpServer::ExecVisibleFn exec_visible_fn_for_test{
-        [](const auth::Session&) { return yuzu::server::authz::VisibleSet{}; }};
+    /// CDX-R5-02 / PLAN-006: the per-caller DispatchCaller derivation for MCP
+    /// dispatch confinement + identity. CDX-R6-02: an UNWIRED callback now
+    /// fails CLOSED on visibility in the handlers (a present-empty visible set
+    /// denies every target; an empty principal), so the harness DEFAULT wires
+    /// a callback whose `exec_visible` is explicitly nullopt (unfiltered) --
+    /// that keeps every existing MCP test on the pre-#1788 full-fleet path. A
+    /// confinement test overrides this with a specific set; a fail-closed test
+    /// sets it to `{}` (genuinely unwired).
+    yuzu::server::mcp::McpServer::CallerFn caller_fn_for_test{
+        [](const auth::Session&) -> yuzu::server::DispatchCaller {
+            return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{}};
+        }};
 
     /// governance R1 (QE SHOULD-1 + happy-LOW-2): allow a test to wire a
     /// real ExecutionTracker so the create_execution / set_agents_targeted
@@ -1063,7 +1066,7 @@ private:
             /*access_review_store=*/nullptr,
             /*auth_db=*/nullptr,
             /*directory_sync=*/nullptr,
-            /*exec_visible_fn=*/exec_visible_fn_for_test,
+            /*caller_fn=*/caller_fn_for_test,
             // 2f PR 3b: the POST handler leases from the SAME budget as GET.
             // Default nullptr keeps every pre-3b test on the plain path - a test
             // that does not opt in cannot accidentally start streaming.
@@ -1497,7 +1500,8 @@ TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mc
     // distinct from "Write" (see mcp_policy.hpp's tier_allows() operator-tier
     // comment for why a shared op would have been a privilege escalation).
     CHECK(rbac_ops_for_test().size() == 8);
-    CHECK(rbac_securables_for_test().size() == 23);
+    // 23 + 3 PR1.9a additions (PluginConfig, PluginSecret, UploadGrant).
+    CHECK(rbac_securables_for_test().size() == 26);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
@@ -4763,7 +4767,7 @@ TEST_CASE("MCP Integration: execute_instruction happy dispatch", "[mcp][integrat
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& execution_id, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string& execution_id, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
@@ -4821,17 +4825,17 @@ TEST_CASE("MCP execute_instruction derives the caller's exec_visible and threads
           "[mcp][integration][execute][scope]") {
     McpTestServer ts;
     // A service-scoped-style confinement: the caller can see only agent-A.
-    ts.exec_visible_fn_for_test = [](const auth::Session&) {
+    ts.caller_fn_for_test = [](const auth::Session&) -> yuzu::server::DispatchCaller {
         std::unordered_set<std::string> s{"agent-A"};
-        return yuzu::server::authz::VisibleSet{s};
+        return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{s}};
     };
     auto dispatch = [&](const std::string&, const std::string&,
                         const std::vector<std::string>& agent_ids, const std::string&,
                         const std::unordered_map<std::string, std::string>&, const std::string&,
-                        const yuzu::server::authz::VisibleSet& exec_visible)
+                        const yuzu::server::DispatchCaller& caller)
         -> std::pair<std::string, int> {
         ts.last_dispatch_agent_ids = agent_ids;
-        ts.last_dispatch_exec_visible = exec_visible;
+        ts.last_dispatch_exec_visible = caller.exec_visible;
         return {"cmd-x", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -4848,6 +4852,35 @@ TEST_CASE("MCP execute_instruction derives the caller's exec_visible and threads
     CHECK(ts.last_dispatch_exec_visible->count("agent-B") == 0);
 }
 
+// PLAN-006: the sibling of the confinement handoff test above, but asserting
+// the IDENTITY half of DispatchCaller — a wired CallerFn's principal must
+// reach the dispatch seam, not just its exec_visible.
+TEST_CASE("MCP execute_instruction threads the caller's principal into dispatch (PLAN-006)",
+          "[mcp][integration][execute][scope]") {
+    McpTestServer ts;
+    ts.caller_fn_for_test = [](const auth::Session& s) -> yuzu::server::DispatchCaller {
+        return yuzu::server::DispatchCaller{.principal = s.username,
+                                            .principal_role = auth::role_to_string(s.role)};
+    };
+    yuzu::server::DispatchCaller captured;
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller& caller)
+        -> std::pair<std::string, int> {
+        captured = caller;
+        return {"cmd-x", 0};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":177,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["agent-A"]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(captured.principal == ts.mock_username);
+    CHECK_FALSE(captured.principal_role.empty());
+    CHECK_FALSE(captured.system);
+}
+
 TEST_CASE("MCP execute_instruction FAILS CLOSED when the exec-visible derivation is unwired "
           "(CDX-R6-02)",
           "[mcp][integration][execute][scope]") {
@@ -4855,13 +4888,13 @@ TEST_CASE("MCP execute_instruction FAILS CLOSED when the exec-visible derivation
     // Genuinely UNWIRED (not the harness's nullopt default): the handler must
     // hand dispatch a PRESENT EMPTY visible set (deny all), never nullopt
     // (unfiltered) -- ADR-0033 §1, a missing applicable filter denies.
-    ts.exec_visible_fn_for_test = {};
+    ts.caller_fn_for_test = {};
     auto dispatch = [&](const std::string&, const std::string&,
                         const std::vector<std::string>&, const std::string&,
                         const std::unordered_map<std::string, std::string>&, const std::string&,
-                        const yuzu::server::authz::VisibleSet& exec_visible)
+                        const yuzu::server::DispatchCaller& caller)
         -> std::pair<std::string, int> {
-        ts.last_dispatch_exec_visible = exec_visible;
+        ts.last_dispatch_exec_visible = caller.exec_visible;
         return {"cmd-x", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -4871,6 +4904,31 @@ TEST_CASE("MCP execute_instruction FAILS CLOSED when the exec-visible derivation
     CHECK(res->status == 200);
     REQUIRE(ts.last_dispatch_exec_visible.has_value()); // PRESENT (deny), not nullopt
     CHECK(ts.last_dispatch_exec_visible->empty());       // EMPTY -> the production sink dispatches to no one
+}
+
+// PLAN-006: the identity sibling of the fail-closed test above — an unwired
+// CallerFn must hand dispatch an EMPTY principal too, not merely a deny-all
+// exec_visible.
+TEST_CASE("MCP execute_instruction hands dispatch an EMPTY principal when the CallerFn is unwired "
+          "(PLAN-006)",
+          "[mcp][integration][execute][scope]") {
+    McpTestServer ts;
+    ts.caller_fn_for_test = {};
+    yuzu::server::DispatchCaller captured;
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller& caller)
+        -> std::pair<std::string, int> {
+        captured = caller;
+        return {"cmd-x", 0};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":178,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","agent_ids":["agent-A"]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(captured.principal.empty());
 }
 
 // ── 23b. execute_instruction with real ExecutionTracker — non-empty path ──
@@ -4916,7 +4974,7 @@ TEST_CASE("MCP Integration: execute_instruction populates execution_id and threa
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& execution_id, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string& execution_id, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
@@ -4983,7 +5041,7 @@ TEST_CASE("MCP Integration: execute_instruction missing plugin", "[mcp][integrat
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -5006,7 +5064,7 @@ TEST_CASE("MCP Integration: execute_instruction missing action", "[mcp][integrat
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -5039,7 +5097,7 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
     bool dispatched = false;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         dispatched = true;
         return {"cmd-abc", 1};
     };
@@ -5213,7 +5271,7 @@ TEST_CASE("MCP Integration: type-confused targeting is rejected, never widened t
     auto dispatch = [&](const std::string&, const std::string&,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>&,
-                        const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         ++dispatch_calls;
         dispatched_ids = agent_ids;
         dispatched_scope = scope_expr;
@@ -5308,7 +5366,7 @@ TEST_CASE("MCP Integration: an input-bound denial emits a counted, correlated au
     ts.metrics_for_test = &reg;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"", 0}; };
+                       const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"", 0}; };
     ts.start_with_dispatch(dispatch, "operator");
 
     const std::string big(129, 'a');
@@ -5445,7 +5503,7 @@ TEST_CASE("MCP Integration: execute_instruction zero agents reached",
     McpTestServer ts;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"cmd-xyz", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -5485,7 +5543,7 @@ TEST_CASE("MCP Integration: execute_instruction default scope __all__",
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         ts.last_dispatch_scope = scope_expr;
         ts.last_dispatch_agent_ids = agent_ids;
         return {"cmd-default", 1};
@@ -5512,7 +5570,7 @@ TEST_CASE("MCP Integration: execute_instruction explicit agent_ids",
     auto dispatch = [&](const std::string&, const std::string&,
                         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                         const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_scope = scope_expr;
         return {"cmd-agents", 2};
@@ -5538,7 +5596,7 @@ TEST_CASE("MCP Integration: execute_instruction params forwarding", "[mcp][integ
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         ts.last_dispatch_params = params;
         return {"cmd-params", 1};
     };
@@ -5562,7 +5620,7 @@ TEST_CASE("MCP Integration: execute_instruction non-string params", "[mcp][integ
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         ts.last_dispatch_params = params;
         return {"cmd-nonstr", 1};
     };
@@ -5587,7 +5645,7 @@ TEST_CASE("MCP Integration: execute_instruction blocked by read_only_mode",
     ts.read_only_mode_ = true;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"cmd-ro", 1};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -5610,7 +5668,7 @@ TEST_CASE("MCP Integration: execute_instruction blocked by readonly tier",
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"cmd-ro", 1};
     };
     ts.start_with_dispatch(dispatch, "readonly");
@@ -5633,7 +5691,7 @@ TEST_CASE("MCP Integration: execute_instruction operator tier proceeds",
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>&, const std::string&,
                         const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         return {"cmd-op", 3};
@@ -5671,7 +5729,7 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier, no approval man
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"cmd-sup", 1};
     };
     ts.start_with_dispatch(dispatch, "supervised"); // approval_manager_for_test == nullptr
@@ -5711,7 +5769,7 @@ TEST_CASE("MCP Integration: execute_instruction supervised tier mints approval t
     bool dispatched = false;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         dispatched = true;
         return {"cmd-sup", 1};
     };
@@ -5738,7 +5796,7 @@ TEST_CASE("MCP Integration: execute_instruction audit on success", "[mcp][integr
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"cmd-audit", 2};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -5762,7 +5820,7 @@ TEST_CASE("MCP Integration: execute_instruction audit on no-agents",
     McpTestServer ts;
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string& /*execution_id*/, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                       const std::string& /*execution_id*/, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"cmd-empty", 0};
     };
     ts.start_with_dispatch(dispatch, "operator");
@@ -6015,7 +6073,7 @@ TEST_CASE("MCP query_responses: full execute_instruction -> collect-by-execution
     ts.response_store_for_test = &store;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string& execution_id, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string& execution_id, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         ts.last_dispatch_execution_id = execution_id;
         return {"cmd-loop", 1};
     };
@@ -7090,7 +7148,7 @@ bool audit_has(const std::vector<std::string>& log, const std::string& entry) {
 yuzu::server::mcp::McpServer::DispatchFn fake_bundle_dispatch() {
     return [](const std::string& plugin, const std::string& action, const std::vector<std::string>&,
               const std::string&, const std::unordered_map<std::string, std::string>&,
-              const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+              const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"cmd-" + plugin + "-" + action, 1};
     };
 }
@@ -7107,14 +7165,14 @@ TEST_CASE("MCP execute_bundle denies an out-of-scope target agent, dispatches an
     McpTestServer ts;
     ts.response_store_for_test = &store;
     // Caller (service-scoped-style) can see only agent-A.
-    ts.exec_visible_fn_for_test = [](const auth::Session&) {
+    ts.caller_fn_for_test = [](const auth::Session&) -> yuzu::server::DispatchCaller {
         std::unordered_set<std::string> s{"agent-A"};
-        return yuzu::server::authz::VisibleSet{s};
+        return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{s}};
     };
     ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
                                          const std::vector<std::string>&, const std::string&,
                                          const std::unordered_map<std::string, std::string>&,
-                                         const std::string&, const yuzu::server::authz::VisibleSet&)
+                                         const std::string&, const yuzu::server::DispatchCaller&)
                                -> std::pair<std::string, int> {
         dispatched = true;
         return {"cmd", 1};
@@ -7144,11 +7202,11 @@ TEST_CASE("MCP execute_bundle FAILS CLOSED when the exec-visible derivation is u
     ts.response_store_for_test = &store;
     // Genuinely UNWIRED (not the harness's nullopt default): a missing applicable
     // filter must DENY, not admit every target (ADR-0033 §1).
-    ts.exec_visible_fn_for_test = {};
+    ts.caller_fn_for_test = {};
     ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
                                          const std::vector<std::string>&, const std::string&,
                                          const std::unordered_map<std::string, std::string>&,
-                                         const std::string&, const yuzu::server::authz::VisibleSet&)
+                                         const std::string&, const yuzu::server::DispatchCaller&)
                                -> std::pair<std::string, int> {
         dispatched = true;
         return {"cmd", 1};
@@ -7165,7 +7223,7 @@ TEST_CASE("MCP execute_bundle admits a management-group-scoped operator with NO 
           "[pg][mcp][bundle][scope]") {
     // Simulates the exact twin-disagreement the finding named: a caller who is
     // NOT globally granted Execution:Execute (perm_override denies it) but IS
-    // scoped to see this one device (exec_visible_fn admits agent-A). REST's
+    // scoped to see this one device (caller_fn admits agent-A). REST's
     // /api/v1/bundles has never required the global grant, only the per-target
     // scoped_perm_fn; before this fix MCP additionally required the global
     // grant and 403'd this exact caller. The twins must now agree: admitted.
@@ -7182,14 +7240,14 @@ TEST_CASE("MCP execute_bundle admits a management-group-scoped operator with NO 
         // session here) is unaffected.
         return !(securable == "Execution" && op == "Execute");
     };
-    ts.exec_visible_fn_for_test = [](const auth::Session&) {
+    ts.caller_fn_for_test = [](const auth::Session&) -> yuzu::server::DispatchCaller {
         std::unordered_set<std::string> s{"agent-A"};
-        return yuzu::server::authz::VisibleSet{s};
+        return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{s}};
     };
     ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
                                          const std::vector<std::string>&, const std::string&,
                                          const std::unordered_map<std::string, std::string>&,
-                                         const std::string&, const yuzu::server::authz::VisibleSet&)
+                                         const std::string&, const yuzu::server::DispatchCaller&)
                                -> std::pair<std::string, int> {
         dispatched = true;
         return {"cmd", 1};
@@ -7217,7 +7275,7 @@ TEST_CASE("MCP execute_bundle fans each step out + returns bundle_id", "[pg][mcp
     ts.start_with_dispatch([&calls](const std::string& plugin, const std::string& action,
                                     const std::vector<std::string>&, const std::string&,
                                     const std::unordered_map<std::string, std::string>&,
-                                    const std::string& correlation, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                                    const std::string& correlation, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         calls.push_back({plugin, action, correlation});
         return {"cmd-" + plugin + "-" + action, 1};
     });
@@ -7373,7 +7431,7 @@ TEST_CASE("MCP get_bundle_result surfaces dispatch_failed + succeeded=0", "[pg][
     ts.start_with_dispatch([](const std::string&, const std::string&,
                               const std::vector<std::string>&, const std::string&,
                               const std::unordered_map<std::string, std::string>&,
-                              const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                              const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {std::string{}, 0}; // reached no agent
     });
     auto disp = ts.call(
@@ -8401,7 +8459,7 @@ TEST_CASE("MCP: a schema-inexpressible violation never mints or consumes a ticke
     int dispatch_calls = 0;
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
-                        const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         ++dispatch_calls;
         return {"cmd-abc", 1};
     };
@@ -8469,18 +8527,36 @@ TEST_CASE("MCP: a schema-inexpressible violation never mints or consumes a ticke
     }
 }
 
+namespace {
+// QuarantineStore migrated to Postgres (ADR-0006/0047) — every "MCP
+// quarantine_device"/cross-tool test below clones this pre-migrated
+// template instead of opening a SQLite path. SAME key as
+// test_quarantine_store.cpp's own template ("quarantinestore") — the
+// registry builds it once and replay-verifies this file's setup lambda
+// produces the identical structural fingerprint (test_helpers.hpp
+// PgTestTemplate contract).
+yuzu::test::PgTestTemplate mcp_quarantine_tpl{"quarantinestore", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::QuarantineStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("quarantinestore template: store failed to migrate");
+}};
+} // namespace
+
 // Governance qa-SHOULD-1: a ticket minted for one tool must not authorize a
 // DIFFERENT tool — the `definition_id = "mcp." + tool_name` binding is the
 // privilege-escalation guard. Mint for delete_tag, present the (approved) id to
 // quarantine_device → denied, and the delete_tag ticket stays consumable.
 TEST_CASE("MCP approval ticket cannot be reused across tools",
-          "[mcp][integration][approval][security]") {
+          "[mcp][integration][approval][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
     yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
     yuzu::server::TagStore tags(tagdb.path);
     tags.set_tag("agent-1", "role", "web", "server");
 
-    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
 
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     sqlite3* raw = nullptr;
@@ -8612,7 +8688,8 @@ TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable 
 
 TEST_CASE("MCP approval masked-denial counter: accumulates per refusal and stays "
           "per-tool, not a shared/latched series",
-          "[mcp][integration][approval][security]") {
+          "[mcp][integration][approval][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
     // Governance quality-engineer finding: prior tests only ever checked the
     // masked counter at 0.0 or 1.0, which a "set to 1" mutant would survive,
     // and only ever exercised a single tool, which a mislabeled-series mutant
@@ -8623,8 +8700,9 @@ TEST_CASE("MCP approval masked-denial counter: accumulates per refusal and stays
     yuzu::server::TagStore tags(tagdb.path);
     tags.set_tag("agent-1", "role", "web", "server");
 
-    yuzu::test::TempDbFile qdb{std::string_view{"yuzu_test_mcp_quar_"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
 
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
     struct Conn {
@@ -9256,7 +9334,7 @@ TEST_CASE("MCP 2405: non-string approval_id is rejected on declaring and non-dec
         auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                            const std::string&,
                            const std::unordered_map<std::string, std::string>&,
-                           const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                           const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
             return {"cmd-x", 1};
         };
         ts2.start_with_dispatch(dispatch, "supervised");
@@ -9290,7 +9368,7 @@ TEST_CASE("MCP 2405: string approval_id is tolerated on tools that do not declar
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
             dispatched = true;
             return {"cmd-ok", 1};
         };
@@ -10200,9 +10278,10 @@ TEST_CASE("MCP reject_request rejects a pending request", "[mcp][integration][ap
 }
 
 TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolation",
-          "[mcp][integration][quarantine][approval]") {
-    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+          "[mcp][integration][quarantine][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
     REQUIRE(quar.is_open());
 
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
@@ -10224,12 +10303,12 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     auto dispatch = [&](const std::string& plugin, const std::string& action,
                         const std::vector<std::string>& agent_ids, const std::string&,
                         const std::unordered_map<std::string, std::string>& params,
-                        const std::string&, const yuzu::server::authz::VisibleSet& exec_visible) -> std::pair<std::string, int> {
+                        const std::string&, const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
         ts.last_dispatch_plugin = plugin;
         ts.last_dispatch_action = action;
         ts.last_dispatch_agent_ids = agent_ids;
         ts.last_dispatch_params = params;
-        ts.last_dispatch_exec_visible = exec_visible;
+        ts.last_dispatch_exec_visible = caller.exec_visible;
         return {"cmd-quar", 1};
     };
     ts.start_with_dispatch(dispatch, "supervised"); // Security:Execute requires approval (C2)
@@ -10242,7 +10321,11 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     CHECK(body1["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
     std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
     CHECK(ts.last_dispatch_plugin.empty()); // not dispatched yet
-    CHECK_FALSE(quar.get_status("agent-q").has_value());
+    {
+        auto st = quar.get_status("agent-q");
+        REQUIRE(st.has_value()); // read succeeded
+        CHECK_FALSE(st->has_value()); // ...found nothing active yet
+    }
     // M2 (PR #1796): the ticket-mint audit detail names the endpoint so SIEM can
     // filter mcp.quarantine_device|pending by agent_id.
     REQUIRE_FALSE(ts.audit_details.empty());
@@ -10271,8 +10354,9 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     CHECK(payload2["quarantine_record"]["agent_id"] == "agent-q");
     // Record persisted.
     auto rec = quar.get_status("agent-q");
-    REQUIRE(rec);
-    CHECK(rec->status == "active");
+    REQUIRE(rec.has_value()); // read succeeded
+    REQUIRE(rec->has_value()); // and found an active record
+    CHECK((*rec)->status == "active");
     // Live isolation dispatched via the quarantine plugin with the whitelist.
     CHECK(ts.last_dispatch_plugin == "quarantine");
     CHECK(ts.last_dispatch_action == "quarantine");
@@ -10291,15 +10375,16 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
 
 TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCCESS, "
           "never a failure - pins the schema's minimum:0, not minimum:1",
-          "[mcp][integration][quarantine][approval]") {
+          "[mcp][integration][quarantine][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
     // #2712: an offline/unreachable device still gets recorded (the isolation
     // dispatch just never lands) - this is NOT a failure path, and the schema
     // must accept agents_reached==0 as a valid success value. A naive copy of
     // execute_instruction's normal-branch minimum:1 onto this tool would be
     // exactly the wrong constraint here (Fable's review of the #2712 batch 3
     // plan flagged this as the natural mistake to avoid).
-    yuzu::test::TempDbFile qdb{std::string_view{"yuzu_test_mcp_quar_"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
     REQUIRE(quar.is_open());
 
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
@@ -10350,8 +10435,9 @@ TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCC
     CHECK(payload2["command_id"].get<std::string>().empty());
     // The record still persisted despite no live dispatch.
     auto rec = quar.get_status("agent-offline");
-    REQUIRE(rec);
-    CHECK(rec->status == "active");
+    REQUIRE(rec.has_value()); // read succeeded
+    REQUIRE(rec->has_value()); // and found an active record
+    CHECK((*rec)->status == "active");
     // #2712: structuredContent mirrors content[0].text exactly, including the
     // agents_reached:0 value the schema must accept (minimum:0).
     CHECK(write_tool_structured(res2) == payload2);
@@ -10464,9 +10550,10 @@ TEST_CASE("MCP delete_tag enforces the per-device scope gate",
 }
 
 TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
-          "[mcp][integration][quarantine][scope]") {
-    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+          "[mcp][integration][quarantine][scope][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
     REQUIRE(quar.is_open());
 
     std::vector<ScopeGateCall> calls;
@@ -10489,7 +10576,11 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
     auto denied = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":264,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-outside","reason":"sus"}}})");
     CHECK(denied->status == 403);
-    CHECK_FALSE(quar.get_status("agent-outside").has_value());
+    {
+        auto st = quar.get_status("agent-outside");
+        REQUIRE(st.has_value()); // read succeeded
+        CHECK_FALSE(st->has_value()); // ...found nothing (never recorded)
+    }
     REQUIRE(calls.size() == 1);
     CHECK(calls[0].securable == "Security");
     CHECK(calls[0].op == "Execute");
@@ -10500,18 +10591,23 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
         R"({"jsonrpc":"2.0","method":"tools/call","id":265,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-inside","reason":"sus"}}})");
     auto payload = write_tool_payload(ok);
     CHECK(payload["quarantine_record"]["agent_id"] == "agent-inside");
-    REQUIRE(quar.get_status("agent-inside").has_value());
+    {
+        auto st = quar.get_status("agent-inside");
+        REQUIRE(st.has_value()); // read succeeded
+        CHECK(st->has_value()); // ...and found the record
+    }
 }
 
 TEST_CASE("MCP quarantine_device FAILS CLOSED when the scope gate is unwired (governance UP-9)",
-          "[mcp][integration][quarantine][scope]") {
+          "[mcp][integration][quarantine][scope][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
     // No scoped_perm_fn wired (default empty). Before this fix the handler
     // widened to the global perm_fn (always-allow in this harness) and
     // proceeded to record + dispatch — the LAST write tool still doing that;
     // set_tag/delete_tag already refuse here (K-06/CDX-R4-09). Must refuse,
     // never fall through.
-    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
     REQUIRE(quar.is_open());
 
     McpTestServer ts;
@@ -10523,7 +10619,73 @@ TEST_CASE("MCP quarantine_device FAILS CLOSED when the scope gate is unwired (go
     REQUIRE(res);
     CHECK(res->body.find("scope gate not configured") != std::string::npos);
     CHECK(res->body.find("\"result\"") == std::string::npos); // fail closed, not served
-    CHECK_FALSE(quar.get_status("agent-x").has_value());       // never recorded
+    {
+        auto st = quar.get_status("agent-x");
+        REQUIRE(st.has_value()); // read succeeded
+        CHECK_FALSE(st->has_value()); // ...found nothing (never recorded)
+    }
+}
+
+// gov-fix(chaos-injector NICE-2): pins the store/business error split at the
+// MCP transport, mirroring the REST route's own pin
+// ("REST routes answer 503 (not 400) on a genuine store failure", test_rest_
+// quarantine_routes.cpp) — a genuine store/pool failure must classify
+// kInternalError + a retryable A5 hint, a business-state error ("already
+// quarantined") must classify kInvalidParams + non-retryable, and neither may
+// silently swap with the other.
+TEST_CASE("MCP quarantine_device classifies store failure vs business error "
+          "(kInternalError+retryable vs kInvalidParams+terminal)",
+          "[mcp][integration][quarantine][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
+
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start(); // default tier: no approval gate, single-call round-trip
+
+    SECTION("business error: agent already quarantined -> kInvalidParams, no retry") {
+        REQUIRE(quar.quarantine_device("agent-dup", "seed", "pre-seeded", "").has_value());
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":267,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-dup","reason":"dup"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] == "device is already quarantined");
+        // Non-retryable business error: no retry_after_ms hint.
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        REQUIRE_FALSE(ts.audit_details.empty());
+        CHECK(ts.audit_details.back().find("agent_id=agent-dup, device is already quarantined") !=
+              std::string::npos);
+    }
+
+    SECTION("store failure: schema dropped -> kInternalError, retryable") {
+        {
+            pg::PgConn conn{PQconnectdb(qpgdb.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            pg::PgResult r{PQexec(conn.get(), "DROP SCHEMA quarantine_store CASCADE")};
+            REQUIRE(r.ok());
+        }
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":268,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-degraded","reason":"boom"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"].get<std::string>().starts_with(
+            yuzu::server::kQuarantineDbErrorPrefix));
+        // Retryable store failure: A5 requires an honest retry_after_ms.
+        CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+        REQUIRE_FALSE(ts.audit_details.empty());
+        CHECK(ts.audit_details.back().find("agent_id=agent-degraded, ") != std::string::npos);
+        CHECK(ts.audit_details.back().find(yuzu::server::kQuarantineDbErrorPrefix) !=
+              std::string::npos);
+    }
 }
 
 // ── M1 (PR #1796): reviewer == submitter surfaces through the MCP error path ─
@@ -11469,7 +11631,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
             return {"cmd-bridge", 2};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -11596,7 +11758,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
             return {"cmd-dup", 1};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -11622,7 +11784,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
             throw std::runtime_error("boom");
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -11640,7 +11802,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
             return {"cmd-zero", 0};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -11662,7 +11824,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string& execution_id, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                            const std::string& execution_id, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
             yuzu::server::AgentExecStatus a;
             a.agent_id = "agent-001";
             a.status = "success";
@@ -11697,7 +11859,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
             return {"cmd-armfault", 2};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -11725,7 +11887,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
             return {"cmd-resvfault", 2};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -11747,7 +11909,7 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         auto dispatch = [&](const std::string&, const std::string&,
                             const std::vector<std::string>&, const std::string&,
                             const std::unordered_map<std::string, std::string>&,
-                            const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
             return {"cmd-subfault", 2};
         };
         ts.start_with_dispatch(dispatch, "operator");
@@ -11854,7 +12016,7 @@ TEST_CASE("streamed POST opt-out: --no-mcp-streamed-post falls back to a plain r
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&,
-                        const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         dispatched = true;
         return {"cmd-dormant", 1};
     };
@@ -11934,7 +12096,7 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
     auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
                         const std::string&, const std::unordered_map<std::string, std::string>&,
                         const std::string&,
-                        const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                        const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"cmd-streamed", 2};
     };
     const auto audit_has = [&](const std::string& row) {
@@ -12102,7 +12264,7 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
             [&](const std::string&, const std::string&, const std::vector<std::string>&,
                 const std::string&, const std::unordered_map<std::string, std::string>&,
                 const std::string&,
-                const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
                 inner = call_sse(exec_body(745, /*with_token=*/true)); // same id, re-entrant
                 return {"cmd-dup-inflight", 2};
             },
@@ -12286,7 +12448,7 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
             [&](const std::string&, const std::string&, const std::vector<std::string>&,
                 const std::string&, const std::unordered_map<std::string, std::string>&,
                 const std::string&,
-                const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
                 (void)bridge.request_cancel(sid, nlohmann::json(780));
                 return {"cmd-cancelled", 2};
             },
@@ -12308,7 +12470,7 @@ TEST_CASE("MCP Integration: execute_instruction streamed POST (2f PR 3b C8)",
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-none", 0}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-none", 0}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -12383,7 +12545,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
         // Reserve leaves the record kArming, which is the only phase that has
@@ -12405,7 +12567,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -12423,7 +12585,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
         REQUIRE(bridge.reserve(sid, "test-user", nlohmann::json(900), nlohmann::json("tok"),
@@ -12443,7 +12605,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -12477,7 +12639,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9live", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9live", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -12515,7 +12677,7 @@ TEST_CASE("MCP Integration: notifications/cancelled records cancel intent (2f PR
             [](const std::string&, const std::string&, const std::vector<std::string>&,
                const std::string&, const std::unordered_map<std::string, std::string>&,
                const std::string&,
-               const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
+               const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> { return {"cmd-c9", 2}; },
             "operator");
         ts.mcp.set_stream_bridge(&bridge);
 
@@ -12572,7 +12734,7 @@ TEST_CASE("CH-5/CH-6: streamed POSTs debit the shared budget and leave the plain
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
                        const std::string&,
-                       const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+                       const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         return {"cmd-ch56", 2};
     };
 

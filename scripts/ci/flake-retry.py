@@ -734,10 +734,16 @@ def _selftest():
     # (not projected) at ~3% of shard B's runtime, moving it to shard A instead
     # of leaving every newly `[pg]`-tagged audit case to land there by default
     # (tests/meson.build's own comment on this pair has the measurement).
+    # 2026-08-15 rebalance added [rbac_store]/[guaranteed_state_store]/
+    # [response_store] to both PG specs the same way: measured 793 (A) / 1154
+    # (B) at the time of the change, moving 207 cases off shard B after it had
+    # drifted to 2.3x shard A's size and started TIMEOUT-ing at 600s on Linux
+    # and Windows (tests/meson.build's own comment on this pair has the
+    # measurement).
     check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
           and ("~[pg]~[auth]~[mcp]",) in _shard_specs
-          and ("[pg][routes],[pg][store],[pg][token],[pg][audit_store]",) in _shard_specs
-          and ("[pg]~[routes]~[store]~[token]~[audit_store]",) in _shard_specs,
+          and ("[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store]",) in _shard_specs
+          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]",) in _shard_specs,
           "meson.build: all four shard tag filters extracted verbatim")
 
     if failures:

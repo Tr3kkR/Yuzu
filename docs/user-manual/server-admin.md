@@ -74,6 +74,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--saml-idp-cert` | *(none)* | **SAML 2.0 SP.** Filesystem path to the IdP's assertion-signing certificate (PEM, max 64 KiB). The cert at this path is the **sole** trusted signing authority — in-document `<KeyInfo>` values are ignored. Env: `YUZU_SAML_IDP_CERT`. |
 | `--saml-sp-entity-id` | *(none)* | **SAML 2.0 SP.** Entity ID URI this SP advertises to the IdP in the AuthnRequest. Env: `YUZU_SAML_SP_ENTITY_ID`. |
 | `--saml-sp-acs-url` | *(none)* | **SAML 2.0 SP.** Full public URL of the Assertion Consumer Service (`https://<host>/saml/acs`). The IdP must be configured to POST the response to this URL. Env: `YUZU_SAML_SP_ACS_URL`. |
+| `--saml-sp-key` | *(none)* | **SAML 2.0 SP.** Filesystem path to the SP AuthnRequest signing private key (PEM, **RSA only** — EC and RSA-PSS keys are rejected). Optional and independent of the five required `--saml-*` flags above. When set, AuthnRequests are signed over the HTTP-Redirect binding with RSA PKCS#1 v1.5 + SHA-256. The key file must pass the same private-key permission check as the HTTPS/gateway TLS keys (not group/other-readable). Fails closed: an unreadable, over-permissioned, oversized (>64 KiB), malformed, or non-RSA key disables SAML entirely at startup — never a silent fall-back to unsigned requests. When unset (the default), AuthnRequests remain unsigned — backward-compatible with IdPs that accept unsigned requests. Env: `YUZU_SAML_SP_KEY`. |
 | `--mcp-disable` | off | Disable the MCP (Model Context Protocol) endpoint entirely. When set, all requests to `/mcp/v1/` are rejected with a JSON-RPC error. Use this in air-gapped or high-security environments where AI integration is not desired. Env: `YUZU_MCP_DISABLE`. |
 | `--mcp-read-only` | off | Restrict MCP to read-only tools only. Write and execute operations (Phase 2) are rejected even if the MCP token's tier would normally allow them. Env: `YUZU_MCP_READ_ONLY`. |
 | `--mcp-no-streaming` | off | Disable the MCP **Streamable HTTP** transport (ADR-1005 Decision 15): no `Mcp-Session-Id` minting, `GET`/`DELETE /mcp/v1/` return `405`, and only plain JSON-RPC POST is served. The spec-required `202` status on notification POSTs still applies. Use where a buffering reverse proxy interferes with streaming. Env: `YUZU_MCP_NO_STREAMING`. |
@@ -225,6 +226,31 @@ HAVING COUNT(*) > 1;
 **Who this affects.** Any integration that was sending a body larger than its route's new class cap and relying on httplib's 100 MiB backstop to accept it. The most likely surface to notice: a very large `POST /api/v1/guaranteed-state/rules`, `/api/workflows`, or `/api/product-packs` body — those three classes are capped at a generous but explicit 16 MiB (a judgment call, not a measured contract, because no aggregate size limit for that content exists yet) rather than the previous 100 MiB backstop. Most other routes had a smaller handler-level check already (response templates, CA import) — for those, the effect really is just an earlier rejection at the same byte count (before the body is buffered rather than after). Also newly affected: any client or intermediary that sends a **compressed** request body — that is now refused outright with `415` on every class (see "What changed" above); no shipped Yuzu client compresses request bodies, so this is expected to affect only a custom integration or a reverse proxy doing transparent compression. One class is **not** the simple "earlier rejection, same effect" case, and clients should not assume "no behavior change" from it: **TAR queries** (`POST /api/dashboard/tar-execute`, `POST /api/v1/result-sets/from-tar-query`) — these two classes' caps as originally shipped bounded the RAW body at the same byte count their handlers check on a DECODED/PARSED value, which is not the same number; that unit mismatch caused some legitimate queries to be rejected here that the handler would have admitted. Both caps carry a margin now (see [`docs/user-manual/rest-api.md`](rest-api.md#pre-auth-request-body-caps-2407) for the sizing), so this class is now also a clean earlier-rejection-only change going forward. **SCIM is no longer a special case either** (fixed as part of this same change, D7): the pre-routing rejection now publishes SCIM's own RFC 7644 §3.12 `application/scim+json` error shape, matching what a strict SCIM client already expected from the handler's own (now-superseded) check.
 
 **How to raise a cap.** Edit the table in `server/core/src/body_cap_policy.hpp` (with review) and the matching row in `docs/user-manual/rest-api.md`. Do **not** reach for httplib's global `Server::set_payload_max_length` — that knob is shared by every route on the listener, including the ~70 MiB live-query bundle route and the OTA agent-binary upload, so a single global value can't fit every route class at once. Rejections are visible per class via `yuzu_body_cap_rejected_total{path_class,reason}` — see `docs/user-manual/metrics.md`.
+
+### vNEXT — `/auto` deployment execute now enforces per-device `Execution:Execute` confinement (breaking)
+
+**What changed.** `/auto` deployment advance (staging + executing an installer on a pre-flight
+run's go-cohort) previously dispatched every `content_dist.stage`/`content_dist.execute_staged`
+command under the server's own system authority, bypassing the caller-identity check the
+chokepoint performs for every other operator-facing dispatch surface — the check the route's own
+permission gate depends on to confine *which devices* an operator's `Execution:Execute` grant
+actually reaches. It now dispatches under the triggering operator's real identity and — as of a
+second, related fix landing in the same release — is confined to that operator's
+`Execution:Execute`-visible device set at the point of dispatch, the same per-device confinement
+`RestApiV1`/`WorkflowRoutes`/`BundleOrchestrator`/`McpServer`/`DashboardRoutes` already enforce.
+
+**Who this affects.** Only deployments where a role that can trigger `/auto` deploy
+(`Infrastructure:Read` + `SoftwareDeployment:Execute`, per the permissions table in
+[`preflight.md`](preflight.md#permissions)) holds a **management-group-scoped** `Execution:Execute`
+grant — narrower than the full fleet — rather than a global one. For that role, a deployment whose
+go-cohort includes a device outside the role's `Execution:Execute` scope will now correctly skip
+that device (visible as `skipped` in the deployment's device list) instead of executing on it.
+A role with a global `Execution:Execute` grant sees no change.
+
+**Before upgrading, check for any role combining a scoped `Execution:Execute` grant with
+`SoftwareDeployment:Execute`** — that combination is the only one affected. If none of your
+deployment-triggering roles hold a scoped (rather than global) `Execution:Execute` grant, this
+note does not affect you.
 
 ### vNEXT — an authorization-topology floor now applies regardless of RBAC, and engine-principal reads move off `Security:Read` (#2376) (breaking)
 
@@ -1815,12 +1841,46 @@ resolution, see issue #1832.
 > dedicated low-membership group for the mapping. At most 64 group values
 > from the configured attribute are considered.
 
+### AuthnRequest signing
+
+One additional, optional flag, independent of the five-flag gate, signs
+SP-initiated AuthnRequests:
+
+| Flag | Env var | Description |
+|---|---|---|
+| `--saml-sp-key` | `YUZU_SAML_SP_KEY` | Filesystem path to the SP AuthnRequest signing private key (PEM, **RSA only** — EC and RSA-PSS keys are rejected). |
+
+When set, AuthnRequests are signed over the HTTP-Redirect binding with
+RSA PKCS#1 v1.5 + SHA-256 (`SigAlg`
+`http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`), carried as the
+`SigAlg`/`Signature` query parameters. The key file must pass the same
+private-key permission check as the HTTPS/gateway TLS keys (not
+group/other-readable). Left unset (the default), AuthnRequests remain
+**unsigned** — backward-compatible with an IdP that accepts unsigned
+requests.
+
+Fails closed: a configured key that is unreadable, over-permissioned,
+exceeds 64 KiB, is malformed, encrypted/passphrase-protected, is not RSA, or
+has a modulus outside **2048–16384 bits** disables SAML **entirely** at
+startup — loudly (an `ERROR` log line), never a silent fall-back to unsigned
+requests. A per-request signing failure fails `/auth/saml/start` rather than
+emitting an unsigned redirect. The key **must be unencrypted** — a
+passphrase-protected key is rejected, not prompted for. The 2048-bit floor
+rejects factorable weak keys; the 16384-bit ceiling bounds per-request signing
+cost on the unauthenticated start endpoint.
+
+Yuzu does not yet publish an SP metadata endpoint, so you must register the
+signing key's **public certificate** with the IdP by hand (as the
+AuthnRequest/request-signing verification certificate) — otherwise the IdP
+rejects the signature despite a clean Yuzu boot. See the user manual's
+[AuthnRequest Signing](authentication.md#authnrequest-signing) section for
+the `openssl` keypair-generation and IdP-registration recipe.
+
 ### Known limitations in this release
 
 - **MFA step-up:** MFA step-up is not supported for SAML sessions — a SAML session hitting any step-up-gated endpoint receives a 403 regardless of `--mfa-enforcement`. Use `optional` and rely on the IdP to enforce MFA. Avoid `required` for SAML deployments.
 - **`--auth-mode=sso-only`:** Requires OIDC configuration. A SAML-only deployment cannot disable local-password login.
 - **HA / multi-replica:** Pending AuthnRequest state is in-process. Configure load-balancer sticky sessions (session affinity) on `/auth/saml/start` + `/saml/acs`. Without affinity, approximately `(N−1)/N` of logins fail as unsolicited. OIDC shares this limitation.
-- **AuthnRequest signing:** The SP does not sign AuthnRequests. The IdP must accept unsigned requests. If your IdP requires signed AuthnRequests, use OIDC.
 - **IdP cert rotation:** Update `--saml-idp-cert` and restart the server. There is no hot-reload.
 - **No login-page button:** Navigate directly to `GET /auth/saml/start`; there is no "Sign in with SAML" button on the login page.
 
