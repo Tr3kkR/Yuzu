@@ -24,6 +24,11 @@
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
+// ADR-0031 operator surface (PR1.6c, p14) — mint/list/revoke_upload_grant.
+// The SAME pure validation grammar the REST route
+// (file_retrieval_routes.cpp) enforces internally, reused here so a
+// handler's pre-validation can never diverge from what the store accepts.
+#include "upload_grant_parsers.hpp"
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
@@ -1401,6 +1406,59 @@ static const ToolDef kTools[] = {
      "Read-only. Mirrors GET /api/v1/secrets/kek/status. Requires Security:Read.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"active_version":{"type":"integer"},"oldest_in_use":{"type":["integer","null"],"description":"null when no secret rows exist"},"rotation_complete":{"type":"boolean"},"live_versions":{"type":["integer","null"],"description":"count of non-retired KEK versions; lock-free snapshot; null when it could not be determined (query failure) -- never a fabricated 0"},"lock_held":{"type":["boolean","null"],"description":"true iff the secrets_kek_op advisory lock has a granted holder; lock-free snapshot; null when it could not be determined (query failure) -- NEVER read null as \"not held\", it means unknown -- never a fabricated false"},"lock_holder_pid":{"type":["integer","null"],"description":"the lock holder's backend pid; null when unheld OR when lock_held itself is null (undetermined)"},"lock_holder_captured_at":{"type":["string","null"],"description":"ISO-8601 UTC instant the lock_held/lock_holder_pid snapshot was taken; null when undetermined; re-confirm the pid in pg_locks before acting on it, never trust one captured earlier"}},"required":["active_version","rotation_complete","live_versions","lock_held"]})j"},
+
+    // ── ADR-0031 operator surface (PR1.6c, p14) — MCP twins of p6's operator
+    // upload-grant routes (mint/list/revoke). Appended at the VERY END of
+    // kTools[], same rebase-conflict-minimising reason the KEK block above
+    // documents. EXEMPTION (review finding, #3135): the five agent-
+    // authenticated upload SESSION endpoints (POST /api/v1/uploads, PUT
+    // .../chunk, GET .../{upload_id}, POST .../commit, DELETE
+    // .../{upload_id}) get NO MCP twin here, on purpose — they authenticate
+    // on a grant/session BEARER CREDENTIAL (X-Yuzu-Upload-Grant /
+    // X-Yuzu-Upload-Session), never an operator session, and every MCP tool
+    // call authenticates as an OPERATOR (auth_fn/perm_fn, tier_allows).
+    // Exposing them as MCP tools would hand an agent-only credential path to
+    // an operator tool — the exact securable-asymmetry ADR-0031 exists to
+    // forbid, just inverted. This exemption is recorded in
+    // docs/adr/1005-headless-platform-use-case-engines.md's "Grandfathered
+    // surfaces" ledger, not just here.
+    {"mint_upload_grant",
+     "Mint a one-time upload-grant credential authorising ONE agent to push ONE file back to "
+     "the server (the CC-06 authenticated chunked-receive protocol). Mirrors POST "
+     "/api/v1/upload-grants. The response's grant_secret is returned EXACTLY ONCE here — it "
+     "is never stored in retrievable form and never appears in any GET/list response "
+     "afterward; hand it to the agent out-of-band (e.g. as an instruction parameter). "
+     "destination_key is SERVER-DERIVED from retention_class + the freshly-minted grant_id "
+     "only — source_path is stored as informational metadata and never influences where the "
+     "file lands. Additive (mints new state, not idempotent — each call issues a distinct "
+     "grant). Requires UploadGrant:Write.",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"The agent authorised to redeem this grant"},"source_path":{"type":"string","maxLength":4096,"description":"Informational only; NEVER used to derive the destination key"},"expected_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"Optional expected content hash, lowercase hex"},"retention_class":{"type":"string","enum":["standard","extended","transient"],"default":"standard"},"declared_max_size":{"type":"integer","minimum":1,"description":"Upper bound on the upload size in bytes"},"ttl_secs":{"type":"integer","minimum":1,"description":"Optional grant expiry override in seconds; server default applies when omitted"}},"required":["agent_id","declared_max_size"]})j",
+     R"j({"type":"object","properties":{"grant_id":{"type":"string"},"grant_secret":{"type":"string","description":"RAW one-time secret; returned only in this response, never again"},"expires_at":{"type":"integer"},"destination_key":{"type":"string"}},"required":["grant_id","grant_secret","expires_at","destination_key"]})j"},
+
+    {"list_upload_grants",
+     "List upload grants (operator metadata only — never a secret or its hash). Mirrors GET "
+     "/api/v1/upload-grants. Read-only, routed through the ADR-0017 admit-then-filter list "
+     "gate: a global UploadGrant:Read grant (or RBAC loaded-and-disabled) lists every grant; "
+     "a management-group-CONFINED grant lists only grants for agents in the caller's visible "
+     "set; no grant anywhere is denied. No client-selected agent_id filter exists on this "
+     "surface — the frozen protocol forbids one on every path. Requires UploadGrant:Read.",
+     // Takes NO arguments: the frozen protocol forbids a client-selected
+     // agent_id filter on every path, so confinement is derived server-side.
+     // `additionalProperties:false` is what makes that BOUNDED rather than
+     // free-form — a bare `properties:{}` would silently accept anything.
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object"}}},"required":["data"]})j"},
+
+    {"revoke_upload_grant",
+     "Revoke an upload grant, closing its one-time redemption window. Mirrors DELETE "
+     "/api/v1/upload-grants/{grant_id}. Has NO effect on a grant already redeemed into a "
+     "session — revoke only prevents a FUTURE redemption; an in-flight or completed upload is "
+     "untouched. Destructive (UploadGrant:Delete): approval-gated on the supervised tier — "
+     "the first call returns an approval ticket, re-call with the returned approval_id after "
+     "an admin approves. A retry against an already-revoked or already-redeemed grant answers "
+     "not_found (nothing to revoke), never a silent success.",
+     R"j({"type":"object","properties":{"grant_id":{"type":"string","pattern":"^[a-f0-9]+$","maxLength":64},"approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"}},"required":["grant_id"]})j",
+     R"j({"type":"object","properties":{"revoked":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"present and false only when the audit row could not be persisted"}},"required":["revoked"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -1438,6 +1496,9 @@ static const char* const kWriteToolsRaw[] = {
     // Human API-token rotation (P2 #11, SOC 2 CC6.3) — MCP twins of POST
     // /api/v1/tokens/{id}/rotate and /confirm.
     "rotate_api_token", "confirm_api_token_rotation",
+    // ADR-0031 operator surface (PR1.6c, p14) — mint/revoke mutate;
+    // list_upload_grants is read-only and deliberately absent.
+    "mint_upload_grant", "revoke_upload_grant",
 };
 
 // Lookup set DERIVED from the raw sequence; collapse here is safe because the
@@ -1591,6 +1652,14 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"rotate_kek", {"Security", "Write"}},
     {"rewrap_secrets", {"Security", "Write"}},
     {"get_kek_status", {"Security", "Read"}},
+    // ADR-0031 operator surface (PR1.6c, p14) — parity with the REST twin's
+    // securable:operation gates exactly (file_retrieval_routes.hpp doc
+    // comment). Delete is approval-gated on the supervised tier generically
+    // (mcp_policy.hpp's `operation == "Delete"` rule) — no bespoke policy
+    // change needed here.
+    {"mint_upload_grant", {"UploadGrant", "Write"}},
+    {"list_upload_grants", {"UploadGrant", "Read"}},
+    {"revoke_upload_grant", {"UploadGrant", "Delete"}},
 };
 
 // Lookup map DERIVED from the raw sequence; first-wins collapse here is safe
@@ -2025,6 +2094,17 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // on the active version) → idempotent, per kek_routes.cpp's own doc
     // comment on the REST twin.
     {"rewrap_secrets", {ToolEffect::Additive, true, "Resume KEK re-wrap"}},
+    // ── ADR-0031 operator surface (PR1.6c, p14) ───────────────────────────
+    // mint_upload_grant: pure INSERT of a NEW grant, nothing existing
+    // overwritten → Additive. Each call issues a distinct grant_id/secret →
+    // not idempotent (same shape as mint_engine_credential above).
+    {"mint_upload_grant", {ToolEffect::Additive, false, "Mint upload grant"}},
+    {"list_upload_grants", {ToolEffect::ReadOnly, true, "List upload grants"}},
+    // revoke_upload_grant: one-way minted→revoked transition; a retry
+    // against an already-revoked/redeemed grant answers not_found rather
+    // than a clean no-op success → not idempotent (same shape as
+    // revoke_certificate/revoke_engine_principal above).
+    {"revoke_upload_grant", {ToolEffect::Destructive, false, "Revoke upload grant"}},
 };
 
 // Generate a tool's served MCP `annotations` object from its classification.
@@ -8747,6 +8827,186 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                 return;
             }
+
+            // ── ADR-0031 operator surface (PR1.6c, p14) — MCP twins of the
+            // operator upload-grant routes (mint/list/revoke). The five
+            // agent-authenticated upload SESSION routes have no twin — see
+            // the kTools[] entries' doc comments and the ADR-1005
+            // "Grandfathered surfaces" ledger for why.
+
+            if (tool_name == "mint_upload_grant") {
+                if (!tier_allows(tier, "UploadGrant", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "UploadGrant", "Write"))
+                    return;
+                if (!upload_grant_store_ || !upload_grant_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "upload grant store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                UploadGrantMintParams params;
+                params.agent_id = param_str(args, "agent_id");
+                params.source_path = param_str(args, "source_path");
+                params.expected_sha256 = param_str(args, "expected_sha256");
+                params.retention_class = param_str(args, "retention_class");
+                params.minted_by = session->username;
+                params.declared_max_size = param_int(args, "declared_max_size");
+                if (args.contains("ttl_secs") && args["ttl_secs"].is_number_integer())
+                    params.requested_ttl_secs = args["ttl_secs"].get<std::int64_t>();
+                auto minted = upload_grant_store_->mint(params, now_epoch());
+                if (!minted) {
+                    (void)audit_fn(req, "upload_grant.mint", "failure", "UploadGrant",
+                                   params.agent_id, minted.error().message);
+                    const bool retryable = minted.error().kind == MintError::kUnavailable;
+                    res.set_content(a4_error(retryable ? kInternalError : kInvalidParams,
+                                             minted.error().message,
+                                             retryable
+                                                 ? std::string_view("retry once the server reports "
+                                                                    "ready")
+                                                 : std::string_view{},
+                                             retryable ? 2000 : -1),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "upload_grant.mint", "success", "UploadGrant",
+                                              minted->grant_id, "agent_id=" + params.agent_id);
+                JObj payload;
+                payload.add("grant_id", minted->grant_id)
+                    .add("grant_secret", minted->grant_secret)
+                    .add("expires_at", minted->expires_at)
+                    .add("destination_key", minted->destination_key);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_upload_grants") {
+                if (!tier_allows(tier, "UploadGrant", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "UploadGrant", "Read"))
+                    return;
+                if (!upload_grant_store_ || !upload_grant_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "upload grant store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                // ADR-0017 admit-then-filter list gate — SAME resolver
+                // server.cpp wires into the REST route's list_read_fn
+                // (set_upload_grant_ops), so the two can never disagree.
+                // Unset (test harness) fails closed.
+                const UploadGrantListAuthorization authz =
+                    upload_grant_list_read_fn_ ? upload_grant_list_read_fn_(session->username)
+                                               : UploadGrantListAuthorization{};
+                if (authz.decision == UploadGrantListDecision::kDenyAll) {
+                    mcp_audit("denied", "UploadGrant:Read (list)");
+                    res.set_content(a4_error(kPermissionDenied, "permission denied"),
+                                    "application/json");
+                    return;
+                }
+                // No client-selected agent_id filter — the frozen protocol
+                // forbids one on every path (file_retrieval_routes.cpp's
+                // list handler comment).
+                auto rows = upload_grant_store_->list_for_agent();
+                if (!rows) {
+                    res.set_content(a4_error(kInternalError, rows.error(),
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& g : *rows) {
+                    if (authz.decision == UploadGrantListDecision::kAdmitScoped &&
+                        std::find(authz.visible_agents.begin(), authz.visible_agents.end(),
+                                 g.agent_id) == authz.visible_agents.end())
+                        continue;
+                    arr.add(JObj()
+                                .add("grant_id", g.grant_id)
+                                .add("agent_id", g.agent_id)
+                                .add("source_path", g.source_path)
+                                .add("declared_max_size", g.declared_max_size)
+                                .add("expected_sha256", g.expected_sha256)
+                                .add("retention_class", g.retention_class)
+                                .add("destination_key", g.destination_key)
+                                .add("state", g.state)
+                                .add("minted_by", g.minted_by)
+                                .add("created_at", g.created_at)
+                                .add("expires_at", g.expires_at));
+                }
+                JObj payload;
+                payload.raw("data", arr.str());
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "revoke_upload_grant") {
+                if (!tier_allows(tier, "UploadGrant", "Delete")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "UploadGrant", "Delete"))
+                    return;
+                if (!upload_grant_store_ || !upload_grant_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "upload grant store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                const auto grant_id = param_str(args, "grant_id");
+                if (grant_id.empty() ||
+                    grant_id.find_first_not_of("0123456789abcdef") != std::string::npos) {
+                    res.set_content(a4_error(kInvalidParams, "grant_id must be lowercase hex"),
+                                    "application/json");
+                    return;
+                }
+                auto result = upload_grant_store_->revoke(grant_id);
+                if (!result) {
+                    (void)audit_fn(req, "upload_grant.revoke", "failure", "UploadGrant", grant_id,
+                                   result.error());
+                    res.set_content(a4_error(kInternalError, result.error(),
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                if (!*result) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "grant not found or not revocable"),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "upload_grant.revoke", "success", "UploadGrant", grant_id, "");
+                JObj payload;
+                payload.add("revoked", true);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
 
             // ── Engine principal role assignments (PR 4.2, design §4.1) ─────
             // MCP/REST parity for /api/v1/engine-principals/{id}/roles. `{id}`

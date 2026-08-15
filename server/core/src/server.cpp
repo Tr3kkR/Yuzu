@@ -40,13 +40,15 @@
 #include "key_provider.hpp"
 #include "scim_routes.hpp"
 // PR1.5c/1.6c (p14): ADR-0031 operator surface — server wiring for p5's
-// plugin-config/secret/kill-switch store + REST routes.
-// http_route_sink.hpp is the HttplibRouteSink adapter the free-function
-// registrar takes (it does not expose an httplib::Server& overload the way
-// KekRoutes does).
+// plugin-config/secret/kill-switch store + REST routes and p6's upload-grant
+// store + REST routes. http_route_sink.hpp is the HttplibRouteSink adapter
+// their free-function registrars take (they do not expose an httplib::Server&
+// overload the way KekRoutes does).
 #include "http_route_sink.hpp"
 #include "plugin_config_routes.hpp"
 #include "plugin_config_store.hpp"
+#include "upload_grant_store.hpp"
+#include "file_retrieval_routes.hpp"
 #include <yuzu/server/scim_json.hpp> // D7 (#2407 hardening): scim::error() for the pre-routing body-cap 4xx
 #include "x509_ca.hpp"
 #include "compliance_eval.hpp"
@@ -3498,8 +3500,9 @@ public:
             }
         }
 
-        // PR1.5c/1.6c (p14) — PluginConfigStore (ADR-0031 operator
-        // surface). Same fail-CLOSED construction posture as every other
+        // PR1.5c/1.6c (p14) — PluginConfigStore + UploadGrantStore (ADR-0031
+        // operator surface: p5/p6 built the stores + routes; this package
+        // wires them). Same fail-CLOSED construction posture as every other
         // born-on-PG store (ADR-0012 §1): a reachable database whose schema
         // can't migrate/open is a deploy error, not a serve-degraded state.
         //
@@ -3557,6 +3560,17 @@ public:
                         startup_failed_ = true;
                     }
                 }
+            }
+        }
+
+        // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
+        // and session credentials are stored as SHA-256 digests, never a
+        // sealed SecretCodec blob (upload_grant_store.hpp file header).
+        if (pg_pool_ && !startup_failed_) {
+            upload_grant_store_ = std::make_unique<UploadGrantStore>(*pg_pool_);
+            if (!upload_grant_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: upload grant store migration/open failed");
+                startup_failed_ = true;
             }
         }
 
@@ -7258,6 +7272,10 @@ public:
         // ADR-0010 audit hook).
         plugin_config_store_.reset();
         plugin_config_secret_codec_.reset();
+        // UploadGrantStore borrows pg_pool_ only (no codec) — drop before
+        // the pool. Every HTTP handler holding the raw pointer is quiesced
+        // by the drains above.
+        upload_grant_store_.reset();
         auth_key_provider_.reset();
         // AuditStore (ADR-0040) borrows pg_pool_ via its retention thread — that
         // thread is joined at stop_cleanup() above; drop the store before the
@@ -10264,6 +10282,14 @@ private:
             // it into both from the start rather than shipping the gap and
             // fixing it in a later governance round (Gate 3 sre, Pattern E).
             bool notification_ok = notification_store_ && notification_store_->is_open();
+            // UploadGrantStore (ADR-3004, PR1.6a) — review finding (#3135):
+            // constructed fail-closed at boot (server.cpp startup_failed_ flip
+            // if migration/open fails) but was absent from both /healthz and
+            // /readyz, the same readyz-vs-healthz drift class the rows above
+            // document. Startup fail-closed limits the immediate blast radius,
+            // but if is_open() ever flips false post-startup, /api/v1/upload-
+            // grants* would 503 while both probes still reported healthy.
+            bool upload_grant_ok = upload_grant_store_ && upload_grant_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -10272,7 +10298,7 @@ private:
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok && quarantine_ok && notification_ok;
+                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -10302,7 +10328,8 @@ private:
                   {"discovery_store", discovery_ok ? "ok" : "error"},
                   {"deployment_store", deployment_ok ? "ok" : "error"},
                   {"quarantine_store", quarantine_ok ? "ok" : "error"},
-                  {"notification_store", notification_ok ? "ok" : "error"}}},
+                  {"notification_store", notification_ok ? "ok" : "error"},
+                  {"upload_grant_store", upload_grant_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -10573,6 +10600,13 @@ private:
                 // Pattern E).
                 {"notification_store",
                  notification_store_ && notification_store_->is_open()},
+                // ADR-3004 (PR1.6a) — review finding (#3135): same
+                // readyz-vs-healthz drift class as the rows above.
+                // Fail-closed at boot, but a not-open post-boot state would
+                // leave /api/v1/upload-grants* silently 503ing while
+                // /readyz still reported "ready".
+                {"upload_grant_store",
+                 upload_grant_store_ && upload_grant_store_->is_open()},
             };
 
             std::string failed_list;
@@ -17042,10 +17076,15 @@ private:
         }
 
         // PR1.5c/1.6c (p14) — ADR-0031 operator surface REST registration:
-        // p5's /api/v1/plugin-config/*. The registrar takes an
-        // HttpRouteSink& (no httplib::Server& overload the way KekRoutes
-        // above offers), so wrap web_server_ — the idiom
-        // http_route_sink.hpp's file header documents.
+        // p5's /api/v1/plugin-config/* and p6's /api/v1/upload-grants* +
+        // /api/v1/uploads* (mint/list/revoke are operator routes; the five
+        // /api/v1/uploads/* routes are the agent-authenticated chunked-
+        // receive protocol — see file_retrieval_routes.hpp's file header
+        // for the two-trust-domain split). Both registrars take an
+        // HttpRouteSink& (neither offers an httplib::Server& overload the
+        // way KekRoutes does above), so wrap web_server_ once and pass the
+        // same sink to both — the idiom http_route_sink.hpp's file header
+        // documents.
         {
             HttplibRouteSink operator_surface_sink{*web_server_};
 
@@ -17058,6 +17097,48 @@ private:
                     .auth_fn = auth_fn,
                     .perm_fn = perm_fn,
                     .audit_fn = audit_fn,
+                });
+
+            register_file_retrieval_routes(
+                operator_surface_sink,
+                yuzu::server::Deps{
+                    .auth_fn = auth_fn,
+                    .perm_fn = perm_fn,
+                    // ADR-0017 admit-then-filter list gate
+                    // (RbacStore::authorize_list_read) for GET
+                    // /api/v1/upload-grants — decoupled from RbacStore/
+                    // ManagementGroupStore at the file_retrieval_routes.hpp
+                    // boundary (its file header), wired here the same way
+                    // visible_set_fn above wires the analogous DEX seam.
+                    // Fail-closed (kDenyAll default) when rbac_store_ is
+                    // unset or closed.
+                    .list_read_fn =
+                        [this](const std::string& username) -> UploadGrantListAuthorization {
+                        UploadGrantListAuthorization out;
+                        if (!rbac_store_ || !rbac_store_->is_open())
+                            return out;
+                        auto authz = rbac_store_->authorize_list_read(
+                            username, "UploadGrant", "Read", mgmt_group_store_.get());
+                        switch (authz.decision) {
+                        case ListReadDecision::AdmitAll:
+                            out.decision = UploadGrantListDecision::kAdmitAll;
+                            break;
+                        case ListReadDecision::AdmitScoped:
+                            out.decision = UploadGrantListDecision::kAdmitScoped;
+                            out.visible_agents = std::move(authz.visible_agents);
+                            break;
+                        case ListReadDecision::DenyAll:
+                            break; // out already kDenyAll (default)
+                        }
+                        return out;
+                    },
+                    .audit_fn = audit_fn,
+                    .store = upload_grant_store_.get(),
+                    .blob_root = cfg_.db_dir() / "upload-blobs",
+                    .tls_enabled = cfg_.https_enabled,
+                    // now_fn left unset — production default reads
+                    // system_clock::now() (Deps::ClockFn doc comment,
+                    // file_retrieval_routes.hpp); only tests pin it.
                 });
         }
 
@@ -17595,6 +17676,40 @@ private:
             // was null while the REST twins worked fine — two surfaces
             // disagreeing about whether the same capability exists (ADR-1005 A1).
             mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
+            // Review finding (#3135): the operator upload-grant mint/list/
+            // revoke routes shipped REST-only, with no MCP twin — an
+            // ADR-1005 gap for an ordinary authenticated operator action.
+            // Wired UNCONDITIONALLY, same reasoning as kek_ops above: gating
+            // this behind a conditional would let the MCP tool answer
+            // "unavailable" while the REST route works, two surfaces
+            // disagreeing about whether the capability exists (ADR-1005 A1).
+            mcp_server_->set_upload_grant_ops(
+                upload_grant_store_.get(),
+                // SAME logic as the REST list_read_fn wired at the
+                // /api/v1/upload-grants registration site below — not the
+                // same std::function instance, but the identical
+                // RbacStore::authorize_list_read call with the identical
+                // (securable, operation), so the two surfaces cannot
+                // observe a different admit decision for the same caller.
+                [this](const std::string& username) -> UploadGrantListAuthorization {
+                    UploadGrantListAuthorization out;
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return out;
+                    auto authz = rbac_store_->authorize_list_read(username, "UploadGrant", "Read",
+                                                                  mgmt_group_store_.get());
+                    switch (authz.decision) {
+                    case ListReadDecision::AdmitAll:
+                        out.decision = UploadGrantListDecision::kAdmitAll;
+                        break;
+                    case ListReadDecision::AdmitScoped:
+                        out.decision = UploadGrantListDecision::kAdmitScoped;
+                        out.visible_agents = std::move(authz.visible_agents);
+                        break;
+                    case ListReadDecision::DenyAll:
+                        break; // out already kDenyAll (default)
+                    }
+                    return out;
+                });
             if (engine_principal_store_) {
                 mcp_server_->set_engine_principal_store(engine_principal_store_.get());
                 mcp_server_->set_engine_credential_store(api_token_store_.get());
@@ -18426,7 +18541,7 @@ private:
 
     // PR1.5c/1.6c (p14) — the ADR-0031 operator-surface stores. Declared in
     // this EXACT order — plugin_config_secret_codec_ -> plugin_config_store_
-    // — same reverse-declaration-destruction reasoning
+    // -> upload_grant_store_ — same reverse-declaration-destruction reasoning
     // as the AuthDB chain above: plugin_config_store_ borrows
     // plugin_config_secret_codec_ by reference (ADR-0010 per-store codec
     // model, same shape as AuthDB(pg::PgPool&, pg::SecretCodec&)), so it must
@@ -18435,9 +18550,14 @@ private:
     // near metrics_) by reference too, so both must destruct before it —
     // true here since every member below this point destructs before
     // pg_pool_ does (docs/postgres-store-playbook.md:112 — "declare the
-    // store so it destructs before the pool").
+    // store so it destructs before the pool"). upload_grant_store_ borrows
+    // only pg_pool_ (no codec of its own — UploadGrantStore never seals a
+    // secret column, see upload_grant_store.hpp), so its position relative
+    // to the codec/plugin_config_store_ pair is unconstrained; declared last
+    // here purely to group the whole p14 surface together.
     std::unique_ptr<pg::SecretCodec> plugin_config_secret_codec_;
     std::unique_ptr<PluginConfigStore> plugin_config_store_;
+    std::unique_ptr<UploadGrantStore> upload_grant_store_;
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     std::unique_ptr<FleetTopologyStore> fleet_topology_store_;

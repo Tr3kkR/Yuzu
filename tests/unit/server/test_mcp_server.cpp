@@ -869,6 +869,17 @@ struct McpTestServer {
     std::string mock_principal_kind{"human"};
     std::string mock_auth_source{"local"};
 
+    /// ADR-0031 operator surface (PR1.6c) — optionally wire a real
+    /// UploadGrantStore so mint/list/revoke_upload_grant can be exercised
+    /// end-to-end against live Postgres state. Default nullptr keeps every
+    /// pre-existing test on the "store unavailable" path, mirroring every
+    /// other *_for_test pointer above. `upload_grant_list_read_fn_for_test`
+    /// mirrors set_upload_grant_ops's own fail-closed (kDenyAll) unwired
+    /// default — a list_upload_grants test must opt in with an explicit
+    /// AdmitAll/AdmitScoped lambda, same as production wiring in server.cpp.
+    yuzu::server::UploadGrantStore* upload_grant_store_for_test{nullptr};
+    yuzu::server::mcp::McpServer::UploadGrantListReadFn upload_grant_list_read_fn_for_test{};
+
     yuzu::server::mcp::McpServer mcp;
     yuzu::server::mcp::McpServer::HandlerFn handler;
     yuzu::server::mcp::McpServer::HandlerFn get_handler;    // 2f: GET /mcp/v1/
@@ -1008,6 +1019,13 @@ private:
         // "not wired yet" production state (every std::function unset), so
         // this is a no-op for every pre-existing test.
         mcp.set_kek_ops(kek_ops_for_test);
+
+        // ADR-0031 operator surface (PR1.6c, review remediation): the
+        // upload-grant store ALSO rides a setter, same pattern as the two
+        // above — wire before the handlers are built.
+        if (upload_grant_store_for_test)
+            mcp.set_upload_grant_ops(upload_grant_store_for_test,
+                                     upload_grant_list_read_fn_for_test);
 
         // 2f: build GET/DELETE handlers FIRST — they copy auth_fn/audit_fn, which
         // build_handler std::move()s below.
@@ -9879,6 +9897,196 @@ TEST_CASE("MCP 2405: subset compiler enforces every supported keyword",
     }
 }
 
+namespace {
+
+// ADR-0031 operator surface (PR1.6c, review remediation) — MCP twins of the
+// operator upload-grant routes. Exercises a REAL UploadGrantStore against
+// live Postgres, proving each tool actually mutates/reads the store rather
+// than just returning a plausible-looking response.
+yuzu::test::PgTestTemplate operator_surface_uploadgrant_tpl{
+    "uploadgrant", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::UploadGrantStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error(
+                "operator_surface uploadgrant template: store failed to migrate");
+    }};
+
+/// Parses the JSON payload carried in result.content[0].text of an MCP tool
+/// reply — same shape as bundle_payload() elsewhere in this file, duplicated
+/// locally so this section reads standalone.
+nlohmann::json operator_surface_payload(const std::unique_ptr<httplib::Response>& res) {
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    return nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+}
+
+std::int64_t operator_surface_now() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+} // namespace
+
+TEST_CASE("MCP operator surface: mint_upload_grant writes a real UploadGrantStore row — proven "
+          "by a DIRECT list_for_agent read, never a re-call of the tool",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
+        R"("arguments":{"agent_id":"agent-mcp-1","source_path":"/var/log/app.log",)"
+        R"("declared_max_size":4096,"retention_class":"extended"}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload.contains("grant_id"));
+    REQUIRE(payload.contains("grant_secret"));
+    const std::string grant_id = payload["grant_id"].get<std::string>();
+    CHECK_FALSE(grant_id.empty());
+    CHECK_FALSE(payload["grant_secret"].get<std::string>().empty());
+
+    // The proof: a direct store read, bypassing the tool that just minted.
+    auto rows = store.list_for_agent("agent-mcp-1");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].grant_id == grant_id);
+    CHECK((*rows)[0].retention_class == "extended");
+    CHECK((*rows)[0].declared_max_size == 4096);
+    CHECK((*rows)[0].state == "minted");
+    CHECK((*rows)[0].minted_by == "test-user");
+
+    REQUIRE(ts.audit_log.size() == 2);
+    CHECK(ts.audit_log[0] == "upload_grant.mint|success");
+    CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
+}
+
+TEST_CASE("MCP operator surface: list_upload_grants is confined to what's actually in the "
+          "store — a live read, not a cached view",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::server::UploadGrantMintParams p1;
+    p1.agent_id = "agent-a";
+    p1.source_path = "/tmp/a.bin";
+    p1.declared_max_size = 100;
+    p1.retention_class = "standard";
+    p1.minted_by = "seed";
+    REQUIRE(store.mint(p1, operator_surface_now()).has_value());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    // Same AdmitAll shape server.cpp derives from a fresh (RBAC-disabled)
+    // RbacStore — hardcoded here because the authz MAPPING itself is already
+    // covered by test_plugin_config_routes.cpp's list-route AdmitAll case and
+    // this MCP twin shares the identical RbacStore::authorize_list_read
+    // chokepoint; this test's own job is proving the LIST TOOL reads live
+    // store rows once admitted, not re-proving the mapping.
+    ts.upload_grant_list_read_fn_for_test =
+        [](const std::string&) -> UploadGrantListAuthorization {
+        return UploadGrantListAuthorization{.decision = UploadGrantListDecision::kAdmitAll};
+    };
+    ts.start();
+
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_upload_grants",)"
+        R"("arguments":{}}})");
+    REQUIRE(res1);
+    auto payload1 = operator_surface_payload(res1);
+    REQUIRE(payload1["data"].is_array());
+    CHECK(payload1["data"].size() == 1);
+    CHECK(payload1["data"][0]["agent_id"] == "agent-a");
+
+    // Mint a second grant DIRECTLY on the store, out from under the tool —
+    // a live read must see it on the very next call.
+    yuzu::server::UploadGrantMintParams p2 = p1;
+    p2.agent_id = "agent-b";
+    REQUIRE(store.mint(p2, operator_surface_now()).has_value());
+
+    auto res2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_upload_grants",)"
+        R"("arguments":{}}})");
+    REQUIRE(res2);
+    auto payload2 = operator_surface_payload(res2);
+    CHECK(payload2["data"].size() == 2);
+
+    REQUIRE(ts.audit_log.size() == 2);
+    CHECK(ts.audit_log[0] == "mcp.list_upload_grants|success");
+    CHECK(ts.audit_log[1] == "mcp.list_upload_grants|success");
+}
+
+TEST_CASE("MCP operator surface: revoke_upload_grant flips the REAL store row to revoked and "
+          "the grant becomes unredeemable — proven via a direct open_session() attempt",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_uploadgrant_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::UploadGrantStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.upload_grant_store_for_test = &store;
+    ts.start();
+
+    auto mint_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"mint_upload_grant",)"
+        R"("arguments":{"agent_id":"agent-revoke","source_path":"/tmp/x.bin",)"
+        R"("declared_max_size":100,"retention_class":"standard"}}})");
+    REQUIRE(mint_res);
+    auto mint_payload = operator_surface_payload(mint_res);
+    const std::string grant_id = mint_payload["grant_id"].get<std::string>();
+    const std::string grant_secret = mint_payload["grant_secret"].get<std::string>();
+
+    auto revoke_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_upload_grant",)"
+        R"("arguments":{"grant_id":")" +
+        grant_id + R"("}}})");
+    REQUIRE(revoke_res);
+    auto revoke_payload = operator_surface_payload(revoke_res);
+    CHECK(revoke_payload["revoked"] == true);
+
+    // The proof: the REAL row's state, read directly.
+    auto rows = store.list_for_agent("agent-revoke");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].state == "revoked");
+    CHECK((*rows)[0].grant_id == grant_id);
+
+    // And it can no longer be redeemed — open_session on a revoked grant
+    // collapses into kGrantUnknown (upload_grant_store.hpp's documented
+    // contract), the identical outcome as a grant that never existed.
+    auto session = store.open_session(grant_id, grant_secret, operator_surface_now());
+    CHECK(session.outcome == yuzu::server::OpenSessionOutcome::kGrantUnknown);
+
+    // Not "mintable again" either — no row for this grant_id is left minted.
+    auto listed = store.list_for_agent();
+    REQUIRE(listed.has_value());
+    bool still_minted = false;
+    for (const auto& r : *listed)
+        if (r.grant_id == grant_id && r.state == "minted")
+            still_minted = true;
+    CHECK_FALSE(still_minted);
+
+    REQUIRE(ts.audit_log.size() == 4);
+    CHECK(ts.audit_log[0] == "upload_grant.mint|success");
+    CHECK(ts.audit_log[1] == "mcp.mint_upload_grant|success");
+    CHECK(ts.audit_log[2] == "upload_grant.revoke|success");
+    CHECK(ts.audit_log[3] == "mcp.revoke_upload_grant|success");
+}
+
+
 TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully covered",
           "[mcp][2g][schema]") {
     using yuzu::server::mcp::compile_input_schema;
@@ -9912,6 +10120,11 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         // KEK rotation (#2395 track C): both take zero arguments.
         {"rotate_kek", nlohmann::json::parse(R"({})")},
         {"rewrap_secrets", nlohmann::json::parse(R"({})")},
+        // ADR-0031 operator surface (PR1.6c): revoke_upload_grant gates on
+        // the supervised tier like every other Delete-class tool.
+        // mint_upload_grant (Write) and list_upload_grants (Read) are not
+        // gated — same pattern as mint_engine_credential above.
+        {"revoke_upload_grant", nlohmann::json::parse(R"({"grant_id":"ab12"})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()
