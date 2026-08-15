@@ -76,6 +76,12 @@ constexpr std::string_view kCerts[] = {"list_issued_certs", "revoke_certificate"
 // certificate, and it gates on a different lifecycle (rotate/rewrap/status,
 // no issue/revoke) even though both share the Security securable.
 constexpr std::string_view kKekRotation[] = {"rotate_kek", "rewrap_secrets", "get_kek_status"};
+// PR1.6c. Upload grants are their own family, not folded into anything else:
+// they are a short-lived CREDENTIAL surface, not configuration or a resource
+// grant, and the agent-side session endpoints they authorize deliberately
+// have no MCP twin at all.
+constexpr std::string_view kUploadGrants[] = {"mint_upload_grant", "list_upload_grants",
+                                              "revoke_upload_grant"};
 constexpr std::string_view kEnginePrincipals[] = {
     "create_engine_principal",        "list_engine_principals",
     "get_engine_principal",           "revoke_engine_principal",
@@ -96,7 +102,7 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
                                            "discover_routes", "discover_scope_kinds",
                                            "discover_plugins"};
 
-constexpr std::array<ToolFamily, 22> kFamilies{{
+constexpr std::array<ToolFamily, 23> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions and recurring schedules", kDefinitions},
@@ -121,6 +127,9 @@ constexpr std::array<ToolFamily, 22> kFamilies{{
     {"KEK rotation", "rotate the server's secrets-at-rest encryption key, resume an "
                      "interrupted re-wrap, and check rotation status",
      kKekRotation},
+    {"Upload grants", "mint, list and revoke the one-time grants that authorize an agent to "
+                      "upload a file northbound",
+     kUploadGrants},
     {"Engine principals", "provision and manage the durable identities behind use-case engines",
      kEnginePrincipals},
     {"Access reviews", "open, attest, close, and export SOC 2 access-certification reviews",

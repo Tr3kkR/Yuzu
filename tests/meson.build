@@ -564,6 +564,9 @@ if build_server
       'unit/server/test_plugin_config_parsers.cpp',
       'unit/server/test_plugin_config_store_pg.cpp',
       'unit/server/test_plugin_config_routes.cpp',
+      'unit/server/test_upload_grant_parsers.cpp',
+      'unit/server/test_upload_grant_store_pg.cpp',
+      'unit/server/test_file_retrieval_routes.cpp',
       'unit/server/test_command_capability.cpp',
       'unit/server/test_rest_access_review.cpp',
       'unit/server/test_secure_random.cpp',
@@ -888,7 +891,13 @@ if build_server
   # 793 (A) / 1154 (B) — better, not perfect; [custom_props] was considered and
   # left out because it also tags test_props_scope_authz.cpp (a scope-authz
   # suite, not pure store CRUD), so its per-case PG cost isn't confirmed uniform
-  # with the others. Partition preserved: N([pg]) == N(A) + N(B).
+  # with the others.
+  #
+  # PR1.6a review remediation (same day) additionally moved [operator_surface]
+  # (the 3 new upload-grant MCP-twin PG integration tests) to A the same way —
+  # untagged, all 3 would land in B, which is already the heavier half and had
+  # separately reached 600.57/600s (killed by TIMEOUT) on CI before this move.
+  # Partition preserved: N([pg]) == N(A) + N(B).
   #
   # RE-BALANCED (ADR-0048, LicenseStore): B had grown to 1193 by the time this
   # store's PR landed (several sibling Wave 2 stores merged in the interim,
@@ -898,16 +907,22 @@ if build_server
   # store's own 33 cases were added. [license_store] moved to A by the same
   # AUDIT_STORE precedent (confined to one file, verified: `grep -rl
   # '\[license_store\]' tests/unit/` matches only test_license_store.cpp).
-  # Moves 33 cases, landing at 826 (A) / 1160 (B). This does not fix B's
-  # underlying imbalance (still the heavier half by a wide margin) — it only
-  # keeps this store's own cases from adding to an already-strained shard;
-  # a real rebalance across all of B's stores is out of scope for a single
-  # store's migration PR. Partition preserved: N([pg]) == N(A) + N(B).
+  # Moves 33 cases. This does not fix B's underlying imbalance (still the
+  # heavier half by a wide margin) — it only keeps this store's own cases
+  # from adding to an already-strained shard; a real rebalance across all of
+  # B's stores is out of scope for a single store's migration PR.
+  #
+  # MERGE OF THE TWO MOVES ABOVE (2026-08-15): re-measured against the
+  # combined tag set post-merge, not assumed from either side's pre-merge
+  # numbers — total [pg] grew to 2003 (from 1986/1947) with everything else
+  # that landed in the same window. Landing at 843 (A) / 1160 (B). Partition
+  # verified: 843 + 1160 == 2003.
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store],[pg][license_store]'],
+       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store],[pg][operator_surface],[pg][license_store]'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[license_store]'], suite: 'server', timeout: 600)
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[license_store]'],
+       suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
