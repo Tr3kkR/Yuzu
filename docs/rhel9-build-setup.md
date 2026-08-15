@@ -321,9 +321,10 @@ to 20 minutes.
 **1. `docs — yuzu:ci telemetry selftest`** — the system-SQLite/`RETURNING` limitation described
 above. Platform-specific, understood, not fixable from the setup script.
 
-**2. `tests/unit/server/test_mcp_server.cpp:2270`** — *"MCP Agentic demo: classify schema drops
-phantom mode and never steers to a write tool (G-S5/G-S6)"*, `CHECK(checked)`. One case out of 500 in
-shard A; one assertion out of 9916.
+**2. `tests/unit/server/test_mcp_server.cpp:4474`** (dev; `:2270` on main — the case moves between
+commits, so match it by name) — *"MCP Agentic demo: classify schema drops phantom mode and never
+steers to a write tool (G-S5/G-S6)"*, `CHECK(checked)`. One case out of 500 in shard A; one assertion
+out of 9916.
 
 **This is [issue #2610](https://github.com/Tr3kkR/Yuzu/issues/2610), not a RHEL problem** — a known
 Linux-only deterministic failure where `classify_operational_question` is missing from `tools/list`
