@@ -524,8 +524,10 @@ if build_server
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_oidc_scim_link.cpp',
       'unit/server/test_oidc_routes.cpp',
+      'unit/server/test_saml_principal.cpp',
       'unit/server/test_saml_provider.cpp',
       'unit/server/test_saml_routes.cpp',
+      'unit/server/test_saml_scim_link.cpp',
       'unit/server/test_error_codes.cpp',
       'unit/server/test_result_envelope.cpp',
       'unit/server/test_concurrency_manager.cpp',
@@ -545,6 +547,11 @@ if build_server
       # kept OFF the production link line so the private cached path has no
       # public trampoline in server_core.
       'unit/server/engine_liveness_test_access.cpp',
+      # PR1.9c: same #2367 pattern for ClassifiedCommandTestAccess::make — the
+      # ONLY definition, deliberately off the production link line so a
+      # production caller that tries to forge a ClassifiedCommand (bypassing
+      # classification and authorization) fails to LINK rather than compiling.
+      'unit/server/classified_command_test_access.cpp',
       'unit/server/test_rest_engine_principal_roles.cpp',
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
@@ -552,6 +559,16 @@ if build_server
       'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
+      'unit/server/test_dispatch_chokepoint.cpp',
+      'unit/server/test_capability_catalogue.cpp',
+      'unit/server/test_schedule_params.cpp',
+      'unit/server/test_plugin_config_parsers.cpp',
+      'unit/server/test_plugin_config_store_pg.cpp',
+      'unit/server/test_plugin_config_routes.cpp',
+      'unit/server/test_upload_grant_parsers.cpp',
+      'unit/server/test_upload_grant_store_pg.cpp',
+      'unit/server/test_file_retrieval_routes.cpp',
+      'unit/server/test_command_capability.cpp',
       'unit/server/test_rest_access_review.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
@@ -595,6 +612,7 @@ if build_server
       'unit/server/test_compliance_eval.cpp',
       'unit/server/test_cel_eval.cpp',
       'unit/server/test_custom_properties_store.cpp',
+      'unit/server/test_props_scope_authz.cpp',
       'unit/server/test_notification_store.cpp',
       'unit/server/test_webhook_store.cpp',
       'unit/server/test_migration_runner.cpp',
@@ -642,6 +660,7 @@ if build_server
       'unit/server/test_rest_inventory_software.cpp',
       'unit/server/test_rest_sessions.cpp',
       'unit/server/test_rest_guaranteed_state.cpp',
+      'unit/server/test_deployment_store.cpp', # ADR-0043: deployment_jobs Postgres migration
       'unit/server/test_discovery_routes.cpp', # A2 discovery surface (Issue 17.1)
       'unit/server/test_security_headers.cpp',
       'unit/server/test_on_behalf_guard.cpp', # ADR-1005 PR 1.1 reserved-key guard
@@ -693,6 +712,8 @@ if build_server
       'unit/server/test_scim_store_pg.cpp',
       'unit/server/test_scim_json.cpp',
       'unit/server/test_scim_routes.cpp',
+      'unit/server/test_discovery_store.cpp',
+      'unit/server/test_discovery_scan_route.cpp',
     ),
     include_directories: [
       include_directories('../server/core/src'),  # private headers (nvd_db.hpp, web_utils.hpp, etc.)
@@ -859,11 +880,31 @@ if build_server
   # change and is not addressed here. The partition is preserved
   # (N([pg]) == N(A) + N(B)); if you add a tag to one side, exclude it on the
   # other in the same edit.
+  #
+  # RE-BALANCED 2026-08-15: measured case counts had drifted to 586 (A) vs 1361
+  # (B) — a 2.3x split, up from the ~1.9x already flagged above — and B was
+  # TIMEOUT-ing at 600s on Linux and Windows both (#2092/#2093's own warning:
+  # "split the suite or rebalance before this flakes"). [rbac_store],
+  # [guaranteed_state_store] and [response_store] moved to A by the same
+  # AUDIT_STORE precedent above — each is a dedicated store's own tag, confined
+  # to that one test file, same shape as [audit_store] (verified: `grep -rl`
+  # each tag matches exactly one file). Moves 207 cases (93+61+53), landing at
+  # 793 (A) / 1154 (B) — better, not perfect; [custom_props] was considered and
+  # left out because it also tags test_props_scope_authz.cpp (a scope-authz
+  # suite, not pure store CRUD), so its per-case PG cost isn't confirmed uniform
+  # with the others.
+  #
+  # PR1.6a review remediation (same day) additionally moved [operator_surface]
+  # (the 3 new upload-grant MCP-twin PG integration tests) to A the same way —
+  # untagged, all 3 would land in B, which is already the heavier half and had
+  # separately reached 600.57/600s (killed by TIMEOUT) on CI before this move.
+  # Partition preserved: N([pg]) == N(A) + N(B).
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store]'],
+       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store],[pg][operator_surface]'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]'], suite: 'server', timeout: 600)
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]'],
+       suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
@@ -881,6 +922,16 @@ test('changelog order',
   args: [files('test_changelog_order.py')],
   suite: 'docs',
   timeout: 10,
+)
+
+# PR1.9 data-gate: every plugin action has exactly one capability-catalogue row
+# across the five fragment headers, and no fragment claims an action no plugin
+# declares. Hermetic — parses sources, builds nothing.
+test('capability catalogue completeness',
+  _python3_test,
+  args: [files('test_capability_catalogue_complete.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint
@@ -1062,6 +1113,16 @@ test('ci telemetry selftest',
   args: [files('../scripts/ci/test_ci_telemetry.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Windows SDK is selected at four independent boundaries: native MSYS2,
+# runner provisioning/manifest, GHA environment activation, and documentation.
+# Keep them exact and keep the GHA action itself visible to Dependabot.
+test('windows sdk contract',
+  _python3_test,
+  args: [files('test_windows_sdk_contract.py')],
+  suite: 'docs',
+  timeout: 10,
 )
 
 # The nightly TSan gdb capture's pure-logic selftest (#1038): junit -> failing

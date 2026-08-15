@@ -81,6 +81,49 @@ struct LinkedIdentity {
     std::string sub;
 };
 
+/// One SAML NameID identity linked to a SCIM resource (ADR-2001 PR4a,
+/// `saml_identity_links` table — the SAML analogue of `LinkedIdentity`
+/// above). Deliberately a SEPARATE table/struct rather than a generalized
+/// `identity_links`, so this stays off the OIDC linkage surface (PR3). The
+/// owning `scim_id` is the query input for `saml_links_for_scim_id` and is
+/// deliberately not repeated on this struct.
+struct SamlLinkedIdentity {
+    std::string entity_id;
+    std::string name_id;
+};
+
+/// Distinguishes a store error from a genuine no-match/ambiguous outcome for
+/// `find_unique_active_by_external_id_checked` (ADR-2001 #3072, SAML D2
+/// observability store layer) — the same tri-state motivation as
+/// `resource_exists`/`get_by_username_checked`: a caller that needs to tell
+/// "no active resource claims this externalId" apart from "the store could
+/// not answer" (rather than folding both into a bare `nullopt`) uses this
+/// variant instead of the plain `find_unique_active_by_external_id`.
+enum class ActiveExternalIdLookupStatus { matched, no_match, ambiguous, store_error };
+
+/// Result of `find_unique_active_by_external_id_checked`. `resource` is only
+/// ever set when `status == matched`.
+struct ActiveExternalIdLookupResult {
+    ActiveExternalIdLookupStatus status;
+    std::optional<ScimResource> resource;
+};
+
+/// The deny-at-login backstop's resolved state for one `(iss, sub)` (ADR-2001
+/// §4), returned engaged (see `linked_resource_active`'s doc comment for the
+/// full tri-state contract — this struct only carries what an ENGAGED result
+/// means):
+///  - `scim_id == nullopt, active == nullopt`: no `identity_links` row for
+///    this identity — genuinely unlinked.
+///  - `scim_id` set, `active == nullopt`: an orphaned link — the linked
+///    `scim_resources` row was hard-DELETEd (`identity_links` is not
+///    FK-cascaded); `scim_id` still names which resource used to own it.
+///  - `scim_id` set, `active` set: exactly one linked row and its
+///    `scim_resources.active` value.
+struct LinkedResourceState {
+    std::optional<std::string> scim_id;
+    std::optional<bool> active;
+};
+
 /// A single SCIM Group resource (slice 2, #2021): the IdP-facing group `id`/
 /// `externalId`/`displayName` — membership itself lives in the separate
 /// `scim_group_members` join table, not on this struct.
@@ -180,7 +223,28 @@ public:
     /// the layer that still holds even if the index is ever bypassed or
     /// absent. Does NOT change `find_by_external_id`'s existing contract —
     /// other callers keep using that one.
+    ///
+    /// Thin COMPATIBILITY WRAPPER over `find_unique_active_by_external_id_checked`
+    /// (ADR-2001 #3072 store-layer task): returns the resource for `matched`,
+    /// `nullopt` for every other status (`no_match`, `ambiguous`,
+    /// `store_error`). Byte-unchanged signature/behaviour — every existing
+    /// caller (OIDC link formation, OIDC + SAML orphan/reprovision checks,
+    /// SAML link formation, deny-at-login) keeps collapsing store-error and
+    /// no-match/ambiguous into the same `nullopt`, exactly as before this
+    /// checked variant was added.
     std::optional<ScimResource> find_unique_active_by_external_id(const std::string& external_id) const;
+
+    /// CHECKED variant of `find_unique_active_by_external_id` that
+    /// distinguishes a store error from a genuine no-match/ambiguous outcome
+    /// (ADR-2001 #3072). Same underlying query/logic as the wrapper above:
+    /// `matched` = exactly one active row (`resource` populated);
+    /// `no_match` = zero rows; `ambiguous` = more than one active row (the
+    /// mis-link guard, ADR-2001 §2); `store_error` = store not open, lease
+    /// timeout, or a failed statement. An empty `external_id` is `no_match`
+    /// (not a store error), matching `find_unique_active_by_external_id`'s
+    /// existing empty-input contract.
+    ActiveExternalIdLookupResult
+    find_unique_active_by_external_id_checked(const std::string& external_id) const;
 
     /// 1-based `start_index` per the SCIM list-response convention (RFC 7644
     /// §3.4.2 `startIndex`). `total_out` receives the total resource count
@@ -336,6 +400,106 @@ public:
     std::optional<std::vector<LinkedIdentity>>
     links_for_scim_id(const std::string& scim_id) const;
 
+    // ── SAML identity linkage (ADR-2001 PR4a) ────────────────────────────
+    //
+    // `saml_identity_links` durably records the (entity_id, name_id) SAML
+    // identity that a successful SAML login resolved to a SCIM resource
+    // (`saml_scim_link.cpp`'s login-site orchestration). A SEPARATE table
+    // from `identity_links` (OIDC) — keeps this PR off PR3's scim_store
+    // schema surface. No route/orchestration logic here — this store owns
+    // the table only (INV-31-3, one owning store).
+
+    /// Idempotent upsert keyed `(entity_id, name_id)` (the table's UNIQUE
+    /// constraint — one link per SAML identity). Re-linking the same
+    /// `(entity_id, name_id)` updates `scim_id` and bumps `linked_at` to
+    /// now. Returns false on CSPRNG/db failure or an empty
+    /// `entity_id`/`name_id`/`scim_id`. Mirrors `upsert_link`'s fail-OPEN
+    /// contract from the login path's point of view — the CALLER
+    /// (`saml_scim_link.cpp`) must not fail a login because this returned
+    /// false.
+    bool upsert_saml_link(const std::string& entity_id, const std::string& name_id,
+                          const std::string& scim_id);
+
+    /// Every SAML identity currently linked to `scim_id` — the deprovision
+    /// seam's lookup direction, mirroring `links_for_scim_id` exactly.
+    /// `nullopt` when the store could not answer: a deprovision path
+    /// folding this into "nothing to revoke" on a transient blip is exactly
+    /// the CC6.8 gap ADR-2001 exists to close, so callers MUST fail closed
+    /// on `nullopt` rather than treat it as "no linked identities". An
+    /// engaged-but-empty vector means the scim_id genuinely has no linked
+    /// SAML identity yet.
+    std::optional<std::vector<SamlLinkedIdentity>>
+    saml_links_for_scim_id(const std::string& scim_id) const;
+
+    /// The deny-at-login backstop's sole store read (ADR-2001 §4): resolves
+    /// `(iss, sub)` against `identity_links` FUSED with a LEFT JOIN to
+    /// `scim_resources` in one query (selecting BOTH `il.scim_id` and
+    /// `sr.active`), so an ORPHANED link (the `scim_resources` row was
+    /// hard-DELETEd by a SCIM DELETE — `identity_links` is not
+    /// FK-cascaded) is distinguishable from "no link at all", reads as
+    /// deprovisioned, AND still names which resource used to own it (the
+    /// CC6.8 audit trail needs a self-contained "denied because resource
+    /// X was deprovisioned" row, not just "denied"). An INNER join would
+    /// instead silently treat a fully-deprovisioned user's now-rowless
+    /// link as "no link", letting them re-authenticate — the bypass this
+    /// LEFT join exists to close (codex-caught). `iss` is carried on
+    /// `identity_links` itself, so this lookup is single-issuer-safe by
+    /// construction; do NOT resolve the decision via
+    /// `scim_resources.external_id` instead (ADR-2001 §5's single-issuer
+    /// precondition).
+    ///
+    /// OUTER `optional<LinkedResourceState>` carries the store-availability
+    /// half of the tri-state (mirrors `get_by_username_checked`); the
+    /// ENGAGED value's `scim_id`/`active` fields (see `LinkedResourceState`'s
+    /// doc comment) carry the rest:
+    ///  - OUTER `nullopt`: the store could not answer (closed, lease
+    ///    timeout, or a failed statement) — the caller MUST fail CLOSED
+    ///    (deny the login), never treat this as "no link".
+    ///  - engaged, `scim_id == nullopt` (zero rows): no `identity_links`
+    ///    row exists for this `(iss, sub)` at all — a genuinely unlinked
+    ///    OIDC identity is not a deprovisioned SCIM user, so the caller
+    ///    PROCEEDS.
+    ///  - engaged, `scim_id` set, `active == nullopt`: exactly one linked
+    ///    row, and the joined `scim_resources` row is gone (NULL `active`,
+    ///    the orphaned-link case above) — the caller DENIES.
+    ///  - engaged, `scim_id` set, `active == false`: exactly one linked
+    ///    row, deactivated — the caller DENIES.
+    ///  - engaged, `scim_id` set, `active == true`: exactly one linked row,
+    ///    active — the caller PROCEEDS.
+    std::optional<LinkedResourceState>
+    linked_resource_active(const std::string& iss, const std::string& sub) const;
+
+    /// The SAML analogue of `linked_resource_active` — the deny-at-login
+    /// backstop's sole store read for a SAML `(entity_id, name_id)` identity
+    /// (ADR-2001 §4/PR4b). Resolves against `saml_identity_links` FUSED with
+    /// a LEFT JOIN to `scim_resources` in one query, exactly mirroring
+    /// `linked_resource_active`'s LEFT-join/tri-state contract — an INNER
+    /// join would instead collapse an orphaned link (the `scim_resources`
+    /// row hard-DELETEd by a SCIM DELETE — `saml_identity_links` is not
+    /// FK-cascaded) into "no rows", letting a fully-deprovisioned SAML
+    /// identity re-authenticate. Reuses `LinkedResourceState` (see its doc
+    /// comment) rather than a new struct — the tri-state shape is identical.
+    ///
+    /// OUTER `optional<LinkedResourceState>` carries the store-availability
+    /// half of the tri-state; the ENGAGED value's `scim_id`/`active` fields
+    /// carry the rest:
+    ///  - OUTER `nullopt`: the store could not answer (closed, lease
+    ///    timeout, or a failed statement) — the caller MUST fail CLOSED
+    ///    (deny the login), never treat this as "no link".
+    ///  - engaged, `scim_id == nullopt` (zero rows): no `saml_identity_links`
+    ///    row exists for this `(entity_id, name_id)` at all — a genuinely
+    ///    unlinked SAML identity is not a deprovisioned SCIM user, so the
+    ///    caller PROCEEDS.
+    ///  - engaged, `scim_id` set, `active == nullopt`: exactly one linked
+    ///    row, and the joined `scim_resources` row is gone (NULL `active`,
+    ///    the orphaned-link case above) — the caller DENIES.
+    ///  - engaged, `scim_id` set, `active == false`: exactly one linked
+    ///    row, deactivated — the caller DENIES.
+    ///  - engaged, `scim_id` set, `active == true`: exactly one linked row,
+    ///    active — the caller PROCEEDS.
+    std::optional<LinkedResourceState>
+    saml_linked_resource_active(const std::string& entity_id, const std::string& name_id) const;
+
     // ── OIDC login observations (ADR-2001 D2 detector) ───────────────────
     //
     // Records every OIDC login's attempted CANDIDATE claim value(s) —
@@ -365,6 +529,52 @@ public:
     /// "cannot tell" as "no candidate seen" is the safe direction for a
     /// signal that only ever ADDS a human-facing hint, never gates access.
     bool observation_matches(const std::string& claim_value) const;
+
+    // ── SAML login observations (ADR-2001 #3072, D2-style SAML detector) ──
+    //
+    // Records every SAML login's NameID observation (`saml_login_observations`
+    // table, migration v5) — the SAML analogue of `record_login_observation`/
+    // `observation_matches` above. Unlike the OIDC surface there is no
+    // multi-candidate-claim shape to preserve: a SAML assertion carries
+    // exactly one NameID, so this is keyed `(entity_id, name_id,
+    // name_id_format)` rather than `(iss, sub, claim_name)`.
+    // `name_id_format` is deliberately IN the uniqueness key (not folded
+    // into `(entity_id, name_id)` alone): a later login presenting the same
+    // NameID value under a STABLE format (`persistent`/`emailAddress`,
+    // `saml::is_linkable_name_id_format`) must not silently overwrite — and
+    // so erase — an earlier observation recorded under an unstable format
+    // (`transient`/`unspecified`); each `(entity_id, name_id, format)`
+    // triple is its own row.
+
+    /// Idempotent upsert keyed `(entity_id, name_id, name_id_format)` — one
+    /// observation per distinct NameID+format pair, refreshed (`seen_at`) on
+    /// every login. Returns false on db failure or an empty
+    /// `entity_id`/`name_id`. An IdP that omits the NameID Format attribute
+    /// is a common, legitimate configuration — `name_id_format` MAY be
+    /// empty and is recorded as `""` (the column is NOT NULL; an empty
+    /// string is a valid, distinct key component), so that population is
+    /// never silently dropped from the D2 detector. The caller
+    /// (`link_saml_login_to_scim`) is responsible for bounding/normalizing
+    /// an oversized or malformed `name_id_format` before it reaches here —
+    /// this method itself does not cap it.
+    bool record_saml_login_observation(const std::string& entity_id, const std::string& name_id,
+                                       const std::string& name_id_format);
+
+    /// TRI-STATE (deliberately, unlike `observation_matches`'s bool — ADR-2001
+    /// #3072 design): whether any recorded SAML login observation carries
+    /// this exact `name_id`, distinguishing "no login ever presented it" from
+    /// "the store could not answer". A store-unusable read collapses to
+    /// `nullopt`, not `false` — this is a detector feeding a caller that
+    /// SKIPS on `nullopt` rather than reporting a false-positive "never
+    /// seen" on a transient blip.
+    ///  - `nullopt`: the store could not answer (closed, lease timeout, or a
+    ///    failed statement) — the caller MUST skip (treat as "cannot tell"),
+    ///    never as a negative match.
+    ///  - engaged `true`: at least one observation row carries this
+    ///    `name_id`.
+    ///  - engaged `false`: the store answered and genuinely has no
+    ///    observation for this `name_id`.
+    std::optional<bool> saml_observation_matches(const std::string& name_id) const;
 
 private:
     pg::PgPool& pool_;

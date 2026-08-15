@@ -125,8 +125,11 @@ agent_plugins(Info) ->
 %% NOTE: this normaliser is NOT on the command-forward path — the gateway
 %% forwards the decoded CommandRequest straight through gpb, which preserves
 %% every field. It is kept faithful (it copies `payload`, the Guardian push
-%% bytes) purely so it can never become a silent strip point if a future
-%% refactor routes commands through it (M8 / #1209).
+%% bytes, and `dispatch_tag`, the p1/p8 dispatch-classification token) purely
+%% so it can never become a silent strip point if a future refactor routes
+%% commands through it (M8 / #1209). dispatch_tag gets the identical
+%% treatment as payload — same reasoning, same field-9-follows-field-8
+%% shape — see proto/yuzu/agent/v1/agent.proto CommandRequest.dispatch_tag.
 -spec encode_command_request(map()) -> map().
 encode_command_request(Cmd) ->
     #{command_id => command_id(Cmd),
@@ -136,6 +139,8 @@ encode_command_request(Cmd) ->
                              maps:get(<<"parameters">>, Cmd, #{})),
       payload    => maps:get(payload, Cmd,
                              maps:get(<<"payload">>, Cmd, <<>>)),
+      dispatch_tag => maps:get(dispatch_tag, Cmd,
+                               maps:get(<<"dispatch_tag">>, Cmd, <<>>)),
       expires_at => maps:get(expires_at, Cmd,
                              maps:get(<<"expires_at">>, Cmd, undefined))}.
 

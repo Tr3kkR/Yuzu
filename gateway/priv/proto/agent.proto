@@ -176,6 +176,22 @@ message CommandRequest {
   // carry it. Half A, Guardian gateway fix. See docs/guardian-mvp-contract.md
   // G2/G12.
   bytes payload = 8;
+
+  // Dispatch classification tag: v1|<class>|<mutability>|<plan_hash_hex>,
+  // with class in {ro, mut, dest} and mutability in {none, rev, irrev}. One
+  // opaque string, not three fields, so a future dispatch class costs no
+  // proto churn — frozen grammar, owned by
+  // server/core/src/command_capability_parsers.hpp
+  // (encode_dispatch_tag/decode_dispatch_tag). Mirrors the canonical
+  // proto/yuzu/agent/v1/agent.proto field 9. gpb DROPS any wire field
+  // absent from this proto, so both gateway copies (priv/proto/agent.proto
+  // and priv/proto/yuzu/agent/v1/agent.proto) must carry it, and the
+  // gateway must forward it untouched on the CommandRequest path (see
+  // yuzu_gw_proto:encode_command_request/1) or the server-side dispatch
+  // chokepoint sees an empty tag. CC-03: this gateway advertises
+  // "command_dispatch_tag_v1" in StreamStatusNotification.wire_capabilities
+  // (gateway.proto) as proof this field survives the hop.
+  string dispatch_tag = 9;
 }
 
 message CommandResponse {

@@ -146,7 +146,8 @@ TEST_CASE("deployment routes: config/result/delete deny a service-scoped "
     auto dispatch = [&dispatched](const std::string&, const std::string&,
                                   const std::vector<std::string>&, const std::string&,
                                   const std::unordered_map<std::string, std::string>&,
-                                  const std::string&) -> std::pair<std::string, int> {
+                                  const std::string&,
+                                  const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         ++dispatched;
         return {"cmd-1", 1};
     };
@@ -225,7 +226,10 @@ TEST_CASE("deployment routes: ordinary session reaches config/result/delete, "
     auto devices = [](const std::string&) { return std::vector<DeviceRow>{}; };
     auto dispatch = [](const std::string&, const std::string&, const std::vector<std::string>&,
                        const std::string&, const std::unordered_map<std::string, std::string>&,
-                       const std::string&) -> std::pair<std::string, int> { return {"cmd-1", 1}; };
+                       const std::string&,
+                       const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+        return {"cmd-1", 1};
+    };
     auto poll = [](const std::string&) { return std::unordered_map<std::string, deployment::AgentResponse>{}; };
     std::vector<std::string> audit_log;
     auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,

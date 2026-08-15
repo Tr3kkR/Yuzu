@@ -66,6 +66,18 @@
 namespace yuzu::server {
 namespace {
 
+// Classifies a QuarantineStore write failure as a genuine DB/pool/query
+// failure (503) vs a business/state error like "already quarantined"/"not
+// quarantined" (400) — mirrors DeploymentStore's
+// is_deployment_db_error/kDeploymentDbErrorPrefix (discovery_routes.cpp,
+// adversarial-review MEDIUM hardening round, 2026-08-12: write routes
+// previously collapsed every failure, including genuine outages, to 400).
+// Keys off the SHARED constant (quarantine_store.hpp), never a local copy of
+// the literal.
+bool is_quarantine_db_error(const std::string& err) {
+    return err.starts_with(kQuarantineDbErrorPrefix);
+}
+
 // ── Lightweight JSON string builder ─────────────────────────────────────
 // Produces JSON output strings directly, bypassing nlohmann::json template
 // instantiation for construction.  Only ~80 lines vs 23 000 lines of
@@ -793,11 +805,11 @@ const std::string& openapi_spec() {
         // form.
         R"json(,
     "/quarantine": {
-      "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}},
-      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}}
+      "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable, or a degraded read (ADR-0047) — never rendered as an empty list. Two distinct causes, distinguished by message: store/pool/query failure only increments yuzu_server_quarantine_read_degrade_total; a per-record admit-then-filter anomaly (e.g. transient engine-principal-store outage) does not"}}},
+      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, or the device is already quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/quarantine/{agent_id}": {
-      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}}
+      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/rbac/roles": {
       "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "responses": {"200": {"description": "List of roles"}}}
@@ -1032,7 +1044,56 @@ const std::string& openapi_spec() {
     },
     "/access-reviews/{id}/close": {
       "post": {"summary": "Close an open review campaign", "tags": ["Access Reviews"], "description": "Requires AccessReview:Attest. Does not require every attestation to be decided first — a campaign closed with pending rows still outstanding is itself evidence, not something this route silently forces to completion. Self-audited as access_review.closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{closed: true}"}, "403": {"description": "Requires AccessReview:Attest"}, "404": {"description": "No campaign with that id, or already closed"}, "503": {"description": "Access-review store unavailable, or a genuine write failure"}}}
-    }
+    })json"
+        // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) — PR1.5c/1.6c
+        // (p14) ADR-0031 operator surface: plugin config/secret/kill-switch
+        // (p5) and upload-grant + agent chunked-receive (p6) paths. The
+        // upload-grant mint/list/revoke routes are operator-facing (MCP
+        // twins exist); the /uploads* session routes authenticate on a
+        // grant/session bearer credential (X-Yuzu-Upload-Grant /
+        // X-Yuzu-Upload-Session), never an operator session, and are part
+        // of the HTTP contract despite having no MCP twin (spec item 2/3).
+        R"json(,
+    "/plugin-config": {
+      "get": {"summary": "List plugin config rows", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read, routed through the ADR-0017 admit-then-filter list gate. AdmitAll (global grant, or RBAC loaded-and-disabled) serves the list; a management-group-CONFINED grant is denied (403), not silently narrowed — this resource is plugin/key configuration, not agent-scoped data, so there is no principled per-agent filter to apply.", "parameters": [{"name": "plugin", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 64}, "description": "Exact plugin filter; omit for every plugin"}], "responses": {"200": {"description": "{data: [{plugin, key, value, updated_at_ms, updated_by}], meta:{api_version, truncated}}"}, "403": {"description": "Requires PluginConfig:Read (or a management-group-confined grant, refused here by design)"}, "503": {"description": "Plugin config store or authorization store unavailable"}}}
+    },
+    "/plugin-config/{plugin}/{key}": {
+      "get": {"summary": "Get one plugin config value", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{plugin, key, value, updated_at_ms, updated_by}"}, "400": {"description": "Invalid plugin/key grammar"}, "404": {"description": "No such row"}, "503": {"description": "Plugin config store unavailable"}}},
+      "put": {"summary": "Upsert one plugin config value", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Write. Audited (plugin_config.set) before the mutation is attempted.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["value"], "properties": {"value": {"type": "string", "maxLength": 8192}}}}}}, "responses": {"200": {"description": "{plugin, key, value, updated_at_ms, updated_by}"}, "400": {"description": "Invalid plugin/key/value grammar, or NUL byte in value"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}},
+      "delete": {"summary": "Delete one plugin config value", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Delete. Audited (plugin_config.delete). A double-delete/retry answers 404 with no audit row (existence pre-checked via GET first).", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{deleted: true}"}, "404": {"description": "No such row"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}}
+    },
+    "/plugin-config/{plugin}/{key}/secret": {
+      "put": {"summary": "Seal a plugin secret value", "tags": ["Plugin Config"], "description": "Requires PluginSecret:Write. Write-only: the response is metadata ONLY (plugin, key, updated_at_ms, updated_by) — no method on this surface, anywhere, returns a secret's plaintext, so there is deliberately no GET/list route for secrets. Each write mints a fresh DEK; the audit detail is structurally redacted (never carries the value). Audited (plugin_secret.set) before the mutation is attempted.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["value"], "properties": {"value": {"type": "string", "minLength": 1, "maxLength": 65536}}}}}}, "responses": {"200": {"description": "{plugin, key, updated_at_ms, updated_by} — no value field, ever"}, "400": {"description": "Invalid plugin/key/value grammar"}, "503": {"description": "Plugin config store, or secret encryption, unavailable — or the pre-mutation audit row could not be persisted"}}},
+      "delete": {"summary": "Delete a sealed plugin secret", "tags": ["Plugin Config"], "description": "Requires PluginSecret:Delete. Audited (plugin_secret.delete) before the mutation is attempted — no existence pre-check exists on this write-only plane, so a delete of an already-absent key still records the attempt.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "key", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{deleted: true}"}, "400": {"description": "Invalid plugin/key grammar"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}}
+    },
+    "/plugin-config/{plugin}/kill-switch": {
+      "get": {"summary": "Read a plugin or plugin-action kill-switch's display state", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Read. NOT the dispatch-gating decision (PluginConfigStore::action_allowed fails closed on any store error, which this display accessor deliberately does not) — this is the inspection view. Absence of a prior flip reads as enabled=true.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}], "responses": {"200": {"description": "{plugin, action, enabled, reason, set_by, updated_at_ms}"}, "400": {"description": "Invalid plugin/action grammar"}, "503": {"description": "Plugin config store unavailable"}}},
+      "put": {"summary": "Flip a plugin or plugin-action kill switch", "tags": ["Plugin Config"], "description": "Requires PluginConfig:Write. Every dispatch-gating caller that consults this switch fails CLOSED on any store error, so this is a reliable emergency stop for the named plugin/action. Audited (plugin_config.kill_switch.set) before the mutation is attempted.", "parameters": [{"name": "plugin", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "action", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Action name for an action-level switch; omit for the whole-plugin switch"}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["enabled"], "properties": {"enabled": {"type": "boolean"}, "reason": {"type": "string", "maxLength": 512}}}}}}, "responses": {"200": {"description": "{plugin, action, enabled, reason, set_by, updated_at_ms}"}, "400": {"description": "Invalid plugin/action/reason grammar, or missing/non-boolean enabled"}, "503": {"description": "Plugin config store unavailable, or the pre-mutation audit row could not be persisted"}}}
+    },
+    "/upload-grants": {
+      "post": {"summary": "Mint a one-time upload-grant credential", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Write. Authorises ONE agent to push ONE file back to the server (CC-06 authenticated chunked-receive protocol, docs/adr/3004-artifact-blob-storage.md). grant_secret is returned EXACTLY ONCE in this response — only its digest is persisted. destination_key is SERVER-DERIVED from retention_class + the freshly-minted grant_id only; source_path is stored as informational metadata and never influences it.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["agent_id"], "properties": {"agent_id": {"type": "string"}, "source_path": {"type": "string", "description": "Informational only; never used to derive the destination key"}, "expected_sha256": {"type": "string"}, "retention_class": {"type": "string", "enum": ["standard", "extended", "transient"], "default": "standard"}, "declared_max_size": {"type": "integer"}, "ttl_secs": {"type": "integer"}}}}}}, "responses": {"201": {"description": "{grant_id, grant_secret, expires_at, destination_key}"}, "400": {"description": "Invalid input (empty agent_id, non-positive declared_max_size, unrecognized retention_class)"}, "503": {"description": "Upload grant store unavailable, or a CSPRNG/digest failure"}}},
+      "get": {"summary": "List upload grants", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Read, routed through the ADR-0017 admit-then-filter list gate: AdmitAll lists every grant; a management-group-confined grant lists only grants for agents in the caller's visible set. No client-selected agent_id filter exists on this surface — the frozen protocol forbids one on every path. Never returns a grant secret or its hash.", "responses": {"200": {"description": "{data: [{grant_id, agent_id, source_path, declared_max_size, expected_sha256, retention_class, destination_key, state, minted_by, created_at, expires_at}]}"}, "403": {"description": "No grant anywhere for UploadGrant:Read"}, "503": {"description": "Upload grant store unavailable"}}}
+    },
+    "/upload-grants/{grant_id}": {
+      "delete": {"summary": "Revoke an upload grant", "tags": ["Upload Grants"], "description": "Requires UploadGrant:Delete. Closes the grant's one-time redemption window; has NO effect on a grant already redeemed into a session — an in-flight or completed upload is untouched.", "parameters": [{"name": "grant_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"204": {"description": "Revoked"}, "404": {"description": "No such grant, or it was already redeemed/revoked"}, "503": {"description": "Upload grant store unavailable"}}}
+    },
+    "/uploads": {
+      "post": {"summary": "Open an upload session by redeeming a grant credential", "tags": ["Upload Grants"], "description": "AGENT-AUTHENTICATED, not an operator route — authenticates via the X-Yuzu-Upload-Grant header (the raw grant_secret from mint), never a session cookie/token/AuthFn. One-time redemption: a grant that has already been redeemed, revoked, or expired is refused. No MCP twin exists for this route (ADR-0031/A5, recorded as a permanent exception in docs/adr/1005-headless-platform-use-case-engines.md's Grandfathered surfaces) — MCP tools authenticate as an operator, and this credential is agent-scoped, not operator-scoped.", "parameters": [{"name": "X-Yuzu-Upload-Grant", "in": "header", "required": true, "schema": {"type": "string"}, "description": "<grant_id>.<grant_secret>"}], "responses": {"201": {"description": "{upload_id, session_secret, chunk_max_bytes, offset:0, expires_at}"}, "400": {"description": "TLS required (when the deployment runs HTTP)"}, "401": {"description": "Grant unknown, or the credential is malformed"}, "409": {"description": "Grant already redeemed"}, "410": {"description": "Grant expired"}, "503": {"description": "Upload grant store unavailable"}}}
+    },
+    "/uploads/{upload_id}/chunk": {
+      "put": {"summary": "Write one chunk of an open upload", "tags": ["Upload Grants"], "description": "AGENT-AUTHENTICATED via X-Yuzu-Upload-Session: <upload_id>.<session_secret> (from the session-open response), never an operator session. Bytes are written to disk BEFORE the recorded offset advances (write-then-CAS). Not individually audited (the per-chunk volume would be noise, not signal) — the session-open and commit/cancel rows bracket the upload's lifecycle. No MCP twin (ADR-0031/A5, permanent exception) — see POST /uploads.", "parameters": [{"name": "upload_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "X-Yuzu-Upload-Session", "in": "header", "required": true, "schema": {"type": "string"}}, {"name": "Content-Range", "in": "header", "required": true, "schema": {"type": "string"}, "description": "bytes <start>-<end>/<total>, per the frozen protocol"}], "responses": {"200": {"description": "{offset}"}, "400": {"description": "Malformed Content-Range, or the body length does not match Content-Range"}, "401": {"description": "Session unknown or credential mismatch"}, "409": {"description": "The CAS on recorded offset missed (a concurrent chunk already advanced it), or the session is already terminal"}, "410": {"description": "Session expired; size_exceeded forces termination the same way"}, "413": {"description": "Chunk exceeds the maximum chunk size, or the upload exceeds the grant's declared size"}, "503": {"description": "Upload grant store unavailable, or a disk write failure"}}}
+    },
+    "/uploads/{upload_id}": {
+      "get": {"summary": "Read an open or terminal upload session's status", "tags": ["Upload Grants"], "description": "AGENT-AUTHENTICATED via X-Yuzu-Upload-Session, never an operator session. No MCP twin (ADR-0031/A5, permanent exception) — see POST /uploads.", "parameters": [{"name": "upload_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "X-Yuzu-Upload-Session", "in": "header", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{state, offset, expires_at} — upload_id and declared_max_size are NOT echoed back"}, "401": {"description": "Session unknown or credential mismatch"}, "410": {"description": "Session expired; the partial blob is discarded on this same request if it is the first touch after expiry"}, "503": {"description": "Upload grant store unavailable"}}},
+      "delete": {"summary": "Cancel an open upload session", "tags": ["Upload Grants"], "description": "AGENT-AUTHENTICATED via X-Yuzu-Upload-Session, never an operator session. Terminal, non-success: discards the partial blob. No MCP twin (ADR-0031/A5, permanent exception) — see POST /uploads.", "parameters": [{"name": "upload_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "X-Yuzu-Upload-Session", "in": "header", "required": true, "schema": {"type": "string"}}], "responses": {"204": {"description": "Cancelled"}, "401": {"description": "Session unknown or credential mismatch"}, "409": {"description": "Session already terminal"}, "503": {"description": "Upload grant store unavailable"}}}
+    },
+    "/uploads/{upload_id}/commit": {
+      "post": {"summary": "Commit a completed upload", "tags": ["Upload Grants"], "description": "AGENT-AUTHENTICATED via X-Yuzu-Upload-Session, never an operator session. Terminal success: verifies the received size/hash, writes the completed_uploads durability record, and transitions the session in ONE transaction. No MCP twin (ADR-0031/A5, permanent exception) — see POST /uploads.", "parameters": [{"name": "upload_id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "X-Yuzu-Upload-Session", "in": "header", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sha256"], "properties": {"sha256": {"type": "string"}}}}}}, "responses": {"200": {"description": "{state: \"committed\", actual_size, sha256}"}, "400": {"description": "sha256 is required"}, "401": {"description": "Session unknown or credential mismatch"}, "409": {"description": "Session already terminal (concurrent commit/cancel)"}, "422": {"description": "Received size/hash does not match the declared/expected values — the session is cancelled and the partial blob discarded"}, "503": {"description": "Upload grant store unavailable, or a server-side verification failure"}}}
+    })json"
+        // Split again (MSVC C2026 16,380-byte cap); concatenated at compile
+        // time, so the emitted OpenAPI JSON is byte-identical to the unsplit
+        // form.
+        R"json(
   }
 })json";
     return spec;
@@ -1417,6 +1478,38 @@ void RestApiV1::register_routes(
         return true;
     };
 
+    // PR1.9c: the caller-carrying sibling of the above. Same resolution, same
+    // fail-closed posture — it just stops throwing the identity away.
+    // `build_classified_command` refuses an empty `DispatchCaller::principal`
+    // as `AnonymousOperator` before the legacy-open bypass, so the routes that
+    // dispatch MUST supply one; the visible-set-only resolver resolved a full
+    // `auth::Session` and discarded everything but the set six lines before
+    // that dispatch, which is what made every REST dispatch undeliverable.
+    //
+    // The unwired-`auth_fn` arm deliberately keeps an EMPTY principal: with no
+    // authenticator there is no identity to claim, and `AnonymousOperator` is
+    // the correct fail-closed answer rather than a fabricated one. It pairs
+    // with `deny_all()` (present-empty), never a defaulted VisibleSet — that
+    // default is nullopt, which reads as UNFILTERED.
+    auto resolve_secondary_caller =
+        [auth_fn, exec_visible_fn](const httplib::Request& req, httplib::Response& res)
+        -> std::optional<yuzu::server::DispatchCaller> {
+        std::optional<auth::Session> sess;
+        if (auth_fn) {
+            sess = auth_fn(req, res);
+            if (!sess)
+                return std::nullopt;
+        }
+        yuzu::server::DispatchCaller caller;
+        if (sess) {
+            caller.principal = sess->username;
+            caller.principal_role = auth::role_to_string(sess->role);
+        }
+        caller.exec_visible = (exec_visible_fn && sess) ? exec_visible_fn(*sess)
+                                                        : yuzu::server::authz::deny_all();
+        return caller;
+    };
+
     // ── CORS preflight handler for /api/v1/* ─────────────────────────────
     // Actual CORS headers are added by the post-routing handler in server.cpp
     // with origin allowlist validation.
@@ -1496,14 +1589,14 @@ void RestApiV1::register_routes(
                                   const std::string& scope,
                                   const std::unordered_map<std::string, std::string>& params,
                                   const std::string& correlation_id,
-                                  const yuzu::server::authz::VisibleSet& exec_visible)
+                                  const yuzu::server::DispatchCaller& caller)
                 -> std::pair<std::string, int> {
                 for (const auto& id : agent_ids) {
-                    if (!yuzu::server::authz::in_scope(exec_visible, id))
+                    if (!yuzu::server::authz::in_scope(caller.exec_visible, id))
                         return {correlation_id, 0};
                 }
                 return command_dispatch_fn(plugin, action, agent_ids, scope, params,
-                                           correlation_id, exec_visible);
+                                           correlation_id, caller);
             },
             response_store,
             [] {
@@ -1654,7 +1747,7 @@ void RestApiV1::register_routes(
     sink.Post(
         "/api/v1/tar/retention-paused/purge",
         [scoped_perm_fn, command_dispatch_fn, audit_fn, metrics_registry,
-         resolve_secondary_exec_visible](const httplib::Request& req, httplib::Response& res) {
+         resolve_secondary_caller](const httplib::Request& req, httplib::Response& res) {
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
             auto bump = [&](const char* result) {
@@ -1729,14 +1822,14 @@ void RestApiV1::register_routes(
             // and has already authorized this exact device_id, so the seam's
             // intersection is a second, independent check rather than the thing
             // standing between this caller and the fleet.
-            const auto exec_visible = resolve_secondary_exec_visible(req, res);
-            if (!exec_visible) {
+            const auto caller = resolve_secondary_caller(req, res);
+            if (!caller) {
                 bump("denied");
                 return;
             }
             const auto [command_id, sent] =
                 command_dispatch_fn("tar", "purge_source", {device_id}, "", {{"source", source}},
-                                    /*execution_id=*/"", *exec_visible);
+                                    /*execution_id=*/"", *caller);
             if (sent == 0) {
                 // NOTE: a confinement drop also lands here and is reported as
                 // "offline" + counted as agent_not_connected. The RESPONSE
@@ -4225,7 +4318,7 @@ void RestApiV1::register_routes(
             // if scoped_perm_fn is unwired, never fall back to an unfiltered list.
             if (!auth_fn(req, res))
                 return;
-            if (!quarantine_store) {
+            if (!quarantine_store || !quarantine_store->is_open()) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
@@ -4237,13 +4330,51 @@ void RestApiV1::register_routes(
                 return;
             }
 
+            // AUTHORITATIVE read (ADR-0047): nullopt is a degraded read, NEVER
+            // rendered as an empty quarantine list — a device could still be
+            // actively contained while the caller sees "nothing quarantined".
             auto records = quarantine_store->list_quarantined();
+            if (!records) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "quarantine list unavailable — try again"),
+                                "application/json");
+                return;
+            }
             JArr arr;
             int64_t visible = 0;
-            for (const auto& r : records) {
+            for (const auto& r : *records) {
                 httplib::Response probe; // throwaway: per-record admit probe, never sent
-                if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id))
+                if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id)) {
+                    // gov-fix(security-guardian, widened by unhappy-path Gate 4):
+                    // a per-record degrade is NOT a denial and must not be
+                    // silently filtered out — that would render a degraded
+                    // authz check as "not quarantined", the exact fail-open
+                    // the store-layer nullopt check above exists to close,
+                    // just one layer up. The auth caller has ALREADY been
+                    // authenticated once by auth_fn above, using the SAME
+                    // req — every per-record call re-derives authorization
+                    // from scratch (require_scoped_permission calls
+                    // require_auth internally on every invocation), so any
+                    // outcome OTHER than an explicit 403 (a genuine scope
+                    // denial) is anomalous mid-request and must fail the
+                    // WHOLE list closed, not just the RBAC/tag-store-degrade
+                    // 503 case: a transient engine-principal store outage
+                    // landing between auth_fn's initial check and a later
+                    // per-record probe surfaces as a bare 401 (require_auth
+                    // does not distinguish "no session" from "could not
+                    // determine" for that principal class — see
+                    // EngineLookupStatus::StoreUnreachable's own comment,
+                    // auth_routes.cpp), which the original 503-only check
+                    // would have silently treated as a denial.
+                    if (probe.status != 403) {
+                        res.status = 503;
+                        res.set_content(
+                            detail::a4_error(res, "authorization check unavailable — try again"),
+                            "application/json");
+                        return;
+                    }
                     continue;
+                }
                 arr.add(JObj()
                             .add("agent_id", r.agent_id)
                             .add("status", r.status)
@@ -4261,9 +4392,21 @@ void RestApiV1::register_routes(
         // CDX-P1-02: authenticate first (401 before any store/body work).
         if (!auth_fn(req, res))
             return;
-        if (!quarantine_store) {
+        if (!quarantine_store || !quarantine_store->is_open()) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            // gov-fix(consistency-auditor, Gate 8): matches this file's own
+            // dominant convention for a bare is_open() 503 (retry_after_ms
+            // present on ~20+ sibling routes) and the MCP quarantine_device
+            // twin's identical retry_after_ms=5000 (F5) — REST was the
+            // outlier.
+            res.set_content(detail::a4_error(res, "service unavailable", {.retry_after_ms = 5000}),
+                            "application/json");
+            // gov-fix(compliance-officer C-2): the target agent_id is not yet
+            // known at this point (the body hasn't been parsed), so this is
+            // the one quarantine failure path that cannot carry a resource
+            // id — audited anyway rather than silently skipped.
+            audit_fn(req, "quarantine.enable", "failure", "Security", "",
+                     "service unavailable — store not open");
             return;
         }
 
@@ -4301,8 +4444,22 @@ void RestApiV1::register_routes(
 
         auto result = quarantine_store->quarantine_device(agent_id, by, reason, whitelist);
         if (!result) {
-            res.status = 400;
-            res.set_content(detail::a4_error(res, result.error()), "application/json");
+            const bool db_error = is_quarantine_db_error(result.error());
+            res.status = db_error ? 503 : 400;
+            // gov-fix(consistency-auditor, Gate 8): retryable ONLY on the
+            // genuine store/pool-failure branch, matching MCP's identical
+            // split (F5) — the business-error branch ("already quarantined")
+            // stays non-retryable (null), never a fabricated retry hint on a
+            // permanent state conflict.
+            res.set_content(detail::a4_error(res, result.error(),
+                                             db_error ? detail::A4ErrorOpts{.retry_after_ms = 5000}
+                                                       : detail::A4ErrorOpts{}),
+                            "application/json");
+            // gov-fix(security-guardian): the MCP quarantine_device twin
+            // already audits this branch (mcp_audit("failure", ...)) — REST
+            // was silently skipping it, the only quarantine failure path with
+            // no audit row.
+            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id, result.error());
             return;
         }
         audit_fn(req, "quarantine.enable", "success", "Security", agent_id, reason);
@@ -4317,13 +4474,23 @@ void RestApiV1::register_routes(
             // CDX-P1-02: authenticate first (401 before any store work).
             if (!auth_fn(req, res))
                 return;
-            if (!quarantine_store) {
+            // Extracted before the is_open() check below (pure regex-match
+            // read, no failure mode) so a store-outage 503 can still carry
+            // the target agent_id in its audit row (gov-fix compliance-officer
+            // C-2) instead of the audit call being skipped for lack of one.
+            auto agent_id = req.matches[1].str();
+            if (!quarantine_store || !quarantine_store->is_open()) {
                 res.status = 503;
-                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                // gov-fix(consistency-auditor, Gate 8): see the POST route's
+                // identical fix above for the rationale.
+                res.set_content(
+                    detail::a4_error(res, "service unavailable", {.retry_after_ms = 5000}),
+                    "application/json");
+                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
+                         "service unavailable — store not open");
                 return;
             }
 
-            auto agent_id = req.matches[1].str();
             // CDX-P1-02: same sole per-target gate as POST above, mirroring
             // set_tag/delete_tag and the MCP quarantine_device twin — fail
             // CLOSED if unwired.
@@ -4340,8 +4507,16 @@ void RestApiV1::register_routes(
 
             auto result = quarantine_store->release_device(agent_id);
             if (!result) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                const bool db_error = is_quarantine_db_error(result.error());
+                res.status = db_error ? 503 : 400;
+                // gov-fix(consistency-auditor, Gate 8): see POST's identical
+                // fix above — retryable only on the genuine store failure.
+                res.set_content(detail::a4_error(res, result.error(),
+                                                 db_error ? detail::A4ErrorOpts{.retry_after_ms = 5000}
+                                                           : detail::A4ErrorOpts{}),
+                                "application/json");
+                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
+                         result.error());
                 return;
             }
             audit_fn(req, "quarantine.disable", "success", "Security", agent_id, "");
@@ -6800,6 +6975,12 @@ void RestApiV1::register_routes(
                 return;
             }
             const yuzu::server::authz::VisibleSet exec_visible = exec_visible_fn(session);
+            // PR1.9c: the chokepoint needs the identity too, and `session` is
+            // this lambda's own parameter — no extra resolution required.
+            const yuzu::server::DispatchCaller caller{
+                .principal = session.username,
+                .principal_role = auth::role_to_string(session.role),
+                .exec_visible = exec_visible};
             // Resolve the parent scope. parent_id present → dispatch is scoped
             // to that set's CURRENT members via the `from_result_set:` scope
             // kind; absent → broadcast to all connected agents (__all__).
@@ -6907,7 +7088,7 @@ void RestApiV1::register_routes(
                 // lives in the server's AgentRegistry, and a second copy of the
                 // intersection is the drift that seam exists to prevent.
                 std::tie(command_id, sent) = command_dispatch_fn(plugin, action, {}, dispatch_scope,
-                                                                 params, exec_id, exec_visible);
+                                                                 params, exec_id, caller);
             } catch (const std::exception& e) {
                 spdlog::error("result-set async producer dispatch failed: {}", e.what());
                 execution_tracker->mark_cancelled(exec_id, owner);
@@ -8100,40 +8281,17 @@ void RestApiV1::register_routes(
              });
 
     // ── File Retrieval (capability 10.13) ────────────────────────────────
-    // Receives files uploaded by the content_dist plugin's upload_file action.
-    sink.Post("/api/v1/file-retrieval",
-              [auth_fn, perm_fn, audit_fn](const httplib::Request& req, httplib::Response& res) {
-                  if (!perm_fn(req, res, "FileRetrieval", "Write"))
-                      return;
-
-                  // Extract form fields from the request body (JSON)
-                  auto body = nlohmann::json::parse(req.body, nullptr, false);
-                  if (body.is_discarded() || !body.contains("agent_id")) {
-                      res.status = 400;
-                      res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
-                      return;
-                  }
-                  auto agent_id = body.value("agent_id", "");
-                  auto original_path = body.value("original_path", "");
-                  auto sha256 = body.value("sha256", "");
-                  auto file_size = body.value("size", int64_t{0});
-
-                  // Store the uploaded file (implementation: write to a configurable
-                  // retrieval directory, keyed by agent_id and timestamp)
-                  spdlog::info("FileRetrieval: received {} bytes from agent={}, path={}", file_size,
-                               agent_id, original_path);
-
-                  audit_fn(req, "file_retrieval.upload", "success", "FileRetrieval", agent_id,
-                           "path=" + original_path + ", size=" + std::to_string(file_size));
-
-                  auto data = JObj()
-                                  .add("status", "received")
-                                  .add("bytes", file_size)
-                                  .add("agent_id", agent_id)
-                                  .add("sha256", sha256)
-                                  .str();
-                  res.set_content(ok_json(data), "application/json");
-              });
+    // The legacy POST /api/v1/file-retrieval handler that lived here was
+    // REMOVED (PR1.5c/1.6c, p14): it trusted a body-supplied `agent_id`
+    // (unauthenticated-as-that-agent metadata-only "upload"), stored
+    // nothing, and had no relationship to the actual bytes an agent might
+    // send. `register_file_retrieval_routes` (file_retrieval_routes.cpp,
+    // wired in server.cpp) replaces it with the authenticated one-time
+    // upload-grant + chunked-receive protocol
+    // (docs/adr/3004-artifact-blob-storage.md) — the operator mint/list/
+    // revoke routes live at /api/v1/upload-grants*, the agent-authenticated
+    // session routes at /api/v1/uploads*. Exactly one handler serves file
+    // retrieval now.
 
     // ── Guardian / Guaranteed State (/api/v1/guaranteed-state) ────────────
     // PR 2 of the Guardian Windows-first rollout. Endpoints follow design
@@ -9099,7 +9257,7 @@ void RestApiV1::register_routes(
     sink.Post(
         R"(/api/v1/dex/devices/([^/]+)/live)",
         [scoped_perm_fn, response_store, command_dispatch_fn, audit_fn, metrics_registry,
-         resolve_secondary_exec_visible](const httplib::Request& req, httplib::Response& res) {
+         resolve_secondary_caller](const httplib::Request& req, httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             // Echo the correlation id on EVERY response path (A3), parity with the
@@ -9164,8 +9322,8 @@ void RestApiV1::register_routes(
             // audit was the original shape and is the ordering defect this
             // moves; the scope gate above has already answered 401, so this
             // still cannot fail in practice and no status ordering shifts.)
-            const auto exec_visible = resolve_secondary_exec_visible(req, res);
-            if (!exec_visible)
+            const auto caller = resolve_secondary_caller(req, res);
+            if (!caller)
                 return;
             // Concurrency cap (UP-1/2/3): acquire an in-flight slot BEFORE dispatch so
             // an over-budget caller gets 429 without orphaning a command. RAII releases
@@ -9208,7 +9366,7 @@ void RestApiV1::register_routes(
                 return;
             }
             const auto [command_id, sent] = command_dispatch_fn(plugin, action, {agent_id}, "", {},
-                                                                /*execution_id=*/"", *exec_visible);
+                                                                /*execution_id=*/"", *caller);
             if (sent == 0) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(

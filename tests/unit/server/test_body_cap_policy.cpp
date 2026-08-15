@@ -81,6 +81,22 @@ constexpr ExpectedResolution kExpected[] = {
     {"DELETE", "/mcp/v1/",                                4u * 1024 * 1024,   true,  "mcp"},
     // bundle_service.hpp:24-33 / rest_api_v1.cpp:1417.
     {"POST",   "/api/v1/bundles",                         70u * 1024 * 1024,  false, "bundles"},
+    // body_cap_policy.hpp upload_session row — the PR1.6a chunked-receive
+    // surface. Cap = upload_grant::kDefaultChunkMaxBytes (bound by the
+    // static_assert in file_retrieval_routes.cpp). requires_measurable=true:
+    // the chunk route's session gate runs in the HANDLER, after httplib
+    // buffers, so the pre-read bound is what stops an unauthenticated caller
+    // buffering 100 MB. ANY method — sibling verbs (status GET, commit POST,
+    // cancel DELETE, session-open POST on the bare prefix) share the class.
+    {"PUT",    "/api/v1/uploads/abc123/chunk",            8u * 1024 * 1024,   true,  "upload_session"},
+    {"POST",   "/api/v1/uploads",                          8u * 1024 * 1024,  true,  "upload_session"},
+    {"POST",   "/api/v1/uploads/abc123/commit",            8u * 1024 * 1024,  true,  "upload_session"},
+    // body_cap_policy.hpp plugin_config row — the PR1.5 config/secret/
+    // kill-switch plane. 256 KiB = the 64 KiB secret-plaintext grammar cap
+    // (plugin_config_parsers.hpp) plus JSON framing headroom.
+    {"PUT",    "/api/v1/plugin-config/email/host",         256u * 1024,        false, "plugin_config"},
+    {"PUT",    "/api/v1/plugin-config/email/key/secret",   256u * 1024,        false, "plugin_config"},
+    {"DELETE", "/api/v1/plugin-config/email/host",         256u * 1024,        false, "plugin_config"},
     // settings_routes.cpp:5146,:5206 — keeps httplib's 100 MiB backstop.
     {"POST",   "/api/settings/updates/upload",            100u * 1024 * 1024, false, "ota_upload"},
     // server.cpp:10809 — unbounded by design, kept at httplib's backstop.
@@ -157,6 +173,8 @@ constexpr std::string_view kExpectedPathClasses[] = {
     "saml_acs",
     "response_templates",
     "tar_dashboard_sql",
+    "upload_session",
+    "plugin_config",
     "tar_result_set_sql",
     "guardian_rule_authoring",
     "workflow_yaml",
@@ -298,21 +316,32 @@ TEST_CASE("kBodyCapTable: the row count is locked", "[body_cap]") {
     // tar_dashboard_sql(1) + tar_result_set_sql(1) +
     // guardian_rule_authoring(2: POST create + PUT update) +
     // workflow_yaml(1) + product_pack_yaml(1) + instruction_import(1) +
-    // instruction_yaml(3: save/validate/preview) + default(1).
-    CHECK(std::size(kBodyCapTable) == 25);
+    // instruction_yaml(3: save/validate/preview) + upload_session(1: the
+    // PR1.6a chunked-receive surface) + plugin_config(1: the PR1.5 config/
+    // secret plane) + default(1).
+    CHECK(std::size(kBodyCapTable) == 27);
 }
 
-// ── 7. requires_measurable: ON for /mcp/, OFF for the named public classes ──
+// ── 7. requires_measurable: ON for /mcp/ and upload_session, OFF elsewhere ──
 
-TEST_CASE("resolve_body_cap: requires_measurable is ON only for /mcp/", "[body_cap]") {
+// M2 (review finding): this case's own name claimed "ON only for /mcp/"
+// while never asserting the OTHER measurable class at all — the doc's
+// rest-api.md carried the identical stale claim (both fixed together). A
+// regression on the upload_session opt-in would have shipped with this
+// test green.
+TEST_CASE("resolve_body_cap: requires_measurable is ON for /mcp/ and upload_session, OFF "
+         "for every other named class",
+         "[body_cap]") {
     CHECK(resolve_body_cap("POST", "/mcp/v1/").requires_measurable);
     CHECK(resolve_body_cap("GET", "/mcp/v1/").requires_measurable);
+    CHECK(resolve_body_cap("PUT", "/api/v1/uploads/abc123/chunk").requires_measurable);
+    CHECK(resolve_body_cap("POST", "/api/v1/uploads").requires_measurable);
 
     // Public REST (bundles), SCIM, certificate import (REST + dashboard),
-    // product-pack/workflow authoring, and OTA upload all default OFF — see
-    // the file header's rationale (chunked is legal HTTP; no client
-    // population has been tested against a hard Content-Length contract on
-    // these routes yet).
+    // product-pack/workflow authoring, OTA upload, and plugin-config all
+    // default OFF — see the file header's rationale (chunked is legal HTTP;
+    // no client population has been tested against a hard Content-Length
+    // contract on these routes yet).
     CHECK_FALSE(resolve_body_cap("POST", "/api/v1/bundles").requires_measurable);
     CHECK_FALSE(resolve_body_cap("POST", "/scim/v2/Users").requires_measurable);
     CHECK_FALSE(resolve_body_cap("POST", "/api/v1/ca/import-chain").requires_measurable);
@@ -320,6 +349,7 @@ TEST_CASE("resolve_body_cap: requires_measurable is ON only for /mcp/", "[body_c
     CHECK_FALSE(resolve_body_cap("POST", "/api/workflows").requires_measurable);
     CHECK_FALSE(resolve_body_cap("POST", "/api/product-packs").requires_measurable);
     CHECK_FALSE(resolve_body_cap("POST", "/api/settings/updates/upload").requires_measurable);
+    CHECK_FALSE(resolve_body_cap("PUT", "/api/v1/plugin-config/email/host").requires_measurable);
     CHECK_FALSE(resolve_body_cap("POST", "/api/v1/totally-unknown-route-xyz").requires_measurable);
 }
 

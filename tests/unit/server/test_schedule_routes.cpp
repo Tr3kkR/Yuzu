@@ -253,6 +253,58 @@ TEST_CASE("POST /api/schedules: Schedule:Write + Execution:Execute together crea
     CHECK(body.value("id", "") == scheds[0].id);
 }
 
+// ── PR1.5a: typed schedule parameters ───────────────────────────────────────
+
+TEST_CASE("POST /api/schedules: parameters round-trip to the stored canonical form",
+          "[server][schedule][params][rest]") {
+    ScheduleRouteHarness h;
+    auto req = h.session_request_for("sched-op", "ScheduleAndExecute",
+                                     {{"Schedule", "Write"}, {"Execution", "Execute"}});
+    req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily",)"
+              R"("parameters":{"zeta":"1","alpha":2}})";
+
+    httplib::Response res;
+    handle_create_schedule(*h.auth_routes, &h.schedule_engine, req, res);
+
+    CHECK(res.status != 400);
+    auto scheds = h.schedule_engine.query_schedules();
+    REQUIRE(scheds.size() == 1);
+    // Canonical: sorted keys, regardless of the caller's JSON key order.
+    CHECK(scheds[0].parameter_values == R"({"alpha":2,"zeta":"1"})");
+}
+
+TEST_CASE("POST /api/schedules: invalid parameters are rejected with 400 and create no row",
+          "[server][schedule][params][rest]") {
+    ScheduleRouteHarness h;
+    auto req = h.session_request_for("sched-op", "ScheduleAndExecute",
+                                     {{"Schedule", "Write"}, {"Execution", "Execute"}});
+    req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily",)"
+              R"("parameters":{"nested":{"a":1}}})";
+
+    httplib::Response res;
+    handle_create_schedule(*h.auth_routes, &h.schedule_engine, req, res);
+
+    CHECK(res.status == 400);
+    CHECK(h.schedule_engine.query_schedules().empty());
+}
+
+TEST_CASE("POST /api/schedules: an omitted parameters field defaults to the canonical empty "
+          "object",
+          "[server][schedule][params][rest]") {
+    ScheduleRouteHarness h;
+    auto req = h.session_request_for("sched-op", "ScheduleAndExecute",
+                                     {{"Schedule", "Write"}, {"Execution", "Execute"}});
+    req.body = R"({"name":"nightly-scan","definition_id":"def-1","frequency_type":"daily"})";
+
+    httplib::Response res;
+    handle_create_schedule(*h.auth_routes, &h.schedule_engine, req, res);
+
+    CHECK(res.status != 400);
+    auto scheds = h.schedule_engine.query_schedules();
+    REQUIRE(scheds.size() == 1);
+    CHECK(scheds[0].parameter_values == "{}");
+}
+
 // ── Interim service-scoped-token deny (guardian-confinement-2298) ─────────
 //
 // A created/enabled schedule fires unattended through ScheduleRunner with NO

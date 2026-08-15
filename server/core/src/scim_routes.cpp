@@ -198,14 +198,69 @@ void bump_role_change_failure(auth::AuthManager* auth_mgr) {
 }
 
 /// ADR-2001 D1: a deprovision `deprovision_role_ok` refused (the #2021
-/// role-refusal fork) for a slug that has at least one active linked OIDC
-/// identity — the federated tokens were NOT auto-revoked and a human must
-/// terminate them manually.
+/// role-refusal fork) for a slug that has at least one active linked
+/// federated identity (OIDC and/or SAML) — the federated credentials were
+/// NOT auto-revoked and a human must terminate them manually.
 void bump_deprovision_role_refused_with_link(auth::AuthManager* auth_mgr) {
     if (!auth_mgr)
         return;
     if (auto* m = auth_mgr->metrics_registry())
         m->counter("yuzu_scim_deprovision_role_refused_with_active_link_total").increment();
+}
+
+/// The result of `federated_links_for_scim_id` below: whether `scim_id` has
+/// at least one active linked federated identity, and how many were
+/// confirmed (best-effort — see that function's doc comment on partial
+/// lookup failure).
+struct FederatedLinkCount {
+    bool has_link = false;
+    std::size_t count = 0;
+};
+
+/// ADR-2001 PR4a — D1's "does this scim_id have any active linked federated
+/// identity" test, UNIONED across OIDC (`links_for_scim_id`) and SAML
+/// (`saml_links_for_scim_id`) — mirrors `resolve_deprovision_principals`'s
+/// union pattern (deprovision_revoke.cpp:17-33), but stays a fire/no-fire +
+/// count question for D1's best-effort LOUDNESS signal rather than a
+/// deprovision-gating resolve (D1 never gates access — see deactivate()'s
+/// doc comment; the underlying role refusal is already fail-closed before
+/// this runs).
+///
+/// A lookup failure on EITHER side is a store blip, not "no linked
+/// identity" — but D1 is best-effort, so it must not CRASH and must not
+/// SUPPRESS a signal the other side would have fired on its own: if OIDC
+/// alone confirms a link, this fires on that count even when the SAML read
+/// blipped, and vice versa (this is why OIDC-only behavior is unchanged
+/// when SAML is the side that blips or is empty). This reports no link
+/// whenever no side actually CONFIRMS one — both blipped, both confirmed-
+/// empty, OR one confirmed-empty while the other blipped. That last case is
+/// the residual: if the blipping side was the one genuinely holding the only
+/// link, the signal is skipped — a single-store-blip degradation identical
+/// in kind to the pre-existing OIDC-only path (no regression, and never a
+/// false-positive fire), acceptable because D1 is a best-effort loudness
+/// overlay on a refusal that has already fail-closed.
+FederatedLinkCount federated_links_for_scim_id(ScimStore& scim_store, const std::string& scim_id) {
+    FederatedLinkCount out;
+    auto oidc_links = scim_store.links_for_scim_id(scim_id);
+    if (oidc_links.has_value()) {
+        out.count += oidc_links->size();
+    } else {
+        spdlog::warn("ScimRoutes: D1 — links_for_scim_id lookup failed for scim_id={} (store "
+                    "blip); the OIDC half of the D1 signal is best-effort skipped, not treated "
+                    "as \"no linked identity\"",
+                    scim_id);
+    }
+    auto saml_links = scim_store.saml_links_for_scim_id(scim_id);
+    if (saml_links.has_value()) {
+        out.count += saml_links->size();
+    } else {
+        spdlog::warn("ScimRoutes: D1 — saml_links_for_scim_id lookup failed for scim_id={} "
+                    "(store blip); the SAML half of the D1 signal is best-effort skipped, not "
+                    "treated as \"no linked identity\"",
+                    scim_id);
+    }
+    out.has_link = out.count > 0;
+    return out;
 }
 
 /// ADR-2001 D1 — the LOUD *severity* channel. `AuditEvent`/`AuditStore`
@@ -246,6 +301,21 @@ void bump_deprovision_unlinked(auth::AuthManager* auth_mgr) {
         return;
     if (auto* m = auth_mgr->metrics_registry())
         m->counter("yuzu_scim_deprovision_unlinked_total").increment();
+}
+
+/// ADR-2001 #3072 — the SAML analogue of `bump_deprovision_unlinked`/
+/// `yuzu_scim_deprovision_unlinked_total`: a deprovision resolved NO linked
+/// SAML identity for a slug, but a recorded SAML login observation shows a
+/// NameID matching that slug's externalId — the user DID authenticate via
+/// SAML but the identity link never formed (either a non-linkable NameID
+/// Format, or a genuine store hiccup on the write side). SEPARATE counter
+/// from the OIDC one — the two federation protocols are independently
+/// actionable signals.
+void bump_deprovision_saml_unlinked(auth::AuthManager* auth_mgr) {
+    if (!auth_mgr)
+        return;
+    if (auto* m = auth_mgr->metrics_registry())
+        m->counter("yuzu_scim_deprovision_saml_unlinked_total").increment();
 }
 
 // ── Audit ────────────────────────────────────────────────────────────────
@@ -722,16 +792,39 @@ void recompute_scim_user_role(ScimStore* scim_store, auth::AuthManager* auth_mgr
 }
 
 /// ADR-2001 D2 detector: called once a deprovision has resolved its
-/// principal set. When that set is slug-only (no linked OIDC identity) AND
-/// `resource`'s externalId has a recorded login observation, a user DID
-/// authenticate via OIDC but the link never formed — surface the CC6.8
-/// false-green tripwire. `scim_store`/`auth_mgr` may be null (defense in
-/// depth, matching every other helper on this surface); a no-op then.
+/// principal set. When `resource`'s scim_id has NO linked OIDC identity AND
+/// its externalId has a recorded login observation, a user DID authenticate
+/// via OIDC but the link never formed — surface the CC6.8 false-green
+/// tripwire. `scim_store`/`auth_mgr` may be null (defense in depth, matching
+/// every other helper on this surface); a no-op then.
+///
+/// Governance fix (PR4a CHANGES_REQUESTED, C2): this used to gate on the
+/// resolved principal-set SIZE (`principals.size() != 1`) as a proxy for
+/// "no OIDC link exists". Once the resolver started appending SAML
+/// principals into that same vector, a user with a coexisting SAML link
+/// AND an unformed OIDC link — the exact D2 misconfiguration this detector
+/// exists to catch — pushed `principals.size()` to 2+, so the proxy read
+/// "has a link" and D2 silently never fired. Query the OIDC link count
+/// SPECIFICALLY instead, independent of any SAML link on the same scim_id.
+/// A store blip on the OIDC read (`nullopt`) is "cannot confirm", not "no
+/// link" — D2 is best-effort and never gates access, so it must not fire a
+/// false tripwire off an unanswerable read; it silently skips instead,
+/// exactly as the OIDC-only code did on any other unanswerable read on this
+/// surface.
 void maybe_flag_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_mgr,
-                            const ScimResource& resource,
-                            const std::vector<std::string>& principals) {
-    if (!scim_store || principals.size() != 1 || resource.external_id.empty())
+                            const ScimResource& resource) {
+    if (!scim_store || resource.external_id.empty())
         return;
+    auto oidc_links = scim_store->links_for_scim_id(resource.scim_id);
+    if (!oidc_links.has_value()) {
+        spdlog::warn("ScimRoutes: D2 — links_for_scim_id lookup failed for scim_id={} (store "
+                    "blip); skipping the unlinked-OIDC tripwire check rather than risk a false "
+                    "positive off an unconfirmed read",
+                    resource.scim_id);
+        return;
+    }
+    if (!oidc_links->empty())
+        return; // an OIDC link IS formed for this scim_id — nothing to flag
     if (!scim_store->observation_matches(resource.external_id))
         return;
     spdlog::warn("ScimRoutes: deprovision of '{}' (scim_id={}) found a login observation "
@@ -739,6 +832,45 @@ void maybe_flag_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_mgr,
                 "--oidc-scim-link-claim misconfiguration",
                 resource.username, resource.scim_id, resource.external_id);
     bump_deprovision_unlinked(auth_mgr);
+}
+
+/// ADR-2001 #3072 — SAML analogue of `maybe_flag_d2_unlinked` above. Fires
+/// the SAML D2 tripwire when `resource`'s scim_id has NO linked SAML
+/// identity AND a recorded SAML login observation shows a NameID matching
+/// its externalId. MUST query `saml_links_for_scim_id` SPECIFICALLY — never
+/// `links_for_scim_id` (OIDC) or a `principals.size()` proxy — mirroring the
+/// PR4a C2 lesson `maybe_flag_d2_unlinked` already learned: an OIDC link
+/// coexisting on the same scim_id must never mask a missing SAML link, and
+/// vice-versa. `scim_store`/`auth_mgr` may be null (defense in depth,
+/// matching every other helper on this surface); a no-op then.
+void maybe_flag_saml_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_mgr,
+                                 const ScimResource& resource) {
+    if (!scim_store || resource.external_id.empty())
+        return;
+    auto saml_links = scim_store->saml_links_for_scim_id(resource.scim_id);
+    // NOTE: via the deprovision route this nullopt branch is currently unreachable —
+    // resolve_deprovision_principals reads saml_links_for_scim_id first and fails the
+    // request closed (500) before this D2 check runs. It is retained as defense-in-depth
+    // so a future reordering (or a caller that reaches D2 without that pre-read) still
+    // fails safe rather than firing a false-positive off an unconfirmed read. The
+    // saml_observation_matches nullopt-skip below IS route-reachable and is tested.
+    if (!saml_links.has_value()) {
+        spdlog::warn("ScimRoutes: SAML D2 — saml_links_for_scim_id lookup failed for "
+                    "scim_id={} (store blip); skipping the unlinked-SAML tripwire check "
+                    "rather than risk a false positive off an unconfirmed read",
+                    resource.scim_id);
+        return;
+    }
+    if (!saml_links->empty())
+        return; // a SAML link IS formed for this scim_id — nothing to flag
+    auto observed = scim_store->saml_observation_matches(resource.external_id);
+    if (!observed.has_value() || !*observed)
+        return; // nullopt (store blip) or a genuine no-match — skip either way
+    spdlog::warn("ScimRoutes: deprovision of '{}' (scim_id={}) found a SAML login observation "
+                "matching externalId '{}' but no formed saml_identity_link — the user "
+                "authenticated via SAML but the identity was never linked",
+                resource.username, resource.scim_id, resource.external_id);
+    bump_deprovision_saml_unlinked(auth_mgr);
 }
 
 /// ADR-2001 §§1,3 — resolve the deprovision principal set for `resource` and
@@ -778,7 +910,8 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
              "identity_link_resolution_failed");
         return false;
     }
-    maybe_flag_d2_unlinked(scim_store, auth_mgr, resource, *principals);
+    maybe_flag_d2_unlinked(scim_store, auth_mgr, resource);
+    maybe_flag_saml_d2_unlinked(scim_store, auth_mgr, resource);
     if (!token_store || !token_store->is_open()) {
         spdlog::error("ScimRoutes: ApiTokenStore unavailable — refusing to deprovision '{}' "
                      "(scim_id={}) without being able to revoke its credentials",
@@ -843,13 +976,13 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
         // that never gates access, so a store blip skips only the extra
         // signal, not the underlying (already fail-closed) role refusal.
         if (scim_store) {
-            auto links = scim_store->links_for_scim_id(resource.scim_id);
-            if (links.has_value() && !links->empty()) {
+            auto links = federated_links_for_scim_id(*scim_store, resource.scim_id);
+            if (links.has_link) {
                 std::string detail = "role-refused deprovision has " +
-                                     std::to_string(links->size()) +
-                                     " active linked OIDC identity(ies) that were NOT "
-                                     "auto-revoked (ADR-2001 D1) — a human must terminate "
-                                     "them manually";
+                                     std::to_string(links.count) +
+                                     " active linked federated identity(ies) (OIDC and/or "
+                                     "SAML) that were NOT auto-revoked (ADR-2001 D1) — a "
+                                     "human must terminate them manually";
                 audit(auth_mgr, audit_store, req,
                      "scim.user.deprovision_role_refused_with_link", "failure", resource.scim_id,
                      detail);
@@ -857,7 +990,7 @@ bool deactivate(ScimStore* scim_store, ApiTokenStore* token_store, auth::AuthMan
                 emit_scim_critical_event(analytics_store,
                                          "scim.user.deprovision_role_refused_with_link",
                                          {{"scim_id", resource.scim_id},
-                                          {"linked_identity_count", links->size()},
+                                          {"linked_identity_count", links.count},
                                           {"detail", detail}});
             }
         }
@@ -1854,14 +1987,14 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                            // a Severity::kCritical analytics event — see
                            // emit_scim_critical_event's doc comment for why
                            // severity cannot live on the AuditEvent itself).
-                           auto links = scim_store->links_for_scim_id(id);
-                           if (links.has_value() && !links->empty()) {
+                           auto links = federated_links_for_scim_id(*scim_store, id);
+                           if (links.has_link) {
                                std::string detail =
                                    "role-refused deprovision has " +
-                                   std::to_string(links->size()) +
-                                   " active linked OIDC identity(ies) that were NOT "
-                                   "auto-revoked (ADR-2001 D1) — a human must terminate them "
-                                   "manually";
+                                   std::to_string(links.count) +
+                                   " active linked federated identity(ies) (OIDC and/or "
+                                   "SAML) that were NOT auto-revoked (ADR-2001 D1) — a human "
+                                   "must terminate them manually";
                                audit(auth_mgr, audit_store, req,
                                     "scim.user.deprovision_role_refused_with_link", "failure", id,
                                     detail);
@@ -1869,7 +2002,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                emit_scim_critical_event(
                                    analytics_store, "scim.user.deprovision_role_refused_with_link",
                                    {{"scim_id", id},
-                                    {"linked_identity_count", links->size()},
+                                    {"linked_identity_count", links.count},
                                     {"detail", detail}});
                            }
                            record_request(auth_mgr, "delete", res.status);

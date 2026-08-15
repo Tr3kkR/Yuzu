@@ -131,6 +131,42 @@ const std::vector<pg::PgMigration>& migrations() {
          // code path needed: the index creation IS the detector.
          "CREATE UNIQUE INDEX scim_resources_external_id_uniq ON scim_resources (external_id) "
          "WHERE external_id IS NOT NULL;"},
+        // v4 (ADR-2001 PR4a): saml_identity_links — the SAML analogue of
+        // v3's identity_links, durably recording the (entity_id, name_id)
+        // SAML identity that a successful SAML login resolved to a SCIM
+        // resource. Deliberately a SEPARATE table (never a generalization
+        // of identity_links) — keeps this PR off PR3's scim_store schema
+        // surface. UNIQUE (entity_id, name_id): one link per SAML identity.
+        // Secondary index on scim_id: deprovision looks up BY scim_id,
+        // which the (entity_id, name_id) key does not serve — same
+        // rationale as identity_links_scim_id_idx above.
+        {4,
+         "CREATE TABLE saml_identity_links ("
+         "  entity_id  TEXT NOT NULL,"
+         "  name_id    TEXT NOT NULL,"
+         "  scim_id    TEXT NOT NULL,"
+         "  linked_at  BIGINT NOT NULL,"
+         "  UNIQUE (entity_id, name_id));"
+         "CREATE INDEX saml_identity_links_scim_id_idx ON saml_identity_links (scim_id);"},
+        // v5 (ADR-2001 #3072, store layer): saml_login_observations — the
+        // SAML analogue of v3's oidc_login_observations, recording every
+        // SAML login's NameID observation regardless of whether it matched
+        // a SCIM resource (the SAML D2-style detector). UNIQUE (entity_id,
+        // name_id, name_id_format): name_id_format is DELIBERATELY part of
+        // the uniqueness key, not folded into (entity_id, name_id) alone —
+        // a later login presenting the same NameID value under a STABLE
+        // format must not erase an earlier observation recorded under an
+        // unstable one; each (entity_id, name_id, format) triple is its own
+        // row. Secondary index on name_id: saml_observation_matches looks
+        // up BY name_id alone, which the 3-column UNIQUE key does not serve.
+        {5,
+         "CREATE TABLE saml_login_observations ("
+         "  entity_id      TEXT   NOT NULL,"
+         "  name_id        TEXT   NOT NULL,"
+         "  name_id_format TEXT   NOT NULL,"
+         "  seen_at        BIGINT NOT NULL,"
+         "  UNIQUE (entity_id, name_id, name_id_format));"
+         "CREATE INDEX saml_login_observations_name_id_idx ON saml_login_observations (name_id);"},
     };
     return kMigrations;
 }
@@ -425,25 +461,44 @@ std::optional<ScimResource> ScimStore::find_by_external_id(const std::string& ex
 
 std::optional<ScimResource>
 ScimStore::find_unique_active_by_external_id(const std::string& external_id) const {
-    if (!open_ || external_id.empty())
-        return std::nullopt;
+    // Compatibility wrapper (ADR-2001 #3072): resource for `matched`,
+    // nullopt for every other status — byte-unchanged behaviour for every
+    // pre-existing caller.
+    auto checked = find_unique_active_by_external_id_checked(external_id);
+    if (checked.status == ActiveExternalIdLookupStatus::matched)
+        return std::move(checked.resource);
+    return std::nullopt;
+}
+
+ActiveExternalIdLookupResult
+ScimStore::find_unique_active_by_external_id_checked(const std::string& external_id) const {
+    if (!open_)
+        return {.status = ActiveExternalIdLookupStatus::store_error, .resource = std::nullopt};
+    if (external_id.empty())
+        return {.status = ActiveExternalIdLookupStatus::no_match, .resource = std::nullopt};
 
     auto lease = pool_.try_acquire_for(kReadTimeout);
     if (!lease)
-        return std::nullopt;
+        return {.status = ActiveExternalIdLookupStatus::store_error, .resource = std::nullopt};
 
     // Deliberately NO `LIMIT 1` — the exactly-one-match guarantee is the
     // point of this method (ADR-2001 §2 mis-link guard). Any number of
-    // rows other than exactly 1 must fall through to `nullopt` below,
-    // including 2+: an ambiguous external_id is "no link", never an
+    // rows other than exactly 1 must fall through to `ambiguous`/`no_match`
+    // below, including 2+: an ambiguous external_id is "no link", never an
     // arbitrary pick.
     std::string sql = std::string("SELECT ") + kResourceCols +
                       " FROM scim_store.scim_resources WHERE external_id = $1 AND active = TRUE";
     pg::PgResult res =
         pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{external_id});
-    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
-        return std::nullopt;
-    return read_resource(res.get(), 0);
+    if (res.status() != PGRES_TUPLES_OK)
+        return {.status = ActiveExternalIdLookupStatus::store_error, .resource = std::nullopt};
+
+    const int rows = PQntuples(res.get());
+    if (rows == 0)
+        return {.status = ActiveExternalIdLookupStatus::no_match, .resource = std::nullopt};
+    if (rows > 1)
+        return {.status = ActiveExternalIdLookupStatus::ambiguous, .resource = std::nullopt};
+    return {.status = ActiveExternalIdLookupStatus::matched, .resource = read_resource(res.get(), 0)};
 }
 
 std::vector<ScimResource> ScimStore::list(int start_index, int count, int& total_out) const {
@@ -928,6 +983,140 @@ ScimStore::links_for_scim_id(const std::string& scim_id) const {
     return results;
 }
 
+// ── SAML identity linkage (ADR-2001 PR4a) ───────────────────────────────
+
+bool ScimStore::upsert_saml_link(const std::string& entity_id, const std::string& name_id,
+                                 const std::string& scim_id) {
+    if (!open_ || entity_id.empty() || name_id.empty() || scim_id.empty())
+        return false;
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO scim_store.saml_identity_links (entity_id, name_id, scim_id, linked_at) "
+        "VALUES ($1, $2, $3, extract(epoch FROM now())::bigint) "
+        "ON CONFLICT (entity_id, name_id) DO UPDATE "
+        "SET scim_id = EXCLUDED.scim_id, linked_at = EXCLUDED.linked_at",
+        std::vector<std::string>{entity_id, name_id, scim_id});
+    return res.status() == PGRES_COMMAND_OK;
+}
+
+std::optional<std::vector<SamlLinkedIdentity>>
+ScimStore::saml_links_for_scim_id(const std::string& scim_id) const {
+    if (!open_)
+        return std::nullopt; // store unusable — never "no linked identities"
+    if (scim_id.empty())
+        return std::vector<SamlLinkedIdentity>{}; // no scim_id asked for → genuinely nothing
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT entity_id, name_id FROM scim_store.saml_identity_links WHERE scim_id = $1 "
+        "ORDER BY entity_id ASC, name_id ASC",
+        std::vector<std::string>{scim_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt;
+
+    const int rows = PQntuples(res.get());
+    std::vector<SamlLinkedIdentity> results;
+    results.reserve(static_cast<std::size_t>(rows));
+    for (int i = 0; i < rows; ++i) {
+        results.push_back(
+            SamlLinkedIdentity{.entity_id = col(res.get(), i, 0), .name_id = col(res.get(), i, 1)});
+    }
+    return results;
+}
+
+std::optional<LinkedResourceState>
+ScimStore::linked_resource_active(const std::string& iss, const std::string& sub) const {
+    if (!open_)
+        return std::nullopt; // store unusable — caller MUST fail closed
+    if (iss.empty() || sub.empty())
+        return LinkedResourceState{}; // nothing to look up — a definitive non-match, not a store error
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt; // lease timeout — store error, not "no link"
+
+    // LEFT JOIN is load-bearing (see the .hpp doc comment): an INNER join
+    // would collapse an orphaned link (scim_resources row hard-DELETEd,
+    // identity_links not FK-cascaded) into "no rows", which reads as "no
+    // link" and lets a fully-deprovisioned identity re-authenticate.
+    // il.scim_id is carried alongside sr.active so a DENY can name which
+    // resource drove it — a self-contained CC6.8 audit row, not just "denied".
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT il.scim_id, sr.active FROM scim_store.identity_links il "
+        "LEFT JOIN scim_store.scim_resources sr ON sr.scim_id = il.scim_id "
+        "WHERE il.iss = $1 AND il.sub = $2 LIMIT 1",
+        std::vector<std::string>{iss, sub});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt; // query failed — store error, not "no link"
+
+    if (PQntuples(res.get()) == 0)
+        return LinkedResourceState{}; // no identity_links row — genuinely no link
+
+    // Exactly one linked row. il.scim_id is NOT NULL (identity_links schema),
+    // so this is always populated once a row matched. NULL sr.active means
+    // the join found no matching scim_resources row (orphaned link) —
+    // reported as an engaged scim_id with active left nullopt; the caller
+    // treats that identically to an explicit active=false: deny.
+    LinkedResourceState state;
+    state.scim_id = col(res.get(), 0, 0);
+    if (!PQgetisnull(res.get(), 0, 1))
+        state.active = to_bool(PQgetvalue(res.get(), 0, 1));
+    return state;
+}
+
+std::optional<LinkedResourceState>
+ScimStore::saml_linked_resource_active(const std::string& entity_id,
+                                       const std::string& name_id) const {
+    if (!open_)
+        return std::nullopt; // store unusable — caller MUST fail closed
+    if (entity_id.empty() || name_id.empty())
+        return LinkedResourceState{}; // nothing to look up — a definitive non-match, not a store error
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt; // lease timeout — store error, not "no link"
+
+    // LEFT JOIN is load-bearing (see the .hpp doc comment): an INNER join
+    // would collapse an orphaned link (scim_resources row hard-DELETEd,
+    // saml_identity_links not FK-cascaded) into "no rows", which reads as
+    // "no link" and lets a fully-deprovisioned identity re-authenticate.
+    // sl.scim_id is carried alongside sr.active so a DENY can name which
+    // resource drove it — a self-contained CC6.8 audit row, not just "denied".
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT sl.scim_id, sr.active FROM scim_store.saml_identity_links sl "
+        "LEFT JOIN scim_store.scim_resources sr ON sr.scim_id = sl.scim_id "
+        "WHERE sl.entity_id = $1 AND sl.name_id = $2 LIMIT 1",
+        std::vector<std::string>{entity_id, name_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt; // query failed — store error, not "no link"
+
+    if (PQntuples(res.get()) == 0)
+        return LinkedResourceState{}; // no saml_identity_links row — genuinely no link
+
+    // Exactly one linked row. sl.scim_id is NOT NULL (saml_identity_links
+    // schema), so this is always populated once a row matched. NULL
+    // sr.active means the join found no matching scim_resources row
+    // (orphaned link) — reported as an engaged scim_id with active left
+    // nullopt; the caller treats that identically to an explicit
+    // active=false: deny.
+    LinkedResourceState state;
+    state.scim_id = col(res.get(), 0, 0);
+    if (!PQgetisnull(res.get(), 0, 1))
+        state.active = to_bool(PQgetvalue(res.get(), 0, 1));
+    return state;
+}
+
 // ── OIDC login observations (ADR-2001 D2 detector) ──────────────────────
 
 bool ScimStore::record_login_observation(const std::string& iss, const std::string& sub,
@@ -965,6 +1154,48 @@ bool ScimStore::observation_matches(const std::string& claim_value) const {
         "SELECT 1 FROM scim_store.oidc_login_observations WHERE claim_value = $1 LIMIT 1",
         std::vector<std::string>{claim_value});
     return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) > 0;
+}
+
+// ── SAML login observations (ADR-2001 #3072) ────────────────────────────
+
+bool ScimStore::record_saml_login_observation(const std::string& entity_id,
+                                              const std::string& name_id,
+                                              const std::string& name_id_format) {
+    if (!open_ || entity_id.empty() || name_id.empty())
+        return false;
+
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return false;
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "INSERT INTO scim_store.saml_login_observations "
+        "(entity_id, name_id, name_id_format, seen_at) "
+        "VALUES ($1, $2, $3, extract(epoch FROM now())::bigint) "
+        "ON CONFLICT (entity_id, name_id, name_id_format) DO UPDATE "
+        "SET seen_at = EXCLUDED.seen_at",
+        std::vector<std::string>{entity_id, name_id, name_id_format});
+    return res.status() == PGRES_COMMAND_OK;
+}
+
+std::optional<bool> ScimStore::saml_observation_matches(const std::string& name_id) const {
+    if (!open_)
+        return std::nullopt; // store unusable — caller MUST skip, not false-positive
+    if (name_id.empty())
+        return false; // nothing to look up — a definitive non-match, not a store error
+
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt; // lease timeout — store error, caller MUST skip
+
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT 1 FROM scim_store.saml_login_observations WHERE name_id = $1 LIMIT 1",
+        std::vector<std::string>{name_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::nullopt; // query failed — store error, caller MUST skip
+    return PQntuples(res.get()) > 0;
 }
 
 } // namespace yuzu::server

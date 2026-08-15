@@ -79,6 +79,7 @@ This is intentional cross-surface behaviour: during an audit-store blip a browsi
   - [Custom Properties](#custom-properties)
   - [Webhooks](#webhooks)
   - [Offload Targets](#offload-targets)
+  - [Network Discovery](#network-discovery)
   - [Workflows](#workflows)
   - [OpenAPI Spec](#openapi-spec)
   - [Discovery (A2)](#discovery-a2)
@@ -1260,9 +1261,17 @@ The admin route emits two distinct 400 bodies — operators scripting the endpoi
 }
 ```
 
-The `username` parameter accepts either a strict local username OR a durable SSO principal (`is_valid_principal`, #1852) — in practice this means an **OIDC** principal (`oidc:<iss>#<sub>`), so an admin can force-log-out an SSO operator authenticated via OIDC today. Local usernames stay on the strict alphanumeric/`._-` charset; an SSO principal permits the `: # / . _ - @ ~ % |` alphabet a real IdP issuer URL and opaque subject need. NUL bytes, control characters, newlines, and shell/SQL metacharacters (`;`, `=`, `\`, quotes, backtick, space) are rejected in both cases — passing them through to the SQL bind would silently truncate/diverge from the audited target string (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
+The `username` parameter accepts either a strict local username OR a durable SSO principal (`is_valid_principal`, #1852) — an **OIDC** principal (`oidc:<iss>#<sub>`) or, since ADR-2001 PR4a, a **SAML** principal (`saml:<entity_id>#<NameID>`), so an admin can force-log-out an SSO operator authenticated via either protocol. Local usernames stay on the strict alphanumeric/`._-` charset; an SSO principal permits the `: # / . _ - @ ~ % |` alphabet a real IdP issuer URL and opaque subject need. NUL bytes, control characters, newlines, and shell/SQL metacharacters (`;`, `=`, `\`, quotes, backtick, space) are rejected in both cases — passing them through to the SQL bind would silently truncate/diverge from the audited target string (sec-H1). A 400 with the `invalid username format` message indicates the client has malformed input; retrying with the same value will not succeed.
 
-**SAML is NOT force-loggable today.** A SAML session's `Session::username` is the raw IdP-supplied NameID (`create_saml_session` sets it verbatim, never a `saml:<idp>#<nameid>` shape) — a NameID is commonly an email address, and `@` fails `is_valid_principal` (it lacks the `saml:` reserved prefix that would unlock the wider SSO charset). A SAML operator's NameID therefore typically 400s against this endpoint, and there is no other revocation lever for a SAML session. This is a tracked gap, not an intentional restriction — see #1859/#1860.
+**SAML sessions are now force-loggable (ADR-2001 PR4a).** A SAML session's `Session::username` is the stable principal `saml:<entity_id>#<NameID>` (`saml_principal_id`, mirroring the OIDC shape exactly), not the raw NameID — `create_saml_session` mints it via the `saml:` reserved prefix, which `is_valid_principal` accepts on the same wider SSO charset as `oidc:`. An admin can therefore force-log-out a SAML operator with:
+
+```bash
+curl -s -X DELETE \
+  -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/sessions?username=saml%3Aentity-id%23NameID"
+```
+
+(URL-encode the `:` and `#`.) SAML sessions are also revoked automatically as part of SCIM deprovision — see "SCIM ↔ SAML identity linkage" in `docs/user-manual/scim-provisioning.md`, which covers the NameID-Format precondition for that automatic linkage. This closes the gap previously tracked as #1859/#1860.
 
 **Error (403) -- caller lacks `UserManagement:Write`:**
 
@@ -1419,6 +1428,20 @@ list entirely, not merely hidden from write access.
 
 **Permission:** `Security:Read`, scoped per-device
 
+> **Fail-closed on a degraded read (ADR-0047).** A store/pool/query failure
+> returns `503` (`"quarantine list unavailable — try again"`), never a
+> silently-empty list — a device could still be actively contained while the
+> caller would otherwise see "nothing quarantined". A **second, distinct**
+> `503` cause exists for the per-record admit-then-filter scope check itself:
+> if it hits an anomalous outcome partway through the list (neither an
+> explicit allow nor an explicit deny — most commonly a transient
+> engine-principal-store outage), the whole list fails closed with
+> `"authorization check unavailable — try again"` rather than silently
+> omitting the affected record(s). Only the first cause increments
+> `yuzu_server_quarantine_read_degrade_total` — see
+> `docs/user-manual/upgrading.md` and `docs/user-manual/metrics.md` for the
+> full distinction.
+
 **Response:**
 
 ```json
@@ -1477,6 +1500,15 @@ Quarantine a device.
 }
 ```
 
+> **`400` vs `503` (ADR-0047).** A `400` means a business/state error (a
+> missing `agent_id`, or the device is already quarantined) — retrying the
+> identical request will not succeed, and `error.retry_after_ms` is
+> `null`. A `503` means a genuine store/pool failure — retrying is
+> reasonable, and `error.retry_after_ms` carries a concrete `5000`
+> hint (REST's envelope has no nested `data` object — that's MCP's JSON-RPC
+> shape; REST matches the MCP `quarantine_device` twin's A5 behavior, not
+> its exact field path).
+
 ---
 
 #### `DELETE /api/v1/quarantine/{agent_id}`
@@ -1493,6 +1525,10 @@ Release a device from quarantine.
   "meta": { "api_version": "v1" }
 }
 ```
+
+> **`400` vs `503` (ADR-0047).** Same distinction as `POST` above — `400`
+> means the device is not currently quarantined (retrying will not help);
+> `503` means a genuine store/pool failure (retrying is reasonable).
 
 ---
 
@@ -2550,7 +2586,7 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `api.v1.events.subscribe` | Agentic-first SSE subscribe to `/api/v1/events?execution_id=<id>` (sprint W5.1). `result=success`. Detail format: `correlation_id=req-<hex-ms>-<hex-seq>` so SIEM rules can join the audit row to the response's `X-Correlation-Id` header. Deliberately separated from `execution.live_subscribe` so the SIEM can distinguish browser-tier vs agentic-worker consumers. Same no-dedup policy (#700). Post-auth denial branches (404 unknown execution / 410 terminal / 503 unavailable) do not audit but write a `spdlog::warn` row carrying the cid and the authenticated principal so an operator can reconstruct what happened without the client surfacing the cid. |
 | `instruction.create` | Instruction definition created. `result` ∈ {`success`, `denied`}. Denied detail value: `duplicate_id` (409, explicit `id` already exists). |
 | `instruction.scope_resolution_failed` | Emitted at dispatch when a `from_result_set:` reference in the scope cannot be resolved (set absent, TTL-expired, or not owned by the dispatching principal). `result=failure`. Detail format: `INSTRUCTION_SCOPE_RESOLUTION_FAILED command=<command_id> ref=<id-or-alias> reason=...`. Fires on all scoped dispatch paths (generic REST, tracked, MCP) and increments the `yuzu_scope_resolution_failed_total` metric; as of governance M1 (2026-07-29) the **entire dispatch is aborted** — no devices are targeted, including from other scope atoms — recorded by a paired `scope.evaluation_aborted` row with `reason=owner_check_failed`. |
-| `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (result-set store could not answer an alias/owner/membership read — ADR-0036), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator). Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
+| `scope.evaluation_aborted` | Emitted when a scoped dispatch is aborted fail-closed before any device is targeted. `result=failure`. Reasons: `db_degraded` (a `from_result_set:<id>` alias/owner/membership read against the result-set store could not answer — ADR-0036 — **or** a `props.<key>` bulk preload against the custom-properties store could not answer — ADR-0045; both abort the same way and share this reason value), `owner_check_failed` (a referenced set is absent, expired, or not owned — paired with per-ref `instruction.scope_resolution_failed` rows), `principal_unresolved` (a tracked/MCP dispatch could not recover the dispatching operator). Fires on all three scoped dispatch paths, plus the no-principal tracked-closure guard (principal_unresolved only). |
 | `bundle.dispatch` | Live-query bundle dispatched via `POST /api/v1/bundles` (ADR-0011). `target_type=Execution`. `result=success` (`target_id=<bundle-… correlation id>`, detail `agent=<id> steps=<n>`) or `result=failure` (dispatch threw — `target_id` empty, detail `agent=<id> error=<…>`). |
 | `bundle.<plugin>.<action>` | One step of a live-query bundle, emitted per step at dispatch — the device-access lens. `target_type=Agent`, `target_id=<agent_id>`. `result=dispatched` (reached the agent) or `result=no_agents` (reached zero agents → `dispatch_failed` on collate). A bundle of N steps emits N of these, so it is exactly as auditable as N separate executions (works-council parity). Emitted on **both** the REST and MCP surfaces (the per-step verb is transport-agnostic; the MCP tool-call envelope additionally audits as `mcp.execute_bundle`). |
 | `bundle.collate` | Live-query bundle collated via `GET /api/v1/bundles/{id}`. `target_type=Execution`, `target_id=<correlation id>`. `result=success` (detail `complete=0\|1`), `result=denied` (`not found or not owned` — the 404 covers both an unknown id and a non-owner, so the audit row is where the real reason is recorded), or `result=failure` (`response store degraded` — a 503, distinct from `denied`: the bundle WAS found and owned, the read just could not be served; retryable, `retry_after_ms:5000`). |
@@ -3456,6 +3492,15 @@ List all custom properties for a specific agent.
 
 **Permission:** `Infrastructure:Read`
 
+**Error (503) -- store degraded:** `custom_properties_store` is a migrated Postgres store
+(authoritative posture); a transient database read failure returns `503` rather than an
+empty/partial property list, so automation never mistakes a degraded read for "this agent has no
+properties."
+
+```json
+{"error":{"code":503,"message":"custom properties store degraded"},"meta":{"api_version":"v1"}}
+```
+
 **Response:**
 
 ```json
@@ -3508,6 +3553,23 @@ Set or update a custom property value on an agent. If a property schema exists f
 }
 ```
 
+**Error (503) -- store outage:**
+
+```json
+{"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}}
+```
+
+**Note on database degrade:** a transient database failure during this write — store not open, a
+pool/query failure on the property INSERT, or a failure on the schema-validation lookup itself —
+now surfaces as this distinguishable `503`, matching `GET /api/agents/:id/properties` above.
+Caller-input validation failures (invalid key/value shape, or a value rejected against an existing
+schema) stay `400`. This closes a gap where every failure, including a genuine store outage,
+collapsed to the same `400` a caller couldn't distinguish from their own bad input (gov Gate 8
+finding, fjarvis re-review of PR #3065). A transient failure on the schema-validation lookup used
+to be silently treated by the SQLite original as "no schema, accept any value" — that fail-open
+was already closed by the original Postgres migration (it correctly rejects the write instead of
+accepting it unvalidated); this change only affects which status code that rejection now uses.
+
 ---
 
 #### `DELETE /api/agents/:id/properties/:key`
@@ -3525,6 +3587,13 @@ Delete a custom property from an agent.
 }
 ```
 
+**Note on database degrade:** a transient database failure during this delete currently surfaces
+as the same `404` ("property not found") a genuine miss would return — not yet type-widened,
+predates the Postgres migration. Unlike `PUT`/`POST` above (fixed to a distinguishable `503`),
+this route's underlying `delete_property` was deliberately left unwidened — it's an
+admin/operator-driven delete, not a scope/dispatch-feeding read, matching `custom_properties_store.hpp`'s
+documented posture — so this stays a tracked gap rather than a fixed one.
+
 ---
 
 #### `GET /api/property-schemas`
@@ -3532,6 +3601,13 @@ Delete a custom property from an agent.
 List all property schemas. Schemas define the allowed keys, types, and validation constraints for custom properties.
 
 **Permission:** `Infrastructure:Read`
+
+**Note on database degrade:** a transient database failure during this list currently surfaces as
+a `200` with an empty `data` array — indistinguishable from "no schemas configured." Not yet
+type-widened, predates the Postgres migration. Unlike `PUT`/`POST` above (fixed to a
+distinguishable `503`), this route's underlying `list_schemas` was deliberately left unwidened —
+it's an admin-surface read, not scope/dispatch-feeding, matching `custom_properties_store.hpp`'s
+documented posture — so this stays a tracked gap rather than a fixed one.
 
 **Response:**
 
@@ -3595,6 +3671,18 @@ Create or update a property schema. If a schema with the given key already exist
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Error (503) -- store outage:**
+
+```json
+{"error":{"code":503,"message":"custom properties store unavailable"},"meta":{"api_version":"v1"}}
+```
+
+**Note on database degrade:** a transient database failure during this write (store not open, a
+pool lease timeout, or a query failure) surfaces as this distinguishable `503`. Caller-input
+validation failures (invalid key, unrecognized type, an invalid/oversized validation regex) stay
+`400` (gov Gate 8 finding, fjarvis re-review of PR #3065 — the same fix as `PUT
+/api/agents/:id/properties/:key` above).
 
 ---
 
@@ -3755,6 +3843,84 @@ Recent delivery attempts for a target (default 50, override via `?limit=N`). Eac
 **Cleartext HTTP warning.** When `url` is `http://` (not `https://`), the entire JSON payload — including potentially sensitive instruction response data (file paths, registry values, software inventory, security findings) — is transmitted in cleartext. Production deployments containing customer endpoint data should use `https://` only. The store accepts `http://` for development convenience and to maintain parity with the webhook precedent.
 
 **Operator trust model.** Any principal with `Infrastructure:Write` can register an offload target pointing at any URL the server can resolve, including RFC1918 / loopback / link-local destinations. There is no URL allowlist or network-egress mitigation in this revision; the trust model is "Infrastructure:Write operators are trusted to choose where data goes." For multi-tenant managed deployments this is a known limitation tracked as a roadmap follow-up.
+
+---
+
+### Network Discovery
+
+Network-discovered devices (Issue 7.18) — raw scan results agents report before an operator promotes a device to a managed agent. Backed by `discovery_store` on the shared PostgreSQL substrate (ADR-0044). Not to be confused with [Discovery (A2)](#discovery-a2) above, which is the unrelated agentic self-discovery family (`/api/v1/discover/*`).
+
+#### `POST /api/discovery/scan`
+
+Store discovery scan results. Requires `Infrastructure:Write`. Upserts one row per device by `ip_address` — `mac_address`/`last_seen`/`subnet` always refresh on a re-scan; `hostname` refreshes only when the new value is non-empty; a re-scan never touches an existing row's `managed`/`agent_id`/`discovered_at`/`discovered_by`.
+
+**Request:**
+
+```json
+{
+  "subnet": "10.0.0.0/24",
+  "discovered_by": "agent-scanner-01",
+  "devices": [
+    {"ip_address": "10.0.0.5", "mac_address": "aa:bb:cc:dd:ee:ff", "hostname": "workstation-05"}
+  ]
+}
+```
+
+`devices[].ip_address` is required per entry; an entry with an empty `ip_address` is silently skipped and not counted.
+
+**Response (200, all or partial success):**
+
+```json
+{"status": "ok", "devices_stored": 1, "devices_failed": 0}
+```
+
+A partial batch failure (e.g. under a degraded Postgres pool) still returns `200` but `"status": "partial"` with `devices_failed > 0`, and audits `discovery.scan` as `"partial"`:
+
+```json
+{"status": "partial", "devices_stored": 1, "devices_failed": 1}
+```
+
+**Response (503, every attempted device failed):**
+
+```json
+{"error":{"code":503,"message":"discovery scan storage degraded"},"meta":{"api_version":"v1"}}
+```
+
+Returned only when every device the request attempted to persist failed — an entry skipped for an empty `ip_address` is not counted as an attempt, so an all-skip batch still returns `200`/`"ok"`. Audits `discovery.scan` as `"failure"`.
+
+Re-sending the exact same request body after a `503` or a `"partial"` response is safe: `upsert_device` is idempotent per `ip_address` (see the upsert semantics above), so a byte-identical retry does not double-count or corrupt already-stored devices. This is narrower than "safe to re-scan": a fresh scan is not a replay, and `mac_address`/`subnet` overwrite unconditionally on every upsert (unlike `hostname`, which only refreshes on a non-empty value) — a re-scan that this time fails to resolve a device's MAC (e.g. a transient ARP miss) will blank a previously known-good `mac_address`, not merely retry the failed write.
+
+There is currently no scan-path-specific Prometheus degrade signal (unlike `GET /api/discovery/results`, which increments `yuzu_server_discovery_read_degrade_total`) — `devices_failed` in the response body, and the audit trail's `"partial"`/`"failure"` outcomes, are the per-request evidence today; the shared `yuzu_pg_*` connection-pool metrics are the closest backend-health proxy. A write-path degrade counter is tracked as a follow-up.
+
+#### `GET /api/discovery/results`
+
+List discovered devices. Requires `Infrastructure:Read`. Optional `?subnet=` query param filters to one subnet; omitted returns every discovered device, newest-`last_seen`-first.
+
+**Response (200):**
+
+```json
+{
+  "devices": [
+    {
+      "id": 1,
+      "ip_address": "10.0.0.5",
+      "mac_address": "aa:bb:cc:dd:ee:ff",
+      "hostname": "workstation-05",
+      "managed": false,
+      "agent_id": "",
+      "discovered_by": "agent-scanner-01",
+      "discovered_at": 1714501234,
+      "last_seen": 1714501234,
+      "subnet": "10.0.0.0/24"
+    }
+  ],
+  "total": 1
+}
+```
+
+**Response (503, degraded read):** `{"error":{"code":503,"message":"discovery read degraded"},"meta":{"api_version":"v1"}}`. `discovery_store` is an authoritative store (ADR-0012 §1) — a query/pool failure surfaces as `503`, never as a silently-empty device list. See `yuzu_server_discovery_read_degrade_total{reason}` (`store_not_open`/`pool_acquire_timeout`/`query_error`).
+
+`mark_managed` and `clear_results` exist on the underlying store but have **no REST route today** — dead surface, noted in ADR-0044's Follow-ups.
 
 ---
 
@@ -7388,7 +7554,7 @@ Begin the SAML 2.0 SP-initiated login flow. Builds an `<samlp:AuthnRequest>` and
 
 #### `POST /saml/acs`
 
-SAML Assertion Consumer Service endpoint. The IdP POSTs the `<samlp:Response>` here after authentication (HTTP-POST binding). The server validates the signed assertion (signature, audience, recipient, expiry, `InResponseTo` single-use) and mints a session cookie on success. On validation failure, the browser is redirected to `/login` with an error. Available only when SAML is enabled (see `GET /auth/saml/start`).
+SAML Assertion Consumer Service endpoint. The IdP POSTs the `<samlp:Response>` here after authentication (HTTP-POST binding). The server validates the signed assertion (signature, audience, recipient, expiry, `InResponseTo` single-use) and mints a session cookie on success. On validation failure, the browser is redirected to `/login` with an error. Available only when SAML is enabled (see `GET /auth/saml/start`). When SCIM linkage is configured (ADR-2001 §4/PR4b), a login whose linked SCIM resource resolves deprovisioned is also refused here — see `auth.saml.deprovisioned_denied` below and `docs/user-manual/scim-provisioning.md` "Deny-at-login: a deprovisioned SAML identity cannot re-authenticate".
 
 ---
 
@@ -7599,6 +7765,10 @@ Audit `result` is `success` | `failure` | `denied` (not `ok`/`error`).
 | `scim.group.deleted` | `success` / `failure` | `DELETE /scim/v2/Groups/{id}` succeeds / audit-write failure (set-and-proceed) |
 | `scim.user.role_changed` | `success` / `failure` | A user's role is recomputed to a new value on user create or a Group create/replace/patch/delete (records `old_role`→`new_role`, `reason=group`) |
 | `scim.user.deprovision_role_refused_with_link` | `failure` | ADR-2001 D1: a role-refused deprovision (`deprovision_role_ok` 404 — the slug's role is not `user`) for a slug with ≥1 active linked OIDC identity, whose tokens are therefore NOT auto-revoked. Always written alongside `yuzu_scim_deprovision_role_refused_with_active_link_total` — see `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
+| `auth.oidc.deprovisioned_denied` | `failure` | ADR-2001 §4/PR3: an OIDC login was refused because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the store could not answer — fail-closed). Emitted from `GET /auth/callback`, not a `/scim/v2/*` route — listed here because it is part of the same ADR-2001 linkage. `detail` carries `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource (deactivated, or orphaned by a hard-deleted `scim_resources` row) drove the denial, or `reason=scim_store_unavailable` when the store could not answer (fail-closed — no `scim_id` to name); and — only on the post-mint re-check path (a concurrent deprovision landed after the primary check) — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). The two `reason` values keep a genuine deprovision (CC6.8 evidence) distinguishable from a store outage. Pairs with `yuzu_auth_oidc_deprovisioned_denied_total`. |
+| `auth.saml.deprovisioned_denied` | `failure` | ADR-2001 §4/PR4b, the SAML analogue of the row above: a SAML login was refused at `POST /saml/acs` because its linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row) or because `ScimStore` could not answer at all (fail-closed). Principal is the `saml:<entity_id>#<NameID>` string. `detail` uses the identical shape the OIDC row above uses: `reason=linked_scim_resource_inactive;scim_id=<id>` when a resolved resource drove the denial, or `reason=scim_store_unavailable` (no `scim_id`) when the store itself could not be asked; and — only on the post-mint re-check path — `post_mint_recheck=true;sessions_invalidated=<N>` (+`db_persisted=false` if that session invalidation itself failed to persist). Pairs with `yuzu_auth_saml_deprovisioned_denied_total`. |
+| `auth.saml.link_unmatched` | `failure` | ADR-2001 #3072: on a SAML login with a linkable (stable-Format) NameID, the identity-link lookup ran but found either zero active SCIM resources matching the NameID as an `externalId` (`reason=no_active_external_id_match;name_id_format=<format>`) or more than one (`reason=ambiguous_active_external_id_match;name_id_format=<format>`, ADR-2001 §2 mis-link guard). **Observe-and-proceed — the SAML login still succeeds** (login-time linking is fail-open by contract; this is not the PR4b deny-at-login path). The two causes pair with separate counters, `yuzu_scim_saml_link_unmatched_total` and `yuzu_scim_saml_link_ambiguous_total` respectively, despite sharing one audit action. Emitted from `POST /saml/acs`. See `docs/auth-architecture.md` "SAML D2 observability (#3072)". |
+| `auth.saml.link_lookup_failed` | `failure` | ADR-2001 #3072: on a SAML login with a linkable NameID, the `ScimStore` active-`externalId` lookup itself could not answer (`reason=scim_store_unavailable`) — distinct from `auth.saml.link_unmatched`'s genuine zero-match answer. **Observe-and-proceed — the SAML login still succeeds.** Pairs with `yuzu_scim_saml_link_lookup_failures_total`. Emitted from `POST /saml/acs`. |
 
 #### Metrics
 
@@ -7612,12 +7782,36 @@ rows).
 **ADR-2001 (SCIM↔OIDC identity linkage, CC6.8):**
 `yuzu_scim_deprovision_role_refused_with_active_link_total` (D1 — a
 deprovision was refused for a slug with an active linked federated identity
-whose tokens were not auto-revoked; a human must terminate them manually)
-and `yuzu_scim_deprovision_unlinked_total` (D2 — a deprovision found a
+whose tokens were not auto-revoked; a human must terminate them manually),
+`yuzu_scim_deprovision_unlinked_total` (D2 — a deprovision found a
 login observation that should have matched the slug's `externalId` but no
-link had formed, almost always a misconfigured `--oidc-scim-link-claim`).
+link had formed, almost always a misconfigured `--oidc-scim-link-claim`),
+`yuzu_auth_oidc_deprovisioned_denied_total` (§4/PR3 — the deny-at-login
+backstop refused an OIDC re-login against a deprovisioned linked identity),
+`yuzu_scim_saml_link_write_failures_total` (a SAML login's identity-link
+write failed — see `docs/user-manual/scim-provisioning.md` "SCIM ↔ SAML
+identity linkage"), and `yuzu_auth_saml_deprovisioned_denied_total`
+(§4/PR4b — the SAML analogue of the OIDC deny-at-login backstop above,
+refused a SAML re-login against a deprovisioned linked identity); see the
+audit actions above and `docs/user-manual/metrics.md` "SSO login metrics".
 Full description: `docs/auth-architecture.md` "SCIM v2 provisioning" §
 Metrics and "SCIM ↔ OIDC identity linkage for deprovision" § New metrics.
+
+**ADR-2001 #3072 (SAML D2 observability):**
+`yuzu_scim_saml_link_unmatched_total` /
+`yuzu_scim_saml_link_ambiguous_total` (login-time: a linkable-Format SAML
+NameID matched zero / more than one active SCIM resource — pairs with
+`auth.saml.link_unmatched` above), `yuzu_scim_saml_link_lookup_failures_total`
+(login-time: the active-`externalId` lookup itself could not answer — pairs
+with `auth.saml.link_lookup_failed` above), and
+`yuzu_scim_deprovision_saml_unlinked_total` (deprovision-time: the SAML
+analogue of `yuzu_scim_deprovision_unlinked_total` above — a deprovision
+found a SAML login observation matching the slug's `externalId` but no
+formed `saml_identity_links` row). See
+`docs/auth-architecture.md` "SAML D2 observability (#3072)" for the honest
+scope of what each half (login-time vs. deprovision-time) can and cannot
+attribute, and `docs/user-manual/metrics.md` "SCIM deprovision-linkage
+metrics" for the operator-facing description.
 
 ---
 
