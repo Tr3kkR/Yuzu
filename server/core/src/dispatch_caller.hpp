@@ -55,4 +55,35 @@ struct DispatchCaller {
     bool system = false;
 };
 
+/// Build the `DispatchCaller` for a STORED username with no live session —
+/// today only `ScheduleRunner`'s fire path, which re-resolves the schedule
+/// creator's authority from a bare string at fire time. Pure so the one
+/// decision that matters is directly testable:
+///
+/// `principal_resolves == false` (the account no longer exists, the auth
+/// store errored, or no auth store is wired) returns an EMPTY-principal,
+/// deny-all caller — which `build_classified_command` refuses as
+/// `AnonymousOperator` BEFORE any permission check runs, independent of the
+/// RBAC on/off toggle. This is the ADR-0033 §1 rule ("an unresolvable,
+/// missing or unparseable input for a filter that applies denies") applied
+/// to the authenticated-actor filter, and it is load-bearing precisely on
+/// the RBAC-off default posture: every OTHER dispatch surface derives its
+/// caller from a live `auth::Session`, which a deleted account cannot
+/// produce, so this resolver is the only place where "the account still
+/// exists" must be enforced explicitly rather than falling out of
+/// authentication. (Round-2 review finding on #3133: an earlier version
+/// returned the bare username with legacy-open visibility here, so a
+/// deleted creator's schedule kept firing unfiltered on a default install.)
+[[nodiscard]] inline DispatchCaller caller_for_stored_username(const std::string& username,
+                                                               bool principal_resolves,
+                                                               std::string principal_role,
+                                                               authz::VisibleSet exec_visible) {
+    if (!principal_resolves)
+        return DispatchCaller{.exec_visible = authz::deny_all()};
+    return DispatchCaller{.principal = username,
+                          .principal_role = std::move(principal_role),
+                          .exec_visible = std::move(exec_visible),
+                          .system = false};
+}
+
 } // namespace yuzu::server

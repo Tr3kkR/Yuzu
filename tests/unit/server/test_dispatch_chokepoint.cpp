@@ -286,6 +286,50 @@ TEST_CASE("classify_and_authorize_dispatch: a DispatchCaller with system == fals
     CHECK(result.error().reason == DispatchDenialReason::AnonymousOperator);
 }
 
+// #3133 round-2 review HIGH (falsifier): a schedule whose stored creator no
+// longer resolves must be DENIED at the chokepoint even when RBAC is
+// administratively off (the shipped default), where the permission callback
+// admits everyone. The full chain, at the pure level: the resolver decision
+// (caller_for_stored_username) yields an empty-principal deny-all caller for
+// an unresolvable username, and the chokepoint refuses that caller as
+// AnonymousOperator BEFORE the always-allowing permission callback is ever
+// consulted. Every other dispatch surface gets account-existence for free
+// from session authentication; the schedule fire path is the only one that
+// recovers authority from a bare stored string, which is why this exact
+// composition needs its own lock.
+TEST_CASE("caller_for_stored_username: an unresolvable creator denies at the chokepoint "
+          "even with an always-allowing (RBAC-off) permission callback",
+          "[server][dispatch][chokepoint][schedule]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kOperatorFixture)};
+
+    SECTION("unresolvable: empty principal, deny-all visibility, chokepoint refuses") {
+        const auto caller = caller_for_stored_username("alice", /*principal_resolves=*/false,
+                                                       "admin", std::nullopt);
+        CHECK(caller.principal.empty());
+        CHECK_FALSE(caller.system);
+        // Present-EMPTY visible set (deny-all), never nullopt-unfiltered.
+        REQUIRE(caller.exec_visible.has_value());
+        CHECK(caller.exec_visible->empty());
+
+        auto result =
+            classify_and_authorize_dispatch(registry, caller, "filesystem", "read", always_allow);
+        REQUIRE_FALSE(result.has_value());
+        CHECK(result.error().reason == DispatchDenialReason::AnonymousOperator);
+    }
+    SECTION("resolvable: the caller carries through untouched") {
+        const auto caller = caller_for_stored_username("alice", /*principal_resolves=*/true,
+                                                       "operator", std::nullopt);
+        CHECK(caller.principal == "alice");
+        CHECK(caller.principal_role == "operator");
+        CHECK_FALSE(caller.system);
+        CHECK_FALSE(caller.exec_visible.has_value()); // nullopt passed through unchanged
+
+        auto result =
+            classify_and_authorize_dispatch(registry, caller, "filesystem", "read", always_allow);
+        REQUIRE(result.has_value());
+    }
+}
+
 TEST_CASE("classify_and_authorize_dispatch: a non-authorized operator principal is denied, "
           "naming the securable it was denied on — four call-site shapes",
           "[server][dispatch][chokepoint]") {

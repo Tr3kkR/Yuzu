@@ -76,10 +76,17 @@ struct Harness {
             -> std::pair<std::string, int> {
             dispatched.push_back({action, agents});
             dispatch_callers.push_back(caller);
-            return {"cmd", static_cast<int>(agents.size())};
+            // deny_dispatch mirrors a chokepoint refusal: dispatch_confined
+            // returns {command_id, 0} on a denial (the command_id is minted
+            // before classification), so a denied and a zero-reach dispatch
+            // are indistinguishable to the engine — which is exactly why the
+            // engine must settle the claim on ANY zero-sent outcome.
+            return {"cmd", deny_dispatch ? 0 : static_cast<int>(agents.size())};
         };
         return d;
     }
+
+    bool deny_dispatch{false};
 
     int dispatch_count(const std::string& action, const std::string& agent) const {
         int n = 0;
@@ -188,6 +195,54 @@ TEST_CASE("deployment engine drives stage→execute, skips out-of-scope, runs on
     advance(deps, id, cfg, authorized, test_caller());
     advance(deps, id, cfg, authorized, test_caller());
     CHECK(h.dispatch_count("execute_staged", "a1") == 1); // still exactly one
+}
+
+// #3133 round-2 review MEDIUM (falsifier): a caller the chokepoint refuses —
+// e.g. holding SoftwareDeployment:Execute but not the Write that
+// content_dist.stage is classified as — used to leave every claimed device
+// stuck in 'staging' forever: the CAS claim ran BEFORE the dispatch outcome
+// was known and the {command_id, 0} refusal was discarded. The rows must
+// settle to a terminal step instead of wedging in an active one, and the
+// engine must not livelock re-claiming and re-denying on every tick.
+TEST_CASE("deployment engine settles a claim to failed when the dispatch is refused, "
+          "instead of wedging it in staging",
+          "[pg][deployment][engine]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string id = "e-denied";
+    REQUIRE(store.create_deployment(make_dep(id), {tgt("a1"), tgt("a2")}));
+
+    Harness h{store};
+    h.deny_dispatch = true; // every dispatch answers {command_id, 0} — a refusal
+    auto deps = h.deps();
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+    const std::unordered_set<std::string> authorized{"a1", "a2"};
+
+    // Tick 1: both devices are claimed, the dispatch is refused, and the rows
+    // settle to terminal 'failed' — never left in 'staging'.
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 1);
+    CHECK(step_of(store, id, "a1") == "failed");
+    CHECK(step_of(store, id, "a2") == "failed");
+
+    // The error names the refusal, so an operator reading the grid sees why
+    // nothing ran rather than a bare failure.
+    for (const auto& d : store.get_devices(id))
+        CHECK(d.error.find("refused or reached no agents") != std::string::npos);
+
+    // Ticks 2-3: terminal rows are never re-claimed or re-dispatched — no
+    // deny-livelock, and the deployment itself settles rather than running
+    // forever.
+    advance(deps, id, cfg, authorized, test_caller());
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 1); // still exactly one
+    auto dep = store.get_deployment(id);
+    REQUIRE(dep);
+    CHECK(dep->failed == 2);
 }
 
 TEST_CASE("deployment engine records a non-zero installer exit as failed",

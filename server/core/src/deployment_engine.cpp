@@ -117,10 +117,37 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
                 authorized.find(d.agent_id) != authorized.end())
                 cand.push_back(d.agent_id);
         auto claimed = deps.store->claim_for_stage(deployment_id, cand);
-        if (!claimed.empty())
-            deps.dispatch_fn("content_dist", "stage", claimed, "",
-                             {{"url", cfg.url}, {"filename", cfg.filename}, {"sha256", cfg.sha256}},
-                             stage_execution_id(deployment_id), caller);
+        if (!claimed.empty()) {
+            const auto [cmd, sent] = deps.dispatch_fn(
+                "content_dist", "stage", claimed, "",
+                {{"url", cfg.url}, {"filename", cfg.filename}, {"sha256", cfg.sha256}},
+                stage_execution_id(deployment_id), caller);
+            // #3133 round-2 review MEDIUM: the claim used to be uncondition-
+            // ally left in 'staging' with the dispatch result discarded — a
+            // chokepoint-denied dispatch (caller lacks the classified
+            // permission for content_dist.stage) or a zero-reach dispatch
+            // left every claimed row stuck in an active step forever, with
+            // no dispatched command and no transition to move it. Settle
+            // them to the terminal 'failed' with an honest error instead —
+            // via the same source-step-GUARDED transitions as every other
+            // mutation here, so a row a concurrent advance already moved is
+            // untouched. NOT 'pending': that would re-claim and re-deny on
+            // every tick forever. The authorization outcome itself is
+            // unchanged — the chokepoint already refused the dispatch; this
+            // only stops the state machine wedging on the refusal.
+            if (sent == 0) {
+                std::vector<DeviceTransition> rollback;
+                rollback.reserve(claimed.size());
+                for (const auto& aid : claimed)
+                    rollback.push_back({.agent_id = aid,
+                                        .from_step = step_token(Step::kStaging),
+                                        .to_step = step_token(Step::kFailed),
+                                        .error = "stage dispatch refused or reached no agents "
+                                                 "(command " +
+                                                 cmd + ", 0 sent)"});
+                deps.store->apply_results(deployment_id, rollback);
+            }
+        }
     }
 
     // ── 6. CAS-claim + dispatch EXECUTE to authorized 'staged' devices ───────
@@ -138,8 +165,26 @@ void advance(const EngineDeps& deps, const std::string& deployment_id, const Dep
                                                                 {"expected_hash", cfg.sha256}};
             if (!cfg.args.empty())
                 params["args"] = cfg.args;
-            deps.dispatch_fn("content_dist", "execute_staged", claimed, "", params,
-                             exec_execution_id(deployment_id), caller);
+            const auto [cmd, sent] =
+                deps.dispatch_fn("content_dist", "execute_staged", claimed, "", params,
+                                 exec_execution_id(deployment_id), caller);
+            // Same settle-on-refusal as the stage claim above. The execute-once
+            // property is PRESERVED, not weakened: claim_for_exec still claims
+            // each row exactly once, and a row settled to 'failed' here was
+            // never dispatched anywhere — there is no second execution to
+            // guard against, only a wedge to release.
+            if (sent == 0) {
+                std::vector<DeviceTransition> rollback;
+                rollback.reserve(claimed.size());
+                for (const auto& aid : claimed)
+                    rollback.push_back({.agent_id = aid,
+                                        .from_step = step_token(Step::kExecuting),
+                                        .to_step = step_token(Step::kFailed),
+                                        .error = "execute dispatch refused or reached no agents "
+                                                 "(command " +
+                                                 cmd + ", 0 sent)"});
+                deps.store->apply_results(deployment_id, rollback);
+            }
         }
     }
 

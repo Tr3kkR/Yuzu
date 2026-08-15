@@ -789,6 +789,7 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         // build_classified_command exactly like every other Write-classified action.
         const auto caller = caller_fn_(req);
         int applied = 0;
+        int refused_or_unreached = 0;
         std::size_t pos = 0;
         while (pos < changes.size()) {
             const auto comma = changes.find(',', pos);
@@ -816,6 +817,27 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             // not claim it was pushed (ADR-0015 review LOW-D).
             if (sent > 0)
                 ++applied;
+            else
+                ++refused_or_unreached;
+        }
+        // #3133 round-2 review minor: a chokepoint denial (the operator lacks
+        // the Infrastructure:Write that tar.configure is classified as) used
+        // to render the same "0 change(s) pushed" as an offline agent. The
+        // dispatch return can't distinguish the two ({command_id, 0} either
+        // way), so when nothing landed, probe scoped Write the same soft way
+        // can_execute probes Execute — for the MESSAGE only. The probe
+        // approximates the chokepoint's decision for display; the chokepoint
+        // itself remains the enforcement authority either way.
+        if (applied == 0 && refused_or_unreached > 0) {
+            httplib::Response probe;
+            const bool likely_authorized =
+                scoped_perm_fn_ && scoped_perm_fn_(req, probe, "Infrastructure", "Write", device);
+            if (!likely_authorized) {
+                note(res, "No changes pushed: modifying capture sources dispatches "
+                          "<code>tar.configure</code>, which needs the <b>Infrastructure "
+                          "Write</b> permission.");
+                return;
+            }
         }
         res.set_content(std::format("<span data-applied=\"{}\">{} change(s) pushed</span>", applied,
                                     applied),

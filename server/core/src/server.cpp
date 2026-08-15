@@ -8128,11 +8128,44 @@ private:
     /// `check_permission`/`visible_agents_for_permission` are username-keyed
     /// RBAC lookups, independent of any session, so this re-derives the
     /// creator's CURRENT grants rather than trusting a stale creation-time
-    /// snapshot. Fail-closed throughout: an unknown/deleted user or a
-    /// degraded RbacStore never resolves to unfiltered — same present-EMPTY
-    /// (deny-all) posture every other unwired/degraded caller path in this
-    /// file takes.
+    /// snapshot.
+    ///
+    /// EXISTENCE IS THE GATE (round-2 review HIGH): every other dispatch
+    /// surface gets "the account still exists" for free from authentication —
+    /// a deleted account cannot mint a Session. Here the username is a bare
+    /// stored string, so existence must be enforced explicitly, and it is the
+    /// one input whose failure must deny INDEPENDENT of RBAC mode: on the
+    /// RBAC-off default posture the permission callback admits everyone and
+    /// legacy-open visibility is unfiltered, so an unresolvable creator that
+    /// kept its bare username as `principal` would fire with full authority
+    /// forever (ADR-0033 §7: a departed scheduler's schedule STOPS). The
+    /// decision lives in `caller_for_stored_username` (dispatch_caller.hpp,
+    /// pure, directly tested): unresolvable — deleted/unknown user, an auth
+    /// store error, or no auth store at all — yields an EMPTY-principal,
+    /// deny-all caller, which `build_classified_command` refuses as
+    /// `AnonymousOperator` before any permission check runs.
     yuzu::server::DispatchCaller derive_dispatch_caller_for_username(const std::string& username) {
+        bool principal_resolves = false;
+        std::string role_label;
+        if (auth_db_ && !username.empty()) {
+            if (auto user = auth_db_->get_user(username)) {
+                principal_resolves = true;
+                role_label = auth::role_to_string(user->role);
+            } else {
+                spdlog::warn("schedule fire: creator '{}' no longer resolves ({}); denying "
+                             "fail-closed rather than firing on a stale identity",
+                             username,
+                             user.error() == AuthDBError::UserNotFound ? "account deleted/unknown"
+                                                                       : "auth store error");
+            }
+        } else if (!username.empty()) {
+            spdlog::warn("schedule fire: no auth store wired to verify creator '{}' exists; "
+                         "denying fail-closed",
+                         username);
+        }
+        if (!principal_resolves)
+            return yuzu::server::caller_for_stored_username(username, false, {}, {});
+
         yuzu::server::authz::ExecVisibleFacts facts;
         facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
         facts.global_grant =
@@ -8144,21 +8177,9 @@ private:
                 facts.scoped_visible = std::unordered_set<std::string>(v->begin(), v->end());
             // else: store error -> scoped_visible stays nullopt -> fail closed.
         }
-
-        std::string role_label;
-        if (auth_db_) {
-            if (auto user = auth_db_->get_user(username))
-                role_label = auth::role_to_string(user->role);
-            // else: unknown/deleted user -> role_label stays empty; exec_visible
-            // above is still correctly fail-closed independent of this label.
-        }
-
-        return yuzu::server::DispatchCaller{
-            .principal = username,
-            .principal_role = role_label,
-            .exec_visible = yuzu::server::authz::compose_exec_visible(facts),
-            .system = false,
-        };
+        return yuzu::server::caller_for_stored_username(
+            username, true, std::move(role_label),
+            yuzu::server::authz::compose_exec_visible(facts));
     }
 
     /// PR1.9c: a stable string label for `DispatchArm`, fed into
@@ -14632,14 +14653,21 @@ private:
         };
 
         // Shared command-dispatch closure — sends a CommandRequest to agents via
-        // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so the
-        // PolicyEvaluator and WorkflowRoutes drive the EXACT same dispatch path.
+        // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so every
+        // background consumer drives the EXACT same dispatch path.
         //
-        // PLAN-006: this is a genuine background/system dispatcher — its ONLY
-        // production caller is PolicyEvaluator (a compliance-check tick with no
-        // Session in the loop) — so it constructs `DispatchCaller{.system =
-        // true}` explicitly rather than leaving `principal` merely empty by
-        // default: a background dispatch is a deliberate, greppable statement.
+        // PLAN-006 (caller list corrected per #3133 round-2 review — it used to
+        // claim PolicyEvaluator was the only caller): the production consumers
+        // are PolicyEvaluator (compliance-check tick), PreflightRunner +
+        // PreflightRoutes (read-only preflight dispatch/re-dispatch), and the
+        // DexRoutes / DeviceRoutes live-info panels' canned read-only queries.
+        // All are either genuine background engines with no Session in the
+        // loop, or pre-existing read-only surfaces behind their own scoped
+        // gates (the latter tracked for caller-widening as a follow-up — see
+        // the #3133 round-1/2 review minors). It constructs
+        // `DispatchCaller{.system = true}` explicitly rather than leaving
+        // `principal` merely empty by default: a background dispatch is a
+        // deliberate, greppable statement.
         auto command_dispatch_fn =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
