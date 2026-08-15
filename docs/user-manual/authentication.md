@@ -435,11 +435,15 @@ OIDC's group-to-role reconciliation: when RBAC is enabled and
 attribute is reconciled into the RBAC store as `saml:<value>` group
 principals (source `"saml"`) on every login — the same
 `RbacStore::reconcile_idp_memberships` mechanism OIDC's fixed `groups` ID
-token claim uses for source `"entra"`. Assign roles to `saml:<value>`
-groups via the existing [`/rbac/roles`](rest-api.md) group-role-assignment
-routes; no new configuration flag is needed — reconciliation is driven
-entirely by `--saml-group-attribute`, which you likely already have
-configured for the coarse admin mapping above.
+token claim uses for source `"entra"`. There is no dedicated group-membership
+UI — a group-scoped role grant is made via the management-group
+role-delegation API, `POST /api/v1/management-groups/{id}/roles`, whose
+`principal_id` field is free text: set `"principal_type": "group"` and
+`"principal_id": "saml:<value>"` to delegate `Operator` or `Viewer` (the only
+two roles this route delegates) to everyone the IdP asserts is in that group;
+no new configuration flag is needed —
+reconciliation is driven entirely by `--saml-group-attribute`, which you
+likely already have configured for the coarse admin mapping above.
 
 Both mechanisms coexist: `--saml-admin-group` still grants the coarse
 `role=admin`/`role=user` session role exactly as documented above,
@@ -470,6 +474,20 @@ knowing:
 - **A store error also denies the login** (fail-closed) — a reconcile call
   that cannot be answered (e.g. the RBAC store is unavailable) refuses the
   login rather than proceeding under an unknown authorization state.
+
+> **Practical reach of the >200-group deny path.** `/saml/acs` receives the
+> IdP's response as an `application/x-www-form-urlencoded` POST, and
+> httplib's own form-parsing layer caps that body at 8 KiB
+> (`CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH`) — enforced **before**
+> the `/saml/acs` handler (and therefore this reconciliation logic) ever
+> runs. A base64-encoded SAML response carrying more than roughly 180 group
+> values typically exceeds that 8 KiB cap on its own, so in practice a real
+> assertion this large is rejected with a bare `413` at the HTTP layer, not
+> the SAML-specific deny-and-redirect-to-`/login?error=saml` path described
+> above. Deployments whose IdP can assert that many groups see a generic
+> `413`, not this section's denial. A follow-up tracks raising the cap for
+> `/saml/acs` so the documented >200-group deny path is reachable at its
+> full documented range.
 
 Reconciliation only runs when a live RBAC store is wired in **and**
 `--saml-group-attribute` is non-empty; with either condition unmet (RBAC

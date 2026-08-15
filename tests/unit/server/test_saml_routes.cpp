@@ -2154,22 +2154,36 @@ TEST_CASE("SAML ACS — asserted groups reconcile into the RBAC store under sour
 // (8192 bytes) for an application/x-www-form-urlencoded body, so a
 // truncated (>200-value) assertion 413s at the transport layer before
 // /saml/acs's handler — and therefore this reconcile-deny branch — ever
-// runs. The DENY LOGIC itself (fail-closed on `group_cap_truncated`) is a
-// straightforward, size-independent consumer of
-// SamlAssertion::group_cap_truncated, whose parser-level correctness is
-// covered by test_saml_provider.cpp's kMaxGroupValues boundary test; the
-// same deny/audit/metric shape (mirroring OIDC's `group_count_exceeded`
-// branch) is exercised at a realistic group count by the sibling
-// reconcile tests in this file (the "reconcile store error" test below
-// covers the same DENY code path — audit rows, metrics, and no partial
-// reconcile — for a different `!reconciled` cause).
+// runs (verified: TestRouteSink deliberately enforces the same 8 KiB
+// httplib form cap — see its own comment above the CPPHTTPLIB_FORM_URL_
+// ENCODED_PAYLOAD_MAX_LENGTH check in test_route_sink.hpp — so this is not
+// a gap in the fixture, the branch is genuinely unreachable via an
+// HTTP-POST route test at this repo's current cap value).
+//
+// What IS and ISN'T covered elsewhere, to be explicit and avoid a
+// false-green closure claim: the cap-truncation MECHANIC itself (>200
+// asserted values -> `groups` truncated to exactly 200,
+// `group_cap_truncated=true`) is covered by test_saml_provider.cpp's
+// kMaxGroupValues boundary test, a pure function call with no HTTP layer.
+// The sibling "reconcile store error" test below exercises the same
+// general DENY SHAPE this branch produces (login denied, an
+// auth.sso_group_provision `result=error` row, a paired
+// auth.saml_login_failed row, no partial reconcile) — but it is a
+// DIFFERENT branch reached via a DIFFERENT cause (`!reconciled` from a
+// down RbacStore, not `group_cap_truncated`). It does NOT exercise this
+// branch's specific `reason=group_count_exceeded` audit detail, nor does
+// it touch `yuzu_saml_group_cap_truncated_total` at all — neither is
+// directly asserted by any test in this file today.
 TEST_CASE("SAML ACS — asserted groups beyond kMaxGroupValues DENIES the login "
           "(fine-grained RBAC fail-closed)",
           "[pg][saml][auth_routes][rbac]") {
-    SKIP("Unreachable via a real HTTP-POST binding at kMaxGroupValues=200 — see the comment "
-        "block above this TEST_CASE. The DENY branch's shape is covered by the sibling "
-        "'reconcile store error' test below; parser-level truncation is covered by "
-        "test_saml_provider.cpp.");
+    SKIP("Unreachable via a real HTTP-POST binding at kMaxGroupValues=200 (TestRouteSink "
+        "enforces the same 8 KiB httplib form cap production traffic hits) — see the comment "
+        "block above this TEST_CASE. The sibling 'reconcile store error' test below covers "
+        "the general deny SHAPE via a DIFFERENT cause, NOT this branch's specific "
+        "reason=group_count_exceeded detail or the yuzu_saml_group_cap_truncated_total metric, "
+        "neither of which is directly asserted anywhere in this file today. Parser-level "
+        "truncation itself is covered by test_saml_provider.cpp.");
 }
 
 TEST_CASE("SAML ACS — an empty asserted group set SKIPS reconcile (no deprovision-to-zero)",

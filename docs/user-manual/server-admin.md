@@ -1842,7 +1842,10 @@ local `users` row in auth.db) regardless of role — a group-mapped admin gets
 reconciled into the RBAC store as `saml:<value>` group principals (source
 `"saml"`) on every login, the same `reconcile_idp_memberships` mechanism
 OIDC uses for source `"entra"` — assign roles to `saml:<value>` groups via
-`/rbac/roles`. Both mechanisms coexist: `--saml-admin-group` still grants
+the management-group role-delegation API,
+`POST /api/v1/management-groups/{id}/roles`, with `"principal_type": "group"`
+and `"principal_id": "saml:<value>"` (only the `Operator` and `Viewer` roles can be
+delegated this way). Both mechanisms coexist: `--saml-admin-group` still grants
 the coarse session role independently of any fine-grained RBAC grants.
 Reconciliation runs before the session is minted (fail-closed on error), and
 two cases deliberately do NOT fall through to a normal reconcile:
