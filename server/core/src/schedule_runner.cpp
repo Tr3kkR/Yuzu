@@ -217,9 +217,16 @@ int ScheduleRunner::dispatch_tracked(const InstructionSchedule& s, const std::st
                                            ? std::string(yuzu::server::kBroadcastScope)
                                            : s.scope_expression;
     try {
+        // Review finding (#3133): re-resolve the creator's CURRENT
+        // permissions at fire time rather than dispatching as `system` —
+        // an operator who could create this schedule but does not (or no
+        // longer) holds the classified permission for `plugin.action`
+        // must be refused by the SAME chokepoint every operator-initiated
+        // dispatch goes through, not silently bypass it.
+        const auto caller = d_.resolve_caller(s.created_by);
         std::tie(command_id, sent) = d_.dispatch_fn(plugin, action, /*agent_ids=*/{},
                                                     dispatch_scope,
-                                                    /*parameters=*/{}, exec_id);
+                                                    /*parameters=*/{}, exec_id, caller);
     } catch (const std::exception& e) {
         count("yuzu_schedule_fire_failures_total");
         spdlog::error("schedule_runner: dispatch failed for schedule '{}' (id={}): {}", s.name,

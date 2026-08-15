@@ -8116,6 +8116,51 @@ private:
         };
     }
 
+    /// Review finding (external PR review, #3133): ScheduleRunner has no live
+    /// Session to derive a caller from at fire time — it only has the stored
+    /// creator username. This is the headless analogue of derive_dispatch_caller
+    /// (which mirrors derive_exec_visible verbatim), NOT a synthesized Session:
+    /// `elevated` is unconditionally false (JIT admin elevation is a
+    /// recent-authentication-event property, auth::is_elevated's own doc
+    /// comment — a background fire has no session to re-establish one) and
+    /// `service_scoped` never applies (no API token on a scheduled fire). What
+    /// DOES get re-resolved is exactly what a live re-check needs:
+    /// `check_permission`/`visible_agents_for_permission` are username-keyed
+    /// RBAC lookups, independent of any session, so this re-derives the
+    /// creator's CURRENT grants rather than trusting a stale creation-time
+    /// snapshot. Fail-closed throughout: an unknown/deleted user or a
+    /// degraded RbacStore never resolves to unfiltered — same present-EMPTY
+    /// (deny-all) posture every other unwired/degraded caller path in this
+    /// file takes.
+    yuzu::server::DispatchCaller derive_dispatch_caller_for_username(const std::string& username) {
+        yuzu::server::authz::ExecVisibleFacts facts;
+        facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
+        facts.global_grant =
+            rbac_store_ && rbac_store_->check_permission(username, "Execution", "Execute");
+        if (rbac_store_) {
+            if (auto v = rbac_store_->visible_agents_for_permission(username, "Execution",
+                                                                     "Execute",
+                                                                     mgmt_group_store_.get()))
+                facts.scoped_visible = std::unordered_set<std::string>(v->begin(), v->end());
+            // else: store error -> scoped_visible stays nullopt -> fail closed.
+        }
+
+        std::string role_label;
+        if (auth_db_) {
+            if (auto user = auth_db_->get_user(username))
+                role_label = auth::role_to_string(user->role);
+            // else: unknown/deleted user -> role_label stays empty; exec_visible
+            // above is still correctly fail-closed independent of this label.
+        }
+
+        return yuzu::server::DispatchCaller{
+            .principal = username,
+            .principal_role = role_label,
+            .exec_visible = yuzu::server::authz::compose_exec_visible(facts),
+            .system = false,
+        };
+    }
+
     /// PR1.9c: a stable string label for `DispatchArm`, fed into
     /// `build_classified_command`'s `target_arm` (→ `compute_plan_hash`) so
     /// two dispatches of the same `plugin.action` differing only in HOW
@@ -14797,7 +14842,17 @@ private:
             .approval_manager = approval_manager_.get(),
             .audit_store = audit_store_.get(),
             .metrics = &metrics_,
-            .dispatch_fn = command_dispatch_fn,
+            // Review finding (#3133): was command_dispatch_fn (hardcoded
+            // system=true, unfiltered) — every scheduled fire bypassed the
+            // classify+authorize chokepoint's per-action check regardless of
+            // the creator's actual permissions. Now carries the caller
+            // resolve_caller derives, exactly like every other operator
+            // dispatch surface.
+            .dispatch_fn = command_dispatch_caller_fn,
+            .resolve_caller =
+                [this](const std::string& username) {
+                return derive_dispatch_caller_for_username(username);
+            },
         });
         schedule_tick_thread_ = std::thread([this]() {
             spdlog::info("Schedule runner thread started (cadence=30s)");
@@ -15926,13 +15981,20 @@ private:
         tar_tree_routes_ = std::make_unique<TarTreeRoutes>();
         tar_tree_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
-            [command_dispatch_fn](const std::string& plugin, const std::string& action,
-                                  const std::vector<std::string>& agent_ids,
-                                  const std::string& scope_expr,
-                                  const std::unordered_map<std::string, std::string>& parameters)
-                -> std::pair<std::string, int> {
-                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
-                                           /*execution_id=*/"");
+            // Review finding (#3133): was command_dispatch_fn (hardcoded
+            // system=true, unfiltered) — the capture-source push dispatches
+            // the mutating, Infrastructure:Write-classified tar.configure
+            // action, and this route only ever gated Infrastructure:Read.
+            // Now forwards through command_dispatch_caller_fn with the real
+            // caller TarTreeRoutes derives via caller_fn below, so the
+            // chokepoint's own classify+authorize check actually runs.
+            [command_dispatch_caller_fn](
+                const std::string& plugin, const std::string& action,
+                const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                const std::unordered_map<std::string, std::string>& parameters,
+                const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+                return command_dispatch_caller_fn(plugin, action, agent_ids, scope_expr,
+                                                  parameters, /*execution_id=*/"", caller);
             },
             [this](const std::string& command_id,
                    const std::string& agent_id) -> std::vector<DexAgentResponse> {
@@ -15945,7 +16007,18 @@ private:
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
-            audit_fn);
+            audit_fn,
+            [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
+                // Resolve the session from a throwaway Response (never written back);
+                // an unresolved session yields an empty principal alongside a
+                // present-EMPTY set (fail CLOSED on visibility) — same idiom as
+                // WorkflowRoutes' caller_fn above.
+                httplib::Response throwaway;
+                if (auto s = require_auth(req, throwaway))
+                    return derive_dispatch_caller(*s);
+                return yuzu::server::DispatchCaller{
+                    .exec_visible = yuzu::server::authz::deny_all()};
+            });
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)

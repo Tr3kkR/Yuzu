@@ -45,6 +45,7 @@ struct DispatchCall {
     std::string action;
     std::string scope;
     std::string execution_id;
+    DispatchCaller caller;
 };
 
 struct Harness {
@@ -74,12 +75,22 @@ struct Harness {
                   [this](const std::string& plugin, const std::string& action,
                          const std::vector<std::string>&, const std::string& scope,
                          const std::unordered_map<std::string, std::string>&,
-                         const std::string& execution_id) -> std::pair<std::string, int> {
+                         const std::string& execution_id,
+                         const DispatchCaller& caller) -> std::pair<std::string, int> {
                       if (throw_on_dispatch)
                           throw std::runtime_error("dispatch boom");
-                      calls.push_back({plugin, action, scope, execution_id});
+                      calls.push_back({plugin, action, scope, execution_id, caller});
                       return {"cmd-" + std::to_string(calls.size()), reach};
                   },
+              // #3133 review fix: resolve_caller re-resolves a real,
+              // non-system caller from the schedule's creator at fire time —
+              // this fake mirrors that shape rather than a stale/system
+              // caller, so a regression back to system=true is observable
+              // via the DispatchCall.caller field above.
+              .resolve_caller =
+                  [](const std::string& username) {
+                  return DispatchCaller{.principal = username, .system = false};
+              },
           }) {
         engine.create_tables();
         tracker.create_tables();
@@ -156,6 +167,13 @@ TEST_CASE("ScheduleRunner: due interval schedule fires once and advances", "[sch
     // schedule into a no-op that still advances and still logs a fire, which is
     // the worst shape a regression here could take: unattended and quiet.
     CHECK(h.calls[0].scope == "__all__");
+    // #3133 review fix: the dispatched caller must be the schedule's creator,
+    // re-resolved via resolve_caller — NEVER system=true. Without this
+    // assertion a regression back to a hardcoded system caller (the exact
+    // bug the review found) would pass every other check in this file
+    // silently, since none of them inspect the caller at all.
+    CHECK_FALSE(h.calls[0].caller.system);
+    CHECK(h.calls[0].caller.principal == "admin");
 
     // Tracked execution row, targeted count recorded.
     auto exec = h.tracker.get_execution(h.calls[0].execution_id);
