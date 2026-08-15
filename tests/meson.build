@@ -891,12 +891,19 @@ if build_server
   # 793 (A) / 1154 (B) — better, not perfect; [custom_props] was considered and
   # left out because it also tags test_props_scope_authz.cpp (a scope-authz
   # suite, not pure store CRUD), so its per-case PG cost isn't confirmed uniform
-  # with the others. Partition preserved: N([pg]) == N(A) + N(B).
+  # with the others.
+  #
+  # PR1.6a review remediation (same day) additionally moved [operator_surface]
+  # (the 3 new upload-grant MCP-twin PG integration tests) to A the same way —
+  # untagged, all 3 would land in B, which is already the heavier half and had
+  # separately reached 600.57/600s (killed by TIMEOUT) on CI before this move.
+  # Partition preserved: N([pg]) == N(A) + N(B).
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store]'],
+       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store],[pg][operator_surface]'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]'], suite: 'server', timeout: 600)
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]'],
+       suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
