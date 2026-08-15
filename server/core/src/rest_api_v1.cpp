@@ -1393,7 +1393,7 @@ void RestApiV1::register_routes(
         // uphold until this fix (Gate 8 compliance-officer finding: the
         // /inventory/software route's old hand-rolled deny embedded cid in
         // its detail string; consolidating it into this shared helper lost
-        // that trail for all 6 callers, not just the one that surfaced it).
+        // that trail for every caller, not just the one that surfaced it).
         const auto cid = detail::make_correlation_id();
         (void)detail::try_persist_audit(audit_fn, req, action, "denied", target_type, target_id,
                                         audit_detail + "; cid=" + cid);
