@@ -13,7 +13,8 @@ instead of operator-editable asset-tagging data.
 
 These all name the offending file, row, or count in the log line — the fix
 is always to repair or replace the named legacy content, then restart. None
-of these require engineering escalation on their own.
+of these require engineering escalation on their own, **except the 5,000-row
+sanity cap** below, which always does.
 
 - **`legacy db ... exists but is 0 bytes`** — SQLite treats a 0-byte file as
   a valid empty database, indistinguishable from "never used" without an
@@ -37,10 +38,10 @@ of these require engineering escalation on their own.
   **and released** — this store's retention is unbounded by design, so a
   long-lived fleet's full history could plausibly approach this over years.
   **Do not prune the legacy file to get under the cap.** A `quarantine_records`
-  row is evidence a specific containment decision was made, by whom, and why;
-  ADR-0047 states outright that deleting it would be "a REGRESSION for a SOC 2
-  security-containment control," and a self-service prune here discards rows
-  before they ever reach Postgres — the backfill then fingerprints the
+  row is evidence that a specific containment decision was made, by whom, and
+  why; ADR-0047 states outright that deleting it would be "a REGRESSION for a
+  SOC 2 security-containment control," and a self-service prune here discards
+  rows before they ever reach Postgres — the backfill then fingerprints the
   *reduced* set as complete, and nothing later detects what was lost. The
   supported path is: raise `kMaxBackfillRows` in `quarantine_store.cpp` and
   rebuild — this is a compile-time constant, there is no runtime flag. Engage
@@ -48,10 +49,14 @@ of these require engineering escalation on their own.
   `kBackfillTxnTimeout`'s budget. If the row count is inflated by content you
   are certain is safe to drop (e.g. confirmed test/lab data on a fleet that
   never had real containment history), that is an engineering-reviewed
-  decision, not an operator one: engage engineering, who will archive a full
-  copy of anything to be dropped before any reduced backfill is accepted —
-  matching `RbacStore`'s equivalent "engage engineering before touching
-  anything" posture for its own comparable case.
+  decision, not an operator one — and it must not produce evidence
+  indistinguishable from a genuinely complete backfill: engage engineering,
+  who will (1) archive a full copy of anything to be dropped, and (2) record
+  the decision (a linked issue or ticket) somewhere `quarantine_meta` or the
+  boot log can reference, before any reduced backfill is accepted. Today
+  `backfill_row_count` cannot itself distinguish a sanctioned reduction from
+  a complete backfill — closing that gap is tracked in #3149, not solved by
+  this runbook alone.
 - **`has an unrecognised status 'X'`** — the `status` column is only ever
   `active` or `released`; something else (hand-edited row, external tooling)
   needs correcting to one of those two values in the legacy file before
@@ -59,9 +64,10 @@ of these require engineering escalation on their own.
 - **`has more than one 'active' record for agent_id='X'`** — the legacy
   SQLite schema never enforced "at most one active record per agent" at the
   database level (only an in-process mutex the server no longer runs did),
-  so this is pre-existing data corruption or a hand-edited file. Release or
-  delete the duplicate row(s) in the legacy file, keeping the one that
-  reflects reality, before retrying.
+  so this is pre-existing data corruption or a hand-edited file. Release the
+  duplicate row(s) where possible (a state transition, not a deletion); if a
+  row must be deleted outright, copy the legacy file aside first — this is
+  the same evidence file the cap remedy above protects.
 
 ## Holder-side verification refusals
 

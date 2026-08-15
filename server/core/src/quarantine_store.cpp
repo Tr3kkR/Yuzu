@@ -956,9 +956,10 @@ bool QuarantineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db
             spdlog::error(
                 "QuarantineStore: migrate_from_sqlite: legacy db {} holds {} quarantine "
                 "records, exceeding the {} sanity cap for a single backfill transaction — "
-                "refusing (fail-closed); see docs/ops-runbooks/"
-                "quarantine-store-backfill-recovery.md for remediation (prune released records "
-                "out of the legacy file, or engage engineering to raise the compile-time cap)",
+                "refusing (fail-closed); NEVER prune the legacy file to get under this cap "
+                "(a quarantine record is SOC 2 containment evidence — see ADR-0047); see "
+                "docs/ops-runbooks/quarantine-store-backfill-recovery.md for remediation "
+                "(engage engineering to raise the compile-time cap)",
                 legacy_db_path.string(), snap.size(), kMaxBackfillRows);
             backfill_metric("failed");
             return false;
