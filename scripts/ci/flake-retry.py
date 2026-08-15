@@ -739,11 +739,16 @@ def _selftest():
     # (B) at the time of the change, moving 207 cases off shard B after it had
     # drifted to 2.3x shard A's size and started TIMEOUT-ing at 600s on Linux
     # and Windows (tests/meson.build's own comment on this pair has the
-    # measurement).
+    # measurement). PR1.6a review remediation (same day) additionally added
+    # [operator_surface]: 3 new PG-backed MCP integration tests, untagged,
+    # all landed in shard B and tipped it over its 600s CI budget (killed by
+    # TIMEOUT at 600.57s).
     check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
           and ("~[pg]~[auth]~[mcp]",) in _shard_specs
-          and ("[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store]",) in _shard_specs
-          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]",) in _shard_specs,
+          and ("[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store],[pg][operator_surface]",)
+          in _shard_specs
+          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]",)
+          in _shard_specs,
           "meson.build: all four shard tag filters extracted verbatim")
 
     if failures:
