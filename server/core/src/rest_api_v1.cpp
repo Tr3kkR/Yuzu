@@ -66,6 +66,18 @@
 namespace yuzu::server {
 namespace {
 
+// Classifies a QuarantineStore write failure as a genuine DB/pool/query
+// failure (503) vs a business/state error like "already quarantined"/"not
+// quarantined" (400) — mirrors DeploymentStore's
+// is_deployment_db_error/kDeploymentDbErrorPrefix (discovery_routes.cpp,
+// adversarial-review MEDIUM hardening round, 2026-08-12: write routes
+// previously collapsed every failure, including genuine outages, to 400).
+// Keys off the SHARED constant (quarantine_store.hpp), never a local copy of
+// the literal.
+bool is_quarantine_db_error(const std::string& err) {
+    return err.starts_with(kQuarantineDbErrorPrefix);
+}
+
 // ── Lightweight JSON string builder ─────────────────────────────────────
 // Produces JSON output strings directly, bypassing nlohmann::json template
 // instantiation for construction.  Only ~80 lines vs 23 000 lines of
@@ -793,11 +805,11 @@ const std::string& openapi_spec() {
         // form.
         R"json(,
     "/quarantine": {
-      "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}},
-      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}}
+      "get": {"summary": "List quarantined devices visible to the caller (admit-then-filter — #1788)", "tags": ["Security"], "responses": {"200": {"description": "List of quarantined devices in the caller's scope"}, "403": {"description": "Requires Security:Read"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable, or a degraded read (ADR-0047) — never rendered as an empty list. Two distinct causes, distinguished by message: store/pool/query failure only increments yuzu_server_quarantine_read_degrade_total; a per-record admit-then-filter anomaly (e.g. transient engine-principal-store outage) does not"}}},
+      "post": {"summary": "Quarantine a device (per-target scoped — #1788)", "tags": ["Security"], "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "reason": {"type": "string"}, "whitelist": {"type": "string"}}}}}}, "responses": {"201": {"description": "Device quarantined"}, "400": {"description": "agent_id missing/empty, or the device is already quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/quarantine/{agent_id}": {
-      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}}}
+      "delete": {"summary": "Release a device from quarantine (per-target scoped — #1788)", "tags": ["Security"], "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Device released"}, "400": {"description": "The device is not currently quarantined"}, "403": {"description": "Requires Security:Execute on the target device (management-group-scoped, or global)"}, "500": {"description": "Per-device scope gate not configured (fails closed)"}, "503": {"description": "quarantine_store unavailable or a store/pool/query failure (ADR-0047) — retryable"}}}
     },
     "/rbac/roles": {
       "get": {"summary": "List RBAC roles", "tags": ["RBAC"], "responses": {"200": {"description": "List of roles"}}}
@@ -4655,7 +4667,7 @@ void RestApiV1::register_routes(
             // if scoped_perm_fn is unwired, never fall back to an unfiltered list.
             if (!auth_fn(req, res))
                 return;
-            if (!quarantine_store) {
+            if (!quarantine_store || !quarantine_store->is_open()) {
                 res.status = 503;
                 res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                 return;
@@ -4667,13 +4679,51 @@ void RestApiV1::register_routes(
                 return;
             }
 
+            // AUTHORITATIVE read (ADR-0047): nullopt is a degraded read, NEVER
+            // rendered as an empty quarantine list — a device could still be
+            // actively contained while the caller sees "nothing quarantined".
             auto records = quarantine_store->list_quarantined();
+            if (!records) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "quarantine list unavailable — try again"),
+                                "application/json");
+                return;
+            }
             JArr arr;
             int64_t visible = 0;
-            for (const auto& r : records) {
+            for (const auto& r : *records) {
                 httplib::Response probe; // throwaway: per-record admit probe, never sent
-                if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id))
+                if (!scoped_perm_fn(req, probe, "Security", "Read", r.agent_id)) {
+                    // gov-fix(security-guardian, widened by unhappy-path Gate 4):
+                    // a per-record degrade is NOT a denial and must not be
+                    // silently filtered out — that would render a degraded
+                    // authz check as "not quarantined", the exact fail-open
+                    // the store-layer nullopt check above exists to close,
+                    // just one layer up. The auth caller has ALREADY been
+                    // authenticated once by auth_fn above, using the SAME
+                    // req — every per-record call re-derives authorization
+                    // from scratch (require_scoped_permission calls
+                    // require_auth internally on every invocation), so any
+                    // outcome OTHER than an explicit 403 (a genuine scope
+                    // denial) is anomalous mid-request and must fail the
+                    // WHOLE list closed, not just the RBAC/tag-store-degrade
+                    // 503 case: a transient engine-principal store outage
+                    // landing between auth_fn's initial check and a later
+                    // per-record probe surfaces as a bare 401 (require_auth
+                    // does not distinguish "no session" from "could not
+                    // determine" for that principal class — see
+                    // EngineLookupStatus::StoreUnreachable's own comment,
+                    // auth_routes.cpp), which the original 503-only check
+                    // would have silently treated as a denial.
+                    if (probe.status != 403) {
+                        res.status = 503;
+                        res.set_content(
+                            detail::a4_error(res, "authorization check unavailable — try again"),
+                            "application/json");
+                        return;
+                    }
                     continue;
+                }
                 arr.add(JObj()
                             .add("agent_id", r.agent_id)
                             .add("status", r.status)
@@ -4691,9 +4741,21 @@ void RestApiV1::register_routes(
         // CDX-P1-02: authenticate first (401 before any store/body work).
         if (!auth_fn(req, res))
             return;
-        if (!quarantine_store) {
+        if (!quarantine_store || !quarantine_store->is_open()) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            // gov-fix(consistency-auditor, Gate 8): matches this file's own
+            // dominant convention for a bare is_open() 503 (retry_after_ms
+            // present on ~20+ sibling routes) and the MCP quarantine_device
+            // twin's identical retry_after_ms=5000 (F5) — REST was the
+            // outlier.
+            res.set_content(detail::a4_error(res, "service unavailable", {.retry_after_ms = 5000}),
+                            "application/json");
+            // gov-fix(compliance-officer C-2): the target agent_id is not yet
+            // known at this point (the body hasn't been parsed), so this is
+            // the one quarantine failure path that cannot carry a resource
+            // id — audited anyway rather than silently skipped.
+            audit_fn(req, "quarantine.enable", "failure", "Security", "",
+                     "service unavailable — store not open");
             return;
         }
 
@@ -4731,8 +4793,22 @@ void RestApiV1::register_routes(
 
         auto result = quarantine_store->quarantine_device(agent_id, by, reason, whitelist);
         if (!result) {
-            res.status = 400;
-            res.set_content(detail::a4_error(res, result.error()), "application/json");
+            const bool db_error = is_quarantine_db_error(result.error());
+            res.status = db_error ? 503 : 400;
+            // gov-fix(consistency-auditor, Gate 8): retryable ONLY on the
+            // genuine store/pool-failure branch, matching MCP's identical
+            // split (F5) — the business-error branch ("already quarantined")
+            // stays non-retryable (null), never a fabricated retry hint on a
+            // permanent state conflict.
+            res.set_content(detail::a4_error(res, result.error(),
+                                             db_error ? detail::A4ErrorOpts{.retry_after_ms = 5000}
+                                                       : detail::A4ErrorOpts{}),
+                            "application/json");
+            // gov-fix(security-guardian): the MCP quarantine_device twin
+            // already audits this branch (mcp_audit("failure", ...)) — REST
+            // was silently skipping it, the only quarantine failure path with
+            // no audit row.
+            audit_fn(req, "quarantine.enable", "failure", "Security", agent_id, result.error());
             return;
         }
         audit_fn(req, "quarantine.enable", "success", "Security", agent_id, reason);
@@ -4747,13 +4823,23 @@ void RestApiV1::register_routes(
             // CDX-P1-02: authenticate first (401 before any store work).
             if (!auth_fn(req, res))
                 return;
-            if (!quarantine_store) {
+            // Extracted before the is_open() check below (pure regex-match
+            // read, no failure mode) so a store-outage 503 can still carry
+            // the target agent_id in its audit row (gov-fix compliance-officer
+            // C-2) instead of the audit call being skipped for lack of one.
+            auto agent_id = req.matches[1].str();
+            if (!quarantine_store || !quarantine_store->is_open()) {
                 res.status = 503;
-                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                // gov-fix(consistency-auditor, Gate 8): see the POST route's
+                // identical fix above for the rationale.
+                res.set_content(
+                    detail::a4_error(res, "service unavailable", {.retry_after_ms = 5000}),
+                    "application/json");
+                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
+                         "service unavailable — store not open");
                 return;
             }
 
-            auto agent_id = req.matches[1].str();
             // CDX-P1-02: same sole per-target gate as POST above, mirroring
             // set_tag/delete_tag and the MCP quarantine_device twin — fail
             // CLOSED if unwired.
@@ -4770,8 +4856,16 @@ void RestApiV1::register_routes(
 
             auto result = quarantine_store->release_device(agent_id);
             if (!result) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                const bool db_error = is_quarantine_db_error(result.error());
+                res.status = db_error ? 503 : 400;
+                // gov-fix(consistency-auditor, Gate 8): see POST's identical
+                // fix above — retryable only on the genuine store failure.
+                res.set_content(detail::a4_error(res, result.error(),
+                                                 db_error ? detail::A4ErrorOpts{.retry_after_ms = 5000}
+                                                           : detail::A4ErrorOpts{}),
+                                "application/json");
+                audit_fn(req, "quarantine.disable", "failure", "Security", agent_id,
+                         result.error());
                 return;
             }
             audit_fn(req, "quarantine.disable", "success", "Security", agent_id, "");

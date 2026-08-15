@@ -876,11 +876,24 @@ if build_server
   # change and is not addressed here. The partition is preserved
   # (N([pg]) == N(A) + N(B)); if you add a tag to one side, exclude it on the
   # other in the same edit.
+  #
+  # RE-BALANCED 2026-08-15: measured case counts had drifted to 586 (A) vs 1361
+  # (B) — a 2.3x split, up from the ~1.9x already flagged above — and B was
+  # TIMEOUT-ing at 600s on Linux and Windows both (#2092/#2093's own warning:
+  # "split the suite or rebalance before this flakes"). [rbac_store],
+  # [guaranteed_state_store] and [response_store] moved to A by the same
+  # AUDIT_STORE precedent above — each is a dedicated store's own tag, confined
+  # to that one test file, same shape as [audit_store] (verified: `grep -rl`
+  # each tag matches exactly one file). Moves 207 cases (93+61+53), landing at
+  # 793 (A) / 1154 (B) — better, not perfect; [custom_props] was considered and
+  # left out because it also tags test_props_scope_authz.cpp (a scope-authz
+  # suite, not pure store CRUD), so its per-case PG cost isn't confirmed uniform
+  # with the others. Partition preserved: N([pg]) == N(A) + N(B).
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store]'],
+       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store]'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]'], suite: 'server', timeout: 600)
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]'], suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────

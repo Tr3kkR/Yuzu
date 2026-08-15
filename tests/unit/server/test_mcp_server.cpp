@@ -8527,18 +8527,36 @@ TEST_CASE("MCP: a schema-inexpressible violation never mints or consumes a ticke
     }
 }
 
+namespace {
+// QuarantineStore migrated to Postgres (ADR-0006/0047) — every "MCP
+// quarantine_device"/cross-tool test below clones this pre-migrated
+// template instead of opening a SQLite path. SAME key as
+// test_quarantine_store.cpp's own template ("quarantinestore") — the
+// registry builds it once and replay-verifies this file's setup lambda
+// produces the identical structural fingerprint (test_helpers.hpp
+// PgTestTemplate contract).
+yuzu::test::PgTestTemplate mcp_quarantine_tpl{"quarantinestore", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::QuarantineStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("quarantinestore template: store failed to migrate");
+}};
+} // namespace
+
 // Governance qa-SHOULD-1: a ticket minted for one tool must not authorize a
 // DIFFERENT tool — the `definition_id = "mcp." + tool_name` binding is the
 // privilege-escalation guard. Mint for delete_tag, present the (approved) id to
 // quarantine_device → denied, and the delete_tag ticket stays consumable.
 TEST_CASE("MCP approval ticket cannot be reused across tools",
-          "[mcp][integration][approval][security]") {
+          "[mcp][integration][approval][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
     yuzu::test::TempDbFile tagdb{std::string_view{"mcp-tag-"}};
     yuzu::server::TagStore tags(tagdb.path);
     tags.set_tag("agent-1", "role", "web", "server");
 
-    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
 
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     sqlite3* raw = nullptr;
@@ -8670,7 +8688,8 @@ TEST_CASE("MCP approval recall: a store fault at the lookup rung is a retryable 
 
 TEST_CASE("MCP approval masked-denial counter: accumulates per refusal and stays "
           "per-tool, not a shared/latched series",
-          "[mcp][integration][approval][security]") {
+          "[mcp][integration][approval][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
     // Governance quality-engineer finding: prior tests only ever checked the
     // masked counter at 0.0 or 1.0, which a "set to 1" mutant would survive,
     // and only ever exercised a single tool, which a mislabeled-series mutant
@@ -8681,8 +8700,9 @@ TEST_CASE("MCP approval masked-denial counter: accumulates per refusal and stays
     yuzu::server::TagStore tags(tagdb.path);
     tags.set_tag("agent-1", "role", "web", "server");
 
-    yuzu::test::TempDbFile qdb{std::string_view{"yuzu_test_mcp_quar_"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
 
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
     struct Conn {
@@ -10258,9 +10278,10 @@ TEST_CASE("MCP reject_request rejects a pending request", "[mcp][integration][ap
 }
 
 TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolation",
-          "[mcp][integration][quarantine][approval]") {
-    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+          "[mcp][integration][quarantine][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
     REQUIRE(quar.is_open());
 
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
@@ -10300,7 +10321,11 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     CHECK(body1["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
     std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
     CHECK(ts.last_dispatch_plugin.empty()); // not dispatched yet
-    CHECK_FALSE(quar.get_status("agent-q").has_value());
+    {
+        auto st = quar.get_status("agent-q");
+        REQUIRE(st.has_value()); // read succeeded
+        CHECK_FALSE(st->has_value()); // ...found nothing active yet
+    }
     // M2 (PR #1796): the ticket-mint audit detail names the endpoint so SIEM can
     // filter mcp.quarantine_device|pending by agent_id.
     REQUIRE_FALSE(ts.audit_details.empty());
@@ -10329,8 +10354,9 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
     CHECK(payload2["quarantine_record"]["agent_id"] == "agent-q");
     // Record persisted.
     auto rec = quar.get_status("agent-q");
-    REQUIRE(rec);
-    CHECK(rec->status == "active");
+    REQUIRE(rec.has_value()); // read succeeded
+    REQUIRE(rec->has_value()); // and found an active record
+    CHECK((*rec)->status == "active");
     // Live isolation dispatched via the quarantine plugin with the whitelist.
     CHECK(ts.last_dispatch_plugin == "quarantine");
     CHECK(ts.last_dispatch_action == "quarantine");
@@ -10349,15 +10375,16 @@ TEST_CASE("MCP quarantine_device ticket round-trip records + dispatches isolatio
 
 TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCCESS, "
           "never a failure - pins the schema's minimum:0, not minimum:1",
-          "[mcp][integration][quarantine][approval]") {
+          "[mcp][integration][quarantine][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
     // #2712: an offline/unreachable device still gets recorded (the isolation
     // dispatch just never lands) - this is NOT a failure path, and the schema
     // must accept agents_reached==0 as a valid success value. A naive copy of
     // execute_instruction's normal-branch minimum:1 onto this tool would be
     // exactly the wrong constraint here (Fable's review of the #2712 batch 3
     // plan flagged this as the natural mistake to avoid).
-    yuzu::test::TempDbFile qdb{std::string_view{"yuzu_test_mcp_quar_"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
     REQUIRE(quar.is_open());
 
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
@@ -10408,8 +10435,9 @@ TEST_CASE("MCP quarantine_device records-only (agents_reached=0) is still a SUCC
     CHECK(payload2["command_id"].get<std::string>().empty());
     // The record still persisted despite no live dispatch.
     auto rec = quar.get_status("agent-offline");
-    REQUIRE(rec);
-    CHECK(rec->status == "active");
+    REQUIRE(rec.has_value()); // read succeeded
+    REQUIRE(rec->has_value()); // and found an active record
+    CHECK((*rec)->status == "active");
     // #2712: structuredContent mirrors content[0].text exactly, including the
     // agents_reached:0 value the schema must accept (minimum:0).
     CHECK(write_tool_structured(res2) == payload2);
@@ -10522,9 +10550,10 @@ TEST_CASE("MCP delete_tag enforces the per-device scope gate",
 }
 
 TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
-          "[mcp][integration][quarantine][scope]") {
-    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+          "[mcp][integration][quarantine][scope][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
     REQUIRE(quar.is_open());
 
     std::vector<ScopeGateCall> calls;
@@ -10547,7 +10576,11 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
     auto denied = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":264,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-outside","reason":"sus"}}})");
     CHECK(denied->status == 403);
-    CHECK_FALSE(quar.get_status("agent-outside").has_value());
+    {
+        auto st = quar.get_status("agent-outside");
+        REQUIRE(st.has_value()); // read succeeded
+        CHECK_FALSE(st->has_value()); // ...found nothing (never recorded)
+    }
     REQUIRE(calls.size() == 1);
     CHECK(calls[0].securable == "Security");
     CHECK(calls[0].op == "Execute");
@@ -10558,18 +10591,23 @@ TEST_CASE("MCP quarantine_device enforces the per-device scope gate",
         R"({"jsonrpc":"2.0","method":"tools/call","id":265,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-inside","reason":"sus"}}})");
     auto payload = write_tool_payload(ok);
     CHECK(payload["quarantine_record"]["agent_id"] == "agent-inside");
-    REQUIRE(quar.get_status("agent-inside").has_value());
+    {
+        auto st = quar.get_status("agent-inside");
+        REQUIRE(st.has_value()); // read succeeded
+        CHECK(st->has_value()); // ...and found the record
+    }
 }
 
 TEST_CASE("MCP quarantine_device FAILS CLOSED when the scope gate is unwired (governance UP-9)",
-          "[mcp][integration][quarantine][scope]") {
+          "[mcp][integration][quarantine][scope][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
     // No scoped_perm_fn wired (default empty). Before this fix the handler
     // widened to the global perm_fn (always-allow in this harness) and
     // proceeded to record + dispatch — the LAST write tool still doing that;
     // set_tag/delete_tag already refuse here (K-06/CDX-R4-09). Must refuse,
     // never fall through.
-    yuzu::test::TempDbFile qdb{std::string_view{"mcp-quar-"}};
-    yuzu::server::QuarantineStore quar(qdb.path);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
     REQUIRE(quar.is_open());
 
     McpTestServer ts;
@@ -10581,7 +10619,73 @@ TEST_CASE("MCP quarantine_device FAILS CLOSED when the scope gate is unwired (go
     REQUIRE(res);
     CHECK(res->body.find("scope gate not configured") != std::string::npos);
     CHECK(res->body.find("\"result\"") == std::string::npos); // fail closed, not served
-    CHECK_FALSE(quar.get_status("agent-x").has_value());       // never recorded
+    {
+        auto st = quar.get_status("agent-x");
+        REQUIRE(st.has_value()); // read succeeded
+        CHECK_FALSE(st->has_value()); // ...found nothing (never recorded)
+    }
+}
+
+// gov-fix(chaos-injector NICE-2): pins the store/business error split at the
+// MCP transport, mirroring the REST route's own pin
+// ("REST routes answer 503 (not 400) on a genuine store failure", test_rest_
+// quarantine_routes.cpp) — a genuine store/pool failure must classify
+// kInternalError + a retryable A5 hint, a business-state error ("already
+// quarantined") must classify kInvalidParams + non-retryable, and neither may
+// silently swap with the other.
+TEST_CASE("MCP quarantine_device classifies store failure vs business error "
+          "(kInternalError+retryable vs kInvalidParams+terminal)",
+          "[mcp][integration][quarantine][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(qpgdb, mcp_quarantine_tpl);
+    yuzu::server::pg::PgPool qpool{{.conninfo = qpgdb.dsn(), .size = 4}};
+    yuzu::server::QuarantineStore quar(qpool);
+    REQUIRE(quar.is_open());
+
+    McpTestServer ts;
+    ts.quarantine_store_for_test = &quar;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start(); // default tier: no approval gate, single-call round-trip
+
+    SECTION("business error: agent already quarantined -> kInvalidParams, no retry") {
+        REQUIRE(quar.quarantine_device("agent-dup", "seed", "pre-seeded", "").has_value());
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":267,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-dup","reason":"dup"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["message"] == "device is already quarantined");
+        // Non-retryable business error: no retry_after_ms hint.
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        REQUIRE_FALSE(ts.audit_details.empty());
+        CHECK(ts.audit_details.back().find("agent_id=agent-dup, device is already quarantined") !=
+              std::string::npos);
+    }
+
+    SECTION("store failure: schema dropped -> kInternalError, retryable") {
+        {
+            pg::PgConn conn{PQconnectdb(qpgdb.dsn().c_str())};
+            REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+            pg::PgResult r{PQexec(conn.get(), "DROP SCHEMA quarantine_store CASCADE")};
+            REQUIRE(r.ok());
+        }
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":268,"params":{"name":"quarantine_device","arguments":{"agent_id":"agent-degraded","reason":"boom"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["message"].get<std::string>().starts_with(
+            yuzu::server::kQuarantineDbErrorPrefix));
+        // Retryable store failure: A5 requires an honest retry_after_ms.
+        CHECK(body["error"]["data"]["retry_after_ms"] == 5000);
+        REQUIRE_FALSE(ts.audit_details.empty());
+        CHECK(ts.audit_details.back().find("agent_id=agent-degraded, ") != std::string::npos);
+        CHECK(ts.audit_details.back().find(yuzu::server::kQuarantineDbErrorPrefix) !=
+              std::string::npos);
+    }
 }
 
 // ── M1 (PR #1796): reviewer == submitter surfaces through the MCP error path ─

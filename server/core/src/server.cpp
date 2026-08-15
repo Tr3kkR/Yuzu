@@ -4627,9 +4627,43 @@ public:
             if (gateway_service_)
                 gateway_service_->set_mgmt_group_store(mgmt_group_store_.get());
         }
-        {
-            auto quar_db = cfg_.db_dir() / "quarantine.db";
-            quarantine_store_ = std::make_unique<QuarantineStore>(quar_db);
+        // Guardian device quarantine (Guardian design §11.7). Migrated
+        // Postgres store (ADR-0006/ADR-0047, schema `quarantine_store`) —
+        // construction fail-CLOSED per ADR-0012 §1: a reachable database
+        // whose schema can't migrate/open is a fatal startup error, never a
+        // serve-degraded state. `migrate_from_sqlite` runs the one-time,
+        // idempotent legacy-`quarantine.db` backfill (ADR-0009) — an active
+        // quarantine record is live security containment state, so backfill
+        // is MANDATORY and a failure is ALSO fatal (never serve on top of
+        // partially-migrated quarantine data).
+        if (pg_pool_ && !startup_failed_) {
+            quarantine_store_ = std::make_unique<QuarantineStore>(*pg_pool_);
+            if (!quarantine_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: quarantine store migration/open failed "
+                              "(database reachable but the quarantine_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                quarantine_store_->set_metrics(&metrics_);
+                auto quar_db = cfg_.db_dir() / "quarantine.db";
+                if (!quarantine_store_->migrate_from_sqlite(quar_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: quarantine legacy-SQLite backfill failed — "
+                        "quarantine_store is AUTHORITATIVE and must not serve partially-"
+                        "migrated data. Operator remediation depends on the SPECIFIC reason "
+                        "logged above, not on this line alone: if it names a corrupt/truncated/"
+                        "unreadable {} or a fingerprint refusal BEFORE any insert happened, "
+                        "nothing has been migrated yet and moving it aside safely skips the "
+                        "backfill (its quarantine history, including any ACTIVE record, will "
+                        "NOT carry over — verify no device should currently be quarantined "
+                        "before doing this). If it instead names a row-insert or completion-"
+                        "marker problem, this replica's rows may ALREADY be durably inserted "
+                        "in Postgres — do NOT move the file aside without first checking "
+                        "quarantine_store.quarantine_records for the affected agent_id(s).",
+                        quar_db.string());
+                    startup_failed_ = true;
+                }
+            }
         }
         // Scope-walking result sets (capability §30). Migrated Postgres store
         // (ADR-0006/ADR-0036, schema `result_set_store`) — construction fail-CLOSED
@@ -7155,6 +7189,17 @@ public:
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
         result_set_store_.reset();
+        // QuarantineStore (ADR-0047) borrows pg_pool_ — drop explicitly rather
+        // than relying solely on reverse-declaration-order destruction (gov
+        // Gate 3 cpp-safety): declaration order alone is a real guarantee for
+        // the EVENTUAL ~ServerImpl teardown, but stop() calls pg_pool_.reset()
+        // directly, WHILE quarantine_store_ is still alive holding a bound
+        // pg::PgPool& — a window where that reference is dangling if anything
+        // still reached it. Every HTTP/gRPC handler holding the raw pointer is
+        // quiesced by the drains above; this reset makes that safety
+        // structural rather than incidental on nothing calling in during the
+        // window.
+        quarantine_store_.reset();
         // ResponseStore (ADR-0039) borrows pg_pool_ — unwire the consumer that
         // holds the raw pointer (agent_service_'s Subscribe-stream ingest) before
         // dropping it, then drop before the pool. The maintenance thread that
@@ -10210,6 +10255,10 @@ private:
             // readyz/healthz wiring; construction is already fail-closed, this
             // is belt-and-braces against a runtime is_open() flip.
             bool deployment_ok = deployment_store_ && deployment_store_->is_open();
+            // QuarantineStore (ADR-0047) — wired into /readyz; adding here
+            // too so this store never joins the readyz-vs-healthz drift
+            // class the rows above were added to fix.
+            bool quarantine_ok = quarantine_store_ && quarantine_store_->is_open();
             // NotificationStore (ADR-0046) — born-on-PG (as of this migration),
             // same readyz-vs-healthz drift class the rows above document; wire
             // it into both from the start rather than shipping the gap and
@@ -10223,7 +10272,7 @@ private:
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok && notification_ok;
+                deployment_ok && quarantine_ok && notification_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -10252,6 +10301,7 @@ private:
                   {"management_group_store", mgmt_group_ok ? "ok" : "error"},
                   {"discovery_store", discovery_ok ? "ok" : "error"},
                   {"deployment_store", deployment_ok ? "ok" : "error"},
+                  {"quarantine_store", quarantine_ok ? "ok" : "error"},
                   {"notification_store", notification_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
@@ -10507,6 +10557,15 @@ private:
                 // serves), so this is belt-and-braces against a runtime
                 // is_open() flip, matching result_set_store's equivalent row.
                 {"discovery_store", discovery_store_ && discovery_store_->is_open()},
+                // Wave 2 migrated Postgres store (ADR-0006/0009/0047, schema
+                // `quarantine_store`). AUTHORITATIVE per ADR-0012 §1 — an
+                // active quarantine record is live security containment
+                // state. Construction fail-closed already makes a not-open
+                // state unreachable in production (startup_failed_ stops
+                // the server before it serves), so this is belt-and-braces
+                // against a runtime is_open() flip, matching
+                // discovery_store's equivalent row.
+                {"quarantine_store", quarantine_store_ && quarantine_store_->is_open()},
                 // ADR-0046 born-on-PG (as of this migration) store — same
                 // rationale as the other rows above: fail-closed at boot, but
                 // a not-open post-boot state would leave the notification
@@ -18124,6 +18183,15 @@ private:
     // destruct-before-pool discipline).
     std::unique_ptr<EnginePrincipalStore> engine_principal_store_;
     std::unique_ptr<ApiTokenStore> api_token_store_;
+    /// Migrated Postgres store (ADR-0006/ADR-0047, schema `quarantine_store`).
+    /// Borrows pg_pool_ (declared earlier, destructs later) and is declared
+    /// after it, so normal reverse-declaration-order destruction destructs
+    /// this before the pool for the EVENTUAL ~ServerImpl teardown (ADR-0012
+    /// destruct-before-pool discipline). That alone does NOT cover stop()'s
+    /// own explicit `pg_pool_.reset()` call, which runs while this member is
+    /// still alive (gov Gate 3 cpp-safety) — see the explicit
+    /// `quarantine_store_.reset()` in stop(), alongside
+    /// api_token_store_/engine_principal_store_/result_set_store_'s.
     std::unique_ptr<QuarantineStore> quarantine_store_;
     /// Migrated Postgres store (ADR-0006/ADR-0036, schema `result_set_store`).
     /// Borrows pg_pool_ (declared earlier, destructs later) — declared here so

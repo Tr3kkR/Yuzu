@@ -477,7 +477,7 @@ collisions possible; vendor precision pending ADR-0018). See
 
 ### 9.9 Quarantine Status Tracking :white_check_mark: `T2`
 
-`QuarantineStore` (SQLite backend). Server-side quarantine records with agent_id, status (active/released), quarantined_by, timestamps, whitelist, and reason. `list_quarantined()` for active quarantines, `get_history()` for per-agent quarantine history. REST API endpoints for quarantine/release/status.
+`QuarantineStore` (PostgreSQL backend, schema `quarantine_store`, ADR-0047). Server-side quarantine records with agent_id, status (active/released), quarantined_by, timestamps, whitelist, and reason. `list_quarantined()` for active quarantines, `get_history()` for per-agent quarantine history. REST API endpoints for quarantine/release/status.
 
 ### 9.10 Application Whitelisting :x: `T3`
 

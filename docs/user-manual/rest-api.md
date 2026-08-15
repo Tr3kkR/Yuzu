@@ -1428,6 +1428,20 @@ list entirely, not merely hidden from write access.
 
 **Permission:** `Security:Read`, scoped per-device
 
+> **Fail-closed on a degraded read (ADR-0047).** A store/pool/query failure
+> returns `503` (`"quarantine list unavailable — try again"`), never a
+> silently-empty list — a device could still be actively contained while the
+> caller would otherwise see "nothing quarantined". A **second, distinct**
+> `503` cause exists for the per-record admit-then-filter scope check itself:
+> if it hits an anomalous outcome partway through the list (neither an
+> explicit allow nor an explicit deny — most commonly a transient
+> engine-principal-store outage), the whole list fails closed with
+> `"authorization check unavailable — try again"` rather than silently
+> omitting the affected record(s). Only the first cause increments
+> `yuzu_server_quarantine_read_degrade_total` — see
+> `docs/user-manual/upgrading.md` and `docs/user-manual/metrics.md` for the
+> full distinction.
+
 **Response:**
 
 ```json
@@ -1486,6 +1500,15 @@ Quarantine a device.
 }
 ```
 
+> **`400` vs `503` (ADR-0047).** A `400` means a business/state error (a
+> missing `agent_id`, or the device is already quarantined) — retrying the
+> identical request will not succeed, and `error.retry_after_ms` is
+> `null`. A `503` means a genuine store/pool failure — retrying is
+> reasonable, and `error.retry_after_ms` carries a concrete `5000`
+> hint (REST's envelope has no nested `data` object — that's MCP's JSON-RPC
+> shape; REST matches the MCP `quarantine_device` twin's A5 behavior, not
+> its exact field path).
+
 ---
 
 #### `DELETE /api/v1/quarantine/{agent_id}`
@@ -1502,6 +1525,10 @@ Release a device from quarantine.
   "meta": { "api_version": "v1" }
 }
 ```
+
+> **`400` vs `503` (ADR-0047).** Same distinction as `POST` above — `400`
+> means the device is not currently quarantined (retrying will not help);
+> `503` means a genuine store/pool failure (retrying is reasonable).
 
 ---
 
