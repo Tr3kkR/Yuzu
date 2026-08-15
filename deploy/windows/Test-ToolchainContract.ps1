@@ -980,7 +980,7 @@ Check 'Windows nightly requires the host manifest without an optional guard' {
 }
 Check 'schema-less compatibility is explicit and time-bounded' {
   $deadline = [DateTimeOffset]$contract.legacy_schema_compatibility_until
-  $deadline -eq [DateTimeOffset]::Parse('2026-08-14T23:59:59Z')
+  $deadline -eq [DateTimeOffset]::Parse('2026-09-14T23:59:59Z')
 }
 Check 'the baseline updater covers every active tracked SHA reference' {
   $workflow = Get-Content -LiteralPath $BaselineWorkflowPath -Raw

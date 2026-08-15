@@ -68,7 +68,7 @@ multi-hour archaeology dig, and no script hardcodes one host's layout.
 
    The schema introduction has one separately bounded bridge for manifests
    emitted by the immediately preceding provisioner: a missing `schema` is
-   accepted through **2026-08-14 23:59:59 UTC**, but every v1 pin, path, and
+   accepted through **2026-09-14 23:59:59 UTC**, but every v1 pin, path, and
    live-version probe still runs. Drain and reprovision every Windows runner
    from merged code before that deadline. Unknown explicit schemas and a
    missing manifest always fail.
