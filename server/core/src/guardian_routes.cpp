@@ -297,15 +297,16 @@ bool GuardianRoutes::deny_service_scoped_(const httplib::Request& req,
             403, "service-scoped tokens may not read this fleet-wide Guardian view", cid,
             detail::A4ErrorOpts{.permission = "GuaranteedState:Read"}),
         "application/json");
-    // One shared verb across all 6 fragments this gate covers (status, guards,
-    // events, guard/page, baselines, baseline/page) — a probing service token
-    // leaves a trace, not silence, mirroring the REST fleet-wide deny's own
-    // denial audit (rest_api_v1.cpp's events route). `req.path` in `detail`
-    // disambiguates which of the six fragments was probed, since the verb
-    // itself does not. try/catch (not routed through try_persist_audit, which
-    // requires a bool-returning AuditFn): the 403 above is already durably
-    // written, so this is belt-and-suspenders against a throwing sink, not a
-    // functional requirement.
+    // One shared verb across every fragment this gate covers (data-bearing:
+    // status, guards, events, guard/page, baselines, baseline/page; and the
+    // create/edit forms: guard-form, baseline-form, baseline/{id}/edit) - a
+    // probing service token leaves a trace, not silence, mirroring the REST
+    // fleet-wide deny's own denial audit (rest_api_v1.cpp's events route).
+    // `req.path` in `detail` disambiguates which fragment was probed, since
+    // the verb itself does not. try/catch (not routed through
+    // try_persist_audit, which requires a bool-returning AuditFn): the 403
+    // above is already durably written, so this is belt-and-suspenders
+    // against a throwing sink, not a functional requirement.
     if (audit_fn_) {
         try {
             audit_fn_(req, "guaranteed_state.fragment.access_denied", "denied", "GuaranteedState",
@@ -2318,19 +2319,31 @@ void GuardianRoutes::register_routes(HttpRouteSink& sink,
             });
 
     // -- Create forms ------------------------------------------------------
+    // Important finding from external review (PR #3156): missed alongside
+    // the data-bearing fragments above - baseline-form and the edit form
+    // both call store_->list_rules() to seed a Member-guards datalist,
+    // disclosing the fleet-wide rule catalogue (and, for edit, one
+    // baseline's own name + member rules) to an otherwise-unconfined
+    // service-scoped token. guard-form only serves the compiled-in schema
+    // catalog (no live data), but is brought under the same deny for
+    // consistency with every other GuaranteedState:Read fragment in this
+    // file.
     sink.Get("/fragments/guardian/guard-form",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_guard_form_fragment(), "text/html; charset=utf-8");
             });
     sink.Get("/fragments/guardian/baseline-form",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baseline_form_fragment(), "text/html; charset=utf-8");
             });
     // Edit-Baseline modal form (pre-filled name + member chips).
     sink.Get(R"(/fragments/guardian/baseline/([A-Za-z0-9._\-]+)/edit)",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (deny_service_scoped_(req, res)) return;
                 if (!perm_fn_(req, res, "GuaranteedState", "Read")) return;
                 res.set_content(render_baseline_edit_form_fragment(req.matches[1].str()),
                                 "text/html; charset=utf-8");

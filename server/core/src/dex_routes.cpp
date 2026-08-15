@@ -2797,6 +2797,12 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
              });
 
     // -- Health score: derived/secondary composite (?weighting=<preset>) --
+    // No service-scoped deny (external review, PR #3156): this is a
+    // fleet-wide COMPOSITE SCORE with no per-agent_id row, the same
+    // aggregate-no-identity shape /fragments/guardian/status already
+    // documents as exempt from this confinement class - confining it is a
+    // correctness question (should the displayed score reflect only the
+    // caller's own scope) separate from the disclosure this branch fixes.
     sink.Get("/fragments/dex/health", [this](const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
@@ -2812,6 +2818,8 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     });
 
     // -- Trends: cross-OS comparison + per-family small-multiples + heatmap --
+    // Same aggregate-no-identity exemption as /fragments/dex/health above -
+    // no service-scoped deny (external review, PR #3156).
     sink.Get("/fragments/dex/trends", [this](const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;

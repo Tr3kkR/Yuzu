@@ -477,10 +477,30 @@ TEST_CASE("Guardian data fragments deny a service-scoped token, regardless of "
     REQUIRE(baseline_page != nullptr);
     CHECK(baseline_page->status == 403);
 
+    // Important finding from external review (PR #3156): the create/edit
+    // FORM fragments were missed alongside the data-bearing fragments above
+    // - baseline-form and the edit form both seed a Member-guards datalist
+    // from store_->list_rules(), disclosing the fleet-wide rule catalogue
+    // (and, for edit, one baseline's own name + members) to an otherwise-
+    // unconfined service-scoped token.
+    auto guard_form = h.sink.dispatch("GET", "/fragments/guardian/guard-form", "", "");
+    REQUIRE(guard_form != nullptr);
+    CHECK(guard_form->status == 403);
+
+    auto baseline_form = h.sink.dispatch("GET", "/fragments/guardian/baseline-form", "", "");
+    REQUIRE(baseline_form != nullptr);
+    CHECK(baseline_form->status == 403);
+
+    auto baseline_edit = h.sink.dispatch("GET", "/fragments/guardian/baseline/bl1/edit", "", "");
+    REQUIRE(baseline_edit != nullptr);
+    CHECK(baseline_edit->status == 403);
+    CHECK(baseline_edit->body.find("BL1") == std::string::npos); // no identity leaked
+    CHECK(baseline_edit->body.find("GuardOne") == std::string::npos);
+
     // Denied before any READ audit (no evidence of unauthorized DATA access to
     // conflate with a legitimate one) — but the denial itself IS recorded, one
     // row per fragment probed, so a probing service token leaves a trace.
-    REQUIRE(h.audit_log.size() == 6);
+    REQUIRE(h.audit_log.size() == 9);
     for (const auto& a : h.audit_log) {
         CHECK(a.action == "guaranteed_state.fragment.access_denied");
         CHECK(a.result == "denied");
@@ -516,10 +536,12 @@ TEST_CASE("an ordinary (non-service-scoped) session still reaches every Guardian
     h.seed_baseline("bl1", "BL1", {"g1"});
     // session_token_scope_service left empty (default) — the ordinary path.
 
-    for (const char* path : {"/fragments/guardian/status", "/fragments/guardian/guards",
-                             "/fragments/guardian/events", "/fragments/guardian/guard/g1/page",
-                             "/fragments/guardian/baselines",
-                             "/fragments/guardian/baseline/bl1/page"}) {
+    for (const char* path :
+         {"/fragments/guardian/status", "/fragments/guardian/guards",
+          "/fragments/guardian/events", "/fragments/guardian/guard/g1/page",
+          "/fragments/guardian/baselines", "/fragments/guardian/baseline/bl1/page",
+          "/fragments/guardian/guard-form", "/fragments/guardian/baseline-form",
+          "/fragments/guardian/baseline/bl1/edit"}) {
         auto res = h.sink.dispatch("GET", path, "", "");
         REQUIRE(res != nullptr);
         CHECK(res->status == 200);

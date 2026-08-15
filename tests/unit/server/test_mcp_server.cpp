@@ -4021,6 +4021,70 @@ TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential
     }
 }
 
+// ── CRITICAL finding, this branch's own governance review (PR #3156, while
+// re-verifying the external review's separate findings on this same file):
+// the REST twins of these two tools were found gated only on the GLOBAL
+// perm_fn - same gap here,
+// same fix (deny_fleet_wide_service_scoped, reused verbs). ────────────────
+
+TEST_CASE("MCP get_dex_group_app_perf: denies a service-scoped token, denial audited",
+          "[pg][mcp][integration][dex][app_perf][security]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.group =
+        [](std::string_view, std::string_view,
+           std::string_view) -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        return std::vector<yuzu::server::AppPerfFleetRow>{};
+    };
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":94,"params":{"name":"get_dex_group_app_perf","arguments":{"group_id":"g1","app":"chrome.exe"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "dex.perf.group.view|denied")
+            saw_denied = true;
+        CHECK(a != "dex.perf.group.view|success");
+    }
+    CHECK(saw_denied);
+}
+
+TEST_CASE("MCP compare_app_perf_versions: denies a service-scoped token, denied under "
+          "the existing dex.app_perf.compare verb",
+          "[pg][mcp][integration][dex][app_perf][security]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.cohort =
+        [](std::string_view, std::string_view, std::string_view, std::string_view, int)
+        -> std::optional<yuzu::server::CohortRead> {
+        yuzu::server::CohortRead cr;
+        cr.member_count = 2;
+        cr.rows = {{"m1", "4.2.0.0", 10, 100, 2.0, 1000}, {"m1", "4.3.0.0", 11, 100, 5.0, 1500}};
+        return cr;
+    };
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":95,"params":{"name":"compare_app_perf_versions","arguments":{"app":"AcmeVPN.exe","group":"g1","baseline":"4.2.0.0","candidate":"4.3.0.0"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+
+    bool saw_denied = false;
+    for (const auto& a : ts.audit_log) {
+        if (a == "dex.app_perf.compare|denied")
+            saw_denied = true;
+        CHECK(a != "dex.app_perf.compare|success");
+    }
+    CHECK(saw_denied);
+}
+
 TEST_CASE("MCP compare_app_perf_versions: provider-absent and degrade → kInternalError",
           "[mcp][integration][dex][app_perf][verify]") {
     const char* call =

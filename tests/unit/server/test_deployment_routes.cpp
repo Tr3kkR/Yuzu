@@ -12,8 +12,11 @@
  * same way as the sibling PreflightRoutes fix in this branch.
  *
  * POST /fragments/auto/deploy/run (the mutating create+first-dispatch route)
- * is DELIBERATELY NOT covered here — it is a separate, unfixed finding
- * pending its own review of the guarded-transition contract.
+ * had no deny at all until external review (PR #3156) caught it - this file
+ * previously left it deliberately uncovered pending a review of the
+ * guarded-transition contract; that review found the missing deny, not a
+ * conflict with it, so it is now fixed and covered below alongside its
+ * siblings.
  */
 
 #include "deployment_routes.hpp"
@@ -188,10 +191,28 @@ TEST_CASE("deployment routes: config/result/delete deny a service-scoped "
     REQUIRE_FALSE(del_body.is_discarded());
     CHECK(del_body["error"]["permission"] == "SoftwareDeployment:Execute");
 
-    REQUIRE(audit_log.size() == 3);
+    // Important finding from external review (PR #3156): the create route
+    // itself - the first fleet-wide dispatch, not just the config/poll/
+    // delete siblings above - had no deny at all until this fix.
+    auto create = sink.Post("/fragments/auto/deploy/run?run=" + run_id, "",
+                            "application/x-www-form-urlencoded");
+    REQUIRE(create);
+    CHECK(create->status == 403);
+    CHECK(dispatched == 0); // still zero - create never reached advance() either
+    auto create_body = nlohmann::json::parse(create->body, nullptr, false);
+    REQUIRE_FALSE(create_body.is_discarded());
+    CHECK(create_body["error"]["permission"] == "SoftwareDeployment:Execute");
+    // No second deployment was created for this run - the run's only
+    // running deployment is still the pre-existing fixture, unchanged.
+    auto still_running = deploy_store.find_running_for_run(run_id, "alice");
+    REQUIRE(still_running.has_value());
+    CHECK(*still_running == dep_id);
+
+    REQUIRE(audit_log.size() == 4);
     CHECK(audit_log[0] == "deployment.config.view|denied");
     CHECK(audit_log[1] == "deployment.advance|denied");
     CHECK(audit_log[2] == "deployment.delete|denied");
+    CHECK(audit_log[3] == "deployment.create|denied");
 }
 
 TEST_CASE("deployment routes: ordinary session reaches config/result/delete, "

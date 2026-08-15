@@ -1006,6 +1006,110 @@ TEST_CASE("REST network/devices: audit-persist failure → 503, no data",
     CHECK(res->has_header("Sec-Audit-Failed"));
 }
 
+// ── BLOCKING finding, external review (PR #3156): Guardian rule CRUD +
+// push carried no service-scoped deny at all - ITServiceOwner holds full
+// CRUD on GuaranteedState plus an explicit Push grant, so a service-scoped
+// token could read/author/delete rules and push the active rule set
+// (full_sync) fleet-wide, outside its own service. Push is the single most
+// severe instance of the guardian-confinement-2298 class: it mutates what
+// every OTHER service's agents enforce. ──────────────────────────────────
+
+TEST_CASE("REST gs.rules list: service-scoped token → 403, denial audited",
+          "[pg][rest][guaranteed_state][rules][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.rule.read");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_type == "GuaranteedState");
+    CHECK(h.audit_log[0].target_id.empty());
+}
+
+TEST_CASE("REST gs.rules list: ordinary session still reaches the route",
+          "[pg][rest][guaranteed_state][rules]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+TEST_CASE("REST gs.rules detail: service-scoped token → 403, denial audited with the rule id",
+          "[pg][rest][guaranteed_state][rules][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r-001");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.rule.read");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_id == "r-001");
+}
+
+TEST_CASE("REST gs.rules create: service-scoped token → 403, .permission names Write",
+          "[pg][rest][guaranteed_state][rules][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Post("/api/v1/guaranteed-state/rules",
+                           R"({"rule_id":"r-svc","name":"svc"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["permission"] == "GuaranteedState:Write");
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.rule.create");
+    CHECK(h.audit_log[0].result == "denied");
+}
+
+TEST_CASE("REST gs.rules update: service-scoped token → 403, .permission names Write, "
+          "target_id is the rule",
+          "[pg][rest][guaranteed_state][rules][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Put("/api/v1/guaranteed-state/rules/r-001", R"({"name":"x"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["permission"] == "GuaranteedState:Write");
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.rule.update");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_id == "r-001");
+}
+
+TEST_CASE("REST gs.rules delete: service-scoped token → 403, .permission names Delete",
+          "[pg][rest][guaranteed_state][rules][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Delete("/api/v1/guaranteed-state/rules/r-001");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["permission"] == "GuaranteedState:Delete");
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.rule.delete");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_id == "r-001");
+}
+
+TEST_CASE("REST gs.push: service-scoped token → 403, .permission names Push (the most severe "
+          "instance of this class - a fleet-wide full_sync push)",
+          "[pg][rest][guaranteed_state][push][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Post("/api/v1/guaranteed-state/push", R"({})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["permission"] == "GuaranteedState:Push");
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "guaranteed_state.push");
+    CHECK(h.audit_log[0].result == "denied");
+}
+
 TEST_CASE("REST gs.status: returns store rule_count rollup", "[pg][rest][guaranteed_state][status]") {
     RestGsHarness h;
     REQUIRE(h.sink
@@ -1777,6 +1881,59 @@ TEST_CASE("REST dex/perf/app: missing app → 400; provider absent → 503; pres
         CHECK(pt["device_count"] == 3);
         CHECK_FALSE(pt.contains("cpu_mean")); // stats omitted when suppressed
     }
+}
+
+// ── CRITICAL finding, this branch's own governance review (PR #3156, while
+// re-verifying the external review's separate findings on this same file):
+// /dex/perf/group and /dex/perf/compare gated only on the GLOBAL perm_fn -
+// their own comments
+// reasoned about RBAC management-group-scoped grants (a different axis) and
+// never considered a service-scoped API token, which holds a GLOBAL
+// GuaranteedState:Read via ITServiceOwner and so could supply any group_id/
+// group, including one outside its own service. ──────────────────────────
+
+TEST_CASE("REST dex/perf/group: service-scoped token → 403, denial audited",
+          "[pg][rest][dex][app_perf][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Get("/api/v1/dex/perf/group?group_id=g1&app=chrome.exe");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "dex.perf.group.view");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_type == "GuaranteedState");
+}
+
+TEST_CASE("REST dex/perf/group: ordinary session still reaches the route",
+          "[pg][rest][dex][app_perf]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/perf/group?group_id=g1&app=chrome.exe");
+    REQUIRE(res);
+    CHECK(res->status != 403);
+}
+
+TEST_CASE("REST dex/perf/compare: service-scoped token → 403, denied under the "
+          "existing dex.app_perf.compare verb",
+          "[pg][rest][dex][app_perf][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Get(
+        "/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1&baseline=4.2.0.0&candidate=4.3.0.0");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "dex.app_perf.compare");
+    CHECK(h.audit_log[0].result == "denied");
+}
+
+TEST_CASE("REST dex/perf/compare: ordinary session still reaches the route",
+          "[pg][rest][dex][app_perf]") {
+    RestGsHarness h;
+    auto res = h.sink.Get(
+        "/api/v1/dex/perf/compare?app=AcmeVPN.exe&group=g1&baseline=4.2.0.0&candidate=4.3.0.0");
+    REQUIRE(res);
+    CHECK(res->status != 403);
 }
 
 TEST_CASE("REST dex/perf/group: missing params → 400; provider absent → 503; floor echoed",

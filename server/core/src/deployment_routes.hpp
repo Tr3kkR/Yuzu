@@ -103,19 +103,19 @@ public:
 
 private:
     /// Deny a service-scoped API token on a `/auto` Deploy surface that scopes
-    /// by `session->username` alone (the config form, result poll, and delete)
-    /// — SEC-2/SEC-3 confinement-gap class, same as PreflightRoutes'
+    /// by `session->username` alone (the config form, result poll, delete, and
+    /// create) — SEC-2/SEC-3 confinement-gap class, same as PreflightRoutes'
     /// deny_service_scoped_: `ApiToken::principal_id` ("username... who
     /// created it") means a service-scoped token shares its creating human's
     /// username, so username-only owner-scoping does not confine it to its
     /// OWN service. The result-poll route additionally re-invokes the
     /// deployment engine's mutating advance() tick on every call (unlike a
     /// pure read) — denying it here narrows exposure (stops further devices
-    /// being admitted to an in-flight deployment on later ticks) but does NOT
-    /// by itself close the fleet-wide creation gap on `POST
-    /// /fragments/auto/deploy/run`, which remains a separate, deliberately
-    /// unfixed finding pending its own review of the guarded-transition
-    /// contract. Writes the 403 FIRST, audits after via the shared
+    /// being admitted to an in-flight deployment on later ticks); the create
+    /// route (`POST /fragments/auto/deploy/run`) closes the fleet-wide
+    /// creation gap directly (external review, PR #3156 — this call site was
+    /// missing for a time after the other three landed). Writes the 403
+    /// FIRST, audits after via the shared
     /// try_persist_audit kernel, under `action`. `target_type` defaults to
     /// "SoftwareDeployment" (the `.advance`/`.delete` verbs' own established
     /// success-path target_type per audit-log.md); the config-view call site

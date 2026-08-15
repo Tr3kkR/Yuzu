@@ -233,6 +233,16 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
             res.set_content("auth required", "text/plain");
             return;
         }
+        // Important finding from external review (PR #3156): this is the
+        // deployment CREATION route itself (the first fleet-wide dispatch),
+        // not just the config-view/result-poll/delete siblings already
+        // fixed elsewhere in this file - a service-scoped token could
+        // otherwise stage + dispatch an installer to devices outside its
+        // own service.
+        if (deny_service_scoped_(req, res, "deployment.create",
+                                 "deployment create denied to a service-scoped token",
+                                 "SoftwareDeployment", "SoftwareDeployment:Execute"))
+            return;
         // Mutating fleet action: Execute tier; + Infrastructure:Read for the device
         // resolution + the result render it returns (so the repoll isn't 403-walled).
         if (!perm_fn_ || !perm_fn_(req, res, "Infrastructure", "Read"))
@@ -366,12 +376,13 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
             return;
         }
         // Owner-scoped by username (advance_and_render -> get_deployment), and
-        // a service-scoped token shares its creating principal's username —
+        // a service-scoped token shares its creating principal's username -
         // it would otherwise re-authorize + advance the mutating engine tick
         // for a deployment outside its own service (SEC-2/SEC-3 class). This
         // narrows exposure (stops further devices being admitted on later
-        // ticks) but does NOT by itself close the fleet-wide creation gap on
-        // POST /fragments/auto/deploy/run, which remains separately unfixed.
+        // ticks); the fleet-wide creation gap on POST
+        // /fragments/auto/deploy/run is closed separately, by its own
+        // deny_service_scoped_ call site below.
         if (deny_service_scoped_(req, res, "deployment.advance",
                                  "deployment result poll denied to a service-scoped token"))
             return;
