@@ -742,12 +742,17 @@ def _selftest():
     # measurement). PR1.6a review remediation (same day) additionally added
     # [operator_surface]: 3 new PG-backed MCP integration tests, untagged,
     # all landed in shard B and tipped it over its 600s CI budget (killed by
-    # TIMEOUT at 600.57s).
+    # TIMEOUT at 600.57s). ADR-0048 (LicenseStore, same day) additionally
+    # added [license_store]: shard B had grown to 1193 cases by the time this
+    # store's tests landed and was TIMEOUT-ing at 600s on Windows on two
+    # consecutive runs, so its 33 cases moved to shard A the same way rather
+    # than adding to an already-strained shard (tests/meson.build's own
+    # comment on this pair has the measurement).
     check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
           and ("~[pg]~[auth]~[mcp]",) in _shard_specs
-          and ("[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store],[pg][operator_surface]",)
+          and ("[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store],[pg][operator_surface],[pg][license_store]",)
           in _shard_specs
-          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]",)
+          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[license_store]",)
           in _shard_specs,
           "meson.build: all four shard tag filters extracted verbatim")
 
