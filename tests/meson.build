@@ -884,8 +884,8 @@ if build_server
   # [guaranteed_state_store] and [response_store] moved to A by the same
   # AUDIT_STORE precedent above — each is a dedicated store's own tag, confined
   # to that one test file, same shape as [audit_store] (verified: `grep -rl`
-  # each tag matches exactly one file). Moves 195 cases (90+55+50), landing at
-  # 781 (A) / 1166 (B) — better, not perfect; [custom_props] was considered and
+  # each tag matches exactly one file). Moves 207 cases (93+61+53), landing at
+  # 793 (A) / 1154 (B) — better, not perfect; [custom_props] was considered and
   # left out because it also tags test_props_scope_authz.cpp (a scope-authz
   # suite, not pure store CRUD), so its per-case PG cost isn't confirmed uniform
   # with the others. Partition preserved: N([pg]) == N(A) + N(B).
