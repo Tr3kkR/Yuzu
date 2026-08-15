@@ -1,0 +1,397 @@
+# Building Yuzu on RHEL 9 / Rocky 9 / AlmaLinux 9
+
+This is the enterprise-Linux counterpart to the apt recipe in `.github/workflows/ci.yml`. CI
+exercises Ubuntu 24.04/26.04, macOS and Windows only — RHEL-family hosts are a supported *developer*
+platform, not a CI-covered one, so this doc records a verified sequence rather than an
+automatically-regression-tested one.
+
+**One command:**
+
+```bash
+bash scripts/setup-rhel9.sh --with-postgres          # provision
+source ~/.config/yuzu/toolchain-env.sh               # activate (also hooked into ~/.bashrc)
+./scripts/setup.sh --tests --native-file meson/native/linux-gcc13.ini
+meson compile -C build-linux
+```
+
+The script is idempotent — re-running it on a provisioned box changes nothing. Verify a machine at
+any time with `bash scripts/setup-rhel9.sh --check --with-postgres`.
+
+The rest of this doc explains *why* each piece is what it is, because the four things most likely
+to bite you (the compiler, the native file, `pg_hba.conf`, and the test role's privileges) all fail
+in confusing ways.
+
+---
+
+## The four traps
+
+### 1. The system GCC cannot build this project
+
+RHEL 9's `gcc` is 11. Yuzu is C++23 and the documented floor is **GCC 13+ / Clang 18+**. The fix is
+a **Software Collection**: `gcc-toolset-14` ships GCC 14.2.1 *and its own libstdc++ 14 headers*,
+which is the part that matters — `<print>`, `<expected>`, and the C++23 `<format>` additions live in
+libstdc++, and the base system's `libstdc++-devel` is 11.5.
+
+This also rules out the obvious-looking alternative: AppStream carries `clang` 21, but Clang uses
+the *system* libstdc++ headers, so a bare `clang++ -std=c++23` still gets the 11.5 library. Using
+Clang here means installing `gcc-toolset-14` anyway and pointing Clang at it with
+`--gcc-install-dir`. Not worth it unless you specifically want a second-opinion compile.
+
+A Software Collection must be activated **per shell**:
+
+```bash
+source /opt/rh/gcc-toolset-14/enable
+```
+
+Inside the collection the binaries are plain **`gcc` / `g++`** — *not* `gcc-14` / `g++-14`. That
+detail drives trap 2. (gcc-toolset links the newer libstdc++ bits statically, so the binaries you
+build still run on the base system without the collection activated.)
+
+### 2. Use `meson/native/linux-gcc13.ini`, whatever your GCC version
+
+The native files are not interchangeable:
+
+| File | Verdict on RHEL 9 |
+|---|---|
+| `linux-gcc13.ini` | ✅ **Use this.** Contains only `cpp_std = 'c++23'` — no hard-coded binaries, no linker override. Compiler selection comes from `CC`/`CXX`. This is what the GHA-hosted ubuntu-24.04 canary uses. |
+| `linux-gcc14.ini` | ❌ Hard-codes `c = 'gcc-14'` / `cpp = 'g++-14'`. Those names do not exist inside the Software Collection — meson fails to find a compiler. |
+| `linux-gcc15.ini`, `linux-clang21.ini` | ❌ Both force `-fuse-ld=mold`. `mold` is not in BaseOS/AppStream/CRB (EPEL only) and is not installed by this recipe — every link fails. |
+
+The name "gcc13" describes the CI leg it was written for, not a compiler constraint.
+
+### 3. `postgresql-setup --initdb` leaves host auth on `ident`
+
+Needed only if you want the server suite's `[pg]` tests to actually run. RHEL's initdb writes:
+
+```
+host    all             all             127.0.0.1/32            ident
+```
+
+`ident` rejects the password auth in `YUZU_TEST_POSTGRES_DSN`, and the failure surfaces as a
+connection error deep inside the test run rather than as a config error. Change the two loopback
+`all all` lines to `scram-sha-256` and `systemctl reload postgresql`. `setup-rhel9.sh
+--with-postgres` does this, preserves the original as `pg_hba.conf.yuzu-orig`, and prints a warning
+rather than editing silently.
+
+Remember the skip-vs-fail contract from `CLAUDE.md`: `YUZU_TEST_POSTGRES_DSN` **unset** → the `[pg]`
+tests skip cleanly; **set but broken** → hard FAIL. So a misconfigured cluster is worse than none.
+
+### 4. The test role needs `pg_signal_backend`, not just `CREATEDB`
+
+This one cost a 600-second timeout to find, and it is the least obvious failure in this document.
+
+`PostgresTestDb` creates an ephemeral `yuzu_test_<salt>_<n>` database per test and drops it
+`WITH (FORCE)`. `FORCE` terminates the backends still attached to the database, and terminating
+another role's backend requires membership in the predefined **`pg_signal_backend`** role. A test
+role with only `LOGIN CREATEDB` gets:
+
+```
+PostgresTestDb: DROP DATABASE failed — leaked yuzu_test_1786828330_843575621_1284:
+ERROR:  permission denied to terminate process
+```
+
+Nothing fails at that moment. The tests keep passing, each one leaking a database, and the cluster
+gets progressively slower until the `server pg unit tests shard B` target blows its 600 s meson
+timeout and is SIGKILLed — with the actual cause buried in thousands of lines of per-test `NOTICE:`
+output. On the reference box this left **70 orphaned databases** behind.
+
+```sql
+GRANT pg_signal_backend TO yuzu;
+```
+
+`setup-rhel9.sh --with-postgres` grants it, `--check` verifies both the membership and that no
+`yuzu_test_*` databases have leaked. If you are cleaning up after hitting this:
+
+```bash
+sudo -u postgres psql -tAc \
+  "SELECT datname FROM pg_database WHERE datname LIKE 'yuzu\_test\_%'" |
+  while read -r db; do
+    [ -n "$db" ] && sudo -u postgres psql -qc "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)"
+  done
+```
+
+---
+
+## RHEL vs Rocky vs Alma
+
+The only material divergence is repository enablement. `ninja-build` and `ccache` live in **CRB**
+(CodeReady Builder, formerly PowerTools), which ships disabled on Rocky/Alma and is
+subscription-gated on RHEL.
+
+| | Rocky 9 / Alma 9 | RHEL 9 |
+|---|---|---|
+| CRB | `sudo dnf config-manager --set-enabled crb` | `sudo subscription-manager repos --enable codeready-builder-for-rhel-9-$(uname -m)-rpms` |
+| Everything else | identical | identical |
+
+**EPEL is not required to build.** Every *mandatory* package resolves from BaseOS / AppStream / CRB —
+verified with `dnf repoquery --installed --qf '%{from_repo}'` on the reference box, which is also how
+`docs/rhel9-toolchain-manifest.json` records provenance.
+
+The one wrinkle: **`ccache` is EPEL-only** on this distro family. It is in neither BaseOS, AppStream
+nor CRB (`ninja-build` *is* in CRB, which is easy to conflate). ccache is optional — without it the
+build works, rebuilds are just slower — so `setup-rhel9.sh` installs it only if it is already
+reachable, warns otherwise, and writes an env file whose `CC`/`CXX` adapt:
+
+```bash
+export CC="ccache gcc"   # if ccache is on PATH
+export CC="gcc"          # otherwise
+```
+
+Pass `--with-epel` to have the script enable EPEL and pick ccache up. It is off by default because
+enabling EPEL on a managed work machine is a policy decision, not a build requirement. EPEL is also
+where `mold` and Erlang live, if you later want either.
+
+---
+
+## What gets installed, and why
+
+```bash
+sudo dnf install -y \
+  gcc-toolset-14 \
+  cmake ninja-build pkgconf-pkg-config make \
+  bison flex autoconf automake libtool \
+  perl perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html \
+  systemd-devel glibc-devel kernel-headers \
+  python3-pip zip unzip tar curl git
+
+sudo dnf install -y ccache          # optional, EPEL only — see above
+```
+
+| Package(s) | Why |
+|---|---|
+| `gcc-toolset-14` | C++23. See trap 1. |
+| `cmake` | Not a build system here — Meson's `dependency(..., method: 'cmake')` resolution needs it, which is how gRPC/protobuf/SQLite/PostgreSQL/Catch2 are all found. |
+| `ninja-build` | Meson's backend (CRB). |
+| `bison`, `flex` | vcpkg's `libpq` port builds PostgreSQL from source and cannot auto-acquire these on Linux. |
+| `perl` + `perl-IPC-Cmd`, `perl-FindBin`, `perl-File-Compare`, `perl-Pod-Html` | vcpkg's `openssl` port is a Perl-driven build. A minimal RHEL install has no `perl` at all. |
+| `systemd-devel` | `agents/core/meson.build` takes a **required** `libsystemd` dependency (`systemd_guard` defaults to `enabled` in `meson.options`). The RHEL name for CI's `libsystemd-dev`. Opt out with `-Dsystemd_guard=disabled` if you must. |
+| `autoconf`, `automake`, `libtool` | Needed by several vcpkg ports (grpc/c-ares, xmlsec, libpq's autoreconf path). |
+| `glibc-devel`, `kernel-headers` | RHEL equivalent of CI's `linux-libc-dev`. |
+| `ccache` | **Optional, EPEL-only.** `CC`/`CXX` are set to `ccache gcc` / `ccache g++` when present (matching CI), plain `gcc`/`g++` otherwise. |
+
+**Do not install `meson` from dnf** — Rocky/RHEL 9 ship 0.63.3, below the `meson_version: '>=1.3.0'`
+floor in `meson.build`. Meson comes from pip, pinned to the CI version:
+
+```bash
+python3 -m pip install --user meson==1.11.2 pyyaml==6.0.3
+```
+
+The system Python 3.9 is fine (meson 1.11.2 declares `requires_python >= 3.7`). PyYAML is a **hard
+configure-time dependency** — `server/core/meson.build` runs `python3 -c 'import yaml'` and
+hard-errors if it fails, because content embedding (`embed_content.py`) needs it. The rpm
+`python3-pyyaml` (5.4.1) would work; the pinned 6.0.3 in `~/.local` shadows it and matches
+`requirements-ci.in`.
+
+> Do not install the hash-pinned `requirements-ci.txt` here — it was `pip-compile`d under Python
+> 3.12, so `--require-hashes` under Python 3.9 is a needless wheel-selection risk. Install the two
+> packages that matter explicitly. (`gcovr` from that file is only for the nightly coverage job.)
+
+### Python 3.9 has a shelf life here
+
+`meson setup` emits:
+
+```
+NOTICE: You are using Python 3.9 which is EOL. Starting with v1.12.0, Meson will require Python 3.10 or newer
+```
+
+Meson 1.11.2 works fine on 3.9 today, so this recipe stays on the system interpreter. When the
+project moves past meson 1.11.x, RHEL 9 boxes will need a newer interpreter from AppStream
+(`python3.12` is packaged). Two things to get right at that point:
+
+1. Install meson under the new interpreter — `python3.12 -m pip install --user meson==<ver>`.
+2. **PyYAML must be importable by whatever `python3` *meson* resolves**, which is a separate
+   question. `find_program('python3')` picks up `/usr/bin/python3` (3.9) unless you shadow it, and
+   that is the interpreter that runs `embed_content.py` and `gen_proto.py`. Installing meson under
+   3.12 while leaving PyYAML only under 3.9, or vice versa, produces a confusing configure-time
+   failure.
+
+   Simplest resolution: keep PyYAML installed for *both* interpreters, or put `python3.12` first on
+   `PATH` as `python3` so meson and the build scripts agree.
+
+**Do not install `libpq-devel`** — libpq comes from vcpkg as a static library, and CI asserts the
+built binary has no dynamic libpq (ADR-0008).
+
+---
+
+## vcpkg
+
+```bash
+git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
+git -C ~/vcpkg checkout 4b77da7fed37817f124936239197833469f1b9a8
+~/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+export VCPKG_ROOT=~/vcpkg
+```
+
+That commit is the `builtin-baseline` in `vcpkg.json`, the `default-registry.baseline` in
+`vcpkg-configuration.json`, and `VCPKG_COMMIT` in `ci.yml` — keep all three in agreement.
+
+**Activate gcc-toolset before the first `vcpkg install`** so every port is built by GCC 14 rather
+than the system GCC 11. Budget for a cold from-source build of all 22 ports (grpc, protobuf, abseil,
+openssl, libpq, libxml2, xmlsec, sqlite3, zlib, catch2 …) and roughly 15–25 GB of
+`buildtrees`/`packages` churn; see `docs/rhel9-toolchain-manifest.json` for measured timings on the
+reference box.
+
+---
+
+## Environment
+
+`setup-rhel9.sh` writes a sourceable `~/.config/yuzu/toolchain-env.sh` and hooks it into `~/.bashrc`
+behind a guard block, so it is safe on re-run:
+
+```bash
+source /opt/rh/gcc-toolset-14/enable   # guarded: no stacked PATH entries
+PATH="$HOME/.local/bin:$PATH"          # meson
+export VCPKG_ROOT="$HOME/vcpkg"
+export CC="ccache gcc" CXX="ccache g++"
+export YUZU_TEST_ENABLE_PG=1
+export YUZU_TEST_POSTGRES_DSN="postgresql://yuzu:yuzu@127.0.0.1:5432/yuzu_test"
+```
+
+The DSN address/role/database match the native-cluster branch of `scripts/ci/ensure-postgres.sh`, so
+that script is a no-op on a box provisioned this way. The `yuzu` role needs **`CREATEDB`** —
+`PostgresTestDb` (`tests/unit/test_helpers.hpp`) creates and drops an ephemeral
+`yuzu_test_<salt>_<n>` database per test.
+
+---
+
+## Verify
+
+```bash
+bash scripts/setup-rhel9.sh --check --with-postgres    # every gate below, scripted
+```
+
+Manually:
+
+```bash
+g++ --version                      # 14.2.1
+meson --version                    # 1.11.2
+python3 -c "import yaml; print(yaml.__version__)"
+printf '#include <print>\nint main(){std::println("c++23 ok");}\n' > /tmp/c23.cpp
+g++ -std=c++23 /tmp/c23.cpp -o /tmp/c23 && /tmp/c23     # proves libstdc++ 14 is in play
+psql "$YUZU_TEST_POSTGRES_DSN" -tAc 'SELECT 1'
+```
+
+After the build:
+
+```bash
+bash scripts/link-tests.sh          # see note below
+meson test -C build-linux --print-errorlogs
+```
+
+> `scripts/setup.sh` calls `link-tests.sh` itself, but it does so at *configure* time — before the
+> test binaries exist — so on a fresh checkout that call legitimately links nothing ("skipped N
+> not-yet-built"). Run it once by hand after the first `meson compile` to get the stable
+> `tests-build-<component>-linux_x64/` symlinks. They point at the real build output, so they stay
+> live across later rebuilds.
+
+Confirm the PG-backed tests really ran rather than skipped:
+
+```bash
+tests-build-server-linux_x64/yuzu_server_tests "[pg]"
+```
+
+---
+
+## Verified reference run
+
+Rocky Linux 9.8, 16 cores / 23 GB RAM, `dev` at `c01493d3`, 2026-08-15. The same recipe was also run
+end-to-end on `main` at `88f9397d` (the 0.13.0 cut, meson 1.11.1) with the same outcome. Full
+provenance — every package version with the repo it came from — is in
+`docs/rhel9-toolchain-manifest.json`; everything above `verified_run` in that file is machine-collected
+by `--manifest`, and the `verified_run` block is hand-recorded from the session.
+
+| Stage | Result |
+|---|---|
+| `vcpkg install` (22 ports, **cold**) + `meson setup` | **20.3 min** — grpc 13 min, protobuf 2.8 min, openssl 46 s, abseil 40 s |
+| `vcpkg install` (warm) + `meson setup --wipe` | **5 s** |
+| `meson compile` (78 targets) | **4.7 min**, 523 warnings, none from vcpkg headers, `werror=false` |
+| `meson test` (23 targets) | **10.4 min** — 18 pass, 2 skip, 2 fail (below) |
+| libpq linkage (ADR-0008) | no dynamic libpq ✅ |
+| Erlang gateway | skipped, rebar3 absent — by design |
+
+The repo's own "~65–70 min cold vcpkg" estimate is calibrated for a smaller machine; 16 cores cut it
+to 20 minutes.
+
+> **Timeout headroom:** even when healthy, `server pg unit tests shard B` takes **523 s against a
+> 600 s meson timeout** on this box. On a slower machine, raise the timeout rather than assuming a
+> hang — but check trap 4 first, because a missing `pg_signal_backend` produces a *real* timeout.
+
+### Two remaining failures
+
+**1. `docs — yuzu:ci telemetry selftest`** — the system-SQLite/`RETURNING` limitation described
+above. Platform-specific, understood, not fixable from the setup script.
+
+**2. `tests/unit/server/test_mcp_server.cpp:2270`** — *"MCP Agentic demo: classify schema drops
+phantom mode and never steers to a write tool (G-S5/G-S6)"*, `CHECK(checked)`. One case out of 500 in
+shard A; one assertion out of 9916.
+
+Assessed as pre-existing and platform-independent rather than a RHEL/GCC-14 artifact. The evidence:
+it fails **identically on `main` @ `88f9397d` and on `dev` @ `c01493d3`** — 2688 commits apart — and
+reproduces with and without the Postgres test environment. The assertion is pure MCP `tools/list`
+visibility logic: the test harness's permission mock always allows, the tool table is a static array
+with a `sizeof`-derived count, and no `#ifdef` or OS/compiler-dependent code sits on the path. It was
+**not** cross-checked against a CI run, so treat it as an open item to confirm rather than an
+established known-failure.
+
+---
+
+## Known limitation: system SQLite is too old for the Python test tooling
+
+RHEL 9 ships **SQLite 3.34.1** (`sqlite-libs-3.34.1`). The `RETURNING` clause landed in **3.35.0**.
+The system `python3`'s `sqlite3` module links that system library, so any repo Python tooling that
+uses `RETURNING` fails on a stock RHEL 9 box:
+
+```
+test_db: SQLite operational error on .../test-runs.db: near "RETURNING": syntax error
+```
+
+Concretely this fails the `docs — yuzu:ci telemetry selftest` meson test, and it means
+`scripts/test/test_db.py` — the durable test-runs database behind the `/test` skill and the CI
+telemetry — cannot record results on this platform.
+
+**Scope: Python only.** The C++ build and test suites are unaffected — they link SQLite **3.52.0**
+from vcpkg, not the system library. Nothing about the compiler, the build, or the C++ tests depends
+on this.
+
+Installing `python3.11` or `python3.12` from AppStream does **not** fix it — those RPMs link the same
+system `sqlite-libs` (their dependency is literally `sqlite-libs >= 3.34.1`). A real fix means a
+newer SQLite for Python (source build, or reworking the tooling onto a bundled driver), so on RHEL 9
+today this is a documented limitation rather than something the setup script can resolve.
+
+---
+
+## Out of scope
+
+- **The Erlang gateway.** `meson.build` does `find_program('rebar3', required: false)`, so with no
+  rebar3 on `PATH` the configure step prints `Erlang gateway: skipped` and the C++ build proceeds
+  normally; the `gateway eunit` / `gateway ct` meson tests simply never register. EPEL has Erlang
+  26, but CI pins **OTP 28 + rebar3 3.24**, and `scripts/ensure-erlang.sh` only *finds* an existing
+  kerl/asdf/brew install — it never downloads one. Adding the gateway means kerl or asdf for OTP 28
+  plus a downloaded rebar3 3.24 escript. See `docs/erlang-gateway-build.md`.
+- **The UAT rigs.** No container runtime is installed. `podman` + `podman-docker` are available in
+  AppStream if you later want `scripts/start-UAT.sh` et al.; `scripts/ci/ensure-postgres.sh` prefers
+  a `docker` binary but falls through to the native cluster this recipe provisions.
+- **Sanitizer / coverage builds.** `-Db_sanitize=...` works with gcc-toolset-14; the nightly coverage
+  job additionally needs `gcovr==8.6`.
+
+## Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `meson.build:1: ERROR: Meson version is 0.63.3 but project requires >=1.3.0` | dnf's meson is on `PATH` ahead of `~/.local/bin`. Source the env file. |
+| `ERROR: PyYAML is required to embed bundled content` at configure time | `python3` resolved to an interpreter without PyYAML. Check `python3 -c 'import yaml'` with the *same* `python3` meson found. |
+| `ERROR: Unknown compiler(s): [['gcc-14']]` | You passed `--native-file meson/native/linux-gcc14.ini`. Use `linux-gcc13.ini`. See trap 2. |
+| `cannot find -lmold` / `unrecognized option '-fuse-ld=mold'` | You passed the gcc15 or clang21 native file. See trap 2. |
+| `error: 'print' is not a member of 'std'` | gcc-toolset not activated — you are on the system GCC 11. `source /opt/rh/gcc-toolset-14/enable`. |
+| `FATAL: Ident authentication failed for user "yuzu"` | `pg_hba.conf` trap 3. |
+| `server pg unit tests shard B` TIMEOUT / SIGKILL after 600 s | Missing `pg_signal_backend`, trap 4. Check for leaked `yuzu_test_*` databases. |
+| `permission denied to terminate process` in test output | Same — trap 4. |
+| `near "RETURNING": syntax error` from a Python script | System SQLite is 3.34.1; `RETURNING` needs 3.35+. Known limitation, see above. |
+| vcpkg `openssl` port fails in `Configure` | Missing perl modules. Install `perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html`. |
+| vcpkg `libpq` port fails looking for `bison`/`flex` | Those two packages are not installed. |
+
+## Related
+
+- `docs/rhel9-toolchain-manifest.json` — exact provenance of the verified reference box.
+- `docs/windows-build.md`, `docs/darwin-compat.md` — the other two platform runbooks.
+- `.github/workflows/ci.yml` — the Ubuntu recipe this one is derived from.

@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+#
+# setup-rhel9.sh — bootstrap the Yuzu C++ build toolchain on RHEL 9 / Rocky 9 / AlmaLinux 9.
+#
+# The repo's CI only exercises Ubuntu, macOS and Windows; this script is the
+# enterprise-Linux equivalent of the apt recipe in .github/workflows/ci.yml.
+# It is idempotent: re-running it makes no changes on an already-provisioned box.
+#
+# Runbook + rationale:  docs/rhel9-build-setup.md
+#
+# Usage:
+#   bash scripts/setup-rhel9.sh                    # toolchain + vcpkg
+#   bash scripts/setup-rhel9.sh --with-postgres    # ... plus a local PG 18 for the server tests
+#   bash scripts/setup-rhel9.sh --with-epel        # ... plus EPEL, for the optional ccache
+#   bash scripts/setup-rhel9.sh --check            # verify only, change nothing
+#   bash scripts/setup-rhel9.sh --manifest out.json
+#
+# Other flags: --skip-vcpkg, --vcpkg-root DIR, --dry-run
+#
+set -euo pipefail
+
+# --- Constants ---------------------------------------------------------------
+
+# Must match vcpkg.json's builtin-baseline, vcpkg-configuration.json's
+# default-registry.baseline, and VCPKG_COMMIT in .github/workflows/ci.yml.
+VCPKG_COMMIT="4b77da7fed37817f124936239197833469f1b9a8"
+
+# GCC 13+ is the documented floor (README "Prerequisites"). RHEL 9's system GCC
+# is 11, so the compiler must come from a gcc-toolset Software Collection.
+GCC_TOOLSET="gcc-toolset-14"
+
+# Pinned to requirements-ci.in. Rocky's dnf meson is 0.63.3 — below the
+# meson_version '>=1.3.0' floor in meson.build — so meson comes from pip.
+MESON_VERSION="1.11.2"
+PYYAML_VERSION="6.0.3"
+
+# AppStream module stream. 18 matches the server substrate (ADR-0006).
+PG_STREAM="18"
+
+# ccache is deliberately NOT in PKGS: on the RHEL 9 family it exists only in
+# EPEL (verified — it is in neither BaseOS, AppStream nor CRB), and enabling
+# EPEL on a managed work machine is a policy decision, not a build requirement.
+# It is optional: without it the env file falls back to plain gcc/g++.
+CCACHE_PKG="ccache"
+
+PKGS=(
+  # C++23 compiler (GCC 14 + its own libstdc++ 14 headers)
+  "${GCC_TOOLSET}"
+  # build tooling
+  cmake ninja-build pkgconf-pkg-config make
+  # vcpkg port build prerequisites
+  bison flex autoconf automake libtool
+  perl perl-IPC-Cmd perl-FindBin perl-File-Compare perl-Pod-Html
+  # headers the build links against
+  systemd-devel glibc-devel kernel-headers
+  # python + archive/network tools vcpkg needs
+  python3-pip zip unzip tar curl git
+)
+
+ENV_FILE="${HOME}/.config/yuzu/toolchain-env.sh"
+
+# --- Options -----------------------------------------------------------------
+
+WITH_POSTGRES=0
+WITH_EPEL=0
+SKIP_VCPKG=0
+CHECK_ONLY=0
+DRY_RUN=0
+MANIFEST=""
+VCPKG_ROOT_ARG="${VCPKG_ROOT:-${HOME}/vcpkg}"
+
+usage() {
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --with-postgres) WITH_POSTGRES=1 ;;
+    --with-epel)     WITH_EPEL=1 ;;
+    --skip-vcpkg)    SKIP_VCPKG=1 ;;
+    --check)         CHECK_ONLY=1 ;;
+    --dry-run)       DRY_RUN=1 ;;
+    --vcpkg-root)    VCPKG_ROOT_ARG="${2:?--vcpkg-root needs a path}"; shift ;;
+    --manifest)      MANIFEST="${2:?--manifest needs a path}"; shift ;;
+    -h|--help)       usage ;;
+    *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# --- Output helpers ----------------------------------------------------------
+
+if [ -t 1 ]; then B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; N=$'\033[0m'
+else B=""; G=""; Y=""; R=""; N=""; fi
+
+step() { printf '\n%s==> %s%s\n' "$B" "$*" "$N"; }
+ok()   { printf '  %s[ ok ]%s %s\n' "$G" "$N" "$*"; }
+skip() { printf '  %s[skip]%s %s\n' "$Y" "$N" "$*"; }
+warn() { printf '  %s[warn]%s %s\n' "$Y" "$N" "$*" >&2; }
+die()  { printf '  %s[fail]%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+run() {
+  if [ "$DRY_RUN" = 1 ]; then printf '  (dry-run) %s\n' "$*"; return 0; fi
+  "$@"
+}
+
+FAILURES=0
+check() { # check <label> <condition-cmd...>
+  local label="$1"; shift
+  if "$@" >/dev/null 2>&1; then ok "$label"; else
+    printf '  %s[fail]%s %s\n' "$R" "$N" "$label" >&2
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
+# --- Distro gate -------------------------------------------------------------
+
+[ -r /etc/os-release ] || die "no /etc/os-release — unsupported system"
+# shellcheck disable=SC1091
+. /etc/os-release
+DISTRO_ID="${ID:-unknown}"
+DISTRO_MAJOR="${VERSION_ID%%.*}"
+
+case "${DISTRO_ID}" in
+  rhel|rocky|almalinux) ;;
+  *) die "unsupported distro '${DISTRO_ID}' — this script targets RHEL/Rocky/Alma 9. \
+Ubuntu users: follow the apt recipe in .github/workflows/ci.yml." ;;
+esac
+[ "${DISTRO_MAJOR}" = "9" ] || die "unsupported release ${VERSION_ID:-?} — this script targets the 9.x line"
+
+ARCH="$(uname -m)"
+[ "${ARCH}" = "x86_64" ] || warn "arch ${ARCH}: only x86_64 has been verified (vcpkg.json filters catch2 to x64|arm64)"
+
+step "Target: ${PRETTY_NAME:-${DISTRO_ID} ${VERSION_ID}} (${ARCH})"
+
+# ============================================================================
+#  --check : verify an already-provisioned box, change nothing
+# ============================================================================
+
+if [ "$CHECK_ONLY" = 1 ]; then
+  step "Verifying toolchain (no changes will be made)"
+
+  # shellcheck disable=SC1090
+  [ -f "$ENV_FILE" ] && . "$ENV_FILE"
+
+  check "${GCC_TOOLSET} present"           test -f "/opt/rh/${GCC_TOOLSET}/enable"
+  check "g++ is GCC 13+"                   bash -c 'v=$(g++ -dumpfullversion -dumpversion 2>/dev/null | cut -d. -f1); [ -n "$v" ] && [ "$v" -ge 13 ]'
+  check "C++23 <print>/<expected> compile" bash -c 'printf "#include <print>\n#include <expected>\nint main(){std::println(\"{}\", std::expected<int,int>{1}.value());}\n" > /tmp/.yuzu_c23_$$.cpp && g++ -std=c++23 /tmp/.yuzu_c23_$$.cpp -o /tmp/.yuzu_c23_$$ && /tmp/.yuzu_c23_$$; rm -f /tmp/.yuzu_c23_$$ /tmp/.yuzu_c23_$$.cpp'
+  check "meson ${MESON_VERSION}"           bash -c "meson --version | grep -qx '${MESON_VERSION}'"
+  check "ninja present"                    command -v ninja
+  check "cmake present"                    command -v cmake
+  check "pkg-config present"               command -v pkg-config
+  check "bison present"                    command -v bison
+  check "flex present"                     command -v flex
+  check "perl present"                     command -v perl
+  check "python3 can import yaml"          python3 -c "import yaml"
+  check "libsystemd headers present"       pkg-config --exists libsystemd
+  check "VCPKG_ROOT set and bootstrapped"  test -x "${VCPKG_ROOT_ARG}/vcpkg"
+  check "vcpkg pinned to baseline"         bash -c "[ \"\$(git -C '${VCPKG_ROOT_ARG}' rev-parse HEAD 2>/dev/null)\" = '${VCPKG_COMMIT}' ]"
+
+  if [ "$WITH_POSTGRES" = 1 ] || [ -n "${YUZU_TEST_POSTGRES_DSN:-}" ]; then
+    check "postgresql service active"      systemctl is-active --quiet postgresql
+    check "DSN connects"                   bash -c 'psql "$YUZU_TEST_POSTGRES_DSN" -tAc "SELECT 1" | grep -qx 1'
+    check "test role has CREATEDB"         bash -c 'psql "$YUZU_TEST_POSTGRES_DSN" -tAc "SELECT rolcreatedb FROM pg_roles WHERE rolname = current_user" | grep -qx t'
+    check "test role has pg_signal_backend" bash -c 'psql "$YUZU_TEST_POSTGRES_DSN" -tAc "SELECT pg_has_role(current_user, '"'"'pg_signal_backend'"'"', '"'"'member'"'"')" | grep -qx t'
+    check "no leaked yuzu_test_* databases" bash -c 'psql "$YUZU_TEST_POSTGRES_DSN" -tAc "SELECT count(*) FROM pg_database WHERE datname LIKE '"'"'yuzu\_test\_%'"'"'" | grep -qx 0'
+  fi
+
+  if [ "$FAILURES" -gt 0 ]; then
+    printf '\n%s%d check(s) failed.%s Re-run without --check to provision.\n' "$R" "$FAILURES" "$N" >&2
+    exit 1
+  fi
+  printf '\n%sAll checks passed.%s\n' "$G" "$N"
+  exit 0
+fi
+
+# ============================================================================
+#  Provision
+# ============================================================================
+
+# --- 1. Repositories ---------------------------------------------------------
+#
+# ninja-build and ccache live in CRB (CodeReady Builder / PowerTools), which is
+# shipped-but-disabled on Rocky/Alma and subscription-gated on RHEL. This is the
+# single biggest RHEL-vs-Rocky divergence in the whole setup.
+
+step "Enabling repositories (CRB)"
+if dnf repolist --enabled 2>/dev/null | grep -qiE '^(crb|codeready-builder)'; then
+  skip "CRB already enabled"
+else
+  run sudo dnf install -y dnf-plugins-core
+  case "${DISTRO_ID}" in
+    rhel)
+      run sudo subscription-manager repos --enable "codeready-builder-for-rhel-9-${ARCH}-rpms" \
+        || die "could not enable CRB. On RHEL this requires an active subscription; \
+enable 'codeready-builder-for-rhel-9-${ARCH}-rpms' by hand and re-run."
+      ;;
+    rocky|almalinux)
+      run sudo dnf config-manager --set-enabled crb
+      ;;
+  esac
+  ok "CRB enabled"
+fi
+
+# EPEL is NOT required to build. Every mandatory package resolves from
+# BaseOS/AppStream/CRB. It is needed only for optional extras: ccache (verified
+# EPEL-only on this family), mold, and Erlang for the gateway.
+if [ "$WITH_EPEL" = 1 ]; then
+  step "Enabling EPEL (for ccache)"
+  if dnf repolist --enabled 2>/dev/null | grep -qE '^epel[[:space:]]'; then
+    skip "EPEL already enabled"
+  else
+    case "${DISTRO_ID}" in
+      rhel) run sudo dnf install -y "https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm" ;;
+      *)    run sudo dnf install -y epel-release ;;
+    esac
+    ok "EPEL enabled"
+  fi
+fi
+
+# --- 2. System packages ------------------------------------------------------
+
+step "Installing system packages"
+MISSING=()
+for p in "${PKGS[@]}"; do rpm -q "$p" >/dev/null 2>&1 || MISSING+=("$p"); done
+if [ ${#MISSING[@]} -eq 0 ]; then
+  skip "all ${#PKGS[@]} packages already installed"
+else
+  printf '  installing: %s\n' "${MISSING[*]}"
+  run sudo dnf install -y "${MISSING[@]}"
+  ok "installed ${#MISSING[@]} package(s)"
+fi
+
+TOOLSET_ENABLE="/opt/rh/${GCC_TOOLSET}/enable"
+[ -f "${TOOLSET_ENABLE}" ] || [ "$DRY_RUN" = 1 ] || die "${TOOLSET_ENABLE} missing after install"
+
+# ccache: optional, EPEL-only. Not a hard failure — the env file adapts.
+if rpm -q "${CCACHE_PKG}" >/dev/null 2>&1; then
+  skip "${CCACHE_PKG} already installed"
+elif dnf --quiet repoquery --qf '%{name}' "${CCACHE_PKG}" 2>/dev/null | grep -qx "${CCACHE_PKG}"; then
+  run sudo dnf install -y "${CCACHE_PKG}"
+  ok "${CCACHE_PKG} installed (optional)"
+else
+  warn "${CCACHE_PKG} not available in any enabled repo — it lives in EPEL on this distro family."
+  warn "  Building without it works fine, just slower on rebuilds. Re-run with --with-epel to get it."
+fi
+
+# --- 3. Python build tooling -------------------------------------------------
+#
+# PyYAML is a HARD configure-time dependency: server/core/meson.build runs
+# `python3 -c 'import yaml'` and hard-errors if it fails (content embedding).
+
+step "Installing Python build tooling (meson ${MESON_VERSION}, pyyaml ${PYYAML_VERSION})"
+if python3 -c "
+import sys
+try:
+    import mesonbuild, yaml
+except ImportError:
+    sys.exit(1)
+" 2>/dev/null && "${HOME}/.local/bin/meson" --version 2>/dev/null | grep -qx "${MESON_VERSION}"; then
+  skip "meson ${MESON_VERSION} and pyyaml already present"
+else
+  run python3 -m pip install --user --upgrade pip
+  run python3 -m pip install --user "meson==${MESON_VERSION}" "pyyaml==${PYYAML_VERSION}"
+  ok "meson + pyyaml installed to ~/.local"
+fi
+
+# --- 4. Shell environment ----------------------------------------------------
+#
+# gcc-toolset is a Software Collection: it must be activated per shell. Inside
+# the collection the binaries are plain `gcc`/`g++`, NOT `gcc-14`/`g++-14`.
+
+step "Writing ${ENV_FILE}"
+if [ "$DRY_RUN" = 0 ]; then
+  mkdir -p "$(dirname "${ENV_FILE}")"
+  cat > "${ENV_FILE}" <<EOF
+# Yuzu build toolchain environment (RHEL/Rocky/Alma 9).
+# Generated by scripts/setup-rhel9.sh — safe to source repeatedly.
+# Manual use:  source ${ENV_FILE}
+
+# GCC 14 (Software Collection). Guarded so repeated sourcing does not stack PATH entries.
+case ":\${PATH}:" in
+  *:/opt/rh/${GCC_TOOLSET}/root/usr/bin:*) ;;
+  *) [ -f ${TOOLSET_ENABLE} ] && . ${TOOLSET_ENABLE} ;;
+esac
+
+# meson (pip --user)
+case ":\${PATH}:" in
+  *:"\$HOME/.local/bin":*) ;;
+  *) PATH="\$HOME/.local/bin:\$PATH" ;;
+esac
+export PATH
+
+export VCPKG_ROOT="${VCPKG_ROOT_ARG}"
+
+# ccache wrappers, matching .github/workflows/ci.yml. ccache is EPEL-only on
+# RHEL/Rocky/Alma, so fall back to the bare compilers when it is absent.
+if command -v ccache >/dev/null 2>&1; then
+  export CC="ccache gcc"
+  export CXX="ccache g++"
+else
+  export CC="gcc"
+  export CXX="g++"
+fi
+
+# PostgreSQL-backed server tests. Unset DSN => those tests skip cleanly;
+# set-but-broken => hard FAIL (CLAUDE.md contract).
+export YUZU_TEST_ENABLE_PG=1
+export YUZU_TEST_POSTGRES_DSN="postgresql://yuzu:yuzu@127.0.0.1:5432/yuzu_test"
+EOF
+  ok "environment file written"
+
+  if grep -q 'yuzu/toolchain-env.sh' "${HOME}/.bashrc" 2>/dev/null; then
+    skip "~/.bashrc hook already present"
+  else
+    cat >> "${HOME}/.bashrc" <<EOF
+
+# >>> yuzu toolchain >>>
+[ -f "${ENV_FILE}" ] && . "${ENV_FILE}"
+# <<< yuzu toolchain <<<
+EOF
+    ok "~/.bashrc hook added"
+  fi
+fi
+
+# --- 5. vcpkg ----------------------------------------------------------------
+
+if [ "$SKIP_VCPKG" = 1 ]; then
+  step "vcpkg: skipped (--skip-vcpkg)"
+else
+  step "Provisioning vcpkg at ${VCPKG_ROOT_ARG}"
+  if [ -d "${VCPKG_ROOT_ARG}/.git" ]; then
+    skip "clone already present"
+  else
+    run git clone https://github.com/microsoft/vcpkg.git "${VCPKG_ROOT_ARG}"
+  fi
+  if [ "$(git -C "${VCPKG_ROOT_ARG}" rev-parse HEAD 2>/dev/null)" = "${VCPKG_COMMIT}" ]; then
+    skip "already at pinned baseline ${VCPKG_COMMIT:0:12}"
+  else
+    run git -C "${VCPKG_ROOT_ARG}" fetch --quiet origin
+    run git -C "${VCPKG_ROOT_ARG}" checkout --quiet "${VCPKG_COMMIT}"
+    ok "checked out ${VCPKG_COMMIT:0:12}"
+  fi
+  if [ -x "${VCPKG_ROOT_ARG}/vcpkg" ]; then
+    skip "already bootstrapped"
+  else
+    run "${VCPKG_ROOT_ARG}/bootstrap-vcpkg.sh" -disableMetrics
+    ok "bootstrapped"
+  fi
+fi
+
+# --- 6. PostgreSQL (optional) ------------------------------------------------
+#
+# Only needed to RUN the server test suite's [pg] tests. The address/role/db
+# below match the native-cluster branch of scripts/ci/ensure-postgres.sh.
+
+if [ "$WITH_POSTGRES" = 1 ]; then
+  step "Provisioning PostgreSQL ${PG_STREAM} for the server test suite"
+
+  if rpm -q postgresql-server >/dev/null 2>&1; then
+    skip "postgresql-server already installed ($(rpm -q --qf '%{VERSION}' postgresql-server))"
+  else
+    run sudo dnf -qy module enable "postgresql:${PG_STREAM}"
+    run sudo dnf install -y postgresql-server postgresql-contrib
+    ok "postgresql ${PG_STREAM} installed"
+  fi
+
+  if sudo test -f /var/lib/pgsql/data/PG_VERSION; then
+    skip "data directory already initialised"
+  else
+    run sudo /usr/bin/postgresql-setup --initdb
+    ok "initdb complete"
+  fi
+
+  if systemctl is-active --quiet postgresql; then
+    skip "postgresql already running"
+  else
+    run sudo systemctl enable --now postgresql
+    ok "postgresql started"
+  fi
+
+  # RHEL's initdb leaves host connections on `ident`, which rejects the
+  # password auth the DSN uses. Report the change rather than doing it silently.
+  if sudo grep -qE '^host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1/32|::1/128)[[:space:]]+ident' \
+       /var/lib/pgsql/data/pg_hba.conf; then
+    warn "pg_hba.conf has host auth = ident; switching the two loopback 'all all' lines to scram-sha-256"
+    warn "  (original preserved as /var/lib/pgsql/data/pg_hba.conf.yuzu-orig)"
+    run sudo cp -n /var/lib/pgsql/data/pg_hba.conf /var/lib/pgsql/data/pg_hba.conf.yuzu-orig
+    run sudo sed -i -E \
+      's@^(host[[:space:]]+all[[:space:]]+all[[:space:]]+(127\.0\.0\.1/32|::1/128)[[:space:]]+)ident$@\1scram-sha-256@' \
+      /var/lib/pgsql/data/pg_hba.conf
+    run sudo systemctl reload postgresql
+    ok "host auth set to scram-sha-256"
+  else
+    skip "pg_hba.conf host auth already password-based"
+  fi
+
+  # CREATEDB is REQUIRED: PostgresTestDb (tests/unit/test_helpers.hpp) creates
+  # and drops an ephemeral yuzu_test_<salt>_<n> database per test.
+  if sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='yuzu'" 2>/dev/null | grep -qx 1; then
+    skip "role 'yuzu' exists"
+  else
+    run sudo -u postgres psql -c "CREATE ROLE yuzu LOGIN CREATEDB PASSWORD 'yuzu';"
+    ok "role 'yuzu' created"
+  fi
+
+  # pg_signal_backend is REQUIRED too, and its absence is expensive rather than
+  # obvious: PostgresTestDb drops each ephemeral database WITH (FORCE), which
+  # terminates the backends still attached to it. Without membership in
+  # pg_signal_backend that termination is denied, every test LEAKS its database,
+  # and the [pg] shard slows down until it blows its 600 s meson timeout — with
+  # the real cause buried in per-test log noise. GRANT is idempotent.
+  if sudo -u postgres psql -tAc \
+       "SELECT pg_has_role('yuzu','pg_signal_backend','member')" 2>/dev/null | grep -qx t; then
+    skip "role 'yuzu' already has pg_signal_backend"
+  else
+    run sudo -u postgres psql -c "GRANT pg_signal_backend TO yuzu;"
+    ok "granted pg_signal_backend to 'yuzu'"
+  fi
+  if sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='yuzu_test'" 2>/dev/null | grep -qx 1; then
+    skip "database 'yuzu_test' exists"
+  else
+    run sudo -u postgres psql -c "CREATE DATABASE yuzu_test OWNER yuzu;"
+    ok "database 'yuzu_test' created"
+  fi
+fi
+
+# --- 7. Manifest -------------------------------------------------------------
+
+if [ -n "${MANIFEST}" ] && [ "$DRY_RUN" = 0 ]; then
+  step "Writing provenance manifest to ${MANIFEST}"
+  # shellcheck disable=SC1090
+  . "${ENV_FILE}"
+  {
+    printf '{\n'
+    printf '  "generated_by": "scripts/setup-rhel9.sh",\n'
+    printf '  "distro": "%s",\n' "${PRETTY_NAME:-${DISTRO_ID} ${VERSION_ID}}"
+    printf '  "distro_id": "%s",\n' "${DISTRO_ID}"
+    printf '  "kernel": "%s",\n' "$(uname -r)"
+    printf '  "arch": "%s",\n' "${ARCH}"
+    printf '  "vcpkg_triplet": "x64-linux",\n'
+    printf '  "vcpkg_commit": "%s",\n' "${VCPKG_COMMIT}"
+    printf '  "vcpkg_tool": "%s",\n' "$("${VCPKG_ROOT_ARG}/vcpkg" version 2>/dev/null | head -1 | sed 's/.*version //;s/[^0-9a-z.-]//g')"
+    printf '  "compiler": "%s",\n' "$(g++ --version 2>/dev/null | head -1)"
+    printf '  "cmake": "%s",\n' "$(cmake --version 2>/dev/null | head -1 | awk '{print $3}')"
+    printf '  "ninja": "%s",\n' "$(ninja --version 2>/dev/null)"
+    printf '  "meson": "%s",\n' "$(meson --version 2>/dev/null)"
+    printf '  "python": "%s",\n' "$(python3 -c 'import platform; print(platform.python_version())')"
+    printf '  "pyyaml": "%s",\n' "$(python3 -c 'import yaml; print(yaml.__version__)')"
+    printf '  "postgresql": "%s",\n' "$(/usr/bin/postgres --version 2>/dev/null | awk '{print $3}')"
+    printf '  "packages": {\n'
+    local_first=1
+    for p in "${PKGS[@]}" "${CCACHE_PKG}"; do
+      rpm -q "$p" >/dev/null 2>&1 || continue
+      evr="$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$p")"
+      repo="$(dnf --quiet repoquery --installed --qf '%{from_repo}' "$p" 2>/dev/null | head -1)"
+      # Packages laid down by the installer carry an opaque hex repo id.
+      case "$repo" in [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*[0-9a-f]) [ ${#repo} -eq 32 ] && repo="base-os-install" ;; esac
+      [ "$local_first" = 1 ] || printf ',\n'
+      printf '    "%s": {"version": "%s", "repo": "%s"}' "$p" "$evr" "${repo:-unknown}"
+      local_first=0
+    done
+    printf '\n  }\n}\n'
+  } > "${MANIFEST}"
+  ok "manifest written"
+fi
+
+# --- Done --------------------------------------------------------------------
+
+step "Toolchain ready"
+cat <<EOF
+
+  Next:
+    source ${ENV_FILE}
+    cd <repo> && ./scripts/setup.sh --tests --native-file meson/native/linux-gcc13.ini
+    meson compile -C build-linux
+
+  Note: use linux-gcc13.ini (cpp_std only). linux-gcc14.ini hard-codes gcc-14/g++-14,
+  which do not exist inside the Software Collection; the gcc15/clang21 files require mold.
+
+  Verify anytime with:  bash scripts/setup-rhel9.sh --check$([ "$WITH_POSTGRES" = 1 ] && echo ' --with-postgres')
+
+EOF
