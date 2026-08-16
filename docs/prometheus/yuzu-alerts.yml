@@ -2659,8 +2659,11 @@ groups:
         # boot on a huge tags.db can trip it during the upgrade window
         # (silence for the window). The BOOT LOG carries the actual
         # remediation (holder-side fingerprint mismatch / direction-aware
-        # row-conflict refusal / unreadable legacy file / oversized-file txn
-        # timeout) — this is the outside-in backstop, not the primary signal.
+        # row-conflict refusal / unreadable legacy file). An oversized legacy
+        # file does NOT time out server-side — it makes a LONG boot that an
+        # orchestrator's startup budget may kill mid-backfill (safe, retried
+        # whole) — so also check for a kill loop, not only a refusal line.
+        # This is the outside-in backstop, not the primary signal.
         expr: |
           absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[15m])
         for: 5m

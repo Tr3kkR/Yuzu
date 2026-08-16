@@ -1457,16 +1457,21 @@ sqlite3 /path/to/tags.db \
   log's `TagStore: migrate_from_sqlite:` lines carry the specific refusal, and
   `docs/ops-runbooks/tag-store-backfill-recovery.md` maps each message to its
   recovery.
-- **The 60-second transaction ceiling is a REFUSAL LOOP, not a slow boot.** The
-  whole backfill runs in one bounded transaction (60 s). The sibling stores'
-  "budget for a longer first boot" guidance is NOT sufficient here: a `tags.db`
-  too large to insert within the ceiling aborts, commits nothing, and every
-  subsequent boot repeats the identical failure — no probe/orchestrator budget
-  helps. Tag data at realistic fleet scale (tens of tags × thousands of devices)
-  completes in seconds; if your row count is in the hundreds of thousands,
-  engage engineering BEFORE upgrading. Below that ceiling, still budget a
-  slower-than-usual first boot (Kubernetes `startupProbe` / compose healthcheck
-  `start_period`) rather than killing the server mid-backfill.
+- **Backfill duration is unbounded and latency-driven — the orchestrator budget
+  is the real constraint.** The backfill inserts row-by-row (roughly two
+  database round trips per row) inside one transaction. No overall time limit
+  applies: the transaction's named 60 s bound covers only the wait to obtain a
+  pool connection, and the fixed 30 s per-statement limit is never approached
+  by single-row operations — so a large `tags.db` produces a LONG first boot,
+  not an automatic abort. Estimate: `row count × 2 × your server↔Postgres
+  round-trip latency` (10k rows ≈ seconds on a local/LAN database; at 1 ms
+  RTT, ~100k rows ≈ several minutes). **The actual oversized-file failure mode
+  is your orchestrator killing the server mid-backfill** (systemd start limits,
+  Kubernetes `startupProbe`, compose healthcheck `start_period`) — which is
+  safe (nothing commits; the next boot retries whole) but loops until the
+  budget is widened. So: check the row count pre-upgrade, widen the startup
+  budget to cover the estimate with margin, and test the upgrade against a
+  staging copy if the estimate is more than a couple of minutes.
 - **Fingerprint-verified, not marker-only** (the `DiscoveryStore`/`QuarantineStore`
   shape — see those sections for the full multi-replica rationale): a later-booting
   replica still holding its own `tags.db` verifies the file's content against the
@@ -1502,7 +1507,10 @@ sqlite3 /path/to/tags.db \
   also silently skipping `tag:`-scoped checks (`last_check_at` stops advancing).
 - Agent tag syncs are bounded: an agent reporting more than 256 tags in one
   Register has the sync refused whole (logged; the agent keeps its prior tag
-  set). Realistic agents report 5–20.
+  set). Realistic agents report 5–20. If an agent legitimately exceeds the
+  cap, reduce what it self-reports (its `scopable_tags` come from the agent's
+  own configuration/plugins) — there is no server-side override knob; treat a
+  sustained refusal in the server log as an agent-configuration defect.
 
 **Verify:** after the server reports ready, `GET /api/v1/tags?agent_id=<id>` (or
 the device page) shows the same tags as before the upgrade, and

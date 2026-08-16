@@ -89,7 +89,8 @@ std::expected<void, std::string> validate(std::string_view input);
 enum class SyntheticKind { kNone, kLen, kStartswith };
 struct SyntheticAttr {
     SyntheticKind kind;
-    std::string_view real; // the attribute the resolver is actually asked for
+    std::string_view real; // the attribute the resolver is actually asked for;
+                            // ALIASES the `attribute` argument — valid only while it lives
 };
 SyntheticAttr classify_synthetic(std::string_view attribute);
 

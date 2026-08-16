@@ -317,6 +317,15 @@ std::expected<void, std::string> TagStore::set_tag_checked(const std::string& ag
 
 std::expected<bool, TagReadError> TagStore::delete_tag(const std::string& agent_id,
                                                        const std::string& key) {
+    // Guard symmetry with the write seams (Gate 8 round 2 — cpp-expert F1/
+    // cons-R1/security). An invalid id is answered as an HONEST NOT-FOUND
+    // rather than a caller error: the write guard above means no row can
+    // exist under such an identity, and this signature's error channel
+    // (TagReadError) deliberately carries only kDegraded. This closes the
+    // libpq C-truncation divergence (audit target vs affected row) without
+    // a signature change.
+    if (!valid_agent_id(agent_id))
+        return false;
     if (!open_) {
         spdlog::warn("TagStore::delete_tag: store not open");
         return std::unexpected(TagReadError::kDegraded);
@@ -347,7 +356,7 @@ TagStore::sync_agent_tags(const std::string& agent_id,
     if (tags.size() > kMaxSyncTags)
         return std::unexpected("too many agent-reported tags (max " +
                                std::to_string(kMaxSyncTags) +
-                               ") — sync refused whole, prior tag set retained");
+                               ") - sync refused whole, prior tag set retained");
 
     // Validate/sanitize OUTSIDE the transaction (no lease held during string
     // work), building the parallel arrays for ONE batched upsert. Malformed
@@ -441,6 +450,12 @@ std::expected<void, std::string> TagStore::delete_all_tags(const std::string& ag
 
 std::expected<std::optional<std::string>, TagReadError>
 TagStore::get_tag(const std::string& agent_id, const std::string& key) const {
+    // Invalid id (empty/oversized/embedded NUL) — honest not-found: the
+    // write-seam guard means no row can exist under it, and answering
+    // through the bind would read a TRUNCATED identity's row instead
+    // (Gate 8 round 2, guard symmetry).
+    if (!valid_agent_id(agent_id))
+        return std::optional<std::string>{std::nullopt};
     if (!open_) {
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_get_tag_sampler))
             spdlog::warn("TagStore::get_tag: store not open");
@@ -467,6 +482,8 @@ TagStore::get_tag(const std::string& agent_id, const std::string& key) const {
 
 std::expected<std::vector<DeviceTag>, TagReadError>
 TagStore::get_all_tags(const std::string& agent_id) const {
+    if (!valid_agent_id(agent_id))
+        return std::vector<DeviceTag>{}; // guard symmetry — see get_tag
     if (!open_) {
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_all_tags_sampler))
             spdlog::warn("TagStore::get_all_tags: store not open");
@@ -505,6 +522,8 @@ TagStore::get_all_tags(const std::string& agent_id) const {
 
 std::expected<std::unordered_map<std::string, std::string>, TagReadError>
 TagStore::get_tag_map(const std::string& agent_id) const {
+    if (!valid_agent_id(agent_id))
+        return std::unordered_map<std::string, std::string>{}; // guard symmetry — see get_tag
     if (!open_) {
         if (note_read_degrade(metrics_, kReasonStoreNotOpen, g_tag_map_sampler))
             spdlog::warn("TagStore::get_tag_map: store not open");

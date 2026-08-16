@@ -970,6 +970,19 @@ TEST_CASE("TagStore: writes reject an agent_id with an embedded NUL (UP-2 identi
     auto del_all = store.delete_all_tags(nul_id);
     REQUIRE_FALSE(del_all.has_value());
 
+    // Guard symmetry (Gate 8 round 2): delete_tag and the point reads answer
+    // an invalid id as honest not-found/empty — never a truncated-identity
+    // bind. Seed a row under the TRUNCATED id first to prove no leak-through.
+    require_ok(store.set_tag("agent", "env", "prod"));
+    auto del = store.delete_tag(nul_id, "env");
+    REQUIRE(del.has_value());
+    CHECK(*del == false); // not-found, and the truncated id's row survives
+    CHECK_FALSE(require_ok(store.get_tag(nul_id, "env")).has_value());
+    CHECK(require_ok(store.get_all_tags(nul_id)).empty());
+    CHECK(require_ok(store.get_tag_map(nul_id)).empty());
+    CHECK(require_ok(store.get_tag("agent", "env")).value_or("") == "prod");
+    require_ok(store.delete_all_tags("agent"));
+
     // Nothing landed under the truncated identity libpq would have written.
     CHECK(require_ok(store.get_all_tags("agent")).empty());
 }
