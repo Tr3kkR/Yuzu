@@ -83,8 +83,8 @@ analogy to ResponseStore: no backfill, the legacy `analytics.db` is never read o
 originally matched has the identical shape (a `warn` that fires on every restart, not just the
 actual cutover boot), and copying it uncorrected would have shipped the same doc/code mismatch
 here. There is no cheap way to distinguish "this is the actual cutover boot" from "the 400th boot
-since," so the log is phrased as an ongoing fact (server.cpp's actual line: "analytics spool on
-Postgres (schema analytics_event_store) — legacy analytics.db is not migrated ..."), not a
+since," so the log is phrased as an ongoing fact (server.cpp's actual line: "[PG] analytics spool
+on Postgres (schema analytics_event_store) — legacy analytics.db is not migrated ..."), not a
 one-time event notification.
 
 ### Secrets — none in `attributes`/`payload`; one found and fixed in `session_id`
@@ -247,3 +247,16 @@ flagged here explicitly for confirmation, per the kickoff doc's governance check
 - `docs/user-manual`/settings UI: the settings page's "Enabled"/"Disabled" analytics status
   label reads `cfg_.analytics_enabled` directly, so it can show "Enabled" even when construction
   silently disabled the feature (migration failure). Cosmetic accuracy gap, not fixed here.
+- `AuditStore`'s `session_id` field (`auth_routes.cpp`'s `make_audit_event`/
+  `audit_log_for_principal`, two call sites of the same `extract_session_cookie()`) has the
+  identical raw-bearer-cookie pattern this ADR fixed for `AnalyticsEvent.session_id` (see
+  §Secrets above) — a separate, already-migrated, out-of-scope store. Not established either way
+  whether its narrower read-permission gating already makes this a non-issue there; needs its own
+  assessment, not assumed safe by silence.
+- `/health`'s store-aggregate check never included `analytics_store_`, before or after this PR
+  (governance Gate 8 re-review, 2026-08-16) — pre-existing gap, same "readyz-vs-healthz drift"
+  class this file documents for several sibling stores. `/readyz`'s new `degraded` field already
+  covers on-call visibility; not fixed here.
+- The new `/readyz` `degraded` field has no dedicated test coverage (governance Gate 8
+  re-review, 2026-08-16) — worth a `[readyz]`-tagged regression test asserting the JSON shape
+  for all four ready/degraded combinations.
