@@ -22,6 +22,11 @@ constexpr const char* kMetricRecordsActive = "yuzu_mcp_bridge_records_active";
 constexpr const char* kMetricRejects = "yuzu_mcp_bridge_reject_total";
 constexpr const char* kMetricListenerFailures = "yuzu_mcp_bridge_listener_failures_total";
 constexpr const char* kMetricMailboxDrops = "yuzu_mcp_bridge_mailbox_drops_total";
+// #2438: H1's suppress-non-strictly-increasing-progress rule fires silently -
+// nothing counted a suppression, so a regression that stopped suppressing
+// (re-admitting equal/decreasing progress onto the wire) was only catchable by
+// unit tests, never production alerting.
+constexpr const char* kMetricProgressSuppressed = "yuzu_mcp_bridge_progress_suppressed_total";
 constexpr const char* kMetricProjectorCycles = "yuzu_mcp_bridge_projector_cycles_total";
 constexpr const char* kMetricProjectionDegraded = "yuzu_mcp_bridge_projection_degraded_total";
 constexpr const char* kMetricStreamingBackstop = "yuzu_mcp_bridge_streaming_backstop_total";
@@ -1673,6 +1678,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
             // allowed, so an initial 0/N is fine as the starting point). Same
             // "a strict client can reject" rationale as the UP-4 total:0 skip.
             if (rec->progress_sent_any && responded <= rec->last_progress_sent) {
+                rec->progress_suppressed_delta.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
             std::string frame;
@@ -2852,6 +2858,16 @@ void McpStreamBridge::flush_record_obs(BridgeRecord& rec) noexcept {
             core_->pending_projection_degraded.fetch_add(degraded, std::memory_order_relaxed);
         }
     }
+    const auto suppressed = rec.progress_suppressed_delta.exchange(0, std::memory_order_relaxed);
+    if (suppressed != 0) {
+        if (metrics_ == nullptr ||
+            !obs_guard([&] {
+                metrics_->counter(kMetricProgressSuppressed)
+                    .increment(static_cast<double>(suppressed));
+            })) {
+            core_->pending_progress_suppressed.fetch_add(suppressed, std::memory_order_relaxed);
+        }
+    }
 }
 
 void McpStreamBridge::flush_core_obs() noexcept {
@@ -2879,6 +2895,14 @@ void McpStreamBridge::flush_core_obs() noexcept {
             metrics_->counter(kMetricProjectionDegraded).increment(static_cast<double>(degraded));
         })) {
         core_->pending_projection_degraded.fetch_add(degraded, std::memory_order_relaxed);
+    }
+    const auto suppressed = core_->pending_progress_suppressed.exchange(0, std::memory_order_relaxed);
+    if (suppressed != 0 &&
+        !obs_guard([&] {
+            metrics_->counter(kMetricProgressSuppressed)
+                .increment(static_cast<double>(suppressed));
+        })) {
+        core_->pending_progress_suppressed.fetch_add(suppressed, std::memory_order_relaxed);
     }
 }
 

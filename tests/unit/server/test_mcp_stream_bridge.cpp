@@ -381,6 +381,13 @@ TEST_CASE("bridge progress is strictly monotonic on the wire (H1)", "[mcp][bridg
     // the MSVC preprocessor (the #2365 comma-in-macro class).
     const std::vector<std::uint64_t> expected{1, 3, 5};
     CHECK(got == expected);
+    // #2438: the 4 non-strictly-increasing candidates (1-dup, 2, 3-dup, 4) must
+    // each count. Polled: the flush that turns the delta into the registered
+    // counter runs on the projector thread, after (not observably-before, from
+    // the test thread) the publish this poll_until above already waited on.
+    REQUIRE(poll_until([&] {
+        return fx.reg.counter("yuzu_mcp_bridge_progress_suppressed_total").value() == 4.0;
+    }));
 }
 
 TEST_CASE("bridge GET-only lifecycle - live progress, no final, no pin", "[mcp][bridge][2f]") {
@@ -505,6 +512,9 @@ TEST_CASE("bridge flip-and-drain - no frame strands across arm (H2)", "[mcp][bri
         CHECK(j["params"]["progress"].get<std::uint64_t>() > prev);
         prev = j["params"]["progress"].get<std::uint64_t>();
     }
+    // #2438: distinct increasing counts by construction (see comment above) -
+    // H1 suppresses nothing here, so the counter must stay at zero.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_progress_suppressed_total").value() == 0.0);
 }
 
 TEST_CASE("bridge listener fault - contained, counted, one-shot", "[mcp][bridge][2f]") {

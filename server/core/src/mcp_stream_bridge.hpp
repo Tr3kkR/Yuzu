@@ -797,6 +797,7 @@ private:
         std::atomic<std::uint64_t> pending_listener_failures{0};
         std::atomic<std::uint64_t> pending_mailbox_drops{0};
         std::atomic<std::uint64_t> pending_projection_degraded{0};
+        std::atomic<std::uint64_t> pending_progress_suppressed{0};
     };
 
     struct BridgeRecord {
@@ -958,6 +959,11 @@ private:
         // itself never touches a metrics mutex.
         std::atomic<std::uint64_t> mailbox_drop_delta{0};
         std::atomic<std::uint64_t> listener_failure_delta{0};
+        /// #2438: H1 progress-monotonicity suppressions. Written on the
+        /// projector thread (no `mu` held from the emission loop onward) but
+        /// flushed from other threads (shutdown/teardown), so it stays atomic
+        /// like its C5 siblings even though there is only one writer.
+        std::atomic<std::uint64_t> progress_suppressed_delta{0};
         /// #2528: ~ClaimGuard released the claim without `mu` and therefore could
         /// not run the settle bookkeeping normally. "Should never happen" - it
         /// needs a genuinely broken platform mutex - so any nonzero value is a
