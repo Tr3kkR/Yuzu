@@ -21,9 +21,19 @@ set -euo pipefail
 
 # --- Constants ---------------------------------------------------------------
 
-# Must match vcpkg.json's builtin-baseline, vcpkg-configuration.json's
-# default-registry.baseline, and VCPKG_COMMIT in .github/workflows/ci.yml.
-VCPKG_COMMIT="4b77da7fed37817f124936239197833469f1b9a8"
+# The vcpkg baseline is READ FROM vcpkg.json rather than duplicated here.
+# Hardcoding it would (a) rot the moment the baseline is bumped and (b) add an
+# untracked copy that .github/workflows/vcpkg-baseline-update.yml does not
+# rewrite — which deploy/windows/Test-ToolchainContract.ps1 rightly fails on
+# ("the baseline updater covers every active tracked SHA reference").
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VCPKG_COMMIT="$(python3 -c "
+import json, sys
+try:
+    print(json.load(open('${REPO_ROOT}/vcpkg.json'))['builtin-baseline'])
+except Exception as exc:
+    sys.exit(f'cannot read builtin-baseline from ${REPO_ROOT}/vcpkg.json: {exc}')
+")" || { echo "Error: could not resolve the vcpkg baseline from vcpkg.json." >&2; exit 1; }
 
 # GCC 13+ is the documented floor (README "Prerequisites"). RHEL 9's system GCC
 # is 11, so the compiler must come from a gcc-toolset Software Collection.
@@ -440,7 +450,13 @@ if [ -n "${MANIFEST}" ] && [ "$DRY_RUN" = 0 ]; then
     printf '  "kernel": "%s",\n' "$(uname -r)"
     printf '  "arch": "%s",\n' "${ARCH}"
     printf '  "vcpkg_triplet": "x64-linux",\n'
-    printf '  "vcpkg_commit": "%s",\n' "${VCPKG_COMMIT}"
+    # Short SHA deliberately. This file is a historical record of what a given
+    # run used, so it must NOT be rewritten when the baseline moves — unlike the
+    # tracked copies in vcpkg.json/ci.yml/etc. A full 40-char SHA here would be
+    # picked up by Test-ToolchainContract.ps1's repo-wide grep and demand exactly
+    # that rewriting. 12 hex chars is unambiguous and is what git itself prints.
+    printf '  "vcpkg_baseline_short": "%s",\n' "${VCPKG_COMMIT:0:12}"
+    printf '  "vcpkg_baseline_authority": "vcpkg.json builtin-baseline",\n'
     printf '  "vcpkg_tool": "%s",\n' "$("${VCPKG_ROOT_ARG}/vcpkg" version 2>/dev/null | head -1 | sed 's/.*version //;s/[^0-9a-z.-]//g')"
     printf '  "compiler": "%s",\n' "$(g++ --version 2>/dev/null | head -1)"
     printf '  "cmake": "%s",\n' "$(cmake --version 2>/dev/null | head -1 | awk '{print $3}')"

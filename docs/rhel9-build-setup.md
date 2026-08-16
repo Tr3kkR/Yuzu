@@ -217,13 +217,17 @@ built binary has no dynamic libpq (ADR-0008).
 
 ```bash
 git clone https://github.com/microsoft/vcpkg.git ~/vcpkg
-git -C ~/vcpkg checkout 4b77da7fed37817f124936239197833469f1b9a8
+git -C ~/vcpkg checkout "$(python3 -c "import json;print(json.load(open('vcpkg.json'))['builtin-baseline'])")"
 ~/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 export VCPKG_ROOT=~/vcpkg
 ```
 
-That commit is the `builtin-baseline` in `vcpkg.json`, the `default-registry.baseline` in
-`vcpkg-configuration.json`, and `VCPKG_COMMIT` in `ci.yml` — keep all three in agreement.
+The baseline is read from `vcpkg.json` rather than written out here on purpose. The same SHA also
+appears as `default-registry.baseline` in `vcpkg-configuration.json` and `VCPKG_COMMIT` in `ci.yml`,
+and `.github/workflows/vcpkg-baseline-update.yml` rewrites every tracked copy when the baseline moves
+— a list that `deploy/windows/Test-ToolchainContract.ps1` enforces against a repo-wide `git grep`. A
+literal SHA in this file would be an untracked copy that silently goes stale, and would fail that
+check. `scripts/setup-rhel9.sh` reads it the same way.
 
 **Activate gcc-toolset before the first `vcpkg install`** so every port is built by GCC 14 rather
 than the system GCC 11. Budget for a cold from-source build of all 22 ports (grpc, protobuf, abseil,
