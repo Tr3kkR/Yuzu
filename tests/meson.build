@@ -254,6 +254,7 @@ agent_test_exe = executable(
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_content_dist_upload_parsers.cpp', # PR1.6b: pure upload-protocol planner/classifier (no I/O)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -274,6 +275,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
     include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
+    include_directories('../agents/plugins/content_dist/src'),  # content_dist_upload_parsers.hpp (PR1.6b pure helpers)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -503,6 +505,7 @@ if build_server
       'unit/server/test_web_utils.cpp',
       'unit/server/test_mcp_body_cap.cpp',
       'unit/server/test_dispatch_target_shape.cpp',
+      'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',

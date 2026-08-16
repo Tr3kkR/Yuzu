@@ -23,6 +23,7 @@
 #include "openapi_spec_access.hpp" // external-linkage accessor for discover_routes.cpp / mcp_server.cpp
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "rest_a4_envelope.hpp"
+#include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
@@ -6975,7 +6976,14 @@ void RestApiV1::register_routes(
             exec.definition_id = std::string(src_kind);
             exec.status = "running";
             exec.scope_expression = scope_expr;
-            exec.parameter_values = nlohmann::json(params).dump();
+            // #3136 blocker: persist a REDACTED copy — the live dispatch
+            // below still uses the raw `params` map. See
+            // sensitive_instruction_params.hpp. This is the same
+            // create-before-dispatch shape as workflow_routes.cpp/
+            // mcp_server.cpp's execute_instruction — an additional leak
+            // site beyond those two, found while remediating #3136.
+            exec.parameter_values =
+                nlohmann::json(redact_sensitive_instruction_params(params)).dump();
             exec.dispatched_by = owner;
             std::string exec_id;
             if (auto created = execution_tracker->create_execution(exec); created.has_value())
