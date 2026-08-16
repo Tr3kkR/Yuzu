@@ -1238,6 +1238,17 @@ sum(rate(yuzu_server_custom_properties_backfill_total{result="failed"}[15m])) > 
 sum(rate(yuzu_server_notification_backfill_total{result="failed"}[15m])) > 0
 ```
 
+## Analytics event outbox metrics (ADR-0049)
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_analytics_emit_dropped_total{reason}` | counter | `AnalyticsEventStore::emit()` drops (fail-soft ingest — a dropped event never fails the request that emitted it). `reason` ∈ `store_not_open`, `pool_acquire_timeout`, `query_error`, `serialize_error`. All four series pre-seeded to `0` at startup. |
+| `yuzu_server_analytics_read_degrade_total{method,reason}` | counter | `/api/analytics/status`/`/api/analytics/recent` reads that returned a degrade (`503`) rather than a result. `method` ∈ `query_recent`, `pending_count`; `reason` ∈ `store_not_open`, `pool_acquire_timeout`, `query_error`. All six combinations pre-seeded to `0`. |
+| `yuzu_server_analytics_drain_pass_failed_total` | counter | Drain passes that threw an exception at the thread boundary and were abandoned (retried at the next interval, never crashes the server). |
+| `yuzu_server_analytics_drain_last_pass_unixtime` | gauge | Wall-clock reading stamped at the start of every drain pass attempt, success or failure. **Caveat before alerting on staleness**: the drain thread only starts if at least one sink is configured (`--analytics-jsonl` or `--clickhouse-url`) — on a default install with neither set, this gauge is pre-seeded to `0` and never moves, by design, not because anything is wedged. A staleness alert on this gauge needs the same never-started/not-running/metric-missing split the audit-retention family uses (`YuzuAuditRetentionNotRunning`/`..._NeverRan`/`..._MetricMissing`), gated on whether a sink is actually configured — not yet shipped (tracked as a follow-up). |
+
+Analytics collection itself is disabled entirely with `--no-analytics` (no store, no metrics beyond the pre-seeded zeros above never incrementing). See [Upgrading](upgrading.md) for the Postgres-cutover behavior change and ADR-0049 for the store's fail-soft/degrade-distinguishable posture.
+
 ## Quarantine store metrics (Guardian device-quarantine bookkeeping, ADR-0047)
 
 The `QuarantineStore` — which agents are network-isolated, who isolated them, why, and their

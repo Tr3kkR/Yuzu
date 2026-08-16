@@ -610,6 +610,20 @@ legacy `analytics.db` is **never read** on upgrade.
   on a construction failure; see ADR-0049) — `/readyz`'s `degraded` field
   (not `failed_stores`) names it when it's on but dead, without affecting the
   node's ready/not-ready status.
+- **The Settings page's Enabled/Disabled analytics label is not accurate in
+  the migration-failed case above** (governance Gate 6 finding, 2026-08-16) —
+  it reads the `--no-analytics` config flag directly, not whether the store
+  actually opened, so it can still say "Enabled" while a failed migration has
+  silently disabled collection for the run. Check `/readyz`'s `degraded`
+  field or `GET /api/analytics/status` (`"enabled":false` in this case) for
+  the accurate state, not the Settings page, until this is wired up.
+- **Security note, separate from the cutover itself:** this release also
+  fixes a pre-existing issue in the same store — `AnalyticsEvent.session_id`
+  is now a hash of the session cookie, not the raw bearer token. If a token
+  may have reached a shared analytics sink or a broadly-read analytics row
+  before upgrading, see the rotation guidance in
+  `changelog.d/20260816-analytics-session-id-hash.security.md` (assembled
+  into the release's Security section at release time).
 
 ## RBAC store moves to PostgreSQL — config preserved by mandatory backfill (RbacStore → Postgres, ADR-0041)
 
