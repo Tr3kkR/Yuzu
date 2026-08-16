@@ -757,14 +757,21 @@ def _selftest():
     # not projection. [license_store] folded into shard B on the cherry-pick
     # (tests/meson.build's own comment on this trio has the reasoning and
     # re-verified counts).
+    # 2026-08-16 (#2092/#2093): the combined store-tag pg shard B TIMEOUT-ed at
+    # 600/600s again (blocking PR #3159). Split B into B+D balanced by measured
+    # TIME, not case count: [rbac_store] alone was ~57s (~54% of the store-tag
+    # runtime), so shard B = [rbac_store] alone and new shard D = the other eight
+    # store tags (~48s). Deliberately count-lopsided (93 vs 335) because time is
+    # what blows the ceiling. shard C UNCHANGED. Local isolated: B 58s / D 49s.
     check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
           and ("~[pg]~[auth]~[mcp]",) in _shard_specs
           and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
-          and ("[pg][audit_store]~[routes]~[store]~[token],[pg][rbac_store]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token]",)
+          and ("[pg][rbac_store]~[routes]~[store]~[token]",) in _shard_specs
+          and ("[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token]",)
           in _shard_specs
           and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]",)
           in _shard_specs,
-          "meson.build: all five shard tag filters extracted verbatim")
+          "meson.build: all six shard tag filters extracted verbatim")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")

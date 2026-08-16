@@ -851,8 +851,8 @@ if build_server
   #     positional specs). Each [pg] half is ONE comma-OR spec (Catch2 ORs
   #     inside a single arg; multiple positional args would AND, not OR);
   #   - no entry name may be a substring of another (flake-retry maps
-  #     meson-junit names by longest substring match) — 'shard A'/'shard B'
-  #     and 'server unit tests' are pairwise non-substring.
+  #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
+  #     'shard C'/'shard D' and 'server unit tests' are pairwise non-substring.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.
