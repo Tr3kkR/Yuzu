@@ -492,6 +492,7 @@ if build_server
       'unit/server/test_deployment_parse.cpp',
       'unit/server/test_deployment_run_store.cpp',
       'unit/server/test_deployment_engine.cpp',
+      'unit/server/test_deployment_routes.cpp',
       'unit/server/test_bundle_service.cpp',
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',
@@ -563,6 +564,7 @@ if build_server
       'unit/server/test_access_review_store.cpp',
       'unit/server/test_dispatch_chokepoint.cpp',
       'unit/server/test_capability_catalogue.cpp',
+      'unit/server/test_operator_surface_twins.cpp',
       'unit/server/test_schedule_params.cpp',
       'unit/server/test_plugin_config_parsers.cpp',
       'unit/server/test_plugin_config_store_pg.cpp',
@@ -908,15 +910,15 @@ if build_server
   # confined to test_license_store.cpp) was moved off it once already.
   #
   # RE-BALANCED AGAIN 2026-08-16 (PR #3156 review-response round, cherry-picked
-  # here — 3f0796777): the day after the rebalance above, B TIMEOUT-ed again —
-  # 66 new/extended PG-backed cases split 25/41, landing B's already-heavier
-  # share disproportionately. A same-day two-shard fix (moving more tags onto
-  # A) was reviewed and rejected before merge: A's own prior measurement
-  # (0.616s/case, already 84% of budget) is a HIGHER per-case rate than B's,
-  # contradicting the "near-uniform per-case cost" premise these rebalances
-  # lean on — concentrating more cases onto the already-more-expensive shard
-  # projected to ~577s (96%), likely relocating the timeout rather than fixing
-  # it.
+  # here — 3f0796777, now also merged to dev via #3156 itself): the day after
+  # the rebalance above, B TIMEOUT-ed again — 66 new/extended PG-backed cases
+  # split 25/41, landing B's already-heavier share disproportionately. A
+  # same-day two-shard fix (moving more tags onto A) was reviewed and rejected
+  # before merge: A's own prior measurement (0.616s/case, already 84% of
+  # budget) is a HIGHER per-case rate than B's, contradicting the
+  # "near-uniform per-case cost" premise these rebalances lean on —
+  # concentrating more cases onto the already-more-expensive shard projected
+  # to ~577s (96%), likely relocating the timeout rather than fixing it.
   #
   # SPLIT INTO THREE SHARDS instead. The store-heavy tag set (expensive: real
   # CREATE DATABASE ... TEMPLATE clones per case, unlike lighter route/handler
@@ -931,9 +933,8 @@ if build_server
   # present on PR #3156's branch, which has no reason to know about this
   # store) — same confined-to-one-file precedent as every other tag in that
   # list, re-verified against this merge's actual case counts via --list-tests
-  # on the built binary, not assumed from either side's pre-merge numbers:
-  # 539 (A) / 415 (B) / 1050 (C), sum 2004 == N([pg]). Partition preserved:
-  # N([pg]) == N(A) + N(B) + N(C).
+  # on the built binary, not assumed from either side's pre-merge numbers.
+  # Partition preserved: N([pg]) == N(A) + N(B) + N(C).
   test('server pg unit tests shard A', server_test_exe,
        args: ['[pg][routes],[pg][store],[pg][token]'],
        suite: 'server', timeout: 600)

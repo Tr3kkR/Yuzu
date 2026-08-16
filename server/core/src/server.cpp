@@ -13906,6 +13906,14 @@ private:
                                                   httplib::Response& res) {
             if (!require_permission(req, res, "Schedule", "Read"))
                 return;
+            // guardian-confinement-2298 hardening sweep: ITServiceOwner grants
+            // full CRUD on Schedule, and query_schedules has no owner/service
+            // filter at all — a bare Schedule:Read gate lets a service-scoped
+            // token enumerate every schedule from every other service. No
+            // single schedule to confine per-target, so this is a blanket
+            // deny, same shape as the fleet-wide dashboard fragment twin.
+            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.list", ""))
+                return;
             if (!schedule_engine_) {
                 res.status = 503;
                 res.set_content(
@@ -13956,6 +13964,14 @@ private:
             }
 
             auto id = req.matches[1].str();
+            // Interim deny (schedule_routes.hpp): delete_schedule is
+            // username-owner-scoped below, and a service-scoped token shares
+            // its creating principal's username (ApiToken::principal_id) —
+            // without this it could delete a fleet-wide schedule its own
+            // principal created interactively.
+            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id,
+                                             "Schedule:Delete"))
+                return;
             // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
             // deletes only schedules the caller created, not the whole
             // fleet's. auth_routes_->resolve_session, not require_permission's
@@ -13985,8 +14001,12 @@ private:
             }
 
             auto id = req.matches[1].str();
-            auto enabled_str = extract_json_string(req.body, "enabled");
-            bool enabled = (enabled_str != "false");
+            // guardian-confinement-2298: parse_schedule_enabled (schedule_routes.hpp)
+            // — extract_json_string only matches a JSON *string*, so a real
+            // JSON boolean {"enabled":false} used to silently fall through
+            // to the "absent" default (true), inverting the request and
+            // defeating the disable-always-reachable kill switch (H-01).
+            bool enabled = parse_schedule_enabled(req.body);
             // H-01 (#1806): re-enabling arms the schedule to fire unattended
             // through ScheduleRunner — the same fleet-wide-dispatch concern
             // as create, so it needs the same Execution:Execute gate.
@@ -13994,6 +14014,15 @@ private:
             // Schedule:Write alone — an operator must be able to kill a
             // runaway schedule even without Execution:Execute.
             if (enabled && !require_permission(req, res, "Execution", "Execute"))
+                return;
+            // Interim deny (schedule_routes.hpp), enable(true) only — a
+            // re-enabled schedule arms unattended fleet-wide dispatch through
+            // ScheduleRunner, the same concern as create. Disabling stays
+            // reachable: it only ever stops a schedule, never arms one, so a
+            // service-scoped token keeps its kill-switch (H-01's own
+            // rationale for gating disable on Schedule:Write alone).
+            if (enabled && deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.enable",
+                                                        id, "Schedule:Write"))
                 return;
 
             // M-01 (#1806): owner-scoped enable/disable, same as delete above.
@@ -15587,12 +15616,18 @@ private:
             // It feeds only fleet AGGREGATES (the crash-free rate denominator + the
             // score-distribution histogram). The device-id LISTS the re-review flagged
             // get their ids from the per-OBSERVATION store queries (dex_top_devices /
-            // dex_signal_devices / dex_app_devices / dex_perf_devices), which ARE
-            // scoped to the caller's management groups (VisibleSetFn). So the
-            // enumeration is closed independent of this provider. True per-TENANT
-            // aggregate RATES would also need the store-side crash/signal NUMERATORS
-            // (dex_crash_summary / dex_signal_summary) scoped — a tracked follow-up;
-            // scoping the denominator here without them would ship a misleading rate.
+            // dex_signal_devices / dex_app_devices / dex_perf_devices), which the
+            // dashboard fragments narrow via VisibleSetFn (username-keyed) — this
+            // closes the enumeration for a management-group-confined OPERATOR
+            // session, but NOT for a service-scoped API token: VisibleSetFn has no
+            // token_scope_service branch (same gap SEC-2/SEC-3 fixed elsewhere), so a
+            // service token whose username resolves to an unscoped grant still sees
+            // the whole fleet through these fragments. That axis is closed by an
+            // explicit deny_service_scoped_-style gate on each fragment, not by this
+            // provider or by VisibleSetFn. True per-TENANT aggregate RATES would also
+            // need the store-side crash/signal NUMERATORS (dex_crash_summary /
+            // dex_signal_summary) scoped — a tracked follow-up; scoping the
+            // denominator here without them would ship a misleading rate.
             [this]() -> DexFleet {
                 DexFleet f;
                 const auto ids = registry_.all_ids();
@@ -15786,7 +15821,7 @@ private:
         };
 
         network_routes_ = std::make_unique<NetworkRoutes>();
-        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, net_perf_fn);
+        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn, net_perf_fn);
 
         // DeviceRoutes — /devices (fleet list) + /device?id= (the shared device
         // page; Device-info lens). Sourced from the live registry (the CONNECTED
@@ -17676,13 +17711,16 @@ private:
             // was null while the REST twins worked fine — two surfaces
             // disagreeing about whether the same capability exists (ADR-1005 A1).
             mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
-            // Review finding (#3135): the operator upload-grant mint/list/
-            // revoke routes shipped REST-only, with no MCP twin — an
-            // ADR-1005 gap for an ordinary authenticated operator action.
-            // Wired UNCONDITIONALLY, same reasoning as kek_ops above: gating
-            // this behind a conditional would let the MCP tool answer
-            // "unavailable" while the REST route works, two surfaces
-            // disagreeing about whether the capability exists (ADR-1005 A1).
+            // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
+            // wired UNCONDITIONALLY exactly like kek_ops above (never
+            // gated behind an unrelated conditional — see the KEK comment
+            // immediately above for why that matters: two surfaces
+            // disagreeing about whether the same capability exists is an
+            // ADR-1005 A1 violation). Also closes review finding #3135
+            // (operator upload-grant mint/list/revoke shipped REST-only,
+            // with no MCP twin — an ADR-1005 gap for an ordinary
+            // authenticated operator action).
+            mcp_server_->set_plugin_config_store(plugin_config_store_.get());
             mcp_server_->set_upload_grant_ops(
                 upload_grant_store_.get(),
                 // SAME logic as the REST list_read_fn wired at the
@@ -18044,6 +18082,7 @@ private:
         } catch (...) {}
         return {};
     }
+
 
     static std::vector<std::string> extract_json_string_array(const std::string& body,
                                                               const std::string& key) {
