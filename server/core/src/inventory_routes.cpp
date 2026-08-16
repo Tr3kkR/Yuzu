@@ -10,6 +10,7 @@
 #include "inventory_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "rest_a4_envelope.hpp" // detail::error_json_a4, make_correlation_id
 #include "rest_audit.hpp" // detail::try_persist_audit — throw-safe set-and-proceed audit kernel (#1647)
 
 #include <algorithm>
@@ -157,6 +158,26 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  auto session = auth_fn_(req, res);
                  if (!session)
                      return;
+                 // Fleet-wide GDPR-personal-data disclosure (SEC-2/SEC-3
+                 // confinement-gap class, found during a docs sweep): devices_fn_
+                 // below is username-keyed and does not confine a service-scoped
+                 // API token whose principal resolves to an unscoped grant — the
+                 // serial/system_uuid/primary_mac-bearing roster would still be
+                 // fleet-wide. Same verb as the route's own success/failure audit.
+                 if (!session->token_scope_service.empty()) {
+                     const auto cid = detail::make_correlation_id();
+                     (void)detail::try_persist_audit(
+                         audit_fn_, req, "inventory.devices", "denied", "Inventory", "fleet",
+                         "fleet-wide device inventory list denied to a service-scoped token");
+                     res.status = 403;
+                     res.set_content(
+                         detail::error_json_a4(
+                             403, "service-scoped tokens may not read the fleet-wide device "
+                                  "inventory list",
+                             cid, detail::A4ErrorOpts{.permission = "Inventory:Read"}),
+                         "application/json");
+                     return;
+                 }
                  if (!perm_fn_(req, res, "Inventory", "Read"))
                      return;
                  InventoryDevicesResult result;
@@ -267,6 +288,29 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                  auto session = auth_fn_(req, res);
                  if (!session)
                      return;
+                 // Same fleet-wide GDPR-adjacent confinement gap as
+                 // /fragments/inventory/devices above: the per-agent scope_fn_
+                 // filter below is management-group-only (mirrors the REST/MCP
+                 // twins), so it never confines a service-scoped API token —
+                 // this route would still return every device fleet-wide
+                 // running a named piece of software. Same verb the route's
+                 // own scope-drop/success rows already use, reused with
+                 // result="denied" (governance finding: this file's sibling
+                 // fix two routes above closed the same class here).
+                 if (!session->token_scope_service.empty()) {
+                     const auto cid = detail::make_correlation_id();
+                     (void)detail::try_persist_audit(
+                         audit_fn_, req, "inventory.software.query", "denied", "Inventory", "fleet",
+                         "fleet-wide software search denied to a service-scoped token");
+                     res.status = 403;
+                     res.set_content(
+                         detail::error_json_a4(
+                             403,
+                             "service-scoped tokens may not run a fleet-wide software search",
+                             cid, detail::A4ErrorOpts{.permission = "Inventory:Read"}),
+                         "application/json");
+                     return;
+                 }
                  if (!perm_fn_(req, res, "Inventory", "Read"))
                      return;
                  const std::string name = req.has_param("name") ? req.get_param_value("name") : "";
