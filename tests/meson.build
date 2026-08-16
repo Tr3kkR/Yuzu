@@ -934,12 +934,33 @@ if build_server
   # store) — same confined-to-one-file precedent as every other tag in that
   # list, re-verified against this merge's actual case counts via --list-tests
   # on the built binary, not assumed from either side's pre-merge numbers.
-  # Partition preserved: N([pg]) == N(A) + N(B) + N(C).
+  # Partition preserved: N([pg]) == N(A) + N(B) + N(D) + N(C). (shard B split
+  # into B+D on 2026-08-16 — see the block above the B/D entries below.)
   test('server pg unit tests shard A', server_test_exe,
        args: ['[pg][routes],[pg][store],[pg][token]'],
        suite: 'server', timeout: 600)
+  # shard B SPLIT into B+D on 2026-08-16 (#2092/#2093): the store-tag half had
+  # reached 600/600s (100%) and flaked. BALANCED BY TIME, NOT COUNT — case count
+  # is not proportional to wall-time (shard C carries ~1082 cases comfortably;
+  # this store-tag set of ~428 was timing out, because each store-behaviour case
+  # does heavy per-test PG DDL / pre-migrated-template clones). Measured per-tag
+  # wall-time (isolated, local :5433 — a proxy; CI under c4 contention is ~2x+):
+  # [rbac_store] alone is the whale at ~57s, vs ~48s for the OTHER EIGHT tags
+  # COMBINED. So shard B = [rbac_store] alone; shard D = the other eight. This is
+  # count-lopsided (93 vs 335) ON PURPOSE — it is the time-balanced split (~57s
+  # vs ~48s), and time is what blows the 600s ceiling. Each shard is a strict
+  # SUBSET of the former at-600s run, so both are well under budget; B and D are
+  # disjoint and together cover exactly the tag set shard C excludes, so the
+  # partition N([pg]) == N(A)+N(B)+N(D)+N(C) is preserved (shard C UNCHANGED).
+  # When adding a new [pg] store tag: measure it, put it in whichever of B/D is
+  # lighter by TIME, AND add it to shard C's exclusion list (both or neither).
+  # If [rbac_store] itself grows toward the ceiling, split IT next (it is already
+  # the single densest tag).
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][rbac_store]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token]'],
+       args: ['[pg][rbac_store]~[routes]~[store]~[token]'],
+       suite: 'server', timeout: 600)
+  test('server pg unit tests shard D', server_test_exe,
+       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token]'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard C', server_test_exe,
        args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]'],
