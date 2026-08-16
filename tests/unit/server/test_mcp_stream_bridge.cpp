@@ -1351,91 +1351,94 @@ TEST_CASE("bridge pressure - one sweep is bounded by the population it started w
     // marks under bridge_mu_ -> rec->mu, the clearing walk takes the same pair, and
     // the producer mutates records_ throughout.
     //
-    // The assertion needs at least one record to arrive DURING a sweep. That is
-    // near-certain with a tight producer against a sweep doing 32 teardowns, but it
-    // is a race, so the scenario gets a few attempts and passes on the first that
-    // lands. It cannot false-RED into a wrong conclusion: without the budget the
-    // sweep drains until the producer stops, and the counter can never move at all.
-    // Streamed admission is capped at 4 per SESSION (pin slots), so a population of
-    // this size needs a session pool. Every session is minted on THIS thread up
-    // front - make_session carries Catch2 assertions, which are not valid off the
-    // main thread - and the producer only ever touches its own slice.
+    // The assertion needs at least one record to arrive DURING a sweep. #3095: an
+    // earlier version left that to chance (a tight producer racing a 32-teardown
+    // sweep, retried a few attempts) and it starved outright on a 2-core CI runner
+    // under scheduler contention - honest-red firing for the RIGHT structural
+    // reason (the scenario genuinely was never exercised), but too often to be
+    // useful. Forced deterministically instead: the #2519 teardown-step probe
+    // blocks the sweep thread mid-teardown of its FIRST pressure victim (outside
+    // every bridge lock - the pressure claim commits without bridge_mu_, so the
+    // producer's own reserve/subscribe/arm calls cannot deadlock against this) until
+    // the producer's first park lands, which GUARANTEES the interleave the test
+    // needs rather than hoping for it. The honest-red property survives the
+    // determinism: the probe still releases on a bounded timeout if the producer
+    // never manages to park anything, and the final CHECK is what actually fails if
+    // that happens - nothing here can silently pass an unexercised scenario.
     constexpr int kPerSession = 4;
     constexpr int kMainSessions = 8;   // 32 records parked before the sweep
     constexpr int kProdSessions = 40;  // up to 160 arrivals during it
-    bool observed = false;
-    for (int attempt = 0; attempt < 12 && !observed; ++attempt) {
-        // The per-principal SESSION cap (8, Decision 15(d)) would otherwise bound the
-        // pool to 32 records - exactly the pre-sweep population, leaving the producer
-        // nothing to add. Raised here only to reach a population big enough for the
-        // budget to bite; nothing in this test depends on the production value.
-        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0},
-              mcp::McpSessionRegistry::Config{.per_principal_cap = 64}};
-        std::vector<Fx::Session> pool;
-        pool.reserve(kMainSessions + kProdSessions);
-        for (int i = 0; i < kMainSessions + kProdSessions; ++i) {
-            pool.push_back(fx.make_session());
+
+    // The per-principal SESSION cap (8, Decision 15(d)) would otherwise bound the
+    // pool to 32 records - exactly the pre-sweep population, leaving the producer
+    // nothing to add. Raised here only to reach a population big enough for the
+    // budget to bite; nothing in this test depends on the production value.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0},
+          mcp::McpSessionRegistry::Config{.per_principal_cap = 64}};
+    std::vector<Fx::Session> pool;
+    pool.reserve(kMainSessions + kProdSessions);
+    for (int i = 0; i < kMainSessions + kProdSessions; ++i) {
+        pool.push_back(fx.make_session());
+    }
+    auto park = [&](const Fx::Session& s, int slot) {
+        const auto j = json(slot);
+        if (!fx.bridge->reserve(s.id, "alice", j, json("t"), true).ok) {
+            return false;
         }
-        auto park = [&](const Fx::Session& s, int slot) {
-            const auto j = json(slot);
-            if (!fx.bridge->reserve(s.id, "alice", j, json("t"), true).ok) {
-                return false;
-            }
-            if (!fx.bridge->subscribe(s.id, j, s.id + "-exec-" + std::to_string(slot))) {
-                return false;
-            }
-            if (fx.bridge->arm(s.id, j, Bridge::ArmMode::kStreaming) !=
-                Bridge::ArmOutcome::kArmed) {
-                return false;
-            }
-            return fx.bridge->on_post_closed(s.id, j);
-        };
-        for (int i = 0; i < kMainSessions; ++i) {
-            for (int slot = 0; slot < kPerSession; ++slot) {
-                REQUIRE(park(pool[static_cast<std::size_t>(i)], slot));
-            }
+        if (!fx.bridge->subscribe(s.id, j, s.id + "-exec-" + std::to_string(slot))) {
+            return false;
         }
-
-        std::atomic<bool> stop{false};
-        auto producer = std::async(std::launch::async, [&] {
-            for (int i = kMainSessions; i < kMainSessions + kProdSessions; ++i) {
-                for (int slot = 0; slot < kPerSession; ++slot) {
-                    if (stop.load(std::memory_order_relaxed)) {
-                        return;
-                    }
-                    (void)park(pool[static_cast<std::size_t>(i)], slot);
-                }
-            }
-        });
-
-        fx.bridge->sweep();  // MUST return without waiting for the producer to stop
-        stop.store(true, std::memory_order_relaxed);
-        producer.get();
-
-        // THE COUNTER IS THE CONDITION, not a proxy for it. An earlier version
-        // gated on a producer-side arrival count and then hard-CHECKed the
-        // counter - but that count also included parks completing AFTER sweep()
-        // returned, because `stop` is only stored post-sweep and the producer
-        // re-reads it per slot. So a run where nothing arrived DURING the sweep
-        // still entered the
-        // branch, found the budget legitimately unexhausted, and failed. It went red
-        // 2 of 3 times at 1.5x CPU oversubscription - which is the ordinary state of
-        // both self-hosted pools, four runner agents to a box - while passing 8/8
-        // unloaded. The in-file claim that it "cannot false-RED into a wrong
-        // conclusion" was simply wrong, and measuring only on an idle machine is
-        // what hid it.
-        //
-        // Reading the counter directly is sound in both directions: it is written
-        // ONLY in the budget-exhausted branch, so it can never move without the fix,
-        // and a run where the producer did not interleave just retries instead of
-        // asserting something it did not establish.
-        if (fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() > 0.0) {
-            observed = true;
+        if (fx.bridge->arm(s.id, j, Bridge::ArmMode::kStreaming) != Bridge::ArmOutcome::kArmed) {
+            return false;
+        }
+        return fx.bridge->on_post_closed(s.id, j);
+    };
+    for (int i = 0; i < kMainSessions; ++i) {
+        for (int slot = 0; slot < kPerSession; ++slot) {
+            REQUIRE(park(pool[static_cast<std::size_t>(i)], slot));
         }
     }
-    // Honest failure, not a silent pass: if the producer never interleaved in any
-    // attempt the scenario was never exercised, and that is a result worth seeing.
-    CHECK(observed);
+
+    // The deterministic barrier: the FIRST kUnsubscribe entry blocks the sweep
+    // thread until producer_parked is set, or the bounded timeout elapses.
+    std::mutex probe_mu;
+    std::condition_variable probe_cv;
+    bool producer_parked = false;
+    std::once_flag block_once;
+    fx.bridge->set_teardown_step_probe_for_test([&](Bridge::TeardownStage stage, bool entering) {
+        if (stage != Bridge::TeardownStage::kUnsubscribe || !entering) {
+            return;
+        }
+        std::call_once(block_once, [&] {
+            std::unique_lock<std::mutex> lk(probe_mu);
+            probe_cv.wait_for(lk, std::chrono::seconds(5), [&] { return producer_parked; });
+        });
+    });
+
+    std::atomic<bool> stop{false};
+    auto producer = std::async(std::launch::async, [&] {
+        for (int i = kMainSessions; i < kMainSessions + kProdSessions; ++i) {
+            for (int slot = 0; slot < kPerSession; ++slot) {
+                if (stop.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                if (park(pool[static_cast<std::size_t>(i)], slot)) {
+                    std::lock_guard<std::mutex> lk(probe_mu);
+                    producer_parked = true;
+                    probe_cv.notify_all();
+                }
+            }
+        }
+    });
+
+    fx.bridge->sweep();  // blocks on the probe until the producer's first park lands
+    stop.store(true, std::memory_order_relaxed);
+    producer.get();
+    fx.bridge->set_teardown_step_probe_for_test(nullptr);
+
+    // THE COUNTER IS THE CONDITION, not a proxy for it - it is written ONLY in
+    // the budget-exhausted branch, so it can never move without the fix.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() > 0.0);
 }
 
 TEST_CASE("bridge pressure - two concurrent sweeps reap a victim exactly once (#2409 qa-S5, TSan)",
