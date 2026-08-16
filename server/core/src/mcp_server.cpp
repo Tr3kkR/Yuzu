@@ -592,8 +592,10 @@ static const ToolDef kTools[] = {
     {"list_dex_perf_devices",
      "The device list behind every fleet-performance drill: worst devices by a metric (default), "
      "devices NOT reporting perf (filter=not_reporting), or one cohort's members (cohort_key + "
-     "cohort_value; empty value = untagged). Machine-health telemetry (device state, not "
-     "behavioral data). Mirrors GET /api/v1/dex/perf/devices. Requires GuaranteedState:Read.",
+     "cohort_value; empty value = untagged). Each row names an agent_id fleet-wide, so every call "
+     "is audit-logged (dex.perf.device.view); a service-scoped API token is denied — no "
+     "single agent_id to confine against. Mirrors GET /api/v1/dex/perf/devices. Requires "
+     "GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("metric":{"type":"string","enum":["cpu","commit","disk_lat"],"default":"cpu"},)j"
      R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = Windows devices with no perf sample this cycle"},)j"
@@ -729,7 +731,10 @@ static const ToolDef kTools[] = {
      "devices NOT reporting network (filter=not_reporting), a co-occurrence band "
      "(cooc=device|app|network_only|degraded), or one cohort's members (key + cohort_value; empty "
      "value = untagged). Rows carry the co-occurring facts (under_pressure, app_unstable) — "
-     "evidence, never a verdict. Mirrors GET /api/v1/network/devices. Requires GuaranteedState:Read.",
+     "evidence, never a verdict. Each row names an agent_id fleet-wide, so every call is "
+     "audit-logged (network.device.view); a service-scoped API token is denied — no single "
+     "agent_id to confine against. Mirrors GET /api/v1/network/devices. Requires "
+     "GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("metric":{"type":"string","enum":["rtt","retrans","throughput"],"default":"rtt"},)j"
      R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = devices with no network sample this cycle"},)j"
@@ -3527,6 +3532,40 @@ McpServer::HandlerFn McpServer::build_handler(
                 return error_response(id, code, message, data);
             };
 
+            // Deny a fleet-wide tool call to a service-scoped API token, with
+            // a denial audit. MCP sibling of REST's
+            // deny_fleet_wide_service_scoped (rest_api_v1.cpp) — same
+            // rationale: require_permission's service-token branch checks
+            // only the ITServiceOwner ROLE, never the token's own
+            // service-tag scope, so perm_fn alone is not confinement for a
+            // fleet-wide per-agent read with no per-agent parameter to scope
+            // against (the REST siblings of get_dex_signal_detail,
+            // list_dex_perf_devices, and list_network_devices all needed
+            // this same fix — Gate 8 review found the MCP twins share the
+            // gap the REST fix closed). Not GuaranteedState-exclusive: a
+            // non-GuaranteedState caller (e.g. query_installed_software's
+            // Inventory:Read, list_schedules' Schedule:Read) passes its own
+            // securable to perm_fn right after this deny — this helper's
+            // deny decision itself is securable-agnostic, keyed only on
+            // token_scope_service. `session` is already resolved once for
+            // the whole request above — no auth_fn call needed here.
+            // Routed through a4_error (defined just above) rather than a bare
+            // error_response, so this denial carries the same correlation_id
+            // /retry_after_ms/remediation envelope as every sibling MCP
+            // denial in this family (gov Gate 4 consistency review: it
+            // previously didn't).
+            auto deny_fleet_wide_service_scoped =
+                [&](const std::string& action, const std::string& target_type,
+                    const std::string& audit_detail, const std::string& message,
+                    const std::string& target_id = "") -> bool {
+                if (session->token_scope_service.empty())
+                    return false;
+                (void)yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, action, "denied", target_type, target_id, audit_detail);
+                res.set_content(a4_error(kPermissionDenied, message), "application/json");
+                return true;
+            };
+
             // A4 envelope that also carries the durable execution handle. Used by
             // the two streamed-POST 500s, which are the only refusals raised AFTER
             // dispatch - the work is running, so the client needs the id to find it
@@ -4710,6 +4749,18 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Governance finding: the management-group scope filter further down
+                // is INERT under the global Inventory:Read gate (same class as
+                // query_responses/query_inventory), and this tool has no per-target
+                // scoped check even when agent_id is supplied. Blanket deny, matching
+                // the REST/dashboard twins (rest_api_v1.cpp, inventory_routes.cpp).
+                if (deny_fleet_wide_service_scoped(
+                        "inventory.software.query", "Inventory",
+                        "fleet-wide software search denied to a service-scoped token (MCP "
+                        "query_installed_software)",
+                        "service-scoped tokens may not run a fleet-wide software search",
+                        "fleet"))
+                    return;
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
                 if (!software_inventory_store) {
@@ -5533,12 +5584,28 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── list_schedules ────────────────────────────────────────────
             if (tool_name == "list_schedules") {
+                // Tier-before-RBAC/confinement (docs/mcp-server.md) — matches
+                // every sibling deny_fleet_wide_service_scoped call site
+                // (get_dex_signal_detail, list_dex_perf_devices,
+                // list_network_devices): tier_allows first, then the deny.
                 if (!tier_allows(tier, "Schedule", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
+                // guardian-confinement-2298 hardening sweep: ITServiceOwner
+                // grants full CRUD on Schedule, and query_schedules has no
+                // owner/service filter of any kind — a bare Schedule:Read
+                // gate lets a service-scoped token enumerate every schedule
+                // from every other service. No single schedule to confine
+                // per-target against, same shape as the REST list twin's fix.
+                if (deny_fleet_wide_service_scoped(
+                        "schedule.list", "schedule",
+                        "fleet-wide schedule list denied to a service-scoped token (MCP "
+                        "list_schedules)",
+                        "service-scoped tokens may not read the fleet-wide schedule list"))
+                    return;
                 if (!perm_fn(req, res, "Schedule", "Read"))
                     return;
                 if (!schedule_engine) {
@@ -5812,6 +5879,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Fleet-wide identity-linked disclosure, same gap as the REST
+                // sibling GET /api/v1/dex/signals/{obs_type} (SEC-3 class):
+                // devices[] below names every agent_id exhibiting this
+                // signal, no per-agent parameter to scope a per-target check
+                // against. target_id left empty: this fires before the
+                // obs_type charset/length validation below, so the raw
+                // param is not yet safe to embed in an audit detail string.
+                if (deny_fleet_wide_service_scoped(
+                        "dex.signal.view", "ObsType",
+                        "fleet-wide DEX signal drill-down denied to a service-scoped token "
+                        "(MCP get_dex_signal_detail)",
+                        "service-scoped tokens may not read fleet-wide DEX signal drill-downs"))
+                    return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
                 if (!guaranteed_state_store) {
@@ -5949,6 +6029,21 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Fleet-wide identity-linked disclosure, same gap as the REST
+                // sibling GET /api/v1/dex/perf/devices (SEC-3 class): each row
+                // names an agent_id + its perf metrics, no per-agent parameter
+                // to scope against. Scoped to list_dex_perf_devices ONLY — its
+                // three siblings in this shared block (get_dex_perf_fleet,
+                // get_dex_perf_cohorts, get_dex_perf_cohort_diff) are genuine
+                // aggregates with no agent_id and stay unconfined.
+                if (tool_name == "list_dex_perf_devices" &&
+                    deny_fleet_wide_service_scoped(
+                        "dex.perf.device.view", "GuaranteedState",
+                        "fleet-wide DEX perf device list denied to a service-scoped token "
+                        "(MCP list_dex_perf_devices)",
+                        "service-scoped tokens may not read the fleet-wide DEX perf device "
+                        "list"))
+                    return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
                 if (!dex_perf_fn) {
@@ -5971,6 +6066,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         .str();
                 };
                 std::string payload;
+                // Only meaningful for list_dex_perf_devices (set inside its
+                // branch below); the other three tools in this shared block
+                // are aggregates and stay on the generic mcp.<tool> audit.
+                bool device_list_audit_ok = true;
                 if (tool_name == "get_dex_perf_fleet") {
                     const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
                     payload = JObj()
@@ -6110,6 +6209,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     const int limit = (std::min)(raw_limit, 500);
+                    // Behavioral-PII access audit — same verb/target as the
+                    // REST sibling GET /api/v1/dex/perf/devices. MCP
+                    // convention: set-and-proceed (audit_persisted:false
+                    // appended below on failure), not REST's fail-closed —
+                    // JSON-RPC has no response-header channel, matching
+                    // get_dex_signal_detail's own established posture.
+                    device_list_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "dex.perf.device.view", "success", "GuaranteedState", "",
+                        "fleet-wide DEX perf device list via MCP list_dex_perf_devices");
                     JArr arr;
                     for (const auto& r : dex_perf_device_list(dex_perf_fn(cohort_key), metric,
                                                               not_reporting, cohort_filter,
@@ -6133,9 +6241,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // is the one bare-array branch and needs the same wrap the Phase-1
                 // reads batch used for its own bare-array tools. content[].text stays
                 // exactly `payload` either way - unchanged wire format.
+                // Evidence-gap signal (matches get_dex_signal_detail): absent
+                // on success (consumers key on absence), false when the
+                // per-read access audit row failed to persist.
                 const std::string structured_payload =
                     tool_name == "list_dex_perf_devices"
-                        ? JObj().raw("devices", payload).str()
+                        ? (device_list_audit_ok
+                               ? JObj().raw("devices", payload).str()
+                               : JObj().raw("devices", payload).add("audit_persisted", false).str())
                         : payload;
                 mcp_audit("success");
                 res.set_content(success_response(
@@ -6279,6 +6392,19 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .raw("points", points.str())
                                   .str();
                 } else { // get_dex_group_app_perf
+                    // REST twin of this gap (GET /api/v1/dex/perf/group) was
+                    // found by this branch's own governance review (PR
+                    // #3156), while re-verifying the external review's
+                    // separate findings on this same file: perm_fn's global
+                    // GuaranteedState:Read check doesn't confine a
+                    // service-scoped token to its own service's management
+                    // groups, so it could otherwise supply any group_id.
+                    if (deny_fleet_wide_service_scoped(
+                            "dex.perf.group.view", "GuaranteedState",
+                            "management-group app-perf trend denied to a service-scoped token",
+                            "service-scoped tokens may not read a management group's app-perf "
+                            "trend"))
+                        return;
                     if (!app_perf_providers.group) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
@@ -6396,6 +6522,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         o.add("remediation", remediation);
                     return o.str();
                 };
+                // REST twin of this gap (GET /api/v1/dex/perf/compare) was
+                // found by this branch's own governance review (PR #3156),
+                // while re-verifying the external review's separate findings
+                // on this same file: perm_fn's global
+                // GuaranteedState:Read check doesn't confine a service-scoped
+                // token to its own service's management groups, so it could
+                // otherwise supply any group and read a near-individual
+                // before/after comparison for it. Denied under the same
+                // dex.app_perf.compare verb its REST twin reuses.
+                if (deny_fleet_wide_service_scoped(
+                        "dex.app_perf.compare", "GuaranteedState",
+                        "app-perf before/after comparison denied to a service-scoped token",
+                        "service-scoped tokens may not compare a management group's app-perf"))
+                    return;
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
                     res.set_content(
                         error_response(id, kTierDenied, "MCP tier does not allow this operation",
@@ -6538,6 +6678,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Fleet-wide identity-linked disclosure, same gap as the REST
+                // sibling GET /api/v1/network/devices (SEC-3 class): each row
+                // names an agent_id + its network perf/correlation facts, no
+                // per-agent parameter to scope against. Scoped to
+                // list_network_devices ONLY — get_network_fleet is a genuine
+                // aggregate with no agent_id and stays unconfined.
+                if (tool_name == "list_network_devices" &&
+                    deny_fleet_wide_service_scoped(
+                        "network.device.view", "GuaranteedState",
+                        "fleet-wide network device list denied to a service-scoped token "
+                        "(MCP list_network_devices)",
+                        "service-scoped tokens may not read the fleet-wide network device "
+                        "list"))
+                    return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
                 if (!net_perf_fn) {
@@ -6558,6 +6712,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         .str();
                 };
                 std::string payload;
+                // Only meaningful for list_network_devices (set inside its
+                // branch below); get_network_fleet is an aggregate and stays
+                // on the generic mcp.<tool> audit.
+                bool device_list_audit_ok = true;
                 if (tool_name == "get_network_fleet") {
                     const auto now = net_perf_fleet_now(net_perf_fn(std::string{}));
                     payload = JObj()
@@ -6596,6 +6754,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     const int limit = (std::min)(raw_limit, 500);
+                    // Behavioral-PII access audit — same verb/target as the
+                    // REST sibling GET /api/v1/network/devices. MCP
+                    // convention: set-and-proceed (audit_persisted:false
+                    // appended below on failure), not REST's fail-closed.
+                    device_list_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "network.device.view", "success", "GuaranteedState", "",
+                        "fleet-wide network device list via MCP list_network_devices");
                     JArr arr;
                     for (const auto& r : net_perf_device_list(net_perf_fn(cohort_key), metric,
                                                               not_reporting, cooc, cohort_filter,
@@ -6624,9 +6789,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the bare-array branch and needs the same wrap the Phase-1 reads
                 // batch used for its own bare-array tools. content[].text stays
                 // exactly `payload` either way - unchanged wire format.
+                // Evidence-gap signal (matches get_dex_signal_detail): absent
+                // on success (consumers key on absence), false when the
+                // per-read access audit row failed to persist.
                 const std::string structured_payload =
                     tool_name == "list_network_devices"
-                        ? JObj().raw("devices", payload).str()
+                        ? (device_list_audit_ok
+                               ? JObj().raw("devices", payload).str()
+                               : JObj().raw("devices", payload).add("audit_persisted", false).str())
                         : payload;
                 mcp_audit("success");
                 res.set_content(success_response(

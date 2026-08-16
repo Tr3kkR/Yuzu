@@ -492,6 +492,7 @@ if build_server
       'unit/server/test_deployment_parse.cpp',
       'unit/server/test_deployment_run_store.cpp',
       'unit/server/test_deployment_engine.cpp',
+      'unit/server/test_deployment_routes.cpp',
       'unit/server/test_bundle_service.cpp',
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',
@@ -902,11 +903,44 @@ if build_server
   # untagged, all 3 would land in B, which is already the heavier half and had
   # separately reached 600.57/600s (killed by TIMEOUT) on CI before this move.
   # Partition preserved: N([pg]) == N(A) + N(B).
+  #
+  # RE-BALANCED AGAIN 2026-08-16 (PR #3156 review-response round): B TIMEOUT-ed
+  # again at 600.57/600s the day after the rebalance above — the round's 66
+  # new/extended PG-backed test cases split 25 (A) / 41 (B), landing B's
+  # already-heavier share disproportionately. A same-day two-shard fix (moving
+  # [guardian_routes]/[workflow]/[deployment_store] to A, landing 937 (A) /
+  # 1076 (B)) was reviewed and rejected before merge: A's OWN prior measurement
+  # (503.75s / 818 cases = 0.616s/case, already at 84% of budget per the
+  # #2092/#2093 watchdog) is a HIGHER per-case rate than B's, contradicting the
+  # "near-uniform per-case cost" premise this file's rebalances lean on —
+  # concentrating MORE cases into the already-more-expensive shard projected to
+  # ~577s (96% of budget), likely relocating the timeout rather than fixing it.
+  #
+  # SPLIT INTO THREE SHARDS instead. The store-heavy tag set (expensive: real
+  # CREATE DATABASE ... TEMPLATE clones per case, unlike lighter route/handler
+  # tests) is itself split across two shards rather than concentrated in one:
+  #   shard A = [routes]/[store]/[token]                         (547 cases)
+  #   shard B = [audit_store]/[rbac_store]/[guaranteed_state_store]/
+  #             [response_store]/[operator_surface]/[guardian_routes]/
+  #             [workflow]/[deployment_store], minus anything already in A
+  #                                                                (390 cases)
+  #   shard C = everything else [pg]-tagged                      (1076 cases)
+  # Verified by actually running all three filters through the built binary
+  # (--list-tests AND a real timed PG run, not projection): counts 547/390/1076
+  # (sum 2013, matching N([pg]) unchanged); measured wall time on a quiet local
+  # box 119.9s/91.6s/206.1s — per-case rate now uniform across all three
+  # (0.19-0.24s/case) instead of concentrated in one shard, and the slowest
+  # shard (C) is faster than the old two-shard proposal's slowest (A, projected
+  # ~577s) even before accounting for CI contention. Partition preserved:
+  # N([pg]) == N(A) + N(B) + N(C).
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store],[pg][operator_surface]'],
+       args: ['[pg][routes],[pg][store],[pg][token]'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]'],
+       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][rbac_store]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token]'],
+       suite: 'server', timeout: 600)
+  test('server pg unit tests shard C', server_test_exe,
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]'],
        suite: 'server', timeout: 600)
 endif
 
