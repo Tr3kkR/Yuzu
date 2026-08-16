@@ -50,9 +50,12 @@ progress streaming, not correctness.
 
 This counter is **defence in depth, not the out-of-memory signal**. On current code all
 three steps are find/erase and node operations that allocate nothing, so only a mutex
-failure can reach them - which in practice does not happen. If you are chasing
-allocation pressure, the counter you want is
-`yuzu_mcp_stream_terminal_publish_failures_total`.
+failure can reach them - which in practice does not happen. TEST-BACKED, not just
+asserted in a comment (#2519): a dedicated allocation-budget probe
+(`tests/unit/server/test_mcp_bridge_alloc_budget.cpp`, Linux-only, non-sanitizer build)
+replaces the global allocator and asserts zero allocations across all three steps, over
+N teardowns in one sweep. If you are chasing allocation pressure, the counter you want
+is `yuzu_mcp_stream_terminal_publish_failures_total`.
 
 If `teardown_incomplete` is moving at all, treat it as a genuine anomaly worth a bug
 report, not routine noise.

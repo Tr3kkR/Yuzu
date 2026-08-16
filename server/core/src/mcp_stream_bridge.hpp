@@ -711,6 +711,16 @@ public:
     /// arms nothing on an out-of-range `stage` cast (#2523) - a mistyped stage must
     /// fail the test loudly rather than pass vacuously against an unfaulted teardown.
     [[nodiscard]] bool inject_teardown_step_fault_for_test(TeardownStage stage, int times = 1);
+    /// #2519: invoked synchronously on the teardown thread immediately before
+    /// (`entering=true`) and after (`entering=false`) each CONTAINED step of
+    /// teardown_claimed (unsubscribe / release_charge / erase), OUTSIDE every
+    /// lock the step itself takes. Lets a test bracket exactly one step's
+    /// allocation footprint, or - for #3095 - block the teardown thread at a
+    /// known point to force a deterministic interleave. Must not throw; not
+    /// thread-safe to set while a sweep may be running concurrently (arm it
+    /// before the first sweep, like set_clock_for_test).
+    void set_teardown_step_probe_for_test(
+        std::function<void(TeardownStage, bool entering)> probe);
     /// The NEXT `times` ~ClaimGuard record-lock acquisitions throw, modelling the
     /// mutex failure this file's fault model already treats as real. Drives the
     /// #2528 DEGRADED SETTLE: the claim must still be released (else the record is
@@ -1298,6 +1308,10 @@ private:
     /// Remaining injected throws per teardown stage (test seam), indexed by
     /// TeardownStage.
     std::array<std::atomic<int>, kTeardownStageCount> teardown_step_fault_{};
+    /// #2519/#3095 test seam: fired around each contained teardown step. Empty
+    /// (default-constructed std::function) in production - never checked on a
+    /// hot path beyond the bool test an empty std::function already supports.
+    std::function<void(TeardownStage, bool)> teardown_step_probe_for_test_;
     std::atomic<int> terminal_build_fault_{0}; ///< remaining teardown frame-build throws (test seam)
     std::atomic<int> charge_lock_fault_{0};    ///< remaining release_charge lock throws (#2529 seam)
     ClockFn clock_;                            ///< reaper clock (default steady_clock::now)

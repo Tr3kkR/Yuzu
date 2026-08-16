@@ -1110,6 +1110,29 @@ if build_server
   test('server pg unit tests shard C', server_test_exe,
        args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]~[engine_principal]~[auth_routes]~[scim]~[saml]~[oidc]~[access_review]~[management_group]~[rbac]~[audit]~[authz]~[mcp]~[dex]~[secrets]~[quarantine]~[agent_service]~[custom_props]~[guaranteed_state]~[notification_store]~[discovery]~[software_inventory]~[result_set]~[tar]'],
        suite: 'server', timeout: 600)
+
+  # ── #2519 MCP bridge teardown allocation-budget probe (separate binary) ────
+  # Same rationale as the #2270 spark probe above: a global operator new/delete
+  # replacement is process-wide, so it cannot share the multi-thousand-case
+  # server binary, and it must be ABSENT (not merely disabled) from sanitizer
+  # builds, which own the allocator themselves. Linux-only for the same
+  # ELF/libstdc++-interposition reason; see the file header.
+  if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
+    mcp_bridge_alloc_budget_exe = executable(
+      'yuzu_mcp_bridge_alloc_budget_tests',
+      files('unit/server/test_mcp_bridge_alloc_budget.cpp'),
+      cpp_args: https_cpp_args + test_partial_init_args +
+                (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
+      dependencies: [yuzu_server_core_dep, catch2_dep,
+                     dependency('openssl', required: true, include_type: 'system')],
+    )
+    test(
+      'mcp bridge teardown allocation budget',
+      mcp_bridge_alloc_budget_exe,
+      suite: 'server',
+      timeout: 60,
+    )
+  endif
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────

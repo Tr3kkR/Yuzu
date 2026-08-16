@@ -2666,20 +2666,32 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     };
 
     // ── Step 2: unsubscribe ────────────────────────────────────────────────────
-    if (!contained([&] {
-            if (take_step_fault(TeardownStage::kUnsubscribe)) {
-                // system_error, not bad_alloc: a mutex failure is the only thing these
-                // steps actually admit, and the seam should model the real fault.
-                throw std::system_error(
-                    std::make_error_code(std::errc::resource_deadlock_would_occur),
-                    "injected teardown unsubscribe failure");
-            }
-            std::lock_guard<std::mutex> lk(bridge_mu_);
-            if (rec->subscribed && bus_ != nullptr) {
-                bus_->unsubscribe(exec_id, rec->sub_id);
-            }
-            rec->subscribed = false;
-        })) {
+    // #2519/#3095: the probe brackets the step OUTSIDE its own lock (contained's
+    // lambda takes bridge_mu_ internally; the probe calls sit before/after the
+    // whole contained(...) call), so a test can measure the step's allocation
+    // footprint in isolation or pause the teardown thread at a known point
+    // without risking a deadlock against bridge_mu_/rec->mu.
+    if (teardown_step_probe_for_test_) {
+        teardown_step_probe_for_test_(TeardownStage::kUnsubscribe, /*entering=*/true);
+    }
+    const bool step2_ok = contained([&] {
+        if (take_step_fault(TeardownStage::kUnsubscribe)) {
+            // system_error, not bad_alloc: a mutex failure is the only thing these
+            // steps actually admit, and the seam should model the real fault.
+            throw std::system_error(
+                std::make_error_code(std::errc::resource_deadlock_would_occur),
+                "injected teardown unsubscribe failure");
+        }
+        std::lock_guard<std::mutex> lk(bridge_mu_);
+        if (rec->subscribed && bus_ != nullptr) {
+            bus_->unsubscribe(exec_id, rec->sub_id);
+        }
+        rec->subscribed = false;
+    });
+    if (teardown_step_probe_for_test_) {
+        teardown_step_probe_for_test_(TeardownStage::kUnsubscribe, /*entering=*/false);
+    }
+    if (!step2_ok) {
         // Bail with the record still in records_, still charged: internally
         // consistent, never an orphan listener, and reclaimed by either a later
         // retry pass (#2513, while under Config::teardown_retry_max) or - once
@@ -2713,14 +2725,20 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     // charge had no surviving handle to reclaim it by. Under retry the record IS
     // the handle - erasing it here would strand the charge with nothing left to
     // find it on a later sweep.
-    if (!contained([&] {
-            if (take_step_fault(TeardownStage::kReleaseCharge)) {
-                throw std::system_error(
-                    std::make_error_code(std::errc::resource_deadlock_would_occur),
-                    "injected teardown release_charge failure");
-            }
-            release_charge(rec);
-        })) {
+    if (teardown_step_probe_for_test_) {
+        teardown_step_probe_for_test_(TeardownStage::kReleaseCharge, /*entering=*/true);
+    }
+    const bool step3_ok = contained([&] {
+        if (take_step_fault(TeardownStage::kReleaseCharge)) {
+            throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur),
+                                    "injected teardown release_charge failure");
+        }
+        release_charge(rec);
+    });
+    if (teardown_step_probe_for_test_) {
+        teardown_step_probe_for_test_(TeardownStage::kReleaseCharge, /*entering=*/false);
+    }
+    if (!step3_ok) {
         count_teardown_incomplete(TeardownStage::kReleaseCharge);
         log_incomplete(stage_name(TeardownStage::kReleaseCharge));
         audit_contained(audit_action, exec_id,
@@ -2738,19 +2756,26 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
 
     // ── Step 4: erase the map entry ────────────────────────────────────────────
     std::size_t active = 0;
-    if (!contained([&] {
-            if (take_step_fault(TeardownStage::kErase)) {
-                throw std::system_error(
-                    std::make_error_code(std::errc::resource_deadlock_would_occur),
-                    "injected teardown erase failure");
-            }
-            std::lock_guard<std::mutex> lk(bridge_mu_);
-            auto it = records_.find(rec->key);
-            if (it != records_.end() && it->second == rec) {
-                records_.erase(it);
-            }
-            active = records_.size();
-        })) {
+    if (teardown_step_probe_for_test_) {
+        teardown_step_probe_for_test_(TeardownStage::kErase, /*entering=*/true);
+    }
+    const bool step4_ok = contained([&] {
+        if (take_step_fault(TeardownStage::kErase)) {
+            throw std::system_error(
+                std::make_error_code(std::errc::resource_deadlock_would_occur),
+                "injected teardown erase failure");
+        }
+        std::lock_guard<std::mutex> lk(bridge_mu_);
+        auto it = records_.find(rec->key);
+        if (it != records_.end() && it->second == rec) {
+            records_.erase(it);
+        }
+        active = records_.size();
+    });
+    if (teardown_step_probe_for_test_) {
+        teardown_step_probe_for_test_(TeardownStage::kErase, /*entering=*/false);
+    }
+    if (!step4_ok) {
         // The gauge would be a lie, but the row must NOT be skipped: an erase
         // failure previously produced no audit evidence at all, which is the same
         // "no row" gap this work closes for the sibling step.
@@ -3184,6 +3209,11 @@ bool McpStreamBridge::inject_teardown_step_fault_for_test(TeardownStage stage, i
     }
     teardown_step_fault_[idx].store(times, std::memory_order_release);
     return true;
+}
+
+void McpStreamBridge::set_teardown_step_probe_for_test(
+    std::function<void(TeardownStage, bool)> probe) {
+    teardown_step_probe_for_test_ = std::move(probe);
 }
 
 void McpStreamBridge::inject_terminal_build_fault_for_test(int times) {
