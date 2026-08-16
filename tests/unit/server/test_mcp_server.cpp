@@ -9020,6 +9020,36 @@ nlohmann::json write_tool_structured(const std::unique_ptr<httplib::Response>& r
 }
 } // namespace
 
+TEST_CASE("MCP get_tags surfaces a degraded tag store as kInternalError, never an empty "
+          "tag list (governance qa-2)",
+          "[pg][mcp][tag][failclosed]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.start("readonly"); // get_tags is ReadOnly — available on every tier
+
+    // Degrade the store out from under the live handler (same mechanism as
+    // the store-level degrade suite: a QUERY failure once is_open() is true).
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(tag_bundle.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "DROP TABLE tag_store.tags CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":300,"params":{"name":"get_tags","arguments":{"agent_id":"agent-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] == "Tag store unavailable");
+}
+
 TEST_CASE("MCP set_tag operator sets the tag and fires the agent tag-push",
           "[pg][mcp][integration][tag]") {
     yuzu::test::TagStorePg tag_bundle;
@@ -9097,9 +9127,13 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
     REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     REQUIRE(tags.set_tag("agent-1", "environment", "prod", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    // RAII handle (governance saf-F3): declared BEFORE appr so the borrowed
+    // connection outlives the manager on every exit path, including a
+    // throwing REQUIRE mid-test — the old manual sqlite3_close leaked on
+    // assert failure AND ran while appr was still alive.
+    SqliteDb raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), raw.addr()) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.get());
     appr.create_tables();
 
     McpTestServer ts;
@@ -9141,7 +9175,6 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
     auto body3 = nlohmann::json::parse(res3->body);
     REQUIRE(body3.contains("error"));
     CHECK(body3["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
-    sqlite3_close(raw);
 }
 
 TEST_CASE("MCP approval recall refuses a ticket presented by a different principal "
@@ -9158,9 +9191,10 @@ TEST_CASE("MCP approval recall refuses a ticket presented by a different princip
     yuzu::server::TagStore& tags = *tag_bundle;
     REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_2442_mcp_appr_"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    // RAII handle (governance saf-F3) — outlives appr on every exit path.
+    SqliteDb raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), raw.addr()) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.get());
     appr.create_tables();
 
     yuzu::MetricsRegistry reg;
@@ -9217,7 +9251,6 @@ TEST_CASE("MCP approval recall refuses a ticket presented by a different princip
     auto payload2 = write_tool_payload(res2);
     CHECK(payload2["deleted"] == true);
     CHECK(tag_val(tags, "agent-1", "role").empty()); // the rightful submitter DID delete it
-    sqlite3_close(raw);
 }
 
 TEST_CASE("MCP delete_tag with a mismatched-args approval_id is rejected",
@@ -9226,9 +9259,10 @@ TEST_CASE("MCP delete_tag with a mismatched-args approval_id is rejected",
     yuzu::server::TagStore& tags = *tag_bundle;
     REQUIRE(tags.set_tag("agent-1", "role", "web", "server").has_value());
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
-    yuzu::server::ApprovalManager appr(raw);
+    // RAII handle (governance saf-F3) — outlives appr on every exit path.
+    SqliteDb raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), raw.addr()) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.get());
     appr.create_tables();
 
     McpTestServer ts;
@@ -9255,7 +9289,6 @@ TEST_CASE("MCP delete_tag with a mismatched-args approval_id is rejected",
     CHECK(body2["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
     // Nothing was consumed — the ticket is still usable for its real request.
     CHECK(appr.pending_count() == 0); // approved, not pending
-    sqlite3_close(raw);
 }
 
 // ── Gate 8 round 2: the schema-inexpressible rules must not burn a ticket ──

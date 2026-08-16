@@ -39,7 +39,12 @@ acting:
 different replica's real `tags.db` was migrated, and this replica's own file
 was never part of it — typically two independently-operated pre-cutover
 servers being merged into one Postgres deployment, or tags edited on more
-than one replica before the cutover completed. Confirm which replica's
+than one replica before the cutover completed. NOTE: if this replica raced
+the winner on the SAME first boot and their contents were row-disjoint (no
+direction conflicts), this replica's rows were already committed BEFORE it
+lost the fingerprint race — Postgres is then serving a MIX of both replicas'
+tags while this replica refuses to boot; compare Postgres's row count
+against both legacy files before deciding which side to keep. Confirm which replica's
 content is authoritative, move aside every OTHER replica's `tags.db`, and
 restart them — they'll find no local file and trust the established marker.
 If the WRONG replica's content won the marker, re-applying the correct tags
@@ -71,6 +76,20 @@ rollback-then-roll-forward shape: a pre-migration binary ran against this
 `tags.db` after Postgres last saw it, and genuinely progressed the tag.
 Refusing protects the LATER write from being silently discarded.
 
+**Classify this as a data-integrity incident, not an availability one**: the
+refusal means the currently-served tag data may be the wrong side of an
+operator-authored-data race, so triage it as "verify which side is
+authoritative", never as "restart failed". There is no scrapeable metric for
+a refused boot (the process exits before `/metrics` serves) — alert on the
+refusal log line itself if you run a log pipeline, and on
+`YuzuTagStoreBackfillNotCompleted` (absent-success shape) otherwise.
+
+One benign-looking cause worth ruling out first: **forward clock skew**. A
+legacy row stamped by a skewed-ahead clock compares as "legacy ahead" even
+when the Postgres write is genuinely newer — if the named row's legacy
+`updated_at` is in the future relative to when that server last ran, suspect
+the clock, not a real progress race.
+
 The refusing transaction rolls back — nothing from this pass is committed,
 the legacy file is not consumed. Recovery: decide which side is
 authoritative for the named row(s). If the legacy side is right, fix the
@@ -84,6 +103,26 @@ mechanical.
 A conflict where Postgres is strictly AHEAD of the legacy row does not
 refuse — it WARNs and keeps Postgres's value (the ordinary "this replica's
 legacy snapshot predates live progress" case).
+
+## After a runtime degrade window ends
+
+Reads recover immediately once the store answers again, but two derived
+states do NOT self-heal on recovery alone:
+
+- **Auto-created service management groups** whose membership refresh was
+  skipped during the degrade stay at their prior membership. There is no
+  automatic repopulation pass — membership refreshes on the next `service`
+  tag write. To force it, re-save any device's `service` tag
+  (`PUT /api/v1/tags`).
+- **Agent-side cached category tags** whose push was skipped stay stale on
+  the device until the next category-tag write for that agent triggers a
+  push (or the agent re-Registers, which re-syncs its own reported tags).
+
+Pool-saturation triage: `/readyz` stays green under pure saturation (the
+`tag_store` row latches construction success) — pair
+`yuzu_server_tag_store_read_degrade_total{reason="pool_acquire_timeout"}`
+with `yuzu_pg_pool_waiters` / `yuzu_pg_acquire_*` to distinguish substrate
+saturation from a store-level failure.
 
 ## Note: no "abandon by hand" procedure
 

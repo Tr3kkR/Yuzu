@@ -5733,7 +5733,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!tag_keys.empty() && tag_store) {
                         auto preload = tag_store->get_values_for_keys(tag_keys);
                         if (!preload) {
-                            mcp_audit("failure");
+                            // Target = the expression being previewed — every
+                            // sibling failure audit here carries a target
+                            // (governance cons-F2).
+                            mcp_audit("failure", expression);
                             res.set_content(
                                 error_response(id, kInternalError, "Tag store unavailable"),
                                 "application/json");
@@ -8166,7 +8169,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!*deleted) {
                     // 404-equivalent (mirror the REST 404 on a missing tag).
-                    mcp_audit("failure", "not found " + agent_id + ":" + key);
+                    // Outcome token matches the legacy + v1 twins' "not_found"
+                    // (governance cons-F2: one outcome vocabulary per event
+                    // across transports, and the target field carries the
+                    // target alone).
+                    mcp_audit("not_found", agent_id + ":" + key);
                     res.set_content(error_response(id, kInvalidParams, "tag not found"),
                                     "application/json");
                     return;

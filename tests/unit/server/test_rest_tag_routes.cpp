@@ -18,8 +18,14 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "pg/pg_raii.hpp"
+
+#include <libpq-fe.h>
+
+#include <algorithm>
 #include <optional>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -41,6 +47,9 @@ struct TagRouteHarness {
     bool scope_allow{true};
     bool scope_fn_called{false};
     std::string scoped_target;
+    // action/result/target triples, in emission order (governance cmp-F1:
+    // the v1 failure branches must leave audit rows).
+    std::vector<std::string> audit_events;
 
     explicit TagRouteHarness(bool wire_scope = true) {
         REQUIRE(tag_store.is_open());
@@ -61,8 +70,10 @@ struct TagRouteHarness {
         // would then fail (proving the scoped gate is the one in force).
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) -> bool { return true; };
-        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                           const std::string&, const std::string&, const std::string&) -> bool {
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string&,
+                               const std::string& target, const std::string&) -> bool {
+            audit_events.push_back(action + "/" + result + "/" + target);
             return true;
         };
 
@@ -188,4 +199,66 @@ TEST_CASE("REST DELETE /api/v1/tags admits in-scope and fails closed when unwire
         CHECK(res->status == 403);
         CHECK(tag_value(h.tag_store, "agent-B", "service") == "ServiceA");
     }
+}
+
+// ── Store-degrade classification at the ROUTE layer (governance qa-1: the
+// db_error?503:400 split was a live surviving mutant — no route-level test
+// drove either polarity — and cmp-F1: the failure branches must audit).
+
+namespace {
+void drop_tags_table(const std::string& dsn) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(conn.get(), "DROP TABLE tag_store.tags CASCADE")};
+    REQUIRE(r.ok());
+}
+bool has_audit(const std::vector<std::string>& events, const std::string& needle) {
+    return std::find(events.begin(), events.end(), needle) != events.end();
+}
+} // namespace
+
+TEST_CASE("REST v1 tag routes classify store degrade as 503 (retryable) and audit the failure",
+          "[pg][rest][tag][failclosed]") {
+    TagRouteHarness h;
+    REQUIRE(h.tag_store.set_tag("agent-B", "service", "ServiceA", "seed").has_value());
+    drop_tags_table(h.tag_bundle.dsn());
+
+    SECTION("GET /api/v1/tags → 503, never an empty tag map") {
+        auto res = h.sink.Get("/api/v1/tags?agent_id=agent-B");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+    }
+
+    SECTION("PUT → 503 with retry_after_ms and a tag.set failure audit") {
+        auto res = h.put(kBody);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("tag store unavailable") != std::string::npos);
+        CHECK(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+        CHECK(has_audit(h.audit_events, "tag.set/failure/agent-B:service"));
+    }
+
+    SECTION("DELETE → 503 (degrade), NOT 404, with a tag.delete failure audit") {
+        auto res = h.del("agent-B", "service");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find(R"("retry_after_ms":5000)") != std::string::npos);
+        CHECK(has_audit(h.audit_events, "tag.delete/failure/agent-B:service"));
+    }
+}
+
+TEST_CASE("REST v1 tag routes classify caller errors as 400 (the 503/400 mutant killer)",
+          "[pg][rest][tag][failclosed]") {
+    TagRouteHarness h; // live store — validation failures must NOT be 503
+    auto res = h.put(R"({"agent_id":"agent-B","key":"environment","value":"NotAllowed"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("allowed values") != std::string::npos);
+    CHECK(has_audit(h.audit_events, "tag.set/failure/agent-B:environment"));
+    // And the not-found DELETE stays 404 (successful read, no such tag).
+    auto del = h.del("agent-B", "missing-key");
+    REQUIRE(del);
+    CHECK(del->status == 404);
+    CHECK(has_audit(h.audit_events, "tag.delete/not_found/agent-B:missing-key"));
 }

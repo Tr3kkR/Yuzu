@@ -2610,6 +2610,78 @@ groups:
             legacy file) — it carries the remediation. See the runbook for
             what each reason means and how to resolve it.
           runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/user-manual/upgrading.md#notification-feed-moves-to-postgresql--history-preserved-notificationstore-adr-0046"
+      - alert: YuzuTagStoreReadDegraded
+        # A tag_store read degraded and the caller failed CLOSED (ADR-0050):
+        # tags are DISPATCH-CRITICAL scope input, so evaluate_scope ABORTS the
+        # whole evaluation, tag:-scoped dispatch/policy targeting resolves to
+        # ZERO agents, service-scoped-token authz 503s, and the REST/MCP tag
+        # surfaces answer 503/-32603 — never a silently-empty result. While
+        # this fires, do NOT read a tag:-scoped rule's empty match as
+        # authoritative, and note the policy evaluator's tick collapses the
+        # abort to "no targets" (verdicts freeze at their prior values;
+        # PolicyStore.last_check_at stops advancing — governance UP-4).
+        # /readyz stays green under pure pool saturation (latched is_open),
+        # so PAIR this with yuzu_pg_pool_waiters / yuzu_pg_acquire_* when
+        # triaging: pool_acquire_timeout/query_error correlate with substrate
+        # saturation or outage; store_not_open means the store failed at boot.
+        # reason = store_not_open | pool_acquire_timeout | query_error.
+        expr: |
+          sum(rate(yuzu_server_tag_store_read_degrade_total[5m])) by (reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tag-store reads degrading ({{ $labels.reason }}) — tag-scoped targeting is failing closed"
+          description: >-
+            yuzu_server_tag_store_read_degrade_total{reason="{{ $labels.reason }}"}
+            is non-zero: a tag read that feeds scope resolution, service-token
+            confinement, or the tag REST/MCP surfaces degraded and the caller
+            failed closed. tag:-scoped dispatch reaches zero agents and the
+            policy evaluator silently skips tag-scoped checks while this
+            fires (last_check_at stops advancing). Pair with yuzu_pg_pool_*
+            saturation signals; /readyz does not reflect this state.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
+      - alert: YuzuTagStoreBackfillNotCompleted
+        # Mirrors YuzuNotificationBackfillFailing's absent-success shape (NOT
+        # the custom-properties result="failed" shape): the one-time legacy
+        # tags.db -> tag_store backfill (ADR-0050) runs during server
+        # CONSTRUCTION, and a failure sets startup_failed_ so the HTTP
+        # listener never starts — /metrics is never served and a
+        # result="failed" sample is never scraped, making a failed-keyed
+        # expression unfireable (governance sre-1). What IS observable is the
+        # ABSENCE of a success outcome. THIS RULE DEPENDS ON THE PRE-SEED in
+        # server.cpp's tag-store construction block (describe() + zero-loop
+        # over fresh/success/failed) — that is what makes "series absent"
+        # mean "no server is serving" rather than "metric not registered".
+        # THREE-WAY result split: fresh | success | failed; expr matches the
+        # two good outcomes. LIMITS: multi-replica — one wedged replica among
+        # healthy ones shows as up == 0, not this; a legitimately long first
+        # boot on a huge tags.db can trip it during the upgrade window
+        # (silence for the window). The BOOT LOG carries the actual
+        # remediation (holder-side fingerprint mismatch / direction-aware
+        # row-conflict refusal / unreadable legacy file / oversized-file txn
+        # timeout) — this is the outside-in backstop, not the primary signal.
+        expr: |
+          absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[15m])
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "No server is reporting a completed tag-store backfill (possible boot refusal)"
+          description: >-
+            No scraped Yuzu server has reported a successful one-time legacy
+            tags.db -> PostgreSQL tag_store backfill (ADR-0050) in the last
+            15 minutes. After an upgrade the usual cause is a server that
+            FAILED the backfill: it fails CLOSED, refuses to serve, and
+            retries on the next start — a restart loop with the whole server
+            down. A DIRECTION-AWARE row-conflict refusal additionally means
+            the currently-served tag data may be the WRONG SIDE of an
+            operator-authored-data race — treat it as a data-integrity
+            incident, not just an availability one (verify which side is
+            authoritative before clearing anything). Read the server BOOT
+            log for the specific refusal; the runbook maps each message to
+            its recovery.
+          runbook_url: "https://github.com/Tr3kkR/Yuzu/blob/main/docs/ops-runbooks/tag-store-backfill-recovery.md"
       - alert: YuzuInventoryIngestSlow
         # Leading indicator for ingest transaction-hold saturation: full-payload
         # ingests taking >10s. Distinct from the yuzu_pg_acquire_* family, which

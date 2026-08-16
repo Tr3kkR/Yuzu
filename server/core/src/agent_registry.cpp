@@ -1264,27 +1264,16 @@ static void collect_result_set_ids(const yuzu::scope::Expression& expr,
     }
 }
 
-// Collect every props.<key> reference in a scope expression, mirroring
-// collect_result_set_ids above — same reason: the resolver preloads all
-// referenced property keys ONCE, before the agent loop, rather than a
-// per-agent CustomPropertiesStore query while holding mu_ (same shape
-// review finding F fixed for from_result_set:).
-static void collect_props_keys(const yuzu::scope::Expression& expr,
-                               std::vector<std::string>& out) {
-    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
-        if (cond->attribute.starts_with("props."))
-            out.push_back(cond->attribute.substr(6));
-    } else if (const auto* comb =
-                   std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
-        if (*comb)
-            for (const auto& child : (*comb)->children)
-                collect_props_keys(child, out);
-    }
-}
-
-// tag:<key> collection uses the shared yuzu::scope::collect_attribute_suffixes
-// (scope_engine.hpp) — added with ADR-0050 for exactly this preload pattern;
-// the two older collectors above predate it and stay as-is.
+// props.<key> and tag:<key> collection both use the shared
+// yuzu::scope::collect_attribute_suffixes (scope_engine.hpp) — added with
+// ADR-0050 for exactly this preload pattern. Folding props onto it (Gate 7,
+// governance DSL-3/arch-F1) also FIXED a pre-existing defect: the local
+// collector this replaced matched the raw attribute, so `LEN(props.x)` /
+// `STARTSWITH(props.x, …)` (synthetic `__len:`/`__startswith:` encodings)
+// never contributed `x` to the preload and those atoms resolved against
+// nothing. collect_result_set_ids above stays local — it is shape-different
+// (id extraction, not a prefix-suffix walk) and from_result_set: has no
+// synthetic interplay worth encoding.
 
 std::optional<std::vector<std::string>>
 AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
@@ -1371,7 +1360,7 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> props_values;
     {
         std::vector<std::string> prop_keys;
-        collect_props_keys(expr, prop_keys);
+        yuzu::scope::collect_attribute_suffixes(expr, "props.", prop_keys);
         if (!prop_keys.empty()) {
             if (props_store == nullptr) {
                 spdlog::error("AgentRegistry::evaluate_scope: scope references props.<key> but no "

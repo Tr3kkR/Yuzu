@@ -4279,6 +4279,28 @@ public:
                 startup_failed_ = true;
             } else {
                 tag_store_->set_metrics(&metrics_);
+                // Pre-seed both bounded-label families to 0 (governance
+                // arch-F2, per docs/observability-conventions.md) so
+                // absent()-based alerting stays meaningful before the first
+                // degrade/backfill event. The sibling migrated stores
+                // predate this convention being applied to store counters —
+                // a class-wide follow-up tracks them; seeding only the new
+                // store is the conventions doc's side of that divergence.
+                metrics_.describe("yuzu_server_tag_store_read_degrade_total",
+                                  "Tag-store reads that degraded instead of answering, by reason "
+                                  "(scope/dispatch callers fail closed on these)",
+                                  "counter");
+                for (auto reason : {"store_not_open", "pool_acquire_timeout", "query_error"}) {
+                    metrics_.counter("yuzu_server_tag_store_read_degrade_total",
+                                     {{"reason", reason}});
+                }
+                metrics_.describe("yuzu_server_tag_store_backfill_total",
+                                  "One-time legacy tags.db backfill outcome (ADR-0050)",
+                                  "counter");
+                for (auto result : {"fresh", "success", "failed"}) {
+                    metrics_.counter("yuzu_server_tag_store_backfill_total",
+                                     {{"result", result}});
+                }
                 auto tag_db = cfg_.db_dir() / "tags.db";
                 if (!tag_store_->migrate_from_sqlite(tag_db)) {
                     spdlog::error("[PG] Refusing to start: tag legacy-SQLite backfill failed "
@@ -7327,9 +7349,10 @@ public:
         agent_service_.set_notification_store(nullptr);
         notification_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
-        // pointer from agent_service_ (Register/heartbeat sync_agent_tags
-        // ingest), then drop the store, BEFORE the pool. No background
-        // thread to join — same discipline as the sibling PG stores above.
+        // pointer from agent_service_ (the Register sync_agent_tags ingest —
+        // Register-only, heartbeats do not sync tags; governance perf-F8),
+        // then drop the store, BEFORE the pool. No background thread to
+        // join — same discipline as the sibling PG stores above.
         agent_service_.set_tag_store(nullptr);
         tag_store_.reset();
         pg_pool_.reset();
@@ -8765,9 +8788,13 @@ private:
         if (result) {
             // Populate with agents that have this service tag. Degrade
             // fails CLOSED: dynamic-group membership is confinement input,
-            // so a degraded tag read must never refresh the group to empty
-            // (prior membership is retained; the next successful pass
-            // repopulates).
+            // so a degraded tag read must never refresh the group to empty.
+            // Prior membership is retained; there is NO automatic
+            // repopulation pass (governance UP-5 — an earlier comment here
+            // claimed one) — membership refreshes only when this ensure
+            // helper next runs, i.e. on the next `service`-tag write. The
+            // operator-facing recovery guidance lives in
+            // docs/ops-runbooks/tag-store-backfill-recovery.md.
             if (tag_store_) {
                 if (auto agents = tag_store_->agents_with_tag("service", service_value)) {
                     mgmt_group_store_->refresh_dynamic_membership(*result, *agents);

@@ -29,8 +29,8 @@
 #include <libpq-fe.h>
 #include <sqlite3.h>
 
-#include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -741,11 +741,11 @@ TEST_CASE("TagStore: backfill refuses on a corrupt legacy file (fail-closed)",
 
     TempSqliteFile legacy("yuzu_test_tags_corrupt_");
     {
-        FILE* f = std::fopen(legacy.path.string().c_str(), "wb");
-        REQUIRE(f != nullptr);
-        const char junk[] = "this is not a sqlite database";
-        std::fwrite(junk, 1, sizeof(junk), f);
-        std::fclose(f);
+        // RAII stream, not fopen/fclose (governance saf-F1 policy floor —
+        // manual cleanup in new C++, even test code, even leak-free today).
+        std::ofstream junk_out{legacy.path, std::ios::binary};
+        REQUIRE(junk_out.is_open());
+        junk_out << "this is not a sqlite database";
     }
 
     CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
@@ -922,4 +922,82 @@ TEST_CASE("TagStore: backfill row conflict — tied updated_at with differing co
     CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
     CHECK(std::filesystem::exists(legacy.path));
     CHECK(require_ok(store.get_tag("agent-1", "env")).value_or("") == "prod-a");
+}
+
+// ── Gate 7 hardening round: sync bounds + agent_id write guard (perf-F1 /
+// UP-2) and the structurally-wrong-legacy-file refusal (UP-14).
+
+TEST_CASE("TagStore: sync_agent_tags refuses an over-cap batch whole, prior set retained",
+          "[pg][tag_store][bounds]") {
+    TAGS_SHARED(store);
+
+    require_ok(store.set_tag("agent-1", "keep", "v", "agent"));
+
+    std::unordered_map<std::string, std::string> big;
+    for (int i = 0; i < 257; ++i) // kMaxSyncTags = 256
+        big.emplace("k" + std::to_string(i), "v");
+    auto res = store.sync_agent_tags("agent-1", big);
+    REQUIRE_FALSE(res.has_value());
+    // Caller error (deterministic refusal), NOT a db_error/503.
+    CHECK_FALSE(res.error().starts_with(kTagDbErrorPrefix));
+    CHECK(res.error().find("too many agent-reported tags") != std::string::npos);
+    // Nothing was written or wiped — the refusal happens before the txn.
+    CHECK(require_ok(store.get_tag("agent-1", "keep")).value_or("") == "v");
+    CHECK(require_ok(store.get_all_tags("agent-1")).size() == 1);
+
+    // Exactly at the cap is accepted (boundary).
+    std::unordered_map<std::string, std::string> at_cap;
+    for (int i = 0; i < 256; ++i)
+        at_cap.emplace("k" + std::to_string(i), "v");
+    require_ok(store.sync_agent_tags("agent-1", at_cap));
+    CHECK(require_ok(store.get_all_tags("agent-1")).size() == 256);
+}
+
+TEST_CASE("TagStore: writes reject an agent_id with an embedded NUL (UP-2 identity guard)",
+          "[pg][tag_store][bounds]") {
+    TAGS_SHARED(store);
+
+    const std::string nul_id{"agent\0evil", 10};
+    auto set = store.set_tag(nul_id, "env", "prod");
+    REQUIRE_FALSE(set.has_value());
+    CHECK_FALSE(set.error().starts_with(kTagDbErrorPrefix));
+    CHECK(set.error().find("invalid agent id") != std::string::npos);
+
+    auto sync = store.sync_agent_tags(nul_id, {{"k", "v"}});
+    REQUIRE_FALSE(sync.has_value());
+    CHECK(sync.error().find("invalid agent id") != std::string::npos);
+
+    auto del_all = store.delete_all_tags(nul_id);
+    REQUIRE_FALSE(del_all.has_value());
+
+    // Nothing landed under the truncated identity libpq would have written.
+    CHECK(require_ok(store.get_all_tags("agent")).empty());
+}
+
+TEST_CASE("TagStore: backfill refuses a structurally-wrong legacy db (updated_at not INTEGER)",
+          "[pg][tag_store][backfill]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    TagStore store{pool};
+    REQUIRE(store.is_open());
+
+    TempSqliteFile legacy("yuzu_test_tags_badtype_");
+    {
+        SqliteDb raw;
+        REQUIRE(sqlite3_open(legacy.path.string().c_str(), raw.addr()) == SQLITE_OK);
+        SqliteErrMsg err;
+        // updated_at TEXT — sqlite3_column_int64 would coerce "yesterday" to
+        // 0, silently making every migrated row "oldest" for the
+        // direction-aware conflict compare (governance UP-14).
+        REQUIRE(sqlite3_exec(raw.get(),
+                             "CREATE TABLE tags (agent_id TEXT, key TEXT, value TEXT, source "
+                             "TEXT, updated_at TEXT, PRIMARY KEY (agent_id, key));"
+                             "INSERT INTO tags VALUES ('a1','env','prod','server','yesterday');",
+                             nullptr, nullptr, err.addr()) == SQLITE_OK);
+    }
+
+    CHECK_FALSE(store.migrate_from_sqlite(legacy.path));
+    CHECK(std::filesystem::exists(legacy.path)); // evidence not consumed
+    CHECK(require_ok(store.get_all_tags("a1")).empty());
 }

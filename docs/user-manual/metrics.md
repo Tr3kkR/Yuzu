@@ -1238,6 +1238,26 @@ sum(rate(yuzu_server_custom_properties_backfill_total{result="failed"}[15m])) > 
 sum(rate(yuzu_server_notification_backfill_total{result="failed"}[15m])) > 0
 ```
 
+## Tag store metrics (device tags / scope-targeting substrate, ADR-0050)
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_tag_store_read_degrade_total{reason}` | counter | A tag read degraded instead of answering, and the caller FAILED CLOSED (ADR-0050): `tag:<key>` scope resolution aborts the whole evaluation (a tag-scoped dispatch reaches zero agents), service-scoped-token confinement 503s, and the REST/MCP tag surfaces answer `503`/`-32603` — never a silently-empty result. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection in time — correlates with `yuzu_pg_acquire_*`/`yuzu_pg_pool_waiters` saturation), `query_error`. **A non-zero rate also means the policy evaluator is silently skipping `tag:`-scoped checks** (its tick collapses the abort to "no targets"; `PolicyStore.last_check_at` stops advancing). Pre-seeded to 0 for all three reasons. Write-path failures (set/sync/delete) are log-only — deliberately no per-store write counter (wave-level decision pending). |
+| `yuzu_server_tag_store_backfill_total{result}` | counter | Outcome of the one-time `tags.db` → Postgres backfill at boot (ADR-0050). `result` ∈ `fresh` (no legacy DB), `success` (backfilled and moved aside), `failed` (refused — the server **fails the boot closed** and retries next start; NOTE a refused boot never serves `/metrics`, so `failed` is effectively unscrapeable — alerting keys on the ABSENCE of `success|fresh` instead, which the pre-seed makes meaningful; see `YuzuTagStoreBackfillNotCompleted`). A direction-aware row-conflict refusal is a data-integrity signal, not just availability — see `docs/ops-runbooks/tag-store-backfill-recovery.md`. |
+
+**Useful PromQL queries:**
+
+```promql
+# Tag reads degrading → tag-scoped dispatch failing closed to zero agents and
+# policy tag-checks silently skipping. (Shipped as YuzuTagStoreReadDegraded.)
+sum(rate(yuzu_server_tag_store_read_degrade_total[5m])) by (reason) > 0
+
+# No server reporting a completed tag backfill → possible fail-closed boot
+# refusal loop. (Shipped as YuzuTagStoreBackfillNotCompleted; absent-success
+# shape, NOT result="failed" — a refused boot never serves /metrics.)
+absent_over_time(yuzu_server_tag_store_backfill_total{result=~"success|fresh"}[15m])
+```
+
 ## Quarantine store metrics (Guardian device-quarantine bookkeeping, ADR-0047)
 
 The `QuarantineStore` — which agents are network-isolated, who isolated them, why, and their

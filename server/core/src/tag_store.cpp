@@ -50,6 +50,27 @@ constexpr const char* kStoreName = "tag_store";
 constexpr std::chrono::milliseconds kAcquireTimeout{2000};
 constexpr std::chrono::milliseconds kBackfillTxnTimeout{60000};
 
+// Upper bound on one sync_agent_tags batch (governance perf-F1). The proto
+// map is unbounded and gRPC's 4 MB default message cap admits ~10^5 entries;
+// unbounded K used to mean K+1 sequential statements pinning one shared-pool
+// connection for tens of seconds per Register — repeatable, and the pool is
+// shared with the dispatch-critical scope preload and RBAC reads. Realistic
+// agent self-reports are 5–20 tags; 256 is generous headroom. Over-cap syncs
+// are REFUSED whole (caller error, prior tag set retained — deterministic,
+// unlike truncating an unordered map) and the Register handler logs it.
+constexpr std::size_t kMaxSyncTags = 256;
+
+// agent_id write guard (governance UP-2): libpq's text binds are C strings,
+// so an embedded NUL silently TRUNCATES the id at the DB seam while
+// AgentRegistry keys the session by the full string — tag rows would land
+// under an identity no read path ever matches. Reject at the write seam
+// (caller error, never db_error). Length cap matches the REST/gRPC agent_id
+// bound used elsewhere (256).
+bool valid_agent_id(const std::string& agent_id) {
+    return !agent_id.empty() && agent_id.size() <= 256 &&
+           agent_id.find('\0') == std::string::npos;
+}
+
 std::int64_t now_secs() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
@@ -243,6 +264,8 @@ std::expected<void, std::string> TagStore::set_tag(const std::string& agent_id,
                                                    const std::string& source) {
     if (!open_)
         return std::unexpected(std::string(kTagDbErrorPrefix) + "store not open");
+    if (!valid_agent_id(agent_id))
+        return std::unexpected("invalid agent id (1-256 bytes, no NUL)");
     if (!validate_key(key))
         return std::unexpected("invalid tag key (1-64 chars, alphanumeric/._:-)");
     if (!validate_value(value))
@@ -319,16 +342,39 @@ TagStore::sync_agent_tags(const std::string& agent_id,
                           const std::unordered_map<std::string, std::string>& tags) {
     if (!open_)
         return std::unexpected(std::string(kTagDbErrorPrefix) + "store not open");
+    if (!valid_agent_id(agent_id))
+        return std::unexpected("invalid agent id (1-256 bytes, no NUL)");
+    if (tags.size() > kMaxSyncTags)
+        return std::unexpected("too many agent-reported tags (max " +
+                               std::to_string(kMaxSyncTags) +
+                               ") — sync refused whole, prior tag set retained");
 
-    // Delete all agent-sourced tags, then re-insert — one transaction. A
-    // failed DELETE or a failed per-row upsert rolls the whole sync back, so
-    // the agent keeps its PRIOR complete tag set rather than a partial wipe
-    // (governance UP-1 on the SQLite original — the invariant carries over;
-    // pool_.with_txn_for gives the same all-or-nothing shape the manual
-    // BEGIN/SqliteTxn pair used to). The source-precedence guarantee (#1411
-    // — operator rows survive an agent sync) depends on the DELETE targeting
-    // source='agent' only and the reinserts using the agent-precedence
-    // upsert.
+    // Validate/sanitize OUTSIDE the transaction (no lease held during string
+    // work), building the parallel arrays for ONE batched upsert. Malformed
+    // entries are skipped, matching the pre-migration contract.
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    keys.reserve(tags.size());
+    values.reserve(tags.size());
+    for (const auto& [key, value] : tags) {
+        if (!validate_key(key) || !validate_value(value))
+            continue; // skip malformed entries; not a transaction failure
+        keys.push_back(key);
+        values.push_back(sanitize_pg_text(value));
+    }
+
+    // Delete all agent-sourced tags, then re-insert — one transaction, and
+    // exactly TWO statements regardless of tag count (governance perf-F1:
+    // the per-row loop was K+1 sequential round-trips pinning a shared-pool
+    // connection per Register). A failed DELETE or batch insert rolls the
+    // whole sync back, so the agent keeps its PRIOR complete tag set rather
+    // than a partial wipe (governance UP-1 — invariant carried over). The
+    // source-precedence guarantee (#1411 — operator rows survive an agent
+    // sync) depends on the DELETE targeting source='agent' only and the
+    // batch upsert's per-row `WHERE tags.source = 'agent'` — the batched
+    // ON CONFLICT applies the WHERE per conflicting row (verified on live
+    // Postgres 18: an operator-sourced conflict row is declined while the
+    // same statement updates/inserts the agent-sourced rows around it).
     std::string error;
     const bool ok = pool_.with_txn_for(kAcquireTimeout, [&](PGconn* c) -> bool {
         pg::PgResult del = pg::exec_params(
@@ -340,16 +386,27 @@ TagStore::sync_agent_tags(const std::string& agent_id,
                          PQerrorMessage(c));
             return false;
         }
-        for (const auto& [key, value] : tags) {
-            if (!validate_key(key) || !validate_value(value))
-                continue; // skip malformed entries; not a transaction failure
-            auto up = upsert_tag_on(c, agent_id, key, sanitize_pg_text(value), "agent");
-            if (!up) {
-                error = up.error();
-                spdlog::warn("TagStore::sync_agent_tags: upsert failed for ({}, {}): {}", agent_id,
-                             key, PQerrorMessage(c));
-                return false; // roll the whole sync back (UP-1)
-            }
+        if (keys.empty())
+            return true;
+        std::vector<std::string_view> key_views(keys.begin(), keys.end());
+        std::vector<std::string_view> value_views(values.begin(), values.end());
+        pg::PgResult ins = pg::exec_params(
+            c,
+            "INSERT INTO tag_store.tags (agent_id, key, value, source, updated_at) "
+            "SELECT $1, t.k, t.v, 'agent', $4::bigint "
+            "FROM unnest($2::text[], $3::text[]) AS t(k, v) "
+            "ON CONFLICT (agent_id, key) DO UPDATE SET "
+            "  value = EXCLUDED.value, source = EXCLUDED.source, "
+            "  updated_at = EXCLUDED.updated_at "
+            "WHERE tags.source = 'agent'",
+            std::vector<std::string>{agent_id, pg::to_text_array(key_views),
+                                     pg::to_text_array(value_views),
+                                     std::to_string(now_secs())});
+        if (ins.status() != PGRES_COMMAND_OK) {
+            error = std::string(kTagDbErrorPrefix) + "database write failed";
+            spdlog::warn("TagStore::sync_agent_tags: batch upsert failed for {} ({} tags): {}",
+                         agent_id, keys.size(), PQerrorMessage(c));
+            return false; // roll the whole sync back (UP-1)
         }
         return true;
     });
@@ -364,6 +421,8 @@ TagStore::sync_agent_tags(const std::string& agent_id,
 std::expected<void, std::string> TagStore::delete_all_tags(const std::string& agent_id) {
     if (!open_)
         return std::unexpected(std::string(kTagDbErrorPrefix) + "store not open");
+    if (!valid_agent_id(agent_id))
+        return std::unexpected("invalid agent id (1-256 bytes, no NUL)");
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease)
         return std::unexpected(std::string(kTagDbErrorPrefix) + "no database connection in time");
@@ -829,6 +888,14 @@ std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* db) {
         } else {
             int rc;
             while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+                // A structurally-wrong-but-openable legacy file (updated_at
+                // stored as TEXT, or NULL) would coerce to 0 through
+                // sqlite3_column_int64, silently making every migrated row
+                // "oldest" and skewing the direction-aware conflict compare
+                // (governance UP-14). Refuse the read instead — the caller's
+                // existing unreadable/corrupt fail-closed messaging covers it.
+                if (sqlite3_column_type(s.get(), 4) != SQLITE_INTEGER)
+                    break; // rc stays SQLITE_ROW -> the != SQLITE_DONE check fails the read
                 LTag t;
                 t.agent_id = legacy_text(s.get(), 0);
                 t.key = legacy_text(s.get(), 1);

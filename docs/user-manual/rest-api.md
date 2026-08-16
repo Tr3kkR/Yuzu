@@ -2268,11 +2268,13 @@ Delete a tag from an agent.
 }
 ```
 
-**Storage failure (all tag endpoints):** a degraded tag store returns `503 tag store
-unavailable` (A4 envelope) — never an empty tag map, a `404`, or a false success. Tags feed
-scope resolution and dispatch targeting, so a silently-empty answer would mis-resolve
-decisions built on them (ADR-0050); retry a `503` once `/readyz` reports `tag_store` healthy.
-`DELETE` returns `404 tag not found` only after a successful read found no such tag.
+**Storage failure (all tag endpoints that read or write stored tags — `GET /api/v1/tag-categories` is compile-time static and exempt):** a degraded tag store returns `503 tag store
+unavailable` (A4 envelope, `retry_after_ms: 5000`) — never an empty tag map, a `404`, or a
+false success. Tags feed scope resolution and dispatch targeting, so a silently-empty answer
+would mis-resolve decisions built on them (ADR-0050); retry a `503` once `/readyz` reports
+`tag_store` healthy. `DELETE` returns `404 tag not found` only after a successful read found
+no such tag. Failed and not-found mutations leave `tag.set`/`tag.delete` audit rows
+(`failure`/`not_found`), matching the legacy and MCP twins.
 
 ---
 
@@ -6641,6 +6643,14 @@ Delete a tag from an agent. Request body: `{"agent_id": "...", "key": "..."}`.
 #### `POST /api/tags/query`
 
 Query agents that have a specific tag. Request body: `{"key": "...", "value": "..."}`. Returns `{"agents": [...], "count": N}`.
+
+**Storage failure (all four legacy routes):** a degraded tag store returns `503`
+(`{"error":{"code":503,"message":"tag store unavailable"}}`) instead of an empty
+result or a false success (ADR-0050). Unlike the v1 `DELETE`, `POST /api/tags/delete`
+has **no 404** — a not-found tag remains `200 {"deleted": false}`; only the
+store-degrade path is new. `POST /api/tags/set` previously returned `200
+{"status":"ok"}` even when the write failed; it now returns `400` (validation) or
+`503` (store degrade) honestly.
 
 ---
 

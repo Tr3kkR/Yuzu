@@ -104,6 +104,19 @@ via `pool_.with_txn_for` (governance UP-1 on the original: a mid-sync failure ro
 the agent's prior complete tag set, never a partial wipe — re-proven by a trigger-based
 fault-injection test, replacing the SQLite authorizer hook).
 
+**Gate 7 hardening (governance perf-F1/UP-2):** the reinsert is ONE batched
+`unnest($keys, $values)` upsert — two statements per sync regardless of tag count (the
+first cut was K+1 sequential round-trips pinning a shared-pool connection per Register,
+and the pool is shared with the dispatch-critical scope preload and RBAC reads); the
+per-row precedence `WHERE` was re-verified against live Postgres 18 in batched form
+(operator-sourced conflict rows declined while the same statement updates/inserts the
+agent rows around them). One sync is capped at **256 tags** (`kMaxSyncTags`) — the proto
+map is unbounded and gRPC's 4 MB default admits ~10^5 entries; an over-cap sync is
+refused whole (deterministic, prior set retained, caller error not db_error). Writes
+also reject an `agent_id` that is empty, over 256 bytes, or carries an embedded NUL —
+libpq's text binds are C strings, so a NUL would silently truncate the identity at the
+DB seam while `AgentRegistry` keys the session by the full string (governance UP-2).
+
 ### `tag:<key>` scope-DSL fail-open — closed at the resolver, with one deliberate asymmetry
 
 `evaluate_scope`'s `tag:` resolver called `TagStore::get_tag` per agent inside the fleet loop
@@ -122,6 +135,21 @@ exactly) — that legitimately answers `tag:` atoms without any store; props hav
 source. In production the store cannot be null post-migration (fatal at boot); a null store is
 a test/embedded configuration running on in-memory tags alone. A DEGRADED (non-null, failing)
 store always aborts.
+
+### Preload cost envelope and the caching deferral (governance perf-F2)
+
+Measured on live Postgres 18 (EXPLAIN ANALYZE, 10k agents × 5 keys = 50k rows): a
+two-key preload materializes ~20k rows in ~2.5 ms server-side, ~600 KB transferred,
+via a bitmap index scan on `tags_key_value_idx` — per scope evaluation. The cost
+scales with fleet × referenced keys, and part of it is dead weight (the loop visits
+connected agents only, and `scopable_tags` shadows agent-sourced rows). Two
+optimizations were considered and REJECTED: filtering `source <> 'agent'` in the
+preload (a sync-failure window would make the store and the in-memory view diverge
+for exactly the rows being shadowed), and caching the preload (ADR-0012 §4's rules —
+positive-only, generation-guarded invalidation on own writes, provenance — are
+unsatisfiable on a dispatch-targeting path where a stale positive TARGETS THE WRONG
+AGENT). The per-evaluation query is the deliberate steady state; revisit only with a
+measured fleet-scale problem in hand.
 
 ### Bulk reads replace point-lookup loops (NFR)
 
@@ -176,7 +204,10 @@ against the SANITIZED legacy values (a prior partial run inserted sanitized byte
 | tied `updated_at`, differing content | **FAIL CLOSED** (two writes the second-granularity clock cannot order) |
 
 A row inserted fresh mid-backfill that then loses to a concurrent writer (`PQcmdTuples()=="0"`
-on the guarded insert) also fails closed rather than silently mixing two writers' rows.
+on the guarded insert) also fails closed rather than silently mixing two writers' rows. A
+legacy file whose `updated_at` column is not INTEGER-typed (TEXT/NULL — SQLite's loose
+typing would coerce it to 0 and silently mark every row "oldest" for the direction
+compare) refuses the read outright (governance UP-14).
 Recovery runbook: `docs/ops-runbooks/tag-store-backfill-recovery.md`.
 
 **Known gap, recorded not hidden:** the release upgrade test
