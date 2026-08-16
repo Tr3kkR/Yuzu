@@ -707,7 +707,7 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    check(len(_entries) >= 5, "meson.build: all five server shard entries located")
+    check(len(_entries) >= 6, "meson.build: all six server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -719,10 +719,24 @@ def _selftest():
             continue  # an args-less entry has no positional specs to strip
         _args = re.findall(r"'([^']*)'", _m.group(1))
         check(bool(_args), "meson.build: args-carrying server entry extracted non-empty")
-        for _arg in _args:
+        # Positional tag-filter specs vs Catch2 OPTION flags. A shard whose
+        # cases ALL skip on a DSN-less platform (macOS: shard D, every case
+        # gated on YUZU_TEST_POSTGRES_DSN) needs `--allow-running-no-tests`, or
+        # Catch2 exits 4 on an all-skipped run and reds the leg (#2092). Option
+        # flags are exempt from the tag-spec hygiene guard and from the shard
+        # pin below (which keys on the positional specs); the isolated-retry
+        # surgery already PRESERVES options (`_cmd_without_test_specs`), so a
+        # flag never ORs with a retried case.
+        _specs = [a for a in _args if not a.startswith("-")]
+        _opts = [a for a in _args if a.startswith("-")]
+        check(bool(_specs), "meson.build: server entry has at least one positional spec")
+        for _arg in _specs:
             check(CATCH2_TAG_SPEC.match(_arg) is not None,
                   f"meson.build server test arg {_arg!r} is not a tag-filter spec")
-        _shard_specs.append(tuple(_args))
+        for _opt in _opts:
+            check(_opt.startswith("--"),
+                  f"meson.build server test option {_opt!r} is not a --long flag")
+        _shard_specs.append(tuple(_specs))
     # Positive pin so hollow extraction can never pass again: the shard filters
     # must come back verbatim. A shard add or rebalance updates this line
     # consciously. #2394 split the single '[pg]' entry into two balanced halves
@@ -757,14 +771,21 @@ def _selftest():
     # not projection. [license_store] folded into shard B on the cherry-pick
     # (tests/meson.build's own comment on this trio has the reasoning and
     # re-verified counts).
+    # 2026-08-16 (#2092/#2093): the combined store-tag pg shard B TIMEOUT-ed at
+    # 600/600s again (blocking PR #3159). Split B into B+D balanced by measured
+    # TIME, not case count: [rbac_store] alone was ~57s (~54% of the store-tag
+    # runtime), so shard B = [rbac_store] alone and new shard D = the other eight
+    # store tags (~48s). Deliberately count-lopsided (93 vs 335) because time is
+    # what blows the ceiling. shard C UNCHANGED. Local isolated: B 58s / D 49s.
     check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
           and ("~[pg]~[auth]~[mcp]",) in _shard_specs
           and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
-          and ("[pg][audit_store]~[routes]~[store]~[token],[pg][rbac_store]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token]",)
+          and ("[pg][rbac_store]~[routes]~[store]~[token]",) in _shard_specs
+          and ("[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token]",)
           in _shard_specs
           and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]",)
           in _shard_specs,
-          "meson.build: all five shard tag filters extracted verbatim")
+          "meson.build: all six shard tag filters extracted verbatim")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")
