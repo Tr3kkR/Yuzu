@@ -88,6 +88,36 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## Behaviour change: SAML login gains a new availability coupling to `rbac_store` (#1832)
+
+SAML SSO now reaches parity with OIDC's group-to-role RBAC reconciliation (see
+[`authentication.md`](authentication.md) "SAML Fine-Grained RBAC"). This introduces a
+coupling that did not exist before: on a deployment that already has **RBAC enabled**
+**and** `--saml-group-attribute` configured, a SAML login now depends on `rbac_store`
+being reachable — a transient reconcile-store error denies the login outright
+(fail-closed), rather than granting a session under stale or unreconciled roles.
+Previously, a `--saml-group-attribute`-configured deployment's SAML logins did not
+touch the RBAC store at all (only the coarse `--saml-admin-group` admin/user mapping
+ran), so this is a genuinely new dependency for that combination of flags, not a
+tightening of an existing one.
+
+**What to do:** if you run SAML with both RBAC enabled and `--saml-group-attribute`
+set, ensure `rbac_store` (PostgreSQL) health and availability are covered by whatever
+you already monitor for RBAC-gated REST/MCP calls — a `rbac_store` outage now also
+takes down SAML login for that deployment, not just RBAC-gated reads. Deployments that
+leave `--saml-group-attribute` unset, or that run with RBAC disabled, are unaffected —
+this section is a no-op for them.
+
+**Also note:** the `--saml-group-attribute` group-value cap (`saml::kMaxGroupValues`)
+is raised from 64 to 200 in this release, to align with
+`RbacStore::kMaxIdpGroupsPerLogin`. A SAML assertion carrying 65–200 group values,
+which previously had its excess values silently truncated (and the login still
+succeeded), now has all of them considered. An assertion carrying more than 200 group
+values, which previously also truncated-and-logged-in, now instead **denies the
+login** (mirrors OIDC's `group_count_exceeded` behaviour) — see "SAML Fine-Grained
+RBAC" in `authentication.md` for the full detail, including the practical httplib
+form-body-size caveat on how large an assertion can realistically reach `/saml/acs`.
+
 ## Behaviour change: MCP approval-store permanent failures now say don't retry (#2786)
 
 An MCP approval-ticket recall that hits a store fault has always returned `-32603` with a `retry_after_ms` hint. Previously that hint was `5000` (retry after 5 seconds) for every store fault except a never-opened store, including one that was open but failing in a way no amount of retrying clears — SQLite corruption, not-a-database, a read-only filesystem, or a full disk. Those four cases now correctly get `retry_after_ms: null` (the same "escalate to an operator" response a never-opened store gets) instead of the transient retry hint.

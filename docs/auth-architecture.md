@@ -599,9 +599,23 @@ Implementation: `RbacStore::reconcile_idp_memberships` /
 `auth_routes.cpp` `/auth/callback`; the claim parsing + gating decision in
 `oidc_provider.{hpp,cpp}` (`IdTokenClaims::groups_claim_present` /
 `groups_overage`, `groups_claim_reconcilable`). Tests:
-`tests/unit/server/test_rbac_store.cpp`, `test_oidc_provider.cpp`. SAML group
-sync is out of scope here (dropped in #1827; will ride this same reconcile
-path once #1826 merges).
+`tests/unit/server/test_rbac_store.cpp`, `test_oidc_provider.cpp`.
+
+**SAML now rides this same reconcile path (source `"saml"`).** The
+`/saml/acs` handler reconciles `--saml-group-attribute`'s asserted values
+the same way, before minting the session — see
+`docs/user-manual/authentication.md` "SAML Fine-Grained RBAC" for the
+operator-facing detail. Two SAML-specific differences from the OIDC shape
+above: (1) SAML has no `groups_claim_present`/`groups_overage` equivalent —
+it cannot distinguish "attribute absent" from "attribute present, zero
+values" — so an EMPTY asserted set skips reconciliation unconditionally
+(never reconciles zero groups), rather than gating on a presence signal;
+(2) the cap is enforced by the SAML verifier itself
+(`saml::kMaxGroupValues`, 200 — aligned with, and independent of,
+`RbacStore::kMaxIdpGroupsPerLogin`) via a `group_cap_truncated` flag on the
+parsed assertion, and a truncated assertion denies the login before
+`reconcile_idp_memberships` is ever called (never a partial/truncated
+reconcile).
 
 ## Stable principal vs. display name (#1837)
 
@@ -683,9 +697,10 @@ as dead code in the #1837 governance hardening round.
 **SAML was unaffected this slice; since resolved (ADR-2001 PR4a).** At the
 time of the #1837 hardening round documented above, `create_saml_session`
 still keyed `username` on the raw NameID (`display_name` set to the same
-value, purely for render-site parity) — SAML does not sync to `rbac_store`
-yet (dropped in #1827), so the collision risk this fix closes was dormant
-there. ADR-2001 PR4a has since closed the SAML side of the same gap:
+value, purely for render-site parity) — SAML did not sync to `rbac_store`
+yet (dropped in #1827; it now does, under source `"saml"`, see #1832
+above), so the collision risk this fix closes was dormant there. ADR-2001
+PR4a has since closed the SAML side of the same gap:
 `create_saml_session` now keys `username` on the stable
 `saml_principal_id(entity_id, name_id)` (`"saml:" + entity_id + "#" +
 name_id`, `saml_principal.hpp`), mirroring the OIDC split above
