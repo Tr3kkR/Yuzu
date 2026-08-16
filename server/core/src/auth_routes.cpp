@@ -13,6 +13,7 @@
 #include <string_view>
 
 #include "authz_topology_floor.hpp"
+#include "deprovision_deny_split.hpp" // record_deprovision_deny_split — ADR-2001 #3069 shared split
 #include "engine_principal_store.hpp"
 #include "http_route_sink.hpp"
 #include "mcp_policy.hpp"
@@ -2497,6 +2498,17 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "user", "User", username, deny_detail);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+                // #3069 split: the total above conflates a genuine
+                // deprovision deny with a store-unavailable fail-closed
+                // deny, which lets a Postgres outage inflate the counter
+                // operators alert on. `decision.scim_id` is the SAME
+                // predicate the audit `reason=` string above already
+                // switches on — absent means the store couldn't be asked
+                // (`scim_store_unavailable`), never a genuine deny.
+                record_deprovision_deny_split(
+                    m, "yuzu_auth_oidc_deprovisioned_denied_genuine_total",
+                    "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
+                    decision.scim_id.has_value());
                 // Also bump the established general OIDC login counter so
                 // dashboards keyed on it don't undercount during a deny
                 // episode — every other /auth/callback failure path bumps
@@ -2754,6 +2766,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "user", "User", username, recheck_detail);
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+                // #3069 split — see the primary check above; same
+                // `decision.scim_id` predicate the recheck's `reason=`
+                // string already switches on.
+                record_deprovision_deny_split(
+                    m, "yuzu_auth_oidc_deprovisioned_denied_genuine_total",
+                    "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
+                    decision.scim_id.has_value());
                 // Also bump the established general OIDC login counter — see
                 // the primary check above.
                 m->counter("yuzu_auth_oidc_login_total", {{"result", "error"}, {"role", "none"}}).increment();
@@ -2862,13 +2881,25 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             res.set_content(detail::error_json_a4(500, "Failed to build SAML AuthnRequest", cid),
                             "application/json");
             spdlog::error("SAML /auth/saml/start: build_authn_request threw: {}", e.what());
+            // Count SP-initiated failures the same way the ACS paths do, so the
+            // signing-failure leg is not the one SAML-login failure mode absent
+            // from yuzu_auth_saml_login_total.
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+            }
             return;
         }
         if (authn_url.empty()) {
             res.status = 500;
             res.set_content(detail::error_json_a4(500, "Failed to build SAML AuthnRequest", cid),
                             "application/json");
+            // An empty URL is the per-request signing-failure signal
+            // (build_authn_request returns {} rather than emit an unsigned
+            // redirect once an SP signing key is configured).
             spdlog::error("SAML /auth/saml/start: build_authn_request returned empty URL");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+            }
             return;
         }
         // Set the browser-binding cookie so the ACS can verify this browser
@@ -3084,6 +3115,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                         deny_detail);
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+                    // #3069 split: same predicate the audit `reason=`
+                    // string above already switches on — see the OIDC
+                    // primary check for the full rationale.
+                    record_deprovision_deny_split(
+                        m, "yuzu_auth_saml_deprovisioned_denied_genuine_total",
+                        "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
+                        decision.scim_id.has_value());
                     // Also bump the established general SAML login counter
                     // so dashboards keyed on it don't undercount during a
                     // deny episode — every other /saml/acs failure path
@@ -3199,6 +3237,13 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                         recheck_detail);
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_saml_deprovisioned_denied_total").increment();
+                    // #3069 split — see the primary check above; same
+                    // `decision.scim_id` predicate the recheck's `reason=`
+                    // string already switches on.
+                    record_deprovision_deny_split(
+                        m, "yuzu_auth_saml_deprovisioned_denied_genuine_total",
+                        "yuzu_auth_saml_deprovisioned_denied_store_unavailable_total",
+                        decision.scim_id.has_value());
                     // Also bump the established general SAML login counter
                     // — see the primary check above.
                     m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();

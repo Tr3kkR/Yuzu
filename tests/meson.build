@@ -254,6 +254,7 @@ agent_test_exe = executable(
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_content_dist_upload_parsers.cpp', # PR1.6b: pure upload-protocol planner/classifier (no I/O)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -274,6 +275,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
     include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
+    include_directories('../agents/plugins/content_dist/src'),  # content_dist_upload_parsers.hpp (PR1.6b pure helpers)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -490,6 +492,7 @@ if build_server
       'unit/server/test_deployment_parse.cpp',
       'unit/server/test_deployment_run_store.cpp',
       'unit/server/test_deployment_engine.cpp',
+      'unit/server/test_deployment_routes.cpp',
       'unit/server/test_bundle_service.cpp',
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',
@@ -503,6 +506,7 @@ if build_server
       'unit/server/test_web_utils.cpp',
       'unit/server/test_mcp_body_cap.cpp',
       'unit/server/test_dispatch_target_shape.cpp',
+      'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
@@ -546,6 +550,11 @@ if build_server
       # kept OFF the production link line so the private cached path has no
       # public trampoline in server_core.
       'unit/server/engine_liveness_test_access.cpp',
+      # PR1.9c: same #2367 pattern for ClassifiedCommandTestAccess::make — the
+      # ONLY definition, deliberately off the production link line so a
+      # production caller that tries to forge a ClassifiedCommand (bypassing
+      # classification and authorization) fails to LINK rather than compiling.
+      'unit/server/classified_command_test_access.cpp',
       'unit/server/test_rest_engine_principal_roles.cpp',
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
@@ -553,6 +562,17 @@ if build_server
       'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
+      'unit/server/test_dispatch_chokepoint.cpp',
+      'unit/server/test_capability_catalogue.cpp',
+      'unit/server/test_operator_surface_twins.cpp',
+      'unit/server/test_schedule_params.cpp',
+      'unit/server/test_plugin_config_parsers.cpp',
+      'unit/server/test_plugin_config_store_pg.cpp',
+      'unit/server/test_plugin_config_routes.cpp',
+      'unit/server/test_upload_grant_parsers.cpp',
+      'unit/server/test_upload_grant_store_pg.cpp',
+      'unit/server/test_file_retrieval_routes.cpp',
+      'unit/server/test_command_capability.cpp',
       'unit/server/test_rest_access_review.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
@@ -865,11 +885,66 @@ if build_server
   # change and is not addressed here. The partition is preserved
   # (N([pg]) == N(A) + N(B)); if you add a tag to one side, exclude it on the
   # other in the same edit.
+  #
+  # RE-BALANCED 2026-08-15: measured case counts had drifted to 586 (A) vs 1361
+  # (B) — a 2.3x split, up from the ~1.9x already flagged above — and B was
+  # TIMEOUT-ing at 600s on Linux and Windows both (#2092/#2093's own warning:
+  # "split the suite or rebalance before this flakes"). [rbac_store],
+  # [guaranteed_state_store] and [response_store] moved to A by the same
+  # AUDIT_STORE precedent above — each is a dedicated store's own tag, confined
+  # to that one test file, same shape as [audit_store] (verified: `grep -rl`
+  # each tag matches exactly one file). Moves 207 cases (93+61+53), landing at
+  # 793 (A) / 1154 (B) — better, not perfect; [custom_props] was considered and
+  # left out because it also tags test_props_scope_authz.cpp (a scope-authz
+  # suite, not pure store CRUD), so its per-case PG cost isn't confirmed uniform
+  # with the others.
+  #
+  # PR1.6a review remediation (same day) additionally moved [operator_surface]
+  # (the 3 new upload-grant MCP-twin PG integration tests) to A the same way —
+  # untagged, all 3 would land in B, which is already the heavier half and had
+  # separately reached 600.57/600s (killed by TIMEOUT) on CI before this move.
+  # Partition preserved: N([pg]) == N(A) + N(B).
+  #
+  # RE-BALANCED (ADR-0048, LicenseStore, 2026-08-15/16): B kept growing as
+  # sibling Wave 2 stores merged in and kept TIMEOUT-ing on Windows (and
+  # eventually Linux) even after this store's own [license_store] (33 cases,
+  # confined to test_license_store.cpp) was moved off it once already.
+  #
+  # RE-BALANCED AGAIN 2026-08-16 (PR #3156 review-response round, cherry-picked
+  # here — 3f0796777, now also merged to dev via #3156 itself): the day after
+  # the rebalance above, B TIMEOUT-ed again — 66 new/extended PG-backed cases
+  # split 25/41, landing B's already-heavier share disproportionately. A
+  # same-day two-shard fix (moving more tags onto A) was reviewed and rejected
+  # before merge: A's own prior measurement (0.616s/case, already 84% of
+  # budget) is a HIGHER per-case rate than B's, contradicting the
+  # "near-uniform per-case cost" premise these rebalances lean on —
+  # concentrating more cases onto the already-more-expensive shard projected
+  # to ~577s (96%), likely relocating the timeout rather than fixing it.
+  #
+  # SPLIT INTO THREE SHARDS instead. The store-heavy tag set (expensive: real
+  # CREATE DATABASE ... TEMPLATE clones per case, unlike lighter route/handler
+  # tests) is itself split across two shards rather than concentrated in one:
+  #   shard A = [routes]/[store]/[token]
+  #   shard B = [audit_store]/[rbac_store]/[guaranteed_state_store]/
+  #             [response_store]/[operator_surface]/[guardian_routes]/
+  #             [workflow]/[deployment_store]/[license_store], minus anything
+  #             already in A
+  #   shard C = everything else [pg]-tagged
+  # [license_store] folded into shard B's tag list on the cherry-pick (not
+  # present on PR #3156's branch, which has no reason to know about this
+  # store) — same confined-to-one-file precedent as every other tag in that
+  # list, re-verified against this merge's actual case counts via --list-tests
+  # on the built binary, not assumed from either side's pre-merge numbers.
+  # Partition preserved: N([pg]) == N(A) + N(B) + N(C).
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store]'],
+       args: ['[pg][routes],[pg][store],[pg][token]'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]'], suite: 'server', timeout: 600)
+       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][rbac_store]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token]'],
+       suite: 'server', timeout: 600)
+  test('server pg unit tests shard C', server_test_exe,
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]'],
+       suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
@@ -887,6 +962,16 @@ test('changelog order',
   args: [files('test_changelog_order.py')],
   suite: 'docs',
   timeout: 10,
+)
+
+# PR1.9 data-gate: every plugin action has exactly one capability-catalogue row
+# across the five fragment headers, and no fragment claims an action no plugin
+# declares. Hermetic — parses sources, builds nothing.
+test('capability catalogue completeness',
+  _python3_test,
+  args: [files('test_capability_catalogue_complete.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint

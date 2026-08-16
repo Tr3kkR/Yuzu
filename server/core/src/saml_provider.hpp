@@ -20,8 +20,11 @@
  *       validate_response()→std::unexpected, build_authn_request()→"".
  */
 
+#include <openssl/evp.h> // EVP_PKEY — OpenSSL is a mandatory dep on every platform (CLAUDE.md)
+
 #include <chrono>
 #include <expected>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -52,6 +55,13 @@ struct SamlConfig {
     /// deployment that never configures this behaves exactly like the thin
     /// slice (SamlAssertion::groups always empty).
     std::string group_attribute;
+
+    /// PEM-encoded SP AuthnRequest signing private key (RSA only). TRANSIT
+    /// field only — server.cpp reads the key file and populates this; the
+    /// SamlProvider constructor parses it once, retains the owned EVP_PKEY,
+    /// and clears this member. Empty (default) means AuthnRequests are
+    /// unsigned (backward-compatible).
+    std::string sp_signing_key_pem;
 };
 
 /// Claims extracted from a verified SAML assertion.
@@ -137,6 +147,19 @@ public:
     /// Purge expired pending AuthnRequest IDs (call periodically).
     void cleanup_expired_states();
 
+    /// True when SamlConfig::sp_signing_key_pem was non-empty but failed to
+    /// parse as a usable SP signing key (malformed PEM, or a non-RSA key —
+    /// EC/RSA-PSS are rejected). Callers (server.cpp) use this to disable
+    /// SAML LOUDLY on a misconfigured key rather than silently falling back
+    /// to unsigned AuthnRequests. Always false on Windows and when
+    /// sp_signing_key_pem was empty.
+    bool signing_configured_but_broken() const;
+
+    /// Human-readable reason signing_configured_but_broken() is true.
+    /// Empty when signing_configured_but_broken() is false. Never contains
+    /// the PEM bytes.
+    const std::string& signing_init_error() const;
+
 private:
     void cleanup_expired_states_locked(); ///< Must be called with mu_ held.
 
@@ -154,6 +177,14 @@ private:
 
     static constexpr auto kRequestTtl          = std::chrono::minutes(10);
     static constexpr std::size_t kMaxPendingRequests = 1000;
+
+    /// Owned SP AuthnRequest signing key, parsed once at construction from
+    /// SamlConfig::sp_signing_key_pem. Null when signing is not configured,
+    /// or when signing_init_failed_ is true (a malformed/non-RSA key is
+    /// never retained — see signing_configured_but_broken()).
+    std::shared_ptr<EVP_PKEY> sp_signing_key_;
+    bool        signing_init_failed_{false};
+    std::string signing_init_error_;
 };
 
 } // namespace yuzu::server::saml

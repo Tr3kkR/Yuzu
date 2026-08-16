@@ -46,6 +46,11 @@ start_link() ->
 %% Returns a fanout reference. Responses are sent to the caller's mailbox as:
 %%   {command_response, FanoutRef, AgentId, Response}
 %%   {fanout_complete, FanoutRef, Summary}
+%%
+%% CommandReq is passed to yuzu_gw_agent:dispatch/3 as an opaque map — the
+%% router never extracts or rebuilds individual fields, so `dispatch_tag`
+%% (like `payload`) rides through untouched, the same as every other
+%% CommandRequest field. See agent.proto CommandRequest.dispatch_tag.
 -spec send_command([binary()], map(), map()) -> {ok, reference()} | {error, term()}.
 send_command(AgentIds, CommandReq, Opts) ->
     gen_server:call(?SERVER, {send_command, AgentIds, CommandReq, Opts}).

@@ -77,8 +77,12 @@ Every SAML and OIDC login attempt — success or failure — increments its prov
 |---|---|---|
 | `yuzu_auth_saml_login_total{result, role}` | counter | SAML `/saml/acs` outcomes. `result` is `ok` or `error`. `role` is the resolved session role (`admin` / `user`) on `result="ok"`, and `role="none"` on every `result="error"` series (no session was ever created, so there is no role to attribute the failure to). |
 | `yuzu_auth_oidc_login_total{result, role}` | counter | OIDC `/auth/callback` outcomes. Same `{result, role}` shape as the SAML counter above — `role="none"` on all error-path increments (IdP-returned error, missing `code`/`state`, and token-exchange/claim-validation failure). |
-| `yuzu_auth_oidc_deprovisioned_denied_total` | counter, no labels | ADR-2001 §4/PR3 — the deny-at-login backstop: an OIDC login was refused, at either the primary pre-mint check or the post-mint re-check in `/auth/callback`, because the identity's linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the `ScimStore` could not answer — fail-closed). A **non-zero value may mean EITHER a deprovisioned federated identity attempted to re-authenticate, OR a ScimStore/Postgres outage denied logins fail-closed — correlate with `yuzu_pg_acquire_wait_seconds`/`yuzu_pg_acquire_timeout_total` and the audit `reason=` (`linked_scim_resource_inactive` vs `scim_store_unavailable`) to distinguish.** Operator action: confirm the deprovision was intentional (expected after an offboarding); if it recurs against the same identity, the user or their IdP session may not yet be aware of the termination — no code action is needed, this is the backstop working as designed. A sustained non-zero rate with no matching recent SCIM deprovision may instead indicate `ScimStore`/Postgres availability trouble (the store-unavailable path also denies and bumps this counter) — correlate with Postgres health before assuming every increment is a legitimate deny. See "SCIM deprovision-linkage metrics (ADR-2001, CC6.8)" below and `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
-| `yuzu_auth_saml_deprovisioned_denied_total` | counter, no labels | ADR-2001 §4/PR4b — the SAML analogue of the row above: a SAML login was refused, at either the primary pre-mint check or the post-mint re-check in `POST /saml/acs`, because the identity's linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the `ScimStore` could not answer — fail-closed). Same dual-cause caveat as the OIDC counter: a non-zero value may mean either a deprovisioned federated identity attempted to re-authenticate, or a `ScimStore`/Postgres outage denied logins fail-closed — correlate with `yuzu_pg_acquire_wait_seconds`/`yuzu_pg_acquire_timeout_total` and the audit `reason=` (`linked_scim_resource_inactive` vs `scim_store_unavailable`) to distinguish. Operator action is identical to the OIDC counter's. See "SCIM deprovision-linkage metrics (ADR-2001, CC6.8)" below and `docs/auth-architecture.md` "SCIM ↔ SAML identity linkage". |
+| `yuzu_auth_oidc_deprovisioned_denied_total` | counter, no labels | ADR-2001 §4/PR3 — the deny-at-login backstop: an OIDC login was refused, at either the primary pre-mint check or the post-mint re-check in `/auth/callback`, because the identity's linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the `ScimStore` could not answer — fail-closed). **This is the TOTAL — the SUM of the two sub-counters below** (`yuzu_auth_oidc_deprovisioned_denied_genuine_total` + `yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total`, #3069). A non-zero value on this series alone does not tell you which cause fired; alert on the `_genuine_total` sub-counter, not this one — a Postgres outage bumps this total without a single genuine deprovision-deny happening. See "SCIM deprovision-linkage metrics (ADR-2001, CC6.8)" below and `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision". |
+| `yuzu_auth_oidc_deprovisioned_denied_genuine_total` | counter, no labels | #3069 — the CC6.8-alertable half of the total above: an OIDC login was refused because the identity's linked SCIM resource genuinely resolved deprovisioned (deactivated, or orphaned by a hard-deleted `scim_resources` row) — `decision.scim_id` was present, i.e. the `ScimStore` was reachable and named a real resource. Operator action: confirm the deprovision was intentional (expected after an offboarding); if it recurs against the same identity, the user or their IdP session may not yet be aware of the termination — no code action needed, this is the backstop working as designed. |
+| `yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total` | counter, no labels | #3069 — the availability half of the total above: an OIDC login was refused **not** because of a real deprovision but because the `ScimStore` could not be reached (fail-closed) — `decision.scim_id` was absent. This is NOT a termination event; a non-zero/rising rate means `ScimStore`/Postgres is unavailable, not that anyone was deprovisioned — correlate with `yuzu_pg_acquire_wait_seconds`/`yuzu_pg_acquire_timeout_total` and Postgres health before treating any increment here as CC6.8 evidence. |
+| `yuzu_auth_saml_deprovisioned_denied_total` | counter, no labels | ADR-2001 §4/PR4b — the SAML analogue of the OIDC total above: a SAML login was refused, at either the primary pre-mint check or the post-mint re-check in `POST /saml/acs`, because the identity's linked SCIM resource resolved deprovisioned (deactivated, orphaned by a hard-deleted `scim_resources` row, or the `ScimStore` could not answer — fail-closed). **This is the TOTAL — the SUM of the two sub-counters below** (`yuzu_auth_saml_deprovisioned_denied_genuine_total` + `yuzu_auth_saml_deprovisioned_denied_store_unavailable_total`, #3069). Same caveat as the OIDC total: alert on the `_genuine_total` sub-counter, not this one. See "SCIM deprovision-linkage metrics (ADR-2001, CC6.8)" below and `docs/auth-architecture.md` "SCIM ↔ SAML identity linkage". |
+| `yuzu_auth_saml_deprovisioned_denied_genuine_total` | counter, no labels | #3069 — SAML analogue of `yuzu_auth_oidc_deprovisioned_denied_genuine_total`: the identity's linked SCIM resource genuinely resolved deprovisioned (`decision.scim_id` present). The CC6.8-alertable signal; operator action is identical to the OIDC counter's. |
+| `yuzu_auth_saml_deprovisioned_denied_store_unavailable_total` | counter, no labels | #3069 — SAML analogue of `yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total`: the login was refused because the `ScimStore` could not be reached, not because of a real deprovision (`decision.scim_id` absent). An availability signal, not a termination event — correlate with Postgres health. |
 | `yuzu_saml_group_cap_truncated_total` | counter, no labels | Bumped once per SAML login (not once per dropped group value) when the assertion's `groups` attribute exceeded the 64-value cap and real group values were dropped. A non-zero rate means some SAML-asserted group-based RBAC role mappings may not be taking effect for the affected principal — check the assertion's attribute statement. OIDC has no equivalent counter: OIDC group claims are bounded by JWT/ID-token size rather than a fixed value-count cap, so the two providers hit different limits and are not expected to have parity here. |
 
 ## SCIM deprovision-linkage metrics (ADR-2001, CC6.8)
@@ -90,12 +94,17 @@ and both pair with a dedicated audit action,
 `scim.user.deprovision_role_refused_with_link` — see
 `docs/auth-architecture.md` "SCIM ↔ OIDC identity linkage for deprovision"
 and `docs/user-manual/scim-provisioning.md` "SCIM ↔ OIDC identity linkage"
-for the full operator runbook. Two further ADR-2001 counters,
+for the full operator runbook. Six further ADR-2001 counters — the
+deny-at-login backstops firing at OIDC/SAML login rather than at SCIM
+deprovision time — live in "SSO login metrics" above, next to their
+siblings `yuzu_auth_oidc_login_total`/`yuzu_auth_saml_login_total`:
 `yuzu_auth_oidc_deprovisioned_denied_total` (§4/PR3) and
-`yuzu_auth_saml_deprovisioned_denied_total` (§4/PR4b) — the deny-at-login
-backstops firing at OIDC/SAML login rather than at SCIM deprovision time —
-live in "SSO login metrics" above, next to their siblings
-`yuzu_auth_oidc_login_total`/`yuzu_auth_saml_login_total`. Four more
+`yuzu_auth_saml_deprovisioned_denied_total` (§4/PR4b) are each the TOTAL of
+a genuine-deny and a store-unavailable sub-counter
+(`yuzu_auth_{oidc,saml}_deprovisioned_denied_genuine_total` /
+`yuzu_auth_{oidc,saml}_deprovisioned_denied_store_unavailable_total`, #3069)
+— alert on the genuine sub-counter, since a Postgres outage alone can bump
+the total. Four more
 (#3072, SAML D2 observability) are below, alongside their OIDC D2 sibling
 `yuzu_scim_deprovision_unlinked_total` —
 `yuzu_scim_saml_link_unmatched_total`,
@@ -1227,6 +1236,31 @@ sum(rate(yuzu_server_custom_properties_backfill_total{result="failed"}[15m])) > 
 
 # One-time notification backfill failed → server refused to boot (ADR-0046).
 sum(rate(yuzu_server_notification_backfill_total{result="failed"}[15m])) > 0
+```
+
+## Quarantine store metrics (Guardian device-quarantine bookkeeping, ADR-0047)
+
+The `QuarantineStore` — which agents are network-isolated, who isolated them, why, and their
+full history (schema `quarantine_store`) — is a migrated PostgreSQL store (authoritative
+posture). An active quarantine record is live security containment state, so a degraded read
+must never be misread as "not quarantined".
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_server_quarantine_read_degrade_total{reason}` | counter | A `list_quarantined`/`get_history` read degraded instead of returning a result. `reason` ∈ `store_not_open` (store failed to open at boot), `pool_acquire_timeout` (no Postgres connection available in time — correlates with `yuzu_pg_acquire_*` saturation), `query_error` (the query failed). **A non-zero rate means `GET /api/v1/quarantine` is answering 503, not that no devices are quarantined** — an active containment could still exist behind the degraded read. `get_status` reports its own degrade via `std::expected` (the `db_error:`-prefixed `unexpected` case) but does **not** emit this counter — it has no REST/MCP caller today (confirmed by repo-wide grep), so this is a documented gap in the metric family's coverage, not a live blind spot; re-derive if a caller lands. **Does NOT cover the route-layer per-record authorization-check 503** (`"authorization check unavailable — try again"`, `rest_api_v1.cpp`'s admit-then-filter loop failing closed on an anomalous scope-check outcome) — that failure mode is entirely store-external (RBAC/engine-principal-store, not `QuarantineStore`) and is documented, not metered, in `docs/user-manual/upgrading.md` and `docs/user-manual/rest-api.md`; a 503 with that message and a flat counter here is expected, not a metric bug. |
+| `yuzu_server_quarantine_backfill_total{result}` | counter | Outcome of the one-time legacy `quarantine.db` → PostgreSQL backfill at boot (ADR-0047). `result` ∈ `fresh` (no legacy DB, or a legacy DB with no `quarantine_records` table — nothing to migrate), `completed` (backfill ran and reconciled), `failed` (backfill could not complete — corrupt/0-byte/oversized legacy file, an unrecognised or duplicated-active legacy `status` value, or a fingerprint mismatch/holder-side-verification failure on a multi-replica boot; the server **fails closed at boot** and retries on next start). **Not pre-seeded** (unlike `yuzu_server_audit_backfill_total`): the marker-present "already migrated, skipping" paths in `migrate_from_sqlite` return without emitting any `result` at all, so a healthy already-migrated server exports **no series** for this metric family — absence is the normal steady state after the first boot, not a gap. **`failed` is not scrapeable** for the same reason as the audit/mgmt-group families: a boot-time failure returns before the HTTP listener starts, so `/metrics` is never served on that path — the boot log naming the specific refusal reason is the signal. |
+
+**Useful PromQL queries:**
+
+```promql
+# Quarantine reads degrading → GET /api/v1/quarantine is answering 503; an
+# active containment could be masked behind the degrade, never assume "clean".
+sum(rate(yuzu_server_quarantine_read_degrade_total[5m])) by (reason) > 0
+
+# One-time quarantine backfill failed → server refused to boot (ADR-0047).
+# Absence of this series is normal on a healthy already-migrated server
+# (the metric is not pre-seeded); this query only fires on an ACTUAL failure sample.
+sum(rate(yuzu_server_quarantine_backfill_total{result="failed"}[15m])) > 0
 ```
 
 ## RBAC store metrics (authorization substrate, ADR-0041)

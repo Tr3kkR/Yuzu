@@ -817,3 +817,46 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
         CHECK(list->body.find("ancestor-child") == std::string::npos);
     }
 }
+
+// SEC-2/SEC-3 confinement-gap class (found during a docs sweep): devices_fn_
+// on /fragments/devices/list is username-keyed and does not confine a
+// service-scoped API token whose principal resolves to an unscoped grant —
+// the full device roster would still be fleet-wide.
+TEST_CASE("device routes: /fragments/devices/list denies a service-scoped "
+          "token, denial audited",
+          "[pg][device][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto serviceScopedAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.token_scope_service = "printers";
+        return std::optional<auth::Session>(s);
+    };
+    auto perm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                   const std::string&) { return true; };
+    auto devices = [](const std::string&) {
+        DeviceRow d;
+        d.agent_id = "mine";
+        d.hostname = "mine-host";
+        return std::vector<DeviceRow>{d};
+    };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+    DeviceRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, serviceScopedAuth, perm, /*scoped_perm_fn=*/{}, devices,
+                           /*lookup_fn=*/{}, &store, /*dispatch_fn=*/{}, /*responses_fn=*/{},
+                           audit);
+
+    auto r = sink.Get("/fragments/devices/list");
+    REQUIRE(r);
+    CHECK(r->status == 403);
+    CHECK(r->body.find("mine-host") == std::string::npos);
+    REQUIRE(audit_log.size() == 1);
+    CHECK(audit_log[0] == "device.list.view|denied");
+}

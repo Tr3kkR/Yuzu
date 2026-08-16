@@ -151,7 +151,7 @@ namespace {
 // TempDir (destroyed at scope exit), the DELETE empties kek_meta before the
 // template is ever cloned, and template fingerprints are structure-only.
 yuzu::test::PgTestTemplate secrets_tpl{"secrets", [](const std::string& dsn) {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn{PQconnectdb(dsn.c_str())};
@@ -175,7 +175,7 @@ TEST_CASE("SecretCodec: encode_bigint_pk is fixed 8-byte BE", "[secrets]") {
 }
 
 TEST_CASE("SecretCodec: register_secret_column validates identifiers", "[secrets]") {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
@@ -189,7 +189,7 @@ TEST_CASE("SecretCodec: register_secret_column validates identifiers", "[secrets
 // registered-column trip-wire.
 TEST_CASE("SecretCodec: register_secret_column rejects a duplicate (store, table, column)",
           "[secrets]") {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     REQUIRE(codec.register_secret_column({"tstore", "things", "secret", "id"}));
@@ -206,7 +206,7 @@ TEST_CASE("SecretCodec: register_secret_column rejects a duplicate (store, table
 // #2530 A2: registered_columns() is a snapshot in registration order.
 TEST_CASE("SecretCodec: registered_columns() returns a snapshot in registration order",
           "[secrets]") {
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     REQUIRE(codec.registered_columns().empty());
@@ -224,7 +224,7 @@ TEST_CASE("SecretCodec: registered_columns() returns a snapshot in registration 
 
 TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     PgConn conn = connect(db.dsn());
 
@@ -257,7 +257,7 @@ TEST_CASE("SecretCodec init: first boot generates v1; re-init verifies", "[pg][s
 
 TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     PgConn conn = connect(db.dsn());
     {
         FileKeyProvider provider(keys.path);
@@ -266,7 +266,7 @@ TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
     }
 
     SECTION("missing KEK file (backup skew / dual server) -> kek_unresolvable") {
-        yuzu::test::TempDir other_keys; // empty keys dir, same database
+        yuzu::test::TempDir other_keys{"yuzu_test_other_keys_"}; // empty keys dir, same database
         FileKeyProvider provider(other_keys.path);
         SecretCodec codec(provider);
         auto r = codec.init(conn.get());
@@ -293,7 +293,7 @@ TEST_CASE("SecretCodec init: fail-closed boot verification", "[pg][secrets]") {
 
 TEST_CASE("SecretCodec: round-trip, blob format, fresh DEK per encrypt", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -340,7 +340,7 @@ TEST_CASE("SecretCodec: round-trip, blob format, fresh DEK per encrypt", "[pg][s
 
 TEST_CASE("SecretCodec: AAD anti-swap and boundary-shift", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -388,7 +388,7 @@ TEST_CASE("SecretCodec: AAD anti-swap and boundary-shift", "[pg][secrets]") {
 
 TEST_CASE("SecretCodec: malformed blobs and payload tamper", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -456,7 +456,7 @@ TEST_CASE("SecretCodec: malformed blobs and payload tamper", "[pg][secrets]") {
 
 TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -576,7 +576,7 @@ TEST_CASE("SecretCodec: KEK rotation — the fjarvis #1333 reproduction", "[pg][
 TEST_CASE("SecretCodec: TEXT primary keys rotate and decrypt (uniform binary-pk path)",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -636,7 +636,7 @@ TEST_CASE("SecretCodec: TEXT primary keys rotate and decrypt (uniform binary-pk 
 TEST_CASE("SecretCodec: lifecycle edges — unknown retire, multi-column laggard, zero-row column",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -711,7 +711,7 @@ TEST_CASE("SecretCodec: lifecycle edges — unknown retire, multi-column laggard
 
 TEST_CASE("SecretCodec: audit detail structure and failure-counter classes", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -780,7 +780,7 @@ TEST_CASE("SecretCodec: audit detail structure and failure-counter classes", "[p
 // switches families is caught here rather than in a Grafana query.
 TEST_CASE("SecretCodec decrypt-failure counts export as a Prometheus counter", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -823,7 +823,7 @@ TEST_CASE("SecretCodec decrypt-failure counts export as a Prometheus counter", "
 TEST_CASE("SecretCodec init: orphaned kek_version (deleted registration) fails closed",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     PgConn conn = connect(db.dsn());
 
@@ -854,7 +854,7 @@ TEST_CASE("SecretCodec init: orphaned kek_version (deleted registration) fails c
 
 TEST_CASE("SecretCodec init: unsupported pk_column type fails closed", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     PgConn conn = connect(db.dsn());
 
@@ -879,7 +879,7 @@ TEST_CASE("SecretCodec init: unsupported pk_column type fails closed", "[pg][sec
 TEST_CASE("SecretCodec: retire with failed key deletion records no false destruction",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider file_provider(keys.path);
     FailingDeleteProvider provider(file_provider); // delete_kek always fails
     SecretCodec codec(provider);
@@ -935,7 +935,7 @@ TEST_CASE("SecretCodec: active_kek_version() advances by exactly one per success
           "rotate_kek call (the REST/MCP seam's half-committed detection depends on this)",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -968,7 +968,7 @@ TEST_CASE("SecretCodec: active_kek_version() advances by exactly one per success
 // #2530 A4: live_kek_version_count() counts only non-retired kek_meta rows.
 TEST_CASE("SecretCodec: live_kek_version_count reflects retirement", "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -996,7 +996,7 @@ TEST_CASE("SecretCodec: live_kek_version_count reflects retirement", "[pg][secre
 TEST_CASE("SecretCodec: rotate_clock reports any_rows=false against an empty kek_meta",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -1012,7 +1012,7 @@ TEST_CASE("SecretCodec: rotate_clock reports any_rows=false against an empty kek
 TEST_CASE("SecretCodec: rotate_clock reports a small age and no anomaly for a fresh row",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -1028,7 +1028,7 @@ TEST_CASE("SecretCodec: rotate_clock reports a small age and no anomaly for a fr
 TEST_CASE("SecretCodec: rotate_clock flags a future-dated newest row as a clock anomaly",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -1061,7 +1061,7 @@ TEST_CASE("SecretCodec: rotate_clock flags a future-dated newest row as a clock 
 TEST_CASE("SecretCodec: a canceled query maps to LifecycleError::Kind::query_canceled",
           "[pg][secrets]") {
     YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
-    yuzu::test::TempDir keys;
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
     FileKeyProvider provider(keys.path);
     SecretCodec codec(provider);
     PgConn conn = connect(db.dsn());
@@ -1243,4 +1243,231 @@ TEST_CASE("KEK op lock: the guard leaves nothing held on the connection it relea
     // And the lock is genuinely free for anyone.
     CHECK(try_lock_kek_op(observer.get()) == KekOpLockAttempt::kAcquired);
     KekOpLockGuard cleanup{observer.get()};
+}
+
+// ── Multi-codec rotation (PR1.5c/PR1.6c) ────────────────────────────────────
+//
+// The server now owns MORE THAN ONE SecretCodec: `auth_secret_codec_` (AuthDB's
+// TOTP secrets) and `plugin_config_secret_codec_` (PluginConfigStore's sealed
+// values), both enrolled in the live `kek_ops.{rotate,rewrap,status}` surface.
+//
+// The failure this pins is silent and expensive: `rotate_kek()` MINTS a new KEK
+// version, so calling it once per codec would mint N versions and strand each
+// codec on a different generation. The production loop therefore mints ONCE (on
+// the primary) and brings every other codec onto that same version with
+// `init()` (a non-minting resync) followed by `rewrap_all()`, all under a SINGLE
+// `secrets_kek_op` lock hold. This test reproduces that sequence at the
+// SecretCodec level and asserts the properties that make it correct.
+TEST_CASE("SecretCodec: a second codec joins a rotation without minting a second KEK",
+          "[pg][secrets][multicodec]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    FileKeyProvider provider(keys.path);
+    PgConn conn = connect(db.dsn());
+    create_test_table(conn.get());
+
+    // A second store/table standing in for the second consumer.
+    REQUIRE(PgResult{PQexec(conn.get(), "CREATE SCHEMA IF NOT EXISTS tstore2")}.ok());
+    REQUIRE(PgResult{PQexec(conn.get(), "CREATE TABLE IF NOT EXISTS tstore2.things ("
+                                        "  id     BIGINT PRIMARY KEY,"
+                                        "  secret BYTEA)")}
+                .ok());
+    auto upsert2 = [&](std::int64_t pk, std::span<const std::uint8_t> blob) {
+        const std::string pk_str = std::to_string(pk);
+        const char* values[] = {pk_str.c_str(), reinterpret_cast<const char*>(blob.data())};
+        const int lengths[] = {0, static_cast<int>(blob.size())};
+        const int formats[] = {0, 1};
+        REQUIRE(PgResult{PQexecParams(conn.get(),
+                                      "INSERT INTO tstore2.things (id, secret)"
+                                      " VALUES ($1::bigint, $2)"
+                                      " ON CONFLICT (id) DO UPDATE SET secret = EXCLUDED.secret",
+                                      2, nullptr, values, lengths, formats, 0)}
+                    .ok());
+    };
+    auto fetch2 = [&](std::int64_t pk) {
+        const std::string pk_str = std::to_string(pk);
+        const char* values[] = {pk_str.c_str()};
+        PgResult res{PQexecParams(conn.get(),
+                                  "SELECT secret FROM tstore2.things WHERE id = $1::bigint", 1,
+                                  nullptr, values, nullptr, nullptr, 1)};
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        const auto* p = reinterpret_cast<const std::uint8_t*>(PQgetvalue(res.get(), 0, 0));
+        return std::vector<std::uint8_t>{p, p + PQgetlength(res.get(), 0, 0)};
+    };
+
+    const SecretCodec::SecretId id_a = test_id(1);
+    const SecretCodec::SecretId id_b{"tstore2", "things", "secret",
+                                     SecretCodec::encode_bigint_pk(1)};
+
+    // Both codecs boot against the same database and land on v1.
+    SecretCodec codec_a(provider);
+    REQUIRE(codec_a.register_secret_column({"tstore", "things", "secret", "id"}));
+    REQUIRE(codec_a.init(conn.get()).has_value());
+
+    SecretCodec codec_b(provider);
+    REQUIRE(codec_b.register_secret_column({"tstore2", "things", "secret", "id"}));
+    REQUIRE(codec_b.init(conn.get()).has_value());
+
+    REQUIRE(codec_a.active_kek_version() == 1);
+    REQUIRE(codec_b.active_kek_version() == 1);
+
+    const auto plain_a = bytes_of("auth-totp-seed");
+    const auto plain_b = bytes_of("plugin-config-sealed-value");
+    auto blob_a = codec_a.encrypt(id_a, plain_a);
+    auto blob_b = codec_b.encrypt(id_b, plain_b);
+    REQUIRE(blob_a.has_value());
+    REQUIRE(blob_b.has_value());
+    upsert_secret(conn.get(), 1, *blob_a);
+    upsert2(1, *blob_b);
+    REQUIRE(blob_kek_version(*blob_a) == 1);
+    REQUIRE(blob_kek_version(*blob_b) == 1);
+
+    auto live_versions = [&] {
+        PgResult res{PQexec(conn.get(), "SELECT count(*) FROM secrets.kek_meta"
+                                        " WHERE retired_at IS NULL")};
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        return std::string{PQgetvalue(res.get(), 0, 0)};
+    };
+    REQUIRE(live_versions() == "1");
+
+    // THE PRODUCTION SEQUENCE: mint once on A...
+    auto rotated = codec_a.rotate_kek(conn.get());
+    INFO((rotated ? std::string{} : rotated.error().internal_message));
+    REQUIRE(rotated.has_value());
+    REQUIRE(*rotated == 2);
+
+    // ...then bring B onto that SAME version — init() resyncs without minting.
+    REQUIRE(codec_b.init(conn.get()).has_value());
+    REQUIRE(codec_b.active_kek_version() == 2);
+    REQUIRE(codec_b.rewrap_all(conn.get()).has_value());
+
+    // EXACTLY ONE new version exists. If the loop had called rotate_kek() per
+    // codec this would be 3, and the two codecs would sit on 2 and 3.
+    REQUIRE(live_versions() == "2");
+    REQUIRE(codec_a.active_kek_version() == codec_b.active_kek_version());
+
+    // Both codecs' stored rows moved onto v2, and both still decrypt.
+    REQUIRE(blob_kek_version(fetch_secret(conn.get(), 1)) == 2);
+    REQUIRE(blob_kek_version(fetch2(1)) == 2);
+
+    auto back_a = codec_a.decrypt(id_a, fetch_secret(conn.get(), 1));
+    REQUIRE(back_a.has_value());
+    REQUIRE(back_a->size() == plain_a.size());
+    REQUIRE(std::equal(plain_a.begin(), plain_a.end(), back_a->data()));
+
+    auto back_b = codec_b.decrypt(id_b, fetch2(1));
+    REQUIRE(back_b.has_value());
+    REQUIRE(back_b->size() == plain_b.size());
+    REQUIRE(std::equal(plain_b.begin(), plain_b.end(), back_b->data()));
+
+    // A codec is NEVER responsible for a sibling's columns: A's rewrap scan
+    // must not have touched tstore2, and vice versa. Proven by registration
+    // being per-instance — a cross-registration would be a duplicate.
+    REQUIRE(codec_a.registered_columns().size() == 1);
+    REQUIRE(codec_b.registered_columns().size() == 1);
+}
+
+// #2395/M7 (Codex review): the other half of the story above — the window
+// server.cpp's kek_ops.rotate route classifies HalfCommitted, BEFORE the
+// secondary-codec loop's init()+rewrap_all() step has run for a given
+// codec. codec_b's own registered rows must stay decryptable through
+// codec_b right through that window: proof the two codecs are genuinely
+// INDEPENDENT SecretCodec instances (one's rotate can leave a sibling
+// stale, but never corrupt or block it), not accidentally-correct because
+// nothing ever exercised the gap. Deliberately light — this pins the
+// independence property, not a full HalfCommitted state machine (that
+// belongs to server.cpp's kek_ops.rotate, out of scope here).
+TEST_CASE("SecretCodec: a not-yet-resynced codec's rows stay decryptable through a "
+          "sibling's mint-only rotate",
+          "[pg][secrets][multicodec]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, secrets_tpl);
+    yuzu::test::TempDir keys{"yuzu_test_keys_"};
+    FileKeyProvider provider(keys.path);
+    PgConn conn = connect(db.dsn());
+    create_test_table(conn.get());
+
+    REQUIRE(PgResult{PQexec(conn.get(), "CREATE SCHEMA IF NOT EXISTS tstore2")}.ok());
+    REQUIRE(PgResult{PQexec(conn.get(), "CREATE TABLE IF NOT EXISTS tstore2.things ("
+                                        "  id     BIGINT PRIMARY KEY,"
+                                        "  secret BYTEA)")}
+                .ok());
+    auto upsert2 = [&](std::int64_t pk, std::span<const std::uint8_t> blob) {
+        const std::string pk_str = std::to_string(pk);
+        const char* values[] = {pk_str.c_str(), reinterpret_cast<const char*>(blob.data())};
+        const int lengths[] = {0, static_cast<int>(blob.size())};
+        const int formats[] = {0, 1};
+        REQUIRE(PgResult{PQexecParams(conn.get(),
+                                      "INSERT INTO tstore2.things (id, secret)"
+                                      " VALUES ($1::bigint, $2)"
+                                      " ON CONFLICT (id) DO UPDATE SET secret = EXCLUDED.secret",
+                                      2, nullptr, values, lengths, formats, 0)}
+                    .ok());
+    };
+    auto fetch2 = [&](std::int64_t pk) {
+        const std::string pk_str = std::to_string(pk);
+        const char* values[] = {pk_str.c_str()};
+        PgResult res{PQexecParams(conn.get(),
+                                  "SELECT secret FROM tstore2.things WHERE id = $1::bigint", 1,
+                                  nullptr, values, nullptr, nullptr, 1)};
+        REQUIRE(res.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(res.get()) == 1);
+        const auto* p = reinterpret_cast<const std::uint8_t*>(PQgetvalue(res.get(), 0, 0));
+        return std::vector<std::uint8_t>{p, p + PQgetlength(res.get(), 0, 0)};
+    };
+
+    const SecretCodec::SecretId id_a = test_id(1);
+    const SecretCodec::SecretId id_b{"tstore2", "things", "secret",
+                                     SecretCodec::encode_bigint_pk(1)};
+
+    // Both codecs boot against the same database and land on v1 — mirrors
+    // the multi-codec test above.
+    SecretCodec codec_a(provider);
+    REQUIRE(codec_a.register_secret_column({"tstore", "things", "secret", "id"}));
+    REQUIRE(codec_a.init(conn.get()).has_value());
+
+    SecretCodec codec_b(provider);
+    REQUIRE(codec_b.register_secret_column({"tstore2", "things", "secret", "id"}));
+    REQUIRE(codec_b.init(conn.get()).has_value());
+
+    const auto plain_b = bytes_of("plugin-config-sealed-value-still-v1");
+    auto blob_b = codec_b.encrypt(id_b, plain_b);
+    REQUIRE(blob_b.has_value());
+    upsert2(1, *blob_b);
+    REQUIRE(blob_kek_version(*blob_b) == 1);
+
+    // codec_a rotates ALONE — the exact "mint on the primary" step
+    // (server.cpp kek_ops.rotate) that runs BEFORE the secondary-codec
+    // loop calls codec_b->init()/rewrap_all(). Stop right here, as if that
+    // loop's step for codec_b had not run yet (or had failed) — the
+    // HalfCommitted window.
+    auto rotated = codec_a.rotate_kek(conn.get());
+    REQUIRE(rotated.has_value());
+    REQUIRE(*rotated == 2);
+    REQUIRE(codec_a.active_kek_version() == 2);
+
+    // codec_b's in-memory state is stale (nobody has told it about v2 yet)...
+    REQUIRE(codec_b.active_kek_version() == 1);
+    // ...but its own stored row is untouched — still v1, and still
+    // decrypts cleanly through codec_b. codec_a's rotate neither corrupted
+    // nor blocked it; the two codecs are genuinely independent, not merely
+    // accidentally uninvolved with each other.
+    const auto still_v1_blob = fetch2(1);
+    REQUIRE(blob_kek_version(still_v1_blob) == 1);
+    auto back_b = codec_b.decrypt(id_b, still_v1_blob);
+    INFO((back_b ? std::string{} : back_b.error().message));
+    REQUIRE(back_b.has_value());
+    REQUIRE(back_b->size() == plain_b.size());
+    REQUIRE(std::equal(plain_b.begin(), plain_b.end(), back_b->data()));
+
+    // The production resume path (POST /secrets/kek/rewrap): catching up
+    // now brings codec_b onto v2 and its row still decrypts afterward.
+    REQUIRE(codec_b.init(conn.get()).has_value());
+    REQUIRE(codec_b.active_kek_version() == 2);
+    REQUIRE(codec_b.rewrap_all(conn.get()).has_value());
+    const auto v2_blob = fetch2(1);
+    REQUIRE(blob_kek_version(v2_blob) == 2);
+    auto back_b2 = codec_b.decrypt(id_b, v2_blob);
+    REQUIRE(back_b2.has_value());
+    REQUIRE(std::equal(plain_b.begin(), plain_b.end(), back_b2->data()));
 }

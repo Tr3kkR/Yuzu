@@ -26,6 +26,7 @@
 
 #include "oidc_scim_link.hpp"
 
+#include "deprovision_deny_split.hpp"
 #include "yuzu/server/scim_store.hpp"
 
 #include "pg/pg_exec.hpp"
@@ -50,6 +51,7 @@ using yuzu::server::pg::PgResult;
 using yuzu::server::oidc::link_oidc_login_to_scim;
 using yuzu::server::oidc::oidc_login_denied_deprovisioned;
 using yuzu::server::oidc::OidcLoginDenyDecision;
+using yuzu::server::record_deprovision_deny_split;
 
 namespace {
 
@@ -870,5 +872,84 @@ TEST_CASE("U6: the post-mint re-check reason-string mapping also distinguishes "
         CHECK(recheck_reason_for(decision, /*sessions_count=*/2, /*db_persisted=*/true) ==
               "reason=linked_scim_resource_inactive;scim_id=" + r->scim_id +
                   ";post_mint_recheck=true;sessions_invalidated=2");
+    }
+}
+
+// ── #3069 — deny-counter split: genuine vs store-unavailable ──
+//
+// Both deny sites in auth_routes.cpp (primary check + post-mint recheck)
+// bump the TOTAL counter (`yuzu_auth_oidc_deprovisioned_denied_total`)
+// unconditionally, then call the SHARED `record_deprovision_deny_split`
+// helper (deprovision_deny_split.hpp, Gate 7 quality-engineer fix) to split
+// into `yuzu_auth_oidc_deprovisioned_denied_genuine_total` (scim_id
+// present) vs `yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total`
+// (scim_id absent) — a Postgres outage must never inflate the
+// genuine/alertable sub-counter. Both sites call the IDENTICAL helper, so
+// ONE TEST_CASE pinning the helper directly (rather than a hand-copied
+// mirror of the increment logic, which could not catch a predicate flip at
+// a real call site) covers both — there is no second, site-specific
+// behaviour left to pin separately.
+TEST_CASE("#3069: record_deprovision_deny_split bumps genuine XOR "
+          "store-unavailable, never both",
+          "[pg][oidc][scim][2001][deny-at-login][3069]") {
+    SECTION("store-unavailable DENY (scim_id absent) -> store_unavailable_total, "
+           "NOT genuine_total") {
+        PgPool broken_pool{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1", .size = 1}};
+        ScimStore broken_store{broken_pool};
+        REQUIRE_FALSE(broken_store.is_open());
+
+        auto decision = oidc_login_denied_deprovisioned(&broken_store, "https://idp.example.com/",
+                                                         "sub-3069-unavailable",
+                                                         "ext-3069-unavailable");
+        REQUIRE(decision.denied);
+        REQUIRE_FALSE(decision.scim_id.has_value());
+
+        yuzu::MetricsRegistry m;
+        m.counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+        // MUTATION-CHECK target: flipping the predicate inside
+        // record_deprovision_deny_split (`scim_id_present` instead of
+        // `!scim_id_present`) makes the SECTIONs below fail — verified by
+        // hand during review, reverted before merge (see the junior task's
+        // VERIFY report).
+        record_deprovision_deny_split(
+            &m, "yuzu_auth_oidc_deprovisioned_denied_genuine_total",
+            "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
+            decision.scim_id.has_value());
+
+        CHECK(m.counter("yuzu_auth_oidc_deprovisioned_denied_total").value() == 1.0);
+        CHECK(m.counter("yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total").value() ==
+              1.0);
+        CHECK(m.counter("yuzu_auth_oidc_deprovisioned_denied_genuine_total").value() == 0.0);
+    }
+
+    SECTION("resolved-deprovisioned DENY (scim_id present) -> genuine_total, "
+           "NOT store_unavailable_total") {
+        YUZU_REQUIRE_PG_DB_TPL(db, oidc_scim_link_tpl);
+        PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+        REQUIRE(pool.valid());
+        ScimStore store{pool};
+        REQUIRE(store.is_open());
+
+        auto r = store.create_resource("u3069-inactive-user", "ext-3069-inactive");
+        REQUIRE(r.has_value());
+        REQUIRE(store.upsert_link("https://idp.example.com/", "sub-3069-inactive", r->scim_id));
+        REQUIRE(store.set_active(r->scim_id, false));
+
+        auto decision = oidc_login_denied_deprovisioned(&store, "https://idp.example.com/",
+                                                         "sub-3069-inactive", "ext-3069-inactive");
+        REQUIRE(decision.denied);
+        REQUIRE(decision.scim_id.has_value());
+
+        yuzu::MetricsRegistry m;
+        m.counter("yuzu_auth_oidc_deprovisioned_denied_total").increment();
+        record_deprovision_deny_split(
+            &m, "yuzu_auth_oidc_deprovisioned_denied_genuine_total",
+            "yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total",
+            decision.scim_id.has_value());
+
+        CHECK(m.counter("yuzu_auth_oidc_deprovisioned_denied_total").value() == 1.0);
+        CHECK(m.counter("yuzu_auth_oidc_deprovisioned_denied_genuine_total").value() == 1.0);
+        CHECK(m.counter("yuzu_auth_oidc_deprovisioned_denied_store_unavailable_total").value() ==
+              0.0);
     }
 }

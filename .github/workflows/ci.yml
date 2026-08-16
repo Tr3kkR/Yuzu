@@ -989,8 +989,8 @@ jobs:
       - name: Assert toolchain manifest (self-hosted)
         shell: pwsh
         # Every active Windows runner must have a manifest before this change
-        # is deployed. Missing manifests fail closed; only the dated
-        # schema-less bridge in the assertion is allowed.
+        # is deployed. Missing or unknown-schema manifests fail closed --
+        # there is no compatibility bridge.
         run: ./deploy/windows/Assert-Toolchain.ps1 -ManifestPath 'C:\actions-runner\toolchain-manifest.json'
 
       - name: Assert runner disk (>= 45 GB free)

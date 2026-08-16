@@ -56,6 +56,15 @@ public:
         std::function<bool(const httplib::Request&, httplib::Response&,
                            const std::string& securable_type, const std::string& operation)>;
 
+    /// Behavioral-PII access audit — same shape as DexRoutes::AuditFn (bool
+    /// persist-signal). Added alongside the /fragments/network/devices
+    /// service-scoped-token deny (SEC-3 sibling class, Gate 8 review): that
+    /// fragment names every reporting agent_id fleet-wide and had NO audit
+    /// capability at all until this fix.
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
+                                       const std::string& result, const std::string& target_type,
+                                       const std::string& target_id, const std::string& detail)>;
+
     /// Resolve the fleet network snapshot for a cohort tag key (assembled in
     /// server.cpp from AgentHealthStore + AgentRegistry + TagStore + the DEX
     /// store). May be empty → the fragments render an honest "unavailable"
@@ -64,17 +73,20 @@ public:
 
     /// Register the /network routes. The page shell is auth-only static chrome;
     /// the data-bearing fragments gate on GuaranteedState:Read.
-    void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, PerfFn perf_fn = {});
+    void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
+                         PerfFn perf_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam
     /// so the handlers are unit-testable in-process via TestRouteSink (no
     /// httplib acceptor; the #438 TSan trap). The httplib::Server& overload
     /// wraps + delegates.
-    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, PerfFn perf_fn = {});
+    void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn, AuditFn audit_fn,
+                         PerfFn perf_fn = {});
 
 private:
     AuthFn auth_fn_;
     PermFn perm_fn_;
+    AuditFn audit_fn_;
     PerfFn perf_fn_;
 };
 

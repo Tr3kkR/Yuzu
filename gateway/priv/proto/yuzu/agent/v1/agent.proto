@@ -176,6 +176,13 @@ message CommandRequest {
   // carry it. Half A, Guardian gateway fix. See docs/guardian-mvp-contract.md
   // G2/G12.
   bytes payload = 8;
+
+  // Dispatch classification tag — v1|<class>|<mutability>|<plan_hash_hex>,
+  // class in {ro, mut, dest}, mutability in {none, rev, irrev}. See
+  // priv/proto/agent.proto. CC-03: this gateway advertises
+  // "command_dispatch_tag_v1" in StreamStatusNotification.wire_capabilities
+  // (gateway.proto) as proof this field survives the hop.
+  string dispatch_tag = 9;
 }
 
 message CommandResponse {

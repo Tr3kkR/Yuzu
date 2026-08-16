@@ -39,28 +39,6 @@ if(-not (Test-Path -LiteralPath $contractModule)){
 try {
   Import-Module $contractModule -Force -ErrorAction Stop
   $contract = Read-YuzuToolchainContract -Path $ContractPath
-  $manifestSchema = [string]$m.schema
-  if([string]::IsNullOrWhiteSpace($manifestSchema)){
-    $legacyDeadline = [DateTimeOffset]::MinValue
-    $deadlineValue = $contract.legacy_schema_compatibility_until
-    $deadlineValid = if($deadlineValue -is [datetime]){
-      $legacyDeadline = [DateTimeOffset]$deadlineValue
-      $true
-    } else {
-      [DateTimeOffset]::TryParse([string]$deadlineValue, [ref]$legacyDeadline)
-    }
-    if(-not $deadlineValid){
-      throw 'contract legacy_schema_compatibility_until is missing or invalid'
-    }
-    if([DateTimeOffset]::UtcNow -gt $legacyDeadline){
-      throw "schema-less manifest compatibility expired at $($legacyDeadline.ToString('o')); drain and reprovision this runner"
-    }
-    Write-Host ("WARN: schema-less legacy manifest accepted through {0}; drain and reprovision this runner before the deadline." -f $legacyDeadline.ToString('o')) -ForegroundColor Yellow
-    # The immediately preceding provisioner emitted the complete v1 shape
-    # except for its discriminator. Add it only in memory so every v1 pin,
-    # path, and live-version probe still runs during the compatibility window.
-    $m | Add-Member -NotePropertyName schema -NotePropertyValue ([string]$contract.schema)
-  }
   $contractResult = Test-YuzuToolchainManifest -Manifest $m -Contract $contract -ExpectedHost $env:COMPUTERNAME
 } catch {
   Write-Host "FAIL: could not validate the toolchain contract ($($_.Exception.Message))" -ForegroundColor Red

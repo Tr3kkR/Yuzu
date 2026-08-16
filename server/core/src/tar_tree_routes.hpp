@@ -24,8 +24,9 @@
 
 #include <yuzu/server/auth.hpp>
 
-#include "dex_routes.hpp"    // DexRoutes::DispatchFn/ResponsesFn/AuditFn + DexAgentResponse
-#include "device_routes.hpp" // DeviceRow
+#include "dex_routes.hpp"      // DexRoutes::ResponsesFn/AuditFn + DexAgentResponse
+#include "device_routes.hpp"   // DeviceRow
+#include "dispatch_caller.hpp" // DispatchCaller
 #include "tar_process_tree.hpp"
 
 #include <httplib.h>
@@ -68,18 +69,37 @@ public:
     /// Unscoped single-device identity lookup (for the device's OS — the Windows
     /// names-only caption). Authz is the scoped gate the routes run first.
     using LookupFn = std::function<std::optional<DeviceRow>(const std::string& agent_id)>;
-    using DispatchFn = DexRoutes::DispatchFn;
+    /// Review finding (external PR review, #3133): every dispatch in this class used
+    /// to go through `DexRoutes::DispatchFn` (no caller parameter), which server.cpp
+    /// wired to the unfiltered `command_dispatch_fn` — so a mutating action
+    /// (`tar.configure`, the capture-source push) dispatched as `system`, bypassing
+    /// the catalogue's `Infrastructure:Write` requirement even though the route
+    /// itself only ever checked `Infrastructure:Read`. TarTreeRoutes now has its own
+    /// caller-aware signature — deliberately NOT sharing `DexRoutes::DispatchFn` with
+    /// `DeviceRoutes` (the device-live-info panel), whose read-only, pre-existing
+    /// system dispatch is a separate, non-blocking finding from the same review.
+    using DispatchFn = std::function<std::pair<std::string, int>(
+        const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const yuzu::server::DispatchCaller& caller)>;
     using ResponsesFn = DexRoutes::ResponsesFn;
     using AuditFn = DexRoutes::AuditFn;
+    /// Resolves the caller's identity + Execution:Execute visible set from the
+    /// request — same contract as WorkflowRoutes::CallerFn: an UNWIRED callback
+    /// fails CLOSED (empty principal, present-EMPTY exec_visible), never nullopt.
+    using CallerFn = std::function<yuzu::server::DispatchCaller(const httplib::Request&)>;
 
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                          ScopedPermFn scoped_perm_fn, DevicesFn devices_fn, LookupFn lookup_fn,
-                         DispatchFn dispatch_fn, ResponsesFn responses_fn, AuditFn audit_fn);
+                         DispatchFn dispatch_fn, ResponsesFn responses_fn, AuditFn audit_fn,
+                         CallerFn caller_fn);
 
     /// HttpRouteSink overload — in-process testable (no httplib acceptor; #438).
     void register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                          ScopedPermFn scoped_perm_fn, DevicesFn devices_fn, LookupFn lookup_fn,
-                         DispatchFn dispatch_fn, ResponsesFn responses_fn, AuditFn audit_fn);
+                         DispatchFn dispatch_fn, ResponsesFn responses_fn, AuditFn audit_fn,
+                         CallerFn caller_fn);
 
 private:
     /// One cached reconstruction. Holds the rendered tree (node-id addressable by the
@@ -120,6 +140,7 @@ private:
     DispatchFn dispatch_fn_;
     ResponsesFn responses_fn_;
     AuditFn audit_fn_;
+    CallerFn caller_fn_;
 
     std::mutex cache_mu_;
     std::unordered_map<std::string, ReconEntry> cache_;
