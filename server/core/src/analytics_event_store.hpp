@@ -128,15 +128,21 @@ private:
     bool open_{false};
     int drain_interval_seconds_;
     int batch_size_;
+    std::atomic<std::uint64_t> total_emitted_{0};
+    yuzu::MetricsRegistry* metrics_{nullptr};
+    std::vector<std::unique_ptr<AnalyticsEventSink>> sinks_;
+    // Declared LAST (governance Gate 3 cpp-expert finding, 2026-08-16,
+    // matching AuditStore::cleanup_thread_'s deliberate placement): implicit
+    // reverse-order member destruction must tear down the thread before
+    // sinks_/metrics_/pool_, in case the destructor's explicit stop_drain()
+    // call is ever removed or reordered ahead of this — the thread body
+    // (run_drain -> drain_batch) reaches all three.
 #ifdef __cpp_lib_jthread
     std::jthread drain_thread_;
 #else
     std::thread drain_thread_;
     std::atomic<bool> stop_requested_{false};
 #endif
-    std::atomic<std::uint64_t> total_emitted_{0};
-    yuzu::MetricsRegistry* metrics_{nullptr};
-    std::vector<std::unique_ptr<AnalyticsEventSink>> sinks_;
 
 #ifdef __cpp_lib_jthread
     void run_drain(std::stop_token stop);

@@ -241,6 +241,12 @@ void AnalyticsEventStore::add_sink(std::unique_ptr<AnalyticsEventSink> sink) {
 void AnalyticsEventStore::start_drain() {
     if (!open_ || drain_interval_seconds_ <= 0 || sinks_.empty())
         return;
+    // Defensive (governance Gate 3 cpp-safety, 2026-08-16): assigning over a
+    // still-joinable jthread/thread calls std::terminate(). No production
+    // call site invokes start_drain() twice today, but a future caller or a
+    // test doing so should get a silent no-op, not a crashed process.
+    if (drain_thread_.joinable())
+        return;
 #ifdef __cpp_lib_jthread
     drain_thread_ = std::jthread([this](std::stop_token stop) { run_drain(stop); });
 #else
@@ -280,7 +286,40 @@ void AnalyticsEventStore::run_drain() {
         if (stop_requested_.load())
             break;
 #endif
-        drain_batch();
+        // NOTHING may escape a thread function: an exception here is
+        // std::terminate on the WHOLE SERVER PROCESS, not a contained
+        // analytics outage (governance Gate 3 sre finding, 2026-08-16 — the
+        // #2037-class hazard AuditStore::run_cleanup already guards against;
+        // this drain loop was missing the identical guard). drain_batch()
+        // allocates, formats, and calls into an operator-supplied
+        // AnalyticsEventSink::send() this store does not control, so the
+        // surface is real.
+        if (metrics_)
+            metrics_->gauge("yuzu_server_analytics_drain_last_pass_unixtime")
+                .set(static_cast<double>(
+                    std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count()));
+        try {
+            drain_batch();
+        } catch (...) {
+            if (metrics_)
+                metrics_->counter("yuzu_server_analytics_drain_pass_failed_total").increment();
+            try {
+                try {
+                    throw;
+                } catch (const std::exception& e) {
+                    spdlog::error("AnalyticsEventStore: drain pass threw ({}); abandoned, "
+                                  "retried at the next interval",
+                                  e.what());
+                } catch (...) {
+                    spdlog::error("AnalyticsEventStore: drain pass threw a non-std exception; "
+                                  "abandoned, retried at the next interval");
+                }
+            } catch (...) {
+                // Nothing escapes a thread function, not even a failure to report.
+            }
+        }
     }
 }
 

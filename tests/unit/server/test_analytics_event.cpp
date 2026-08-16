@@ -15,10 +15,13 @@
 #include "analytics_event.hpp"
 #include "analytics_event_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <libpq-fe.h>
 
 #include <atomic>
 #include <chrono>
@@ -30,7 +33,9 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
 // ── Mock sink for testing ──────────────────────────────────────────────────
 
@@ -78,6 +83,17 @@ yuzu::test::PgTestTemplate analytics_tpl{"analytics", [](const std::string& dsn)
     if (!store.is_open())
         throw std::runtime_error("analytics template: store failed to migrate");
 }};
+
+// Run a raw SQL statement against the test database on a second connection —
+// lets a test simulate a corrupt row / hold the advisory lock directly.
+// Mirrors test_response_store.cpp's helper of the same name.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
 
 } // namespace
 
@@ -340,6 +356,96 @@ TEST_CASE("AnalyticsEventStore: sink failure reverts claim, event stays pending"
     auto pending = store.pending_count();
     REQUIRE(pending.has_value());
     CHECK(*pending == 1);
+}
+
+// Governance Gate 3 quality-engineer finding, 2026-08-16: a batch row whose
+// event_json fails to parse is claimed (drained=true) in phase A but never
+// added to the send/revert sets — it drains exactly once and is dropped,
+// unlike the SQLite predecessor which re-selected (and re-failed to parse)
+// the same poison-pill row every tick, forever. Emit two events, corrupt one
+// directly, and confirm: the sink receives only the valid one, and nothing
+// is left pending after one drain tick (the corrupt row is gone, not stuck).
+TEST_CASE("AnalyticsEventStore: a batch row with unparseable JSON drains once and is dropped",
+          "[pg][analytics_store][drain]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AnalyticsEventStore store(pool, 1, 100);
+    REQUIRE(store.is_open());
+
+    auto sink = std::make_unique<MockSink>();
+    auto* sink_ptr = sink.get();
+    store.add_sink(std::move(sink));
+
+    AnalyticsEvent good;
+    good.event_type = "test.valid";
+    store.emit(good);
+    AnalyticsEvent bad;
+    bad.event_type = "test.poison";
+    store.emit(bad);
+
+    auto pending = store.pending_count();
+    REQUIRE(pending.has_value());
+    REQUIRE(*pending == 2);
+
+    exec_sql(db.dsn(), "UPDATE analytics_event_store.analytics_buffer SET event_json = "
+                       "'{not valid json' WHERE event_json LIKE '%test.poison%'");
+
+    store.start_drain();
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    store.stop_drain();
+
+    auto received = sink_ptr->received();
+    REQUIRE(received.size() == 1);
+    CHECK(received[0].event_type == "test.valid");
+
+    pending = store.pending_count();
+    REQUIRE(pending.has_value());
+    CHECK(*pending == 0); // the poison row is gone, not stuck retrying forever
+}
+
+// Governance Gate 3 quality-engineer finding, 2026-08-16 (copy of
+// test_response_store.cpp's "reap_expired skips quietly when a sibling holds
+// the advisory lock" — same primitive, different key). Single-sweeper
+// exclusion: a sibling replica already draining holds the fleet-wide
+// try-advisory-xact-lock, so this store's own drain tick must skip quietly —
+// never claim, never send, never revert.
+TEST_CASE("AnalyticsEventStore: drain skips quietly when a sibling holds the advisory lock",
+          "[pg][analytics_store][drain]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AnalyticsEventStore store(pool, 1, 100);
+    REQUIRE(store.is_open());
+
+    auto sink = std::make_unique<MockSink>();
+    auto* sink_ptr = sink.get();
+    store.add_sink(std::move(sink));
+
+    AnalyticsEvent event;
+    event.event_type = "test.locked";
+    store.emit(event);
+
+    PgConn locker{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    {
+        PgResult begin{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        PgResult lock{PQexec(locker.get(),
+                             "SELECT pg_advisory_xact_lock(hashtextextended("
+                             "'analytics_event_store:drain', 0))")};
+        REQUIRE(lock.status() == PGRES_TUPLES_OK);
+    }
+
+    store.start_drain();
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    store.stop_drain();
+
+    CHECK(sink_ptr->send_count() == 0); // never reached phase B — the lock was held
+    auto pending = store.pending_count();
+    REQUIRE(pending.has_value());
+    CHECK(*pending == 1); // nothing claimed — the sibling held the lock
+
+    PgResult rollback{PQexec(locker.get(), "ROLLBACK")};
+    REQUIRE(rollback.status() == PGRES_COMMAND_OK);
 }
 
 TEST_CASE("AnalyticsEventStore: concurrent emit from multiple threads",

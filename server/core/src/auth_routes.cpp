@@ -1088,7 +1088,29 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
         // session (including an elevated admin's, via role.elevation.granted
         // events). The hash still correlates events from the same session
         // (same cookie -> same hash) without being a redeemable credential.
-        ae.session_id = auth::AuthManager::sha256_hex(extract_session_cookie(req));
+        // Guard on the COOKIE, not just the session (governance Gate 3
+        // cpp-expert finding, 2026-08-16): resolve_session() also succeeds
+        // for Bearer/X-Yuzu-Token auth, which carries no cookie —
+        // extract_session_cookie returns "", and sha256_hex("") is a FIXED
+        // constant. Hashing unconditionally would give every token-
+        // authenticated row the SAME non-empty session_id, falsely
+        // correlating unrelated principals as "the same session" — a
+        // regression the pre-hash code didn't have (empty stayed
+        // distinguishably empty). Only hash a real cookie; leave
+        // session_id at its default-empty value otherwise.
+        //
+        // Fail-soft parity (governance Gate 3 cpp-safety finding,
+        // 2026-08-16): sha256_hex can throw on an internal EVP failure
+        // (OOM-class, rare) — this whole function exists so a dropped
+        // analytics event never fails the operation that emitted it.
+        // Degrades to an empty session_id, not a failed request.
+        if (auto cookie = extract_session_cookie(req); !cookie.empty()) {
+            try {
+                ae.session_id = auth::AuthManager::sha256_hex(cookie);
+            } catch (const std::exception& e) {
+                spdlog::debug("AuthRoutes::emit_event: session_id hash failed: {}", e.what());
+            }
+        }
     }
     analytics_store_->emit(std::move(ae));
 }

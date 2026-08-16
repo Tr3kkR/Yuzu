@@ -773,10 +773,15 @@ int main(int argc, char* argv[]) {
         ->each([&cfg](const std::string&) { cfg.analytics_enabled = false; });
     app.add_option("--analytics-drain-interval", cfg.analytics_drain_interval_seconds,
                    "Analytics drain interval in seconds (default: 10)")
-        ->default_val(10);
+        ->default_val(10)
+        // governance Gate 3 sre finding, 2026-08-16: an interval <= 0 makes
+        // run_drain()'s inner sleep loop execute zero iterations, busy-
+        // spinning claim transactions against the shared pool with no delay.
+        ->check(CLI::PositiveNumber);
     app.add_option("--analytics-batch-size", cfg.analytics_batch_size,
                    "Analytics drain batch size (default: 100)")
-        ->default_val(100);
+        ->default_val(100)
+        ->check(CLI::PositiveNumber);
     app.add_option("--analytics-jsonl", cfg.analytics_jsonl_path,
                    "Path for JSON Lines analytics output file")
         ->envname("YUZU_ANALYTICS_JSONL");

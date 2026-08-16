@@ -4320,6 +4320,25 @@ public:
                         {"store_not_open", "pool_acquire_timeout", "query_error"})
                         metrics_.counter("yuzu_server_analytics_read_degrade_total",
                                          {{"method", method}, {"reason", reason}});
+                // Drain-thread liveness (governance Gate 3 sre finding,
+                // 2026-08-16, #2037-class): the drain loop now catches every
+                // exception at the thread boundary instead of letting it
+                // std::terminate() the whole server — these two are how an
+                // operator tells "healthy but idle" from "silently dead"
+                // (mirrors yuzu_server_audit_cleanup_failed_total /
+                // yuzu_server_audit_retention_last_pass_unixtime).
+                metrics_.describe("yuzu_server_analytics_drain_pass_failed_total",
+                                  "Analytics drain passes that threw an exception at the thread "
+                                  "boundary and were abandoned (retried at the next interval)",
+                                  "counter");
+                metrics_.counter("yuzu_server_analytics_drain_pass_failed_total");
+                metrics_.describe("yuzu_server_analytics_drain_last_pass_unixtime",
+                                  "Wall-clock reading stamped at the start of every drain pass "
+                                  "attempt, success or failure. Flat means the drain thread is not "
+                                  "running — the one condition drain_pass_failed_total cannot "
+                                  "report (a wedged/exited thread never gets to increment it)",
+                                  "gauge");
+                metrics_.gauge("yuzu_server_analytics_drain_last_pass_unixtime").set(0);
                 // info, not warn: this branch runs on EVERY successful open,
                 // i.e. every restart forever, not just the actual cutover
                 // boot (adversarial review finding, 2026-08-14) — a warn
