@@ -272,6 +272,26 @@ def _cmd_without_test_specs(cmd):
     return [cmd[0]] + [a for a in cmd[1:] if not CATCH2_TAG_SPEC.match(a)]
 
 
+def _cmd_for_case_retry(cmd):
+    """cmd minus tag-filter specs AND --allow-running-no-tests.
+
+    That flag (pg shard D, #2092) survives _cmd_without_test_specs — it
+    doesn't match CATCH2_TAG_SPEC — so it would otherwise carry straight into
+    an isolated single-case retry. Catch2 ORs a comma inside a positional
+    name spec into multiple sub-filters, so a case whose own name contains a
+    literal comma (real example: ADR-0051's "...missing ONLY
+    software_packages, with real deployment data in the other two tables")
+    legitimately zero-matches both halves. On a whole-shard run that
+    zero-match is the DSN-less-platform all-skip the flag exists for; on a
+    single already-known case name it is always an error, never a
+    legitimate skip — left in, that zero-match still exits 0 and
+    retry_case() reports a case that never ran as recovered."""
+    stripped = _cmd_without_test_specs(cmd)
+    if not stripped:
+        return stripped
+    return [stripped[0]] + [a for a in stripped[1:] if a != "--allow-running-no-tests"]
+
+
 def _run(cmd, env, workdir, extra=None, timeout=None):
     e = dict(os.environ)
     e.update(env or {})
@@ -315,10 +335,10 @@ def catch2_failed_cases(test, this_os):
 
 def retry_case(test, case, retries):
     """Return the 1-based retry attempt that passed, or 0 if none passed."""
+    cmd = _cmd_for_case_retry(test.get("cmd") or [])
     for attempt in range(1, retries + 1):
         try:
-            result = _run(_cmd_without_test_specs(test.get("cmd") or []),
-                          test.get("env"), test.get("workdir"), extra=[case],
+            result = _run(cmd, test.get("env"), test.get("workdir"), extra=[case],
                           timeout=test.get("timeout") or None)
         except subprocess.TimeoutExpired:
             continue
@@ -691,6 +711,23 @@ def _selftest():
     check(_cmd_without_test_specs(["x", "[.]"]) == ["x"], "strips hidden-tag spec")
     check(_cmd_without_test_specs(["x", ""]) == ["x", ""], "empty arg kept (not a spec)")
 
+    # _cmd_for_case_retry (2026-08-17, found reviewing PR #3174's pg-shard-D
+    # routing): --allow-running-no-tests must NOT survive into an isolated
+    # single-case retry. It doesn't match CATCH2_TAG_SPEC, so
+    # _cmd_without_test_specs() alone keeps it — and a case name with a
+    # literal comma (Catch2 ORs a comma inside a positional spec) then
+    # legitimately zero-matches, which the flag turns into a silent exit 0.
+    check(_cmd_for_case_retry(["x", "[pg][audit_store]~[routes]~[store]~[token],"
+                               "[pg][software_deployment]~[routes]~[store]~[token]",
+                               "--allow-running-no-tests"]) == ["x"],
+          "strips both the pg-shard-D tag spec and --allow-running-no-tests")
+    check(_cmd_for_case_retry(["x", "--allow-running-no-tests", "[pg]"]) == ["x"],
+          "strips the flag regardless of its position relative to the tag spec")
+    check(_cmd_for_case_retry(["x", "--foo"]) == ["x", "--foo"],
+          "an unrelated option flag is not mistaken for --allow-running-no-tests")
+    check(_cmd_for_case_retry(["--allow-running-no-tests"]) == ["--allow-running-no-tests"],
+          "argv[0] untouched even when it equals the flag")
+
     # Repo-hygiene guard (#2092): every positional arg on the server test()
     # entries in tests/meson.build must be a Catch2 tag-filter spec — the
     # invariant the retry surgery relies on. A future case-name or comma-list
@@ -724,9 +761,16 @@ def _selftest():
         # gated on YUZU_TEST_POSTGRES_DSN) needs `--allow-running-no-tests`, or
         # Catch2 exits 4 on an all-skipped run and reds the leg (#2092). Option
         # flags are exempt from the tag-spec hygiene guard and from the shard
-        # pin below (which keys on the positional specs); the isolated-retry
-        # surgery already PRESERVES options (`_cmd_without_test_specs`), so a
-        # flag never ORs with a retried case.
+        # pin below (which keys on the positional specs). The whole-shard
+        # enumeration re-run (catch2_failed_cases) preserves options, including
+        # this one — it still needs to survive a DSN-less all-skip. The
+        # isolated SINGLE-CASE retry (_cmd_for_case_retry) does NOT preserve
+        # --allow-running-no-tests specifically: a comma-containing case name
+        # would otherwise zero-match (Catch2 ORs a comma in a positional name
+        # spec) and the flag would turn that into a silent false "recovered"
+        # instead of the honest failure a single-case retry should never
+        # tolerate zero matches on (found reviewing PR #3174's pg-shard-D
+        # routing, 2026-08-17 — see _cmd_for_case_retry's own docstring).
         _specs = [a for a in _args if not a.startswith("-")]
         _opts = [a for a in _args if a.startswith("-")]
         check(bool(_specs), "meson.build: server entry has at least one positional spec")
