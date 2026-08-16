@@ -902,29 +902,46 @@ if build_server
   # separately reached 600.57/600s (killed by TIMEOUT) on CI before this move.
   # Partition preserved: N([pg]) == N(A) + N(B).
   #
-  # RE-BALANCED (ADR-0048, LicenseStore): B had grown to 1193 by the time this
-  # store's PR landed (several sibling Wave 2 stores merged in the interim,
-  # each defaulting into B same as this one would have) and was TIMEOUT-ing at
-  # 600s on Windows twice in a row — reproduced on an unrelated dev merge
-  # commit around the same time, so B was already over budget before this
-  # store's own 33 cases were added. [license_store] moved to A by the same
-  # AUDIT_STORE precedent (confined to one file, verified: `grep -rl
-  # '\[license_store\]' tests/unit/` matches only test_license_store.cpp).
-  # Moves 33 cases. This does not fix B's underlying imbalance (still the
-  # heavier half by a wide margin) — it only keeps this store's own cases
-  # from adding to an already-strained shard; a real rebalance across all of
-  # B's stores is out of scope for a single store's migration PR.
+  # RE-BALANCED (ADR-0048, LicenseStore, 2026-08-15/16): B kept growing as
+  # sibling Wave 2 stores merged in and kept TIMEOUT-ing on Windows (and
+  # eventually Linux) even after this store's own [license_store] (33 cases,
+  # confined to test_license_store.cpp) was moved off it once already.
   #
-  # MERGE OF THE TWO MOVES ABOVE (2026-08-15): re-measured against the
-  # combined tag set post-merge, not assumed from either side's pre-merge
-  # numbers — total [pg] grew to 2003 (from 1986/1947) with everything else
-  # that landed in the same window. Landing at 843 (A) / 1160 (B). Partition
-  # verified: 843 + 1160 == 2003.
+  # RE-BALANCED AGAIN 2026-08-16 (PR #3156 review-response round, cherry-picked
+  # here — 3f0796777): the day after the rebalance above, B TIMEOUT-ed again —
+  # 66 new/extended PG-backed cases split 25/41, landing B's already-heavier
+  # share disproportionately. A same-day two-shard fix (moving more tags onto
+  # A) was reviewed and rejected before merge: A's own prior measurement
+  # (0.616s/case, already 84% of budget) is a HIGHER per-case rate than B's,
+  # contradicting the "near-uniform per-case cost" premise these rebalances
+  # lean on — concentrating more cases onto the already-more-expensive shard
+  # projected to ~577s (96%), likely relocating the timeout rather than fixing
+  # it.
+  #
+  # SPLIT INTO THREE SHARDS instead. The store-heavy tag set (expensive: real
+  # CREATE DATABASE ... TEMPLATE clones per case, unlike lighter route/handler
+  # tests) is itself split across two shards rather than concentrated in one:
+  #   shard A = [routes]/[store]/[token]
+  #   shard B = [audit_store]/[rbac_store]/[guaranteed_state_store]/
+  #             [response_store]/[operator_surface]/[guardian_routes]/
+  #             [workflow]/[deployment_store]/[license_store], minus anything
+  #             already in A
+  #   shard C = everything else [pg]-tagged
+  # [license_store] folded into shard B's tag list on the cherry-pick (not
+  # present on PR #3156's branch, which has no reason to know about this
+  # store) — same confined-to-one-file precedent as every other tag in that
+  # list, re-verified against this merge's actual case counts via --list-tests
+  # on the built binary, not assumed from either side's pre-merge numbers:
+  # 539 (A) / 415 (B) / 1050 (C), sum 2004 == N([pg]). Partition preserved:
+  # N([pg]) == N(A) + N(B) + N(C).
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store],[pg][operator_surface],[pg][license_store]'],
+       args: ['[pg][routes],[pg][store],[pg][token]'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[license_store]'],
+       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][rbac_store]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token]'],
+       suite: 'server', timeout: 600)
+  test('server pg unit tests shard C', server_test_exe,
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]'],
        suite: 'server', timeout: 600)
 endif
 
