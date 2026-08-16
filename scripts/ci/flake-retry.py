@@ -707,7 +707,7 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    check(len(_entries) >= 5, "meson.build: all five server shard entries located")
+    check(len(_entries) >= 6, "meson.build: all six server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -719,10 +719,24 @@ def _selftest():
             continue  # an args-less entry has no positional specs to strip
         _args = re.findall(r"'([^']*)'", _m.group(1))
         check(bool(_args), "meson.build: args-carrying server entry extracted non-empty")
-        for _arg in _args:
+        # Positional tag-filter specs vs Catch2 OPTION flags. A shard whose
+        # cases ALL skip on a DSN-less platform (macOS: shard D, every case
+        # gated on YUZU_TEST_POSTGRES_DSN) needs `--allow-running-no-tests`, or
+        # Catch2 exits 4 on an all-skipped run and reds the leg (#2092). Option
+        # flags are exempt from the tag-spec hygiene guard and from the shard
+        # pin below (which keys on the positional specs); the isolated-retry
+        # surgery already PRESERVES options (`_cmd_without_test_specs`), so a
+        # flag never ORs with a retried case.
+        _specs = [a for a in _args if not a.startswith("-")]
+        _opts = [a for a in _args if a.startswith("-")]
+        check(bool(_specs), "meson.build: server entry has at least one positional spec")
+        for _arg in _specs:
             check(CATCH2_TAG_SPEC.match(_arg) is not None,
                   f"meson.build server test arg {_arg!r} is not a tag-filter spec")
-        _shard_specs.append(tuple(_args))
+        for _opt in _opts:
+            check(_opt.startswith("--"),
+                  f"meson.build server test option {_opt!r} is not a --long flag")
+        _shard_specs.append(tuple(_specs))
     # Positive pin so hollow extraction can never pass again: the shard filters
     # must come back verbatim. A shard add or rebalance updates this line
     # consciously. #2394 split the single '[pg]' entry into two balanced halves

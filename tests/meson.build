@@ -846,10 +846,14 @@ if build_server
   # job-level timeouts (90-120 min in ci.yml, 60 min in nightly.yml). The Catch2
   # cleanup/sweep listener (test_pg_template_cleanup.cpp) fires in all shards —
   # idempotent, harmless without a DSN. Constraints the shards must keep:
-  #   - only tag-filter specs may appear in args (flake-retry.py strips
-  #     positional tag specs before an isolated case retry — Catch2 ORs
+  #   - only tag-filter specs may appear as POSITIONAL args (flake-retry.py
+  #     strips positional tag specs before an isolated case retry — Catch2 ORs
   #     positional specs). Each [pg] half is ONE comma-OR spec (Catch2 ORs
-  #     inside a single arg; multiple positional args would AND, not OR);
+  #     inside a single arg; multiple positional args would AND, not OR).
+  #     Catch2 OPTION flags (--long form, e.g. --allow-running-no-tests on an
+  #     all-skip-on-macOS shard) are permitted: they are not positional, so the
+  #     retry surgery preserves them and the selftest exempts them from the
+  #     tag-spec pin;
   #   - no entry name may be a substring of another (flake-retry maps
   #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
   #     'shard C'/'shard D' and 'server unit tests' are pairwise non-substring.
@@ -959,8 +963,18 @@ if build_server
   test('server pg unit tests shard B', server_test_exe,
        args: ['[pg][rbac_store]~[routes]~[store]~[token]'],
        suite: 'server', timeout: 600)
+  # --allow-running-no-tests: shard D's eight tags are ALL DSN-gated store
+  # behaviour tests, so on a DSN-less platform (macOS, ADR-0035) every case
+  # SKIPs and Catch2 exits 4 on an all-skipped run — reddening the leg (#2092,
+  # found on the B/D split's first CI). Shards A/B/C survive the same all-skip
+  # only because each happens to carry a non-DSN case that runs to completion;
+  # D has none, so it needs the flag explicitly. The flag is a no-op where PG is
+  # present (Linux/Windows CI): the cases run normally. It is an OPTION, not a
+  # positional tag spec — flake-retry.py's isolated-retry surgery preserves it,
+  # and its hygiene selftest exempts --flags from the tag-spec pin.
   test('server pg unit tests shard D', server_test_exe,
-       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token]'],
+       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token]',
+              '--allow-running-no-tests'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard C', server_test_exe,
        args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]'],
