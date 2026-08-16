@@ -564,6 +564,7 @@ if build_server
       'unit/server/test_access_review_store.cpp',
       'unit/server/test_dispatch_chokepoint.cpp',
       'unit/server/test_capability_catalogue.cpp',
+      'unit/server/test_operator_surface_twins.cpp',
       'unit/server/test_schedule_params.cpp',
       'unit/server/test_plugin_config_parsers.cpp',
       'unit/server/test_plugin_config_store_pg.cpp',
