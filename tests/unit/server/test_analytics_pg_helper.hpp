@@ -4,8 +4,13 @@
 // construction helper for fixtures that need it only as a secondary
 // dependency (test_auth_routes*.cpp, test_auth_sso_identity.cpp,
 // test_auth_jit_elevation.cpp, test_saml_routes.cpp, test_oidc_routes.cpp,
-// test_schedule_routes.cpp, test_mcp_server.cpp). Mirrors
-// test_api_token_pg_helper.hpp's ApiTokenStorePg shape exactly.
+// test_mcp_server.cpp). Mirrors test_api_token_pg_helper.hpp's
+// ApiTokenStorePg shape exactly. NOT used by test_schedule_routes.cpp or
+// test_scim_routes.cpp — both of those construct AnalyticsEventStore
+// directly against a pool an earlier fixture member already owns
+// (rbac_pool / auth_db.pool()) rather than a second ephemeral database
+// (governance Gate 4 consistency-auditor finding, 2026-08-16 — this
+// comment previously claimed test_schedule_routes.cpp as a consumer).
 //
 // AnalyticsEventStore ported to Postgres (ADR-0049, schema
 // `analytics_event_store`): every fixture that used to open it against a

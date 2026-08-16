@@ -231,10 +231,15 @@ flagged here explicitly for confirmation, per the kickoff doc's governance check
   503 on a degraded read instead of silently rendering an empty/zero result.
 - Drained-row growth is unbounded (deliberately, per the retention decision above) — now a
   shared-substrate concern, not an isolated file; flagged, not fixed.
-- Tests → `YUZU_REQUIRE_PG_DB_TPL` + the shared `"analytics"` `PgTestTemplate` (the store's own
-  `test_analytics_event.cpp` and the ten other fixture files that construct it as a secondary
-  dependency, via the new `test_analytics_pg_helper.hpp` `AnalyticsEventStorePg` bundle, share
-  the same template key so the migration is paid once per suite run).
+- Tests → `YUZU_REQUIRE_PG_DB_TPL` + the shared `"analytics"` `PgTestTemplate`. The store's own
+  `test_analytics_event.cpp` and eight of the ten other fixture files that construct it as a
+  secondary dependency use the new `test_analytics_pg_helper.hpp` `AnalyticsEventStorePg`
+  bundle, sharing the same template key so the migration is paid once per suite run.
+  **Correction (governance Gate 4, 2026-08-16):** `test_schedule_routes.cpp` and
+  `test_scim_routes.cpp` do NOT use the bundle or the `"analytics"` template — each constructs
+  `AnalyticsEventStore` directly against a `PgPool` an earlier fixture member already owns
+  (`rbac_pool` / `auth_db.pool()`), per that store's own migration, not the shared one. An
+  earlier revision of this bullet claimed all ten used the bundle; it did not.
 
 ## Follow-ups
 

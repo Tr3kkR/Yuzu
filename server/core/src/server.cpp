@@ -14347,6 +14347,18 @@ private:
                         limit = std::stoi(req.get_param_value("limit"));
                     } catch (...) {}
                 }
+                // A non-positive limit isn't a client-error worth a 400 (this
+                // route has always silently ignored a malformed value), but
+                // unlike SQLite's LIMIT -1 = "unlimited" idiom the old store
+                // relied on, Postgres's LIMIT REJECTS a negative bind
+                // outright — which query_recent() below can only report as
+                // nullopt (degraded), and this route would then 503
+                // "analytics store degraded" for a client-supplied bad
+                // parameter, not an actual store problem (governance Gate 4
+                // unhappy-path finding, 2026-08-16, following up on the
+                // happy-path reviewer's flagged lead). Clamp instead.
+                if (limit <= 0)
+                    limit = 50;
                 if (!analytics_store_) {
                     res.set_content(R"({"events":[],"count":0})", "application/json");
                     return;
