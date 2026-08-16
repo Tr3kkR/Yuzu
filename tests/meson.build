@@ -904,43 +904,45 @@ if build_server
   # separately reached 600.57/600s (killed by TIMEOUT) on CI before this move.
   # Partition preserved: N([pg]) == N(A) + N(B).
   #
-  # RE-BALANCED AGAIN 2026-08-16 (PR #3156 review-response round): B TIMEOUT-ed
-  # again at 600.57/600s the day after the rebalance above — the round's 66
-  # new/extended PG-backed test cases split 25 (A) / 41 (B), landing B's
-  # already-heavier share disproportionately. A same-day two-shard fix (moving
-  # [guardian_routes]/[workflow]/[deployment_store] to A, landing 937 (A) /
-  # 1076 (B)) was reviewed and rejected before merge: A's OWN prior measurement
-  # (503.75s / 818 cases = 0.616s/case, already at 84% of budget per the
-  # #2092/#2093 watchdog) is a HIGHER per-case rate than B's, contradicting the
-  # "near-uniform per-case cost" premise this file's rebalances lean on —
-  # concentrating MORE cases into the already-more-expensive shard projected to
-  # ~577s (96% of budget), likely relocating the timeout rather than fixing it.
+  # RE-BALANCED (ADR-0048, LicenseStore, 2026-08-15/16): B kept growing as
+  # sibling Wave 2 stores merged in and kept TIMEOUT-ing on Windows (and
+  # eventually Linux) even after this store's own [license_store] (33 cases,
+  # confined to test_license_store.cpp) was moved off it once already.
+  #
+  # RE-BALANCED AGAIN 2026-08-16 (PR #3156 review-response round, cherry-picked
+  # here — 3f0796777, now also merged to dev via #3156 itself): the day after
+  # the rebalance above, B TIMEOUT-ed again — 66 new/extended PG-backed cases
+  # split 25/41, landing B's already-heavier share disproportionately. A
+  # same-day two-shard fix (moving more tags onto A) was reviewed and rejected
+  # before merge: A's own prior measurement (0.616s/case, already 84% of
+  # budget) is a HIGHER per-case rate than B's, contradicting the
+  # "near-uniform per-case cost" premise these rebalances lean on —
+  # concentrating more cases onto the already-more-expensive shard projected
+  # to ~577s (96%), likely relocating the timeout rather than fixing it.
   #
   # SPLIT INTO THREE SHARDS instead. The store-heavy tag set (expensive: real
   # CREATE DATABASE ... TEMPLATE clones per case, unlike lighter route/handler
   # tests) is itself split across two shards rather than concentrated in one:
-  #   shard A = [routes]/[store]/[token]                         (547 cases)
+  #   shard A = [routes]/[store]/[token]
   #   shard B = [audit_store]/[rbac_store]/[guaranteed_state_store]/
   #             [response_store]/[operator_surface]/[guardian_routes]/
-  #             [workflow]/[deployment_store], minus anything already in A
-  #                                                                (390 cases)
-  #   shard C = everything else [pg]-tagged                      (1076 cases)
-  # Verified by actually running all three filters through the built binary
-  # (--list-tests AND a real timed PG run, not projection): counts 547/390/1076
-  # (sum 2013, matching N([pg]) unchanged); measured wall time on a quiet local
-  # box 119.9s/91.6s/206.1s — per-case rate now uniform across all three
-  # (0.19-0.24s/case) instead of concentrated in one shard, and the slowest
-  # shard (C) is faster than the old two-shard proposal's slowest (A, projected
-  # ~577s) even before accounting for CI contention. Partition preserved:
-  # N([pg]) == N(A) + N(B) + N(C).
+  #             [workflow]/[deployment_store]/[license_store], minus anything
+  #             already in A
+  #   shard C = everything else [pg]-tagged
+  # [license_store] folded into shard B's tag list on the cherry-pick (not
+  # present on PR #3156's branch, which has no reason to know about this
+  # store) — same confined-to-one-file precedent as every other tag in that
+  # list, re-verified against this merge's actual case counts via --list-tests
+  # on the built binary, not assumed from either side's pre-merge numbers.
+  # Partition preserved: N([pg]) == N(A) + N(B) + N(C).
   test('server pg unit tests shard A', server_test_exe,
        args: ['[pg][routes],[pg][store],[pg][token]'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][rbac_store]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token]'],
+       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][rbac_store]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token]'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard C', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]'],
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]'],
        suite: 'server', timeout: 600)
 endif
 

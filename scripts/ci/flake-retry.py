@@ -743,7 +743,8 @@ def _selftest():
     # [operator_surface]: 3 new PG-backed MCP integration tests, untagged,
     # all landed in shard B and tipped it over its 600s CI budget (killed by
     # TIMEOUT at 600.57s).
-    # 2026-08-16 (PR #3156 review-response round): B TIMEOUT-ed again the day
+    # 2026-08-16 (PR #3156 review-response round, cherry-picked as 3f0796777,
+    # now also merged to dev via #3156 itself): B TIMEOUT-ed again the day
     # after the rebalance above. A same-day two-shard fix was reviewed and
     # rejected before merge — it would have concentrated more cases into
     # shard A, whose own prior per-case rate was already HIGHER than shard
@@ -753,15 +754,15 @@ def _selftest():
     # cost, unlike lighter route/handler tests) is itself split across two
     # shards (A, B) instead of concentrated in one; shard C holds everything
     # else. Verified by running all three filters through the built binary,
-    # not projection: counts 547/390/1076 (sum unchanged at 2013); measured
-    # wall time on a quiet local box 119.9s/91.6s/206.1s — a uniform per-case
-    # rate across all three instead of concentrated in one shard.
+    # not projection. [license_store] folded into shard B on the cherry-pick
+    # (tests/meson.build's own comment on this trio has the reasoning and
+    # re-verified counts).
     check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
           and ("~[pg]~[auth]~[mcp]",) in _shard_specs
           and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
-          and ("[pg][audit_store]~[routes]~[store]~[token],[pg][rbac_store]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token]",)
+          and ("[pg][audit_store]~[routes]~[store]~[token],[pg][rbac_store]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token]",)
           in _shard_specs
-          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]",)
+          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]",)
           in _shard_specs,
           "meson.build: all five shard tag filters extracted verbatim")
 
