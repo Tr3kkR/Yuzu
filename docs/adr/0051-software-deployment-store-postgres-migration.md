@@ -159,14 +159,28 @@ FILE, not per table, since the three tables in one legacy file are one atomic sn
 
 **Three decisions beyond the single-table `DeploymentStore` precedent, all new for this store:**
 
-1. **Partial legacy schema fails closed, is never treated as sourceless.** The pre-migration
-   store's own `create_tables()` always creates all three tables together in one migration
-   statement — a real legacy file produced by this store's code has all three tables or none. A
-   file with `software_packages` present but `software_deployments` or `agent_software_status`
-   missing cannot be a genuine fresh-install/no-data case; it is refused (fail-closed, "likely
-   corruption") rather than silently treated as an empty/fresh file. Copying `DeploymentStore`'s
+1. **Partial legacy schema fails closed, is never treated as sourceless — checked symmetrically
+   across all three tables, and a table-existence PROBE FAILURE is its own always-fail-closed
+   outcome, never folded into "absent."** The pre-migration store's own `create_tables()` always
+   creates all three tables together in one migration statement — a real legacy file produced by
+   this store's code has all three tables or none. ANY partial combination is refused
+   (fail-closed, "likely corruption") rather than silently treated as an empty/fresh file, and
+   `LegacyTableStatus` is a three-way result (`Present`/`Absent`/`Error`, ported from
+   `AuditStore`'s reference fix for the identical defect class) rather than a `bool`, because a
+   `sqlite3_prepare_v2`/`sqlite3_step` failure — a corrupt or non-SQLite file — is not the same
+   fact as genuine absence and must not be collapsed into it. Copying `DeploymentStore`'s
    single-table sourceless check verbatim (has-table ⇒ read; no-table ⇒ sourceless) would have
-   missed this — a single-table store has no "partial" state to distinguish.
+   missed this — a single-table store has no "partial" state to distinguish. **Hardening round
+   (2026-08-16 governance run):** the first cut of this check verified only ONE direction
+   (`software_packages` present but the other two missing) — a legacy file missing only
+   `software_packages` but holding real `software_deployments`/`agent_software_status` data
+   silently took the sourceless branch, permanently discarding it (the sourceless stamp never
+   expires or retries). Independently found/escalated to BLOCKING by 6 governance reviewers
+   across Gates 2–6 (docs-writer, architect, cpp-safety, sre, compliance-officer, unhappy-path —
+   the latter two also identified the coupled `LegacyTableStatus`/probe-failure gap as a second,
+   independently-necessary fix); fixed in the same round, with regression tests for both the
+   reverse-direction partial-schema case and a corrupt/non-SQLite legacy file, plus a companion
+   control test proving a genuinely empty (0-byte) legacy file still takes the sourceless path.
 2. **Referential closure is validated CLIENT-SIDE, before any Postgres round trip.** Postgres
    enforces the `package_id`/`deployment_id` foreign keys the legacy SQLite store never did (see
    Schema above), so a wired-era legacy file can hold a genuine orphan — e.g. a deployment whose
@@ -263,7 +277,10 @@ this store's tables are not high-volume, and once re-wired, boots are infrequent
   Dormancy above), so there is nothing to wire a pointer that never exists into. When a future
   change re-wires construction, add the `/readyz`/`/healthz` conjunction entries at that time,
   matching every other migrated authoritative store's pattern (`rbac_store`, `result_set_store`,
-  `access_review_store`, `deployment_store`, ...).
+  `access_review_store`, `deployment_store`, ...). That same re-wiring also re-triggers ADR-1005's
+  standing REST+MCP-twin review question (Decision 1) — today the routes have zero reachability
+  at all, not merely a missing MCP twin, so the question doesn't apply yet (gov Gate 6
+  enterprise-readiness, mirroring ADR-0048's identical deferral).
 
 ## Consequences
 
@@ -286,6 +303,14 @@ this store's tables are not high-volume, and once re-wired, boots are infrequent
   `tests/unit/server/test_software_deployment_store.cpp`'s backfill suite against a live Postgres
   instance, including the referential-closure and partial-schema cases this ADR adds beyond that
   precedent.
+- **Every REST route's genuine-database-failure (503) branch logs the real error server-side and
+  returns a generic message to the caller** (`sw_deploy_client_message`, `rest_api_v1.cpp`) —
+  raw `PQerrorMessage()` text (which can embed schema/constraint/`DETAIL` fragments) is never
+  echoed to the client, matching `DeploymentStore`'s `discovery_routes.cpp` precedent. Fixed in
+  the same hardening round as the backfill asymmetry above (gov Gate 2 security-guardian MEDIUM,
+  corroborated by architect and unhappy-path). `software_deployment.create`'s audit event now
+  carries `package_id` as its correlating detail field, matching every sibling create-audit event
+  in the codebase (gov Gate 4 consistency-auditor, corroborated by compliance-officer).
 - Re-wiring this store into `server.cpp` (construction, `/readyz`/`/healthz`, calling
   `migrate_from_sqlite` at boot, and actually passing the store into `register_routes`) remains
   entirely out of scope for this migration and is not tracked by a follow-up issue here — the

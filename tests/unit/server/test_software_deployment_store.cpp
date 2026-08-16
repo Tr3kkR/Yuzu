@@ -121,8 +121,10 @@ SoftwareDeployment make_deployment(const std::string& package_id,
 
 // Writes a legacy SQLite file with all three tables, no PRAGMA foreign_keys
 // (matches the pre-migration store's own constructor — FKs were never
-// enforced there). Naive string-concatenation SQL: test-only, every caller
-// passes fixed literal test data with no embedded quotes.
+// enforced there). Bound parameters throughout (never string concatenation)
+// — an earlier version of this helper concatenated raw values and broke on
+// make_deployment's own default scope_expression, "ostype = 'windows'",
+// which contains an embedded single quote.
 void write_legacy_sqlite_db(const std::filesystem::path& path,
                             const std::vector<SoftwarePackage>& pkgs,
                             const std::vector<SoftwareDeployment>& deps,
@@ -1362,6 +1364,118 @@ TEST_CASE("migrate_from_sqlite fails closed on a legacy file with a partial sche
         captured = capture.str();
     }
     CHECK(captured.find("missing") != std::string::npos);
+}
+
+// Regression test for the governance-round fix (Gate 3/4 BLOCKING, converged
+// on independently by 6 reviewers): the ORIGINAL guard only checked this
+// direction (software_packages present, others missing) and silently took
+// the sourceless branch on the REVERSE — software_packages missing but
+// software_deployments/agent_software_status present, holding real data.
+// This is the companion direction the fix above must also cover.
+TEST_CASE("migrate_from_sqlite fails closed on a legacy file missing ONLY software_packages, "
+          "with real deployment data in the other two tables",
+          "[software_deployment][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, sw_deploy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto legacy_path = yuzu::test::unique_temp_path("yuzu_test_swdep_partial_no_pkg") /
+                       "software-deployment.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    {
+        SqliteDb legacy_db;
+        REQUIRE(sqlite3_open(legacy_path.string().c_str(), legacy_db.addr()) == SQLITE_OK);
+        // software_packages deliberately absent — software_deployments and
+        // agent_software_status hold real, would-be-lost data.
+        REQUIRE(sqlite3_exec(legacy_db.get(),
+                             "CREATE TABLE software_deployments (id TEXT PRIMARY KEY, "
+                             "package_id TEXT, status TEXT);"
+                             "CREATE TABLE agent_software_status (deployment_id TEXT, agent_id "
+                             "TEXT, status TEXT, PRIMARY KEY (deployment_id, agent_id));"
+                             "INSERT INTO software_deployments (id, package_id, status) VALUES "
+                             "('11111111111111111111111111111111', "
+                             "'22222222222222222222222222222222', 'deploying');"
+                             "INSERT INTO agent_software_status (deployment_id, agent_id, status) "
+                             "VALUES ('11111111111111111111111111111111', 'agent-1', "
+                             "'installing');",
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+
+    std::string captured;
+    {
+        LogCapture capture;
+        CHECK_FALSE(store.migrate_from_sqlite(legacy_path));
+        captured = capture.str();
+    }
+    // Pre-fix this would have logged "nothing to backfill" (INFO) and
+    // returned true, permanently discarding the deployment/agent rows above.
+    CHECK(captured.find("nothing to backfill") == std::string::npos);
+    CHECK(captured.find("software_packages") != std::string::npos);
+
+    auto deps = store.list_deployments();
+    REQUIRE(deps.has_value());
+    CHECK(deps->empty()); // nothing landed — refused before any Postgres write
+}
+
+// Regression test for the coupled root-cause: fixing the branch above alone
+// does not close this. A legacy file that fails ALL THREE table-existence
+// probes (corrupt/non-SQLite bytes) must not be treated as "all absent, so
+// sourceless" — a probe FAILURE is a distinct, always-fail-closed outcome
+// from genuine absence (see LegacyTableStatus in the .cpp). Mirrors
+// AuditStore's own reference regression test for the identical defect class
+// ("38 bytes of junk is never treated as a fresh install",
+// test_audit_store.cpp) — `sqlite3_open_v2(SQLITE_OPEN_READONLY)` succeeds
+// lazily on junk bytes; the corruption surfaces only at the first real read.
+TEST_CASE("migrate_from_sqlite never treats a corrupt/non-SQLite legacy file as a fresh install",
+          "[software_deployment][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, sw_deploy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_swdep_corrupt") / "software-deployment.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    {
+        std::ofstream f(legacy_path, std::ios::binary);
+        f << "not a sqlite database, just some junk bytes";
+    }
+    REQUIRE(std::filesystem::exists(legacy_path));
+
+    std::string captured;
+    {
+        LogCapture capture;
+        CHECK_FALSE(store.migrate_from_sqlite(legacy_path));
+        captured = capture.str();
+    }
+    CHECK(captured.find("nothing to backfill") == std::string::npos);
+    CHECK(captured.find("probe failed") != std::string::npos);
+    CHECK(std::filesystem::exists(legacy_path)); // untouched
+}
+
+// Companion control for the fix above: a genuinely ZERO-BYTE legacy file is
+// NOT corrupt in the sense the previous test covers — SQLite treats 0 bytes
+// as a valid, uninitialized database, so all three probes succeed and
+// legitimately report Absent, not Error. This must still take the
+// sourceless path — asserting it explicitly guards against an over-eager
+// fix that fails closed on every empty/fresh legacy file (chaos-injector's
+// Gate 5 "Required control" for this exact scenario).
+TEST_CASE("migrate_from_sqlite: a zero-byte legacy file is legitimately sourceless, not corrupt",
+          "[software_deployment][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, sw_deploy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_swdep_zerobyte") / "software-deployment.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+    { std::ofstream f(legacy_path, std::ios::binary); } // 0 bytes
+    REQUIRE(std::filesystem::exists(legacy_path));
+    REQUIRE(std::filesystem::file_size(legacy_path) == 0);
+
+    CHECK(store.migrate_from_sqlite(legacy_path));
 }
 
 TEST_CASE("SoftwareDeploymentStore::migrate_from_sqlite aborts unstamped on a mid-scan legacy "

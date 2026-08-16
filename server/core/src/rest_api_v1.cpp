@@ -359,6 +359,23 @@ static int sw_deploy_error_status(const std::string& err) {
     return err.starts_with(kSwDeployDbErrorPrefix) ? 503 : 400;
 }
 
+// Never echoes a genuine DB/lease failure's raw text to the client — it can
+// embed PQerrorMessage() fragments (schema/constraint/DETAIL names, and on a
+// connection-phase failure occasionally a host:port) that are internal
+// implementation detail, not information the caller needs (gov Gate 2
+// security-guardian MEDIUM). Logs the real error server-side and returns a
+// generic constant instead, matching DeploymentStore's discovery_routes.cpp
+// precedent (`is_deployment_db_error` branch). A validation/business-rule
+// error (never carries the prefix) is safe to echo verbatim — it's
+// operator-authored request feedback, not database internals.
+static std::string sw_deploy_client_message(const char* op, const std::string& err) {
+    if (err.starts_with(kSwDeployDbErrorPrefix)) {
+        spdlog::error("{}: {}", op, err);
+        return "service unavailable";
+    }
+    return err;
+}
+
 // LicenseStore (docs/adr/0048-...md) error mapping — three-way, unlike
 // access_review_error_status's binary shape: LicenseStore's own methods still validate some
 // inputs internally (e.g. "license key already activated", "organization cannot be empty")
@@ -7936,8 +7953,11 @@ void RestApiV1::register_routes(
                          return;
                      auto pkgs = sw_deploy_store->list_packages();
                      if (!pkgs) {
-                         res.status = 503;
-                         res.set_content(detail::a4_error(res, pkgs.error()), "application/json");
+                         res.status = sw_deploy_error_status(pkgs.error());
+                         res.set_content(
+                             detail::a4_error(res, sw_deploy_client_message(
+                                                       "GET /api/v1/software-packages", pkgs.error())),
+                             "application/json");
                          return;
                      }
                      JArr arr;
@@ -8065,7 +8085,10 @@ void RestApiV1::register_routes(
             auto result = sw_deploy_store->create_package(pkg);
             if (!result) {
                 res.status = sw_deploy_error_status(result.error());
-                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                res.set_content(detail::a4_error(res, sw_deploy_client_message(
+                                                          "POST /api/v1/software-packages",
+                                                          result.error())),
+                                "application/json");
                 return;
             }
             audit_fn(req, "software_package.create", "success", "SoftwarePackage", *result,
@@ -8082,8 +8105,11 @@ void RestApiV1::register_routes(
             auto status = req.has_param("status") ? req.get_param_value("status") : std::string{};
             auto deps = sw_deploy_store->list_deployments(status);
             if (!deps) {
-                res.status = 503;
-                res.set_content(detail::a4_error(res, deps.error()), "application/json");
+                res.status = sw_deploy_error_status(deps.error());
+                res.set_content(
+                    detail::a4_error(res, sw_deploy_client_message(
+                                              "GET /api/v1/software-deployments", deps.error())),
+                    "application/json");
                 return;
             }
             JArr arr;
@@ -8125,11 +8151,14 @@ void RestApiV1::register_routes(
                       auto result = sw_deploy_store->create_deployment(dep);
                       if (!result) {
                           res.status = sw_deploy_error_status(result.error());
-                          res.set_content(detail::a4_error(res, result.error()), "application/json");
+                          res.set_content(detail::a4_error(res, sw_deploy_client_message(
+                                                                    "POST /api/v1/software-deployments",
+                                                                    result.error())),
+                                          "application/json");
                           return;
                       }
                       audit_fn(req, "software_deployment.create", "success", "SoftwareDeployment",
-                               *result, "");
+                               *result, dep.package_id);
                       res.status = 201;
                       res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
                   });
@@ -8156,7 +8185,11 @@ void RestApiV1::register_routes(
                     res.set_content(ok_json(JObj().add("started", true).str()), "application/json");
                 } else {
                     res.status = sw_deploy_error_status(result.error());
-                    res.set_content(detail::a4_error(res, result.error()), "application/json");
+                    res.set_content(
+                        detail::a4_error(res, sw_deploy_client_message(
+                                                  "POST /api/v1/software-deployments/{id}/start",
+                                                  result.error())),
+                        "application/json");
                 }
             });
 
@@ -8177,8 +8210,12 @@ void RestApiV1::register_routes(
                                           "application/json");
                       } else {
                           res.status = sw_deploy_error_status(result.error());
-                          res.set_content(detail::a4_error(res, result.error()),
-                                          "application/json");
+                          res.set_content(
+                              detail::a4_error(
+                                  res, sw_deploy_client_message(
+                                           "POST /api/v1/software-deployments/{id}/rollback",
+                                           result.error())),
+                              "application/json");
                       }
                   });
 
@@ -8199,8 +8236,12 @@ void RestApiV1::register_routes(
                                           "application/json");
                       } else {
                           res.status = sw_deploy_error_status(result.error());
-                          res.set_content(detail::a4_error(res, result.error()),
-                                          "application/json");
+                          res.set_content(
+                              detail::a4_error(
+                                  res, sw_deploy_client_message(
+                                           "POST /api/v1/software-deployments/{id}/cancel",
+                                           result.error())),
+                              "application/json");
                       }
                   });
     }

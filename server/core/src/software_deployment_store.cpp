@@ -359,15 +359,32 @@ AgentDeploymentStatus read_agent_status(PGresult* res, int i) {
     return a;
 }
 
-bool legacy_has_table(sqlite3* db, const char* name) {
-    SqliteStmt probe;
-    if (sqlite3_prepare_v2(db, "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?",
-                           -1, probe.addr(), nullptr) != SQLITE_OK)
-        return false;
-    sqlite3_bind_text(probe.get(), 1, name, -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(probe.get()) != SQLITE_ROW)
-        return false;
-    return sqlite3_column_int64(probe.get(), 0) > 0;
+// Three outcomes, not two — ported from audit_store.cpp's reference fix for
+// this exact defect class (Gate 4 unhappy-path UP-1/UP-2 on THIS store's own
+// governance run measured the identical shape independently). A
+// `sqlite3_prepare_v2`/`sqlite3_step` failure (corrupt file, encrypted file,
+// disk I/O error — bytes present that don't parse as a SQLite header) is NOT
+// the same fact as "the table genuinely does not exist": the former means
+// this process cannot see what the file holds, the latter means it can see
+// the file holds nothing of interest. Collapsing them to one `bool` lets a
+// corrupt legacy file masquerade as a fresh install and silently forfeit the
+// mandatory backfill. A genuinely zero-byte file is `Absent`, not `Error` —
+// SQLite treats 0 bytes as a valid, uninitialized database and
+// `sqlite_master` reads back empty rather than failing.
+enum class LegacyTableStatus { Present, Absent, Error };
+
+LegacyTableStatus legacy_has_table(sqlite3* db, const char* table) {
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", -1,
+                           s.addr(), nullptr) != SQLITE_OK)
+        return LegacyTableStatus::Error;
+    sqlite3_bind_text(s.get(), 1, table, -1, SQLITE_TRANSIENT);
+    const int rc = sqlite3_step(s.get());
+    if (rc == SQLITE_ROW)
+        return LegacyTableStatus::Present;
+    if (rc == SQLITE_DONE)
+        return LegacyTableStatus::Absent;
+    return LegacyTableStatus::Error;
 }
 
 } // namespace
@@ -420,10 +437,16 @@ SoftwareDeploymentStore::SoftwareDeploymentStore(pg::PgPool& pool) : pool_(pool)
 // decision this store adds beyond the single-table precedent): the
 // pre-migration store's own migration always creates all three tables
 // together in one statement, so a real legacy file produced by this store's
-// code has all three or none. A file with `software_packages` present but
-// `software_deployments` or `agent_software_status` missing cannot be a
-// genuine fresh-install/no-data case — it fails the backfill closed rather
-// than silently treating the file as empty.
+// code has all three or none. ANY partial combination — not just
+// "software_packages present, the others missing" — cannot be a genuine
+// fresh-install/no-data case; it fails the backfill closed rather than
+// silently treating the file as empty. This must be checked symmetrically
+// across all three tables (an earlier version of this function checked only
+// one direction and was fixed in the same governance round that shipped it,
+// per Gate 3/4's independently-converging BLOCKING findings). A table-probe
+// FAILURE (corrupt/unreadable file) is itself a distinct, always-fail-closed
+// outcome — see `LegacyTableStatus` above — never silently folded into
+// "absent".
 //
 // REFERENTIAL CLOSURE is validated CLIENT-SIDE, before any Postgres round
 // trip (ADR-0051 decision beyond the single-table precedent): Postgres
@@ -488,23 +511,34 @@ bool SoftwareDeploymentStore::migrate_from_sqlite(const std::filesystem::path& l
             return false;
         }
 
-        const bool has_pkg_table = legacy_has_table(legacy.get(), "software_packages");
-        if (!has_pkg_table) {
+        const LegacyTableStatus pkg_status = legacy_has_table(legacy.get(), "software_packages");
+        const LegacyTableStatus dep_status = legacy_has_table(legacy.get(), "software_deployments");
+        const LegacyTableStatus agent_status =
+            legacy_has_table(legacy.get(), "agent_software_status");
+        if (pkg_status == LegacyTableStatus::Error || dep_status == LegacyTableStatus::Error ||
+            agent_status == LegacyTableStatus::Error) {
+            spdlog::error(
+                "SoftwareDeploymentStore::migrate_from_sqlite: legacy {} table-existence probe "
+                "failed (corrupt or unreadable file?) — a probe failure is never treated as "
+                "absence; refusing (fail-closed)",
+                legacy_db_path.string());
+            return false;
+        }
+        const bool has_pkg_table = pkg_status == LegacyTableStatus::Present;
+        const bool has_dep_table = dep_status == LegacyTableStatus::Present;
+        const bool has_agent_table = agent_status == LegacyTableStatus::Present;
+        if (!has_pkg_table && !has_dep_table && !has_agent_table) {
             fingerprint = kSourcelessFingerprint;
+        } else if (!has_pkg_table || !has_dep_table || !has_agent_table) {
+            spdlog::error(
+                "SoftwareDeploymentStore::migrate_from_sqlite: legacy {} has a PARTIAL schema "
+                "(missing {}{}{}) — a genuine fresh/empty file never has a partial schema (all "
+                "three tables are created together); refusing (fail-closed, likely corruption)",
+                legacy_db_path.string(), !has_pkg_table ? "software_packages " : "",
+                !has_dep_table ? "software_deployments " : "",
+                !has_agent_table ? "agent_software_status " : "");
+            return false;
         } else {
-            const bool has_dep_table = legacy_has_table(legacy.get(), "software_deployments");
-            const bool has_agent_table = legacy_has_table(legacy.get(), "agent_software_status");
-            if (!has_dep_table || !has_agent_table) {
-                spdlog::error(
-                    "SoftwareDeploymentStore::migrate_from_sqlite: legacy {} has "
-                    "software_packages but is missing {} — a genuine fresh/empty file never has "
-                    "a partial schema (all three tables are created together); refusing "
-                    "(fail-closed, likely corruption)",
-                    legacy_db_path.string(),
-                    !has_dep_table ? "software_deployments" : "agent_software_status");
-                return false;
-            }
-
             const auto read_all = [&](const char* sql,
                                       const std::function<void(sqlite3_stmt*)>& row) -> bool {
                 SqliteStmt s;
