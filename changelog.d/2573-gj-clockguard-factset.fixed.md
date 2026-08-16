@@ -7,7 +7,13 @@
   fix). The guard now dedups on the whole fact set (shared with the audit
   store's and TAR's clock guards), so a distinct anomaly reports again
   instead of deleting, while an identical repeat still drains at the same
-  paced rate as before. One accepted behavior change: an idle journal (no
-  batch actually past its retention window) that observes a large forward
-  clock jump is no longer reported as a clock anomaly — with nothing at risk
-  of loss, there is nothing to decline.
+  paced rate as before. Two accepted behavior changes: (1) an idle journal
+  (no batch actually past its retention window) that observes a large
+  forward clock jump is no longer reported as a clock anomaly — with
+  nothing at risk of loss, there is nothing to decline; (2) a live clock
+  jump landing on a journal with an existing expired backlog now costs two
+  declines instead of one before eviction resumes — the jump itself
+  (would-wipe + step, distinct from any prior decline) reports separately
+  from the backlog it leaves behind (would-wipe alone, once the step
+  self-resolves on the next pass) — always the safe direction (an extra
+  paced pass of delay, never an extra deletion).
