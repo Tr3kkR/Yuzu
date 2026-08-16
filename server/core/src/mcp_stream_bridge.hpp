@@ -266,8 +266,12 @@ public:
         /// attempt has had multiple ticks to self-heal and is effectively
         /// permanent; retrying it forever would re-run the same audit/log/metric
         /// work every tick for a record that is never coming back. `0` restores
-        /// the pre-#2513 one-way behaviour (retained until shutdown, no retry) -
-        /// a code-constant default only, deliberately not exposed as a CLI
+        /// the pre-#2513 one-way RETENTION posture (still retained until
+        /// shutdown, never retried) - it does NOT restore pre-#2513
+        /// observability: the first bail still fires `teardown_retry_total{
+        /// outcome="exhausted"}`, the exhaustion error log, and the "(retry
+        /// budget exhausted...)" audit suffix, all of which are new. A
+        /// code-constant default only, deliberately not exposed as a CLI
         /// flag/env var: this is a fault-recovery bound, not an operator dial.
         std::size_t teardown_retry_max = 3;
     };
@@ -994,8 +998,13 @@ private:
         /// touching torn_down's own claim sites.
         bool teardown_retry_claimable = false;
         /// Attempts consumed so far; 0 before the first entry to teardown_claimed,
-        /// bounded by Config::teardown_retry_max beyond the first.
-        std::uint8_t teardown_attempts = 0;
+        /// bounded by Config::teardown_retry_max beyond the first. std::size_t,
+        /// not a narrower counter: it is compared directly against
+        /// Config::teardown_retry_max (also std::size_t, test-settable), and a
+        /// narrower type wrapping at its max would silently re-open eligibility
+        /// forever - the exact unbounded-retry outcome this bound exists to
+        /// prevent.
+        std::size_t teardown_attempts = 0;
         /// The `decision` teardown_claimed's Step 1 ran (or will run) with,
         /// persisted so a retry pass can replay the SAME decision without
         /// independently re-arbitrating what to publish.

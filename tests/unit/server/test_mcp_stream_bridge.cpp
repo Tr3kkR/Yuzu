@@ -1770,6 +1770,66 @@ TEST_CASE("bridge teardown - a failed unsubscribe retains the record for retry, 
     }
 }
 
+TEST_CASE("bridge teardown retry - a healed retry RE-PUBLISHES a terminal that never got "
+          "built on attempt 1, and shutdown sees nothing left to poison (#2513)",
+          "[mcp][bridge][2f]") {
+    // Guards the exact regression the design worried about: if a future change set
+    // teardown_terminal_handled=true on attempt 1 despite the frame build failing
+    // (rung staying kNotAttempted), a retry would skip Step 1 forever - the client
+    // never gets its -32014, and if the record then survived to an exhausted-budget
+    // shutdown, shutdown()'s should_poison check (keyed on !teardown_terminal_handled)
+    // would wrongly see "handled" and stay silent, reproducing #2517 under a new name.
+    // This forces attempt 1 to fail at BOTH the frame build AND the unsubscribe step
+    // (so the record bails and stays retry-eligible rather than being erased by Steps
+    // 2-4 succeeding around an unpublished terminal), then lets both one-shot faults
+    // heal for the retry, and checks the ring - not just record_count() - for the
+    // actual publish.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    // A (older, never completes) is the pressure victim -> kSynthesizeUnavailable.
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-republish-a"));
+    REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-republish-b"));
+    REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+    fx.bus.publish("exec-republish-b", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+    fx.bridge->inject_terminal_build_fault_for_test(1);  // one-shot: attempt 1's build fails
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1));
+    REQUIRE_NOTHROW(fx.bridge->sweep());  // attempt 1: pressure-claims A, bails at unsubscribe
+
+    // Retained, unresolved: nothing published (build failed before the ladder ran).
+    // NOT asserting subscriber_count here: a pressure claim removes the bus
+    // subscription atomically with the claim itself (before teardown_claimed's
+    // Step 2 ever runs), so it reads 0 whether or not the injected unsubscribe
+    // fault fires - the #2487-review test above doesn't assert it either, for
+    // the same reason.
+    CHECK(fx.bridge->record_count() == 2);
+    CHECK(count_error_code(ring_frames(*s.stream, "alice"), mcp::kMcpTerminalUnavailable) == 0);
+
+    REQUIRE_NOTHROW(fx.bridge->sweep());  // attempt 2 (retry pass): both faults spent, heals
+
+    // Exactly one -32014 reached the ring - the retry actually re-ran Step 1, it did
+    // not silently treat the record as already handled.
+    CHECK(count_error_code(ring_frames(*s.stream, "alice"), mcp::kMcpTerminalUnavailable) == 1);
+    CHECK(fx.bridge->record_count() == 1);  // A settled and erased; B still live/pinned
+    CHECK(fx.bus.subscriber_count("exec-republish-a") == 0);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "recovered"}})
+              .value() == 1.0);
+
+    // A resolved normally before shutdown ran, so there is nothing left for shutdown's
+    // walk to poison - a healed retry must not ALSO leave a spurious shutdown_reap
+    // trail behind it (the #3052 shutdown-evidence contract this retry sits on top of).
+    fx.bridge->shutdown();
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 0);
+}
+
 TEST_CASE("bridge subscribe() is an exactly-once state-checked transition (#2487 review)",
           "[mcp][bridge][2f]") {
     // This gate is what makes teardown_claimed's lock-free BORROW of execution_id
