@@ -872,9 +872,13 @@ if build_server
   #     positional specs). Each [pg] half is ONE comma-OR spec (Catch2 ORs
   #     inside a single arg; multiple positional args would AND, not OR).
   #     Catch2 OPTION flags (--long form, e.g. --allow-running-no-tests on an
-  #     all-skip-on-macOS shard) are permitted: they are not positional, so the
-  #     retry surgery preserves them and the selftest exempts them from the
-  #     tag-spec pin;
+  #     all-skip-on-macOS shard) are permitted: they are not positional, so
+  #     the selftest exempts them from the tag-spec pin, and the whole-shard
+  #     enumeration re-run preserves them (still needed for a DSN-less
+  #     all-skip). The ISOLATED SINGLE-CASE retry does NOT preserve
+  #     --allow-running-no-tests specifically — it strips that flag so a
+  #     comma-containing case name can never silently zero-match-and-succeed
+  #     (2026-08-17, see scripts/ci/flake-retry.py's _cmd_for_case_retry);
   #   - no entry name may be a substring of another (flake-retry maps
   #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
   #     'shard C'/'shard D' and 'server unit tests' are pairwise non-substring.
@@ -999,8 +1003,12 @@ if build_server
   # only because each happens to carry a non-DSN case that runs to completion;
   # D has none, so it needs the flag explicitly. The flag is a no-op where PG is
   # present (Linux/Windows CI): the cases run normally. It is an OPTION, not a
-  # positional tag spec — flake-retry.py's isolated-retry surgery preserves it,
-  # and its hygiene selftest exempts --flags from the tag-spec pin.
+  # positional tag spec — its hygiene selftest exempts --flags from the
+  # tag-spec pin, and the whole-shard enumeration re-run preserves it (still
+  # needed there for the DSN-less all-skip). The isolated SINGLE-CASE retry
+  # strips it specifically, so a comma-containing case name can never
+  # silently zero-match-and-succeed instead of honestly failing (2026-08-17,
+  # see scripts/ci/flake-retry.py's _cmd_for_case_retry).
   test('server pg unit tests shard D', server_test_exe,
        args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][software_deployment]~[routes]~[store]~[token]',
               '--allow-running-no-tests'],
