@@ -960,10 +960,18 @@ if build_server
   # lighter by TIME, AND add it to shard C's exclusion list (both or neither).
   # If [rbac_store] itself grows toward the ceiling, split IT next (it is already
   # the single densest tag).
+  #
+  # 2026-08-16 (ADR-0051, SoftwareDeploymentStore, PR #3174) followed exactly
+  # that recipe for [software_deployment] (66 cases): measured in isolation on
+  # this store's own dedicated Postgres container — [software_deployment]
+  # 4.0s, vs. shard B ([rbac_store]) 55.2s and shard D (the other eight tags)
+  # 31.5s on the same container — D is by far the lighter destination, so
+  # [software_deployment] joins D, not B. Also added to shard C's exclusion
+  # list per the same instruction (both or neither).
   test('server pg unit tests shard B', server_test_exe,
        args: ['[pg][rbac_store]~[routes]~[store]~[token]'],
        suite: 'server', timeout: 600)
-  # --allow-running-no-tests: shard D's eight tags are ALL DSN-gated store
+  # --allow-running-no-tests: shard D's tags are ALL DSN-gated store
   # behaviour tests, so on a DSN-less platform (macOS, ADR-0035) every case
   # SKIPs and Catch2 exits 4 on an all-skipped run — reddening the leg (#2092,
   # found on the B/D split's first CI). Shards A/B/C survive the same all-skip
@@ -973,11 +981,11 @@ if build_server
   # positional tag spec — flake-retry.py's isolated-retry surgery preserves it,
   # and its hygiene selftest exempts --flags from the tag-spec pin.
   test('server pg unit tests shard D', server_test_exe,
-       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token]',
+       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][software_deployment]~[routes]~[store]~[token]',
               '--allow-running-no-tests'],
        suite: 'server', timeout: 600)
   test('server pg unit tests shard C', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]'],
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]'],
        suite: 'server', timeout: 600)
 endif
 
