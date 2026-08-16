@@ -32,7 +32,19 @@
 using namespace yuzu::server;
 namespace fs = std::filesystem;
 
+// LicenseStore (ADR-0048) and SoftwareDeploymentStore (ADR-0051) are both
+// Postgres-backed; DeviceTokenStore/ExecutionTracker in this file remain
+// pre-migration SQLite. Mirrors test_deployment_store.cpp's PgTestTemplate
+// declaration.
 namespace {
+yuzu::test::PgTestTemplate license_store_tpl{
+    "licensestore_t2", [](const std::string& dsn) {
+        pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        LicenseStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("license_store template: store failed to migrate");
+    }};
+
 // Pre-migrated template — shares the "swdeploystore" key with
 // test_software_deployment_store.cpp's own template (identical setup,
 // replay-verified per docs/postgres-store-playbook.md step 7).
@@ -662,10 +674,10 @@ TEST_CASE("T2 REST: active_count reflects running deployments",
 // License flow (POST/GET /api/v1/license)
 // ============================================================================
 
-TEST_CASE("T2 REST: license activate and get active", "[rest_api_t2][license]") {
-    auto path = unique_temp_path("license-test");
-    TempFileGuard guard(path);
-    LicenseStore store(path);
+TEST_CASE("T2 REST: license activate and get active", "[rest_api_t2][license][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
     REQUIRE(store.is_open());
 
     License lic;
@@ -680,16 +692,17 @@ TEST_CASE("T2 REST: license activate and get active", "[rest_api_t2][license]") 
 
     auto active = store.get_active_license();
     REQUIRE(active.has_value());
-    CHECK(active->organization == "Acme Corp");
-    CHECK(active->seat_count == 100);
-    CHECK(active->edition == "enterprise");
+    REQUIRE(active->has_value());
+    CHECK((*active)->organization == "Acme Corp");
+    CHECK((*active)->seat_count == 100);
+    CHECK((*active)->edition == "enterprise");
 }
 
 TEST_CASE("T2 REST: license validate with agent count generates alerts on exceeded",
-          "[rest_api_t2][license]") {
-    auto path = unique_temp_path("license-validate");
-    TempFileGuard guard(path);
-    LicenseStore store(path);
+          "[rest_api_t2][license][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
     REQUIRE(store.is_open());
 
     License lic;
@@ -703,12 +716,14 @@ TEST_CASE("T2 REST: license validate with agent count generates alerts on exceed
     REQUIRE(result.has_value());
 
     // Validate with more agents than seats
-    store.validate(10);
+    auto validated = store.validate(10);
+    REQUIRE(validated.has_value());
 
     auto alerts = store.list_alerts();
+    REQUIRE(alerts.has_value());
     // Should have generated at least one alert about exceeded seats
     bool found_exceeded = false;
-    for (auto& a : alerts) {
+    for (auto& a : *alerts) {
         if (a.alert_type == "exceeded" || a.alert_type == "seat_limit_warning") {
             found_exceeded = true;
         }
@@ -716,10 +731,10 @@ TEST_CASE("T2 REST: license validate with agent count generates alerts on exceed
     CHECK(found_exceeded);
 }
 
-TEST_CASE("T2 REST: license feature check", "[rest_api_t2][license]") {
-    auto path = unique_temp_path("license-features");
-    TempFileGuard guard(path);
-    LicenseStore store(path);
+TEST_CASE("T2 REST: license feature check", "[rest_api_t2][license][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
     REQUIRE(store.is_open());
 
     License lic;
@@ -729,17 +744,23 @@ TEST_CASE("T2 REST: license feature check", "[rest_api_t2][license]") {
     lic.features_json = R"(["sso","advanced_policies","webhook_delivery"])";
     lic.status = "active";
 
-    store.activate_license(lic, "LICENSE-FEAT-001");
+    REQUIRE(store.activate_license(lic, "LICENSE-FEAT-001").has_value());
 
-    CHECK(store.has_feature("sso") == true);
-    CHECK(store.has_feature("advanced_policies") == true);
-    CHECK(store.has_feature("nonexistent_feature") == false);
+    auto sso = store.has_feature("sso");
+    REQUIRE(sso.has_value());
+    CHECK(*sso == true);
+    auto adv = store.has_feature("advanced_policies");
+    REQUIRE(adv.has_value());
+    CHECK(*adv == true);
+    auto none = store.has_feature("nonexistent_feature");
+    REQUIRE(none.has_value());
+    CHECK(*none == false);
 }
 
-TEST_CASE("T2 REST: license alert acknowledge", "[rest_api_t2][license]") {
-    auto path = unique_temp_path("license-ack");
-    TempFileGuard guard(path);
-    LicenseStore store(path);
+TEST_CASE("T2 REST: license alert acknowledge", "[rest_api_t2][license][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
     REQUIRE(store.is_open());
 
     License lic;
@@ -749,28 +770,30 @@ TEST_CASE("T2 REST: license alert acknowledge", "[rest_api_t2][license]") {
     lic.features_json = "[]";
     lic.status = "active";
 
-    store.activate_license(lic, "LICENSE-ALERT-001");
-    store.validate(100); // trigger alerts
+    REQUIRE(store.activate_license(lic, "LICENSE-ALERT-001").has_value());
+    REQUIRE(store.validate(100).has_value()); // trigger alerts
 
     auto alerts = store.list_alerts();
-    if (!alerts.empty()) {
-        auto ack_result = store.acknowledge_alert(alerts[0].id);
-        CHECK(ack_result == true);
+    REQUIRE(alerts.has_value());
+    if (!alerts->empty()) {
+        auto ack_result = store.acknowledge_alert((*alerts)[0].id);
+        CHECK(ack_result.has_value());
 
         auto unacked = store.list_alerts(true);
+        REQUIRE(unacked.has_value());
         bool found_acked = false;
-        for (auto& a : unacked) {
-            if (a.id == alerts[0].id)
+        for (auto& a : *unacked) {
+            if (a.id == (*alerts)[0].id)
                 found_acked = true;
         }
         CHECK(found_acked == false);
     }
 }
 
-TEST_CASE("T2 REST: license remove", "[rest_api_t2][license]") {
-    auto path = unique_temp_path("license-remove");
-    TempFileGuard guard(path);
-    LicenseStore store(path);
+TEST_CASE("T2 REST: license remove", "[rest_api_t2][license][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore store{pool};
     REQUIRE(store.is_open());
 
     License lic;
@@ -784,10 +807,11 @@ TEST_CASE("T2 REST: license remove", "[rest_api_t2][license]") {
     REQUIRE(result.has_value());
 
     auto removed = store.remove_license(*result);
-    CHECK(removed == true);
+    CHECK(removed.has_value());
 
     auto active = store.get_active_license();
-    CHECK(!active.has_value());
+    REQUIRE(active.has_value());
+    CHECK(!active->has_value());
 }
 
 // ============================================================================
@@ -893,10 +917,10 @@ TEST_CASE("T2 REST: device tokens and software deployment independent stores",
 }
 
 TEST_CASE("T2 REST: license store and execution tracker independent operation",
-          "[rest_api_t2][cross_store]") {
-    auto license_path = unique_temp_path("cross-license");
-    TempFileGuard lg(license_path);
-    LicenseStore license_store(license_path);
+          "[rest_api_t2][cross_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, license_store_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    LicenseStore license_store{pool};
     REQUIRE(license_store.is_open());
 
     TestDb tdb;
@@ -919,8 +943,12 @@ TEST_CASE("T2 REST: license store and execution tracker independent operation",
     REQUIRE(exec_id.has_value());
 
     // Both stores maintain their data independently
-    CHECK(license_store.has_feature("unlimited_executions") == true);
-    CHECK(license_store.seat_count() == 50);
+    auto feat = license_store.has_feature("unlimited_executions");
+    REQUIRE(feat.has_value());
+    CHECK(*feat == true);
+    auto seats = license_store.seat_count();
+    REQUIRE(seats.has_value());
+    CHECK(*seats == 50);
 
     auto fetched = tracker.get_execution(*exec_id);
     CHECK(fetched.has_value());

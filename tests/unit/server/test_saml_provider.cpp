@@ -969,6 +969,179 @@ static std::string extract_request_id_from_url(const std::string& url) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helpers: AuthnRequest signature reconstruction/verification (HTTP-Redirect
+// binding detached query-string signature — SAML 2.0 core §3.4.4.1).
+// ─────────────────────────────────────────────────────────────────────────────
+
+static std::string url_decode_simple(const std::string& encoded) {
+    std::string out;
+    for (std::size_t i = 0; i < encoded.size(); ++i) {
+        if (encoded[i] == '%' && i + 2 < encoded.size()) {
+            char hex[3] = {encoded[i + 1], encoded[i + 2], 0};
+            out += static_cast<char>(std::strtol(hex, nullptr, 16));
+            i += 2;
+        } else if (encoded[i] == '+') {
+            out += ' ';
+        } else {
+            out += encoded[i];
+        }
+    }
+    return out;
+}
+
+static std::vector<unsigned char> std_b64_decode(const std::string& b64) {
+    static constexpr unsigned char kT[256] = {
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64, 64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64, 64,64,64,64,64,64,64,64, 64,64,64,62,64,64,64,63,
+        52,53,54,55,56,57,58,59,60,61,64,64,64,64,64,64,
+        64, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,64,64,64,64,64,
+        64,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,64,64,64,64,64,
+        // 128-255: 64
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,64,
+        64,64,64,64,64,64,64,64,
+    };
+    std::vector<unsigned char> out;
+    unsigned int val = 0;
+    int bits = -8;
+    for (unsigned char c : b64) {
+        if (kT[c] == 64) continue;
+        val = (val << 6) | kT[c];
+        bits += 6;
+        if (bits >= 0) {
+            out.push_back(static_cast<unsigned char>((val >> bits) & 0xFF));
+            bits -= 8;
+        }
+    }
+    return out;
+}
+
+/// Returns the substring of `url` after '?' and before "&Signature=" — the
+/// exact octet-string the production code signs. Empty when the URL carries
+/// no "&Signature=" marker.
+static std::string extract_signed_base(const std::string& url) {
+    const auto q_pos = url.find('?');
+    if (q_pos == std::string::npos) return {};
+    const auto sig_marker = url.find("&Signature=", q_pos);
+    if (sig_marker == std::string::npos) return {};
+    return url.substr(q_pos + 1, sig_marker - (q_pos + 1));
+}
+
+/// Returns the raw (URL- and base64-decoded) signature bytes from the
+/// "&Signature=" parameter of `url`. Empty when absent.
+static std::vector<unsigned char> extract_signature_bytes(const std::string& url) {
+    static const std::string kMarker = "&Signature=";
+    const auto pos = url.find(kMarker);
+    if (pos == std::string::npos) return {};
+    const auto encoded = url.substr(pos + kMarker.size());
+    return std_b64_decode(url_decode_simple(encoded));
+}
+
+/// Verify a detached RSA-SHA256 signature (EXPLICIT PKCS#1 v1.5 padding) over
+/// `base` using the public component of `priv_key_pem`. Mirrors the exact
+/// padding contract of the production rsa_sha256_sign — using a private-key
+/// PEM here is fine, OpenSSL verify only consumes the public numbers it
+/// carries.
+static bool verify_rsa_sha256(const std::string& priv_key_pem, const std::string& base,
+                               const std::vector<unsigned char>& sig) {
+    BIO* bio = BIO_new_mem_buf(priv_key_pem.data(), static_cast<int>(priv_key_pem.size()));
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    EVP_PKEY* pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    REQUIRE(ctx != nullptr);
+    struct CtxGuard { EVP_MD_CTX* c; ~CtxGuard() { EVP_MD_CTX_free(c); } } cg{ctx};
+
+    EVP_PKEY_CTX* pctx = nullptr;
+    REQUIRE(EVP_DigestVerifyInit(ctx, &pctx, EVP_sha256(), nullptr, pkey) == 1);
+    REQUIRE(pctx != nullptr);
+    REQUIRE(EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PADDING) > 0);
+    REQUIRE(EVP_DigestVerifyUpdate(ctx, base.data(), base.size()) == 1);
+    return EVP_DigestVerifyFinal(ctx, sig.data(), sig.size()) == 1;
+}
+
+/// Generate a fresh EC (P-256) private key PEM — used to prove a non-RSA
+/// signing key is rejected.
+static std::string generate_ec_key_pem() {
+    EVP_PKEY* pkey = EVP_EC_gen("P-256");
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+/// A valid RSA-2048 key, PEM-encoded AES-256-CBC passphrase-encrypted. The
+/// provider must reject it WITHOUT prompting for the passphrase (UP-1).
+static std::string generate_encrypted_rsa_key_pem() {
+    EVP_PKEY* pkey = EVP_RSA_gen(2048);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    std::string pass = "test-passphrase";
+    REQUIRE(PEM_write_bio_PrivateKey(
+                bio, pkey, EVP_aes_256_cbc(),
+                reinterpret_cast<unsigned char*>(pass.data()),
+                static_cast<int>(pass.size()), nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+/// A valid but WEAK (1024-bit) unencrypted RSA key — below the 2048-bit floor.
+static std::string generate_small_rsa_key_pem() {
+    EVP_PKEY* pkey = EVP_RSA_gen(1024);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+/// A valid RSA-PSS key (EVP_PKEY_RSA_PSS base id) — must be rejected by the
+/// RSA-only gate, never signed with PKCS#1 v1.5.
+static std::string generate_rsa_pss_key_pem() {
+    EVP_PKEY_CTX* ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA_PSS, nullptr);
+    REQUIRE(ctx != nullptr);
+    struct CtxGuard { EVP_PKEY_CTX* c; ~CtxGuard() { if (c) EVP_PKEY_CTX_free(c); } } cg{ctx};
+    REQUIRE(EVP_PKEY_keygen_init(ctx) == 1);
+    REQUIRE(EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048) == 1);
+    EVP_PKEY* pkey = nullptr;
+    REQUIRE(EVP_PKEY_keygen(ctx, &pkey) == 1);
+    REQUIRE(pkey != nullptr);
+    struct PkeyGuard { EVP_PKEY* k; ~PkeyGuard() { if (k) EVP_PKEY_free(k); } } pg{pkey};
+
+    BIO* bio = BIO_new(BIO_s_mem());
+    REQUIRE(bio != nullptr);
+    struct BioGuard { BIO* b; ~BioGuard() { if (b) BIO_free(b); } } bg{bio};
+    REQUIRE(PEM_write_bio_PrivateKey(bio, pkey, nullptr, nullptr, 0, nullptr, nullptr) == 1);
+    BUF_MEM* bptr = nullptr;
+    BIO_get_mem_ptr(bio, &bptr);
+    return std::string(bptr->data, bptr->length);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // TEST CASES
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1028,6 +1201,166 @@ TEST_CASE("SAML: build_authn_request generates valid redirect URL", "[saml]") {
     CHECK_FALSE(request_id.empty());
     // Request ID must start with '_' (required for valid XML ID production)
     CHECK(request_id[0] == '_');
+}
+
+TEST_CASE("SAML: build_authn_request is unsigned when no SP signing key is configured "
+          "(backward-compat)",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    REQUIRE(cfg.sp_signing_key_pem.empty());
+    SamlProvider p{cfg};
+
+    const auto authn = p.build_authn_request("myrelay");
+    const auto& url  = authn.url;
+    REQUIRE_FALSE(url.empty());
+
+    // Matches the existing unsigned shape exactly: "?SAMLRequest=...&RelayState=...".
+    CHECK(url.starts_with(f.idp_sso_url + "?SAMLRequest="));
+    CHECK(url.find("&RelayState=") != std::string::npos);
+    CHECK(url.find("SigAlg=") == std::string::npos);
+    CHECK(url.find("Signature=") == std::string::npos);
+}
+
+TEST_CASE("SAML: build_authn_request signs the redirect URL when an SP signing key is "
+          "configured",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = f.priv_key_pem; // RSA-2048 — exactly our supported type
+    SamlProvider p{cfg};
+
+    const auto authn = p.build_authn_request("myrelay");
+    const auto& url  = authn.url;
+    REQUIRE_FALSE(url.empty());
+
+    CHECK(url.find("&SigAlg=http%3A%2F%2Fwww.w3.org%2F2001%2F04%2Fxmldsig-more%23rsa-sha256") !=
+          std::string::npos);
+    CHECK(url.find("&Signature=") != std::string::npos);
+
+    const auto base = extract_signed_base(url);
+    REQUIRE_FALSE(base.empty());
+    CHECK(base.starts_with("SAMLRequest="));
+    CHECK(base.find("&RelayState=") != std::string::npos);
+    CHECK(base.find("myrelay") != std::string::npos); // "myrelay" is alnum-only, url_encode is a no-op
+    CHECK(base.find("&SigAlg=") != std::string::npos);
+    CHECK(base.find("&Signature=") == std::string::npos); // extract_signed_base stops there
+
+    const auto sig = extract_signature_bytes(url);
+    REQUIRE_FALSE(sig.empty());
+    CHECK(verify_rsa_sha256(f.priv_key_pem, base, sig));
+
+    // MUTATION-CHECK: tampering a single byte of the signed base must fail
+    // verification — proves the test isn't accidentally verifying against
+    // an empty/always-true signature.
+    std::string tampered = base;
+    tampered[0] = (tampered[0] == 'S') ? 'X' : 'S';
+    CHECK_FALSE(verify_rsa_sha256(f.priv_key_pem, tampered, sig));
+}
+
+TEST_CASE("SAML: signed AuthnRequest with empty RelayState omits RelayState from the signed "
+          "base entirely",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = f.priv_key_pem;
+    SamlProvider p{cfg};
+
+    const auto authn = p.build_authn_request(""); // no relay state
+    const auto& url  = authn.url;
+    REQUIRE_FALSE(url.empty());
+
+    const auto base = extract_signed_base(url);
+    REQUIRE_FALSE(base.empty());
+    // Never "RelayState=" — omitted entirely, not present-but-empty.
+    CHECK(base.find("RelayState=") == std::string::npos);
+    CHECK(base.starts_with("SAMLRequest="));
+    CHECK(base.find("&SigAlg=") != std::string::npos);
+
+    const auto sig = extract_signature_bytes(url);
+    REQUIRE_FALSE(sig.empty());
+    CHECK(verify_rsa_sha256(f.priv_key_pem, base, sig));
+}
+
+TEST_CASE("SAML: a non-RSA (EC) SP signing key is rejected — signing stays disabled", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = generate_ec_key_pem();
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK(p.signing_init_error().find("RSA") != std::string::npos);
+
+    // The provider itself may still be otherwise enabled (IdP verification is
+    // independent of SP signing) — but the redirect URL must never carry a
+    // signature produced from a rejected key. Assert the URL is present
+    // UNCONDITIONALLY: a future regression that made is_enabled() false on a
+    // broken signing key would otherwise make this check silently vacuous.
+    const auto authn = p.build_authn_request("myrelay");
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
+}
+
+TEST_CASE("SAML: a malformed SP signing key PEM is rejected", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = "not a key";
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK_FALSE(p.signing_init_error().empty());
+}
+
+TEST_CASE("SAML: a weak (1024-bit) SP signing key is rejected — below the 2048-bit floor",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = generate_small_rsa_key_pem();
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK_FALSE(p.signing_init_error().empty());
+
+    const auto authn = p.build_authn_request("myrelay");
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
+}
+
+TEST_CASE("SAML: an RSA-PSS SP signing key is rejected by the RSA-only gate", "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = generate_rsa_pss_key_pem();
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK_FALSE(p.signing_init_error().empty());
+
+    const auto authn = p.build_authn_request("myrelay");
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
+}
+
+TEST_CASE("SAML: an encrypted (passphrase-protected) SP signing key is rejected "
+          "without prompting",
+          "[saml]") {
+    const auto& f = fixture();
+    auto cfg      = f.make_config();
+    cfg.sp_signing_key_pem = generate_encrypted_rsa_key_pem();
+    // If the ctor ever fell back to OpenSSL's default password callback this
+    // would prompt on /dev/tty and hang the test; the no-op callback makes it
+    // fail closed deterministically instead. (UP-1)
+    SamlProvider p{cfg};
+
+    CHECK(p.signing_configured_but_broken());
+    CHECK_FALSE(p.signing_init_error().empty());
+
+    const auto authn = p.build_authn_request("myrelay");
+    REQUIRE_FALSE(authn.url.empty());
+    CHECK(authn.url.find("SigAlg=") == std::string::npos);
+    CHECK(authn.url.find("Signature=") == std::string::npos);
 }
 
 TEST_CASE("SAML: valid signed assertion is accepted", "[saml]") {

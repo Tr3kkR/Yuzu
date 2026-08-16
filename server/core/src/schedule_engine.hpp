@@ -27,6 +27,13 @@ struct InstructionSchedule {
     int execution_count{0};
     std::string created_by;
     int64_t created_at{0};
+    // Canonical JSON object (PR1.5a, schedule_params_parsers.hpp), sorted
+    // keys, scalar values only. create_schedule() defaults an empty value to
+    // "{}" and re-canonicalizes whatever is supplied, so a row read back
+    // from storage always carries a validated canonical blob — never the raw
+    // caller-supplied text and never truly empty. Additive column
+    // (migration v2); pre-existing rows back-fill to "{}".
+    std::string parameter_values;
 };
 
 struct ScheduleQuery {

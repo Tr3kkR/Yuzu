@@ -477,7 +477,7 @@ collisions possible; vendor precision pending ADR-0018). See
 
 ### 9.9 Quarantine Status Tracking :white_check_mark: `T2`
 
-`QuarantineStore` (SQLite backend). Server-side quarantine records with agent_id, status (active/released), quarantined_by, timestamps, whitelist, and reason. `list_quarantined()` for active quarantines, `get_history()` for per-agent quarantine history. REST API endpoints for quarantine/release/status.
+`QuarantineStore` (PostgreSQL backend, schema `quarantine_store`, ADR-0047). Server-side quarantine records with agent_id, status (active/released), quarantined_by, timestamps, whitelist, and reason. `list_quarantined()` for active quarantines, `get_history()` for per-agent quarantine history. REST API endpoints for quarantine/release/status.
 
 ### 9.10 Application Whitelisting :x: `T3`
 
@@ -539,7 +539,7 @@ Not implemented. Integrity verification of directory trees.
 
 ### 10.13 File Retrieval (Upload to Server) :white_check_mark: `T2`
 
-`upload_file` action in `content_dist` plugin. Agent-side: SHA-256 hash, multipart POST to server. Server-side: `POST /api/v1/file-retrieval` endpoint. File stored in `{data_dir}/file-retrieval/`. `GET/DELETE` endpoints for management.
+`upload_file` action in `content_dist` plugin, via the PR1.6 one-time upload-grant + authenticated chunked-receive protocol (`docs/adr/3004-artifact-blob-storage.md`) — the legacy unauthenticated `POST /api/v1/file-retrieval` endpoint was removed. Operator mints a grant (`POST /api/v1/upload-grants`); the agent redeems it, streams the file in bounded chunks with per-chunk offset CAS, and commits with a SHA-256 computed from the exact bytes acknowledged. File stored in `{data_dir}/upload-blobs/{retention_class}/{grant_id}`. `GET /api/v1/upload-grants` (list) / `DELETE /api/v1/upload-grants/{id}` (revoke) for management.
 
 ### 10.14 Find File by Size and Hash :white_check_mark: `T2`
 
@@ -917,7 +917,7 @@ Kubernetes-style health probes: `/livez` (always 200) and `/readyz` (checks stor
 
 ### 22.3 License Management :white_check_mark: `T2`
 
-`LicenseStore` (SQLite) with seat-based licensing, expiry, edition, feature flags. Soft enforcement with alerts at 90% seats / 30 days to expiry. REST: `GET/POST/DELETE /api/v1/license`, `GET /api/v1/license/alerts`.
+`LicenseStore` with seat-based licensing, expiry, edition, feature flags. Soft enforcement with alerts at 90% seats / 30 days to expiry. REST: `GET/POST/DELETE /api/v1/license`, `GET /api/v1/license/alerts`. **Dormant** (ADR-0048) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
 
 ### 22.4 Platform Configuration (TTLs, Limits) :white_check_mark: `T2`
 

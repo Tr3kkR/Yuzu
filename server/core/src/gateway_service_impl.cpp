@@ -656,13 +656,39 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
     }
 
     switch (request->event()) {
-    case gw::StreamStatusNotification::CONNECTED:
-        registry_.set_gateway_node(agent_id, request->gateway_node());
-        spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}'", agent_id,
-                     request->gateway_node());
+    case gw::StreamStatusNotification::CONNECTED: {
+        // PLAN item 5 (CC-03, peer finding PLAN-007): `wire_capabilities` was
+        // read off the wire and dropped on the floor here — p3's advertised
+        // capability set never reached the registry, so the dispatch
+        // chokepoint's routed-path gateway-capability check (agent_registry.cpp)
+        // had nothing to consult and every gateway session looked
+        // capability-less. Record the FULL set exactly as advertised; a
+        // reconnect (a fresh CONNECTED, which this branch always is —
+        // `wire_capabilities` is sent with EVERY CONNECTED notification, not
+        // only the first) REPLACES it, never merges.
+        //
+        // M1 (review finding, post-merge round): node + capabilities publish
+        // through ONE call, `set_gateway_route` — they used to be two calls,
+        // which both raced `send_to`/`send_to_all`'s reads on `gateway_node`
+        // (a C++ data race: written under a different lock than it was read
+        // under) and exposed an observable intermediate state (node set,
+        // capabilities not yet replaced) that could false-deny a dispatch.
+        std::vector<std::string> wire_capabilities(request->wire_capabilities().begin(),
+                                                    request->wire_capabilities().end());
+        registry_.set_gateway_route(agent_id, request->gateway_node(),
+                                    std::move(wire_capabilities));
+        spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}' ({} wire "
+                     "capabilit{})",
+                     agent_id, request->gateway_node(), request->wire_capabilities_size(),
+                     request->wire_capabilities_size() == 1 ? "y" : "ies");
         break;
+    }
 
     case gw::StreamStatusNotification::DISCONNECTED:
+        // `clear_stream_if_session` also clears the advertised-capability set
+        // (agent_registry.cpp) — a session whose stream is gone has nothing
+        // live to route a dispatch-tagged command through, so no separate
+        // clear call is needed here.
         registry_.clear_stream_if_session(agent_id, session_id);
         registry_.remove_agent_if_session(agent_id, session_id);
         {

@@ -1,6 +1,6 @@
 # The authz MODEL (ADR-0033 §2) and per-device dispatch visibility (#1788)
 
-This document covers two related but separable pieces of PR1.4:
+This document covers two related but separable pieces of PR1.4, plus a PR1.9a addition:
 
 1. **The registry-independent authz MODEL** (`server/core/src/authz_model.hpp`) — the
    securable×operation×risk_tier×mcp_tier_class classification a future runtime
@@ -8,10 +8,15 @@ This document covers two related but separable pieces of PR1.4:
    route.
 2. **The #1788 fix** — closing the `/api/command` per-device visibility gap across all four
    dispatch arms.
+3. **PR1.9a: the command capability registry (pure headers) + three new securables** — the
+   `plugin.action` classification core PR1.9's registration path will eventually consume, plus the
+   live RBAC seed extensions (`PluginConfig`/`PluginSecret`/`UploadGrant`) it needs to not deny an
+   Administrator on a fresh RBAC-enabled install (peer finding PLAN-001). See §3 below.
 
-Both live in `authz_model.hpp` because the second reuses the first's shared `VisibleSet`
-primitive, but they are independent: the model does not enforce anything, and the #1788 fix does
-not depend on the seed catalogue.
+Both PR1.4 pieces live in `authz_model.hpp` because the second reuses the first's shared
+`VisibleSet` primitive, but they are independent: the model does not enforce anything, and the
+#1788 fix does not depend on the seed catalogue. §3 is a separate PR entirely and lives in its own
+headers (`command_capability.hpp` etc.) plus an additive `authz_model.hpp` extension.
 
 ## Spine-version assumption
 
@@ -251,6 +256,74 @@ holder could enumerate devices outside every caller's actionable scope.
   list runs first, and this fix's visibility filter composes on top of whatever `agent_ids` block
   leaves behind (intersecting twice is idempotent).
 
+## 3. PR1.9a: the command capability registry (pure headers) + three new securables
+
+### The classification core
+
+Three new header-only files under `server/core/src/`, zero `server.cpp` involvement:
+
+- **`command_capability.hpp`** — `DispatchClass` (ReadOnly/Mutating/Destructive) and `Mutability`
+  (None/Reversible/Irreversible), deliberately independent axes set explicitly per row rather than
+  inferred from each other or from `authz::Operation` (same ADR-0033 §1 "not self-certified"
+  reasoning as `McpTierClass` in §1 above). `CommandCapability` is a view/enum-only struct — no
+  `std::string`, no heap on the lookup path. `CommandCapabilityRegistry` composes SEVERAL
+  independently-authored fragments (injected as `std::span`s via its constructor's
+  `initializer_list`, stored in a small fixed array — never a file-scope singleton) and exposes
+  `classify(plugin, action)`, case-insensitive on both components (matching the lowercase
+  normalisation `server.cpp:6360-6368` applies to the action before dispatch, extended here to the
+  plugin half too). A miss is `ClassificationError::Unclassified`, **never** a permissive default;
+  the same `plugin.action` declared by two fragments is `ClassificationError::Ambiguous`, never
+  first-wins.
+- **`command_capability_parsers.hpp`** — `normalize_action_key`, `compute_plan_hash` (a
+  parameter-insertion-order-invariant plan identity, since it iterates a `std::map` in its natural
+  key order), and `encode_dispatch_tag`/`decode_dispatch_tag` for the **frozen** wire grammar
+  `v1|<class>|<mutability>|<plan_hash_hex>` (class ∈ {ro,mut,dest}, mutability ∈
+  {none,rev,irrev}) — later PRs mirror this exact grammar into the proto comment and put it on the
+  wire; this header is the one place that gets to change the spelling.
+- **`capability_decls/core_dispatch_capabilities.hpp`** — this package's own fragment: the three
+  dispatches the **server issues to itself** (`tar.fleet_snapshot`, `__guard__.push_rules`,
+  `asset_tags.sync`), each `system_reserved = true`. Every other plugin's rows live in separate
+  per-group fragment headers owned by other packages; none of them are aggregated here.
+
+**Wired to the live dispatch path.** This paragraph previously recorded the registry as
+shipped-incomplete and reachable only from `test_command_capability.cpp`; PR1.9c ended that.
+`ServerImpl::build_classified_command` (`server.cpp`) constructs a `CommandCapabilityRegistry` over
+all six spans — `core_dispatch_capabilities()` plus the five per-group fragment headers — and every
+`CommandRequest` the server builds is classified and authorized through it. An unclassified or
+ambiguous `plugin.action` is refused there, so the registry is now load-bearing rather than
+declarative.
+
+### Three new securables
+
+The declaration model above is not the same thing as the live RBAC seed — `RbacStore::seed_defaults()`
+(`rbac_store.cpp:283-375`) independently seeds its own `types[]`/`ops[]` arrays, and a securable
+absent from `types[]` cannot receive a default grant (including Administrator's). This PR appends
+three securables to both `authz_model.hpp`'s `kSeedCatalogue` (representative `CapabilitySeed` rows)
+and `rbac_store.cpp`'s `types[]` (the live seed):
+
+| Securable | Purpose | Example operation |
+|---|---|---|
+| `PluginConfig` | A plugin's configuration, including its kill-switch flip | `PluginConfig:Write` |
+| `PluginSecret` | Plugin secret material (credentials, tokens a plugin holds) | `PluginSecret:Write` |
+| `UploadGrant` | The mint/revoke lifecycle of an upload grant (not the file transfer itself — that stays under the existing `FileRetrieval` securable) | `UploadGrant:Write` (mint), `UploadGrant:Delete` (revoke) |
+
+No new `Operation` enumerator — every one of the three maps onto the existing
+Read/Write/Execute/Delete/Approve vocabulary, keeping the `rbac_store.cpp` change to three appended
+`types[]` strings plus role grants, with `ops[]` untouched byte-for-byte.
+
+Role grants (`rbac_store.cpp` `seed_defaults()`):
+
+| Role | PluginConfig | PluginSecret | UploadGrant |
+|---|---|---|---|
+| Administrator | Read/Write/Execute/Delete/Approve (existing CRUD loop over `types[]`) | Read/Write/Execute/Delete/Approve | Read/Write/Execute/Delete/Approve |
+| PlatformEngineer | Read/Write/Delete | Read/Write/Delete | Read/Write/Delete |
+| Operator | Read | **none** | Read |
+
+Operator deliberately never sees `PluginSecret` — secret material stays PlatformEngineer/
+Administrator-only, unlike `PluginConfig`/`UploadGrant` where Operator gets read visibility for
+day-to-day triage. No other role (Viewer, ITServiceOwner, ApiTokenManager, Reviewer) is touched by
+this PR.
+
 ## Testing
 
 `tests/unit/server/test_authz_model.cpp` covers:
@@ -279,3 +352,13 @@ call fails them.
 Route-level tests additionally prove the HANDOFF — that each handler derives the caller's visible
 set and threads it in — for the MCP, REST-bundle, dashboard, instruction-execute and
 workflow-execute surfaces. Handoff plus intersection together is the full path; either alone is not.
+
+`tests/unit/server/test_command_capability.cpp` covers §3's classification core:
+`CommandCapabilityRegistry::classify` (unknown → `Unclassified`, cross-fragment collision →
+`Ambiguous`, case-insensitivity on both `plugin` and `action`), `core_dispatch_capabilities()`'s
+three rows, and the `command_capability_parsers.hpp` helpers (`compute_plan_hash`'s
+insertion-order invariance and per-component sensitivity, and `encode_dispatch_tag`/
+`decode_dispatch_tag` round-tripping every `DispatchClass`×`Mutability` pair and rejecting a
+malformed tag). `tests/unit/server/test_rbac_store.cpp` adds the PLAN-001 fresh-seed coverage:
+securable-type presence, and the Administrator/PlatformEngineer/Operator grant tables above,
+including the explicit "Operator holds nothing on `PluginSecret`" negative assertion.

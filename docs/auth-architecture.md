@@ -929,6 +929,7 @@ mapping below).
 | `--saml-sp-acs-url` | `YUZU_SAML_SP_ACS_URL` | Full URL of this server's Assertion Consumer Service (`POST /saml/acs`) |
 | `--saml-group-attribute` *(optional)* | `YUZU_SAML_GROUP_ATTRIBUTE` | `<Attribute Name="...">` in the assertion's `<AttributeStatement>` whose `<AttributeValue>`s are group identifiers (e.g. Entra's `http://schemas.microsoft.com/ws/2008/06/identity/claims/groups`) |
 | `--saml-admin-group` *(optional)* | `YUZU_SAML_ADMIN_GROUP` | Group value (from `--saml-group-attribute`) that grants `role=admin` |
+| `--saml-sp-key` *(optional)* | `YUZU_SAML_SP_KEY` | Filesystem path to an SP AuthnRequest signing private key (PEM, **RSA only**); when set, AuthnRequests are signed (see AuthnRequest signing below) |
 
 Example startup:
 
@@ -959,8 +960,10 @@ binding.
 2. The server builds a `<samlp:AuthnRequest>` (SP entity ID, ACS URL,
    `ID`=random, `IssueInstant`, `ForceAuthn=false`) and redirects the browser
    to the IdP's SSO URL via HTTP-Redirect binding (deflate-compressed,
-   URL-encoded `SAMLRequest` query parameter). **AuthnRequest signing is not
-   implemented in this slice** — the request is unsigned.
+   URL-encoded `SAMLRequest` query parameter). When `--saml-sp-key` is
+   configured, the request is signed (see AuthnRequest signing below);
+   otherwise it is unsigned — the IdP must be configured to accept unsigned
+   requests in that case.
 3. The user authenticates at the IdP.
 4. The IdP POSTs a `<samlp:Response>` containing a signed `<saml:Assertion>`
    to the ACS endpoint (`POST /saml/acs`).
@@ -1102,13 +1105,40 @@ its in-process PKCE state.
 Update `--saml-idp-cert` and **restart the server** — there is no hot-reload
 for the IdP cert in this release.
 
+### AuthnRequest signing
+
+Optional and independent of the five-flag enable gate: `--saml-sp-key`
+points at a filesystem PEM containing the SP's AuthnRequest signing private
+key. Design:
+
+- **Binding and algorithm.** Signs over the **HTTP-Redirect binding** only
+  (the only binding the SP uses for AuthnRequest) with **RSA PKCS#1 v1.5 +
+  SHA-256** (`SigAlg` `http://www.w3.org/2001/04/xmldsig-more#rsa-sha256`),
+  carried as the `SigAlg`/`Signature` query parameters alongside
+  `SAMLRequest` — per the standard query-string signing scheme for this
+  binding.
+- **RSA only.** EC and RSA-PSS keys are rejected; only a plain RSA key
+  parses.
+- **Pinned single signing key, parsed once at boot.** `server.cpp` reads the
+  key file, and `SamlProvider`'s constructor parses it once into an owned
+  `EVP_PKEY`, retained for the process lifetime — mirrors the IdP cert's
+  pinned-at-boot posture (N1 above), applied here to the SP's own key
+  instead of the IdP's — the key is not re-read per request.
+- **Fail-closed, never a silent downgrade.** The key file passes the same
+  private-key permission check used for the HTTPS/gateway TLS keys (not
+  group/other-readable), then the same 64 KiB read-and-cap the IdP cert PEM
+  uses. A permission failure, unreadable file, oversize file, malformed PEM,
+  or non-RSA key disables SAML **entirely** at startup (the provider is not
+  constructed / is reset) rather than silently falling back to unsigned
+  AuthnRequests. A per-request signing failure fails `/auth/saml/start`
+  rather than emitting an unsigned redirect.
+- **Backward-compatible default.** Left unset, AuthnRequests remain
+  unsigned, same as prior releases.
+
 ### Deferred items (not in this slice)
 
 - **Login-page SSO button.** There is no "Sign in with SAML" button on the
   login page; users must navigate directly to `GET /auth/saml/start`.
-- **AuthnRequest signing.** The SP does not sign its `<samlp:AuthnRequest>`; the
-  IdP must be configured to accept unsigned requests. If the IdP requires signed
-  AuthnRequests, use OIDC.
 - **`--auth-mode=sso-only` for SAML.** A SAML-only deployment cannot disable
   local-password login. Compliance impact: CC6.3 (local-password fallback
   remains active). OIDC is the path to `sso-only`.
@@ -2397,6 +2427,16 @@ header, so these names stay rejected on client ingress permanently.
 
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
 - **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
+
+### Service-scoped token fleet-wide confinement (guardian-confinement-2298, interim)
+
+A **service-scoped API token** is bound to one IT service's agents (`session->token_scope_service` non-empty on the resolved session) — created so an integration's credential reaches only the devices tagged to its own service, not the whole fleet. A recurring gap closed across several branches: a confinement check keyed on username, role, or resource ownership never actually consulted the token's *own* service-tag scope, so a service-scoped token could reach fleet-wide data or, on a few mutating surfaces, fleet-wide actions.
+
+The fix is a **blanket deny** — a service-scoped token gets `403` outright on the affected surface, rather than a narrowed per-service view — because the surfaces in question (fleet-wide census reads, and a handful of fleet-wide mutations like Guardian Baseline deploy) have no natural per-service slice to narrow to. This is a deliberate **interim posture**, not a design ambition: the durable fix — persisting the minting token's service scope where each per-request confinement check can consult it — is unbuilt.
+
+**The check itself is forked, not shared, across ~8 independent implementations** plus inline checks in several more files — see `.claude/routed-concerns-access-control.md`'s row for the current authoritative list of call sites and their exact shapes. Governance review (2026-08) explicitly recommended deferring consolidation into one chokepoint (the shape `authz_topology_floor.hpp`/`body_cap_policy.hpp` use for structurally identical problems) until the instance inventory settles — extend an existing helper in the file you're touching; do not hand-roll a 10th copy.
+
+**Known-but-unfixed instances** are tracked as GitHub issues, updated as fixes land: #3123 (device discovery), #3124 (response/execution data), #3125 (inventory data). Check an issue's current body before citing an instance count from it — issues are edited down as their listed instances get fixed elsewhere.
 
 ## Engine principals & delegation (ADR-1005 — design)
 

@@ -278,15 +278,68 @@ void AgentRegistry::clear_stream_if_session(const std::string& agent_id,
         session->stream = nullptr;
         session->server_context = nullptr;
         session->peer_cert_pem.clear(); // PR3 H-1: stream gone → nothing to sweep
+        // PLAN item 5: a stream that's gone has nothing live to route a
+        // dispatch-tagged command through, gateway or not — clear the
+        // advertised-capability set alongside the other connection-lifetime
+        // fields so a later reconnect starts from a clean slate rather than
+        // inheriting a prior connection's advertisement.
+        session->gateway_wire_capabilities.clear();
     }
 }
 
-void AgentRegistry::set_gateway_node(const std::string& agent_id, const std::string& node) {
-    std::lock_guard lock(mu_);
-    auto it = agents_.find(agent_id);
-    if (it != agents_.end()) {
-        it->second->gateway_node = node;
+void AgentRegistry::set_gateway_route(const std::string& agent_id, const std::string& node,
+                                      std::vector<std::string> capabilities) {
+    std::shared_ptr<AgentSession> session;
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end())
+            return;
+        session = it->second;
     }
+    // M1 (review finding): `gateway_node` and `gateway_wire_capabilities` used
+    // to be TWO setters, TWO lock domains — this one wrote `node` under `mu_`
+    // only, while `send_to`/`send_to_all` read it under `stream_mu` (a data
+    // race), and CONNECTED published the two fields in two separate calls (an
+    // observable intermediate state: node present, capabilities not yet
+    // replaced, which the gateway-capability gate could read as a false
+    // deny). Both fields are published together, under the SAME lock
+    // `send_to`/`send_to_all` already read them under, so there is exactly
+    // one lock domain and no publish step in between for a reader to land in.
+    std::lock_guard slock(session->stream_mu);
+    session->gateway_node = node;
+    // PLAN item 5: a full REPLACE, never a merge — a reconnect behind an
+    // upgraded (or downgraded) gateway build must not keep stacking
+    // capabilities a prior connection advertised but this one does not.
+    session->gateway_wire_capabilities =
+        std::unordered_set<std::string>(capabilities.begin(), capabilities.end());
+}
+
+void AgentRegistry::clear_gateway_wire_capabilities(const std::string& agent_id) {
+    std::shared_ptr<AgentSession> session;
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end())
+            return;
+        session = it->second;
+    }
+    std::lock_guard slock(session->stream_mu);
+    session->gateway_wire_capabilities.clear();
+}
+
+bool AgentRegistry::gateway_has_wire_capability(const std::string& agent_id,
+                                                std::string_view capability) const {
+    std::shared_ptr<AgentSession> session;
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end())
+            return false;
+        session = it->second;
+    }
+    std::lock_guard slock(session->stream_mu);
+    return session->gateway_wire_capabilities.contains(std::string(capability));
 }
 
 void AgentRegistry::sweep_and_publish_trusted_gateway_locked() {
@@ -378,7 +431,80 @@ void AgentRegistry::expire_trusted_gateway_for_test(std::chrono::seconds offset)
         .set(static_cast<double>(trusted_gateway_peer_ips_.size()));
 }
 
-bool AgentRegistry::send_to(const std::string& agent_id, const pb::CommandRequest& cmd) {
+namespace {
+
+/// PLAN item 3 (belt-and-braces): the TYPE invariant (private
+/// `ClassifiedCommand` constructor, `ServerImpl`-only friend) is what
+/// actually stops a hand-built `pb::CommandRequest` from reaching either send
+/// path — this is a SEPARATE, defensive runtime check that the tag a
+/// `ClassifiedCommand` carries still decodes, counted apart from the
+/// gateway-capability denial below so the two failure modes are
+/// distinguishable on a dashboard. Shared by `send_to`/`send_to_all` so the
+/// two cannot drift on what "malformed" means.
+bool tag_is_valid(const pb::CommandRequest& cmd, yuzu::MetricsRegistry& metrics,
+                  const std::string& agent_id) {
+    if (yuzu::server::decode_dispatch_tag(cmd.dispatch_tag()))
+        return true;
+    metrics.counter("yuzu_server_dispatch_tag_invalid_total").increment();
+    spdlog::error("send_to: ClassifiedCommand for agent {} carries an unparseable dispatch_tag "
+                 "'{}' — refusing to send (defensive check)",
+                 agent_id, cmd.dispatch_tag());
+    return false;
+}
+
+/// PLAN item 5 (CC-03): true iff `session` is routed through a gateway that
+/// has NOT proven — via its most recent CONNECTED advertisement — that it
+/// forwards `CommandRequest.dispatch_tag` untouched. Every dispatch reaching
+/// this point already carries a non-empty tag (only `ClassifiedCommand`
+/// reaches `send_to`/`send_to_all`, and `build_classified_command` always
+/// stamps one), so this check applies unconditionally on the gateway-routed
+/// arm — never silently downgraded to "send anyway, tag be damned".
+///
+/// DECISION (CC-03, adversarial review): the `session.gateway_node.empty()`
+/// early-return is DEFENSIVE, not the decision point, and is deliberately
+/// left as an allow. Both callers only enter the gateway arm when
+/// `gateway_node` is non-empty, so an empty node never reaches this check in
+/// production — flipping it to deny would change nothing and would misstate
+/// where the real hazard lives.
+///
+/// The real hazard is upstream and is a DELIVERY problem, not a gate-posture
+/// one. `gateway_node` (and `gateway_wire_capabilities` with it) is written
+/// only by `NotifyStreamStatus`'s CONNECTED arm, which the gateway delivers
+/// as an Erlang `gen_server:cast` (`yuzu_gw_upstream.erl`) that is dropped
+/// with no retry when the circuit is open or ≥10 notifies are in flight. A
+/// proxied agent whose arming notification was dropped therefore sits with
+/// `gateway_node == ""`, `send_to` takes the DIRECT-STREAM branch, and the
+/// command is written into the gateway's proxy Subscribe stream and never
+/// reaches the agent — the #1004 black-hole the `gateway_node`-first
+/// ordering exists to prevent. Hardening this check cannot see that state,
+/// because the state it would need to observe was never delivered.
+///
+/// What ships here instead: the two deny counters are PRE-REGISTERED at boot
+/// (server.cpp's metrics seed block), so "the check ran and passed" (zero)
+/// is distinguishable from "the check never ran" (absent) — which is exactly
+/// the blind state a dropped arming message produces. Making the arming
+/// delivery itself reliable or reconcilable is a gateway-side change with
+/// its own wire implications and is deliberately NOT folded in here.
+bool gateway_capability_missing(const AgentSession& session, yuzu::MetricsRegistry& metrics,
+                                const std::string& agent_id) {
+    if (session.gateway_node.empty())
+        return false; // direct agent — no gateway hop to prove anything about.
+    if (session.gateway_wire_capabilities.contains(
+            std::string(kGatewayWireCapabilityDispatchTagV1)))
+        return false;
+    metrics
+        .counter("yuzu_server_gateway_capability_denied_total",
+                 {{"capability", std::string(kGatewayWireCapabilityDispatchTagV1)}})
+        .increment();
+    spdlog::warn("send_to: refusing to route a dispatch-tagged command to agent {} via gateway "
+                 "node '{}' — gateway has not advertised '{}'",
+                 agent_id, session.gateway_node, kGatewayWireCapabilityDispatchTagV1);
+    return true;
+}
+
+} // namespace
+
+bool AgentRegistry::send_to(const std::string& agent_id, const ClassifiedCommand& cmd) {
     std::shared_ptr<AgentSession> session;
     {
         std::lock_guard lock(mu_);
@@ -387,6 +513,8 @@ bool AgentRegistry::send_to(const std::string& agent_id, const pb::CommandReques
             return false;
         session = it->second;
     }
+    if (!tag_is_valid(cmd.wire(), metrics_, agent_id))
+        return false;
     std::lock_guard slock(session->stream_mu);
     // #1004: prefer the gateway-pending path when `gateway_node` is set.
     // The canonical fanout path for gateway-routed agents is
@@ -398,16 +526,21 @@ bool AgentRegistry::send_to(const std::string& agent_id, const pb::CommandReques
     // black-hole where the command is Write()-en into the gateway's
     // Subscribe stream and never reaches the agent.
     if (!session->gateway_node.empty()) {
+        // PLAN item 5: DENY, counted and logged, never silently downgraded —
+        // checked under stream_mu, which already guards
+        // gateway_wire_capabilities (set/cleared under the same lock).
+        if (gateway_capability_missing(*session, metrics_, agent_id))
+            return false;
         std::lock_guard glock(gw_pending_mu_);
-        gw_pending_.push_back({agent_id, cmd});
+        gw_pending_.push_back({agent_id, cmd.wire()});
         return true;
     }
     if (session->stream)
-        return session->stream->Write(cmd, grpc::WriteOptions());
+        return session->stream->Write(cmd.wire(), grpc::WriteOptions());
     return false;
 }
 
-int AgentRegistry::send_to_all(const pb::CommandRequest& cmd) {
+int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
     std::vector<std::shared_ptr<AgentSession>> snapshot;
     {
         std::lock_guard lock(mu_);
@@ -416,16 +549,24 @@ int AgentRegistry::send_to_all(const pb::CommandRequest& cmd) {
             snapshot.push_back(s);
         }
     }
+    if (!tag_is_valid(cmd.wire(), metrics_, "<broadcast>"))
+        return 0;
     int count = 0;
     for (auto& s : snapshot) {
         std::lock_guard slock(s->stream_mu);
         // #1004: mirror send_to() — gateway-pending path wins over any
         // Subscribe stream the gateway may also hold for the agent.
         if (!s->gateway_node.empty()) {
+            // PLAN item 5: an individual recipient's missing advertisement
+            // excludes only that agent from the count — it is not an error
+            // for the rest of the broadcast, mirroring how a dead Subscribe
+            // stream already excludes a direct agent without aborting the loop.
+            if (gateway_capability_missing(*s, metrics_, s->agent_id))
+                continue;
             std::lock_guard glock(gw_pending_mu_);
-            gw_pending_.push_back({s->agent_id, cmd});
+            gw_pending_.push_back({s->agent_id, cmd.wire()});
             ++count;
-        } else if (s->stream && s->stream->Write(cmd, grpc::WriteOptions())) {
+        } else if (s->stream && s->stream->Write(cmd.wire(), grpc::WriteOptions())) {
             ++count;
         }
     }

@@ -318,7 +318,10 @@ retention_guard_failures_total|2
 Only tables with a non-zero count appear, so a healthy agent emits just the two
 totals. `__clock_state__` is not a table: it reports that the agent could not
 persist its own clock reading, which leaves the guard without a comparison point
-after the next restart. The per-table counters are in-memory and reset when the agent restarts
+after the next restart. `__implausible_now__` is also not a table: it reports
+that the clock reading **handed to a pass** (not the stored comparison point)
+was too far ahead to trust, so the whole pass declined before touching any
+table -- see "The retention clock guard" below. The per-table counters are in-memory and reset when the agent restarts
 (the clock reading they compare against is persisted, so restarting does not
 blind the guard). Scrape this across the fleet to find endpoints whose clocks
 need attention -- the agent has no `/metrics` endpoint, so this action is the
@@ -433,10 +436,15 @@ before NTP converges all produce a reading that marks every row in a warehouse
 table expired at once, and an unguarded delete then takes the whole forensic
 window with it.
 
-A retention pass therefore refuses to act on that:
+A retention pass first refuses to act at all if the clock reading **handed to
+it** is implausible (too far ahead to be trusted into arithmetic) -- the whole
+pass declines before anything is persisted or any table is examined, and
+retention resumes once a sane reading arrives.
 
-- **A pass declines for a table, deletes nothing from it, and counts the
-  decline** when any of these holds:
+Per table, the pass then either declines (deletes nothing from that table,
+counts the decline) or proceeds, based on the same **fact set** each time --
+the combination of which of these four conditions hold for this table on
+this pass:
 
   1. it would delete **every** datable row of that table;
   2. more than **a fixed 30 days** elapsed since the previous pass;
@@ -444,11 +452,17 @@ A retention pass therefore refuses to act on that:
   4. there is **no stored reading at all** -- the first pass after an agent
      upgrade or a restore.
 
-  **Triggers 1-3 latch** per table, so a warehouse that is legitimately
-  all-expired still ages out at the cost of one rollup tick (900 s).
-  **Trigger 4 does not latch**, since a missing comparison point is not an
-  anomaly and spending the latch on it would let a real one on the very next
-  pass go undeclined.
+  A table declines whenever this pass's fact set **differs from what was last
+  reported** for it. An **identical repeat** is a suppressed, capped drain, so
+  a warehouse that is legitimately all-expired still ages out -- at the cost
+  of one rollup tick (900 s) per distinct anomaly, not one per pass. A
+  **different** anomaly arriving while one is still being worked off (e.g. the
+  table starts wiping while a corrupt-reading decline is still active) reports
+  again rather than deleting silently. Trigger 4 is the one exception: it is
+  never recorded, so a table that keeps failing to persist its own comparison
+  point declines **every** pass rather than being suppressed after the first --
+  a missing comparison point is not an anomaly whose fact set can safely repeat
+  unreported.
 
   **What to do:** for 4, nothing. The reading is a single `tar_config` key
   shared by every source and table, so it is expected once per agent -- but note

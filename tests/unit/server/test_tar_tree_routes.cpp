@@ -10,6 +10,7 @@
 ///   * the cache token is CSPRNG and an entropy failure fails closed (no cache entry),
 ///   * preset/os are neutralized in the audit detail.
 
+#include "authz_model.hpp"
 #include "secure_random.hpp"
 #include "tar_tree_routes.hpp"
 #include "test_route_sink.hpp"
@@ -67,11 +68,13 @@ struct TarHarness {
     std::string compat_output = "config|dummy|1";
     bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
     bool audit_throws = false; // #1647: simulate a bad_alloc-class throw out of audit_fn
+    bool service_scoped = false; // simulate a service-scoped API token session
 
     struct AuditRow {
         std::string action, result, target_id, detail;
     };
     std::vector<AuditRow> audit_log;
+    DispatchCaller last_dispatch_caller; // #3133: observes what dispatch actually received
 
     TarHarness() {
         auto auth = [this](const httplib::Request&,
@@ -80,6 +83,8 @@ struct TarHarness {
                 return std::nullopt;
             auth::Session s;
             s.username = session_user;
+            if (service_scoped)
+                s.token_scope_service = "printers";
             return s;
         };
         auto perm = [this](const httplib::Request&, httplib::Response&, const std::string&,
@@ -106,12 +111,24 @@ struct TarHarness {
         // keyed off the SQL the route built, so the responses stub can disambiguate.
         auto dispatch = [this](const std::string&, const std::string&, const std::vector<std::string>&,
                                const std::string&,
-                               const std::unordered_map<std::string, std::string>& params)
+                               const std::unordered_map<std::string, std::string>& params,
+                               const DispatchCaller& caller)
             -> std::pair<std::string, int> {
+            last_dispatch_caller = caller;
             const auto it = params.find("sql");
             const bool is_proc =
                 it != params.end() && it->second.find("$Process_Live") != std::string::npos;
             return {is_proc ? kProcCmd : kTcpCmd, 1};
+        };
+        // #3133 review fix: mirrors the production idiom (resolve the session,
+        // derive a real caller) closely enough for this harness's simplified
+        // auth — never a synthesized system caller. An unresolved session
+        // (empty session_user) fails closed with an empty principal, same
+        // contract every production CallerFn documents.
+        auto caller_fn = [this](const httplib::Request&) -> DispatchCaller {
+            if (session_user.empty())
+                return DispatchCaller{.exec_visible = authz::deny_all()};
+            return DispatchCaller{.principal = session_user, .system = false};
         };
         auto responses = [this](const std::string& cmd,
                                  const std::string& /*agent_id*/) -> std::vector<DexAgentResponse> {
@@ -135,7 +152,8 @@ struct TarHarness {
                 throw std::runtime_error("audit DB write blew up");
             return audit_ok; // DexRoutes::AuditFn (aliased by TarTreeRoutes) is bool-returning (#1549)
         };
-        routes.register_routes(sink, auth, perm, scoped, devices, lookup, dispatch, responses, audit);
+        routes.register_routes(sink, auth, perm, scoped, devices, lookup, dispatch, responses, audit,
+                               caller_fn);
     }
 
     // Drive /result directly (skips /run; the result route reads pcmd/tcmd from the
@@ -427,6 +445,39 @@ TEST_CASE("tar routes: a throwing audit_fn is caught + flags Sec-Audit-Failed at
     }
 }
 
+// #3133 external PR review finding: this route gated only Infrastructure:Read
+// before dispatching the mutating, Infrastructure:Write-classified
+// tar.configure action through a hardcoded system=true closure — bypassing
+// the chokepoint's per-action authorization entirely regardless of the
+// caller's actual grants. The fix threads the real, non-system caller
+// through every dispatch in this class; this pins it at the exact route the
+// review flagged, and the four others sharing the same dispatch_fn_ member.
+TEST_CASE("tar routes: every dispatch carries the real caller, never a system one",
+         "[tar][routes][security]") {
+    TarHarness h;
+    h.session_user = "alice";
+
+    SECTION("process-tree /run") {
+        // /result only polls pre-canned command ids (run_result() skips /run
+        // by design, per the harness's own doc comment) — /run is the
+        // handler that actually calls dispatch_fn_.
+        (void)h.sink.Get("/fragments/tar/process-tree/run?device=dev-A&preset=10m");
+        CHECK_FALSE(h.last_dispatch_caller.system);
+        CHECK(h.last_dispatch_caller.principal == "alice");
+    }
+    SECTION("capture-sources/push — tar.configure") {
+        (void)h.sink.Post(
+            "/fragments/tar/capture-sources/push?device=dev-A&changes=process%3Don", "");
+        CHECK_FALSE(h.last_dispatch_caller.system);
+        CHECK(h.last_dispatch_caller.principal == "alice");
+    }
+    SECTION("capture-sources/load — tar.status + tar.compatibility") {
+        (void)h.sink.Get("/fragments/tar/capture-sources/load?device=dev-A");
+        CHECK_FALSE(h.last_dispatch_caller.system);
+        CHECK(h.last_dispatch_caller.principal == "alice");
+    }
+}
+
 // #1647: a DROPPED (returns-false) audit row is the realistic failure path (audit DB
 // locked/full). Before this PR the tar sites discarded the bool and set NO header; now
 // they surface Sec-Audit-Failed while still rendering (set-and-proceed). Also pins the
@@ -556,4 +607,29 @@ TEST_CASE("TAR capture-sources: a healthy device still renders the sources grid"
     CHECK(res->body.find("capTable") != std::string::npos);
     CHECK(res->body.find("TAR storage is offline") == std::string::npos);
     CHECK(res->body.find("failed the status query") == std::string::npos);
+}
+
+// SEC-2/SEC-3 confinement-gap class (found during a docs sweep): devices_fn_
+// backing both TAR frame device pickers is username-keyed and does not
+// confine a service-scoped API token whose principal resolves to an
+// unscoped grant.
+TEST_CASE("TAR device pickers: service-scoped token denied on both frames, "
+          "denial audited",
+          "[tar][tree][routes][security]") {
+    TarHarness h;
+    h.service_scoped = true;
+
+    auto tree = h.sink.Get("/fragments/tar/process-tree");
+    REQUIRE(tree);
+    CHECK(tree->status == 403);
+
+    auto cap = h.sink.Get("/fragments/tar/capture-sources");
+    REQUIRE(cap);
+    CHECK(cap->status == 403);
+
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[0].action == "tar.device_picker.view");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[1].action == "tar.device_picker.view");
+    CHECK(h.audit_log[1].result == "denied");
 }
