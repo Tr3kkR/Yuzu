@@ -1452,7 +1452,7 @@ static const ToolDef kTools[] = {
      "unfiltered under a confined grant would widen a device-scoped grant to fleet-wide "
      "platform configuration. Requires PluginConfig:Read.",
      R"j({"type":"object","properties":{"plugin":{"type":"string","maxLength":64,"description":"Exact plugin filter; omit for every plugin"}}})j",
-     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object"}},"truncated":{"type":"boolean","description":"true when more rows exist past the internal row cap"}},"required":["data","truncated"]})j"},
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"},"updated_at_ms":{"type":"integer"},"updated_by":{"type":"string"}},"required":["plugin","key","value","updated_at_ms","updated_by"]}},"truncated":{"type":"boolean","description":"true when more rows exist past the internal row cap"}},"required":["data","truncated"]})j"},
 
     {"set_plugin_config",
      "Upsert one plugin config value. Mirrors PUT /api/v1/plugin-config/{plugin}/{key} (body "
@@ -1533,7 +1533,7 @@ static const ToolDef kTools[] = {
      // `additionalProperties:false` is what makes that BOUNDED rather than
      // free-form — a bare `properties:{}` would silently accept anything.
      R"j({"type":"object","properties":{},"additionalProperties":false})j",
-     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object"}}},"required":["data"]})j"},
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"grant_id":{"type":"string"},"agent_id":{"type":"string"},"source_path":{"type":"string"},"declared_max_size":{"type":"integer"},"expected_sha256":{"type":"string"},"retention_class":{"type":"string"},"destination_key":{"type":"string"},"state":{"type":"string","description":"minted | redeemed | revoked"},"minted_by":{"type":"string"},"created_at":{"type":"integer"},"expires_at":{"type":"integer"}},"required":["grant_id","agent_id","source_path","declared_max_size","expected_sha256","retention_class","destination_key","state","minted_by","created_at","expires_at"]}}},"required":["data"]})j"},
 
     {"revoke_upload_grant",
      "Revoke an upload grant, closing its one-time redemption window. Mirrors DELETE "
