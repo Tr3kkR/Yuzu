@@ -520,9 +520,28 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     }
     const bool would_wipe = datable > 0 && expired == datable;
     const bool big_step = last_prune_now_ms_ != 0 && now_ms - last_prune_now_ms_ > window_ms;
-    // Declined ONCE per anomaly. Latching matters: declining every time a pass would wipe the
-    // journal means a genuinely long-idle agent never ages anything out at all.
-    const bool skip_age = (would_wipe || big_step) && !age_wipe_declined_;
+
+    // Adopt the shared decision core (#2573 GJ half; rung 1 #2549 extracted it, rung 2 PR #3101
+    // adopted it in TAR). Field mapping, deliberate:
+    //  - prev_unusable = false: the comparison reading (last_prune_now_ms_) is in-process only,
+    //    never read back from an untrusted store, so there is nothing to sanitise.
+    //  - no_anchor = false: GJ persists no anchor across restarts BY DESIGN (unlike TAR /
+    //    audit_store, which both need one because they DO persist) - last_prune_now_ms_ == 0 on
+    //    every process start is the ordinary case, not an anomaly. Feeding that in would decline
+    //    once per restart, a behavior change this refactor deliberately does not make.
+    namespace audit_retention = yuzu::server::audit_retention;
+    const audit_retention::Facts facts{.has_expired = expired > 0,
+                                        .would_wipe = would_wipe,
+                                        .big_step = big_step,
+                                        .prev_unusable = false,
+                                        .no_anchor = false};
+    const audit_retention::Anomaly anomaly = audit_retention::classify(facts);
+    // Declined ONCE per anomaly (identity, not just presence - a bool latch cannot tell a
+    // repeat from a DIFFERENT anomaly arriving mid-backlog; see the member doc comment).
+    // Latching still matters: declining every pass a wipe would occur means a genuinely
+    // long-idle agent never ages anything out at all.
+    const bool already_reported = last_reported_facts_.has_value() && *last_reported_facts_ == facts;
+    const bool skip_age = anomaly != audit_retention::Anomaly::None && !already_reported;
     if (skip_age) {
         clock_jump_skips_.fetch_add(1, std::memory_order_relaxed);
         // The delta is meaningless on the FIRST pass of a process - last_prune_now_ms_ is still
@@ -598,13 +617,19 @@ JournalPruneStats GuardianLifecycleJournal::prune_locked_(std::int64_t now_ms) {
     // and while incrementing a counter documented to mean "this endpoint's clock moved", which
     // would have an operator chasing a second anomaly that never happened.
     //
-    // Hold the latch only while an anomaly BACKLOG is still being worked off - which is what
-    // `pacing` already means. Setting it from `age_candidates > 0` disarmed the guard after any
-    // pass that aged out even one batch, and a live agent past its retention horizon has such a
-    // pass constantly; a real jump arriving next would then evict unguarded, with no warn line
-    // and no clock_jump_skips increment. Four Gate 8b reviewers found this independently, and
-    // the correct expression was already computed one line above.
-    age_wipe_declined_ = pacing;
+    // Hold the recorded fact set only while an anomaly BACKLOG is still being worked off - which
+    // is what `pacing` already means. Setting it from `age_candidates > 0` disarmed the guard
+    // after any pass that aged out even one batch, and a live agent past its retention horizon
+    // has such a pass constantly; a real jump arriving next would then evict unguarded, with no
+    // warn line and no clock_jump_skips increment. Four Gate 8b reviewers found this
+    // independently, and the correct expression was already computed one line above. Recording
+    // THIS pass's facts (not just re-affirming presence) is what lets a DIFFERENT anomaly
+    // arriving mid-drain compare unequal to the recorded set and decline on its own merits,
+    // rather than being swallowed by a same-shaped-bool latch (#2573 GJ half).
+    if (pacing)
+        last_reported_facts_ = facts;
+    else
+        last_reported_facts_.reset();
 
     // Shutdown immediately before the pass's heaviest write: del_keys is one transaction over
     // the whole evict set and is the single longest KvStore call prune makes (#2298 governance
