@@ -958,6 +958,11 @@ public:
         for (auto stage : mcp::McpStreamBridge::kTeardownStageNames) {
             metrics_.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", stage}});
         }
+        // #2513: CLOSED set, derived the same way, so a third retry outcome
+        // cannot ship without this seed following it.
+        for (auto outcome : mcp::McpStreamBridge::kTeardownRetryOutcomeNames) {
+            metrics_.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", outcome}});
+        }
         // sre-N1 (#2489): CLOSED set, derived from TeardownFinal the same way, so a
         // fourth disposition cannot ship without this seed following it. Seeding
         // matters more here than elsewhere: an idle server force-expires nothing,
