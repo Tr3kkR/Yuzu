@@ -140,6 +140,15 @@ void AnalyticsEventStore::emit(AnalyticsEvent event) {
         spdlog::debug("AnalyticsEventStore: emit dropped, serialize failed: {}", e.what());
         note_emit_dropped(metrics_, kReasonSerializeError);
         return;
+    } catch (...) {
+        // Belt-and-braces parity with parse_event() (governance Gate 2,
+        // 2026-08-16): the fail-soft contract is "never throws into the
+        // caller's request path" — that guarantee shouldn't rest on every
+        // possible thrower deriving from std::exception.
+        spdlog::debug("AnalyticsEventStore: emit dropped, unexpected non-std exception "
+                      "during serialize");
+        note_emit_dropped(metrics_, kReasonSerializeError);
+        return;
     }
 
     auto lease = pool_.try_acquire_for(kEmitAcquireTimeout);

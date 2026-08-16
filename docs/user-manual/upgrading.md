@@ -600,11 +600,16 @@ legacy `analytics.db` is **never read** on upgrade.
   and are unaffected.
 - New events buffer and drain normally from first boot. No operator action
   required.
-- If analytics collection is disabled (`--no-analytics`) or its schema fails
-  to migrate, the server logs an error and continues running with analytics
-  collection off for that run — a broken analytics store never blocks server
-  startup (this store is the one Postgres-backed store on this ladder that
-  does NOT fail the server closed on a construction failure; see ADR-0049).
+- If analytics collection is disabled (`--no-analytics`), no store is
+  constructed and no log line is emitted for it. If it's enabled but the
+  schema fails to migrate, the server logs an error
+  (`[PG] analytics-event store migration/open failed ...`) and continues
+  running with analytics collection off for that run. Either way, a broken
+  analytics store never blocks server startup (this store is the one
+  Postgres-backed store on this ladder that does NOT fail the server closed
+  on a construction failure; see ADR-0049) — `/readyz`'s `degraded` field
+  (not `failed_stores`) names it when it's on but dead, without affecting the
+  node's ready/not-ready status.
 
 ## RBAC store moves to PostgreSQL — config preserved by mandatory backfill (RbacStore → Postgres, ADR-0041)
 

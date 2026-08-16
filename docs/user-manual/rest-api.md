@@ -6646,11 +6646,19 @@ Returns current user info (legacy version; prefer `/api/v1/me`).
 
 #### `GET /api/analytics/status`
 
-Returns the status of the analytics event pipeline.
+Requires `Infrastructure:Read`. Returns the status of the analytics event pipeline:
+`{"enabled":true,"pending_count":N,"total_emitted":N}`, or `{"enabled":false,"pending_count":0,"total_emitted":0}`
+when analytics collection is disabled (`--no-analytics`). Degrade-distinguishable (ADR-0049): a
+Postgres read failure returns `503` — `{"error":{"code":503,"message":"analytics store degraded"},"meta":{"api_version":"v1"}}`
+— rather than a possibly-inaccurate `200`.
 
 #### `GET /api/analytics/recent`
 
-Returns recent analytics events. Accepts `limit` as a query parameter (default 50).
+Requires `Infrastructure:Read`. Returns recent analytics events. Accepts `limit` as a query
+parameter (default 50). `{"events":[...],"count":N}` on success, `{"events":[],"count":0}` when
+analytics collection is disabled. Degrade-distinguishable (ADR-0049): a Postgres read failure
+returns `503` with the same envelope shape as `/api/analytics/status` above, rather than a
+possibly-inaccurate `200`.
 
 #### `GET /api/nvd/status`
 

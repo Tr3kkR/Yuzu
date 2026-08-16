@@ -7356,6 +7356,18 @@ public:
         // declaration order alone.
         agent_service_.set_notification_store(nullptr);
         notification_store_.reset();
+        // AnalyticsEventStore (ADR-0049) borrows pg_pool_ — same destruct-
+        // before-pool discipline as every sibling PG-backed store above
+        // (governance Gate 2, 2026-08-16: this store was the one missing
+        // from this proactive-reset sequence, left holding a dangling
+        // `PgPool&` past pg_pool_.reset() below — new to this migration,
+        // since the SQLite predecessor never borrowed the pool at all).
+        // The drain thread is already joined via stop_drain() above; unwire
+        // the borrowed raw pointer from both ingest services first.
+        agent_service_.set_analytics_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_analytics_store(nullptr);
+        analytics_store_.reset();
         pg_pool_.reset();
     }
 
@@ -10482,14 +10494,6 @@ private:
             };
             std::vector<StoreCheck> checks = {
                 {"response_store", response_store_ && response_store_->is_open()},
-                // ADR-0049: construction is fail-soft-disable, not fatal
-                // (see server.cpp's analytics_store_ construction comment),
-                // so `analytics_store_` is null both when the feature is off
-                // AND when it's on but migration failed — this row tells
-                // those two apart for on-call, without gating the rest of
-                // /readyz on a non-critical telemetry store (Pattern E).
-                {"analytics_event_store",
-                 !cfg_.analytics_enabled || (analytics_store_ && analytics_store_->is_open())},
                 {"audit_store", audit_store_ && audit_store_->is_open()},
                 {"instruction_store", instruction_store_ && instruction_store_->is_open()},
                 {"api_token_store", api_token_store_ && api_token_store_->is_open()},
@@ -10676,6 +10680,19 @@ private:
                  upload_grant_store_ && upload_grant_store_->is_open()},
             };
 
+            // Non-gating (governance Gate 2, 2026-08-16): ADR-0049's own construction
+            // posture is deliberately NOT fatal for this one store (analytics is a
+            // non-critical telemetry spool, on by default, every caller null-guards
+            // it) — folding it into `checks` above would flip /readyz to 503 for the
+            // WHOLE node on a transient migration hiccup here, directly contradicting
+            // that posture and the comment that used to sit on this row. Reported
+            // separately so on-call can still tell feature-off from feature-on-but-
+            // dead without pulling a healthy node out of LB/orchestrator rotation.
+            std::vector<StoreCheck> notices = {
+                {"analytics_event_store",
+                 !cfg_.analytics_enabled || (analytics_store_ && analytics_store_->is_open())},
+            };
+
             std::string failed_list;
             for (const auto& c : checks) {
                 if (!c.ok) {
@@ -10686,14 +10703,29 @@ private:
                     failed_list += "\"";
                 }
             }
+            std::string degraded_list;
+            for (const auto& c : notices) {
+                if (!c.ok) {
+                    if (!degraded_list.empty())
+                        degraded_list += ",";
+                    degraded_list += "\"";
+                    degraded_list += c.name;
+                    degraded_list += "\"";
+                }
+            }
 
             if (failed_list.empty()) {
-                res.set_content(R"({"status":"ready"})", "application/json");
+                res.set_content(degraded_list.empty()
+                                    ? R"({"status":"ready"})"
+                                    : "{\"status\":\"ready\",\"degraded\":[" + degraded_list + "]}",
+                                "application/json");
             } else {
                 res.status = 503;
-                res.set_content("{\"status\":\"not ready\",\"failed_stores\":[" + failed_list +
-                                    "]}",
-                                "application/json");
+                std::string body = "{\"status\":\"not ready\",\"failed_stores\":[" + failed_list + "]";
+                if (!degraded_list.empty())
+                    body += ",\"degraded\":[" + degraded_list + "]";
+                body += "}";
+                res.set_content(body, "application/json");
             }
         });
 

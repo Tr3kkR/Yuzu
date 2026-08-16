@@ -83,16 +83,34 @@ analogy to ResponseStore: no backfill, the legacy `analytics.db` is never read o
 originally matched has the identical shape (a `warn` that fires on every restart, not just the
 actual cutover boot), and copying it uncorrected would have shipped the same doc/code mismatch
 here. There is no cheap way to distinguish "this is the actual cutover boot" from "the 400th boot
-since," so the log is phrased as an ongoing fact ("analytics spool on Postgres — legacy
-analytics.db is not migrated"), not a one-time event notification.
+since," so the log is phrased as an ongoing fact (server.cpp's actual line: "analytics spool on
+Postgres (schema analytics_event_store) — legacy analytics.db is not migrated ..."), not a
+one-time event notification.
 
-### Secrets — none
+### Secrets — none in `attributes`/`payload`; one found and fixed in `session_id`
 
 Grepped every `emit()` call site's `attributes`/`payload` construction (auth_routes.cpp,
 scim_routes.cpp, agent_service_impl.cpp, gateway_service_impl.cpp): usernames, source IPs, reason
 strings, method/status labels, durations, byte/exit-code counts. No plaintext password, TOTP
-code, session token, or API token fragment is ever assigned into an `AnalyticsEvent` field.
-Plain columns, no `SecretCodec`.
+code, or API token fragment is ever assigned into those two fields. Plain columns, no
+`SecretCodec` needed there.
+
+**Correction (governance Gate 2, 2026-08-16, security-guardian):** the first pass of this audit
+covered `attributes`/`payload` and missed a THIRD field — `AnalyticsEvent::session_id`, set
+separately at `auth_routes.cpp`'s `emit_event()`. That line (pre-existing, not introduced by this
+migration) assigned the RAW `yuzu_session` cookie value — the exact bearer token
+`AuthManager::validate_session()` accepts — verbatim. Read-only on SQLite, this was a
+narrow-blast-radius wart; migrated onto the shared Postgres substrate under this ADR's own
+unbounded drained-row retention (see Retention below) and readable by any `Infrastructure:Read`
+holder via `/api/analytics/recent` (a broad, non-session-management permission), it became a
+durable, widely-readable session-hijack vector — including hijacking an admin's session via
+`role.elevation.granted` events. Fixed in this PR: `emit_event()` now stores
+`AuthManager::sha256_hex(extract_session_cookie(req))` — a one-way hash, still useful as a
+same-session correlator, never a redeemable credential. `AuditStore`'s `session_id` field
+(`auth_routes.cpp`'s `make_audit_event`/`audit_log_for_principal`, two other call sites of the
+same `extract_session_cookie()`) has the identical raw-value pattern but feeds a different,
+already-migrated, out-of-scope store — not fixed here; flagged as a follow-up (its read-permission
+gating may already be adequately restrictive, not established either way by this review).
 
 ### Untrusted bytes (UTF-8) — handled at serialization, not at bind
 
@@ -175,6 +193,14 @@ not-open-but-should-be-open store silently reads as healthy): `!cfg_.analytics_e
 (analytics_store_ && analytics_store_->is_open())` reports true when the feature is off, false
 when it's on but dead — visible to on-call without gating the rest of the fleet's readiness on a
 non-critical telemetry store.
+
+**Correction (governance Gate 2, 2026-08-16, security-guardian):** the first cut of this row
+shipped in the SAME `checks` vector as every other, mandatory-gating store — so a migration
+failure here flipped the WHOLE node's `/readyz` to 503, pulling it out of LB/orchestrator
+rotation on a non-critical table's hiccup, exactly contradicting the paragraph above (and the
+comment that used to sit on that row). Fixed: the row now lives in a separate `notices` list that
+surfaces in the `/readyz` body (`"degraded":["analytics_event_store"]`) but never contributes to
+the gating `failed_stores` list or the response's HTTP status.
 
 **This is the one point in this migration that isn't a straight port of an existing pattern —
 flagged here explicitly for confirmation, per the kickoff doc's governance checkpoint.**

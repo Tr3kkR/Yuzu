@@ -1079,7 +1079,16 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
         // effective_role: an elevated session's analytics row reflects admin too
         // (#1748 H1/L4). No-op when not elevated.
         ae.principal_role = auth::role_to_string(auth::effective_role(*session));
-        ae.session_id = extract_session_cookie(req);
+        // HASHED, never the raw cookie (ADR-0049 governance Gate 2, 2026-08-16):
+        // this value is durably persisted into AnalyticsEventStore (unbounded
+        // retention on Postgres, ADR-0049) and readable by anyone holding the
+        // broad Infrastructure:Read permission via /api/analytics/recent — the
+        // live bearer token is exactly what validate_session() accepts, so
+        // storing it raw would let any Infrastructure:Read holder hijack the
+        // session (including an elevated admin's, via role.elevation.granted
+        // events). The hash still correlates events from the same session
+        // (same cookie -> same hash) without being a redeemable credential.
+        ae.session_id = auth::AuthManager::sha256_hex(extract_session_cookie(req));
     }
     analytics_store_->emit(std::move(ae));
 }
