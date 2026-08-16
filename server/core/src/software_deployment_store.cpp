@@ -360,8 +360,9 @@ AgentDeploymentStatus read_agent_status(PGresult* res, int i) {
 }
 
 // Three outcomes, not two — ported from audit_store.cpp's reference fix for
-// this exact defect class (Gate 4 unhappy-path UP-1/UP-2 on THIS store's own
-// governance run measured the identical shape independently). A
+// this exact defect class (found by cpp-safety, Gate 3, on THIS store's own
+// governance run; independently re-derived by unhappy-path, Gate 4, as its
+// own UP-2). A
 // `sqlite3_prepare_v2`/`sqlite3_step` failure (corrupt file, encrypted file,
 // disk I/O error — bytes present that don't parse as a SQLite header) is NOT
 // the same fact as "the table genuinely does not exist": the former means

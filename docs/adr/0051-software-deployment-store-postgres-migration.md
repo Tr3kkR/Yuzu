@@ -175,12 +175,15 @@ FILE, not per table, since the three tables in one legacy file are one atomic sn
    (`software_packages` present but the other two missing) — a legacy file missing only
    `software_packages` but holding real `software_deployments`/`agent_software_status` data
    silently took the sourceless branch, permanently discarding it (the sourceless stamp never
-   expires or retries). Independently found/escalated to BLOCKING by 6 governance reviewers
-   across Gates 2–6 (docs-writer, architect, cpp-safety, sre, compliance-officer, unhappy-path —
-   the latter two also identified the coupled `LegacyTableStatus`/probe-failure gap as a second,
-   independently-necessary fix); fixed in the same round, with regression tests for both the
-   reverse-direction partial-schema case and a corrupt/non-SQLite legacy file, plus a companion
-   control test proving a genuinely empty (0-byte) legacy file still takes the sourceless path.
+   expires or retries). First flagged by `docs-writer` (Gate 2); escalated to BLOCKING and
+   confirmed by every Gate 3/4/6 reviewer whose domain touched this code (architect, cpp-expert,
+   cpp-safety, sre, quality-engineer, unhappy-path, compliance-officer). The coupled root cause —
+   `legacy_has_table` conflating a table-probe FAILURE with genuine absence, meaning a
+   branch-symmetry fix alone would not close a corrupt-legacy-file variant of the same defect —
+   was found by `cpp-safety` (Gate 3) and independently re-derived by `unhappy-path` (Gate 4, as
+   its own UP-2). Both fixed in the same round, with regression tests for the reverse-direction
+   partial-schema case, a corrupt/non-SQLite legacy file, and a companion control test proving a
+   genuinely empty (0-byte) legacy file still takes the sourceless path.
 2. **Referential closure is validated CLIENT-SIDE, before any Postgres round trip.** Postgres
    enforces the `package_id`/`deployment_id` foreign keys the legacy SQLite store never did (see
    Schema above), so a wired-era legacy file can hold a genuine orphan — e.g. a deployment whose
