@@ -687,13 +687,18 @@ kind: InstructionDefinition
 metadata:
   id: agent.content_dist.upload_file
   displayName: Upload File to Server
-  version: 1.1.0
+  version: 1.2.0
   description: >
-    Upload a local file from the agent endpoint to the Yuzu server via
-    multipart POST. Computes the SHA-256 hash of the file before upload and
-    sends it alongside the file data for server-side verification. If
-    server_url is not provided, derives it from the agent's configured
-    server web URL. Maximum file size is configurable (default 100 MB).
+    Upload a local file from the agent endpoint to the Yuzu server through
+    the one-time upload-grant + authenticated chunked-receive protocol
+    (PR1.6, CC-06): the operator mints a grant out of band (POST
+    /api/v1/upload-grants) and passes its one-time grant_id/grant_secret
+    here. The agent opens a session against that grant, streams the file in
+    bounded chunks honouring the server's declared chunk size, and commits
+    with a SHA-256 computed from the exact bytes acknowledged. There is no
+    server_url parameter — the destination is derived entirely from the
+    grant and the agent's own configured server transport
+    (agent.server_web_url), and the connection is always TLS.
   tags: [content, upload, transfer, deployment]
 
 spec:
@@ -707,7 +712,7 @@ spec:
 
   parameters:
     type: object
-    required: [path]
+    required: [path, grant_id, grant_secret]
     properties:
       path:
         type: string
@@ -716,19 +721,37 @@ spec:
           The local file path on the endpoint to upload.
         validation:
           maxLength: 4096
-      server_url:
+      grant_id:
         type: string
-        displayName: Server URL
+        displayName: Grant ID
         description: >
-          The Yuzu server base URL to upload to. If not provided, uses the
-          agent's configured server web URL (agent.server_web_url).
+          The one-time upload grant's id, minted operator-side via POST
+          /api/v1/upload-grants. Paired with grant_secret to authenticate
+          the session; both are revealed by the mint response exactly once.
         validation:
-          maxLength: 2048
+          maxLength: 64
+      grant_secret:
+        type: string
+        displayName: Grant Secret
+        description: >
+          The one-time upload grant's secret, minted alongside grant_id.
+          Never logged or echoed back by the server after the mint response.
+        validation:
+          maxLength: 128
+      base_dir:
+        type: string
+        displayName: Base Directory Restriction
+        description: >
+          If set, path must resolve (after symlink canonicalisation) inside
+          this directory, or the upload is refused before anything is read.
+        validation:
+          maxLength: 4096
       max_size_mb:
         type: int32
         displayName: Max Size (MB)
         description: >
-          Maximum allowed file size in megabytes. Default: 100.
+          Maximum allowed file size in megabytes, checked locally before
+          the session opens. Default: 100.
         default: 100
         validation:
           minimum: 1
@@ -740,9 +763,9 @@ spec:
         type: string
       - name: sha256
         type: string
-      - name: bytes_uploaded
+      - name: size
         type: int64
-      - name: filename
+      - name: upload_id
         type: string
 
   readablePayload: "Upload ${path} to server"

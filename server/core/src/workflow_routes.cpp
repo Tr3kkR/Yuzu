@@ -8,6 +8,7 @@
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
 #include "scope_engine.hpp"
+#include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "web_utils.hpp"
 
 #include <nlohmann/json.hpp>
@@ -1684,7 +1685,11 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             exec.definition_id = def_id;
             exec.status = "running";
             exec.scope_expression = scope_expr;
-            exec.parameter_values = nlohmann::json(params).dump();
+            // #3136 blocker: persist a REDACTED copy — the live dispatch
+            // below still uses the raw `params` map. See
+            // sensitive_instruction_params.hpp.
+            exec.parameter_values =
+                nlohmann::json(redact_sensitive_instruction_params(params)).dump();
             exec.dispatched_by = session->username;
             if (auto created = execution_tracker->create_execution(exec); created.has_value()) {
                 execution_id = *created;

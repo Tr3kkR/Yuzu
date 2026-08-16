@@ -81,6 +81,52 @@ TEST_CASE("ScheduleEngine: create with bad frequency_type fails", "[schedule_eng
     CHECK(!result.has_value());
 }
 
+// #3136 blocker: a schedule's parameter_values is the sole record
+// ScheduleRunner::dispatch_tracked reads back to re-dispatch on every future
+// occurrence — redacting a persisted grant_secret would silently break that
+// re-dispatch rather than merely protecting a history row, so creation is
+// refused outright instead. See sensitive_instruction_params.hpp.
+TEST_CASE("ScheduleEngine: create is refused when parameters carry a one-time credential",
+         "[schedule_engine]") {
+    TestDb tdb;
+    ScheduleEngine engine(tdb.db);
+    engine.create_tables();
+
+    auto sched = make_schedule("def-001", "interval", "Upload Schedule");
+    sched.interval_minutes = 60;
+    sched.parameter_values = R"({"grant_secret":"deadbeef","path":"/tmp/x"})";
+    auto result = engine.create_schedule(sched);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("one-time credential") != std::string::npos);
+}
+
+TEST_CASE("ScheduleEngine: create is refused when parameters carry a bare grant_id",
+         "[schedule_engine]") {
+    TestDb tdb;
+    ScheduleEngine engine(tdb.db);
+    engine.create_tables();
+
+    auto sched = make_schedule("def-001", "interval", "Upload Schedule");
+    sched.interval_minutes = 60;
+    sched.parameter_values = R"({"grant_id":"abc123"})";
+    auto result = engine.create_schedule(sched);
+    CHECK_FALSE(result.has_value());
+}
+
+TEST_CASE("ScheduleEngine: create succeeds when parameters carry no sensitive key",
+         "[schedule_engine]") {
+    TestDb tdb;
+    ScheduleEngine engine(tdb.db);
+    engine.create_tables();
+
+    auto sched = make_schedule("def-001", "interval", "Ordinary Schedule");
+    sched.interval_minutes = 60;
+    sched.parameter_values = R"({"path":"/tmp/x","max_size_mb":"100"})";
+    auto result = engine.create_schedule(sched);
+    REQUIRE(result.has_value());
+    CHECK(!result->empty());
+}
+
 TEST_CASE("ScheduleEngine: create schedule with all fields", "[schedule_engine]") {
     TestDb tdb;
     ScheduleEngine engine(tdb.db);

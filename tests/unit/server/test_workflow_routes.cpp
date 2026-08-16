@@ -143,6 +143,11 @@ struct ExecHarness {
     /// into the dispatch stub (the confinement the production dispatch_confined
     /// seam then applies). Mirrors test_mcp_server.cpp's last_dispatch_exec_visible.
     yuzu::server::authz::VisibleSet last_dispatch_exec_visible;
+    /// #3136 blocker regression net: the RAW params map cmd_dispatch actually
+    /// received, so a test can assert it still carries a sensitive value
+    /// (e.g. grant_secret) even though the PERSISTED execution row's
+    /// parameter_values must not.
+    std::unordered_map<std::string, std::string> last_dispatch_params;
     /// PLAN-006: the full DispatchCaller (identity + exec_visible) the execute
     /// handler threaded into the dispatch stub, so a test can assert the
     /// principal half independently of last_dispatch_exec_visible above.
@@ -248,7 +253,7 @@ struct ExecHarness {
         auto cmd_dispatch = [this](const std::string&, const std::string&,
                                    const std::vector<std::string>& agent_ids,
                                    const std::string& scope_expr,
-                                   const std::unordered_map<std::string, std::string>&,
+                                   const std::unordered_map<std::string, std::string>& params,
                                    const std::string& execution_id,
                                    const yuzu::server::DispatchCaller& caller)
             -> std::pair<std::string, int> {
@@ -257,6 +262,7 @@ struct ExecHarness {
             ++dispatch_calls;
             last_dispatch_agent_ids = agent_ids;
             last_dispatch_scope = scope_expr;
+            last_dispatch_params = params;
             // K-R7-02 / PLAN-006: capture the confinement + identity threaded
             // into dispatch.
             last_dispatch_exec_visible = caller.exec_visible;
@@ -999,6 +1005,47 @@ TEST_CASE("#1088 — POST /api/instructions/:id/execute response includes execut
     CHECK(body["command_id"] == "cmd-agentic-abc");
     CHECK(body["agents_reached"] == 3);
     CHECK(body["definition_id"] == "def-AGENTIC");
+}
+
+TEST_CASE("#3136 blocker: grant_secret reaches cmd_dispatch but is redacted from the "
+         "persisted execution row",
+         "[pg][workflow][executions][security]") {
+    // The concrete attack this closes: an execution row created BEFORE
+    // dispatch (create-before-dispatch, UP2-4) used to carry the FULL
+    // caller-supplied params JSON — including a one-time upload-grant
+    // secret — into executions.parameter_values, readable by any principal
+    // holding the broadly-granted Execution:Read permission within the
+    // grant's TTL. See sensitive_instruction_params.hpp.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-UPLOAD", "Upload File");
+    h.dispatch_cmd_override = "cmd-upload-abc";
+    h.dispatch_sent_override = 1;
+
+    auto res = h.sink.Post(
+        "/api/instructions/def-UPLOAD/execute",
+        R"({"params":{"grant_id":"deadbeef","grant_secret":"topsecret","path":"/tmp/x"},)"
+        R"("agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+
+    // The LIVE dispatch still got the raw secret — otherwise the upload
+    // could never actually authenticate against the server.
+    REQUIRE(h.dispatch_calls == 1);
+    CHECK(h.last_dispatch_params.at("grant_secret") == "topsecret");
+    CHECK(h.last_dispatch_params.at("grant_id") == "deadbeef");
+
+    // The PERSISTED row must not carry either sensitive key.
+    auto body = nlohmann::json::parse(res->body);
+    auto exec = h.tracker->get_execution(body["execution_id"].get<std::string>());
+    REQUIRE(exec.has_value());
+    auto stored = nlohmann::json::parse(exec->parameter_values);
+    CHECK_FALSE(stored.contains("grant_secret"));
+    CHECK_FALSE(stored.contains("grant_id"));
+    // Ordinary, non-sensitive parameters survive untouched.
+    REQUIRE(stored.contains("path"));
+    CHECK(stored["path"] == "/tmp/x");
 }
 
 TEST_CASE("PR2 hardening — query_by_execution includes the partial-index "

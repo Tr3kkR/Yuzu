@@ -14,6 +14,7 @@
 #include "reserved_definition_id.hpp" // kMcpDefinitionPrefix (#2442 — the ONE reserved-namespace rule)
 #include "rotation_confirm_state.hpp" // classify_confirm_state (#2443 confirm_engine_rotation precondition)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric (shared REST/MCP metric symbol)
+#include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
@@ -7141,7 +7142,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // appears in the live executions view.
                     exec.status = "running";
                     exec.scope_expression = scope;
-                    exec.parameter_values = nlohmann::json(params).dump();
+                    // #3136 blocker: persist a REDACTED copy — the live
+                    // dispatch below still uses the raw `params` map. See
+                    // sensitive_instruction_params.hpp.
+                    exec.parameter_values =
+                        nlohmann::json(redact_sensitive_instruction_params(params)).dump();
                     // dispatched_by — `session` was authenticated at
                     // handler entry (line ~363) and is in scope here.
                     exec.dispatched_by = session->username;
