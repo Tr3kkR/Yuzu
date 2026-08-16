@@ -3709,7 +3709,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // future orphaned handler branch would otherwise execute with
                 // no tier/approval gate. Same audit + response as the terminal
                 // "Unknown tool" backstop at the bottom of the chain.
-                mcp_audit("failure", "unknown tool");
+                //
+                // Audited "denied", not "failure" (#2445): the caller named a
+                // tool that doesn't exist — client-caused, matching every
+                // other rejection on this surface (tier/read-only/schema/
+                // bounds/cap denials all use "denied"). "failure" is reserved
+                // for server-side faults (misconfig, store degraded, dispatch
+                // exception) — see the kKnownMissingSecurity branch below.
+                mcp_audit("denied", "unknown tool");
                 res.set_content(
                     error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
                     "application/json");
@@ -11992,7 +11999,9 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── Unknown tool ──────────────────────────────────────────────
-            mcp_audit("failure", "unknown tool");
+            // "denied" not "failure" (#2445) — see the pre-gate kUnknown
+            // branch above for the taxonomy rationale.
+            mcp_audit("denied", "unknown tool");
             res.set_content(error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
                             "application/json");
             return;
