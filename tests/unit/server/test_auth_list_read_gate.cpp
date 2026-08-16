@@ -250,7 +250,8 @@ TEST_CASE("require_list_read — a DenyAll denial writes a real audit row (gover
 
     Config cfg{};
     auth::AuthManager auth_mgr{};
-    RbacStore rbac_store{":memory:"};
+    yuzu::test::RbacStorePg rbac_bundle;
+    RbacStore& rbac_store = *rbac_bundle;
     REQUIRE(rbac_store.is_open());
     rbac_store.set_rbac_enabled(true); // enforcement in effect; no roles/grants created
     std::shared_mutex oidc_mu;
