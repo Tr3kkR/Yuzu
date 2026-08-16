@@ -1014,6 +1014,18 @@ TEST_CASE("mcp_body_unmeasurable: refuses any framing or encoding we do not sole
     }
 }
 
+// ── upload chunk body cap ───────────────────────────────────────────────────
+//
+// HISTORY: three predicate tests lived here for a hand-rolled BR-008
+// pre-routing branch (is_upload_chunk_path / upload_chunk_body_exceeds_cap /
+// upload_chunk_body_unmeasurable). #2407's `kBodyCapTable` landed on dev as
+// the SINGLE per-route body-cap chokepoint (routed-concern: catastrophic if
+// forked), so the branch and its helpers were deleted and the upload surface
+// registered as the `upload_session` table row instead. Coverage moved with
+// it: test_body_cap_policy.cpp asserts the row's cap/measurability/boundary
+// behaviour, and file_retrieval_routes.cpp's static_assert binds the row's
+// cap to `upload_grant::kDefaultChunkMaxBytes`.
+
 // ── JSON depth guard (#2437, governance Gate 5 CH-1) ─────────────────────
 
 TEST_CASE("json_exceeds_depth: rejects the nesting that SIGSEGVs dump()",

@@ -707,7 +707,7 @@ def _selftest():
     # or the guard fails loudly instead of silently inspecting half the
     # surface.
     _entries = re.findall(r"test\(\s*'[^']*',\s*server_test_exe\b(.*?)\)", _src, re.S)
-    check(len(_entries) >= 4, "meson.build: all four server shard entries located")
+    check(len(_entries) >= 5, "meson.build: all five server shard entries located")
     _shard_specs = []
     for _body in _entries:
         # Quote-aware list match: a naive [(.*?)] truncates at the tag spec's
@@ -734,11 +734,37 @@ def _selftest():
     # (not projected) at ~3% of shard B's runtime, moving it to shard A instead
     # of leaving every newly `[pg]`-tagged audit case to land there by default
     # (tests/meson.build's own comment on this pair has the measurement).
+    # 2026-08-15 rebalance added [rbac_store]/[guaranteed_state_store]/
+    # [response_store] to both PG specs the same way: measured 793 (A) / 1154
+    # (B) at the time of the change, moving 207 cases off shard B after it had
+    # drifted to 2.3x shard A's size and started TIMEOUT-ing at 600s on Linux
+    # and Windows (tests/meson.build's own comment on this pair has the
+    # measurement). PR1.6a review remediation (same day) additionally added
+    # [operator_surface]: 3 new PG-backed MCP integration tests, untagged,
+    # all landed in shard B and tipped it over its 600s CI budget (killed by
+    # TIMEOUT at 600.57s).
+    # 2026-08-16 (PR #3156 review-response round, cherry-picked as 3f0796777,
+    # now also merged to dev via #3156 itself): B TIMEOUT-ed again the day
+    # after the rebalance above. A same-day two-shard fix was reviewed and
+    # rejected before merge — it would have concentrated more cases into
+    # shard A, whose own prior per-case rate was already HIGHER than shard
+    # B's (0.616s/case at 84% of budget), likely relocating the timeout
+    # rather than fixing it. Split into THREE pg shards instead: the
+    # store-heavy tag set (expensive per case — real Postgres template-clone
+    # cost, unlike lighter route/handler tests) is itself split across two
+    # shards (A, B) instead of concentrated in one; shard C holds everything
+    # else. Verified by running all three filters through the built binary,
+    # not projection. [license_store] folded into shard B on the cherry-pick
+    # (tests/meson.build's own comment on this trio has the reasoning and
+    # re-verified counts).
     check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
           and ("~[pg]~[auth]~[mcp]",) in _shard_specs
-          and ("[pg][routes],[pg][store],[pg][token],[pg][audit_store]",) in _shard_specs
-          and ("[pg]~[routes]~[store]~[token]~[audit_store]",) in _shard_specs,
-          "meson.build: all four shard tag filters extracted verbatim")
+          and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
+          and ("[pg][audit_store]~[routes]~[store]~[token],[pg][rbac_store]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token]",)
+          in _shard_specs
+          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]",)
+          in _shard_specs,
+          "meson.build: all five shard tag filters extracted verbatim")
 
     if failures:
         print("SELFTEST FAILURES:", *failures, sep="\n  ")
