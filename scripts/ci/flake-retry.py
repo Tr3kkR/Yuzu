@@ -777,13 +777,20 @@ def _selftest():
     # runtime), so shard B = [rbac_store] alone and new shard D = the other eight
     # store tags (~48s). Deliberately count-lopsided (93 vs 335) because time is
     # what blows the ceiling. shard C UNCHANGED. Local isolated: B 58s / D 49s.
+    # 2026-08-16 (ADR-0051, SoftwareDeploymentStore, PR #3174) followed the
+    # recipe from the comment above for its new [software_deployment] tag (66
+    # cases): measured in isolation — 4.0s, vs. B ([rbac_store]) 55.2s and D
+    # (the other eight tags) 31.5s on the same container — D is the lighter
+    # destination, so [software_deployment] joins D; also added to shard C's
+    # exclusion list per the same instruction (tests/meson.build's own
+    # comment on this pair has the measurement).
     check(("~[pg][auth],~[pg][mcp]",) in _shard_specs
           and ("~[pg]~[auth]~[mcp]",) in _shard_specs
           and ("[pg][routes],[pg][store],[pg][token]",) in _shard_specs
           and ("[pg][rbac_store]~[routes]~[store]~[token]",) in _shard_specs
-          and ("[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token]",)
+          and ("[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token],[pg][software_deployment]~[routes]~[store]~[token]",)
           in _shard_specs
-          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]",)
+          and ("[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]~[software_deployment]",)
           in _shard_specs,
           "meson.build: all six shard tag filters extracted verbatim")
 
