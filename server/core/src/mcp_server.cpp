@@ -3711,11 +3711,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // "Unknown tool" backstop at the bottom of the chain.
                 //
                 // Audited "denied", not "failure" (#2445): the caller named a
-                // tool that doesn't exist — client-caused, matching every
-                // other rejection on this surface (tier/read-only/schema/
-                // bounds/cap denials all use "denied"). "failure" is reserved
-                // for server-side faults (misconfig, store degraded, dispatch
-                // exception) — see the kKnownMissingSecurity branch below.
+                // tool that doesn't exist — client-caused, matching most
+                // other rejections on this surface (tier/read-only/schema/
+                // bounds/cap denials all use "denied"; approve_request/
+                // reject_request and set_tag/delete_tag are known,
+                // undischarged exceptions still on "failure"). "failure" is
+                // otherwise reserved for server-side faults (misconfig, store
+                // degraded, dispatch exception) — see kKnownMissingSecurity
+                // below.
                 mcp_audit("denied", "unknown tool");
                 res.set_content(
                     error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
