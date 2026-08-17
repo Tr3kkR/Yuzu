@@ -125,6 +125,31 @@ void parse_firewall_rules(yuzu::CommandContext& ctx, const std::string& output) 
 
 #endif
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Both actions shell out on every platform via a raw popen()/_popen()
+// (run_command above — never the bounded subprocess runner), so every leg
+// is rung 3: netsh on Windows, firewall-cmd/ufw/iptables on Linux,
+// socketfilterfw/pfctl on macOS. Neither action mutates firewall state —
+// this plugin exposes status/listing only.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "state",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "firewall-cmd/ufw/iptables via popen", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "socketfilterfw/pfctl via popen", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "netsh via popen", nullptr},
+    },
+    {
+        /* .action      = */ "rules",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "firewall-cmd/ufw/iptables via popen", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "pfctl via popen", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "netsh via popen", nullptr},
+    },
+};
+
 } // namespace
 
 class FirewallPlugin final : public yuzu::Plugin {
@@ -138,6 +163,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"state", "rules", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

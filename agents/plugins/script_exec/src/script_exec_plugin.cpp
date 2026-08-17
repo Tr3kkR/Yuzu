@@ -489,6 +489,34 @@ int do_bash(yuzu::CommandContext& ctx, yuzu::Params params) {
 #endif
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// exec: CreateProcess (Windows) / fork+execvp (POSIX) with a pre-split argv
+// -- no shell interpretation of any kind (the code's own comments say so
+// explicitly) -- rung 2 on every OS.
+// powershell: spawns powershell.exe directly (no /bin/sh wrapper), but
+// PowerShell is itself a scripting interpreter executing the caller's
+// script text -- an interpreter payload, rung 3, same principle as
+// interaction's osascript leg. Windows-only; the code returns an explicit
+// "Windows-only" error elsewhere.
+// bash: execvp({"/bin/bash", "-c", script}) -- bash is the interpreter
+// executing the caller's script text -- rung 3. Linux/macOS only; the code
+// returns an explicit "not available on Windows" error there.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"exec",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "fork_execvp", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "fork_execvp", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 2, "create_process", nullptr}},
+    {"powershell",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* macos   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_encodedcommand", nullptr}},
+    {"bash",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "bash_c", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "bash_c", nullptr},
+     /* windows = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr}},
+};
+
 } // namespace
 
 class ScriptExecPlugin final : public yuzu::Plugin {
@@ -502,6 +530,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"exec", "powershell", "bash", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

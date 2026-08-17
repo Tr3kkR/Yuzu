@@ -414,6 +414,136 @@ bool atomic_write_file(const fs::path& target, std::string_view content) {
     return true;
 }
 
+// ── ABI4 capability declarations (#2204) ─────────────────────────────────
+//
+// One row per entry in actions() above, same names/order. Legs reflect what
+// this TU does TODAY, read directly off the #ifdef structure above:
+//   - exists/list_dir/create_temp/create_temp_dir/read/search_dir/search/
+//     replace/write_content/append/delete_lines are pure std::filesystem /
+//     std::ifstream / std::ofstream / yuzu_create_temp_{file,dir} calls —
+//     native, in-process, every OS (rung 1).
+//   - file_hash/find_by_hash: BCryptHashData in-process on Windows (rung 1,
+//     compute_hash_win); on POSIX routed through
+//     yuzu::agent::run_bounded_subprocess exec'ing an ABSOLUTE-path
+//     shasum/sha256sum/sha1sum — argv, no shell (rung 2, compute_hash_unix).
+//   - get_acl: Windows uses GetNamedSecurityInfo/DACL enumeration (native,
+//     rung 1). The #else branch (Linux AND macOS both take it) is stat()-only
+//     basic owner/group/permission bits — no ACL/ACE enumeration — a real
+//     limitation, so CONSTRAINED rather than SUPPORTED on those two legs.
+//   - get_signature: Windows WinVerifyTrust (native, rung 1). macOS execs
+//     /usr/bin/codesign via run_bounded_subprocess (argv, no shell — rung 2,
+//     per the objective's reference point). Linux has no equivalent
+//     verification surface at all (do_get_signature's final #else) —
+//     UNSUPPORTED.
+//   - get_version_info: Windows GetFileVersionInfoW/VerQueryValueW (native,
+//     rung 1). macOS execs /usr/bin/plutil via run_bounded_subprocess (argv,
+//     no shell — rung 2). Linux has no PE-resource/Info.plist equivalent
+//     (final #else) — UNSUPPORTED.
+namespace {
+
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        "exists",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+    },
+    {
+        "list_dir",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem", nullptr},
+    },
+    {
+        "file_hash",
+        {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:sha256sum/sha1sum", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:shasum", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "bcrypt", nullptr},
+    },
+    {
+        "create_temp",
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_file", nullptr},
+    },
+    {
+        "create_temp_dir",
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_dir", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_dir", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "yuzu_create_temp_dir", nullptr},
+    },
+    {
+        "read",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream", nullptr},
+    },
+    {
+        "get_acl",
+        {YUZU_SUPPORT_CONSTRAINED, 1, "posix_stat",
+         "stat()-only basic owner/group/permission bits; no ACL/ACE enumeration"},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "posix_stat",
+         "stat()-only basic owner/group/permission bits; no ACL/ACE enumeration"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_acl", nullptr},
+    },
+    {
+        "get_signature",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:codesign", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "wintrust", nullptr},
+    },
+    {
+        "find_by_hash",
+        {YUZU_SUPPORT_SUPPORTED, 2, "std::filesystem+subprocess_runner:sha256sum", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "std::filesystem+subprocess_runner:shasum", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem+bcrypt", nullptr},
+    },
+    {
+        "search_dir",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem+std::regex", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem+std::regex", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::filesystem+std::regex", nullptr},
+    },
+    {
+        "get_version_info",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "subprocess_runner:plutil", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_version_info", nullptr},
+    },
+    {
+        "search",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream+std::regex", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream+std::regex", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ifstream+std::regex", nullptr},
+    },
+    {
+        "replace",
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+    },
+    {
+        "write_content",
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+    },
+    {
+        "append",
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ofstream", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ofstream", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "std::ofstream", nullptr},
+    },
+    {
+        "delete_lines",
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "atomic_write_file", nullptr},
+    },
+};
+
+} // namespace
+
 #ifdef __APPLE__
 // ── get_version_info (macOS): Info.plist path selection ────────────────
 // `validated` is already base_dir-validated by the caller (validate_path
@@ -459,6 +589,14 @@ public:
                                      "search",          "replace",         "write_content",
                                      "append",          "delete_lines",    nullptr};
         return acts;
+    }
+
+    [[nodiscard]] const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    [[nodiscard]] size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

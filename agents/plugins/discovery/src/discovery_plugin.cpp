@@ -333,6 +333,27 @@ bool ping_host(const std::string& ip, int timeout_ms) {
 #endif
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// scan_subnet combines an ARP-table read with a ping sweep. The ARP read is
+// native on Windows (GetIpNetTable) but shells out via popen on Linux/macOS
+// (get_arp_table above); the ping sweep shells out via system() on EVERY
+// platform, including Windows (ping_host above) — so even the Windows leg
+// cannot be called a native GetIpNetTable2-only leg: the action still
+// popens arp/ping today (rung 3 on all three platforms), not a native
+// netlink/GetIpNetTable2-only implementation.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "scan_subnet",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "arp table + ping sweep via popen/system()", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "arp table + ping sweep via popen/system()", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "GetIpNetTable + ping sweep via system()", nullptr},
+    },
+};
+
 } // namespace
 
 class DiscoveryPlugin final : public yuzu::Plugin {
@@ -346,6 +367,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"scan_subnet", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override {
