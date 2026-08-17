@@ -212,17 +212,31 @@ public:
     /// `GateFailure::Degraded` (503) on a null or query-failed tag store,
     /// which stays distinguishable.
     ///
-    /// CONFINEMENT AXES ONLY, NOT A FULL AUTHORITY DECISION — same caveat as
-    /// `authorize_agent_target` below. This does not consult `mcp_tier`
-    /// (`mcp::tier_allows`/`requires_approval`, applied in `require_permission`
-    /// before its own service branch) and, for a service-scoped session, does
-    /// not require RBAC to be enabled the way `require_permission`'s service
-    /// branch does (a disabled-RBAC service session still gets a narrowed,
-    /// non-empty result here, via the service-tag axis alone). A caller
-    /// pairs this with `require_permission` (or equivalent tier/RBAC
-    /// enforcement) for the same `(securable_type, operation)` — adversarial
-    /// review (2026-08-17) flagged both gaps as real caller-contract hazards
-    /// to close explicitly when a route is first wired to this gate.
+    /// SELF-SUFFICIENT for the RBAC/management-group authority decision — do
+    /// NOT additionally gate the same `(securable_type, operation)` on
+    /// `require_permission` before or after calling this. `require_permission`'s
+    /// ordinary RBAC branch decides on `check_permission` ALONE (a global-grant
+    /// check) and never consults `mgmt_group_store_` — pairing it with this gate
+    /// rejects a management-group-scoped-only caller before this gate's own
+    /// `authorize_list_read` call ever runs, making the `AdmitScoped` branch
+    /// below permanently unreachable for exactly the confined reader ADR-0017
+    /// exists to serve. Confirmed BLOCKING in code review (2026-08-17,
+    /// reviewer `fjarvis`, PR #3216) — the prior text here prescribed that
+    /// exact broken sequence; see `test_authz_gates.cpp`'s "documented pairing"
+    /// test for the falsifier (the broken sequence denies a management-group-
+    /// scoped-only caller; this gate alone, correctly, does not).
+    ///
+    /// What this gate genuinely does NOT cover — a caller needing either must
+    /// check it WITHOUT re-deciding the RBAC/mgmt-group axis (i.e. not via
+    /// `require_permission`'s full branch chain): `mcp_tier` enforcement
+    /// (`mcp::tier_allows`/`requires_approval`), and the RBAC-enabled
+    /// requirement for service-scoped sessions specifically (a disabled-RBAC
+    /// service session still gets a narrowed, non-empty result here, via the
+    /// service-tag axis alone, unlike `require_permission`'s service branch
+    /// which hard-403s in that case). No such standalone tier/RBAC-enabled
+    /// check exists yet as of this comment — a route wiring this gate to a
+    /// tier-sensitive or service-scope-sensitive operation must add one, not
+    /// assume `require_permission` supplies it.
     [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
     authorize_fleet_read(const httplib::Request& req, httplib::Response& res,
                          const std::string& securable_type, const std::string& operation);
@@ -230,10 +244,17 @@ public:
     /// The single-agent confinement gate: does `agent_id` carry the
     /// `service` tag matching this session's `token_scope_service`?
     /// CONFINEMENT-AXIS ONLY — this is NOT a full authority decision and
-    /// does not re-check the `ITServiceOwner` RBAC grant `require_permission`
-    /// already verifies for the same `(securable_type, operation)`; a caller
-    /// pairs this with `require_permission`, exactly as `authorize_fleet_read`
-    /// pairs `meet` with `authorize_list_read` for the list-read case. For a
+    /// does not re-check the RBAC grant a caller must independently verify
+    /// for the same `(securable_type, operation)`. Pair with
+    /// `require_scoped_permission`, NOT `require_permission` — this gate is
+    /// single-agent-shaped, and `require_scoped_permission` (unlike
+    /// `require_permission`) correctly passes `mgmt_group_store_` to
+    /// `check_scoped_permission` in every branch, so a management-group-
+    /// scoped-only caller is not incorrectly rejected before ever reaching
+    /// this gate's own check — the exact BLOCKING defect found in
+    /// `authorize_fleet_read`'s sibling comment (2026-08-17, reviewer
+    /// `fjarvis`, PR #3216) does not apply here, but corrected proactively
+    /// since the wrong function name was named for the same reason. For a
     /// NON-service session the axis is TOP (unfiltered) by definition, so
     /// this returns `true` unconditionally — it answers only "is this
     /// target inside the token's service scope," never "is this caller
