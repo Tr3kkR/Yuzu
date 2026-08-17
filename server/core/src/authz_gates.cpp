@@ -10,8 +10,7 @@ namespace yuzu::server {
 
 std::expected<authz::ListAuthority, authz::GateFailure>
 AuthRoutes::authorize_fleet_read(const httplib::Request& req, httplib::Response& res,
-                                 const std::string& securable_type,
-                                 const std::string& operation) {
+                                 const std::string& securable_type, const std::string& operation) {
     auto session = require_auth(req, res);
     if (!session)
         // require_auth already wrote the 401 response (unaudited — matches
@@ -50,8 +49,8 @@ AuthRoutes::authorize_fleet_read(const httplib::Request& req, httplib::Response&
     // against a future non-exhaustive edit to ListReadDecision's cases
     // (cpp-safety, governance run 2026-08-17).
     authz::VisibleSet mgmt_scope = authz::deny_all();
-    auto mgmt_authz =
-        rbac_store_->authorize_list_read(session->username, securable_type, operation, mgmt_group_store_);
+    auto mgmt_authz = rbac_store_->authorize_list_read(session->username, securable_type, operation,
+                                                       mgmt_group_store_);
     switch (mgmt_authz.decision) {
     case ListReadDecision::DenyAll:
         audit_log(req, "auth.fleet_read_required", "denied", "", "",
@@ -66,7 +65,7 @@ AuthRoutes::authorize_fleet_read(const httplib::Request& req, httplib::Response&
         break;
     case ListReadDecision::AdmitScoped:
         mgmt_scope = std::unordered_set<std::string>(mgmt_authz.visible_agents.begin(),
-                                                      mgmt_authz.visible_agents.end());
+                                                     mgmt_authz.visible_agents.end());
         break;
     }
 
@@ -78,7 +77,8 @@ AuthRoutes::authorize_fleet_read(const httplib::Request& req, httplib::Response&
             audit_log(req, "auth.fleet_read_required", "denied", "", "",
                       "fleet read blocked: tag store unavailable");
             res.status = 503;
-            res.set_content(detail::a4_denial(res, 503, "tag store unavailable, cannot verify scope",
+            res.set_content(detail::a4_denial(res, 503,
+                                              "tag store unavailable, cannot verify scope",
                                               detail::A4ErrorOpts{.retry_after_ms = 5000}),
                             "application/json");
             return std::unexpected(authz::GateFailure::Degraded);
@@ -106,8 +106,7 @@ AuthRoutes::authorize_fleet_read(const httplib::Request& req, httplib::Response&
 
 bool AuthRoutes::authorize_agent_target(const httplib::Request& req, httplib::Response& res,
                                         const std::string& securable_type,
-                                        const std::string& operation,
-                                        const std::string& agent_id) {
+                                        const std::string& operation, const std::string& agent_id) {
     auto session = require_auth(req, res);
     if (!session)
         return false;
@@ -159,7 +158,8 @@ bool AuthRoutes::authorize_agent_target(const httplib::Request& req, httplib::Re
                         "application/json");
         return false;
     }
-    const authz::VisibleSet service_scope{std::unordered_set<std::string>(tagged->begin(), tagged->end())};
+    const authz::VisibleSet service_scope{
+        std::unordered_set<std::string>(tagged->begin(), tagged->end())};
     if (!authz::in_scope(service_scope, agent_id)) {
         audit_log(req, "auth.agent_target_required", "denied", "Agent", agent_id,
                   "agent is not in service '" + session->token_scope_service + "'");

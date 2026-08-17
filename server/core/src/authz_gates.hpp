@@ -56,8 +56,7 @@ public:
 
     /// Narrow an already-resolved id list to this authority — see
     /// `authz::filter_to_scope`.
-    template <class Ids>
-    [[nodiscard]] std::vector<std::string> filter(const Ids& ids) const {
+    template <class Ids> [[nodiscard]] std::vector<std::string> filter(const Ids& ids) const {
         return authz::filter_to_scope(ids, visible_);
     }
 

@@ -36,7 +36,7 @@ inline constexpr std::array<PermPair, 0> kServiceScopeGlobalSafe{};
 /// Whether a service-scoped token may exercise `(securable_type, operation)`
 /// unconfined. False for everything while `kServiceScopeGlobalSafe` is empty.
 [[nodiscard]] inline bool service_scope_global_safe(std::string_view securable_type,
-                                                     std::string_view operation) {
+                                                    std::string_view operation) {
     for (const auto& pair : kServiceScopeGlobalSafe) {
         if (pair.securable_type == securable_type && pair.operation == operation)
             return true;
