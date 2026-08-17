@@ -709,6 +709,9 @@ Service-scoped tokens:
 - Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
 - Must have `ITServiceOwner` role permission for the target operation
 - Are scoped to agents tagged with the matching `service` tag
+- Carry a session role floored to the base `user` level regardless of the
+  minting principal's own role — an `ITServiceOwner` RBAC grant is the sole
+  authority ceiling for a service-scoped token, never the minter's role
 
 ### Revoking a Token
 

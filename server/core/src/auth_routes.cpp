@@ -277,10 +277,10 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
             // OTHER consumers of role/effective_role() that have no such
             // independent guard: a service-scoped token minted by a
             // currently-admin user inherited `role == admin` and satisfied
-            // inline `effective_role(*session) == admin` checks such as the
-            // workflow/instruction step-approval gates (workflow_routes.cpp,
-            // meant to require a human decision) and MCP bundle-ownership
-            // checks (mcp_server.cpp).
+            // the workflow/instruction step-approval gates' inline
+            // `effective_role(*session) == admin` check (workflow_routes.cpp,
+            // meant to require a human decision) and MCP bundle-ownership's
+            // raw `session->role == admin` check (mcp_server.cpp).
             synth.role = auth::Role::user;
         } else {
             // Resolve the creator's actual legacy role fresh (not unconditional
