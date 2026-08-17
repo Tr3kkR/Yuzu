@@ -1,4 +1,4 @@
-discovery_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
+discovery_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
 
 # Windows needs iphlpapi for ARP table (GetIpNetTable2) and ws2_32 for
 # socket functions (inet_pton, IcmpSendEcho's iphlpapi lives here too).

@@ -44,7 +44,12 @@
 #include <sys/sysctl.h>
 #include <sys/types.h>
 
-#include <spdlog/spdlog.h>
+// NO third-party includes here by design: docs/cpp-conventions.md — "What
+// belongs in agents/shared/: zero-dependency header-only leaves ONLY —
+// nothing with a build target or a core/plugin dependency edge." An earlier
+// cut logged its sysctl failures via <spdlog/spdlog.h>, which forced
+// spdlog_dep into every consumer's meson.build. fetch_rt_flags_llinfo()
+// returns an empty buffer instead and the caller owns the reporting.
 
 namespace yuzu::shared {
 
@@ -58,21 +63,21 @@ struct ArpRecord {
 /**
  * Fetch the raw NET_RT_FLAGS/RTF_LLINFO routing-socket buffer — the same
  * data `arp -a` reads. Size-then-fill sysctl(2); no popen/exec. Empty
- * vector on any failure (including a zero-sized table).
+ * vector on any failure (including a zero-sized table) — indistinguishable
+ * from an empty neighbour table by design, since both mean "no ARP-derived
+ * hosts" to every caller. A caller wanting to log the difference should
+ * check errno itself; this leaf carries no logging dependency (see the
+ * include block above).
  */
 inline std::vector<unsigned char> fetch_rt_flags_llinfo() {
     int mib[6] = {CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_LLINFO};
     std::size_t needed = 0;
-    if (::sysctl(mib, 6, nullptr, &needed, nullptr, 0) != 0 || needed == 0) {
-        spdlog::warn("discovery arp (macOS): sysctl NET_RT_FLAGS size query failed");
+    if (::sysctl(mib, 6, nullptr, &needed, nullptr, 0) != 0 || needed == 0)
         return {};
-    }
 
     std::vector<unsigned char> buf(needed);
-    if (::sysctl(mib, 6, buf.data(), &needed, nullptr, 0) != 0) {
-        spdlog::warn("discovery arp (macOS): sysctl NET_RT_FLAGS fill query failed");
+    if (::sysctl(mib, 6, buf.data(), &needed, nullptr, 0) != 0)
         return {};
-    }
     buf.resize(needed);
     return buf;
 }
