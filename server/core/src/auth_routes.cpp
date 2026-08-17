@@ -253,7 +253,10 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
     }
 
     if (api_token.principal_kind == "human") {
-        // ---- human branch — byte-identical to pre-#2021 behavior ----------
+        // ---- human branch ---------------------------------------------
+        // No longer byte-identical to pre-#2021 behavior: a service-scoped
+        // token's role is now floored below, rather than always resolved
+        // from the creator's live role (see the scope_service branch).
         auth::Session synth;
         synth.username = api_token.principal_id;
         // #1837: no separate display label is stored for a token; fall back to
@@ -267,11 +270,39 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
         synth.mcp_tier = api_token.mcp_tier;
         synth.principal_kind = "human";
 
-        // Resolve the creator's actual legacy role fresh (not unconditional admin).
-        // get_user_role() queries the current role on every call, so a creator who's
-        // been demoted since the token was issued will produce a user-role session.
-        auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
-        synth.role = legacy_role.value_or(auth::Role::user);
+        if (!api_token.scope_service.empty()) {
+            // A service-scoped token is capped at the user floor regardless of
+            // the minter's live role — ITServiceOwner (an RBAC grant, resolved
+            // elsewhere) is the sole authority ceiling for such a token, never
+            // the minter's legacy role. require_admin() already denies every
+            // service-scoped token outright on token_scope_service alone
+            // (below, pre-dating this cap) — the exposure this closes is the
+            // OTHER consumers of role/effective_role() that have no such
+            // independent guard: a service-scoped token minted by a
+            // currently-admin user inherited `role == admin` and satisfied
+            // the workflow/instruction step-approval gates' inline
+            // `effective_role(*session) == admin` check (workflow_routes.cpp,
+            // meant to require a human decision) and MCP bundle-ownership's
+            // raw `session->role == admin` check (mcp_server.cpp).
+            synth.role = auth::Role::user;
+            // Fires on every service-scoped session, not just when the cap
+            // changed the outcome — proving "changed the outcome" needs the
+            // creator's live role, i.e. the very get_user_role() lookup this
+            // branch deliberately skips (see the else branch's comment).
+            // This is a debuggability signal ("the cap is active for this
+            // token"), not an anomaly counter — there is no expected-vs-
+            // unexpected split to alert on here.
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_service_token_role_capped_total").increment();
+            }
+        } else {
+            // Resolve the creator's actual legacy role fresh (not unconditional
+            // admin). get_user_role() queries the current role on every call, so
+            // a creator who's been demoted since the token was issued will
+            // produce a user-role session.
+            auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
+            synth.role = legacy_role.value_or(auth::Role::user);
+        }
 
         return synth;
     }
