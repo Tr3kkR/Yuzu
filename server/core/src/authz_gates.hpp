@@ -2,6 +2,7 @@
 
 #include "authz_model.hpp"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
