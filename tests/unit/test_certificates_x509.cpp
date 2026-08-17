@@ -419,7 +419,7 @@ eXnFkkNcPJENOk0=
 
 constexpr const char* kBundleA_Thumbprint = "F372C9BB593D12B697F3E88E8B4B7F1D42843469";
 constexpr const char* kBundleB_Thumbprint = "159A47FB8B2784CD95A0C65E69A20F58EAE34CD7";
-constexpr const char* kBundleC_Thumbprint = "6CD0A1291C8830BF9DDE356550820B63DBECA800";
+constexpr const char* kBundleC_Thumbprint = "6CD0A1291C8830BF9DDE35655082B063DBECA800";
 
 std::vector<unsigned char> pem_to_der(const std::string& pem) {
     // Minimal PEM->DER for parse_der_cert() vectors: strip the header/footer
