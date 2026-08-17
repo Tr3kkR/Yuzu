@@ -529,3 +529,28 @@ TEST_CASE("REST POST software-deployments: create audits dep.package_id as the d
     CHECK(create_call->result == "success");
     CHECK(create_call->detail == pkg_id);
 }
+
+// gov review (Doomgoose, PR #3174, important; re-checked at Gate 8 by
+// security-guardian): the earlier 503-path test (above) only covers half of
+// sw_deploy_error_status/sw_deploy_client_message's job -- a genuine store
+// failure. The OTHER branch, a business/validation error returned by the
+// store (never carrying kSwDeployDbErrorPrefix), must map to 400 with the
+// message echoed verbatim, not masked like a genuine failure would be.
+TEST_CASE("REST software-deployment routes answer 400 (not 503) on a business/validation "
+          "error, echoing the message verbatim",
+          "[rest][software_deployment][pg]") {
+    SwPkgHarness h;
+
+    SECTION("POST /api/v1/software-deployments: package_id does not exist") {
+        auto res = h.post_deployment(R"({"package_id":"no-such-package","scope_expression":"all"})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("package_id does not exist") != std::string::npos);
+    }
+    SECTION("POST /api/v1/software-deployments/{id}/start: deployment not found") {
+        auto res = h.post_start("0000000000000000000000000000dead");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("deployment not found") != std::string::npos);
+    }
+}
