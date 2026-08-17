@@ -1,10 +1,12 @@
 /**
- * test_discovery_parsers.cpp — parse_proc_net_arp (discovery_parsers.hpp)
- * (Wave-2 PR2.1, WP-C).
+ * test_discovery_parsers.cpp — parse_proc_net_arp + format_mac48
+ * (discovery_parsers.hpp, Wave-2 PR2.1 WP-C).
  *
- * Portable and unguarded — parse_proc_net_arp is pure header-only text
- * parsing (no ifstream, no platform dependency), so this TU carries no
- * platform guard and runs on every leg, macOS included.
+ * Portable and unguarded — both are pure header-only text handling (no
+ * ifstream, no platform dependency), so this TU carries no platform guard and
+ * runs on every leg, macOS included. That is deliberate for format_mac48: its
+ * only production caller is the _WIN32 ARP leg, so testing it here is the one
+ * part of the Windows path that can be verified off-Windows.
  */
 #include "discovery_parsers.hpp"
 
@@ -142,4 +144,33 @@ TEST_CASE("parse_proc_net_arp tolerates a missing header line",
     REQUIRE(entries.size() == 1);
     CHECK(entries[0].ip == "192.168.1.80");
     CHECK(entries[0].mac == "aa:bb:cc:44:55:66");
+}
+
+// ── format_mac48 (Windows leg's MAC formatter, portable + tested everywhere) ──
+
+TEST_CASE("format_mac48 emits lowercase colon-separated hex with zero padding",
+         "[agent][discovery_parsers]") {
+    // Zero-padding is the discriminating part: a formatter losing the leading
+    // zero of 0x00/0x0a yields "0:17:88:a6:b2:13", which no longer matches the
+    // MACs the Linux and macOS legs emit for the same host.
+    const unsigned char addr[6] = {0x00, 0x17, 0x88, 0xa6, 0xb2, 0x13};
+    CHECK(yuzu::discovery::format_mac48(addr) == "00:17:88:a6:b2:13");
+    CHECK(yuzu::discovery::format_mac48(addr).size() == 17);
+}
+
+TEST_CASE("format_mac48 lowercases the high hex digits", "[agent][discovery_parsers]") {
+    // Upper-case output ("AA:BB:...") would silently break MAC equality against
+    // the /proc/net/arp and sysctl legs, which are lowercase.
+    const unsigned char addr[6] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF};
+    CHECK(yuzu::discovery::format_mac48(addr) == "aa:bb:cc:dd:ee:ff");
+}
+
+TEST_CASE("format_mac48 handles the all-zero and all-ones extremes",
+         "[agent][discovery_parsers]") {
+    const unsigned char zero[6] = {0, 0, 0, 0, 0, 0};
+    // The all-zero MAC is formatted faithfully; DROPPING it is the parser's
+    // job (see the all-zero case above), not the formatter's.
+    CHECK(yuzu::discovery::format_mac48(zero) == "00:00:00:00:00:00");
+    const unsigned char bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    CHECK(yuzu::discovery::format_mac48(bcast) == "ff:ff:ff:ff:ff:ff");
 }

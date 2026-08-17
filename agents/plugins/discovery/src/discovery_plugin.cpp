@@ -65,9 +65,9 @@
 
 #include "discovery_scan_plan.hpp" // pure sweep bounds + honest-degrade decisions
 
-#ifdef __linux__
-#include "discovery_parsers.hpp" // yuzu::discovery::parse_proc_net_arp — pure /proc/net/arp parser
-#endif
+// Portable (no platform guard of its own): parse_proc_net_arp for the Linux
+// leg, format_mac48 for the Windows leg.
+#include "discovery_parsers.hpp"
 
 #ifdef __APPLE__
 #include "route_sysctl_arp.hpp" // yuzu::shared::{fetch,parse}_rt_flags_llinfo — sysctl ARP read
@@ -213,12 +213,11 @@ std::vector<ArpEntry> get_arp_table() {
         if (!inet_ntop(AF_INET, const_cast<IN_ADDR*>(&row.Address.Ipv4.sin_addr), ip, sizeof(ip)))
             continue;
 
-        char mac[18]{};
-        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                 row.PhysicalAddress[0], row.PhysicalAddress[1], row.PhysicalAddress[2],
-                 row.PhysicalAddress[3], row.PhysicalAddress[4], row.PhysicalAddress[5]);
-
-        entries.push_back({ip, mac});
+        // format_mac48, not snprintf: printf-family calls are on
+        // docs/cpp-conventions.md's "Forbidden in new code" list, and the
+        // shared helper is portable so this formatting is unit-tested on
+        // every leg rather than only on Windows.
+        entries.push_back({ip, yuzu::discovery::format_mac48(row.PhysicalAddress)});
     }
 
     return entries;

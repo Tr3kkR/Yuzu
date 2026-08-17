@@ -1,9 +1,9 @@
 /**
- * discovery_parsers.hpp — pure /proc/net/arp table parser
+ * discovery_parsers.hpp — pure ARP-data parsing/formatting for discovery
  * (Wave-2 PR2.1, WP-C). Portable and header-only: this file and its test
  * TU (test_discovery_parsers.cpp) carry no platform guard and run on every
- * leg, macOS included, even though only discovery_plugin.cpp's Linux
- * get_arp_table() includes it for real.
+ * leg. Two consumers in discovery_plugin.cpp: parse_proc_net_arp() on the
+ * Linux leg, and format_mac48() on the Windows leg.
  *
  * Kernel format (`net/ipv4/arp.c:arp_seq_show`):
  *   IP address       HW type     Flags       HW address            Mask     Device
@@ -31,6 +31,33 @@ struct ArpEntry {
     std::string ip;
     std::string mac;
 };
+
+/**
+ * Format 6 raw bytes as lowercase colon-separated hex ("aa:bb:cc:dd:ee:ff") —
+ * the canonical MAC shape every leg of this plugin emits, so a Windows
+ * neighbour row and a Linux /proc row are indistinguishable downstream.
+ *
+ * `addr` must point to at least 6 readable bytes; callers check the platform's
+ * own length field first (Windows: MIB_IPNET_ROW2::PhysicalAddressLength).
+ *
+ * Exists as a pure function because the Windows leg previously formatted MACs
+ * with snprintf, which docs/cpp-conventions.md lists under "Forbidden in new
+ * code" (printf-family calls). Being portable, it is also compiled and tested
+ * on every leg, so the one piece of the Windows ARP path that can be verified
+ * off-Windows is verified.
+ */
+inline std::string format_mac48(const unsigned char* addr) {
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(17);
+    for (int i = 0; i < 6; ++i) {
+        if (i)
+            out += ':';
+        out += kHex[addr[i] >> 4];
+        out += kHex[addr[i] & 0x0F];
+    }
+    return out;
+}
 
 /**
  * Parse the text of /proc/net/arp into resolved {ip, mac} entries. Pure —
