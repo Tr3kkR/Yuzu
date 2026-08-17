@@ -130,12 +130,27 @@ inline std::string decode_xml_entities(std::string_view s) {
     return out;
 }
 
+// Tolerant of an attribute-bearing open tag (e.g. some providers emit
+// <EventID Qualifiers='...'>4624</EventID>, not just the bare <EventID>) --
+// locates the tag's start, then its own '>' before searching for the value,
+// same shape as extract_time_created's empty-element handling below.
 inline std::string extract_tag_text(std::string_view s, std::string_view tag, std::size_t from,
                                     std::size_t limit) {
-    const std::string open_tag = std::format("<{}>", tag);
+    const std::string open_prefix = std::format("<{}", tag);
     const std::string close_tag = std::format("</{}>", tag);
+    auto tag_start = s.find(open_prefix, from);
+    if (tag_start == std::string_view::npos || tag_start >= limit)
+        return {};
+    // Reject a longer tag name sharing this prefix (e.g. "<EventIDFoo") --
+    // the byte right after the prefix must be '>' or whitespace/attribute.
+    if (const auto after = tag_start + open_prefix.size();
+        after >= s.size() || !(s[after] == '>' || s[after] == ' '))
+        return {};
+    auto tag_end = s.find('>', tag_start);
+    if (tag_end == std::string_view::npos || tag_end > limit)
+        return {};
     std::size_t vb = 0, ve = 0;
-    if (!find_between(s, open_tag, close_tag, from, limit, vb, ve))
+    if (!find_between(s, ">", close_tag, tag_end, limit, vb, ve))
         return {};
     return decode_xml_entities(s.substr(vb, ve - vb));
 }

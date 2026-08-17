@@ -91,6 +91,25 @@ TEST_CASE("parse_logon_events: a block truncated mid-tag yields empty, never thr
     CHECK(events.empty());
 }
 
+TEST_CASE("parse_logon_events: an attribute-bearing <EventID Qualifiers='...'> tag is parsed",
+          "[users][win_events]") {
+    // Some Windows event providers emit <EventID Qualifiers='...'>N</EventID>
+    // rather than the bare <EventID>N</EventID> this plugin's own captured
+    // fixtures happen to show -- the extractor must not silently drop the
+    // event just because a real provider took the attribute-bearing shape.
+    const std::string xml =
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>"
+        "<System><Provider Name='Microsoft-Windows-Security-Auditing'/>"
+        "<EventID Qualifiers='0'>4624</EventID><TimeCreated SystemTime='t'/></System>"
+        "<EventData><Data Name='TargetUserSid'>S-1-5-21-0-0-0-1</Data>"
+        "<Data Name='TargetUserName'>Alex</Data>"
+        "<Data Name='LogonType'>3</Data></EventData></Event>";
+    auto events = parse_logon_events(xml);
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].event_id == "4624");
+    CHECK(events[0].target_user == "Alex");
+}
+
 TEST_CASE("parse_logon_events: a truncated SECOND event doesn't lose a complete first one",
           "[users][win_events]") {
     const std::string xml =
