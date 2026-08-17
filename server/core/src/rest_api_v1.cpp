@@ -8091,8 +8091,13 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            if (!audit_fn(req, "software_package.create", "success", "SoftwarePackage", *result,
-                          pkg.name))
+            // try_persist_audit (not a bare audit_fn call): a throwing audit
+            // sink must not turn this 201 into an uncaught-exception 500 (no
+            // exception_handler_ is installed) after the mutation already
+            // committed — same rationale as deny_fleet_wide_service_scoped
+            // above, unhappy-path Gate 4 (b77952416..HEAD review round).
+            if (!detail::try_persist_audit(audit_fn, req, "software_package.create", "success",
+                                           "SoftwarePackage", *result, pkg.name))
                 res.set_header("Sec-Audit-Failed", "true");
             res.status = 201;
             res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
@@ -8158,8 +8163,10 @@ void RestApiV1::register_routes(
                                           "application/json");
                           return;
                       }
-                      if (!audit_fn(req, "software_deployment.create", "success",
-                                    "SoftwareDeployment", *result, dep.package_id))
+                      // try_persist_audit — see software_package.create above.
+                      if (!detail::try_persist_audit(audit_fn, req, "software_deployment.create",
+                                                     "success", "SoftwareDeployment", *result,
+                                                     dep.package_id))
                           res.set_header("Sec-Audit-Failed", "true");
                       res.status = 201;
                       res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
@@ -8182,8 +8189,9 @@ void RestApiV1::register_routes(
                 auto id = req.matches[1].str();
                 auto result = sw_deploy_store->start_deployment(id);
                 if (result) {
-                    if (!audit_fn(req, "software_deployment.start", "success",
-                                  "SoftwareDeployment", id, ""))
+                    // try_persist_audit — see software_package.create above.
+                    if (!detail::try_persist_audit(audit_fn, req, "software_deployment.start",
+                                                   "success", "SoftwareDeployment", id, ""))
                         res.set_header("Sec-Audit-Failed", "true");
                     res.set_content(ok_json(JObj().add("started", true).str()), "application/json");
                 } else {
@@ -8207,8 +8215,10 @@ void RestApiV1::register_routes(
                       auto id = req.matches[1].str();
                       auto result = sw_deploy_store->rollback_deployment(id);
                       if (result) {
-                          if (!audit_fn(req, "software_deployment.rollback", "success",
-                                        "SoftwareDeployment", id, ""))
+                          // try_persist_audit — see software_package.create above.
+                          if (!detail::try_persist_audit(audit_fn, req,
+                                                         "software_deployment.rollback", "success",
+                                                         "SoftwareDeployment", id, ""))
                               res.set_header("Sec-Audit-Failed", "true");
                           res.set_content(ok_json(JObj().add("rolled_back", true).str()),
                                           "application/json");
@@ -8234,8 +8244,10 @@ void RestApiV1::register_routes(
                       auto id = req.matches[1].str();
                       auto result = sw_deploy_store->cancel_deployment(id);
                       if (result) {
-                          if (!audit_fn(req, "software_deployment.cancel", "success",
-                                        "SoftwareDeployment", id, ""))
+                          // try_persist_audit — see software_package.create above.
+                          if (!detail::try_persist_audit(audit_fn, req,
+                                                         "software_deployment.cancel", "success",
+                                                         "SoftwareDeployment", id, ""))
                               res.set_header("Sec-Audit-Failed", "true");
                           res.set_content(ok_json(JObj().add("cancelled", true).str()),
                                           "application/json");

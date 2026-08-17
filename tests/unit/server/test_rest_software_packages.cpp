@@ -85,6 +85,7 @@ struct SwPkgHarness {
     auth::Role session_role{auth::Role::admin};
 
     std::vector<AuditRecord> audit_log;
+    bool audit_succeeds{true};
 
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
@@ -119,7 +120,7 @@ struct SwPkgHarness {
                                const std::string& result, const std::string&,
                                const std::string& target_id, const std::string& detail) -> bool {
             audit_log.push_back({action, result, target_id, detail});
-            return true;
+            return audit_succeeds;
         };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -170,6 +171,12 @@ struct SwPkgHarness {
     auto get_deployments() { return sink.Get("/api/v1/software-deployments"); }
     auto post_start(const std::string& id) {
         return sink.Post("/api/v1/software-deployments/" + id + "/start", "");
+    }
+    auto post_rollback(const std::string& id) {
+        return sink.Post("/api/v1/software-deployments/" + id + "/rollback", "");
+    }
+    auto post_cancel(const std::string& id) {
+        return sink.Post("/api/v1/software-deployments/" + id + "/cancel", "");
     }
 };
 
@@ -552,5 +559,66 @@ TEST_CASE("REST software-deployment routes answer 400 (not 503) on a business/va
         REQUIRE(res);
         CHECK(res->status == 400);
         CHECK(res->body.find("deployment not found") != std::string::npos);
+    }
+}
+
+// gov review (unhappy-path + compliance-officer, Gate 4/6, b77952416..HEAD
+// review round): the audit-persistence discard fix (DG-2) shipped with no
+// test proving Sec-Audit-Failed actually gets set when audit_fn returns
+// false -- audit_succeeds was always true, so the header-set branch was
+// dead code from the test suite's perspective. Matches the harness-toggle
+// precedent in test_kek_routes.cpp / test_ca_routes.cpp. The mutation has
+// already durably committed by the time audit_fn runs, so the correct
+// posture is set-and-proceed (still 2xx), never fail-closed.
+TEST_CASE("REST software-deployment/package routes set Sec-Audit-Failed on a dropped audit row, "
+          "and still return success",
+          "[rest][software_deployment][pg]") {
+    SwPkgHarness h;
+
+    SECTION("POST /api/v1/software-packages") {
+        h.audit_succeeds = false;
+        auto res = h.post(SwPkgHarness::make_body("dpkg -s firefox"));
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    SECTION("POST /api/v1/software-deployments, .../start, .../rollback, .../cancel") {
+        auto pkg = h.post(SwPkgHarness::make_body("dpkg -s firefox"));
+        REQUIRE(pkg);
+        REQUIRE(pkg->status == 201);
+        auto pkg_id = nlohmann::json::parse(pkg->body)["data"]["id"].get<std::string>();
+
+        h.audit_succeeds = false;
+        auto dep =
+            h.post_deployment(R"({"package_id":")" + pkg_id + R"(","scope_expression":"all"})");
+        REQUIRE(dep);
+        REQUIRE(dep->status == 201);
+        CHECK(dep->get_header_value("Sec-Audit-Failed") == "true");
+        auto dep_id = nlohmann::json::parse(dep->body)["data"]["id"].get<std::string>();
+
+        auto start = h.post_start(dep_id);
+        REQUIRE(start);
+        REQUIRE(start->status == 200);
+        CHECK(start->get_header_value("Sec-Audit-Failed") == "true");
+
+        auto rollback = h.post_rollback(dep_id);
+        REQUIRE(rollback);
+        REQUIRE(rollback->status == 200);
+        CHECK(rollback->get_header_value("Sec-Audit-Failed") == "true");
+
+        auto pkg2 = h.post(SwPkgHarness::make_body("dpkg -s firefox", "", "Firefox-2"));
+        REQUIRE(pkg2);
+        REQUIRE(pkg2->status == 201);
+        auto pkg2_id = nlohmann::json::parse(pkg2->body)["data"]["id"].get<std::string>();
+        auto dep2 =
+            h.post_deployment(R"({"package_id":")" + pkg2_id + R"(","scope_expression":"all"})");
+        REQUIRE(dep2);
+        REQUIRE(dep2->status == 201);
+        auto dep2_id = nlohmann::json::parse(dep2->body)["data"]["id"].get<std::string>();
+
+        auto cancel = h.post_cancel(dep2_id);
+        REQUIRE(cancel);
+        REQUIRE(cancel->status == 200);
+        CHECK(cancel->get_header_value("Sec-Audit-Failed") == "true");
     }
 }
