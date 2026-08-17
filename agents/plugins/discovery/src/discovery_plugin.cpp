@@ -432,14 +432,22 @@ private:
             return 1;
         }
 
+        // A non-numeric timeout_ms used to be discarded in silence, so an
+        // automation template typo simply scanned with the default. Say so.
+        // No clamp here: probe_budget_ms() owns the bound (a second clamp to
+        // [100,10000] was dead — nothing can observe a value above the
+        // per-host ceiling).
         int timeout_ms = 1000;
         if (!timeout_str.empty()) {
-            std::from_chars(timeout_str.data(),
-                            timeout_str.data() + timeout_str.size(),
-                            timeout_ms);
+            const auto [p_end, ec] = std::from_chars(
+                timeout_str.data(), timeout_str.data() + timeout_str.size(), timeout_ms);
+            if (ec != std::errc{} || p_end != timeout_str.data() + timeout_str.size()) {
+                timeout_ms = 1000;
+                ctx.write_output(std::format(
+                    "status|warning|ignoring invalid timeout_ms '{}', using default 1000ms",
+                    timeout_str));
+            }
         }
-        if (timeout_ms < 100) timeout_ms = 100;
-        if (timeout_ms > 10000) timeout_ms = 10000;
 
         uint32_t base_ip = 0;
         int prefix_len = 0;
@@ -450,7 +458,17 @@ private:
 
         auto hosts = enumerate_hosts(base_ip, prefix_len);
         if (hosts.empty()) {
-            ctx.write_output("status|error|subnet too large (max /24) or no valid hosts");
+            // Two different refusals: a /16 is not "too large" as a prefix, and
+            // a /31 has no host bits at all. One message for both told an
+            // operator the subnet was invalid when the scan simply declines it.
+            if (prefix_len < 24)
+                ctx.write_output(std::format(
+                    "status|error|subnet has too many hosts to scan (/{} requested, /24 is the "
+                    "widest supported)",
+                    prefix_len));
+            else
+                ctx.write_output(std::format(
+                    "status|error|/{} contains no usable host addresses", prefix_len));
             return 1;
         }
 
