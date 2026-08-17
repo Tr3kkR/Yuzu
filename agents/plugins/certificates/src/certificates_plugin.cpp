@@ -135,8 +135,10 @@ struct CertRecord {
         // safe_output_field so a hostile '|' or embedded CR/LF can never
         // inject an extra column or row into this pipe-delimited output
         // (BR-07). thumbprint/not_before/not_after/store are excluded:
-        // thumbprint is hex-validated (is_valid_thumbprint) or a literal
-        // "(unknown)" sentinel, the dates are produced entirely by this
+        // thumbprint is hex-validated (is_valid_thumbprint) or one of this
+        // file's own literal sentinels ("(unknown)"/"(skipped)" -- both
+        // parenthesised ASCII, no '|' or CR/LF), the dates are produced
+        // entirely by this
         // file's own date formatting, and store is always one of this
         // plugin's own fixed literal labels -- none of the four can carry
         // attacker-controlled bytes.
@@ -166,6 +168,28 @@ CertRecord to_cert_record(const yuzu::certificates_x509::CertFields& fields, std
     rec.thumbprint = fields.thumbprint;
     rec.key_usage = fields.key_usage;
     return rec;
+}
+
+/// Report a partial certificate read through the ABI4 typed result seam
+/// (`yuzu_ctx_set_result_status`, sdk/include/yuzu/plugin.hpp) in addition to
+/// the operator-visible `not_available|<reason>` row the caller writes.
+///
+/// The sentinel row alone is only OPERATOR-visible: a consumer reading the
+/// command's RESULT METADATA rather than scraping rows would otherwise see an
+/// inventory that is missing a whole keychain (or a whole certificate file)
+/// presented with the default UNDECLARED status, from which the agent derives
+/// a coarse success. Every degraded read here is therefore CONSTRAINED +
+/// PARTIAL, with `provenance` naming the half that failed so the two halves
+/// of a hybrid macOS read stay distinguishable ("login-keychain" is the
+/// spec-named value for the governed-shell half).
+///
+/// Idempotent by construction: the seam records the last call for the
+/// currently-executing command, and every call here reports the same
+/// CONSTRAINED/PARTIAL pair, so a read that degrades in two places reports
+/// degraded once with the last-named provenance rather than escalating.
+void mark_result_partial(yuzu::CommandContext& ctx, std::string_view provenance) {
+    ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                          provenance);
 }
 #endif
 
@@ -402,7 +426,8 @@ std::optional<yuzu::certificates_x509::CertFields> first_cert_of_file(
     return std::move(certs.front());
 }
 
-CertRecord read_linux_cert_record(const std::filesystem::path& pem_path,
+CertRecord read_linux_cert_record(yuzu::CommandContext& ctx,
+                                  const std::filesystem::path& pem_path,
                                   const std::string& store_name) {
     auto cert = first_cert_of_file(pem_path);
     if (!cert) {
@@ -410,16 +435,34 @@ CertRecord read_linux_cert_record(const std::filesystem::path& pem_path,
         // metacharacters before this file ever shelled out to
         // `openssl x509 -in <path>` -- native std::ifstream I/O never
         // interpolates the path into a shell command, so that specific risk
-        // is gone. What remains in its place is the same fallback for a
-        // file this code genuinely cannot turn into a certificate record
+        // is gone, and with it the only condition "(unsafe path)" ever
+        // described. What reaches this branch now is a DIFFERENT condition:
+        // a file this code genuinely cannot turn into a certificate record
         // (missing, permission denied, empty, garbage, or a truncated PEM
-        // block) -- reported via the EXACT SAME sentinel strings
-        // ("(unsafe path)"/"(skipped)") the old unsafe-path branch emitted,
-        // so a downstream consumer matching on those literal values sees no
-        // behaviour change for an unreadable/unparseable file.
+        // block). Reporting that as "(unsafe path)" would name a cause that
+        // cannot occur, so the sentinel says what actually happened.
+        //
+        // This is a deliberate, narrow divergence from the pre-migration
+        // output, and NOT the one the deleted code's own comment claimed:
+        // pre-migration an unreadable/unparseable file did NOT take the
+        // unsafe-path branch at all -- every `openssl x509` call simply
+        // failed, leaving subject/issuer/thumbprint at "(unknown)" and
+        // key_usage at "(none)". So "(unsafe path)" was never this case's
+        // output either way; "(unreadable)" is strictly more honest than
+        // both the old "(unknown)" (which is also what a per-field parse
+        // failure on a VALID certificate produces, and so cannot be
+        // distinguished from it) and "(unsafe path)".
+        //
+        // The row is still emitted, not dropped: expires_within_days()
+        // returns true for a not_after shorter than 10 characters, so this
+        // record survives the expiry filter in list_certs_linux and the
+        // unreadable file stays operator-visible. mark_result_partial makes
+        // it machine-visible too -- an inventory missing a certificate file
+        // is a partial inventory, not a clean one.
+        mark_result_partial(ctx, "libcrypto:unreadable-file");
         CertRecord rec;
         rec.store = store_name;
-        rec.subject = "(unsafe path)";
+        rec.subject = "(unreadable)";
         rec.thumbprint = "(skipped)";
         return rec;
     }
@@ -444,7 +487,7 @@ void list_certs_linux(yuzu::CommandContext& ctx, std::string_view /*store_filter
         if (ext != ".pem" && ext != ".crt")
             continue;
 
-        auto rec = read_linux_cert_record(entry.path(), "/etc/ssl/certs");
+        auto rec = read_linux_cert_record(ctx, entry.path(), "/etc/ssl/certs");
         if (expires_within_days(rec.not_after, expiring_days)) {
             ctx.write_output(rec.to_row());
         }
@@ -469,7 +512,7 @@ void details_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint) 
         if (ext != ".pem" && ext != ".crt")
             continue;
 
-        auto rec = read_linux_cert_record(entry.path(), "/etc/ssl/certs");
+        auto rec = read_linux_cert_record(ctx, entry.path(), "/etc/ssl/certs");
         if (rec.thumbprint == thumbprint) {
             ctx.write_output(rec.to_row());
             return;
@@ -1025,6 +1068,7 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
         // above with zero rows following would read as "ran fine, no
         // certs") and never a fabricated result.
         ctx.write_output("not_available|no console session");
+        mark_result_partial(ctx, "login-keychain");
         return;
     }
 
@@ -1039,6 +1083,7 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
         if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=
             std::chrono::milliseconds::zero()) {
             ctx.write_output("not_available|System.keychain action deadline exceeded");
+            mark_result_partial(ctx, "secitem:System.keychain");
         } else {
             auto sys_result = read_keychain_secitem(yuzu::macos::system_keychain_path().c_str());
             if (sys_result.ok) {
@@ -1050,9 +1095,11 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                 }
                 if (!sys_result.complete) {
                     ctx.write_output("not_available|System.keychain scan incomplete");
+                    mark_result_partial(ctx, "secitem:System.keychain");
                 }
             } else {
                 ctx.write_output("not_available|System.keychain read failed");
+                mark_result_partial(ctx, "secitem:System.keychain");
             }
         }
     }
@@ -1062,6 +1109,7 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
             std::chrono::milliseconds::zero()) {
             ctx.write_output(
                 "not_available|SystemRootCertificates.keychain action deadline exceeded");
+            mark_result_partial(ctx, "secitem:SystemRootCertificates.keychain");
         } else {
             auto root_result = read_keychain_secitem(yuzu::macos::root_keychain_path().c_str());
             if (root_result.ok) {
@@ -1074,9 +1122,11 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                 if (!root_result.complete) {
                     ctx.write_output(
                         "not_available|SystemRootCertificates.keychain scan incomplete");
+                    mark_result_partial(ctx, "secitem:SystemRootCertificates.keychain");
                 }
             } else {
                 ctx.write_output("not_available|SystemRootCertificates.keychain read failed");
+                mark_result_partial(ctx, "secitem:SystemRootCertificates.keychain");
             }
         }
     }
@@ -1093,10 +1143,12 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
             // should never fail here. Still an honest sentinel rather than
             // a silent no-op if it somehow does.
             ctx.write_output("not_available|login keychain command construction failed");
+            mark_result_partial(ctx, "login-keychain");
         } else {
             auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
             if (read_deadline <= std::chrono::milliseconds::zero()) {
                 ctx.write_output("not_available|login keychain action deadline exceeded");
+                mark_result_partial(ctx, "login-keychain");
             } else {
                 // The launchctl/sudo wrapper relies on the outer shell's
                 // `~username` expansion (build_login_keychain_read_command's
@@ -1119,6 +1171,7 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                     if (!emit_keychain_rows_macos(ctx, login_result.output, "login.keychain-db",
                                                   expiring_days, action_deadline)) {
                         ctx.write_output("not_available|login keychain scan incomplete");
+                        mark_result_partial(ctx, "login-keychain");
                     }
                 } else {
                     // A missing sudoers grant, a launchctl/sudo failure, or an
@@ -1127,6 +1180,7 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                     // indistinguishable from "this keychain is genuinely
                     // empty".
                     ctx.write_output("not_available|login keychain read failed");
+                    mark_result_partial(ctx, "login-keychain");
                 }
             }
         }
@@ -1147,6 +1201,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
 
     if (plan.sentinel_required) {
         ctx.write_output("not_available|no console session");
+        mark_result_partial(ctx, "login-keychain");
         return;
     }
 
@@ -1222,17 +1277,24 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // had already failed.
     bool read_failed = false;
     std::string_view failure_reason;
+    // Which half of the hybrid read failed, for the ABI4 result seam below --
+    // set together with failure_reason at every site (first failure wins), so
+    // the machine-visible provenance can never name a different keychain from
+    // the operator-visible reason.
+    std::string_view failure_provenance;
 
     if (plan.want_system) {
         if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=
             std::chrono::milliseconds::zero()) {
             read_failed = true;
             failure_reason = "System.keychain action deadline exceeded";
+            failure_provenance = "secitem:System.keychain";
         } else {
             auto sys_result = read_keychain_secitem(yuzu::macos::system_keychain_path().c_str());
             if (!sys_result.ok) {
                 read_failed = true;
                 failure_reason = "System.keychain read failed";
+                failure_provenance = "secitem:System.keychain";
             } else {
                 switch (check_secitem(sys_result, "System.keychain")) {
                 case ScanOutcome::kFound:
@@ -1240,6 +1302,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                 case ScanOutcome::kIncomplete:
                     read_failed = true;
                     failure_reason = "System.keychain scan incomplete";
+                    failure_provenance = "secitem:System.keychain";
                     break;
                 case ScanOutcome::kNotFound:
                     break;
@@ -1254,6 +1317,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
             if (!read_failed) {
                 read_failed = true;
                 failure_reason = "SystemRootCertificates.keychain action deadline exceeded";
+                failure_provenance = "secitem:SystemRootCertificates.keychain";
             }
         } else {
             auto root_result = read_keychain_secitem(yuzu::macos::root_keychain_path().c_str());
@@ -1261,6 +1325,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                 if (!read_failed) {
                     read_failed = true;
                     failure_reason = "SystemRootCertificates.keychain read failed";
+                    failure_provenance = "secitem:SystemRootCertificates.keychain";
                 }
             } else {
                 switch (check_secitem(root_result, "SystemRootCertificates.keychain")) {
@@ -1270,6 +1335,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                     if (!read_failed) {
                         read_failed = true;
                         failure_reason = "SystemRootCertificates.keychain scan incomplete";
+                        failure_provenance = "secitem:SystemRootCertificates.keychain";
                     }
                     break;
                 case ScanOutcome::kNotFound:
@@ -1286,6 +1352,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
             if (!read_failed) {
                 read_failed = true;
                 failure_reason = "login keychain command construction failed";
+                failure_provenance = "login-keychain";
             }
         } else {
             auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
@@ -1293,6 +1360,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                 if (!read_failed) {
                     read_failed = true;
                     failure_reason = "login keychain action deadline exceeded";
+                    failure_provenance = "login-keychain";
                 }
             } else {
                 // See list_certs_macos's matching comment: `cmd` needs the
@@ -1308,6 +1376,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                     if (!read_failed) {
                         read_failed = true;
                         failure_reason = "login keychain read failed";
+                        failure_provenance = "login-keychain";
                     }
                 } else {
                     switch (check(login_result.output, "login.keychain-db")) {
@@ -1317,6 +1386,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                         if (!read_failed) {
                             read_failed = true;
                             failure_reason = "login keychain scan incomplete";
+                            failure_provenance = "login-keychain";
                         }
                         break;
                     case ScanOutcome::kNotFound:
@@ -1335,6 +1405,7 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
         // inaccessible keychain path, the cap/deadline hit mid-scan, an
         // unparseable block, ...). See list_certs_macos's matching comment.
         ctx.write_output(std::format("not_available|{}", failure_reason));
+        mark_result_partial(ctx, failure_provenance);
         return;
     }
 
