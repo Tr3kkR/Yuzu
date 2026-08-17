@@ -148,6 +148,18 @@ public:
     /// implementation plan §2c); the service axis returns
     /// `GateFailure::Degraded` (503) on a null or query-failed tag store,
     /// which stays distinguishable.
+    ///
+    /// CONFINEMENT AXES ONLY, NOT A FULL AUTHORITY DECISION — same caveat as
+    /// `authorize_agent_target` below. This does not consult `mcp_tier`
+    /// (`mcp::tier_allows`/`requires_approval`, applied in `require_permission`
+    /// before its own service branch) and, for a service-scoped session, does
+    /// not require RBAC to be enabled the way `require_permission`'s service
+    /// branch does (a disabled-RBAC service session still gets a narrowed,
+    /// non-empty result here, via the service-tag axis alone). A caller
+    /// pairs this with `require_permission` (or equivalent tier/RBAC
+    /// enforcement) for the same `(securable_type, operation)` — adversarial
+    /// review (2026-08-17) flagged both gaps as real caller-contract hazards
+    /// to close explicitly when a route is first wired to this gate.
     [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
     authorize_fleet_read(const httplib::Request& req, httplib::Response& res,
                          const std::string& securable_type, const std::string& operation);
