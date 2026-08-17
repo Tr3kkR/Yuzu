@@ -668,8 +668,13 @@ int do_local_users(yuzu::CommandContext& ctx) {
             // above, which already degrades (last_logon stays "unknown")
             // rather than dropping the row on the same condition.
             if (!is_safe_identifier(user)) {
-                ctx.write_output(
-                    std::format("local_user|{}|unknown|unknown|-|unknown", user));
+                // `user` failed the argv-safety check precisely because it
+                // contains a character outside the allowed charset -- it is
+                // exactly the value most likely to carry a literal '|' or an
+                // embedded CR/LF, the same row/column-injection class the
+                // `desc` field below is already escaped against (K-11/CDX-10).
+                ctx.write_output(std::format("local_user|{}|unknown|unknown|-|unknown",
+                                             yuzu::util::safe_output_field(user)));
                 continue;
             }
 
