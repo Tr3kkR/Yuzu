@@ -479,6 +479,7 @@ if build_server
     files(
       'unit/server/test_auth.cpp',
       'unit/server/test_auth_routes.cpp',
+      'unit/server/test_auth_list_read_gate.cpp',
       'unit/server/test_auth_routes_mfa.cpp',
       'unit/server/test_auth_jit_elevation.cpp',
       'unit/server/test_auth_sso_identity.cpp',
@@ -625,6 +626,7 @@ if build_server
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
+      'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
       'unit/server/test_guardian_form_render.cpp',
@@ -743,12 +745,14 @@ if build_server
       # constexpr — no link to yuzu_agent_core, just the include path.
       include_directories('../agents/core/include'),
       # Tag-key pins: test_spark_fleet_tags.cpp includes the agent's
-      # spark_heartbeat.hpp (emit_spark_heartbeat_tags), and
+      # spark_heartbeat.hpp (emit_spark_heartbeat_tags),
       # test_guardian_journal_fleet_tags.cpp includes guardian_journal_heartbeat.hpp
-      # (emit_guardian_journal_heartbeat_tags), each asserting the agent's actual
-      # emitted keys equal the matching server-side *_fleet_tags.hpp table - a full
-      # writer↔reader compile/run bind, no silent zero-reporting drift. Header-only
-      # templates - no link to yuzu_agent_core, just the include path.
+      # (emit_guardian_journal_heartbeat_tags), and test_guardian_health_fleet_tags.cpp
+      # includes guardian_health_heartbeat.hpp (emit_guardian_health_heartbeat_tags,
+      # #2298 gate 3 item 6d) - each asserting the agent's actual emitted keys equal the
+      # matching server-side *_fleet_tags.hpp table - a full writer↔reader compile/run
+      # bind, no silent zero-reporting drift. Header-only templates - no link to
+      # yuzu_agent_core, just the include path.
       #
       # CONSTRAINT (governance Gate-3 architect). This puts 47 PRIVATE agent headers on
       # the include path of every server test TU. It is safe TODAY only because there is
@@ -762,12 +766,13 @@ if build_server
       # header: that would be an upward dependency edge (server → agent), which the build
       # graph does not have and must not gain. The durable fix is to hoist the shared tag
       # keys into one source of truth. NOTE THE SCOPE: that hoist is triggered by spark's
-      # rung 2, "when the wire contract changes anyway" - but the GUARDIAN JOURNAL keys
-      # are not part of that wire-contract change, so a rung-2 hoist sweeping only spark
-      # would leave the 22 yuzu.guardian_journal_* literals behind while this comment
-      # still read as though it covered them. Both key families must move together; the
-      # journal side must be added to #2298's cutover-gate list (not yet filed there as of
-      # this commit). Concrete target when it
+      # rung 2, "when the wire contract changes anyway" - but the GUARDIAN JOURNAL and
+      # GUARDIAN HEALTH keys are not part of that wire-contract change, so a rung-2 hoist
+      # sweeping only spark would leave the 30 yuzu.guardian_journal_* and 3
+      # yuzu.guardian_unhealthy_*/guardian_priority_demoted literals behind while this
+      # comment still read as though it covered them. ALL THREE key families must move
+      # together; the journal and health sides must be added to #2298's cutover-gate
+      # list (not yet filed there as of this commit). Concrete target when it
       # happens: a hand-written header carried by proto/meson.build's
       # yuzu_proto_headers_dep - a DOWNWARD edge for both server and agent, no cycle, no
       # new build-graph node. NOT sdk/, which is the public plugin ABI surface.
