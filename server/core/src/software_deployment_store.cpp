@@ -379,7 +379,12 @@ LegacyTableStatus legacy_has_table(sqlite3* db, const char* table) {
     if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", -1,
                            s.addr(), nullptr) != SQLITE_OK)
         return LegacyTableStatus::Error;
-    sqlite3_bind_text(s.get(), 1, table, -1, SQLITE_TRANSIENT);
+    // A failed bind (realistically SQLITE_NOMEM) leaves the parameter
+    // unbound/NULL; `name = NULL` then matches zero rows, which step()
+    // alone can't distinguish from genuine absence -- exactly the
+    // probe-failure-vs-absence conflation this function exists to close.
+    if (sqlite3_bind_text(s.get(), 1, table, -1, SQLITE_TRANSIENT) != SQLITE_OK)
+        return LegacyTableStatus::Error;
     const int rc = sqlite3_step(s.get());
     if (rc == SQLITE_ROW)
         return LegacyTableStatus::Present;

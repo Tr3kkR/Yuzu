@@ -40,6 +40,7 @@
 
 #include "../test_helpers.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -498,4 +499,30 @@ TEST_CASE("REST software-deployment routes answer 503 (not 400) on a genuine sto
         CHECK(res->body.find("service unavailable") != std::string::npos);
         CHECK(res->body.find("does not exist") == std::string::npos);
     }
+}
+
+// gov review (Doomgoose, PR #3174, minor): a fix landed in this same round
+// (software_deployment.create now audits dep.package_id as its detail field,
+// matching every sibling create-event's convention of naming what the row
+// belongs to, instead of an empty string) with no regression test.
+TEST_CASE("REST POST software-deployments: create audits dep.package_id as the detail field, "
+          "not empty",
+          "[rest][software_deployment][pg]") {
+    SwPkgHarness h;
+    auto pkg = h.post(SwPkgHarness::make_body("dpkg -s firefox"));
+    REQUIRE(pkg);
+    REQUIRE(pkg->status == 201);
+    auto pkg_id = nlohmann::json::parse(pkg->body)["data"]["id"].get<std::string>();
+
+    auto res =
+        h.post_deployment(R"({"package_id":")" + pkg_id + R"(","scope_expression":"all"})");
+    REQUIRE(res);
+    REQUIRE(res->status == 201);
+
+    auto create_call =
+        std::find_if(h.audit_log.begin(), h.audit_log.end(),
+                     [](const AuditRecord& a) { return a.action == "software_deployment.create"; });
+    REQUIRE(create_call != h.audit_log.end());
+    CHECK(create_call->result == "success");
+    CHECK(create_call->detail == pkg_id);
 }
