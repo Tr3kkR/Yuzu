@@ -22,8 +22,8 @@
 #include "pg/pg_pool.hpp"
 #include "rbac_store.hpp"
 #include "tag_store.hpp"
-#include "test_api_token_pg_helper.hpp"    // ApiTokenStorePg
-#include "test_mgmt_group_pg_helper.hpp"   // ManagementGroupStorePg
+#include "test_api_token_pg_helper.hpp"  // ApiTokenStorePg
+#include "test_mgmt_group_pg_helper.hpp" // ManagementGroupStorePg
 
 #include "../test_helpers.hpp"
 
@@ -87,7 +87,9 @@ int deny_tag_read(void*, int action, const char* arg1, const char*, const char*,
 // SQLITE_INTERRUPT rather than SQLITE_ROW/SQLITE_DONE, exercising the
 // mid-scan (not prepare-time) failure path agents_with_tag_checked's fix
 // distinguishes from a genuine end-of-results.
-int force_interrupt(void*) { return 1; }
+int force_interrupt(void*) {
+    return 1;
+}
 
 // Distinct template name from every other file's "rbacstore*" registrations
 // (test_list_read_confinement.cpp's "rbacstore", test_engine_principal_
@@ -134,8 +136,8 @@ struct GatesRig {
     std::string gP, gC1, gC2, gS;
 
     explicit GatesRig(const std::string& dsn)
-        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool},
-          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool} {
+        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool}, audit_pool{{.conninfo = dsn, .size = 2}},
+          audit_store{audit_pool} {
         REQUIRE(pool.valid());
         REQUIRE(rbac.is_open());
         REQUIRE(audit_store.is_open());
@@ -184,7 +186,8 @@ struct GatesRig {
 
     /// Mint a token as "minter" — scope_service empty ⇒ a non-service token.
     std::string mint(const std::string& scope_service = {}) {
-        auto raw = api_tokens->create_token("gates-test", "minter", now_epoch() + 3600, scope_service);
+        auto raw =
+            api_tokens->create_token("gates-test", "minter", now_epoch() + 3600, scope_service);
         REQUIRE(raw.has_value());
         return *raw;
     }
@@ -232,7 +235,7 @@ TEST_CASE("authorize_fleet_read: AdmitAll × absent service ⇒ unfiltered "
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
     REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value()); // GLOBAL allow
-    auto token = r.mint(); // non-service
+    auto token = r.mint();                                                     // non-service
     auto req = bearer_request(token);
     httplib::Response res;
 
@@ -266,7 +269,7 @@ TEST_CASE("authorize_fleet_read: AdmitScoped-M × absent service ⇒ mgmt scope 
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
     r.group_assign(r.gP, "minter", "RespReader"); // group allow ⇒ AdmitScoped(P's subtree)
-    auto token = r.mint(); // non-service
+    auto token = r.mint();                        // non-service
     auto req = bearer_request(token);
     httplib::Response res;
 
@@ -291,15 +294,15 @@ TEST_CASE("authorize_fleet_read: AdmitScoped-M × service S ⇒ real intersectio
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
     r.group_assign(r.gP, "minter", "RespReader"); // AdmitScoped({a_p,a_c1,a_c2})
-    auto token = r.mint("printers");               // service S = {a_p,a_c1,a_s}
+    auto token = r.mint("printers");              // service S = {a_p,a_c1,a_s}
     auto req = bearer_request(token);
     httplib::Response res;
 
     auto result = r.ar->authorize_fleet_read(req, res, "Response", "Read");
     REQUIRE(result.has_value());
     CHECK_FALSE(result->unfiltered());
-    CHECK(result->in_scope("a_p"));   // in both
-    CHECK(result->in_scope("a_c1"));  // in both
+    CHECK(result->in_scope("a_p"));        // in both
+    CHECK(result->in_scope("a_c1"));       // in both
     CHECK_FALSE(result->in_scope("a_c2")); // mgmt-only, dropped by the service axis
     CHECK_FALSE(result->in_scope("a_s"));  // service-only, dropped by the mgmt axis
 
@@ -328,7 +331,7 @@ TEST_CASE("authorize_fleet_read: documented pairing — require_permission-then-
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
     r.group_assign(r.gP, "minter", "RespReader"); // ONLY a group-scoped grant — no global grant
-    auto token = r.mint(); // non-service
+    auto token = r.mint();                        // non-service
     auto req_a = bearer_request(token);
     httplib::Response res_a;
 
@@ -344,7 +347,7 @@ TEST_CASE("authorize_fleet_read: documented pairing — require_permission-then-
     auto result = r.ar->authorize_fleet_read(req_b, res_b, "Response", "Read");
     REQUIRE(result.has_value()); // admitted — the gate is self-sufficient
     CHECK_FALSE(result->unfiltered());
-    CHECK(result->in_scope("a_p")); // exactly this group's witness
+    CHECK(result->in_scope("a_p"));       // exactly this group's witness
     CHECK_FALSE(result->in_scope("a_s")); // NOT the whole fleet — a_s is outside group P
 }
 
@@ -368,8 +371,8 @@ TEST_CASE("authorize_fleet_read: null tag store on a service token ⇒ Degraded"
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     AuthRoutes ar(cfg, auth_mgr, &rbac, api_tokens.get(), /*audit_store=*/nullptr,
-                 /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
-                 /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+                  /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
 
     auto raw = api_tokens->create_token("gates-test", "minter", now_epoch() + 3600, "printers");
     REQUIRE(raw.has_value());
@@ -403,8 +406,8 @@ TEST_CASE("authorize_fleet_read: degraded tag-store prepare on a service token �
     sqlite3_set_authorizer(db, nullptr, nullptr);
 }
 
-TEST_CASE("authorize_fleet_read: mid-scan tag-store failure (not prepare-time) on a service "
-          "token ⇒ Degraded, never a partial admit",
+TEST_CASE("authorize_fleet_read: tag-store step() terminates with rc != SQLITE_DONE on a "
+          "service token ⇒ Degraded, never a partial admit",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
@@ -416,8 +419,15 @@ TEST_CASE("authorize_fleet_read: mid-scan tag-store failure (not prepare-time) o
     sqlite3* db = TagStoreFaultHook::db(r.tags);
     REQUIRE(db != nullptr);
     // Fires during the VM run, after prepare succeeds — unlike deny_tag_read
-    // above, this exercises agents_with_tag_checked's terminal-rc check
-    // (any sqlite3_step rc other than SQLITE_DONE), not its prepare guard.
+    // above, this exercises agents_with_tag_checked's terminal-rc check (any
+    // sqlite3_step rc other than SQLITE_DONE), not its prepare guard. NOTE:
+    // N=1 fires the interrupt on the VM's very first progress check, which in
+    // practice lands before any row is accumulated (a zero-rows case) — this
+    // proves the terminal-rc check itself is correct, but NOT that it holds
+    // after real rows were already scanned. That genuine after-real-rows
+    // mid-scan case is covered separately and calibrated for it in
+    // test_tag_store.cpp (counts ticks in a clean pass, then aborts at
+    // tick_count/2 to guarantee real rows were scanned first).
     sqlite3_progress_handler(db, 1, force_interrupt, nullptr);
 
     auto result = r.ar->authorize_fleet_read(req, res, "Response", "Read");
@@ -455,8 +465,8 @@ TEST_CASE("authorize_fleet_read: null rbac store ⇒ Forbidden (not a crash)",
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     AuthRoutes ar(cfg, auth_mgr, /*rbac_store=*/nullptr, api_tokens.get(),
-                 /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
-                 /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+                  /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
 
     auto raw = api_tokens->create_token("gates-test", "minter");
     REQUIRE(raw.has_value());
@@ -502,7 +512,7 @@ TEST_CASE("authorize_agent_target: non-service session ⇒ true (axis is TOP)",
 }
 
 TEST_CASE("authorize_agent_target: matching service tag ⇒ true", "[pg][auth_routes][authz_gates]"
-                                                                  "[service_scope]") {
+                                                                 "[service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
     auto token = r.mint("printers");
@@ -564,8 +574,8 @@ TEST_CASE("authorize_agent_target: null tag store on a service token ⇒ 503",
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;
     AuthRoutes ar(cfg, auth_mgr, /*rbac_store=*/nullptr, api_tokens.get(),
-                 /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
-                 /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+                  /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
 
     auto raw = api_tokens->create_token("gates-test", "minter", now_epoch() + 3600, "printers");
     REQUIRE(raw.has_value());
