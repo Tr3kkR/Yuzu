@@ -507,6 +507,7 @@ if build_server
       'unit/server/test_deployment_parse.cpp',
       'unit/server/test_deployment_run_store.cpp',
       'unit/server/test_deployment_engine.cpp',
+      'unit/server/test_deployment_routes.cpp',
       'unit/server/test_bundle_service.cpp',
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',
@@ -861,13 +862,17 @@ if build_server
   # job-level timeouts (90-120 min in ci.yml, 60 min in nightly.yml). The Catch2
   # cleanup/sweep listener (test_pg_template_cleanup.cpp) fires in all shards —
   # idempotent, harmless without a DSN. Constraints the shards must keep:
-  #   - only tag-filter specs may appear in args (flake-retry.py strips
-  #     positional tag specs before an isolated case retry — Catch2 ORs
+  #   - only tag-filter specs may appear as POSITIONAL args (flake-retry.py
+  #     strips positional tag specs before an isolated case retry — Catch2 ORs
   #     positional specs). Each [pg] half is ONE comma-OR spec (Catch2 ORs
-  #     inside a single arg; multiple positional args would AND, not OR);
+  #     inside a single arg; multiple positional args would AND, not OR).
+  #     Catch2 OPTION flags (--long form, e.g. --allow-running-no-tests on an
+  #     all-skip-on-macOS shard) are permitted: they are not positional, so the
+  #     retry surgery preserves them and the selftest exempts them from the
+  #     tag-spec pin;
   #   - no entry name may be a substring of another (flake-retry maps
-  #     meson-junit names by longest substring match) — 'shard A'/'shard B'
-  #     and 'server unit tests' are pairwise non-substring.
+  #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
+  #     'shard C'/'shard D' and 'server unit tests' are pairwise non-substring.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.
@@ -918,11 +923,77 @@ if build_server
   # untagged, all 3 would land in B, which is already the heavier half and had
   # separately reached 600.57/600s (killed by TIMEOUT) on CI before this move.
   # Partition preserved: N([pg]) == N(A) + N(B).
+  #
+  # RE-BALANCED (ADR-0048, LicenseStore, 2026-08-15/16): B kept growing as
+  # sibling Wave 2 stores merged in and kept TIMEOUT-ing on Windows (and
+  # eventually Linux) even after this store's own [license_store] (33 cases,
+  # confined to test_license_store.cpp) was moved off it once already.
+  #
+  # RE-BALANCED AGAIN 2026-08-16 (PR #3156 review-response round, cherry-picked
+  # here — 3f0796777, now also merged to dev via #3156 itself): the day after
+  # the rebalance above, B TIMEOUT-ed again — 66 new/extended PG-backed cases
+  # split 25/41, landing B's already-heavier share disproportionately. A
+  # same-day two-shard fix (moving more tags onto A) was reviewed and rejected
+  # before merge: A's own prior measurement (0.616s/case, already 84% of
+  # budget) is a HIGHER per-case rate than B's, contradicting the
+  # "near-uniform per-case cost" premise these rebalances lean on —
+  # concentrating more cases onto the already-more-expensive shard projected
+  # to ~577s (96%), likely relocating the timeout rather than fixing it.
+  #
+  # SPLIT INTO THREE SHARDS instead. The store-heavy tag set (expensive: real
+  # CREATE DATABASE ... TEMPLATE clones per case, unlike lighter route/handler
+  # tests) is itself split across two shards rather than concentrated in one:
+  #   shard A = [routes]/[store]/[token]
+  #   shard B = [audit_store]/[rbac_store]/[guaranteed_state_store]/
+  #             [response_store]/[operator_surface]/[guardian_routes]/
+  #             [workflow]/[deployment_store]/[license_store], minus anything
+  #             already in A
+  #   shard C = everything else [pg]-tagged
+  # [license_store] folded into shard B's tag list on the cherry-pick (not
+  # present on PR #3156's branch, which has no reason to know about this
+  # store) — same confined-to-one-file precedent as every other tag in that
+  # list, re-verified against this merge's actual case counts via --list-tests
+  # on the built binary, not assumed from either side's pre-merge numbers.
+  # Partition preserved: N([pg]) == N(A) + N(B) + N(D) + N(C). (shard B split
+  # into B+D on 2026-08-16 — see the block above the B/D entries below.)
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store],[pg][rbac_store],[pg][guaranteed_state_store],[pg][response_store],[pg][operator_surface]'],
+       args: ['[pg][routes],[pg][store],[pg][token]'],
        suite: 'server', timeout: 600)
+  # shard B SPLIT into B+D on 2026-08-16 (#2092/#2093): the store-tag half had
+  # reached 600/600s (100%) and flaked. BALANCED BY TIME, NOT COUNT — case count
+  # is not proportional to wall-time (shard C carries ~1082 cases comfortably;
+  # this store-tag set of ~428 was timing out, because each store-behaviour case
+  # does heavy per-test PG DDL / pre-migrated-template clones). Measured per-tag
+  # wall-time (isolated, local :5433 — a proxy; CI under c4 contention is ~2x+):
+  # [rbac_store] alone is the whale at ~57s, vs ~48s for the OTHER EIGHT tags
+  # COMBINED. So shard B = [rbac_store] alone; shard D = the other eight. This is
+  # count-lopsided (93 vs 335) ON PURPOSE — it is the time-balanced split (~57s
+  # vs ~48s), and time is what blows the 600s ceiling. Each shard is a strict
+  # SUBSET of the former at-600s run, so both are well under budget; B and D are
+  # disjoint and together cover exactly the tag set shard C excludes, so the
+  # partition N([pg]) == N(A)+N(B)+N(D)+N(C) is preserved (shard C UNCHANGED).
+  # When adding a new [pg] store tag: measure it, put it in whichever of B/D is
+  # lighter by TIME, AND add it to shard C's exclusion list (both or neither).
+  # If [rbac_store] itself grows toward the ceiling, split IT next (it is already
+  # the single densest tag).
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]'],
+       args: ['[pg][rbac_store]~[routes]~[store]~[token]'],
+       suite: 'server', timeout: 600)
+  # --allow-running-no-tests: shard D's eight tags are ALL DSN-gated store
+  # behaviour tests, so on a DSN-less platform (macOS, ADR-0035) every case
+  # SKIPs and Catch2 exits 4 on an all-skipped run — reddening the leg (#2092,
+  # found on the B/D split's first CI). Shards A/B/C survive the same all-skip
+  # only because each happens to carry a non-DSN case that runs to completion;
+  # D has none, so it needs the flag explicitly. The flag is a no-op where PG is
+  # present (Linux/Windows CI): the cases run normally. It is an OPTION, not a
+  # positional tag spec — flake-retry.py's isolated-retry surgery preserves it,
+  # and its hygiene selftest exempts --flags from the tag-spec pin.
+  test('server pg unit tests shard D', server_test_exe,
+       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token]',
+              '--allow-running-no-tests'],
+       suite: 'server', timeout: 600)
+  test('server pg unit tests shard C', server_test_exe,
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]'],
        suite: 'server', timeout: 600)
 endif
 

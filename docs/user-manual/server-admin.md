@@ -1176,6 +1176,14 @@ Programmatic clients (CI pipelines, health checks, `curl` scripts) that call `PO
 
 MFA CLI flags: `--mfa-enforcement` (default `optional`; `admin-only`/`required` now **enforce** — see the breaking note in `docs/user-manual/upgrading.md`), `--mfa-step-up-window-secs` (default `300`), `--mfa-login-pending-secs` (default `120`), and the break-glass `--mfa-reset <username>` (clears a locked-out user's MFA and exits, writing an `mfa.reset.breakglass` audit row — see `docs/ops-runbooks/auth-db-recovery.md`). Recovery code format changed from `XXXXX-XXXXX` (50 bits) to `XXXX-XXXX-XXXX-XXXX` (80 bits) — codes printed by earlier PR1 commits remain valid until consumed or regenerated. The break-glass procedure for a user who has lost both their authenticator and all recovery codes — and the recovery path for an operator locked out by an enforcement misconfiguration (SSO IdP not asserting `amr`, or a sole admin who could not enroll) — lives at `docs/ops-runbooks/auth-db-recovery.md`.
 
+### vNEXT — service-scoped API tokens can no longer read or mutate the confirmed fleet-wide Guardian/DEX/network/inventory/TAR/Schedule surfaces found as of this release (breaking)
+
+**What changed.** A pre-existing gap let a service-scoped API token read identity-linked, fleet-wide device data — and, for Guardian Baselines, MUTATE what every agent enforces — across every reporting agent, not just its own service's agents. **This note does not claim the underlying class is fully closed** — three tracked issues (#3123 device-discovery, #3124 response/execution data, #3125 inventory data) document further confirmed instances on surfaces this release does not touch, found by an independent adversarial review during this branch's own governance run; see those issues for the current list. The confinement check on these fleet-wide (no single `agent_id`) reads only ever verified the token's role, never its service scope, and several of the affected reads had no per-open audit trail at all. Fixed across REST, the dashboard, and MCP: `GET /api/v1/guaranteed-state/events` (no-`agent_id` shape), `GET /api/v1/dex/signals/{obs_type}`, `GET /api/v1/dex/perf/devices`, `GET /api/v1/network/devices` and their MCP twins now deny a service-scoped token outright and are access-audited (`dex.signal.view` / `dex.perf.device.view` / `network.device.view` — the latter two had no audit coverage at all before this release); the Guardian dashboard's fleet status, guards list, event timeline, per-Guard drilldown, baselines list, and per-Baseline fragments, plus the `/fragments/dex/perf/devices`, `/fragments/network/devices`, `/fragments/dex/overview`, `/fragments/dex/app`, and `/fragments/dex/catalogue/signal` dashboard fragments now deny a service-scoped token the same way. The same confinement-gap class extends beyond `GuaranteedState:Read`: `GET /fragments/devices/list` (`Infrastructure:Read`), `GET /fragments/inventory/devices` (`Inventory:Read` — GDPR-personal-data serial/system_uuid/primary_mac columns), and both TAR frame device pickers (`GET /fragments/tar/process-tree`, `GET /fragments/tar/capture-sources`) now deny a service-scoped token too. It also reached a MUTATING surface: `POST /fragments/auto/run` (the `/auto` Pre-flight dispatch) resolved its device cohort the same unconfined way before dispatching the configured checks — now denied the same way, before any dispatch occurs. A different shape of the same root cause also reached three more `/auto` Pre-flight routes: `GET /fragments/auto` (the saved-runs rail), `GET /fragments/auto/result` (the run result poll), and `POST /fragments/auto/delete` (run delete) scope by `session->username` alone, and a service-scoped API token shares its creating principal's username (`ApiToken::principal_id`) — so a token scoped to e.g. one IT service could read back, poll, or delete a fleet-wide pre-flight run its own principal created interactively. All three now deny a service-scoped token the same way. The same owner-scoping shape reached the `/auto` Deploy stage too: `GET /fragments/auto/deploy` (the deploy config form) and `POST /fragments/auto/deploy/delete` (deployment delete) now deny a service-scoped token for the same reason; `GET /fragments/auto/deploy/result` (the deployment result poll) now denies too, and — because it also re-invokes the deployment engine's mutating advance step on every call — this additionally narrows how far an already-in-flight deployment can progress for a service-scoped caller. The same owner-scoping shape reached the Schedule API too, and worse: `POST /api/schedules` (create) and `POST /api/schedules/{id}/enable` (re-enable) now deny a service-scoped token outright, even one holding both `Schedule:Write` and `Execution:Execute` — a recurring schedule dispatches fleet-wide through `ScheduleRunner` with no per-fire confinement at all, unattended, and reaching it needs no pre-existing state (unlike every route above). `DELETE /api/schedules/{id}` (delete) denies the same way as the ordinary owner-scoping class. Disabling a schedule (`enable=false`) is deliberately **not** denied — the kill switch must stay reachable even for a service-scoped token. A separate, worse-than-username-scoping gap in the same feature area: `GET /api/schedules` (REST) and the MCP `list_schedules` tool now also deny a service-scoped token, because `ITServiceOwner` grants full CRUD on `Schedule` and the underlying query had no owner/service filter of any kind, so `Schedule:Read` alone let a service-scoped token enumerate every schedule from every other service. `GET /fragments/schedules` (the dashboard twin) is fixed the same way, and separately gains an RBAC gate it never had — this fragment was previously reachable by **any authenticated session, regardless of role or grant**. Independently, `POST /api/schedules/{id}/enable` had a request-parsing bug that silently reinterpreted the standards-compliant JSON boolean `{"enabled": false}` as `enabled=true` — this is now fixed; see "What to do" below for who needs to check their integration. Two more instances were found and fixed during this branch's own governance review, both in files already touched above: the Guardian dashboard's six MUTATING fragments (guard create, guard enable/disable, baseline create/deploy/delete/update) never got the same deny their read-only siblings got in the same earlier commit — worst of all the fixes in this note, since a service-scoped token could deploy a Baseline (a fleet-wide, `full_sync` operation) outside its own service; and `GET /fragments/inventory/find/results`, `GET /api/v1/inventory/software`, and MCP `query_installed_software` (the software-search family) never got the deny their sibling `/fragments/inventory/devices` got. See `docs/user-manual/audit-log.md` for the full list of new/changed audit verbs and `docs/enterprise-readiness-soc2-first-customer.md` "The machine-health audit exemption" for the narrowed CC7.2 scope.
+
+**Who this affects.** Any integration authenticating with a service-scoped API token (a token bound to one service's agents) that currently calls any of the routes/tools/fragments above will start receiving `403` instead of fleet-wide data on this upgrade — this is the intended fix, not a regression. Separately, any integration calling `POST /api/schedules/{id}/enable` with `enabled` as a native JSON boolean will see its `enabled: false` calls actually disable the schedule for the first time — see "What to do" below. Ordinary (non-service-scoped) operator sessions are unaffected by the confinement changes.
+
+**What to do.** An integration that needs this data should use a token scoped appropriately for the surface it reads: a global (non-service-scoped) credential for a fleet-wide aggregate view, or the existing per-device REST/MCP reads (`.../{agent_id}` shapes), which remain available and stay confined to the token's own service. For the `/auto` Pre-flight and Deploy rail/result/config/delete routes there is no per-device equivalent — a service-scoped token cannot manage its own principal's fleet-wide pre-flight runs or deployments at all; use a non-service-scoped credential for pre-flight and deployment workflows. The Schedule API has no per-device equivalent either — a service-scoped token cannot list, create, or arm a recurring schedule at all; use a non-service-scoped credential, or, if a service-scoped token is all that's reachable, it can still disable (never create, re-enable, or list) a runaway schedule. Guardian Guard/Baseline mutation and fleet-wide software search have no per-device equivalent either — use a non-service-scoped credential for those too. For the `enabled` parsing fix: if your integration sends `{"enabled": false}` as a real JSON boolean and has been relying on (or working around) it actually re-enabling the schedule, update it — that was always a bug, and the workaround is now unnecessary and will produce the opposite of the intended effect.
+
 ### v0.10.0 — API token revocation is owner-scoped
 
 Starting with v0.10.0, non-admin users can no longer revoke API tokens they do not own. A caller holding the `ApiToken:Delete` permission may revoke only tokens whose `principal_id` matches the session's username; the global `admin` role is the sole bypass. Prior releases allowed any holder of `ApiToken:Delete` to revoke any token, which was an IDOR (tracked in GitHub issue #222).
@@ -1825,11 +1833,7 @@ group list contains an **exact match** for `--saml-admin-group`; otherwise
 group-membership evidence. Changing either flag requires a server restart
 (no hot-reload). JIT elevation remains non-functional for SAML users (no
 local `users` row in auth.db) regardless of role — a group-mapped admin gets
-`role=admin` directly at login, not via the elevation endpoint. Unlike OIDC,
-SAML group values are **not** synced into `rbac_store` — group-scoped RBAC
-role assignments do not apply to SAML principals (they only feed the
-admin-or-user decision above) — deferred pending source-aware group
-resolution, see issue #1832.
+`role=admin` directly at login, not via the elevation endpoint.
 
 > **Configuring `--saml-admin-group` against a real IdP:** the value must be
 > the exact identifier the IdP puts in the assertion, not a display name —
@@ -1838,8 +1842,36 @@ resolution, see issue #1832.
 > **"groups overage"**: Entra omits the `groups` claim entirely for that
 > assertion (substituting a Graph API link), so such users can never resolve
 > to admin via `--saml-admin-group` regardless of actual membership — use a
-> dedicated low-membership group for the mapping. At most 64 group values
+> dedicated low-membership group for the mapping. At most 200 group values
 > from the configured attribute are considered.
+
+**Fine-grained RBAC (parity with OIDC).** When RBAC is enabled and
+`--saml-group-attribute` is configured, every asserted group value is ALSO
+reconciled into the RBAC store as `saml:<value>` group principals (source
+`"saml"`) on every login, the same `reconcile_idp_memberships` mechanism
+OIDC uses for source `"entra"` — assign roles to `saml:<value>` groups via
+the management-group role-delegation API,
+`POST /api/v1/management-groups/{id}/roles`, with `"principal_type": "group"`
+and `"principal_id": "saml:<value>"` (only the `Operator` and `Viewer` roles can be
+delegated this way). Both mechanisms coexist: `--saml-admin-group` still grants
+the coarse session role independently of any fine-grained RBAC grants.
+Reconciliation runs before the session is minted (fail-closed on error), and
+two cases deliberately do NOT fall through to a normal reconcile:
+
+- **More than 200 asserted group values DENIES the login** — the parser has
+  already truncated `groups` to 200 entries by then, and reconciling that
+  truncated view would silently deprovision every membership past the
+  200th, so the login is refused instead (mirrors OIDC's
+  `group_count_exceeded`).
+- **An empty or absent group attribute SKIPS reconciliation** (never
+  deprovisions) — SAML cannot distinguish "attribute absent" from
+  "attribute present, zero values", and deprovisioning on that ambiguity
+  would be wrong. Existing `saml:` memberships are left untouched; SCIM
+  deprovisioning remains the only full deprovisioning path for a
+  SAML-linked identity.
+
+See [authentication.md's SAML Fine-Grained RBAC section](authentication.md#saml-fine-grained-rbac)
+for the full detail.
 
 ### AuthnRequest signing
 

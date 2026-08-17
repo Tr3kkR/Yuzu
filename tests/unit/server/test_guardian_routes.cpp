@@ -114,6 +114,12 @@ struct Harness {
 
     std::string session_user{"alice"};
     auth::Role session_role{auth::Role::admin};
+    // Non-empty simulates a service-scoped API token session (SEC-2: the
+    // fleet-wide/identity-bearing Guardian fragments blanket-deny these —
+    // perm_fn_'s service-token branch checks only the ITServiceOwner role,
+    // never the token's own service-tag scope). Default empty preserves every
+    // other test's ordinary-operator session.
+    std::string session_token_scope_service;
 
     // "Securable:Operation" entries the perm_fn should DENY (default: grant all).
     std::set<std::string> denied;
@@ -150,6 +156,7 @@ struct Harness {
             auth::Session s;
             s.username = session_user;
             s.role = session_role;
+            s.token_scope_service = session_token_scope_service;
             return s;
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -428,6 +435,236 @@ TEST_CASE("guard/baseline /page fragments are gated on GuaranteedState:Read",
     auto b = h.sink.dispatch("GET", "/fragments/guardian/baseline/bl1/page", "", "");
     REQUIRE(b != nullptr);
     CHECK(b->status == 403);
+}
+
+// ── SEC-2 regression coverage: a service-scoped API token (e.g. a token
+// carrying the seeded ITServiceOwner role's GuaranteedState:Read grant) must
+// be blanket-denied on every fleet-wide/identity-bearing Guardian fragment —
+// perm_fn_'s service-token branch checks only the ITServiceOwner ROLE, never
+// the token's own service-tag scope, so perm_fn_ alone is not confinement.
+// /status and /guards/ /events had NO permission-gate test at all before this. ──
+
+TEST_CASE("Guardian data fragments deny a service-scoped token, regardless of "
+          "GuaranteedState:Read",
+          "[pg][guardian_routes][rbac][security]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+    h.session_token_scope_service = "printers"; // any non-empty service scope
+
+    auto status = h.sink.dispatch("GET", "/fragments/guardian/status", "", "");
+    REQUIRE(status != nullptr);
+    CHECK(status->status == 403);
+
+    auto guards = h.sink.dispatch("GET", "/fragments/guardian/guards", "", "");
+    REQUIRE(guards != nullptr);
+    CHECK(guards->status == 403);
+
+    auto events = h.sink.dispatch("GET", "/fragments/guardian/events", "", "");
+    REQUIRE(events != nullptr);
+    CHECK(events->status == 403);
+
+    auto guard_page = h.sink.dispatch("GET", "/fragments/guardian/guard/g1/page", "", "");
+    REQUIRE(guard_page != nullptr);
+    CHECK(guard_page->status == 403);
+    CHECK(guard_page->body.find("GuardOne") == std::string::npos); // no identity leaked
+
+    auto baselines = h.sink.dispatch("GET", "/fragments/guardian/baselines", "", "");
+    REQUIRE(baselines != nullptr);
+    CHECK(baselines->status == 403);
+
+    auto baseline_page = h.sink.dispatch("GET", "/fragments/guardian/baseline/bl1/page", "", "");
+    REQUIRE(baseline_page != nullptr);
+    CHECK(baseline_page->status == 403);
+
+    // Important finding from external review (PR #3156): the create/edit
+    // FORM fragments were missed alongside the data-bearing fragments above
+    // - baseline-form and the edit form both seed a Member-guards datalist
+    // from store_->list_rules(), disclosing the fleet-wide rule catalogue
+    // (and, for edit, one baseline's own name + members) to an otherwise-
+    // unconfined service-scoped token.
+    auto guard_form = h.sink.dispatch("GET", "/fragments/guardian/guard-form", "", "");
+    REQUIRE(guard_form != nullptr);
+    CHECK(guard_form->status == 403);
+
+    auto baseline_form = h.sink.dispatch("GET", "/fragments/guardian/baseline-form", "", "");
+    REQUIRE(baseline_form != nullptr);
+    CHECK(baseline_form->status == 403);
+
+    auto baseline_edit = h.sink.dispatch("GET", "/fragments/guardian/baseline/bl1/edit", "", "");
+    REQUIRE(baseline_edit != nullptr);
+    CHECK(baseline_edit->status == 403);
+    CHECK(baseline_edit->body.find("BL1") == std::string::npos); // no identity leaked
+    CHECK(baseline_edit->body.find("GuardOne") == std::string::npos);
+
+    // Denied before any READ audit (no evidence of unauthorized DATA access to
+    // conflate with a legitimate one) — but the denial itself IS recorded, one
+    // row per fragment probed, so a probing service token leaves a trace.
+    REQUIRE(h.audit_log.size() == 9);
+    for (const auto& a : h.audit_log) {
+        CHECK(a.action == "guaranteed_state.fragment.access_denied");
+        CHECK(a.result == "denied");
+    }
+}
+
+TEST_CASE("status/guards/events fragments are gated on GuaranteedState:Read (previously untested)",
+          "[pg][guardian_routes][rbac]") {
+    Harness h;
+    h.denied = {"GuaranteedState:Read"};
+
+    auto status = h.sink.dispatch("GET", "/fragments/guardian/status", "", "");
+    REQUIRE(status != nullptr);
+    CHECK(status->status == 403);
+
+    auto guards = h.sink.dispatch("GET", "/fragments/guardian/guards", "", "");
+    REQUIRE(guards != nullptr);
+    CHECK(guards->status == 403);
+
+    auto events = h.sink.dispatch("GET", "/fragments/guardian/events", "", "");
+    REQUIRE(events != nullptr);
+    CHECK(events->status == 403);
+
+    auto baselines = h.sink.dispatch("GET", "/fragments/guardian/baselines", "", "");
+    REQUIRE(baselines != nullptr);
+    CHECK(baselines->status == 403);
+}
+
+TEST_CASE("an ordinary (non-service-scoped) session still reaches every Guardian fragment",
+          "[pg][guardian_routes][rbac]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+    // session_token_scope_service left empty (default) — the ordinary path.
+
+    for (const char* path :
+         {"/fragments/guardian/status", "/fragments/guardian/guards",
+          "/fragments/guardian/events", "/fragments/guardian/guard/g1/page",
+          "/fragments/guardian/baselines", "/fragments/guardian/baseline/bl1/page",
+          "/fragments/guardian/guard-form", "/fragments/guardian/baseline-form",
+          "/fragments/guardian/baseline/bl1/edit"}) {
+        auto res = h.sink.dispatch("GET", path, "", "");
+        REQUIRE(res != nullptr);
+        CHECK(res->status == 200);
+    }
+}
+
+// ── Governance finding (guardian-confinement-2298 Gate 2/4/5/6, six
+// independent confirmations): the six MUTATING fragments below had NO
+// service-scoped-token deny at all, unlike their six GET siblings above in
+// this same file — deploy_baseline's fleet-wide full_sync push meant a
+// service-scoped token could change what every OTHER service's agents
+// enforce, not just read it. Mutation-tested per chaos-injector's CH-1
+// design: this test was confirmed to fail (403 becomes 200, h.pushes gains
+// an entry) when deny_service_scoped_mutation_'s call sites are reverted,
+// before being restored to this passing state. ──
+
+TEST_CASE("Guardian MUTATING fragments deny a service-scoped token, regardless of "
+          "GuaranteedState:Write/Push/Delete, and nothing changes",
+          "[pg][guardian_routes][rbac][security]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+    h.session_token_scope_service = "printers"; // any non-empty service scope
+
+    auto create_guard = h.sink.dispatch("POST", "/fragments/guardian/guards?name=NewGuard", "",
+                                        "application/x-www-form-urlencoded");
+    REQUIRE(create_guard != nullptr);
+    CHECK(create_guard->status == 403);
+
+    auto enable = h.sink.dispatch("POST", "/fragments/guardian/guard/g1/enabled?value=0", "",
+                                  "application/x-www-form-urlencoded");
+    REQUIRE(enable != nullptr);
+    CHECK(enable->status == 403);
+
+    auto create_baseline = h.sink.dispatch("POST", "/fragments/guardian/baselines?name=NewBL", "",
+                                           "application/x-www-form-urlencoded");
+    REQUIRE(create_baseline != nullptr);
+    CHECK(create_baseline->status == 403);
+
+    auto deploy = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                                  "application/x-www-form-urlencoded");
+    REQUIRE(deploy != nullptr);
+    CHECK(deploy->status == 403);
+
+    auto update = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1?name=Renamed", "",
+                                  "application/x-www-form-urlencoded");
+    REQUIRE(update != nullptr);
+    CHECK(update->status == 403);
+
+    auto del = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/delete", "",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(del != nullptr);
+    CHECK(del->status == 403);
+
+    // The load-bearing assertions: NOT ONE of the six attempts had any effect.
+    CHECK(h.pushes.empty()); // deploy never reached push_fn_ — no fleet convergence
+    auto rules = h.store->list_rules();
+    REQUIRE(rules.has_value());
+    CHECK(rules->size() == 1); // still just g1 — create_guard never persisted
+    auto g1 = h.store->get_rule("g1");
+    REQUIRE(g1.has_value());
+    REQUIRE(g1->has_value());
+    CHECK((*g1)->enabled == true); // enable(value=0) never applied
+    CHECK(h.baselines->list_baselines().size() == 1); // still just BL1 — create_baseline never persisted
+    auto bl1 = h.baseline_named("BL1");
+    REQUIRE(bl1.has_value());
+    CHECK(bl1->lifecycle == kBaselineDraft); // deploy never applied
+    CHECK(bl1->baseline_id == "bl1");        // delete never applied (still present)
+
+    // Each denial reuses its own action's real success-path verb (result=denied)
+    // — deliberately NOT a shared generic verb, since (unlike the read fragments'
+    // /status etc., which have no per-open success audit to extend) all six of
+    // these mutations already have one.
+    REQUIRE(h.audit_log.size() == 6);
+    const std::vector<std::string> expected_actions = {
+        "guaranteed_state.rule.create",     "guaranteed_state.rule.update",
+        "guaranteed_state.baseline.create", "guaranteed_state.baseline.deploy",
+        "guaranteed_state.baseline.update", "guaranteed_state.baseline.delete"};
+    for (std::size_t i = 0; i < h.audit_log.size(); ++i) {
+        CHECK(h.audit_log[i].action == expected_actions[i]);
+        CHECK(h.audit_log[i].result == "denied");
+    }
+}
+
+TEST_CASE("Guardian mutating fragments are still gated on GuaranteedState:Write/Push/Delete "
+          "(previously untested)",
+          "[pg][guardian_routes][rbac]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_baseline("bl1", "BL1", {"g1"});
+    h.denied = {"GuaranteedState:Write", "GuaranteedState:Push", "GuaranteedState:Delete"};
+
+    auto create_guard = h.sink.dispatch("POST", "/fragments/guardian/guards?name=NewGuard", "",
+                                        "application/x-www-form-urlencoded");
+    REQUIRE(create_guard != nullptr);
+    CHECK(create_guard->status == 403);
+
+    auto deploy = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
+                                  "application/x-www-form-urlencoded");
+    REQUIRE(deploy != nullptr);
+    CHECK(deploy->status == 403);
+
+    auto del = h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/delete", "",
+                               "application/x-www-form-urlencoded");
+    REQUIRE(del != nullptr);
+    CHECK(del->status == 403);
+}
+
+TEST_CASE("the per-guard drilldown emits a guaranteed_state.rule.view audit-on-open, scoped to "
+          "the CORRECT guard",
+          "[pg][guardian_routes][audit][security]") {
+    Harness h;
+    h.seed_guard("g1", "GuardOne");
+    h.seed_guard("g2", "GuardTwo"); // a second guard in scope, to prove target_id isn't hardcoded
+
+    auto res = h.sink.dispatch("GET", "/fragments/guardian/guard/g2/page", "", "");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 200);
+    REQUIRE(h.audit_count("guaranteed_state.rule.view", "success") == 1);
+    CHECK(h.audit_log[0].target_id == "g2"); // the OPENED guard, not the first-seeded one
+    // Every other fragment is NOT the worst-disclosure surface and stays
+    // un-audited (matches its existing set-and-proceed dashboard-read posture).
+    CHECK(h.audit_log.size() == 1);
 }
 
 TEST_CASE("guard/baseline /page fragments render a seeded id",

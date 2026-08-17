@@ -416,17 +416,84 @@ element cannot inject group membership that the IdP didn't attest to.
 >   regardless of actual group membership. Either keep the target admin's
 >   group count under the overage threshold or use a dedicated,
 >   low-membership group for the admin mapping.
-> - At most **64 group values** from the configured attribute are considered
->   (a DoS guard); a value beyond the 64th is never evaluated.
+> - At most **200 group values** from the configured attribute are considered
+>   (a DoS guard, aligned with the RBAC reconcile cap below); an assertion
+>   carrying more than 200 values is **rejected outright** when
+>   `--saml-group-attribute` is configured and RBAC is enabled — see
+>   [SAML Fine-Grained RBAC](#saml-fine-grained-rbac) below. The coarse
+>   `--saml-admin-group` mapping on its own (RBAC disabled, or no RBAC store)
+>   still just silently ignores a value beyond the 200th, same as before.
 
 Changing either flag requires a server restart to take effect (no hot-reload,
 same as the other SAML flags).
 
-> **Unlike OIDC, SAML group values are not synced into `rbac_store`:**
-> SAML group values feed the admin/user role decision only; they are NOT
-> synced into `rbac_store` (group-scoped RBAC role assignments do not apply
-> to SAML principals) — deferred pending source-aware group resolution, see
-> issue #1832.
+### SAML Fine-Grained RBAC
+
+Beyond the coarse admin/user mapping above, SAML now reaches parity with
+OIDC's group-to-role reconciliation: when RBAC is enabled and
+`--saml-group-attribute` is configured, every value in the configured group
+attribute is reconciled into the RBAC store as `saml:<value>` group
+principals (source `"saml"`) on every login — the same
+`RbacStore::reconcile_idp_memberships` mechanism OIDC's fixed `groups` ID
+token claim uses for source `"entra"`. There is no dedicated group-membership
+UI — a group-scoped role grant is made via the management-group
+role-delegation API, `POST /api/v1/management-groups/{id}/roles`, whose
+`principal_id` field is free text: set `"principal_type": "group"` and
+`"principal_id": "saml:<value>"` to delegate `Operator` or `Viewer` (the only
+two roles this route delegates) to everyone the IdP asserts is in that group;
+no new configuration flag is needed —
+reconciliation is driven entirely by `--saml-group-attribute`, which you
+likely already have configured for the coarse admin mapping above.
+
+Both mechanisms coexist: `--saml-admin-group` still grants the coarse
+`role=admin`/`role=user` session role exactly as documented above,
+independently of any RBAC-assigned fine-grained permissions.
+
+Reconciliation happens **before** the session is minted, so a provisioning
+failure denies the login outright (fail-closed) rather than granting a
+session under stale or partially-reconciled roles. Three cases worth
+knowing:
+
+- **More than 200 asserted group values DENIES the login.** The verifier
+  already truncates its parsed `groups` list to 200 entries (the DoS guard
+  above) — reconciling that truncated, incomplete view would silently
+  deprovision every membership beyond the 200th on the next login, so the
+  login is refused instead (redirects to the login page with an error,
+  same as any other SAML failure). This matches OIDC's
+  `group_count_exceeded` behaviour exactly.
+- **An empty or absent group attribute does NOT deprovision.** SAML cannot
+  distinguish "the attribute was never asserted" from "the attribute was
+  asserted with zero values" — both produce an empty group list. Unlike
+  OIDC (which has an explicit `groups` claim presence signal from the
+  token), reconciling an empty SAML group list would delete every one of
+  the user's `saml:`-sourced memberships. Reconciliation is skipped
+  entirely in this case — existing memberships are left untouched, and the
+  login still proceeds normally. **SCIM deprovisioning remains the only
+  full deprovisioning path** for a SAML-linked identity — see
+  [SCIM ↔ SAML identity linkage](scim-provisioning.md#scim--saml-identity-linkage-federated-session-revocation).
+- **A store error also denies the login** (fail-closed) — a reconcile call
+  that cannot be answered (e.g. the RBAC store is unavailable) refuses the
+  login rather than proceeding under an unknown authorization state.
+
+> **Practical reach of the >200-group deny path.** `/saml/acs` receives the
+> IdP's response as an `application/x-www-form-urlencoded` POST, and
+> httplib's own form-parsing layer caps that body at 8 KiB
+> (`CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH`) — enforced **before**
+> the `/saml/acs` handler (and therefore this reconciliation logic) ever
+> runs. A base64-encoded SAML response carrying more than roughly 180 group
+> values typically exceeds that 8 KiB cap on its own, so in practice a real
+> assertion this large is rejected with a bare `413` at the HTTP layer, not
+> the SAML-specific deny-and-redirect-to-`/login?error=saml` path described
+> above. Deployments whose IdP can assert that many groups see a generic
+> `413`, not this section's denial. A follow-up tracks raising the cap for
+> `/saml/acs` so the documented >200-group deny path is reachable at its
+> full documented range.
+
+Reconciliation only runs when a live RBAC store is wired in **and**
+`--saml-group-attribute` is non-empty; with either condition unmet (RBAC
+disabled, or the attribute unconfigured), this section is a no-op and only
+the coarse `--saml-admin-group` mapping applies — group-scoped RBAC role
+assignments do not reach SAML principals in that configuration.
 
 ### AuthnRequest Signing
 
@@ -512,6 +579,7 @@ The resulting session behaves identically to an OIDC session — it is subject t
 | Audience / recipient / expiry validation | Supported |
 | Replay protection (`InResponseTo` single-use) | Supported |
 | Group-to-role mapping | Supported — `--saml-group-attribute` + `--saml-admin-group`, exact-match only; both unset ⇒ all SAML users are `role=user` (see [SAML Group-to-Role Mapping](#saml-group-to-role-mapping)) |
+| Fine-grained RBAC group provisioning | Supported — parity with OIDC; requires RBAC enabled + `--saml-group-attribute`, reconciles asserted groups into `saml:<value>` RBAC group principals (see [SAML Fine-Grained RBAC](#saml-fine-grained-rbac)) |
 | Admin access for SAML users | Supported via group mapping above; JIT elevation itself is still non-functional for SAML users (no local `users` row) — an admin session is granted directly at login, not via the elevation endpoint |
 | Login-page SSO button | Not in this release — navigate directly to `GET /auth/saml/start` |
 | MFA step-up at high-risk endpoints | Not supported — SAML sessions receive 403 at all step-up-gated endpoints regardless of `--mfa-enforcement`; rely on IdP MFA |
