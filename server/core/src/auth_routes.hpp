@@ -249,9 +249,10 @@ public:
     /// `require_scoped_permission`, NOT `require_permission` — this gate is
     /// single-agent-shaped, and `require_scoped_permission` (unlike
     /// `require_permission`) correctly passes `mgmt_group_store_` to
-    /// `check_scoped_permission` in every branch, so a management-group-
-    /// scoped-only caller is not incorrectly rejected before ever reaching
-    /// this gate's own check — the exact BLOCKING defect found in
+    /// `check_scoped_permission` in the branches a management-group-scoped
+    /// (non-service) caller can reach — engine and the RBAC-enforced
+    /// default — so such a caller is not incorrectly rejected before ever
+    /// reaching this gate's own check — the exact BLOCKING defect found in
     /// `authorize_fleet_read`'s sibling comment (2026-08-17, reviewer
     /// `fjarvis`, PR #3216) does not apply here, but corrected proactively
     /// since the wrong function name was named for the same reason. For a

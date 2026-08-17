@@ -132,8 +132,11 @@ bool AuthRoutes::authorize_agent_target(const httplib::Request& req, httplib::Re
 
     // Confinement-axis only (see the declaration's doc comment): a
     // non-service session has no service scope to confine against, so this
-    // axis is TOP. The RBAC/ITServiceOwner decision is require_permission's
-    // job, not re-checked here.
+    // axis is TOP. The RBAC/ITServiceOwner decision is require_scoped_permission's
+    // job (NOT require_permission's — that function never consults
+    // mgmt_group_store_ and would incorrectly reject a management-group-
+    // scoped-only caller; the identical defect class fjarvis's PR #3216
+    // review blocked one level up, in auth_routes.hpp), not re-checked here.
     if (session->token_scope_service.empty())
         return true;
 

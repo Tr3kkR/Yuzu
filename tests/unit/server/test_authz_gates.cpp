@@ -345,6 +345,7 @@ TEST_CASE("authorize_fleet_read: documented pairing — require_permission-then-
     REQUIRE(result.has_value()); // admitted — the gate is self-sufficient
     CHECK_FALSE(result->unfiltered());
     CHECK(result->in_scope("a_p")); // exactly this group's witness
+    CHECK_FALSE(result->in_scope("a_s")); // NOT the whole fleet — a_s is outside group P
 }
 
 // ── Degradation and store-unavailable failure modes ─────────────────────────
