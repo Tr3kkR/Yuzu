@@ -26,8 +26,11 @@ set -o pipefail
 url="${1:?url}"; sha="${2:-}"; dst="${3:?dst}"
 
 auth=()
+# Host-ANCHORED match (https://<host>/…), not a substring: an unanchored
+# *github.com* would also match https://github.com.attacker.example/… and leak
+# the token to it. The trailing slash after the host is what defeats that.
 case "$url" in
-  *github.com*|*githubusercontent.com*|*codeload.github*)
+  https://github.com/*|https://api.github.com/*|https://codeload.github.com/*|https://*.githubusercontent.com/*)
     tok="${GH_TOKEN:-$(gh auth token 2>/dev/null || true)}"
     [ -n "$tok" ] && auth=(-H "Authorization: token $tok")
     ;;

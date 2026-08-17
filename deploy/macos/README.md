@@ -74,6 +74,16 @@ git clone https://github.com/Homebrew/brew /opt/homebrew
 echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
 eval "$(/opt/homebrew/bin/brew shellenv)"
 
+# CRITICAL: the CI "Install dependencies" step runs `brew` and
+# `pip3 --break-system-packages pyyaml` as the NON-admin runner user `yuzuci`
+# (group staff), which cannot write an admin-owned prefix. Make /opt/homebrew
+# staff-group-writable + setgid — the same treatment /opt/ci gets below — or the
+# FIRST real CI job fails at "Install dependencies" (brew relink / brew-python
+# site-packages write). Validating a build as an admin user does NOT exercise this.
+sudo chgrp -R staff /opt/homebrew
+sudo chmod -R g+rwX /opt/homebrew
+sudo find /opt/homebrew -type d -exec chmod g+s {} +
+
 # CI toolchain packages. NOTE pkg-config — the hosted macos-15 image bakes it in
 # and the ci.yml brew line historically omitted it; a bare box needs it or vcpkg's
 # abseil pkgconfig-fixup fails (delta #1). ci.yml's macOS brew line now lists it too.
@@ -127,11 +137,15 @@ for re-warming when a dependency changes or GitHub is degraded.
 
 ```bash
 # Dedicated NON-admin service account (GitHub advises against admin/root runners).
-# staff primary group → inherits /opt/ci access via the setgid above.
+# staff primary group → inherits /opt/ci + /opt/homebrew access via the setgid above.
 sudo sysadminctl -addUser yuzuci -fullName "Yuzu CI Runner" -home /Users/yuzuci -shell /bin/zsh
-sudo dscl . -append /Groups/staff GroupMembership yuzuci   # verify it is a staff member
-# yuzuci needs brew on PATH:
-sudo -u yuzuci sh -c 'echo '\''eval "$(/opt/homebrew/bin/brew shellenv)"'\'' >> ~/.zprofile'
+# sysadminctl ASSIGNS the home but does not CREATE it — do so explicitly, or the
+# runner's ~/Library/Caches/ccache and ~/.local (pipx) writes have nowhere to go.
+sudo createhomedir -c -u yuzuci
+# yuzuci needs brew on PATH. Write as root to the absolute path then hand it over;
+# `sudo -u yuzuci … ~` resolves to the CALLER's home without -H, so avoid that form.
+echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' | sudo tee -a /Users/yuzuci/.zprofile >/dev/null
+sudo chown yuzuci:staff /Users/yuzuci/.zprofile
 ```
 
 ### 4. Register the agents
@@ -168,6 +182,36 @@ GitHub's actual runner set (`strict_unknown_runners: true`). So:
    `bigmags_pool_healthy` emits `true` — the `macos` job fail-closed-skips until
    it does.
 
+### 5. Deregister / stop / recover
+
+**Stop an agent** (leaves it registered, just not listening):
+```bash
+sudo launchctl bootout system/com.yuzu.ci-runner.r0
+```
+
+**Deregister an agent** — ORDER MATTERS. `KeepAlive=true` respawns `run.sh` the
+instant `config.sh remove` makes the listener exit 0, so **boot the daemon out
+first**, then remove:
+```bash
+sudo launchctl bootout system/com.yuzu.ci-runner.r0 2>/dev/null || true
+sudo rm -f /Library/LaunchDaemons/com.yuzu.ci-runner.r0.plist
+( cd /opt/ci/actions-runner/r0 && sudo -u yuzuci ./config.sh remove \
+    --token "$(gh api -X POST repos/Tr3kkR/Yuzu/actions/runners/remove-token --jq .token)" )
+```
+
+**Bump the runner version**: deregister, then re-run
+`sudo RUNNER_VERSION=<new> ./deploy/macos/register-bigmags-runner.sh <idx>`
+(or omit `RUNNER_VERSION` to auto-take the latest). Do it at an idle window — the
+register script refuses while a `Runner.Worker` (job) is live.
+
+**Recover a wedged daemon** (crash-looping — check `_diag/daemon.err.log`):
+```bash
+sudo launchctl bootout system/com.yuzu.ci-runner.r0 2>/dev/null || true
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.yuzu.ci-runner.r0.plist
+```
+The `ThrottleInterval=30` in the plist caps respawn rate so a misconfig can't
+hot-loop and flood the logs / fill `/opt/ci` while you investigate.
+
 ## Contracts (why the env vars exist)
 
 Set in each agent's runner-directory `.env` / `.path` (read by the launchd
@@ -175,8 +219,9 @@ service at job start):
 
 | Var | Value | Why |
 |---|---|---|
-| `RUNNER_TOOL_CACHE` | `/opt/ci/tool_cache` | Shared binary-cache + telemetry root. `ci-telemetry.py` refuses a non-persistent DB without it; `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml` derives from it; `cache-prune.yml` prunes under it. Shared across both agents so they share one warm cache. |
-| `YUZU_BUILD_JOBS` | `6` (tune) | Per-agent build parallelism. **The single most important knob on 24 GiB.** 2 agents × 6 = 12 cores; worst case is both agents cold-compiling at once — if the telemetry DB shows swap, drop to 4. Verify the `macos` job's compile step actually honors it; if it doesn't, constrain via a workflow `-j` tweak. |
+| `RUNNER_TOOL_CACHE` | `/opt/ci/tool_cache` | Shared vcpkg binary-cache root. `VCPKG_DEFAULT_BINARY_CACHE` in `ci.yml` derives from it and `cache-prune.yml`'s `prune-macos` job prunes under it. Shared across both agents so they share one warm cache. (Also the telemetry-DB root **once Phase 4 wires `ci-telemetry.py` into the `macos` job** — not yet live; see Phase 4 below.) |
+| `YUZU_BUILD_JOBS` | `6` (tune) | Per-agent build parallelism, honored by `meson compile -j "${YUZU_BUILD_JOBS:-6}"` in the `macos` job. **The single most important knob on 24 GiB.** 2 agents × 6 = 12 cores; worst case is both agents cold-compiling at once. Drop to 4 if you see swap — but note the swap signal needs the Phase-4 telemetry DB, which isn't wired yet, so re-validate 6 under concurrent load. |
+| `HOMEBREW_NO_AUTO_UPDATE` | `1` | Stops `brew install` from git-pulling `/opt/homebrew` on every job (write + network round-trip); steady-state installs become a fast no-op. Written into each agent's `.env` by `register-bigmags-runner.sh`. |
 | PATH (`.path`) | `/opt/homebrew/bin` + system | So `brew`/`pipx`/`python3` resolve for the job's "Install dependencies" step (which then prepends its own pipx bin dir to `GITHUB_PATH`). |
 
 ccache: the `macos` job uses `~/Library/Caches/ccache`, which persists naturally

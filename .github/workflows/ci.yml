@@ -355,7 +355,7 @@ jobs:
           GITHUB_HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: >-
           python3 scripts/ci/runner-health-check.py --mode preflight
-          --require-pool bigtam --require-pool weetam
+          --require-pool bigtam --require-pool weetam --require-pool bigmags
 
       # The checkout below is deliberately after the only step that receives
       # RUNNER_INVENTORY_TOKEN. A trusted fork may execute tests from this
