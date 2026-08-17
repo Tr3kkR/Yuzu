@@ -14,6 +14,7 @@
 
 #include "auth_routes.hpp"
 #include "authz_gates.hpp"
+#include "service_scope_policy.hpp"
 
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
@@ -514,4 +515,25 @@ TEST_CASE("authorize_agent_target: degraded tag-store prepare on a service token
     CHECK(res.status == 503);
 
     sqlite3_set_authorizer(db, nullptr, nullptr);
+}
+
+// ── service_scope_policy.hpp — compile coverage ─────────────────────────────
+//
+// No TU in this PR includes this header otherwise (it isn't wired to
+// anything yet), so without this it has zero compile-time or runtime
+// verification this round (architect, governance run 2026-08-17). A
+// static_assert plus a runtime lookup tripwire the moment the first entry
+// lands without a matching test update.
+
+static_assert(yuzu::server::authz::kServiceScopeGlobalSafe.empty(),
+              "kServiceScopeGlobalSafe must stay seeded empty until an entry clears the bar "
+              "documented in service_scope_policy.hpp — if this fires, add a case here.");
+
+TEST_CASE("service_scope_policy: service_scope_global_safe denies everything while the "
+          "allow-list is empty",
+          "[authz_gates][service_scope]") {
+    using yuzu::server::authz::service_scope_global_safe;
+    CHECK_FALSE(service_scope_global_safe("Response", "Read"));
+    CHECK_FALSE(service_scope_global_safe("Execution", "Execute"));
+    CHECK_FALSE(service_scope_global_safe("", ""));
 }
