@@ -1768,10 +1768,19 @@ TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel retu
     // errored_rule_count (ADR-0017 INV-3, #2298 item 6d) is std::expected like
     // get_rule/list_rules above -> closed store is std::unexpected, never a
     // silent 0 (that posture is exactly what this method exists to avoid on
-    // the confined read path). Both the unscoped and scoped forms degrade the
-    // same way.
+    // the confined read path), for BOTH the unscoped and an engaged non-empty
+    // scoped form. The ONE deliberate exception: an engaged but EMPTY scope
+    // (INV-2, "a real grant with zero visible agents is a legitimate 0, not a
+    // denial") short-circuits to success(0) before the open-check even runs
+    // -- pinned explicitly here (found by cpp-expert review: an earlier
+    // version of this comment claimed "never a silent 0" unqualified, which
+    // this third case disproves) so the fast path stays a documented
+    // exception, not an accidental gap in this test's own coverage.
     CHECK_FALSE(bad.errored_rule_count(std::nullopt).has_value());
     CHECK_FALSE(bad.errored_rule_count(std::vector<std::string>{"WS-1"}).has_value());
+    auto empty_scope = bad.errored_rule_count(std::vector<std::string>{});
+    REQUIRE(empty_scope.has_value());
+    CHECK(*empty_scope == 0);
 }
 
 TEST_CASE("GuaranteedStateStore: migration is idempotent across re-open",

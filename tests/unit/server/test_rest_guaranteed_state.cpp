@@ -1598,6 +1598,17 @@ TEST_CASE("REST gs.status/{agent_id}: a management-group-confined grant that doe
           "review gap: this route's cross-management-group denial was previously only proven "
           "against a local string-match stub, never AuthRoutes::require_scoped_permission",
           "[pg][rest][guaranteed_state][status][adr0017]") {
+    // WS-9 is a member of a REAL group carol has no grant on (RegionB), not of
+    // NO group at all — a security-guardian re-review of the original version
+    // of this test (WS-9 in zero groups) found it denied via
+    // check_scoped_permission's empty-membership early-return
+    // (rbac_store.cpp's `reachable.empty()` short-circuit) WITHOUT ever
+    // reaching the allow/deny-group intersection that is the actual
+    // cross-group boundary this test exists to prove — a regression in that
+    // intersection logic (e.g. an inverted contains() check) would have left
+    // this test exactly as green. Giving WS-9 a real, resolvable, but
+    // unauthorized group membership forces the denial through the
+    // intersection path instead.
     RestGsHarness h;
     h.wire_real_gs_scoped_perm_ = true;
     // Ordinary (non-admin) role — the point is to prove the RBAC/management-
@@ -1608,13 +1619,20 @@ TEST_CASE("REST gs.status/{agent_id}: a management-group-confined grant that doe
     REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
     REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
 
-    ManagementGroup g;
-    g.name = "RegionA";
-    g.membership_type = "static";
-    auto gid = h.mgmt_.create_group(g);
-    REQUIRE(gid.has_value());
-    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value()); // WS-9 is NOT a member
-    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
+    ManagementGroup ga;
+    ga.name = "RegionA";
+    ga.membership_type = "static";
+    auto gida = h.mgmt_.create_group(ga);
+    REQUIRE(gida.has_value());
+    REQUIRE(h.mgmt_.add_member(*gida, "WS-1").has_value());
+    REQUIRE(h.mgmt_.assign_role({*gida, "user", "carol", "GsReader"}).has_value());
+
+    ManagementGroup gb;
+    gb.name = "RegionB";
+    gb.membership_type = "static";
+    auto gidb = h.mgmt_.create_group(gb);
+    REQUIRE(gidb.has_value());
+    REQUIRE(h.mgmt_.add_member(*gidb, "WS-9").has_value()); // real membership, no grant on it
     h.session_user = "carol";
     h.seed_status("e1", "WS-9", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
 
