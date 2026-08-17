@@ -48,6 +48,8 @@ Routes that serve per-person behavioural / compliance PII (the `dex.device.view`
 
 This is intentional cross-surface behaviour: during an audit-store blip a browsing operator sees data while a wired REST integration receives `503`. Alert on `Sec-Audit-Failed: true` (or `audit_persisted: false`) from any surface as a SOC 2 CC7.2 evidence-gap signal. (Mutating routes such as token/session revoke use the related `audit_emitted` body field — see those endpoints.)
 
+A separate, narrower shape applies to ordinary mutation routes that audit a change **after** it already durably committed (not the behavioural-PII read routes above): `POST /api/v1/software-packages`, `POST /api/v1/software-deployments`, and its `.../start`, `.../rollback`, `.../cancel` actions. These **always set-and-proceed** — the mutation cannot be un-committed, so the response stays `2xx` and only `Sec-Audit-Failed: true` signals a dropped audit row, with no `audit_emitted`/`audit_persisted` body field. Treat the header the same way as the behavioural-PII surfaces: a CC7.2 evidence-gap signal, not an error.
+
 ---
 
 ## Table of Contents
@@ -4928,6 +4930,8 @@ Register a new software package.
 }
 ```
 
+May carry `Sec-Audit-Failed: true` — see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture) above.
+
 **Errors:**
 
 | Condition | Response |
@@ -4997,6 +5001,8 @@ Create a new software deployment. Starts in status `staged`.
 }
 ```
 
+May carry `Sec-Audit-Failed: true` — see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture) above.
+
 **Errors:**
 
 | Condition | Response |
@@ -5011,7 +5017,7 @@ Start a `staged` deployment (transitions to `deploying`).
 
 **Permission:** `SoftwareDeployment:Execute`
 
-**Response:** `{"data": {"started": true}, "meta": {"api_version": "v1"}}`
+**Response:** `{"data": {"started": true}, "meta": {"api_version": "v1"}}` — may carry `Sec-Audit-Failed: true` (see above).
 
 **Errors:**
 
@@ -5027,7 +5033,7 @@ Roll back a `deploying`, `verifying`, or `completed` deployment (transitions to
 
 **Permission:** `SoftwareDeployment:Execute`
 
-**Response:** `{"data": {"rolled_back": true}, "meta": {"api_version": "v1"}}`
+**Response:** `{"data": {"rolled_back": true}, "meta": {"api_version": "v1"}}` — may carry `Sec-Audit-Failed: true` (see above).
 
 **Errors:**
 
@@ -5042,7 +5048,7 @@ Cancel a `staged` or `deploying` deployment (transitions to `cancelled`).
 
 **Permission:** `SoftwareDeployment:Execute`
 
-**Response:** `{"data": {"cancelled": true}, "meta": {"api_version": "v1"}}`
+**Response:** `{"data": {"cancelled": true}, "meta": {"api_version": "v1"}}` — may carry `Sec-Audit-Failed: true` (see above).
 
 **Errors:**
 
