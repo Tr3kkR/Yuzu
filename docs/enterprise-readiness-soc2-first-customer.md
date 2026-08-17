@@ -175,9 +175,13 @@ devices tagged with its own service on every one of those surfaces; a global
 administrator, a JIT-elevated session, or a legacy-RBAC-disabled admin remains
 full-fleet (their actual authority, not a bypass); the derivation fails
 **closed** (a present-empty visible set, never "unfiltered") if the underlying
-store is unavailable. Credit as a CC6.1 least-privilege control and a CC6.3
-access-enforcement control with consistent enforcement across every listed
-surface; operator-facing reference is `docs/authz-model.md`. **Residual, not
+store is unavailable. (2026-08-17: "unavailable" now also covers a mid-scan
+read failure on an otherwise-reachable tag store, not just prepare-time/
+connection failures — `TagStore::agents_with_tag_checked`, closed by the
+service-scope-confinement PR 2 hardening round.) Credit as a CC6.1
+least-privilege control and a CC6.3 access-enforcement control with
+consistent enforcement across every listed surface; operator-facing
+reference is `docs/authz-model.md`. **Residual, not
 yet closed, for THIS seam specifically:** a purely management-group-confined
 operator (no global grant) reaching one of the surfaces above is *narrowed but
 not yet reachable* — that principal is still denied earlier by the base
