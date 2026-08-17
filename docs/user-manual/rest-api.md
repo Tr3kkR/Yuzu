@@ -48,6 +48,8 @@ Routes that serve per-person behavioural / compliance PII (the `dex.device.view`
 
 This is intentional cross-surface behaviour: during an audit-store blip a browsing operator sees data while a wired REST integration receives `503`. Alert on `Sec-Audit-Failed: true` (or `audit_persisted: false`) from any surface as a SOC 2 CC7.2 evidence-gap signal. (Mutating routes such as token/session revoke use the related `audit_emitted` body field — see those endpoints.)
 
+A separate, narrower shape applies to ordinary mutation routes that audit a change **after** it already durably committed (not the behavioural-PII read routes above): `POST /api/v1/software-packages`, `POST /api/v1/software-deployments`, and its `.../start`, `.../rollback`, `.../cancel` actions. These **always set-and-proceed** — the mutation cannot be un-committed, so the response stays `2xx` and only `Sec-Audit-Failed: true` signals a dropped audit row, with no `audit_emitted`/`audit_persisted` body field. Treat the header the same way as the behavioural-PII surfaces: a CC7.2 evidence-gap signal, not an error.
+
 ---
 
 ## Table of Contents
@@ -4859,7 +4861,11 @@ Revoke a device token.
 
 ### Software Deployment
 
-Manage software packages and their deployments to agents.
+Manage software packages and their deployments to agents. `SoftwareDeploymentStore` is
+currently not constructed by the server (capability 7.6 is deliberately shelved — same family
+as [License Management](#license-management), `docs/adr/0051-software-deployment-store-postgres-migration.md`
+Context), so these routes do not register today; documented for when a future change re-wires
+them.
 
 #### `GET /api/v1/software-packages`
 
@@ -4887,6 +4893,12 @@ List all registered software packages.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| A genuine database read failure | `503` |
 
 #### `POST /api/v1/software-packages`
 
@@ -4918,6 +4930,15 @@ Register a new software package.
 }
 ```
 
+May carry `Sec-Audit-Failed: true` — see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture) above.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Malformed JSON body, a required field wrong-typed or empty, or `verify_command`/`rollback_command`/`silent_args` fails the shell-metacharacter/length check | `400` |
+| A genuine database write failure | `503` |
+
 #### `GET /api/v1/software-deployments`
 
 List software deployments, optionally filtered by status.
@@ -4928,7 +4949,7 @@ List software deployments, optionally filtered by status.
 
 | Param | Type | Description |
 |---|---|---|
-| `status` | string | Filter by status: `pending`, `running`, `completed`, `failed`, `rolled_back` |
+| `status` | string | Filter by status: `staged`, `deploying`, `verifying`, `completed`, `cancelled`, `rolled_back`, `failed` |
 
 **Response:**
 
@@ -4952,9 +4973,15 @@ List software deployments, optionally filtered by status.
 }
 ```
 
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| A genuine database read failure | `503` |
+
 #### `POST /api/v1/software-deployments`
 
-Create a new software deployment.
+Create a new software deployment. Starts in status `staged`.
 
 **Permission:** `SoftwareDeployment:Execute`
 
@@ -4974,29 +5001,61 @@ Create a new software deployment.
 }
 ```
 
+May carry `Sec-Audit-Failed: true` — see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture) above.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Malformed JSON body, or `package_id` empty | `400` |
+| `package_id` does not reference a registered package | `400` |
+| A genuine database write failure | `503` |
+
 #### `POST /api/v1/software-deployments/{id}/start`
 
-Start a pending deployment.
+Start a `staged` deployment (transitions to `deploying`).
 
 **Permission:** `SoftwareDeployment:Execute`
 
-**Response:** `{"data": {"started": true}, "meta": {"api_version": "v1"}}`
+**Response:** `{"data": {"started": true}, "meta": {"api_version": "v1"}}` — may carry `Sec-Audit-Failed: true` (see above).
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| No deployment with this id, or it is not `staged` | `400` |
+| A genuine database write failure | `503` |
 
 #### `POST /api/v1/software-deployments/{id}/rollback`
 
-Roll back a deployment.
+Roll back a `deploying`, `verifying`, or `completed` deployment (transitions to
+`rolled_back`).
 
 **Permission:** `SoftwareDeployment:Execute`
 
-**Response:** `{"data": {"rolled_back": true}, "meta": {"api_version": "v1"}}`
+**Response:** `{"data": {"rolled_back": true}, "meta": {"api_version": "v1"}}` — may carry `Sec-Audit-Failed: true` (see above).
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| No deployment with this id, or it is not `deploying`/`verifying`/`completed` | `400` |
+| A genuine database write failure | `503` |
 
 #### `POST /api/v1/software-deployments/{id}/cancel`
 
-Cancel a running or pending deployment.
+Cancel a `staged` or `deploying` deployment (transitions to `cancelled`).
 
 **Permission:** `SoftwareDeployment:Execute`
 
-**Response:** `{"data": {"cancelled": true}, "meta": {"api_version": "v1"}}`
+**Response:** `{"data": {"cancelled": true}, "meta": {"api_version": "v1"}}` — may carry `Sec-Audit-Failed: true` (see above).
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| No deployment with this id, or it is not `staged`/`deploying` | `400` |
+| A genuine database write failure | `503` |
 
 ---
 
@@ -5577,17 +5636,49 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 
 #### `GET /api/v1/guaranteed-state/status`
 
-Fleet-wide status rollup. Returns placeholder counts today; full fleet aggregation lands in Guardian PR 4.
+Fleet-wide status rollup. `errored_rules` is real (#2298 item 6d): the count of
+distinct rule_ids with at least one agent currently reporting state `errored` in
+the `guardian_agent_rule_status` census, intersected against the live rule catalogue
+(a census row for a since-deleted rule is excluded) — the source of truth also
+behind the dashboard's Unhealthy Guards card, not the (reaped, 30-day) event log.
+`compliant_rules` and `drifted_rules` stay `0` deliberately — full status ingest
+(`action=="status"`) lands in a later rung. This route's SOLE authorization gate is
+`AuthRoutes::require_list_read` (ADR-0017 admit-then-filter; never the flat
+`require_permission`, which does not consult management groups and cannot be
+stacked with a separate confinement check — the two do not compose). A
+**service-scoped API token is denied (`403`) outright**: this route aggregates
+across every agent's census, and a token scoped to one service must not read the
+fleet-wide count. For every other caller, the route is **management-group-confined**:
+a global `GuaranteedState:Read` grant sees the fleet-wide count, a
+management-group-confined grant sees `errored_rules` scoped to that operator's
+visible agents only (applied in SQL before the aggregate, ADR-0017 INV-3), and a
+caller with no grant anywhere is refused with `403`. `total_rules` is never
+confined — it is the size of the global rule catalogue, which has no agent or
+management-group dimension. **A real grant that resolves to ZERO visible agents
+(an empty or agent-less management group) is still `200` with `errored_rules: 0`**
+(ADR-0017 INV-2 — a narrow-but-real grant is not a denial); do not read a `0` as
+"fleet healthy" without also confirming the caller's management-group scope
+actually covers the agents it should.
 
-- **Permission:** `GuaranteedState:Read`
+- **Permission:** `GuaranteedState:Read` (non-service-scoped; management-group confined via `AuthRoutes::require_list_read`, ADR-0017)
 - **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
+- **4xx/5xx:** `403` for a service-scoped token, a caller with no `GuaranteedState:Read` grant anywhere, **or an unreachable/corrupt RBAC or management-group store for an ordinary caller** — `authorize_list_read` fails closed to the SAME `403` as a genuine no-grant denial, not a `503`, for every non-engine caller (the two are not currently distinguished in the response code). `503` only for: an unwired list-read gate or a null Guaranteed State store (server misconfiguration, no `retry_after_ms`); a Guaranteed State store query-time degrade (transient, `retry_after_ms: 5000`); or, for an **engine-principal** caller specifically, an unreachable/unopened RBAC store (engine sessions get a distinct `503` here, unlike human/service sessions) — never a silent `0`.
 
 #### `GET /api/v1/guaranteed-state/status/{agent_id}`
 
-Per-agent status. Returns placeholder counts today; per-agent aggregation lands in Guardian PR 4.
+Per-agent status. `errored_rules` and `total_rules` are BOTH real and BOTH intersected
+against the live rule catalogue (a census row for a since-deleted rule counts toward
+neither) — `total_rules` is the count of rules with any census entry for this agent
+still present in that catalogue, not the fleet catalogue size. `compliant_rules`/`drifted_rules` stay `0` for the same reason as the fleet
+route. Per-device behavioral read: scoped the same
+way as `GET /guaranteed-state/device-compliance` (a global grant passes fleet-wide,
+otherwise the caller must hold Read via a management group the device is in), and
+audited as `guardian.device.view` — **fail-closed**: `503` + `Sec-Audit-Failed: true`
+if the audit row cannot persist.
 
-- **Permission:** `GuaranteedState:Read`
+- **Permission:** `GuaranteedState:Read`, per-device scoped
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
+- **5xx:** `503` on an unwired scope gate/store, an audit-persistence failure, or a degraded store — never a silent `0`.
 
 #### `GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`
 

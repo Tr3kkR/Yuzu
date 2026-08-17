@@ -120,7 +120,7 @@ duplicates.
 | procfetch | ✅ | ✅ | ✅ | linux/apple/win branches |
 | quarantine | ✅ | ✅ | ✅ | full per-OS blocks |
 | rdp_control | ✅ | ⛔ | ⛔ | Windows-only. Off-Windows returns an honest `rdp_control\|unsupported` sentinel (macOS names Screen Sharing); state-changing `set_state` reports terminal FAILURE, read-only `status` rc=0 — `rdp_control_plugin.cpp` `#ifndef _WIN32` branch |
-| registry | ✅ | ⛔ | ⛔ | Windows-only (advapi32). Off-Windows returns an honest `registry\|unsupported` sentinel (reads rc=0; mutating `set_value`/`delete_*` report terminal FAILURE — no false success) — `registry_plugin.cpp` `#ifndef _WIN32` branch. `list_profiles` (PR1.7) enumerates local profiles via ProfileList/HKEY_USERS. `get_user_value` resolves the target profile via ProfileList and reads the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `RegLoadKey` mount (SeBackup/SeRestore privileges, required only for that fallback) when not |
+| registry | ✅ | ⛔ | ⛔ | Windows-only (advapi32). Off-Windows returns an honest `registry\|unsupported` sentinel (reads rc=0; mutating `set_value`/`delete_*` report terminal FAILURE — no false success) — `registry_plugin.cpp` `#ifndef _WIN32` branch. `list_profiles` (PR1.7) enumerates local profiles via ProfileList/HKEY_USERS. `get_user_value` resolves the target profile via ProfileList and reads the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `RegLoadKey` mount (SeBackup/SeRestore privileges, required only for that fallback) when not. The ladder lives in `agents/shared/win_profiles.hpp` and is shared with `installed_apps.list_per_user`, `license_scan`'s per-user surfaces and `tar`'s mapdrive history (#2771) |
 | sccm | ✅ | ⛔ | ⛔ | Windows-only. macOS returns an honest `sccm\|unsupported` (points at Jamf/MDM); Linux `installed\|false` + "platform not supported" — `sccm_plugin.cpp` `__APPLE__` branch |
 | script_exec | ✅ | ✅ | ✅ | win/apple/linux. Different action sets per OS (`bash` POSIX-only; powershell/cmd on Windows) |
 | services | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `list`/`running` now emit `startup_type` (automatic/disabled/unknown) from a bulk `launchctl print-disabled` join (parser `services_macos_launchd.hpp`); `set_start_mode` rejects `manual` (launchd is binary enable/disable) |
@@ -160,70 +160,577 @@ merely shrink it — the script exits 1 on a *lower* count too until
 adoption gain is sticky rather than leaving room for a later regression back
 up to the old baseline.
 
-This PR ships the *machinery* only — no plugin populates `action_descriptors`
-yet (that is per-plugin follow-up work; TAR unified its `OsSupportStatus`
-enum with the descriptor's `YuzuSupportLevel` as a first step, see the TAR
-section above, but does not yet populate its own `action_descriptors`). Every
-plugin the CI gate currently tracks therefore shows up as undeclared below —
-expected, and exactly what the ratchet baseline reflects today.
+Adoption is now **complete**: all 49 plugins the CI gate tracks populate
+`action_descriptors`, so the undeclared count and `RATCHET_BASELINE_UNDECLARED`
+are both **0** and the "Undeclared plugins" section below is empty. From here
+the ratchet is equivalent to a hard fail — a new plugin directory landing
+without descriptors grows the count above 0 and fails the Linux leg.
+
+The generator is also the completeness check: `capmatrix-gen` hard-errors on
+any mismatch between a plugin's `actions()` list and its `action_descriptors`
+array *before* it writes anything, so a declaration that silently omits an
+action cannot reach this table.
+
+**Rung legend** (the table's Rung column below): 1 = native OS interface
+(zero processes, best) · 2 = argv runner · 3 = governed shell (two-plus
+processes, worst) — rung states *how* a leg acquires its capability per
+docs/adr/3002-acquisition-ladder.md, never how mature or hardened the
+implementation is.
 
 <!-- BEGIN GENERATED: capmatrix-gen (#2204) — do not hand-edit; regenerate with
      tools/capmatrix-gen, verified by scripts/ci/check-capability-matrix.sh -->
 | Plugin | Action | OS | Support | Rung | Mechanism | Fallback |
 |---|---|---|---|---|---|---|
-| _(none yet)_ | - | - | - | - | - | - |
+| agent_actions | set_log_level | linux | supported | 1 | spdlog_runtime | - |
+| agent_actions | set_log_level | macos | supported | 1 | spdlog_runtime | - |
+| agent_actions | set_log_level | windows | supported | 1 | spdlog_runtime | - |
+| agent_actions | info | linux | supported | 1 | agent_config_read | - |
+| agent_actions | info | macos | supported | 1 | agent_config_read | - |
+| agent_actions | info | windows | supported | 1 | agent_config_read | - |
+| agent_logging | get_log | linux | supported | 1 | agent config lookup + std::ifstream tail read | - |
+| agent_logging | get_log | macos | supported | 1 | agent config lookup + std::ifstream tail read | - |
+| agent_logging | get_log | windows | supported | 1 | agent config lookup + std::ifstream tail read | - |
+| agent_logging | get_key_files | linux | supported | 1 | /proc/self/exe symlink + std::filesystem metadata | - |
+| agent_logging | get_key_files | macos | supported | 1 | _NSGetExecutablePath + realpath(3) + std::filesystem metadata | - |
+| agent_logging | get_key_files | windows | supported | 1 | GetModuleFileNameA + std::filesystem metadata | - |
+| antivirus | products | linux | supported | 3 | pgrep+filesystem_probe | - |
+| antivirus | products | macos | supported | 3 | plistbuddy+systemextensionsctl | - |
+| antivirus | products | windows | supported | 3 | powershell_cim_securitycenter2 | - |
+| antivirus | status | linux | unsupported | - | - | - |
+| antivirus | status | macos | supported | 3 | plistbuddy+stat | - |
+| antivirus | status | windows | supported | 3 | powershell_defender_status | - |
+| asset_tags | sync | linux | supported | 1 | local_json_store | - |
+| asset_tags | sync | macos | supported | 1 | local_json_store | - |
+| asset_tags | sync | windows | supported | 1 | local_json_store | - |
+| asset_tags | status | linux | supported | 1 | local_json_store | - |
+| asset_tags | status | macos | supported | 1 | local_json_store | - |
+| asset_tags | status | windows | supported | 1 | local_json_store | - |
+| asset_tags | get | linux | supported | 1 | local_json_store | - |
+| asset_tags | get | macos | supported | 1 | local_json_store | - |
+| asset_tags | get | windows | supported | 1 | local_json_store | - |
+| asset_tags | changes | linux | supported | 1 | local_json_store | - |
+| asset_tags | changes | macos | supported | 1 | local_json_store | - |
+| asset_tags | changes | windows | supported | 1 | local_json_store | - |
+| bitlocker | state | linux | supported | 3 | lsblk+cryptsetup | - |
+| bitlocker | state | macos | supported | 3 | fdesetup+diskutil | - |
+| bitlocker | state | windows | supported | 3 | manage_bde | - |
+| certificates | list | linux | supported | 3 | openssl x509 via governed shell runner | - |
+| certificates | list | macos | supported | 3 | security find-certificate with login shell fallback | - |
+| certificates | list | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
+| certificates | details | linux | supported | 3 | openssl x509 via governed shell runner | - |
+| certificates | details | macos | supported | 3 | security find-certificate with login shell fallback | - |
+| certificates | details | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
+| certificates | delete | linux | supported | 3 | openssl lookup via governed shell + filesystem remove | - |
+| certificates | delete | macos | constrained | 2 | security delete-certificate via subprocess runner | SystemRootCertificates.keychain is sealed under SIP and rejected outright; only System/MY store deletes are supported |
+| certificates | delete | windows | supported | 1 | CryptoAPI (CertDeleteCertificateFromStore) | - |
+| chargen | chargen_start | linux | supported | 1 | in-process | - |
+| chargen | chargen_start | macos | supported | 1 | in-process | - |
+| chargen | chargen_start | windows | supported | 1 | in-process | - |
+| chargen | chargen_stop | linux | supported | 1 | in-process | - |
+| chargen | chargen_stop | macos | supported | 1 | in-process | - |
+| chargen | chargen_stop | windows | supported | 1 | in-process | - |
+| content_dist | stage | linux | supported | 1 | httplib_tls | - |
+| content_dist | stage | macos | supported | 1 | httplib_tls | - |
+| content_dist | stage | windows | constrained | 1 | httplib_tls | requires OpenSSL to be found at build time; HTTPS unavailable if absent |
+| content_dist | execute_staged | linux | supported | 2 | fork_execvp | - |
+| content_dist | execute_staged | macos | supported | 2 | fork_execvp | - |
+| content_dist | execute_staged | windows | supported | 2 | createprocessw | - |
+| content_dist | list_staged | linux | supported | 1 | std_filesystem | - |
+| content_dist | list_staged | macos | supported | 1 | std_filesystem | - |
+| content_dist | list_staged | windows | supported | 1 | std_filesystem | - |
+| content_dist | cleanup | linux | supported | 1 | std_filesystem | - |
+| content_dist | cleanup | macos | supported | 1 | std_filesystem | - |
+| content_dist | cleanup | windows | supported | 1 | std_filesystem | - |
+| content_dist | upload_file | linux | supported | 1 | httplib_tls | - |
+| content_dist | upload_file | macos | supported | 1 | httplib_tls | - |
+| content_dist | upload_file | windows | constrained | 1 | httplib_tls | requires OpenSSL to be found at build time; HTTPS unavailable if absent |
+| device_identity | device_name | linux | supported | 1 | gethostname(3) | - |
+| device_identity | device_name | macos | supported | 1 | gethostname(3) | - |
+| device_identity | device_name | windows | supported | 1 | GetComputerNameExA | - |
+| device_identity | domain | linux | supported | 3 | /etc/resolv.conf read + popen(realm list) [fallback: /etc/sssd/sssd.conf read] | - |
+| device_identity | domain | macos | supported | 3 | popen(dsconfigad -show) [fallback: popen(hostname -f)] | - |
+| device_identity | domain | windows | supported | 1 | NetGetJoinInformation | - |
+| device_identity | ou | linux | supported | 3 | popen(realm list) [fallback: /etc/sssd/sssd.conf read] | - |
+| device_identity | ou | macos | supported | 3 | popen(dsconfigad -show) | - |
+| device_identity | ou | windows | supported | 1 | GetComputerObjectNameA | - |
+| diagnostics | log_level | linux | supported | 1 | in-process agent config (agent.log_level) | - |
+| diagnostics | log_level | macos | supported | 1 | in-process agent config (agent.log_level) | - |
+| diagnostics | log_level | windows | supported | 1 | in-process agent config (agent.log_level) | - |
+| diagnostics | certificates | linux | supported | 1 | in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists | - |
+| diagnostics | certificates | macos | supported | 1 | in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists | - |
+| diagnostics | certificates | windows | supported | 1 | in-process agent config (tls.*_cert/tls.client_key) + std::filesystem::exists | - |
+| diagnostics | connection_info | linux | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
+| diagnostics | connection_info | macos | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
+| diagnostics | connection_info | windows | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
+| discovery | scan_subnet | linux | supported | 3 | arp table + ping sweep via popen/system() | - |
+| discovery | scan_subnet | macos | supported | 3 | arp table + ping sweep via popen/system() | - |
+| discovery | scan_subnet | windows | supported | 3 | GetIpNetTable + ping sweep via system() | - |
+| disk_space | free | linux | supported | 1 | statvfs(2) | - |
+| disk_space | free | macos | supported | 1 | statfs(2) | - |
+| disk_space | free | windows | supported | 1 | GetDiskFreeSpaceExW | - |
+| event_logs | errors | linux | supported | 3 | journalctl | - |
+| event_logs | errors | macos | supported | 2 | log_show | - |
+| event_logs | errors | windows | supported | 3 | powershell_getwinevent | - |
+| event_logs | query | linux | supported | 3 | journalctl | - |
+| event_logs | query | macos | supported | 2 | log_show | - |
+| event_logs | query | windows | supported | 3 | powershell_getwinevent | - |
+| example | ping | linux | supported | 1 | in-process | - |
+| example | ping | macos | supported | 1 | in-process | - |
+| example | ping | windows | supported | 1 | in-process | - |
+| example | echo | linux | supported | 1 | in-process | - |
+| example | echo | macos | supported | 1 | in-process | - |
+| example | echo | windows | supported | 1 | in-process | - |
+| filesystem | exists | linux | supported | 1 | std::filesystem | - |
+| filesystem | exists | macos | supported | 1 | std::filesystem | - |
+| filesystem | exists | windows | supported | 1 | std::filesystem | - |
+| filesystem | list_dir | linux | supported | 1 | std::filesystem | - |
+| filesystem | list_dir | macos | supported | 1 | std::filesystem | - |
+| filesystem | list_dir | windows | supported | 1 | std::filesystem | - |
+| filesystem | file_hash | linux | supported | 2 | subprocess_runner:sha256sum/sha1sum | - |
+| filesystem | file_hash | macos | supported | 2 | subprocess_runner:shasum | - |
+| filesystem | file_hash | windows | supported | 1 | bcrypt | - |
+| filesystem | create_temp | linux | supported | 1 | yuzu_create_temp_file | - |
+| filesystem | create_temp | macos | supported | 1 | yuzu_create_temp_file | - |
+| filesystem | create_temp | windows | supported | 1 | yuzu_create_temp_file | - |
+| filesystem | create_temp_dir | linux | supported | 1 | yuzu_create_temp_dir | - |
+| filesystem | create_temp_dir | macos | supported | 1 | yuzu_create_temp_dir | - |
+| filesystem | create_temp_dir | windows | supported | 1 | yuzu_create_temp_dir | - |
+| filesystem | read | linux | supported | 1 | std::ifstream | - |
+| filesystem | read | macos | supported | 1 | std::ifstream | - |
+| filesystem | read | windows | supported | 1 | std::ifstream | - |
+| filesystem | get_acl | linux | constrained | 1 | posix_stat | stat()-only basic owner/group/permission bits; no ACL/ACE enumeration |
+| filesystem | get_acl | macos | constrained | 1 | posix_stat | stat()-only basic owner/group/permission bits; no ACL/ACE enumeration |
+| filesystem | get_acl | windows | supported | 1 | win32_acl | - |
+| filesystem | get_signature | linux | unsupported | - | - | - |
+| filesystem | get_signature | macos | supported | 2 | subprocess_runner:codesign | - |
+| filesystem | get_signature | windows | supported | 1 | wintrust | - |
+| filesystem | find_by_hash | linux | supported | 2 | std::filesystem+subprocess_runner:sha256sum | - |
+| filesystem | find_by_hash | macos | supported | 2 | std::filesystem+subprocess_runner:shasum | - |
+| filesystem | find_by_hash | windows | supported | 1 | std::filesystem+bcrypt | - |
+| filesystem | search_dir | linux | supported | 1 | std::filesystem+std::regex | - |
+| filesystem | search_dir | macos | supported | 1 | std::filesystem+std::regex | - |
+| filesystem | search_dir | windows | supported | 1 | std::filesystem+std::regex | - |
+| filesystem | get_version_info | linux | unsupported | - | - | - |
+| filesystem | get_version_info | macos | supported | 2 | subprocess_runner:plutil | - |
+| filesystem | get_version_info | windows | supported | 1 | win32_version_info | - |
+| filesystem | search | linux | supported | 1 | std::ifstream+std::regex | - |
+| filesystem | search | macos | supported | 1 | std::ifstream+std::regex | - |
+| filesystem | search | windows | supported | 1 | std::ifstream+std::regex | - |
+| filesystem | replace | linux | supported | 1 | atomic_write_file | - |
+| filesystem | replace | macos | supported | 1 | atomic_write_file | - |
+| filesystem | replace | windows | supported | 1 | atomic_write_file | - |
+| filesystem | write_content | linux | supported | 1 | atomic_write_file | - |
+| filesystem | write_content | macos | supported | 1 | atomic_write_file | - |
+| filesystem | write_content | windows | supported | 1 | atomic_write_file | - |
+| filesystem | append | linux | supported | 1 | std::ofstream | - |
+| filesystem | append | macos | supported | 1 | std::ofstream | - |
+| filesystem | append | windows | supported | 1 | std::ofstream | - |
+| filesystem | delete_lines | linux | supported | 1 | atomic_write_file | - |
+| filesystem | delete_lines | macos | supported | 1 | atomic_write_file | - |
+| filesystem | delete_lines | windows | supported | 1 | atomic_write_file | - |
+| firewall | state | linux | supported | 3 | firewall-cmd/ufw/iptables via popen | - |
+| firewall | state | macos | supported | 3 | socketfilterfw/pfctl via popen | - |
+| firewall | state | windows | supported | 3 | netsh via popen | - |
+| firewall | rules | linux | supported | 3 | firewall-cmd/ufw/iptables via popen | - |
+| firewall | rules | macos | supported | 3 | pfctl via popen | - |
+| firewall | rules | windows | supported | 3 | netsh via popen | - |
+| hardware | manufacturer | linux | supported | 1 | /sys/class/dmi/id/sys_vendor | - |
+| hardware | manufacturer | macos | supported | 3 | popen(sysctl -n hw.manufacturer) | - |
+| hardware | manufacturer | windows | supported | 1 | WMI Win32_ComputerSystem.Manufacturer | - |
+| hardware | model | linux | supported | 1 | /sys/class/dmi/id/product_name | - |
+| hardware | model | macos | supported | 3 | popen(sysctl -n hw.model) | - |
+| hardware | model | windows | supported | 1 | WMI Win32_ComputerSystem.Model | - |
+| hardware | bios | linux | supported | 1 | /sys/class/dmi/id/bios_vendor + bios_version + bios_date | - |
+| hardware | bios | macos | supported | 3 | popen(system_profiler SPHardwareDataType, grep 'Boot ROM', awk) | - |
+| hardware | bios | windows | supported | 1 | WMI Win32_BIOS | - |
+| hardware | processors | linux | supported | 1 | /proc/cpuinfo | - |
+| hardware | processors | macos | supported | 3 | popen(sysctl machdep.cpu.*, hw.*cpu*) | - |
+| hardware | processors | windows | supported | 1 | WMI Win32_Processor | - |
+| hardware | memory | linux | constrained | 3 | popen(dmidecode -t memory) | falls back to the aggregate MemTotal from /proc/meminfo (no per-DIMM detail) when dmidecode is unavailable or unprivileged |
+| hardware | memory | macos | constrained | 3 | popen(sysctl -n hw.memsize) | aggregate total only, no per-DIMM breakdown (macOS has no public per-DIMM API) |
+| hardware | memory | windows | supported | 1 | WMI Win32_PhysicalMemory | - |
+| hardware | disks | linux | supported | 3 | popen(lsblk) | - |
+| hardware | disks | macos | supported | 3 | popen(system_profiler SPStorageDataType SPNVMeDataType SPSerialATADataType -json) | - |
+| hardware | disks | windows | supported | 1 | WMI Win32_DiskDrive | - |
+| hardware | drivers | linux | supported | 1 | /proc/modules | - |
+| hardware | drivers | macos | unsupported | - | - | - |
+| hardware | drivers | windows | supported | 1 | WMI Win32_PnPSignedDriver | - |
+| hardware | system | linux | supported | 1 | /sys/class/dmi/id/product_serial + product_uuid | - |
+| hardware | system | macos | supported | 3 | popen(ioreg -rd1 -c IOPlatformExpertDevice, awk) | - |
+| hardware | system | windows | supported | 1 | WMI Win32_BIOS.SerialNumber + Win32_ComputerSystemProduct.UUID | - |
+| http_client | download | linux | supported | 1 | cpp-httplib (native sockets) | - |
+| http_client | download | macos | supported | 1 | cpp-httplib (native sockets) | - |
+| http_client | download | windows | supported | 1 | cpp-httplib (native sockets) | - |
+| http_client | get | linux | supported | 1 | cpp-httplib (native sockets) | - |
+| http_client | get | macos | supported | 1 | cpp-httplib (native sockets) | - |
+| http_client | get | windows | supported | 1 | cpp-httplib (native sockets) | - |
+| http_client | head | linux | supported | 1 | cpp-httplib (native sockets) | - |
+| http_client | head | macos | supported | 1 | cpp-httplib (native sockets) | - |
+| http_client | head | windows | supported | 1 | cpp-httplib (native sockets) | - |
+| installed_apps | list | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
+| installed_apps | list | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | list | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
+| installed_apps | query | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
+| installed_apps | query | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | query | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
+| installed_apps | list_per_user | linux | supported | 3 | popen(dpkg-query / rpm / pacman) | - |
+| installed_apps | list_per_user | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) + popen(brew list --versions) | - |
+| installed_apps | list_per_user | windows | supported | 1 | Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | - |
+| installed_apps | list_inventory | linux | supported | 3 | popen(dpkg-query / rpm / pacman / apk) | - |
+| installed_apps | list_inventory | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
+| installed_apps | list_inventory | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
+| interaction | notify | linux | supported | 3 | notify_send | - |
+| interaction | notify | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
+| interaction | notify | windows | supported | 1 | shell_notifyicon | - |
+| interaction | message_box | linux | supported | 3 | zenity | - |
+| interaction | message_box | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
+| interaction | message_box | windows | supported | 1 | messageboxw | - |
+| interaction | input | linux | supported | 3 | zenity | - |
+| interaction | input | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
+| interaction | input | windows | supported | 3 | powershell_inputbox | - |
+| interaction | survey | linux | supported | 3 | zenity | - |
+| interaction | survey | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
+| interaction | survey | windows | supported | 3 | powershell_winforms | - |
+| interaction | set_dnd | linux | supported | 1 | local_kv_store | - |
+| interaction | set_dnd | macos | supported | 1 | local_kv_store | - |
+| interaction | set_dnd | windows | supported | 1 | local_kv_store | - |
+| ioc | check | linux | supported | 1 | procfs | - |
+| ioc | check | macos | supported | 3 | lsof | - |
+| ioc | check | windows | supported | 1 | iphlpapi_dnsapi | - |
+| license_scan | list | linux | supported | 3 | popen(rpm/dpkg-query/openssl) | - |
+| license_scan | list | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
+| license_scan | list | windows | supported | 1 | wmi+win32_registry | - |
+| license_scan | surfaces | linux | supported | 3 | popen(rpm/dpkg-query/openssl) | - |
+| license_scan | surfaces | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
+| license_scan | surfaces | windows | supported | 1 | wmi+win32_registry | - |
+| msi_packages | list | linux | unsupported | - | - | - |
+| msi_packages | list | macos | supported | 3 | pkgutil | - |
+| msi_packages | list | windows | supported | 1 | msi_api | - |
+| msi_packages | product_codes | linux | unsupported | - | - | - |
+| msi_packages | product_codes | macos | supported | 3 | pkgutil | - |
+| msi_packages | product_codes | windows | supported | 1 | msi_api | - |
+| netprobe | icmp | linux | constrained | 1 | SOCK_DGRAM ICMP ping socket | requires net.ipv4.ping_group_range to admit the process group; reports not-permitted otherwise |
+| netprobe | icmp | macos | supported | 1 | SOCK_DGRAM ICMP ping socket | - |
+| netprobe | icmp | windows | supported | 1 | IcmpSendEcho | - |
+| netprobe | tcp | linux | supported | 1 | non-blocking connect() timing | - |
+| netprobe | tcp | macos | supported | 1 | non-blocking connect() timing | - |
+| netprobe | tcp | windows | supported | 1 | non-blocking connect() timing | - |
+| netprobe | dns | linux | supported | 1 | getaddrinfo | - |
+| netprobe | dns | macos | supported | 1 | getaddrinfo | - |
+| netprobe | dns | windows | supported | 1 | getaddrinfo | - |
+| netstat | netstat_list | linux | supported | 1 | /proc/net/{tcp,udp}[6] | - |
+| netstat | netstat_list | macos | supported | 1 | libproc | - |
+| netstat | netstat_list | windows | supported | 1 | GetExtendedTcpTable/GetExtendedUdpTable | - |
+| network_actions | flush_dns | linux | constrained | 3 | resolvectl/systemd-resolve via popen | silently reports ok even when neither resolvectl nor systemd-resolve is present |
+| network_actions | flush_dns | macos | supported | 3 | dscacheutil/mDNSResponder via sudo popen | - |
+| network_actions | flush_dns | windows | supported | 3 | ipconfig via popen | - |
+| network_actions | ping | linux | supported | 3 | system ping via popen | - |
+| network_actions | ping | macos | supported | 3 | system ping via popen | - |
+| network_actions | ping | windows | supported | 3 | system ping via popen | - |
+| network_config | adapters | linux | supported | 3 | ip(8) via governed shell runner | - |
+| network_config | adapters | macos | supported | 3 | ifconfig via governed shell runner | - |
+| network_config | adapters | windows | supported | 1 | GetAdaptersAddresses | - |
+| network_config | ip_addresses | linux | supported | 3 | ip(8) via governed shell runner | - |
+| network_config | ip_addresses | macos | supported | 3 | ifconfig/route via governed shell runner | - |
+| network_config | ip_addresses | windows | supported | 1 | GetAdaptersAddresses | - |
+| network_config | dns_servers | linux | supported | 1 | /etc/resolv.conf read | - |
+| network_config | dns_servers | macos | supported | 3 | scutil via governed shell runner | - |
+| network_config | dns_servers | windows | supported | 1 | GetAdaptersAddresses | - |
+| network_config | proxy | linux | supported | 1 | environment variables | - |
+| network_config | proxy | macos | constrained | 3 | networksetup via governed shell runner | only the Wi-Fi network service is queried; other interfaces are not checked |
+| network_config | proxy | windows | supported | 1 | WinHttpGetIEProxyConfigForCurrentUser | - |
+| network_config | dns_cache | linux | constrained | 3 | resolvectl via governed shell runner | falls back to systemd-resolve statistics, or reports unavailable, when resolvectl is absent |
+| network_config | dns_cache | macos | unsupported | - | - | - |
+| network_config | dns_cache | windows | supported | 1 | DnsGetCacheDataTable (dnsapi.dll) | - |
+| network_config | arp | linux | unsupported | - | - | - |
+| network_config | arp | macos | unsupported | - | - | - |
+| network_config | arp | windows | supported | 1 | GetIpNetTable2 | - |
+| network_diag | listening | linux | supported | 1 | /proc/net/tcp[6] | - |
+| network_diag | listening | macos | supported | 3 | lsof via popen | - |
+| network_diag | listening | windows | supported | 1 | GetExtendedTcpTable | - |
+| network_diag | connections | linux | supported | 1 | /proc/net/tcp[6] | - |
+| network_diag | connections | macos | supported | 3 | lsof via popen | - |
+| network_diag | connections | windows | supported | 1 | GetExtendedTcpTable | - |
+| os_info | os_name | linux | supported | 1 | /etc/os-release | - |
+| os_info | os_name | macos | supported | 3 | popen(sw_vers -productName/-productVersion) | - |
+| os_info | os_name | windows | supported | 1 | Reg*W CurrentVersion\\ProductName + build-number correction | - |
+| os_info | os_version | linux | supported | 1 | uname(2) | - |
+| os_info | os_version | macos | supported | 3 | uname(2) + popen(sw_vers -productVersion) | - |
+| os_info | os_version | windows | supported | 1 | RtlGetVersion (ntdll) | - |
+| os_info | os_build | linux | supported | 1 | /proc/version | - |
+| os_info | os_build | macos | supported | 3 | popen(sw_vers -buildVersion) | - |
+| os_info | os_build | windows | supported | 1 | Reg*W CurrentBuildNumber + UBR | - |
+| os_info | os_arch | linux | supported | 1 | uname(2) | - |
+| os_info | os_arch | macos | supported | 1 | uname(2) | - |
+| os_info | os_arch | windows | supported | 1 | GetNativeSystemInfo | - |
+| os_info | uptime | linux | supported | 1 | /proc/uptime | - |
+| os_info | uptime | macos | supported | 1 | sysctl(2) KERN_BOOTTIME | - |
+| os_info | uptime | windows | supported | 1 | GetTickCount64 | - |
+| processes | list | linux | supported | 1 | /proc enumeration | - |
+| processes | list | macos | supported | 3 | popen(ps -axo pid,ppid,comm) | - |
+| processes | list | windows | supported | 1 | CreateToolhelp32Snapshot | - |
+| processes | list_hashed | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
+| processes | list_hashed | macos | supported | 3 | popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256 | - |
+| processes | list_hashed | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
+| processes | list_tree | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
+| processes | list_tree | macos | supported | 3 | popen(ps -axo pid,ppid,comm) + proc_pidpath + SHA-256 | - |
+| processes | list_tree | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
+| processes | query | linux | supported | 1 | /proc enumeration | - |
+| processes | query | macos | supported | 3 | popen(ps -axo pid,ppid,comm) | - |
+| processes | query | windows | supported | 1 | CreateToolhelp32Snapshot | - |
+| procfetch | procfetch_fetch | linux | supported | 1 | /proc enumeration + OpenSSL EVP SHA-1 | - |
+| procfetch | procfetch_fetch | macos | supported | 1 | libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1 | - |
+| procfetch | procfetch_fetch | windows | supported | 1 | CreateToolhelp32Snapshot + BCrypt SHA-1 | - |
+| quarantine | quarantine | linux | supported | 3 | sudo iptables via popen | - |
+| quarantine | quarantine | macos | supported | 3 | sudo pfctl via popen | - |
+| quarantine | quarantine | windows | supported | 3 | netsh via popen | - |
+| quarantine | unquarantine | linux | supported | 3 | sudo iptables via popen | - |
+| quarantine | unquarantine | macos | supported | 3 | sudo pfctl via popen | - |
+| quarantine | unquarantine | windows | supported | 3 | netsh via popen | - |
+| quarantine | status | linux | supported | 3 | sudo iptables via popen | - |
+| quarantine | status | macos | supported | 3 | sudo pfctl via popen | - |
+| quarantine | status | windows | supported | 3 | netsh via popen | - |
+| quarantine | whitelist | linux | supported | 3 | sudo iptables via popen | - |
+| quarantine | whitelist | macos | supported | 3 | sudo pfctl via popen | - |
+| quarantine | whitelist | windows | supported | 3 | netsh via popen | - |
+| rdp_control | set_state | linux | unsupported | - | - | - |
+| rdp_control | set_state | macos | unsupported | - | - | - |
+| rdp_control | set_state | windows | supported | 1 | Win32 registry + INetFwPolicy2 COM + SCM | - |
+| rdp_control | status | linux | unsupported | - | - | - |
+| rdp_control | status | macos | unsupported | - | - | - |
+| rdp_control | status | windows | supported | 1 | Win32 registry + INetFwPolicy2 COM + SCM | - |
+| registry | get_value | linux | unsupported | - | - | - |
+| registry | get_value | macos | unsupported | - | - | - |
+| registry | get_value | windows | supported | 1 | win32_registry | - |
+| registry | set_value | linux | unsupported | - | - | - |
+| registry | set_value | macos | unsupported | - | - | - |
+| registry | set_value | windows | supported | 1 | win32_registry | - |
+| registry | delete_value | linux | unsupported | - | - | - |
+| registry | delete_value | macos | unsupported | - | - | - |
+| registry | delete_value | windows | supported | 1 | win32_registry | - |
+| registry | delete_key | linux | unsupported | - | - | - |
+| registry | delete_key | macos | unsupported | - | - | - |
+| registry | delete_key | windows | supported | 1 | win32_registry | - |
+| registry | key_exists | linux | unsupported | - | - | - |
+| registry | key_exists | macos | unsupported | - | - | - |
+| registry | key_exists | windows | supported | 1 | win32_registry | - |
+| registry | enumerate_keys | linux | unsupported | - | - | - |
+| registry | enumerate_keys | macos | unsupported | - | - | - |
+| registry | enumerate_keys | windows | supported | 1 | win32_registry | - |
+| registry | enumerate_values | linux | unsupported | - | - | - |
+| registry | enumerate_values | macos | unsupported | - | - | - |
+| registry | enumerate_values | windows | supported | 1 | win32_registry | - |
+| registry | get_user_value | linux | unsupported | - | - | - |
+| registry | get_user_value | macos | unsupported | - | - | - |
+| registry | get_user_value | windows | supported | 1 | win32_registry+hive_mount | - |
+| registry | list_profiles | linux | unsupported | - | - | - |
+| registry | list_profiles | macos | unsupported | - | - | - |
+| registry | list_profiles | windows | supported | 1 | win32_registry | - |
+| sccm | client_version | linux | unsupported | - | - | - |
+| sccm | client_version | macos | unsupported | - | - | - |
+| sccm | client_version | windows | supported | 3 | registry+sc_query | - |
+| sccm | site | linux | unsupported | - | - | - |
+| sccm | site | macos | unsupported | - | - | - |
+| sccm | site | windows | supported | 3 | registry+powershell_com | - |
+| script_exec | exec | linux | supported | 2 | fork_execvp | - |
+| script_exec | exec | macos | supported | 2 | fork_execvp | - |
+| script_exec | exec | windows | supported | 2 | create_process | - |
+| script_exec | powershell | linux | unsupported | - | - | - |
+| script_exec | powershell | macos | unsupported | - | - | - |
+| script_exec | powershell | windows | supported | 3 | powershell_encodedcommand | - |
+| script_exec | bash | linux | supported | 3 | bash_c | - |
+| script_exec | bash | macos | supported | 3 | bash_c | - |
+| script_exec | bash | windows | unsupported | - | - | - |
+| services | list | linux | supported | 3 | systemctl | - |
+| services | list | macos | supported | 3 | launchctl | - |
+| services | list | windows | supported | 1 | win32_service_api | - |
+| services | running | linux | supported | 3 | systemctl | - |
+| services | running | macos | supported | 3 | launchctl | - |
+| services | running | windows | supported | 1 | win32_service_api | - |
+| services | set_start_mode | linux | supported | 3 | systemctl | - |
+| services | set_start_mode | macos | supported | 3 | launchctl | - |
+| services | set_start_mode | windows | supported | 1 | win32_service_api | - |
+| sockwho | sockwho_list | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | - |
+| sockwho | sockwho_list | macos | supported | 1 | libproc | - |
+| sockwho | sockwho_list | windows | supported | 1 | IP Helper API + QueryFullProcessImageNameW | - |
+| software_actions | list_upgradable | linux | supported | 3 | apt+yum | - |
+| software_actions | list_upgradable | macos | supported | 3 | softwareupdate | - |
+| software_actions | list_upgradable | windows | supported | 3 | winget | - |
+| software_actions | installed_count | linux | supported | 3 | dpkg+rpm | - |
+| software_actions | installed_count | macos | supported | 3 | pkgutil | - |
+| software_actions | installed_count | windows | supported | 3 | powershell_registry_count | - |
+| status | version | linux | supported | 1 | in-process (compiled version constants) | - |
+| status | version | macos | supported | 1 | in-process (compiled version constants) | - |
+| status | version | windows | supported | 1 | in-process (compiled version constants) | - |
+| status | info | linux | supported | 1 | uname(2) + gethostname(3) | - |
+| status | info | macos | supported | 1 | uname(2) + gethostname(3) | - |
+| status | info | windows | supported | 1 | GetNativeSystemInfo + GetComputerNameA | - |
+| status | health | linux | supported | 1 | /proc/self/status VmRSS + steady_clock | - |
+| status | health | macos | supported | 1 | task_info(MACH_TASK_BASIC_INFO) + steady_clock | - |
+| status | health | windows | supported | 1 | K32GetProcessMemoryInfo + steady_clock | - |
+| status | plugins | linux | supported | 1 | in-process agent config (agent.plugins.*) | - |
+| status | plugins | macos | supported | 1 | in-process agent config (agent.plugins.*) | - |
+| status | plugins | windows | supported | 1 | in-process agent config (agent.plugins.*) | - |
+| status | modules | linux | supported | 1 | in-process agent config (agent.modules.*) | - |
+| status | modules | macos | supported | 1 | in-process agent config (agent.modules.*) | - |
+| status | modules | windows | supported | 1 | in-process agent config (agent.modules.*) | - |
+| status | connection | linux | supported | 1 | in-process agent config (agent.server_address/tls_enabled/*) | - |
+| status | connection | macos | supported | 1 | in-process agent config (agent.server_address/tls_enabled/*) | - |
+| status | connection | windows | supported | 1 | in-process agent config (agent.server_address/tls_enabled/*) | - |
+| status | switch | linux | supported | 1 | in-process agent config (agent.server_address/session_id/*) | - |
+| status | switch | macos | supported | 1 | in-process agent config (agent.server_address/session_id/*) | - |
+| status | switch | windows | supported | 1 | in-process agent config (agent.server_address/session_id/*) | - |
+| status | config | linux | supported | 1 | in-process agent config (agent.*) | - |
+| status | config | macos | supported | 1 | in-process agent config (agent.*) | - |
+| status | config | windows | supported | 1 | in-process agent config (agent.*) | - |
+| storage | set | linux | supported | 1 | in-process agent KV store (yuzu_ctx_storage_set) | - |
+| storage | set | macos | supported | 1 | in-process agent KV store (yuzu_ctx_storage_set) | - |
+| storage | set | windows | supported | 1 | in-process agent KV store (yuzu_ctx_storage_set) | - |
+| storage | get | linux | supported | 1 | in-process agent KV store (yuzu_ctx_storage_get) | - |
+| storage | get | macos | supported | 1 | in-process agent KV store (yuzu_ctx_storage_get) | - |
+| storage | get | windows | supported | 1 | in-process agent KV store (yuzu_ctx_storage_get) | - |
+| storage | delete | linux | supported | 1 | in-process agent KV store (yuzu_ctx_storage_delete) | - |
+| storage | delete | macos | supported | 1 | in-process agent KV store (yuzu_ctx_storage_delete) | - |
+| storage | delete | windows | supported | 1 | in-process agent KV store (yuzu_ctx_storage_delete) | - |
+| storage | list | linux | supported | 1 | in-process agent KV store (yuzu_ctx_storage_list) | - |
+| storage | list | macos | supported | 1 | in-process agent KV store (yuzu_ctx_storage_list) | - |
+| storage | list | windows | supported | 1 | in-process agent KV store (yuzu_ctx_storage_list) | - |
+| storage | clear | linux | supported | 1 | in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key) | - |
+| storage | clear | macos | supported | 1 | in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key) | - |
+| storage | clear | windows | supported | 1 | in-process agent KV store (yuzu_ctx_storage_list + storage_delete per key) | - |
+| tags | set | linux | supported | 1 | local_json_store | - |
+| tags | set | macos | supported | 1 | local_json_store | - |
+| tags | set | windows | supported | 1 | local_json_store | - |
+| tags | get | linux | supported | 1 | local_json_store | - |
+| tags | get | macos | supported | 1 | local_json_store | - |
+| tags | get | windows | supported | 1 | local_json_store | - |
+| tags | get_all | linux | supported | 1 | local_json_store | - |
+| tags | get_all | macos | supported | 1 | local_json_store | - |
+| tags | get_all | windows | supported | 1 | local_json_store | - |
+| tags | delete | linux | supported | 1 | local_json_store | - |
+| tags | delete | macos | supported | 1 | local_json_store | - |
+| tags | delete | windows | supported | 1 | local_json_store | - |
+| tags | check | linux | supported | 1 | local_json_store | - |
+| tags | check | macos | supported | 1 | local_json_store | - |
+| tags | check | windows | supported | 1 | local_json_store | - |
+| tags | clear | linux | supported | 1 | local_json_store | - |
+| tags | clear | macos | supported | 1 | local_json_store | - |
+| tags | clear | windows | supported | 1 | local_json_store | - |
+| tags | count | linux | supported | 1 | local_json_store | - |
+| tags | count | macos | supported | 1 | local_json_store | - |
+| tags | count | windows | supported | 1 | local_json_store | - |
+| tar | status | linux | supported | 1 | sqlite | - |
+| tar | status | macos | supported | 1 | sqlite | - |
+| tar | status | windows | supported | 1 | sqlite | - |
+| tar | query | linux | supported | 1 | sqlite | - |
+| tar | query | macos | supported | 1 | sqlite | - |
+| tar | query | windows | supported | 1 | sqlite | - |
+| tar | snapshot | linux | constrained | 3 | procfs+systemctl+dpkg_rpm(planned) | software inventory collection is PLANNED (dpkg/rpm not yet wired) on Linux; service enumeration shells out via popen(systemctl) |
+| tar | snapshot | macos | constrained | 3 | endpoint_security+nstat+launchctl+pkgutil(planned) | software and mapdrive collection are PLANNED on macOS; service enumeration shells out via popen(launchctl); process/tcp fall back to a poll without the Endpoint Security entitlement or nstat root privilege |
+| tar | snapshot | windows | supported | 1 | etw+iphlpapi+scm+wts+wnet+wevtapi+registry | - |
+| tar | export | linux | supported | 1 | sqlite | - |
+| tar | export | macos | supported | 1 | sqlite | - |
+| tar | export | windows | supported | 1 | sqlite | - |
+| tar | configure | linux | supported | 1 | sqlite | - |
+| tar | configure | macos | supported | 1 | sqlite | - |
+| tar | configure | windows | supported | 1 | sqlite | - |
+| tar | collect_fast | linux | constrained | 1 | procfs | arp/dns opt-in sub-sources are PLANNED (no-op) on Linux; core process/network/netqual collection is native |
+| tar | collect_fast | macos | constrained | 1 | endpoint_security+nstat | process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the Endpoint Security entitlement or nstat root privilege; arp/dns opt-in sub-sources are PLANNED (no-op) on macOS |
+| tar | collect_fast | windows | supported | 1 | etw+iphlpapi | - |
+| tar | collect_slow | linux | constrained | 3 | systemctl+utmp | service enumeration shells out via popen(systemctl); startup_type reads 'unknown'; netconn opt-in source is PLANNED (no-op) on Linux |
+| tar | collect_slow | macos | constrained | 3 | launchctl+utmpx | service enumeration shells out via popen(launchctl); no startup_type; mapdrive and netconn opt-in sources are PLANNED (no-op) on macOS |
+| tar | collect_slow | windows | supported | 1 | scm+wts+wnet+wevtapi | - |
+| tar | collect_perf | linux | supported | 1 | procfs | - |
+| tar | collect_perf | macos | planned | 1 | host_statistics | - |
+| tar | collect_perf | windows | supported | 1 | ntcounters | - |
+| tar | collect_software | linux | planned | 2 | dpkg_rpm | - |
+| tar | collect_software | macos | planned | 2 | pkgutil | - |
+| tar | collect_software | windows | supported | 1 | registry | - |
+| tar | rollup | linux | supported | 1 | sqlite | - |
+| tar | rollup | macos | supported | 1 | sqlite | - |
+| tar | rollup | windows | supported | 1 | sqlite | - |
+| tar | sql | linux | supported | 1 | sqlite | - |
+| tar | sql | macos | supported | 1 | sqlite | - |
+| tar | sql | windows | supported | 1 | sqlite | - |
+| tar | compatibility | linux | supported | 1 | sqlite | - |
+| tar | compatibility | macos | supported | 1 | sqlite | - |
+| tar | compatibility | windows | supported | 1 | sqlite | - |
+| tar | fleet_snapshot | linux | supported | 1 | procfs | - |
+| tar | fleet_snapshot | macos | constrained | 1 | libproc(proc_pidfdinfo) | inherent TOCTOU between pid enumeration and per-fd query; short-lived sockets may be missed |
+| tar | fleet_snapshot | windows | supported | 1 | iphlpapi+win32_process_enum | - |
+| tar | purge_source | linux | supported | 1 | sqlite | - |
+| tar | purge_source | macos | supported | 1 | sqlite | - |
+| tar | purge_source | windows | supported | 1 | sqlite | - |
+| users | logged_on | linux | supported | 1 | utmp (setutent/getutent) | - |
+| users | logged_on | macos | supported | 3 | runner /bin/sh -c 'who' | - |
+| users | logged_on | windows | supported | 1 | WTSEnumerateSessionsW + WTSQuerySessionInformationW | - |
+| users | sessions | linux | supported | 3 | runner /bin/sh -c 'w -h' | - |
+| users | sessions | macos | supported | 3 | runner /bin/sh -c 'w -h' | - |
+| users | sessions | windows | supported | 1 | WTSEnumerateSessionsW + WTSQuerySessionInformationW | - |
+| users | local_users | linux | supported | 3 | /etc/passwd read + runner /bin/sh -c 'lastlog -u <user>' per account | - |
+| users | local_users | macos | supported | 3 | runner /bin/sh -c 'dscl . -list/-read UserShell/RealName' + 'last -y -1 <user>' per account | - |
+| users | local_users | windows | supported | 1 | NetUserEnum | - |
+| users | local_admins | linux | supported | 1 | getgrnam(sudo/wheel) + getpwuid(0) | - |
+| users | local_admins | macos | supported | 3 | runner /bin/sh -c 'dscl . -read /Groups/admin GroupMembership' | - |
+| users | local_admins | windows | supported | 1 | NetLocalGroupGetMembers | - |
+| users | group_members | linux | supported | 1 | getgrnam + /etc/passwd primary-group scan | - |
+| users | group_members | macos | supported | 3 | runner /bin/sh -c 'dscl . -read /Groups/<name> GroupMembership' | - |
+| users | group_members | windows | supported | 1 | NetLocalGroupGetMembers | - |
+| users | primary_user | linux | supported | 3 | runner /bin/sh -c 'last -F, piped through head -200' | - |
+| users | primary_user | macos | supported | 3 | runner /bin/sh -c 'last, piped through head -200' | - |
+| users | primary_user | windows | constrained | 3 | _popen(wevtutil qe Security EventID=4624) | falls back to an ungoverned _popen(reg query ProfileList) scan (no login-count) when the Security event log is inaccessible |
+| users | session_history | linux | supported | 3 | runner /bin/sh -c 'last -F -n <count>' | - |
+| users | session_history | macos | supported | 3 | runner /bin/sh -c 'last -n <count>' | - |
+| users | session_history | windows | constrained | 3 | _popen(wevtutil qe Security EventID=4624/4634) | requires an elevated/administrative token to read the Security event log; reports an error otherwise |
+| vuln_scan | scan | linux | supported | 3 | popen(pkg-manager+iptables/nft/ufw) | - |
+| vuln_scan | scan | macos | supported | 3 | popen(system_profiler/brew+security-checks) | - |
+| vuln_scan | scan | windows | supported | 1 | win32_registry | - |
+| vuln_scan | cve_scan | linux | supported | 3 | popen(dpkg-query/rpm/pacman/apk) | - |
+| vuln_scan | cve_scan | macos | supported | 3 | popen(system_profiler/brew) | - |
+| vuln_scan | cve_scan | windows | supported | 1 | win32_registry | - |
+| vuln_scan | config_scan | linux | supported | 3 | popen(iptables/nft/ufw)+procfs | - |
+| vuln_scan | config_scan | macos | supported | 3 | popen(spctl/fdesetup/csrutil/socketfilterfw) | - |
+| vuln_scan | config_scan | windows | supported | 1 | win32_registry | - |
+| vuln_scan | summary | linux | supported | 3 | popen(pkg-manager+iptables/nft/ufw) | - |
+| vuln_scan | summary | macos | supported | 3 | popen(system_profiler/brew+security-checks) | - |
+| vuln_scan | summary | windows | supported | 1 | win32_registry | - |
+| vuln_scan | inventory | linux | supported | 3 | popen(dpkg-query/rpm/pacman/apk) | - |
+| vuln_scan | inventory | macos | supported | 3 | popen(system_profiler/brew) | - |
+| vuln_scan | inventory | windows | supported | 1 | win32_registry | - |
+| wifi | list_networks | linux | constrained | 3 | nmcli via governed shell runner | falls back to a raw, unstructured iw/iwlist text dump when nmcli is unavailable |
+| wifi | list_networks | macos | constrained | 3 | airport -s via governed shell runner | airport was removed in macOS 14 (Sonoma); the system_profiler SPAirPortDataType fallback needs Location Services authorisation a background daemon may lack, so an unauthorised modern host yields no networks and an honest wifi\|info sentinel |
+| wifi | list_networks | windows | supported | 1 | WlanGetAvailableNetworkList | - |
+| wifi | connected | linux | constrained | 3 | nmcli via governed shell runner | falls back to a raw iwconfig text blob (ESSID/Signal only) when nmcli reports no SSID |
+| wifi | connected | macos | constrained | 1 | CoreWLAN | Location Services (macOS 14+) may withhold SSID/BSSID from a background daemon |
+| wifi | connected | windows | supported | 1 | WlanQueryInterface | - |
+| windows_updates | installed | linux | supported | 3 | rpm+apt | - |
+| windows_updates | installed | macos | supported | 3 | system_profiler | - |
+| windows_updates | installed | windows | supported | 3 | powershell_gethotfix | - |
+| windows_updates | missing | linux | supported | 3 | apt+yum | - |
+| windows_updates | missing | macos | supported | 3 | softwareupdate | - |
+| windows_updates | missing | windows | supported | 3 | powershell_update_session | - |
+| windows_updates | pending_reboot | linux | supported | 3 | filesystem+uname+needs_restarting | - |
+| windows_updates | pending_reboot | macos | constrained | 3 | softwareupdate | unbounded network call -- may take 30-120s or hang on an offline/headless Mac |
+| windows_updates | pending_reboot | windows | supported | 1 | registry | - |
+| windows_updates | patch_connectivity | linux | supported | 1 | raw_sockets | - |
+| windows_updates | patch_connectivity | macos | supported | 1 | raw_sockets | - |
+| windows_updates | patch_connectivity | windows | supported | 1 | raw_sockets | - |
+| wmi | query | linux | unsupported | - | - | - |
+| wmi | query | macos | unsupported | - | - | - |
+| wmi | query | windows | supported | 1 | wmi | - |
+| wmi | get_instance | linux | unsupported | - | - | - |
+| wmi | get_instance | macos | unsupported | - | - | - |
+| wmi | get_instance | windows | supported | 1 | wmi | - |
+| wol | wake | linux | supported | 1 | raw UDP broadcast socket | - |
+| wol | wake | macos | supported | 1 | raw UDP broadcast socket | - |
+| wol | wake | windows | supported | 1 | raw UDP broadcast socket | - |
+| wol | check | linux | supported | 3 | system ping via popen | - |
+| wol | check | macos | supported | 3 | system ping via popen | - |
+| wol | check | windows | supported | 3 | system ping via popen | - |
 
 **Undeclared plugins** (ABI<4, or ABI4 with no capability declarations yet — RATCHET: this count must never grow):
 
-- `agent_actions`
-- `agent_logging`
-- `antivirus`
-- `asset_tags`
-- `bitlocker`
-- `certificates`
-- `chargen`
-- `content_dist`
-- `device_identity`
-- `diagnostics`
-- `discovery`
-- `disk_space`
-- `event_logs`
-- `example`
-- `filesystem`
-- `firewall`
-- `hardware`
-- `http_client`
-- `installed_apps`
-- `interaction`
-- `ioc`
-- `license_scan`
-- `msi_packages`
-- `netprobe`
-- `netstat`
-- `network_actions`
-- `network_config`
-- `network_diag`
-- `os_info`
-- `processes`
-- `procfetch`
-- `quarantine`
-- `rdp_control`
-- `registry`
-- `sccm`
-- `script_exec`
-- `services`
-- `sockwho`
-- `software_actions`
-- `status`
-- `storage`
-- `tags`
-- `tar`
-- `users`
-- `vuln_scan`
-- `wifi`
-- `windows_updates`
-- `wmi`
-- `wol`
+_none — every built plugin has adopted the ABI4 capability descriptor._
 <!-- END GENERATED -->
 
 ## Make this self-maintaining

@@ -111,6 +111,22 @@ private:
 };
 #endif
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// windows: IWbemLocator/IWbemServices COM API -- native, rung 1.
+// linux/macos: no WMI equivalent -- execute() returns an explicit
+// "WMI not available on this platform" error outright.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"query",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* macos   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "wmi", nullptr}},
+    {"get_instance",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* macos   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "wmi", nullptr}},
+};
+
 } // namespace
 
 class WmiPlugin final : public yuzu::Plugin {
@@ -124,6 +140,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"query", "get_instance", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override { g_ctx = ctx.raw(); return {}; }

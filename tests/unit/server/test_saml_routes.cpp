@@ -23,6 +23,7 @@
 #include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "audit_store.hpp"
+#include "rbac_store.hpp" // fine-grained SAML RBAC reconcile tests
 #include "pg/pg_pool.hpp"
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
@@ -83,9 +84,23 @@ yuzu::test::PgTestTemplate saml_audit_tpl{"samlaudit", [](const std::string& dsn
         throw std::runtime_error("samlaudit template: store failed to migrate");
 }};
 
+// Pre-migrated + seeded RbacStore template (SAML fine-grained RBAC reconcile
+// tests below). Same tag/setup as test_oidc_principal_key.cpp's `rbac_tpl` —
+// the registry builds each NAME once and shares it across TUs that need the
+// identical store set (docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate saml_rbac_tpl{"rbacstore", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::RbacStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("rbacstore template: store failed to migrate/seed");
+}};
+
 /// Fixture — stores + AuthRoutes wired against an in-process TestRouteSink.
 /// Accepts an optional (non-owning) SamlProvider pointer so tests can supply
-/// a pre-configured provider without transferring ownership.
+/// a pre-configured provider without transferring ownership, and an optional
+/// (non-owning) RbacStore pointer — null (the default) for every existing
+/// coarse-admin-group test in this file, wired for the fine-grained SAML
+/// RBAC reconcile tests below.
 struct SamlRoutesFixture {
     yuzu::test::TempDir tmp;
     Config                                  cfg{};
@@ -112,7 +127,8 @@ struct SamlRoutesFixture {
     std::unique_ptr<AuthRoutes>             auth_routes;
     yuzu::server::test::TestRouteSink       sink;
 
-    explicit SamlRoutesFixture(SamlProvider* saml_provider = nullptr) {
+    explicit SamlRoutesFixture(SamlProvider* saml_provider = nullptr,
+                               RbacStore* rbac_store = nullptr) {
         // TempDir computes a unique path but does NOT create the directory.
         // Create it before opening any SQLite stores (mirrors the JIT-elevation
         // fixture's comma-operator trick, but explicit is clearer here).
@@ -131,7 +147,7 @@ struct SamlRoutesFixture {
 
         auth_routes = std::make_unique<AuthRoutes>(
             cfg, auth_mgr,
-            /*rbac_store=*/nullptr,
+            rbac_store,
             /*api_token_store=*/nullptr,
             audit_store.get(),
             /*mgmt_group_store=*/nullptr,
@@ -1521,69 +1537,55 @@ TEST_CASE("SAML ACS — a case-differing group value does not mint admin (qa-S1)
 #endif
 }
 
-TEST_CASE("SAML ACS — an admin-group match beyond the 64-value cap does not mint admin (qa-S2)",
+// qa-S2 / #1828.3 boundary — beyond-cap and exactly-at-cap group counts.
+//
+// Both cases below are SKIPPED as of the 64->200 kMaxGroupValues raise
+// (SAML fine-grained RBAC, parity with RbacStore::kMaxIdpGroupsPerLogin):
+// reaching (or exceeding) 200 <saml:AttributeValue> elements needs at
+// least ~8.7 KB of raw XML for the group attribute ALONE — even with
+// every value empty (200 * "<saml:AttributeValue></saml:AttributeValue>"
+// = 8698 bytes) — which already exceeds httplib's hardcoded
+// CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH=8192 cap on an
+// application/x-www-form-urlencoded body BEFORE the rest of the
+// assertion's fixed XML, before base64 encoding (+33%), and before
+// percent-encoding '+' bytes. httplib rejects the POST with a bare 413
+// INSIDE parse_form_data_message, before /saml/acs's handler ever runs —
+// TestRouteSink deliberately mirrors this (see its own comment) rather
+// than let a fixture "prove" behaviour production traffic can never
+// reach. This is a genuine, pre-existing, unrelated constant (not
+// overridden anywhere in this repo — verified via
+// `grep CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH`) that this cap
+// raise was the first change to bring into practical reach: at the old
+// cap=64, "beyond cap" only needed ~70 short values (~3.5 KB), comfortably
+// under 8 KB. There is no way to shrink the per-element XML tag overhead
+// (<saml:AttributeValue></saml:AttributeValue> = 44 bytes) below the
+// 8192-byte budget for >=186 elements, so this scenario is not
+// reconstructible at any group-value length once the cap is 200.
+//
+// The cap-truncation MECHANIC itself (>200 asserted values -> `groups`
+// truncated to exactly 200, `group_cap_truncated=true`) is still fully
+// covered where it belongs: SamlProvider::validate_response is a pure
+// function call in test_saml_provider.cpp's "group values are capped at
+// kMaxGroupValues entries (DoS guard)" test, which has no HTTP layer and
+// therefore no 8 KB ceiling to work around. auth_routes.cpp's consumption
+// of that already-truncated `groups` vector (both the coarse
+// --saml-admin-group non-match and the fine-grained reconcile-deny
+// branch) is then a straightforward, size-independent read of the
+// verifier's output — exercised at realistic group counts by the
+// reconcile tests above and the pre-existing case/near-miss tests below.
+TEST_CASE("SAML ACS — an admin-group match beyond the kMaxGroupValues cap does not mint admin "
+          "(qa-S2)",
           "[pg][saml][auth_routes]") {
-#if defined(_WIN32)
-    SKIP("SamlProvider always disabled on Windows (N4)");
-#else
-    const auto& f = saml_test_fixture();
-    auto saml_cfg = f.make_config();
-    saml_cfg.group_attribute = "groups";
-    SamlProvider provider(std::move(saml_cfg));
-    REQUIRE(provider.is_enabled());
-
-    SamlRoutesFixture fix(&provider);
-    fix.cfg.saml_admin_group = "admins";
-
-    // 70 groups; "admins" sits at index 64 (the 65th value) — beyond the
-    // kMaxGroupValues=64 DoS cap, so extract_group_values never collects it
-    // and the session must stay non-admin.
-    std::vector<std::string> groups;
-    for (int i = 0; i < 70; ++i) groups.push_back("group" + std::to_string(i));
-    groups[64] = "admins";
-    REQUIRE(groups.size() == 70);
-
-    const auto token = run_saml_acs_flow(fix, f, "beyond_cap_user@example.test", groups);
-    REQUIRE_FALSE(token.empty());
-
-    auto session = fix.auth_mgr.validate_session(token);
-    REQUIRE(session.has_value());
-    CHECK(session->role == auth::Role::user);
-
-    // #1828.3: this assertion carries 70 group values against a 64-value
-    // cap — the truncation counter must fire exactly once (not once per
-    // dropped value; a per-login counter, not a per-value one).
-    CHECK(fix.counter("yuzu_saml_group_cap_truncated_total") == 1.0);
-#endif
+    SKIP("Unreachable via a real HTTP-POST binding at kMaxGroupValues=200 — see the comment "
+        "block above this TEST_CASE. Cap-truncation coverage lives in test_saml_provider.cpp.");
 }
 
 TEST_CASE("SAML ACS — exactly kMaxGroupValues values does not trip the cap-truncation counter "
           "(#1828.3 boundary)",
           "[pg][saml][auth_routes]") {
-#if defined(_WIN32)
-    SKIP("SamlProvider always disabled on Windows (N4)");
-#else
-    const auto& f = saml_test_fixture();
-    auto saml_cfg = f.make_config();
-    saml_cfg.group_attribute = "groups";
-    SamlProvider provider(std::move(saml_cfg));
-    REQUIRE(provider.is_enabled());
-
-    SamlRoutesFixture fix(&provider);
-
-    // Exactly 64 values — none dropped, so the counter must stay at 0. This
-    // is the "false positive" guard: the truncation signal must not fire
-    // merely because the cap was reached, only when a value was ACTUALLY
-    // dropped past it.
-    std::vector<std::string> groups;
-    for (int i = 0; i < 64; ++i) groups.push_back("group" + std::to_string(i));
-    REQUIRE(groups.size() == yuzu::server::saml::kMaxGroupValues);
-
-    const auto token = run_saml_acs_flow(fix, f, "exact_cap_user@example.test", groups);
-    REQUIRE_FALSE(token.empty());
-
-    CHECK(fix.counter("yuzu_saml_group_cap_truncated_total") == 0.0);
-#endif
+    SKIP("Unreachable via a real HTTP-POST binding at kMaxGroupValues=200 — see the comment "
+        "block above the sibling qa-S2 TEST_CASE. Boundary coverage lives in "
+        "test_saml_provider.cpp.");
 }
 
 TEST_CASE("SAML ACS — a trailing space in --saml-admin-group still matches after trim (UP-4)",
@@ -2091,3 +2093,220 @@ TEST_CASE("SAML ACS — valid RelayState /dashboard is accepted (H-D)",
     CHECK(res->get_header_value("Location") == "/dashboard");
 #endif
 }
+
+// ── SAML fine-grained RBAC — group_attribute reconcile into RbacStore ──────
+//
+// Parity with OIDC's `#1832` reconcile block. These tests wire a LIVE
+// RbacStore into SamlRoutesFixture (unlike every test above, which passes
+// rbac_store=nullptr and only exercises the coarse --saml-admin-group path)
+// so the reconcile branch in auth_routes.cpp's /saml/acs handler actually
+// runs.
+#if !defined(_WIN32)
+
+namespace {
+/// Find the first (newest) audit event with the given action, or nullptr.
+const AuditEvent* find_event(const std::vector<AuditEvent>& events, const std::string& action) {
+    for (const auto& e : events) {
+        if (e.action == action) return &e;
+    }
+    return nullptr;
+}
+} // namespace
+
+TEST_CASE("SAML ACS — asserted groups reconcile into the RBAC store under source 'saml'",
+          "[pg][saml][auth_routes][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, saml_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool_{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_pool_.valid());
+    RbacStore rbac{rbac_pool_};
+    REQUIRE(rbac.is_open());
+
+    const auto& f = saml_test_fixture();
+    auto saml_cfg = f.make_config();
+    saml_cfg.group_attribute = "groups";
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+
+    SamlRoutesFixture fix(&provider, &rbac);
+    fix.cfg.saml_group_attribute = "groups";
+
+    const std::string name_id = "grouped_user@example.test";
+    const auto token = run_saml_acs_flow(fix, f, name_id, {"eng", "sales"});
+    REQUIRE_FALSE(token.empty());
+
+    const auto saml_principal = saml::saml_principal_id(f.idp_entity_id, name_id);
+    CHECK(rbac.get_group_members("saml:eng") == std::vector<std::string>{saml_principal});
+    CHECK(rbac.get_group_members("saml:sales") == std::vector<std::string>{saml_principal});
+
+    const auto events = fix.audit_events();
+    const auto* provision_event = find_event(events, "auth.sso_group_provision");
+    REQUIRE(provision_event != nullptr);
+    CHECK(provision_event->result == "ok");
+    CHECK(provision_event->detail.find("source=saml") != std::string::npos);
+    CHECK(provision_event->detail.find("added=2") != std::string::npos);
+
+    CHECK(fix.counter("yuzu_auth_sso_group_provision_total",
+                      {{"source", "saml"}, {"result", "ok"}}) == 1.0);
+}
+
+// Same unreachable-via-real-HTTP-POST finding as the qa-S2 / #1828.3
+// boundary tests above (see that comment block): >=186 group values
+// already exceed httplib's CPPHTTPLIB_FORM_URL_ENCODED_PAYLOAD_MAX_LENGTH
+// (8192 bytes) for an application/x-www-form-urlencoded body, so a
+// truncated (>200-value) assertion 413s at the transport layer before
+// /saml/acs's handler — and therefore this reconcile-deny branch — ever
+// runs (verified: TestRouteSink deliberately enforces the same 8 KiB
+// httplib form cap — see its own comment above the CPPHTTPLIB_FORM_URL_
+// ENCODED_PAYLOAD_MAX_LENGTH check in test_route_sink.hpp — so this is not
+// a gap in the fixture, the branch is genuinely unreachable via an
+// HTTP-POST route test at this repo's current cap value).
+//
+// What IS and ISN'T covered elsewhere, to be explicit and avoid a
+// false-green closure claim: the cap-truncation MECHANIC itself (>200
+// asserted values -> `groups` truncated to exactly 200,
+// `group_cap_truncated=true`) is covered by test_saml_provider.cpp's
+// kMaxGroupValues boundary test, a pure function call with no HTTP layer.
+// The sibling "reconcile store error" test below exercises the same
+// general DENY SHAPE this branch produces (login denied, an
+// auth.sso_group_provision `result=error` row, a paired
+// auth.saml_login_failed row, no partial reconcile) — but it is a
+// DIFFERENT branch reached via a DIFFERENT cause (`!reconciled` from a
+// down RbacStore, not `group_cap_truncated`). It does NOT exercise this
+// branch's specific `reason=group_count_exceeded` audit detail, nor does
+// it touch `yuzu_saml_group_cap_truncated_total` at all — neither is
+// directly asserted by any test in this file today.
+TEST_CASE("SAML ACS — asserted groups beyond kMaxGroupValues DENIES the login "
+          "(fine-grained RBAC fail-closed)",
+          "[pg][saml][auth_routes][rbac]") {
+    SKIP("Unreachable via a real HTTP-POST binding at kMaxGroupValues=200 (TestRouteSink "
+        "enforces the same 8 KiB httplib form cap production traffic hits) — see the comment "
+        "block above this TEST_CASE. The sibling 'reconcile store error' test below covers "
+        "the general deny SHAPE via a DIFFERENT cause, NOT this branch's specific "
+        "reason=group_count_exceeded detail or the yuzu_saml_group_cap_truncated_total metric, "
+        "neither of which is directly asserted anywhere in this file today. Parser-level "
+        "truncation itself is covered by test_saml_provider.cpp.");
+}
+
+TEST_CASE("SAML ACS — an empty asserted group set SKIPS reconcile (no deprovision-to-zero)",
+          "[pg][saml][auth_routes][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, saml_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool_{{.conninfo = rbac_db_.dsn(), .size = 4}};
+    REQUIRE(rbac_pool_.valid());
+    RbacStore rbac{rbac_pool_};
+    REQUIRE(rbac.is_open());
+
+    const auto& f = saml_test_fixture();
+    auto saml_cfg = f.make_config();
+    saml_cfg.group_attribute = "groups";
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+
+    SamlRoutesFixture fix(&provider, &rbac);
+    fix.cfg.saml_group_attribute = "groups";
+    fix.cfg.saml_idp_entity_id   = f.idp_entity_id;
+
+    const std::string name_id = "preexisting_member_user@example.test";
+    const auto saml_principal = saml::saml_principal_id(f.idp_entity_id, name_id);
+
+    // Pre-seed a 'saml'-sourced membership directly, mirroring what an
+    // earlier login (asserting non-empty groups) would have reconciled.
+    REQUIRE(rbac.reconcile_idp_memberships(saml_principal, "saml", {{"eng", "eng"}}).has_value());
+    REQUIRE(rbac.get_group_members("saml:eng") == std::vector<std::string>{saml_principal});
+
+    // This login asserts the "groups" attribute PRESENT but with zero
+    // values — SAML cannot distinguish this from "attribute absent", so
+    // reconcile must SKIP rather than treat it as "this user is in zero
+    // groups" (which would delete the pre-seeded membership above).
+    const auto token = run_saml_acs_flow(fix, f, name_id, {});
+    REQUIRE_FALSE(token.empty());
+
+    CHECK(rbac.get_group_members("saml:eng") == std::vector<std::string>{saml_principal});
+
+    const auto events = fix.audit_events();
+    const auto* provision_event = find_event(events, "auth.sso_group_provision");
+    REQUIRE(provision_event != nullptr);
+    CHECK(provision_event->result == "skipped");
+    CHECK(provision_event->detail.find("groups_absent") != std::string::npos);
+
+    CHECK(fix.counter("yuzu_auth_sso_group_provision_total",
+                      {{"source", "saml"}, {"result", "skipped"}}) == 1.0);
+}
+
+TEST_CASE("SAML ACS — a reconcile store error DENIES the login (fail-closed)",
+          "[pg][saml][auth_routes][rbac]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr) {
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    }
+
+    // A RbacStore pointed at a database that does not exist: construction's
+    // pool_.acquire() fails fast (same host/port, bad dbname — no network
+    // timeout), leaving is_open()==false. reconcile_idp_memberships on a
+    // not-open store deterministically returns "database not open" —
+    // exercises the fail-closed error branch without depending on a live
+    // outage.
+    std::string bad_dsn = yuzu::test::pg_admin_dsn_env();
+    const auto slash = bad_dsn.rfind('/');
+    REQUIRE(slash != std::string::npos);
+    bad_dsn = bad_dsn.substr(0, slash + 1) + "yuzu_test_definitely_nonexistent_db";
+    yuzu::server::pg::PgPool bad_pool{{.conninfo = bad_dsn, .size = 1}};
+    RbacStore bad_rbac{bad_pool};
+    REQUIRE_FALSE(bad_rbac.is_open());
+
+    const auto& f = saml_test_fixture();
+    auto saml_cfg = f.make_config();
+    saml_cfg.group_attribute = "groups";
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+
+    SamlRoutesFixture fix(&provider, &bad_rbac);
+    fix.cfg.saml_group_attribute = "groups";
+
+    const std::string name_id = "store_error_user@example.test";
+    const auto token = run_saml_acs_flow(fix, f, name_id, {"eng"});
+    CHECK(token.empty()); // login DENIED — never reaches session mint
+
+    const auto events = fix.audit_events();
+    const auto* provision_event = find_event(events, "auth.sso_group_provision");
+    REQUIRE(provision_event != nullptr);
+    CHECK(provision_event->result == "error");
+    CHECK(provision_event->detail.find("database not open") != std::string::npos);
+    const auto* login_failed_event = find_event(events, "auth.saml_login_failed");
+    REQUIRE(login_failed_event != nullptr);
+    CHECK(login_failed_event->result == "error");
+
+    CHECK(fix.counter("yuzu_auth_sso_group_provision_total",
+                      {{"source", "saml"}, {"result", "error"}}) == 1.0);
+    CHECK(fix.counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}) ==
+          1.0);
+}
+
+TEST_CASE("SAML ACS — rbac_store absent skips reconcile; coarse --saml-admin-group role "
+          "still resolves",
+          "[pg][saml][auth_routes][rbac]") {
+
+    const auto& f = saml_test_fixture();
+    auto saml_cfg = f.make_config();
+    saml_cfg.group_attribute = "groups";
+    SamlProvider provider(std::move(saml_cfg));
+    REQUIRE(provider.is_enabled());
+
+    // Default rbac_store=nullptr — RBAC-off / not wired.
+    SamlRoutesFixture fix(&provider);
+    fix.cfg.saml_admin_group     = "admins";
+    fix.cfg.saml_group_attribute = "groups"; // configured, but inert without rbac_store_
+
+    const std::string name_id = "rbac_off_admin_user@example.test";
+    const auto token = run_saml_acs_flow(fix, f, name_id, {"admins", "eng"});
+    REQUIRE_FALSE(token.empty());
+
+    auto session = fix.auth_mgr.validate_session(token);
+    REQUIRE(session.has_value());
+    // The coarse --saml-admin-group mechanism still resolves admin.
+    CHECK(session->role == auth::Role::admin);
+
+    // The fine-grained reconcile block never ran — no provisioning audit row.
+    const auto events = fix.audit_events();
+    CHECK(find_event(events, "auth.sso_group_provision") == nullptr);
+}
+
+#endif // !_WIN32
