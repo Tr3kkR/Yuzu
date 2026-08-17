@@ -189,6 +189,16 @@ The same engine is designed to be driven headless by an automation worker later.
 | Open the Verify form | `Infrastructure:Read` |
 | Run a Verify comparison / open the per-machine drill | `GuaranteedState:Read` |
 
+The route-level permissions above gate *whether* you can open/advance a deployment at all. Each
+advance additionally dispatches per device through the same chokepoint every other operator
+surface uses, which applies **two further, per-action checks** you don't request directly: staging
+an artifact on a device requires `SoftwareDeployment:Write`, and executing it requires
+`Execution:Execute` — confined to your `Execution:Execute`-**visible** device set, the same
+per-device confinement `Execution:Execute` enforces everywhere else (e.g. running a pre-flight,
+above). A device outside that visible set is skipped, never executed on, regardless of whether
+it's in the go-cohort. A global `Execution:Execute` grant is unaffected; a management-group-scoped
+one confines deployment execution the same way it confines everything else.
+
 Deployments are **owner-scoped** (viewing, advancing, resuming, and deleting all
 require you to be the creator; another operator's deployment reads as not-found).
 The result poll requires `Execute` as well as `Read` because the same request

@@ -599,9 +599,23 @@ Implementation: `RbacStore::reconcile_idp_memberships` /
 `auth_routes.cpp` `/auth/callback`; the claim parsing + gating decision in
 `oidc_provider.{hpp,cpp}` (`IdTokenClaims::groups_claim_present` /
 `groups_overage`, `groups_claim_reconcilable`). Tests:
-`tests/unit/server/test_rbac_store.cpp`, `test_oidc_provider.cpp`. SAML group
-sync is out of scope here (dropped in #1827; will ride this same reconcile
-path once #1826 merges).
+`tests/unit/server/test_rbac_store.cpp`, `test_oidc_provider.cpp`.
+
+**SAML now rides this same reconcile path (source `"saml"`).** The
+`/saml/acs` handler reconciles `--saml-group-attribute`'s asserted values
+the same way, before minting the session — see
+`docs/user-manual/authentication.md` "SAML Fine-Grained RBAC" for the
+operator-facing detail. Two SAML-specific differences from the OIDC shape
+above: (1) SAML has no `groups_claim_present`/`groups_overage` equivalent —
+it cannot distinguish "attribute absent" from "attribute present, zero
+values" — so an EMPTY asserted set skips reconciliation unconditionally
+(never reconciles zero groups), rather than gating on a presence signal;
+(2) the cap is enforced by the SAML verifier itself
+(`saml::kMaxGroupValues`, 200 — aligned with, and independent of,
+`RbacStore::kMaxIdpGroupsPerLogin`) via a `group_cap_truncated` flag on the
+parsed assertion, and a truncated assertion denies the login before
+`reconcile_idp_memberships` is ever called (never a partial/truncated
+reconcile).
 
 ## Stable principal vs. display name (#1837)
 
@@ -683,9 +697,10 @@ as dead code in the #1837 governance hardening round.
 **SAML was unaffected this slice; since resolved (ADR-2001 PR4a).** At the
 time of the #1837 hardening round documented above, `create_saml_session`
 still keyed `username` on the raw NameID (`display_name` set to the same
-value, purely for render-site parity) — SAML does not sync to `rbac_store`
-yet (dropped in #1827), so the collision risk this fix closes was dormant
-there. ADR-2001 PR4a has since closed the SAML side of the same gap:
+value, purely for render-site parity) — SAML did not sync to `rbac_store`
+yet (dropped in #1827; it now does, under source `"saml"`, see #1832
+above), so the collision risk this fix closes was dormant there. ADR-2001
+PR4a has since closed the SAML side of the same gap:
 `create_saml_session` now keys `username` on the stable
 `saml_principal_id(entity_id, name_id)` (`"saml:" + entity_id + "#" +
 name_id`, `saml_principal.hpp`), mirroring the OIDC split above
@@ -2427,6 +2442,16 @@ header, so these names stay rejected on client ingress permanently.
 
 - **API tokens** — Bearer token and `X-Yuzu-Token` header auth for automation. MCP tokens (see `docs/mcp-server.md`) use the same table with mandatory expiration (max 90 days).
 - **Ownership-scoped revocation** — `DELETE /api/v1/tokens/{id}` and `DELETE /api/settings/api-tokens/{id}` both require the caller to own the token; the global `admin` role is the sole bypass. Cross-user revoke returns `404 token not found` (identical to unknown-id, to prevent enumeration). Denied attempts are recorded with `result=denied`, `detail=owner=<principal>`. See #222 and `docs/user-manual/server-admin.md` "Upgrade Notes".
+
+### Service-scoped token fleet-wide confinement (guardian-confinement-2298, interim)
+
+A **service-scoped API token** is bound to one IT service's agents (`session->token_scope_service` non-empty on the resolved session) — created so an integration's credential reaches only the devices tagged to its own service, not the whole fleet. A recurring gap closed across several branches: a confinement check keyed on username, role, or resource ownership never actually consulted the token's *own* service-tag scope, so a service-scoped token could reach fleet-wide data or, on a few mutating surfaces, fleet-wide actions.
+
+The fix is a **blanket deny** — a service-scoped token gets `403` outright on the affected surface, rather than a narrowed per-service view — because the surfaces in question (fleet-wide census reads, and a handful of fleet-wide mutations like Guardian Baseline deploy) have no natural per-service slice to narrow to. This is a deliberate **interim posture**, not a design ambition: the durable fix — persisting the minting token's service scope where each per-request confinement check can consult it — is unbuilt.
+
+**The check itself is forked, not shared, across ~8 independent implementations** plus inline checks in several more files — see `.claude/routed-concerns-access-control.md`'s row for the current authoritative list of call sites and their exact shapes. Governance review (2026-08) explicitly recommended deferring consolidation into one chokepoint (the shape `authz_topology_floor.hpp`/`body_cap_policy.hpp` use for structurally identical problems) until the instance inventory settles — extend an existing helper in the file you're touching; do not hand-roll a 10th copy.
+
+**Known-but-unfixed instances** are tracked as GitHub issues, updated as fixes land: #3123 (device discovery), #3124 (response/execution data), #3125 (inventory data). Check an issue's current body before citing an instance count from it — issues are edited down as their listed instances get fixed elsewhere.
 
 ## Engine principals & delegation (ADR-1005 — design)
 

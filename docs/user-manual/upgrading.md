@@ -88,6 +88,36 @@ a reviewed runbook rather than summarised here. Until that lands, see
 [`authentication.md`](authentication.md) ("OIDC Single Sign-On") for the durable and non-durable ways to
 configure OIDC.
 
+## Behaviour change: SAML login gains a new availability coupling to `rbac_store` (#1832)
+
+SAML SSO now reaches parity with OIDC's group-to-role RBAC reconciliation (see
+[`authentication.md`](authentication.md) "SAML Fine-Grained RBAC"). This introduces a
+coupling that did not exist before: on a deployment that already has **RBAC enabled**
+**and** `--saml-group-attribute` configured, a SAML login now depends on `rbac_store`
+being reachable — a transient reconcile-store error denies the login outright
+(fail-closed), rather than granting a session under stale or unreconciled roles.
+Previously, a `--saml-group-attribute`-configured deployment's SAML logins did not
+touch the RBAC store at all (only the coarse `--saml-admin-group` admin/user mapping
+ran), so this is a genuinely new dependency for that combination of flags, not a
+tightening of an existing one.
+
+**What to do:** if you run SAML with both RBAC enabled and `--saml-group-attribute`
+set, ensure `rbac_store` (PostgreSQL) health and availability are covered by whatever
+you already monitor for RBAC-gated REST/MCP calls — a `rbac_store` outage now also
+takes down SAML login for that deployment, not just RBAC-gated reads. Deployments that
+leave `--saml-group-attribute` unset, or that run with RBAC disabled, are unaffected —
+this section is a no-op for them.
+
+**Also note:** the `--saml-group-attribute` group-value cap (`saml::kMaxGroupValues`)
+is raised from 64 to 200 in this release, to align with
+`RbacStore::kMaxIdpGroupsPerLogin`. A SAML assertion carrying 65–200 group values,
+which previously had its excess values silently truncated (and the login still
+succeeded), now has all of them considered. An assertion carrying more than 200 group
+values, which previously also truncated-and-logged-in, now instead **denies the
+login** (mirrors OIDC's `group_count_exceeded` behaviour) — see "SAML Fine-Grained
+RBAC" in `authentication.md` for the full detail, including the practical httplib
+form-body-size caveat on how large an assertion can realistically reach `/saml/acs`.
+
 ## Behaviour change: MCP approval-store permanent failures now say don't retry (#2786)
 
 An MCP approval-ticket recall that hits a store fault has always returned `-32603` with a `retry_after_ms` hint. Previously that hint was `5000` (retry after 5 seconds) for every store fault except a never-opened store, including one that was open but failing in a way no amount of retrying clears — SQLite corruption, not-a-database, a read-only filesystem, or a full disk. Those four cases now correctly get `retry_after_ms: null` (the same "escalate to an operator" response a never-opened store gets) instead of the transient retry hint.
@@ -1231,6 +1261,193 @@ thing: `mac_address`/`subnet` overwrite unconditionally on every upsert, so a re
 fails to resolve a device's MAC this time will blank a previously known-good value rather
 than simply retry the earlier failure. See the REST API reference's Network Discovery
 section for the full response shapes.
+
+## Guardian quarantine records migrate to Postgres (mandatory backfill, QuarantineStore, ADR-0047)
+
+The `QuarantineStore` — the Guardian device-quarantine bookkeeping behind
+`POST /api/v1/quarantine`, `DELETE /api/v1/quarantine/{agent_id}`, and the MCP
+`quarantine_device` tool — moves from the SQLite `quarantine.db` file to the server's
+PostgreSQL substrate in this release (ADR-0006 Wave 2), schema `quarantine_store`. It
+reuses the existing shared connection pool — no new connection flag or config is
+required.
+
+**This is NOT a fresh-start cutover.** An active quarantine record is live security
+containment state — losing it would silently un-quarantine a device in the server's
+view — so the migration performs a **mandatory one-time backfill** on first Postgres
+boot:
+
+**Before you upgrade**, check the legacy `quarantine.db` for the conditions that make
+the backfill refuse to boot (all listed below), so you can fix them ahead of a
+maintenance window rather than during one:
+
+```bash
+# Row count against the 5,000 sanity cap.
+sqlite3 /path/to/quarantine.db "SELECT count(*) FROM quarantine_records;"
+
+# Duplicate 'active' rows for the same agent (never enforced at the DB level
+# in the legacy schema — only an in-process mutex the server no longer runs did).
+sqlite3 /path/to/quarantine.db \
+  "SELECT agent_id, count(*) FROM quarantine_records WHERE status='active' GROUP BY agent_id HAVING count(*) > 1;"
+
+# Any status value other than 'active'/'released'.
+sqlite3 /path/to/quarantine.db \
+  "SELECT agent_id, status FROM quarantine_records WHERE status NOT IN ('active','released');"
+```
+
+If any query returns unexpected rows, resolve them in the legacy file before
+upgrading — `docs/ops-runbooks/quarantine-store-backfill-recovery.md` has the exact
+remediation for each. A 0-byte or otherwise corrupt/unreadable `quarantine.db` also
+refuses the boot; the queries above will simply fail to run against such a file,
+which is itself the signal to investigate before upgrading.
+
+- **What is preserved:** every quarantine record, active and released — agent_id,
+  status, who quarantined it, timestamps, the IP whitelist, and the reason — carries
+  over, in full history (not just the current active row).
+- **Fail-closed boot on backfill failure.** If the backfill cannot complete — a
+  Postgres write error, an unreadable legacy DB, an unrecognised legacy `status` value,
+  or a fingerprint mismatch (below) — the server **refuses to boot** rather than come
+  up with an empty or partial quarantine inventory. The backfill marker is only
+  stamped on success, so a failed attempt is **retried on the next start** once the
+  underlying cause is fixed.
+- **Fingerprint-verified, not marker-only**, the same shape `DiscoveryStore` uses
+  (see that section above for the full rationale): on a multi-replica deployment
+  sharing one Postgres database, a later-booting replica that still holds its own
+  legacy file verifies its content against the recorded fingerprint before trusting
+  an already-set completion marker. A "HOLDER-SIDE VERIFICATION FAILED" log line has
+  **two distinct causes, not one** — read it carefully rather than assuming the
+  multi-replica case: (1) two replicas each hold `quarantine.db` files with genuinely
+  different content — do not force-boot around it; an operator needs to decide which
+  is authoritative first; or (2) **this exact server** was rolled back to a
+  pre-ADR-0047 build after its backfill had already completed (see
+  [Rollback](#rollback) below), ran against the legacy file again, and is now being
+  re-upgraded — the file no longer matches what Postgres already holds. See
+  `docs/ops-runbooks/quarantine-store-backfill-recovery.md` for the recovery
+  procedure for each cause. Two narrower variants of the same "don't trust the marker
+  blindly" check also
+  refuse and require manual reconciliation: a marker set with **no** recorded
+  fingerprint at all (predates this mechanism) while this replica still holds real
+  legacy content, and a marker set **sourceless** (no replica has ever migrated real
+  content for this fleet yet) while this replica holds real content — in the second
+  case, refusing matters because a live `quarantine_device`/`release_device` call
+  could already have landed against the sourceless-stamped store, and blindly
+  migrating stale legacy content on top would silently clobber it.
+- **A 0-byte `quarantine.db` is refused, not treated as a fresh install** — same
+  rationale as `discovery.db` above (SQLite opens a 0-byte file as a valid empty
+  database, indistinguishable from "never used" without an explicit check, but a
+  genuine fresh install never has a file here at all).
+- **An unrecognised legacy `status` value refuses the boot.** The `status` column is
+  only ever `active` or `released`; a legacy row carrying anything else (e.g. from
+  manual DB surgery) fails the backfill closed with a log line naming the offending
+  `agent_id` and value, rather than silently inserting an unrecognised state or
+  silently dropping the row.
+- **More than one `active` record for the same agent in the legacy file also
+  refuses the boot.** The legacy SQLite schema never enforced "at most one active
+  record per agent" at the database level (only an in-process mutex the server no
+  longer runs did), so a legacy file could in principle hold a duplicate from
+  pre-existing data corruption or a hand-edited file. The backfill checks for this
+  before touching Postgres and names the offending `agent_id`, rather than aborting
+  mid-transaction on a raw database constraint-violation error.
+- **More than 5,000 legacy records refuses the boot** as a sanity cap sized against the
+  single backfill transaction's own time budget (the row-insert loop is one round-trip per
+  row under an exclusive cross-replica lock, so an oversized backfill would otherwise block
+  every OTHER replica's boot for its full duration). The cap counts every legacy record,
+  active and released — this store's retention is unbounded by design (no prune pass), so a
+  long-lived fleet's full quarantine history could plausibly approach this over years, unlike
+  a purely never-expected-to-bind DoS guard. `kMaxBackfillRows` is a compile-time constant,
+  not a runtime flag, and the legacy file must never be pruned to get under this cap —
+  a `quarantine_records` row is SOC 2 containment evidence, and this store's retention is
+  unbounded by design specifically so that evidence is never lost. See
+  `docs/ops-runbooks/quarantine-store-backfill-recovery.md` for the supported path (engage
+  engineering to raise the constant and rebuild) before you hit it.
+- **Legacy file moved aside after a verified backfill.** Once the backfill is
+  confirmed complete, `quarantine.db` is renamed to
+  `quarantine.db.migrated-<epoch>` (the server never reads it again). If the rename
+  itself fails (e.g. a permissions issue), this is logged as a warning and does
+  **not** block boot — the file is safe to archive or remove manually, and every
+  later boot re-verifies it by fingerprint before trusting the already-set marker,
+  so a lingering un-renamed file is never silently re-migrated. Keep the renamed
+  file (or the un-renamed original) until you have confirmed quarantine history
+  looks correct, then dispose of it per your data-retention policy.
+- **A same-boot race between two replicas migrating for the first time is
+  serialized, not refused.** If two replicas reach the backfill within the same
+  narrow window, one waits on the other under an internal database lock (bounded by
+  the same timeout as the backfill transaction itself) rather than both attempting
+  the insert; the loser then re-verifies by fingerprint as described above. This is
+  expected, self-resolving behavior on a fresh multi-replica rollout and does not
+  need operator action. **Edge case:** if the winner's own insert loop runs
+  unusually long (a very large legacy file close to the 5,000-row cap), the loser's
+  wait can itself exceed the lock timeout and produce a "backfill lock failed
+  (retryable on next boot...)" refusal instead of a clean serialize — this is not a
+  data problem, just retry booting that replica once the winner has finished.
+- **Budget for a longer first boot.** First boot takes longer than usual while the
+  backfill runs; a legacy `quarantine.db` closer to the 5,000-record cap extends
+  this further. **Widen your own orchestrator's startup budget accordingly**
+  (Kubernetes `startupProbe` failure/period budget, or the Docker Compose
+  healthcheck `start_period`) so it does not kill the server mid-backfill and
+  restart it into the same long boot repeatedly — do not treat a slower-than-normal
+  first boot as a hang.
+
+**Operator-visible behaviour change (fail-closed reads).** `GET /api/v1/quarantine`
+can now return **503** for two DISTINCT reasons — the response body's message
+distinguishes them, since only one is covered by the existing metric:
+
+- **`"quarantine list unavailable — try again"`** — a genuine store/pool/query
+  degrade (store not open, pool-acquire timeout, or query error) instead of
+  silently rendering an empty quarantine list; previously, a local SQLite read
+  essentially never failed short of file corruption, so this failure mode was not
+  practically reachable. Watch the `yuzu_server_quarantine_read_degrade_total{reason}`
+  counter — a non-zero rate means the quarantine view is degraded, **not** that no
+  devices are quarantined.
+- **`"authorization check unavailable — try again"`** (new) — the per-record
+  admit-then-filter loop that scopes the list to the caller's management groups hit
+  an anomalous outcome (neither an explicit allow nor an explicit 403 deny) partway
+  through, most commonly a transient engine-principal-store outage landing between
+  the request's initial auth check and a later per-record scope check. The whole
+  list fails closed rather than silently omitting just the affected record(s) — the
+  alternative is rendering a partial list that reads as complete. **This cause does
+  NOT increment `yuzu_server_quarantine_read_degrade_total`** — that counter is
+  wired to the store-layer degrade above only; if you see 503s here with the
+  authorization-check message and the counter isn't moving, the RBAC/engine-principal
+  path is what to investigate, not the quarantine store itself.
+
+`yuzu_server_quarantine_backfill_total{result}` records the one-time backfill outcome
+(`completed` / `fresh` / `failed`).
+
+**Verify:** after the server reports ready, confirm the migration actually moved
+your data — `GET /api/v1/quarantine` (or the dashboard Guardian → Quarantine view)
+should show the same active quarantine records you had before upgrading, and
+`SELECT value FROM quarantine_store.quarantine_meta WHERE key = 'backfill_row_count';`
+against the Postgres database should match the row count you'd have gotten from
+`sqlite3 quarantine.db.migrated-<epoch> "SELECT count(*) FROM quarantine_records;"`
+against the moved-aside legacy file.
+
+**Rollback note:** downgrading below the ADR-0047 release is **not** a simple binary
+swap-back once the backfill has completed — the old binary reads `quarantine.db`,
+which has already been renamed to `quarantine.db.migrated-<epoch>` and is no longer
+at its expected path. **Both paths below set up the same later-boot hazard — gov-fix
+(docs-writer, Gate 8.2): the naive path is NOT benign, it was previously described as
+though it were.**
+
+- **If you restore a backed-up `quarantine.db`** (per the generic [Rollback](#rollback)
+  procedure below) and run the old binary for a while, creating new quarantine/release
+  activity in the restored file, a later **re-upgrade** hits the single-replica cause
+  of the "HOLDER-SIDE VERIFICATION FAILED" refusal described above.
+- **If you do a naive rollback with no restore**, the old binary finds no file at the
+  vacated path and behaves as a fresh install (an EMPTY quarantine view) — but its
+  constructor unconditionally runs `CREATE TABLE IF NOT EXISTS` on that path regardless
+  of whether any quarantine/release action ever happens, creating a present-but-empty
+  table. A present-but-empty table fingerprints as real content, not `sourceless`, so
+  **merely booting the old binary at all — zero quarantine activity, no restore — is
+  independently sufficient** to hit the identical refusal on a later re-upgrade.
+
+Either way, see `docs/ops-runbooks/quarantine-store-backfill-recovery.md` for the
+recovery procedure; do not repeatedly restart hoping it self-resolves, it will not.
+
+**Not affected:** the agent-side quarantine firewall enforcement (WFP/nftables/pf
+block-all + exceptions) is untouched by this migration — only the server-side
+bookkeeping's storage substrate changes. `POST /api/v1/quarantine` and
+`DELETE /api/v1/quarantine/{agent_id}`'s request/response shapes, and the MCP
+`quarantine_device` tool's ticket-then-recall approval flow, are unchanged.
 
 ## Upgrade Order
 

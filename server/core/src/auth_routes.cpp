@@ -3117,6 +3117,127 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 return;
             }
 
+            // SAML fine-grained RBAC — parity with the OIDC block above
+            // (`#1832`, ~2531-2634): reconcile the configured
+            // `--saml-group-attribute`'s asserted values into the RBAC store
+            // under source "saml" BEFORE minting the session, so a
+            // provisioning failure denies the login outright (fail-closed)
+            // instead of granting a session under stale/unreconciled roles.
+            // Runs AFTER the PR4b primary deny check and BEFORE both link
+            // formation and create_saml_session, so a reconcile-deny leaves
+            // no link-write or session side effect behind.
+            //
+            // Only runs when `rbac_store_` is present AND a group attribute
+            // is configured — otherwise this is a no-op and the coarse
+            // `--saml-admin-group` role (create_saml_session, below) is the
+            // only mechanism in play, exactly as before this change.
+            //
+            // SAML cannot distinguish "group attribute absent from the
+            // assertion" from "attribute present, zero values" — both yield
+            // an empty `result.value().groups`. Unlike OIDC (which has an
+            // explicit `groups_claim_reconcilable` signal from the token),
+            // reconciling an empty SAML group set would DELETE every one of
+            // this user's `saml:`-sourced memberships (deprovision-to-zero),
+            // so an empty asserted set is SKIPPED entirely — the SCIM
+            // deprovision chokepoint (PR4a/PR4b above) remains the only full
+            // deprovisioning path here.
+            if (rbac_store_ && !cfg_.saml_group_attribute.empty()) {
+                const auto& asserted_groups = result.value().groups;
+                if (asserted_groups.empty()) {
+                    spdlog::info("SAML group provisioning skipped for '{}': no groups asserted",
+                                saml_principal);
+                    audit_log_for_principal(
+                        req, "auth.sso_group_provision", "skipped", saml_principal, "user", "User",
+                        saml_principal, "reason=groups_absent;source=saml");
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_auth_sso_group_provision_total",
+                                  {{"source", "saml"}, {"result", "skipped"}})
+                            .increment();
+                    }
+                } else if (result.value().group_cap_truncated) {
+                    // Fail-closed: the verifier's `groups` vector is already
+                    // a TRUNCATED view once the assertion carried more than
+                    // `saml::kMaxGroupValues` (200) values — reconciling it
+                    // would false-deprovision every membership beyond the
+                    // cap. Deny the login instead, mirroring OIDC's
+                    // group_count_exceeded branch.
+                    spdlog::warn(
+                        "SAML group provisioning denied for '{}': asserted groups exceeded cap {}",
+                        saml_principal, saml::kMaxGroupValues);
+                    audit_log_for_principal(
+                        req, "auth.sso_group_provision", "error", saml_principal, "user", "User",
+                        saml_principal, "reason=group_count_exceeded;source=saml");
+                    audit_log_for_principal(
+                        req, "auth.saml_login_failed", "error", saml_principal, "user", "User",
+                        saml_principal, "reason=group_count_exceeded");
+                    emit_event("auth.saml_login_failed", req,
+                              {{"source_ip", req.remote_addr},
+                               {"username", saml_principal},
+                               {"error", "group_count_exceeded"}},
+                              {}, Severity::kWarn);
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_saml_group_cap_truncated_total").increment();
+                        m->counter("yuzu_auth_sso_group_provision_total",
+                                  {{"source", "saml"}, {"result", "error"}})
+                            .increment();
+                        m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+                    }
+                    res.set_header("Set-Cookie", kBindCookieClear);
+                    res.set_redirect("/login?error=saml");
+                    return;
+                } else {
+                    std::vector<std::pair<std::string, std::string>> asserted;
+                    asserted.reserve(asserted_groups.size());
+                    for (const auto& gid : asserted_groups)
+                        asserted.emplace_back(gid, gid);
+
+                    auto reconciled =
+                        rbac_store_->reconcile_idp_memberships(saml_principal, "saml", asserted);
+                    if (!reconciled) {
+                        spdlog::warn("SAML group provisioning failed for '{}': {}", saml_principal,
+                                    reconciled.error());
+                        audit_log_for_principal(
+                            req, "auth.sso_group_provision", "error", saml_principal, "user",
+                            "User", saml_principal,
+                            "reason=" + reconciled.error() + ";source=saml");
+                        audit_log_for_principal(
+                            req, "auth.saml_login_failed", "error", saml_principal, "user", "User",
+                            saml_principal, "reason=" + reconciled.error());
+                        emit_event("auth.saml_login_failed", req,
+                                  {{"source_ip", req.remote_addr},
+                                   {"username", saml_principal},
+                                   {"error", reconciled.error()}},
+                                  {}, Severity::kWarn);
+                        if (auto* m = auth_mgr_.metrics_registry()) {
+                            m->counter("yuzu_auth_sso_group_provision_total",
+                                      {{"source", "saml"}, {"result", "error"}})
+                                .increment();
+                            m->counter("yuzu_auth_saml_login_total", {{"result", "error"}, {"role", "none"}}).increment();
+                        }
+                        res.set_header("Set-Cookie", kBindCookieClear);
+                        res.set_redirect("/login?error=saml");
+                        return;
+                    }
+
+                    // Mirrors OIDC's cons-S3: a no-op reconcile (nothing
+                    // added or removed) writes no provisioning audit row —
+                    // every login after the first steady-state one is
+                    // typically a no-op.
+                    if (reconciled->added + reconciled->removed > 0) {
+                        audit_log_for_principal(
+                            req, "auth.sso_group_provision", "ok", saml_principal, "user", "User",
+                            saml_principal,
+                            "source=saml;added=" + std::to_string(reconciled->added) +
+                                ";removed=" + std::to_string(reconciled->removed));
+                    }
+                    if (auto* m = auth_mgr_.metrics_registry()) {
+                        m->counter("yuzu_auth_sso_group_provision_total",
+                                  {{"source", "saml"}, {"result", "ok"}})
+                            .increment();
+                    }
+                }
+            }
+
             // ADR-2001 PR4a — form a durable SCIM<->SAML identity link when
             // the NameID Format is stable (see saml_scim_link.hpp), BEFORE
             // minting the session. Fail-OPEN: never fails this login. No
@@ -3239,10 +3360,16 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
             // #1828.3: the verifier flags (rather than logs or increments
             // directly — it has no metrics handle) when the assertion's
-            // group-attribute values exceeded the 64-value cap. Bump the
-            // counter here, once per login, not a per-value/per-login log
-            // line (anti-flood — same rationale as the sibling
-            // metric-only signals in docs/observability-conventions.md).
+            // group-attribute values exceeded the `saml::kMaxGroupValues`
+            // (200) cap. Bump the counter here, once per login, not a
+            // per-value/per-login log line (anti-flood — same rationale as
+            // the sibling metric-only signals in
+            // docs/observability-conventions.md). Reached ONLY when the
+            // fine-grained reconcile block above did NOT already deny this
+            // login for the same reason (`rbac_store_` absent, or
+            // `--saml-group-attribute` unconfigured) — a truncated assertion
+            // under an active reconcile is denied before session mint and
+            // never reaches this point.
             if (result.value().group_cap_truncated) {
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_saml_group_cap_truncated_total").increment();

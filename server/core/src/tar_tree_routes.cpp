@@ -5,6 +5,7 @@
 #include "tar_tree_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "rest_a4_envelope.hpp" // detail::error_json_a4, make_correlation_id
 #include "rest_audit.hpp"     // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "secure_random.hpp" // random_hex (CSPRNG cache token, #801)
 #include "web_utils.hpp"      // html_escape, audit_token, now_epoch_seconds
@@ -294,17 +295,19 @@ std::optional<std::string> TarTreeRoutes::cache_render_detail(const std::string&
 void TarTreeRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                     ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
                                     LookupFn lookup_fn, DispatchFn dispatch_fn,
-                                    ResponsesFn responses_fn, AuditFn audit_fn) {
+                                    ResponsesFn responses_fn, AuditFn audit_fn,
+                                    CallerFn caller_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(scoped_perm_fn),
                     std::move(devices_fn), std::move(lookup_fn), std::move(dispatch_fn),
-                    std::move(responses_fn), std::move(audit_fn));
+                    std::move(responses_fn), std::move(audit_fn), std::move(caller_fn));
 }
 
 void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                     ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
                                     LookupFn lookup_fn, DispatchFn dispatch_fn,
-                                    ResponsesFn responses_fn, AuditFn audit_fn) {
+                                    ResponsesFn responses_fn, AuditFn audit_fn,
+                                    CallerFn caller_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
@@ -313,6 +316,7 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
     dispatch_fn_ = std::move(dispatch_fn);
     responses_fn_ = std::move(responses_fn);
     audit_fn_ = std::move(audit_fn);
+    caller_fn_ = std::move(caller_fn);
 
     // Soft Execute probe (htmx swallows a raw 403 → render an in-panel note instead).
     auto can_execute = [this](const httplib::Request& req, const std::string& id) {
@@ -327,6 +331,24 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         if (!session) {
             res.status = 401;
             res.set_content("auth required", "text/plain");
+            return;
+        }
+        // Fleet-wide device-enumeration disclosure (SEC-2/SEC-3 confinement-gap
+        // class, found during a docs sweep): devices_fn_ below is username-keyed
+        // and does not confine a service-scoped API token whose principal
+        // resolves to an unscoped grant.
+        if (!session->token_scope_service.empty()) {
+            const auto cid = detail::make_correlation_id();
+            (void)detail::try_persist_audit(
+                audit_fn_, req, "tar.device_picker.view", "denied", "Infrastructure", "",
+                "fleet-wide TAR device picker denied to a service-scoped token "
+                "(path=" + req.path + ")");
+            res.status = 403;
+            res.set_content(
+                detail::error_json_a4(
+                    403, "service-scoped tokens may not read the fleet-wide device list", cid,
+                    detail::A4ErrorOpts{.permission = "Infrastructure:Read"}),
+                "application/json");
             return;
         }
         if (!perm_fn_(req, res, "Infrastructure", "Read"))
@@ -379,8 +401,9 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             "SELECT pid, process_name, proto, local_port, remote_addr, remote_port, state, ts, "
             "action FROM $TCP_Live" +
             where + " ORDER BY ts DESC LIMIT 5000";
-        const auto [pcmd, psent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", psql}});
-        const auto [tcmd, tsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", tsql}});
+        const auto caller = caller_fn_(req);
+        const auto [pcmd, psent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", psql}}, caller);
+        const auto [tcmd, tsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", tsql}}, caller);
         // Audit at DISPATCH (parity with device-live-info / DEX-perf): the live query
         // hitting the endpoint is the access event and must be recorded even when it
         // reaches no agent or the later poll never completes. Shared #1647 chokepoint:
@@ -577,8 +600,9 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             const std::string asql =
                 "SELECT interface, ip_address, mac_address, entry_type, ts, action "
                 "FROM $ARP_Live ORDER BY ts DESC LIMIT 20000";
-            const auto [dc, dsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", dsql}});
-            const auto [ac, asent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", asql}});
+            const auto caller = caller_fn_(req);
+            const auto [dc, dsent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", dsql}}, caller);
+            const auto [ac, asent] = dispatch_fn_("tar", "sql", {device}, "", {{"sql", asql}}, caller);
             // Shared #1647 chokepoint: catch-arm parity + Sec-Audit-Failed per verb
             // (DNS is usage-class PII, kept separately countable). Dispatch posture
             // unchanged; if either evidence row drops, the header is set.
@@ -650,6 +674,24 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             res.set_content("auth required", "text/plain");
             return;
         }
+        // Fleet-wide device-enumeration disclosure (SEC-2/SEC-3 confinement-gap
+        // class): same gap and same verb as /fragments/tar/process-tree above —
+        // devices_fn_ is username-keyed and does not confine a service-scoped
+        // API token whose principal resolves to an unscoped grant.
+        if (!session->token_scope_service.empty()) {
+            const auto cid = detail::make_correlation_id();
+            (void)detail::try_persist_audit(
+                audit_fn_, req, "tar.device_picker.view", "denied", "Infrastructure", "",
+                "fleet-wide TAR device picker denied to a service-scoped token "
+                "(path=" + req.path + ")");
+            res.status = 403;
+            res.set_content(
+                detail::error_json_a4(
+                    403, "service-scoped tokens may not read the fleet-wide device list", cid,
+                    detail::A4ErrorOpts{.permission = "Infrastructure:Read"}),
+                "application/json");
+            return;
+        }
         if (!perm_fn_(req, res, "Infrastructure", "Read"))
             return;
         std::vector<DeviceRow> devices =
@@ -686,8 +728,9 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
         std::string scmd = get_param(req, "scmd");
         std::string ccmd = get_param(req, "ccmd");
         if (scmd.empty() || ccmd.empty()) {
-            const auto [sc, ssent] = dispatch_fn_("tar", "status", {device}, "", {});
-            const auto [cc, csent] = dispatch_fn_("tar", "compatibility", {device}, "", {});
+            const auto caller = caller_fn_(req);
+            const auto [sc, ssent] = dispatch_fn_("tar", "status", {device}, "", {}, caller);
+            const auto [cc, csent] = dispatch_fn_("tar", "compatibility", {device}, "", {}, caller);
             (void)detail::emit_behavioral_audit(
                 audit_fn_, req, res, "tar.sources.read", ssent > 0 ? "dispatched" : "no_agents",
                 "Agent", device,
@@ -775,7 +818,15 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             "process", "tcp", "service", "user",   "perf",
             "procperf", "netqual", "module", "arp", "dns"};
         const std::string changes = get_param(req, "changes");
+        // Review finding (#3133): this route gates only Infrastructure:Read above,
+        // but `tar.configure` is classified Infrastructure:Write — the route relied
+        // on the chokepoint to enforce Write, and the chokepoint only does that when
+        // handed a real, non-system caller. Deriving it here (not a bare Read-only
+        // gate) is the complete fix: an operator who lacks Write is refused by
+        // build_classified_command exactly like every other Write-classified action.
+        const auto caller = caller_fn_(req);
         int applied = 0;
+        int refused_or_unreached = 0;
         std::size_t pos = 0;
         while (pos < changes.size()) {
             const auto comma = changes.find(',', pos);
@@ -792,8 +843,8 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             if (val != "on" && val != "off")
                 continue;
             const std::string enabled = (val == "on") ? "true" : "false";
-            const auto [cmd, sent] =
-                dispatch_fn_("tar", "configure", {device}, "", {{src + "_enabled", enabled}});
+            const auto [cmd, sent] = dispatch_fn_("tar", "configure", {device}, "",
+                                                  {{src + "_enabled", enabled}}, caller);
             (void)detail::emit_behavioral_audit(
                 audit_fn_, req, res, "tar.sources.configure", sent > 0 ? "dispatched" : "no_agents",
                 "Agent", device,
@@ -803,6 +854,27 @@ void TarTreeRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn 
             // not claim it was pushed (ADR-0015 review LOW-D).
             if (sent > 0)
                 ++applied;
+            else
+                ++refused_or_unreached;
+        }
+        // #3133 round-2 review minor: a chokepoint denial (the operator lacks
+        // the Infrastructure:Write that tar.configure is classified as) used
+        // to render the same "0 change(s) pushed" as an offline agent. The
+        // dispatch return can't distinguish the two ({command_id, 0} either
+        // way), so when nothing landed, probe scoped Write the same soft way
+        // can_execute probes Execute — for the MESSAGE only. The probe
+        // approximates the chokepoint's decision for display; the chokepoint
+        // itself remains the enforcement authority either way.
+        if (applied == 0 && refused_or_unreached > 0) {
+            httplib::Response probe;
+            const bool likely_authorized =
+                scoped_perm_fn_ && scoped_perm_fn_(req, probe, "Infrastructure", "Write", device);
+            if (!likely_authorized) {
+                note(res, "No changes pushed: modifying capture sources dispatches "
+                          "<code>tar.configure</code>, which needs the <b>Infrastructure "
+                          "Write</b> permission.");
+                return;
+            }
         }
         res.set_content(std::format("<span data-applied=\"{}\">{} change(s) pushed</span>", applied,
                                     applied),

@@ -3,12 +3,15 @@
 # machinery: tools/capmatrix-gen + scripts/ci/check-capability-matrix.sh (PR1.1
 # finding F10).
 #
-# WHY: all 49 shipped plugins are still undeclared and
-# RATCHET_BASELINE_UNDECLARED is pinned at 49, so the production gate only ever
-# observes the all-undeclared, count-equals-baseline state. A green gate
-# therefore proved neither that capmatrix-gen renders a DECLARED descriptor
-# correctly — the whole reason the generator exists — nor that either ratchet
-# rejection branch rejects anything. Both were reachable only by code reading.
+# WHY: the production gate only ever observes ONE state at a time — today
+# all 49 shipped plugins declare and RATCHET_BASELINE_UNDECLARED is 0, so it
+# observes the all-declared, count-equals-baseline state (when this file was
+# written the situation was the exact inverse: nothing declared, baseline 49).
+# Either way a green production gate proves nothing about the ratchet's two
+# REJECTION branches — grew, and improved-but-baseline-not-lowered — which no
+# passing state can exercise. This file drives all of them deliberately, and
+# it does so through throwaway fixture repos whose baseline it rewrites per
+# scenario, so it is unaffected by whatever the real baseline happens to be.
 #
 # This closes both halves against the REAL binary and the REAL gate script:
 #   1. Renderer: capmatrix-gen is run over tests/fixtures/abi4/'s declaring

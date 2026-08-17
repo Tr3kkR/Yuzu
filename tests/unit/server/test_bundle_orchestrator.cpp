@@ -41,6 +41,7 @@ struct FakeDispatch {
         std::string plugin, action, correlation;
         std::vector<std::string> agent_ids;
         yuzu::server::authz::VisibleSet exec_visible; // governance UP-8: what the caller threaded
+        std::string principal; // M11: the IDENTITY half — see the test below
     };
     std::vector<Call> calls;
     int sent = 1; // agents_reached returned for every step
@@ -50,8 +51,9 @@ struct FakeDispatch {
                       const std::vector<std::string>& agent_ids, const std::string& /*scope*/,
                       const std::unordered_map<std::string, std::string>& /*params*/,
                       const std::string& correlation,
-                      const yuzu::server::authz::VisibleSet& exec_visible) -> std::pair<std::string, int> {
-            calls.push_back(Call{plugin, action, correlation, agent_ids, exec_visible});
+                      const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+            calls.push_back(
+                Call{plugin, action, correlation, agent_ids, caller.exec_visible, caller.principal});
             return {"cmd-" + plugin + "-" + action, sent};
         };
     }
@@ -141,6 +143,12 @@ TEST_CASE("orchestrator threads the caller's exec_visible into DispatchFn unchan
         REQUIRE(call.exec_visible.has_value()); // NOT nullopt/unfiltered
         CHECK(call.exec_visible->size() == 1);
         CHECK(call.exec_visible->count("agent-1") == 1);
+        // M11 (review finding, post-merge round): this suite proved the
+        // VISIBILITY half of DispatchCaller reaches dispatch_fn but ignored
+        // the IDENTITY half — the same asymmetry the original CRITICAL fix
+        // was about. `dispatch()`'s third positional argument ("alice"
+        // above) is exactly `caller.principal`.
+        CHECK(call.principal == "alice");
     }
 }
 
@@ -288,7 +296,7 @@ TEST_CASE("orchestrator: a throwing dispatch step is isolated, manifest still st
     BundleOrchestrator::DispatchFn throwing =
         [&n](const std::string& plugin, const std::string& action, const std::vector<std::string>&,
              const std::string&, const std::unordered_map<std::string, std::string>&,
-             const std::string&, const yuzu::server::authz::VisibleSet&) -> std::pair<std::string, int> {
+             const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
         if (++n == 2)
             throw std::runtime_error("gRPC write failed");
         return {"cmd-" + plugin + "-" + action, 1};

@@ -14,6 +14,7 @@
 #include "reserved_definition_id.hpp" // kMcpDefinitionPrefix (#2442 — the ONE reserved-namespace rule)
 #include "rotation_confirm_state.hpp" // classify_confirm_state (#2443 confirm_engine_rotation precondition)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric (shared REST/MCP metric symbol)
+#include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
@@ -24,6 +25,11 @@
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
+// ADR-0031 operator surface (PR1.6c, p14) — mint/list/revoke_upload_grant.
+// The SAME pure validation grammar the REST route
+// (file_retrieval_routes.cpp) enforces internally, reused here so a
+// handler's pre-validation can never diverge from what the store accepts.
+#include "upload_grant_parsers.hpp"
 #include "engine_principal_store.hpp"     // PR 4.2: engine role-assignment MCP twins
 #include "dex_routes.hpp"               // dex_window_to_days / dex_iso_since (shared resolver)
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
@@ -37,6 +43,15 @@
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
 #include "directory_sync.hpp"           // access-review read-model optional email enrichment
+// ADR-0031 operator surface (PR1.5c/1.6c, p14) — MCP twins of p5's plugin
+// config/secret/kill-switch surface and p6's upload-grant mint/list/revoke.
+// The *_parsers.hpp headers are the SAME pure validation grammar the REST
+// routes (plugin_config_routes.cpp / file_retrieval_routes.cpp) enforce
+// internally — reused here so a handler's pre-validation can never diverge
+// from what the store would accept or reject.
+#include "plugin_config_store.hpp"
+#include "plugin_config_parsers.hpp"
+#include "upload_grant_parsers.hpp"
 
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
@@ -577,8 +592,10 @@ static const ToolDef kTools[] = {
     {"list_dex_perf_devices",
      "The device list behind every fleet-performance drill: worst devices by a metric (default), "
      "devices NOT reporting perf (filter=not_reporting), or one cohort's members (cohort_key + "
-     "cohort_value; empty value = untagged). Machine-health telemetry (device state, not "
-     "behavioral data). Mirrors GET /api/v1/dex/perf/devices. Requires GuaranteedState:Read.",
+     "cohort_value; empty value = untagged). Each row names an agent_id fleet-wide, so every call "
+     "is audit-logged (dex.perf.device.view); a service-scoped API token is denied — no "
+     "single agent_id to confine against. Mirrors GET /api/v1/dex/perf/devices. Requires "
+     "GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("metric":{"type":"string","enum":["cpu","commit","disk_lat"],"default":"cpu"},)j"
      R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = Windows devices with no perf sample this cycle"},)j"
@@ -714,7 +731,10 @@ static const ToolDef kTools[] = {
      "devices NOT reporting network (filter=not_reporting), a co-occurrence band "
      "(cooc=device|app|network_only|degraded), or one cohort's members (key + cohort_value; empty "
      "value = untagged). Rows carry the co-occurring facts (under_pressure, app_unstable) — "
-     "evidence, never a verdict. Mirrors GET /api/v1/network/devices. Requires GuaranteedState:Read.",
+     "evidence, never a verdict. Each row names an agent_id fleet-wide, so every call is "
+     "audit-logged (network.device.view); a service-scoped API token is denied — no single "
+     "agent_id to confine against. Mirrors GET /api/v1/network/devices. Requires "
+     "GuaranteedState:Read.",
      R"j({"type":"object","properties":{)j"
      R"j("metric":{"type":"string","enum":["rtt","retrans","throughput"],"default":"rtt"},)j"
      R"j("filter":{"type":"string","enum":["not_reporting"],"description":"not_reporting = devices with no network sample this cycle"},)j"
@@ -1401,6 +1421,135 @@ static const ToolDef kTools[] = {
      "Read-only. Mirrors GET /api/v1/secrets/kek/status. Requires Security:Read.",
      R"({"type":"object","properties":{}})",
      R"j({"type":"object","properties":{"active_version":{"type":"integer"},"oldest_in_use":{"type":["integer","null"],"description":"null when no secret rows exist"},"rotation_complete":{"type":"boolean"},"live_versions":{"type":["integer","null"],"description":"count of non-retired KEK versions; lock-free snapshot; null when it could not be determined (query failure) -- never a fabricated 0"},"lock_held":{"type":["boolean","null"],"description":"true iff the secrets_kek_op advisory lock has a granted holder; lock-free snapshot; null when it could not be determined (query failure) -- NEVER read null as \"not held\", it means unknown -- never a fabricated false"},"lock_holder_pid":{"type":["integer","null"],"description":"the lock holder's backend pid; null when unheld OR when lock_held itself is null (undetermined)"},"lock_holder_captured_at":{"type":["string","null"],"description":"ISO-8601 UTC instant the lock_held/lock_holder_pid snapshot was taken; null when undetermined; re-confirm the pid in pg_locks before acting on it, never trust one captured earlier"}},"required":["active_version","rotation_complete","live_versions","lock_held"]})j"},
+
+    // ── ADR-0031 operator surface (PR1.5c/1.6c, p14) — MCP twins of p5's
+    // /api/v1/plugin-config/* and p6's operator upload-grant routes
+    // (mint/list/revoke). Appended at the VERY END of kTools[], same
+    // rebase-conflict-minimising reason the KEK block above documents.
+    // EXEMPTION (spec item 3 / review finding #3135): the five agent-
+    // authenticated upload SESSION endpoints (POST /api/v1/uploads, PUT
+    // .../chunk, GET .../{upload_id}, POST .../commit, DELETE
+    // .../{upload_id}) get NO MCP twin here, on purpose — they authenticate
+    // on a grant/session BEARER CREDENTIAL (X-Yuzu-Upload-Grant /
+    // X-Yuzu-Upload-Session), never an operator session, and every MCP tool
+    // call authenticates as an OPERATOR (auth_fn/perm_fn,
+    // tier_allows/requires_approval). Exposing them as MCP tools would hand
+    // an agent-only credential path to an operator tool — the exact
+    // securable-asymmetry ADR-0031 exists to forbid, just inverted. This
+    // exemption is recorded in
+    // docs/adr/1005-headless-platform-use-case-engines.md's "Grandfathered
+    // surfaces" ledger, not just here; tests/unit/server/
+    // test_operator_surface_twins.cpp asserts no served tool answers to any
+    // of those five routes.
+    {"get_plugin_config",
+     "Read one plugin config value by (plugin, key). Mirrors GET "
+     "/api/v1/plugin-config/{plugin}/{key}. Read-only. Requires PluginConfig:Read.",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":64,"description":"Plugin identifier, e.g. content_dist"},"key":{"type":"string","minLength":1,"maxLength":128,"description":"Config key, may contain dots for a nested path, e.g. smtp.host"}},"required":["plugin","key"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"},"updated_at_ms":{"type":"integer"},"updated_by":{"type":"string"}},"required":["plugin","key","value","updated_at_ms","updated_by"]})j"},
+
+    {"list_plugin_config",
+     "List plugin config rows, optionally scoped to one plugin. Mirrors GET "
+     "/api/v1/plugin-config. Read-only, routed through the ADR-0017 admit-then-filter list "
+     "gate (RbacStore::authorize_list_read): a global PluginConfig:Read grant (or RBAC "
+     "loaded-and-disabled) admits an unfiltered list; a management-group-CONFINED grant is "
+     "DENIED, not silently narrowed — this resource is plugin/key configuration, not "
+     "agent-scoped data, so there is no principled per-agent filter to apply, and serving it "
+     "unfiltered under a confined grant would widen a device-scoped grant to fleet-wide "
+     "platform configuration. Requires PluginConfig:Read.",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","maxLength":64,"description":"Exact plugin filter; omit for every plugin"}}})j",
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"},"updated_at_ms":{"type":"integer"},"updated_by":{"type":"string"}},"required":["plugin","key","value","updated_at_ms","updated_by"]}},"truncated":{"type":"boolean","description":"true when more rows exist past the internal row cap"}},"required":["data","truncated"]})j"},
+
+    {"set_plugin_config",
+     "Upsert one plugin config value. Mirrors PUT /api/v1/plugin-config/{plugin}/{key} (body "
+     "{value}). Additive/overwriting, not idempotent-in-response (updated_at_ms changes every "
+     "call) but converges on one target value. Requires PluginConfig:Write.",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":64},"key":{"type":"string","minLength":1,"maxLength":128},"value":{"type":"string","maxLength":8192,"description":"Plain-text config value; NUL bytes are rejected"}},"required":["plugin","key","value"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string"},"key":{"type":"string"},"value":{"type":"string"},"updated_at_ms":{"type":"integer"},"updated_by":{"type":"string"}},"required":["plugin","key","value","updated_at_ms","updated_by"]})j"},
+
+    {"delete_plugin_config",
+     "Delete one plugin config value. Mirrors DELETE /api/v1/plugin-config/{plugin}/{key}. "
+     "Destructive (PluginConfig:Delete): approval-gated on the supervised tier — the first "
+     "call returns an approval ticket (kApprovalRequired), re-call with the returned "
+     "approval_id after an admin approves. A retry against an already-deleted key answers "
+     "not_found, never a silent success.",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":64},"key":{"type":"string","minLength":1,"maxLength":128},"approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"}},"required":["plugin","key"]})j",
+     R"j({"type":"object","properties":{"deleted":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"present and false only when the audit row could not be persisted"}},"required":["deleted"]})j"},
+
+    {"set_plugin_secret",
+     "Seal a plugin secret value (API key, webhook token, ...) under this install's KEK. "
+     "Mirrors PUT /api/v1/plugin-config/{plugin}/{key}/secret (body {value}). Write-only: the "
+     "response is METADATA ONLY (plugin, key, updated_at_ms, updated_by) — no method anywhere "
+     "on this surface, REST or MCP, ever returns a secret's plaintext, so there is no "
+     "get_plugin_secret tool and never will be. Each write mints a fresh DEK (never reused). "
+     "Requires PluginSecret:Write.",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":64},"key":{"type":"string","minLength":1,"maxLength":128},"value":{"type":"string","minLength":1,"maxLength":65536,"description":"Secret plaintext; sealed at rest, never echoed back or logged"}},"required":["plugin","key","value"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string"},"key":{"type":"string"},"updated_at_ms":{"type":"integer"},"updated_by":{"type":"string"}},"required":["plugin","key","updated_at_ms","updated_by"]})j"},
+
+    {"delete_plugin_secret",
+     "Delete a sealed plugin secret. Mirrors DELETE /api/v1/plugin-config/{plugin}/{key}/secret. "
+     "Destructive (PluginSecret:Delete): approval-gated on the supervised tier — the first "
+     "call returns an approval ticket, re-call with the returned approval_id after an admin "
+     "approves.",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":64},"key":{"type":"string","minLength":1,"maxLength":128},"approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"}},"required":["plugin","key"]})j",
+     R"j({"type":"object","properties":{"deleted":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"present and false only when the audit row could not be persisted"}},"required":["deleted"]})j"},
+
+    {"get_plugin_kill_switch",
+     "Read a plugin or plugin-action kill-switch's current display state. Mirrors GET "
+     "/api/v1/plugin-config/{plugin}/kill-switch (?action=). NOT the dispatch-gating "
+     "decision (PluginConfigStore::action_allowed collapses any store error to disabled, "
+     "which this display accessor deliberately does not) — this is the inspection view an "
+     "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
+     "enabled=true with no reason/set_by. Requires PluginConfig:Read.",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":64},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"}},"required":["plugin"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"}},"required":["plugin","action","enabled"]})j"},
+
+    {"set_plugin_kill_switch",
+     "Flip a plugin or plugin-action kill switch on or off. Mirrors PUT "
+     "/api/v1/plugin-config/{plugin}/kill-switch (?action=, body {enabled, reason}). Every "
+     "dispatch-gating caller that consults this switch fails CLOSED (treats disabled) on any "
+     "store error, so throwing this switch is a reliable emergency stop for the named "
+     "plugin/action — there is no separate 'force disable' escalation beyond this call. "
+     "Requires PluginConfig:Write.",
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":64},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
+     R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"}},"required":["plugin","action","enabled"]})j"},
+
+    {"mint_upload_grant",
+     "Mint a one-time upload-grant credential authorising ONE agent to push ONE file back to "
+     "the server (the CC-06 authenticated chunked-receive protocol). Mirrors POST "
+     "/api/v1/upload-grants. The response's grant_secret is returned EXACTLY ONCE here — it "
+     "is never stored in retrievable form and never appears in any GET/list response "
+     "afterward; hand it to the agent out-of-band (e.g. as an instruction parameter). "
+     "destination_key is SERVER-DERIVED from retention_class + the freshly-minted grant_id "
+     "only — source_path is stored as informational metadata and never influences where the "
+     "file lands. Additive (mints new state, not idempotent — each call issues a distinct "
+     "grant). Requires UploadGrant:Write.",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"The agent authorised to redeem this grant"},"source_path":{"type":"string","maxLength":4096,"description":"Informational only; NEVER used to derive the destination key"},"expected_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"Optional expected content hash, lowercase hex"},"retention_class":{"type":"string","enum":["standard","extended","transient"],"default":"standard"},"declared_max_size":{"type":"integer","minimum":1,"description":"Upper bound on the upload size in bytes"},"ttl_secs":{"type":"integer","minimum":1,"description":"Optional grant expiry override in seconds; server default applies when omitted"}},"required":["agent_id","declared_max_size"]})j",
+     R"j({"type":"object","properties":{"grant_id":{"type":"string"},"grant_secret":{"type":"string","description":"RAW one-time secret; returned only in this response, never again"},"expires_at":{"type":"integer"},"destination_key":{"type":"string"}},"required":["grant_id","grant_secret","expires_at","destination_key"]})j"},
+
+    {"list_upload_grants",
+     "List upload grants (operator metadata only — never a secret or its hash). Mirrors GET "
+     "/api/v1/upload-grants. Read-only, routed through the ADR-0017 admit-then-filter list "
+     "gate: a global UploadGrant:Read grant (or RBAC loaded-and-disabled) lists every grant; "
+     "a management-group-CONFINED grant lists only grants for agents in the caller's visible "
+     "set; no grant anywhere is denied. No client-selected agent_id filter exists on this "
+     "surface — the frozen protocol forbids one on every path. Requires UploadGrant:Read.",
+     // Takes NO arguments: the frozen protocol forbids a client-selected
+     // agent_id filter on every path, so confinement is derived server-side.
+     // `additionalProperties:false` is what makes that BOUNDED rather than
+     // free-form — a bare `properties:{}` would silently accept anything.
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"grant_id":{"type":"string"},"agent_id":{"type":"string"},"source_path":{"type":"string"},"declared_max_size":{"type":"integer"},"expected_sha256":{"type":"string"},"retention_class":{"type":"string"},"destination_key":{"type":"string"},"state":{"type":"string","description":"minted | redeemed | revoked"},"minted_by":{"type":"string"},"created_at":{"type":"integer"},"expires_at":{"type":"integer"}},"required":["grant_id","agent_id","source_path","declared_max_size","expected_sha256","retention_class","destination_key","state","minted_by","created_at","expires_at"]}}},"required":["data"]})j"},
+
+    {"revoke_upload_grant",
+     "Revoke an upload grant, closing its one-time redemption window. Mirrors DELETE "
+     "/api/v1/upload-grants/{grant_id}. Has NO effect on a grant already redeemed into a "
+     "session — revoke only prevents a FUTURE redemption; an in-flight or completed upload is "
+     "untouched. Destructive (UploadGrant:Delete): approval-gated on the supervised tier — "
+     "the first call returns an approval ticket, re-call with the returned approval_id after "
+     "an admin approves. A retry against an already-revoked or already-redeemed grant answers "
+     "not_found (nothing to revoke), never a silent success.",
+     R"j({"type":"object","properties":{"grant_id":{"type":"string","pattern":"^[a-f0-9]+$","maxLength":64},"approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"}},"required":["grant_id"]})j",
+     R"j({"type":"object","properties":{"revoked":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"present and false only when the audit row could not be persisted"}},"required":["revoked"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -1435,6 +1584,14 @@ static const char* const kWriteToolsRaw[] = {
     // KEK rotation (#2395 track C) — rotate/rewrap mutate; get_kek_status is
     // read-only and deliberately absent from this set.
     "rotate_kek", "rewrap_secrets",
+    // ADR-0031 operator surface (PR1.5c/1.6c, p14) — set/delete mutate;
+    // get_plugin_config, list_plugin_config, get_plugin_kill_switch, and
+    // list_upload_grants are read-only and deliberately absent.
+    "set_plugin_config", "delete_plugin_config", "set_plugin_secret",
+    "delete_plugin_secret", "set_plugin_kill_switch",
+    // mint/revoke_upload_grant mutate; list_upload_grants is read-only and
+    // deliberately absent.
+    "mint_upload_grant", "revoke_upload_grant",
     // Human API-token rotation (P2 #11, SOC 2 CC6.3) — MCP twins of POST
     // /api/v1/tokens/{id}/rotate and /confirm.
     "rotate_api_token", "confirm_api_token_rotation",
@@ -1591,6 +1748,22 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"rotate_kek", {"Security", "Write"}},
     {"rewrap_secrets", {"Security", "Write"}},
     {"get_kek_status", {"Security", "Read"}},
+    // ADR-0031 operator surface (PR1.5c/1.6c, p14) — parity with the REST
+    // twins' securable:operation gates exactly (plugin_config_routes.hpp /
+    // file_retrieval_routes.hpp doc comments). Delete ops are approval-gated
+    // on the supervised tier generically (mcp_policy.hpp's
+    // `operation == "Delete"` rule) — no bespoke policy change needed here.
+    {"get_plugin_config", {"PluginConfig", "Read"}},
+    {"list_plugin_config", {"PluginConfig", "Read"}},
+    {"set_plugin_config", {"PluginConfig", "Write"}},
+    {"delete_plugin_config", {"PluginConfig", "Delete"}},
+    {"set_plugin_secret", {"PluginSecret", "Write"}},
+    {"delete_plugin_secret", {"PluginSecret", "Delete"}},
+    {"get_plugin_kill_switch", {"PluginConfig", "Read"}},
+    {"set_plugin_kill_switch", {"PluginConfig", "Write"}},
+    {"mint_upload_grant", {"UploadGrant", "Write"}},
+    {"list_upload_grants", {"UploadGrant", "Read"}},
+    {"revoke_upload_grant", {"UploadGrant", "Delete"}},
 };
 
 // Lookup map DERIVED from the raw sequence; first-wins collapse here is safe
@@ -2025,6 +2198,30 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // on the active version) → idempotent, per kek_routes.cpp's own doc
     // comment on the REST twin.
     {"rewrap_secrets", {ToolEffect::Additive, true, "Resume KEK re-wrap"}},
+
+    // ── ADR-0031 operator surface (PR1.5c/1.6c, p14) ──────────────────────
+    {"get_plugin_config", {ToolEffect::ReadOnly, true, "Get plugin config value"}},
+    {"list_plugin_config", {ToolEffect::ReadOnly, true, "List plugin config"}},
+    // set_plugin_config/set_plugin_secret/set_plugin_kill_switch: upsert
+    // that OVERWRITES an existing row → Destructive, same reasoning as
+    // set_tag above; the end state on retry with the same arguments is
+    // identical → idempotent.
+    {"set_plugin_config", {ToolEffect::Destructive, true, "Set plugin config value"}},
+    {"delete_plugin_config", {ToolEffect::Destructive, true, "Delete plugin config value"}},
+    {"set_plugin_secret", {ToolEffect::Destructive, true, "Set plugin secret"}},
+    {"delete_plugin_secret", {ToolEffect::Destructive, true, "Delete plugin secret"}},
+    {"get_plugin_kill_switch", {ToolEffect::ReadOnly, true, "Get plugin kill switch"}},
+    {"set_plugin_kill_switch", {ToolEffect::Destructive, true, "Set plugin kill switch"}},
+    // mint_upload_grant: pure INSERT of a NEW grant, nothing existing
+    // overwritten → Additive. Each call issues a distinct grant_id/secret →
+    // not idempotent (same shape as mint_engine_credential above).
+    {"mint_upload_grant", {ToolEffect::Additive, false, "Mint upload grant"}},
+    {"list_upload_grants", {ToolEffect::ReadOnly, true, "List upload grants"}},
+    // revoke_upload_grant: one-way minted→revoked transition; a retry
+    // against an already-revoked/redeemed grant answers not_found rather
+    // than a clean no-op success → not idempotent (same shape as
+    // revoke_certificate/revoke_engine_principal above).
+    {"revoke_upload_grant", {ToolEffect::Destructive, false, "Revoke upload grant"}},
 };
 
 // Generate a tool's served MCP `annotations` object from its classification.
@@ -2311,6 +2508,38 @@ KekFailureInfo kek_failure_info(const KekOpResult& result) {
     return {kInternalError, "internal error", nullptr, -1};
 }
 
+// ADR-0031 operator surface (PR1.5c, p14) — maps PluginConfigStore::Error to
+// an MCP A4 error triple, mirroring plugin_config_routes.cpp's
+// write_store_error() REST twin family-for-family (NotFound/InvalidInput are
+// the caller's mistake, not retryable; Unavailable/SecretUnavailable are the
+// server's, retryable with an honest hint; WriteFailed is a genuine internal
+// failure) so the two surfaces can never disagree about what a given store
+// error means. Same shape as KekFailureInfo above.
+struct PluginConfigErrorInfo {
+    int code;
+    const char* message;
+    const char* remediation; // nullptr = no specific remediation beyond "retry"/"fix the input"
+    long retry_after_ms;     // -1 => no retry hint
+};
+
+PluginConfigErrorInfo plugin_config_error_info(PluginConfigStore::Error err) {
+    switch (err) {
+    case PluginConfigStore::Error::NotFound:
+        return {kInvalidParams, "not found", nullptr, -1};
+    case PluginConfigStore::Error::InvalidInput:
+        return {kInvalidParams, "invalid plugin/key/value/reason", nullptr, -1};
+    case PluginConfigStore::Error::Unavailable:
+        return {kInternalError, "plugin config store unavailable",
+                "retry once the server reports ready", 2000};
+    case PluginConfigStore::Error::WriteFailed:
+        return {kInternalError, "write failed", nullptr, -1};
+    case PluginConfigStore::Error::SecretUnavailable:
+        return {kInternalError, "secret encryption unavailable",
+                "retry once the server reports ready", 2000};
+    }
+    return {kInternalError, "internal error", nullptr, -1};
+}
+
 // Short, static audit-detail tag for a KEK operation failure — mirrors
 // kek_routes.cpp's failure_tag() (REST twin) so both surfaces log the same
 // detail vocabulary for the same failure classification. Rule B applies here
@@ -2459,7 +2688,7 @@ McpServer::HandlerFn McpServer::build_handler(
     const bool* mcp_streamed_post_enabled,
     std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
-    AuthDB* auth_db, DirectorySync* directory_sync, ExecVisibleFn exec_visible_fn,
+    AuthDB* auth_db, DirectorySync* directory_sync, CallerFn caller_fn,
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
     StreamPrincipalAuditFn principal_audit_fn) {
 
@@ -2498,6 +2727,18 @@ McpServer::HandlerFn McpServer::build_handler(
     // the handler below; outlives every request.
     std::shared_ptr<BundleOrchestrator> bundle_orch;
     if (dispatch_fn && response_store) {
+        // PR1.9c: `BundleOrchestrator::DispatchFn` now carries the whole
+        // `DispatchCaller`, so it is signature-identical to `McpServer::
+        // DispatchFn` and `dispatch_fn` feeds it directly — the adapter that
+        // used to sit here is gone.
+        //
+        // That adapter was the defect, not the boilerplate: it manufactured a
+        // `DispatchCaller{.exec_visible = ...}` with an EMPTY principal, and
+        // `build_classified_command` refuses an empty principal as
+        // `AnonymousOperator` before the legacy-open bypass — so every
+        // `execute_bundle` step was already being denied. The orchestrator
+        // supplies the real principal now (it has always received one; it just
+        // had nowhere to put it).
         bundle_orch = std::make_shared<BundleOrchestrator>(
             dispatch_fn, response_store,
             [] {
@@ -3215,6 +3456,31 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, "mcp." + tool_name, result_status, "mcp_tool", tool_name, detail);
             };
 
+            // BR-006 second half, MCP twin of plugin_config_routes.cpp's
+            // `audit_outcome`. The five plugin-config/secret/kill-switch tools
+            // below write a pre-mutation `attempted` row under their OWN verb
+            // (`plugin_config.set`, not `mcp.set_plugin_config`) so the REST and
+            // MCP surfaces land in one queryable evidence series; this records
+            // what the store actually did once it has answered.
+            //
+            // Deliberately not fail-closed: the mutation has already happened by
+            // the time this runs, so refusing it is not on the table and erroring
+            // a completed write would be a worse lie than the one BR-006 fixes. A
+            // dropped outcome row leaves the `attempted` row standing, which reads
+            // as "started, outcome unknown" — the honest reading of that state.
+            auto plugin_config_outcome = [&](const std::string& action, bool ok,
+                                             const std::string& target_type,
+                                             const std::string& target_id,
+                                             const std::string& detail) {
+                if (!yuzu::server::detail::try_persist_audit(audit_fn, req, action,
+                                                             ok ? "success" : "failure",
+                                                             target_type, target_id, detail)) {
+                    spdlog::warn("mcp: {} outcome row ({}) could not be persisted for {}; the "
+                                 "'attempted' row stands and the outcome is unrecorded",
+                                 action, ok ? "success" : "failure", target_id);
+                }
+            };
+
             // A4 error envelope for the MCP layer (#1470). The shared tier /
             // approval chokepoints below gate ~13 tools from one code path, so a
             // single helper here makes the whole family A4-consistent: every error
@@ -3264,6 +3530,40 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 data += "}";
                 return error_response(id, code, message, data);
+            };
+
+            // Deny a fleet-wide tool call to a service-scoped API token, with
+            // a denial audit. MCP sibling of REST's
+            // deny_fleet_wide_service_scoped (rest_api_v1.cpp) — same
+            // rationale: require_permission's service-token branch checks
+            // only the ITServiceOwner ROLE, never the token's own
+            // service-tag scope, so perm_fn alone is not confinement for a
+            // fleet-wide per-agent read with no per-agent parameter to scope
+            // against (the REST siblings of get_dex_signal_detail,
+            // list_dex_perf_devices, and list_network_devices all needed
+            // this same fix — Gate 8 review found the MCP twins share the
+            // gap the REST fix closed). Not GuaranteedState-exclusive: a
+            // non-GuaranteedState caller (e.g. query_installed_software's
+            // Inventory:Read, list_schedules' Schedule:Read) passes its own
+            // securable to perm_fn right after this deny — this helper's
+            // deny decision itself is securable-agnostic, keyed only on
+            // token_scope_service. `session` is already resolved once for
+            // the whole request above — no auth_fn call needed here.
+            // Routed through a4_error (defined just above) rather than a bare
+            // error_response, so this denial carries the same correlation_id
+            // /retry_after_ms/remediation envelope as every sibling MCP
+            // denial in this family (gov Gate 4 consistency review: it
+            // previously didn't).
+            auto deny_fleet_wide_service_scoped =
+                [&](const std::string& action, const std::string& target_type,
+                    const std::string& audit_detail, const std::string& message,
+                    const std::string& target_id = "") -> bool {
+                if (session->token_scope_service.empty())
+                    return false;
+                (void)yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, action, "denied", target_type, target_id, audit_detail);
+                res.set_content(a4_error(kPermissionDenied, message), "application/json");
+                return true;
             };
 
             // A4 envelope that also carries the durable execution handle. Used by
@@ -4449,6 +4749,18 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Governance finding: the management-group scope filter further down
+                // is INERT under the global Inventory:Read gate (same class as
+                // query_responses/query_inventory), and this tool has no per-target
+                // scoped check even when agent_id is supplied. Blanket deny, matching
+                // the REST/dashboard twins (rest_api_v1.cpp, inventory_routes.cpp).
+                if (deny_fleet_wide_service_scoped(
+                        "inventory.software.query", "Inventory",
+                        "fleet-wide software search denied to a service-scoped token (MCP "
+                        "query_installed_software)",
+                        "service-scoped tokens may not run a fleet-wide software search",
+                        "fleet"))
+                    return;
                 if (!perm_fn(req, res, "Inventory", "Read"))
                     return;
                 if (!software_inventory_store) {
@@ -5272,12 +5584,28 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── list_schedules ────────────────────────────────────────────
             if (tool_name == "list_schedules") {
+                // Tier-before-RBAC/confinement (docs/mcp-server.md) — matches
+                // every sibling deny_fleet_wide_service_scoped call site
+                // (get_dex_signal_detail, list_dex_perf_devices,
+                // list_network_devices): tier_allows first, then the deny.
                 if (!tier_allows(tier, "Schedule", "Read")) {
                     res.set_content(
                         a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
                         "application/json");
                     return;
                 }
+                // guardian-confinement-2298 hardening sweep: ITServiceOwner
+                // grants full CRUD on Schedule, and query_schedules has no
+                // owner/service filter of any kind — a bare Schedule:Read
+                // gate lets a service-scoped token enumerate every schedule
+                // from every other service. No single schedule to confine
+                // per-target against, same shape as the REST list twin's fix.
+                if (deny_fleet_wide_service_scoped(
+                        "schedule.list", "schedule",
+                        "fleet-wide schedule list denied to a service-scoped token (MCP "
+                        "list_schedules)",
+                        "service-scoped tokens may not read the fleet-wide schedule list"))
+                    return;
                 if (!perm_fn(req, res, "Schedule", "Read"))
                     return;
                 if (!schedule_engine) {
@@ -5551,6 +5879,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Fleet-wide identity-linked disclosure, same gap as the REST
+                // sibling GET /api/v1/dex/signals/{obs_type} (SEC-3 class):
+                // devices[] below names every agent_id exhibiting this
+                // signal, no per-agent parameter to scope a per-target check
+                // against. target_id left empty: this fires before the
+                // obs_type charset/length validation below, so the raw
+                // param is not yet safe to embed in an audit detail string.
+                if (deny_fleet_wide_service_scoped(
+                        "dex.signal.view", "ObsType",
+                        "fleet-wide DEX signal drill-down denied to a service-scoped token "
+                        "(MCP get_dex_signal_detail)",
+                        "service-scoped tokens may not read fleet-wide DEX signal drill-downs"))
+                    return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
                 if (!guaranteed_state_store) {
@@ -5688,6 +6029,21 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Fleet-wide identity-linked disclosure, same gap as the REST
+                // sibling GET /api/v1/dex/perf/devices (SEC-3 class): each row
+                // names an agent_id + its perf metrics, no per-agent parameter
+                // to scope against. Scoped to list_dex_perf_devices ONLY — its
+                // three siblings in this shared block (get_dex_perf_fleet,
+                // get_dex_perf_cohorts, get_dex_perf_cohort_diff) are genuine
+                // aggregates with no agent_id and stay unconfined.
+                if (tool_name == "list_dex_perf_devices" &&
+                    deny_fleet_wide_service_scoped(
+                        "dex.perf.device.view", "GuaranteedState",
+                        "fleet-wide DEX perf device list denied to a service-scoped token "
+                        "(MCP list_dex_perf_devices)",
+                        "service-scoped tokens may not read the fleet-wide DEX perf device "
+                        "list"))
+                    return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
                 if (!dex_perf_fn) {
@@ -5710,6 +6066,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         .str();
                 };
                 std::string payload;
+                // Only meaningful for list_dex_perf_devices (set inside its
+                // branch below); the other three tools in this shared block
+                // are aggregates and stay on the generic mcp.<tool> audit.
+                bool device_list_audit_ok = true;
                 if (tool_name == "get_dex_perf_fleet") {
                     const auto now = dex_perf_fleet_now(dex_perf_fn(std::string{}));
                     payload = JObj()
@@ -5849,6 +6209,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     const int limit = (std::min)(raw_limit, 500);
+                    // Behavioral-PII access audit — same verb/target as the
+                    // REST sibling GET /api/v1/dex/perf/devices. MCP
+                    // convention: set-and-proceed (audit_persisted:false
+                    // appended below on failure), not REST's fail-closed —
+                    // JSON-RPC has no response-header channel, matching
+                    // get_dex_signal_detail's own established posture.
+                    device_list_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "dex.perf.device.view", "success", "GuaranteedState", "",
+                        "fleet-wide DEX perf device list via MCP list_dex_perf_devices");
                     JArr arr;
                     for (const auto& r : dex_perf_device_list(dex_perf_fn(cohort_key), metric,
                                                               not_reporting, cohort_filter,
@@ -5872,9 +6241,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // is the one bare-array branch and needs the same wrap the Phase-1
                 // reads batch used for its own bare-array tools. content[].text stays
                 // exactly `payload` either way - unchanged wire format.
+                // Evidence-gap signal (matches get_dex_signal_detail): absent
+                // on success (consumers key on absence), false when the
+                // per-read access audit row failed to persist.
                 const std::string structured_payload =
                     tool_name == "list_dex_perf_devices"
-                        ? JObj().raw("devices", payload).str()
+                        ? (device_list_audit_ok
+                               ? JObj().raw("devices", payload).str()
+                               : JObj().raw("devices", payload).add("audit_persisted", false).str())
                         : payload;
                 mcp_audit("success");
                 res.set_content(success_response(
@@ -6018,6 +6392,19 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .raw("points", points.str())
                                   .str();
                 } else { // get_dex_group_app_perf
+                    // REST twin of this gap (GET /api/v1/dex/perf/group) was
+                    // found by this branch's own governance review (PR
+                    // #3156), while re-verifying the external review's
+                    // separate findings on this same file: perm_fn's global
+                    // GuaranteedState:Read check doesn't confine a
+                    // service-scoped token to its own service's management
+                    // groups, so it could otherwise supply any group_id.
+                    if (deny_fleet_wide_service_scoped(
+                            "dex.perf.group.view", "GuaranteedState",
+                            "management-group app-perf trend denied to a service-scoped token",
+                            "service-scoped tokens may not read a management group's app-perf "
+                            "trend"))
+                        return;
                     if (!app_perf_providers.group) {
                         res.set_content(
                             error_response(id, kInternalError, "app-perf store provider unavailable",
@@ -6135,6 +6522,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         o.add("remediation", remediation);
                     return o.str();
                 };
+                // REST twin of this gap (GET /api/v1/dex/perf/compare) was
+                // found by this branch's own governance review (PR #3156),
+                // while re-verifying the external review's separate findings
+                // on this same file: perm_fn's global
+                // GuaranteedState:Read check doesn't confine a service-scoped
+                // token to its own service's management groups, so it could
+                // otherwise supply any group and read a near-individual
+                // before/after comparison for it. Denied under the same
+                // dex.app_perf.compare verb its REST twin reuses.
+                if (deny_fleet_wide_service_scoped(
+                        "dex.app_perf.compare", "GuaranteedState",
+                        "app-perf before/after comparison denied to a service-scoped token",
+                        "service-scoped tokens may not compare a management group's app-perf"))
+                    return;
                 if (!tier_allows(tier, "GuaranteedState", "Read")) {
                     res.set_content(
                         error_response(id, kTierDenied, "MCP tier does not allow this operation",
@@ -6277,6 +6678,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Fleet-wide identity-linked disclosure, same gap as the REST
+                // sibling GET /api/v1/network/devices (SEC-3 class): each row
+                // names an agent_id + its network perf/correlation facts, no
+                // per-agent parameter to scope against. Scoped to
+                // list_network_devices ONLY — get_network_fleet is a genuine
+                // aggregate with no agent_id and stays unconfined.
+                if (tool_name == "list_network_devices" &&
+                    deny_fleet_wide_service_scoped(
+                        "network.device.view", "GuaranteedState",
+                        "fleet-wide network device list denied to a service-scoped token "
+                        "(MCP list_network_devices)",
+                        "service-scoped tokens may not read the fleet-wide network device "
+                        "list"))
+                    return;
                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
                     return;
                 if (!net_perf_fn) {
@@ -6297,6 +6712,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         .str();
                 };
                 std::string payload;
+                // Only meaningful for list_network_devices (set inside its
+                // branch below); get_network_fleet is an aggregate and stays
+                // on the generic mcp.<tool> audit.
+                bool device_list_audit_ok = true;
                 if (tool_name == "get_network_fleet") {
                     const auto now = net_perf_fleet_now(net_perf_fn(std::string{}));
                     payload = JObj()
@@ -6335,6 +6754,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     const int limit = (std::min)(raw_limit, 500);
+                    // Behavioral-PII access audit — same verb/target as the
+                    // REST sibling GET /api/v1/network/devices. MCP
+                    // convention: set-and-proceed (audit_persisted:false
+                    // appended below on failure), not REST's fail-closed.
+                    device_list_audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "network.device.view", "success", "GuaranteedState", "",
+                        "fleet-wide network device list via MCP list_network_devices");
                     JArr arr;
                     for (const auto& r : net_perf_device_list(net_perf_fn(cohort_key), metric,
                                                               not_reporting, cooc, cohort_filter,
@@ -6363,9 +6789,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the bare-array branch and needs the same wrap the Phase-1 reads
                 // batch used for its own bare-array tools. content[].text stays
                 // exactly `payload` either way - unchanged wire format.
+                // Evidence-gap signal (matches get_dex_signal_detail): absent
+                // on success (consumers key on absence), false when the
+                // per-read access audit row failed to persist.
                 const std::string structured_payload =
                     tool_name == "list_network_devices"
-                        ? JObj().raw("devices", payload).str()
+                        ? (device_list_audit_ok
+                               ? JObj().raw("devices", payload).str()
+                               : JObj().raw("devices", payload).add("audit_persisted", false).str())
                         : payload;
                 mcp_audit("success");
                 res.set_content(success_response(
@@ -6879,7 +7310,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // appears in the live executions view.
                     exec.status = "running";
                     exec.scope_expression = scope;
-                    exec.parameter_values = nlohmann::json(params).dump();
+                    // #3136 blocker: persist a REDACTED copy — the live
+                    // dispatch below still uses the raw `params` map. See
+                    // sensitive_instruction_params.hpp.
+                    exec.parameter_values =
+                        nlohmann::json(redact_sensitive_instruction_params(params)).dump();
                     // dispatched_by — `session` was authenticated at
                     // handler entry (line ~363) and is in scope here.
                     exec.dispatched_by = session->username;
@@ -6948,24 +7383,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 // forever AND the JSON-RPC client sees a connection
                 // drop instead of a structured error envelope. Mirrors
                 // the REST sibling at workflow_routes.cpp:1427-1444.
-                // #1788: confine the dispatch to the caller's Execution:Execute
-                // visible device set, mirroring /api/command. Fail closed when
-                // the derivation is unwired (CDX-R6-02, see below).
-                auto exec_visible =
-                    exec_visible_fn ? exec_visible_fn(*session)
-                                    // CDX-R6-02: unwired == FAIL CLOSED. A present EMPTY set
-                                    // (not nullopt) means "no target visible" -> nothing
-                                    // dispatched. ADR-0033 §1 forbids inferring unfiltered
-                                    // authority from an omitted applicable filter (same
-                                    // posture as the tag ScopedPermFn, K-06). Production
-                                    // always wires it (server.cpp); a test wanting unfiltered
-                                    // wires a callback that returns nullopt.
-                                    : yuzu::server::authz::deny_all();
+                // #1788 / PLAN-006: confine the dispatch to the caller's
+                // Execution:Execute visible device set AND identify who asked,
+                // mirroring /api/command. Fail closed on visibility when the
+                // derivation is unwired (CDX-R6-02, see below).
+                auto caller =
+                    caller_fn ? caller_fn(*session)
+                                    // CDX-R6-02: unwired == FAIL CLOSED on exec_visible. A
+                                    // present EMPTY set (not nullopt) means "no target
+                                    // visible" -> nothing dispatched. ADR-0033 §1 forbids
+                                    // inferring unfiltered authority from an omitted
+                                    // applicable filter (same posture as the tag
+                                    // ScopedPermFn, K-06). Production always wires it
+                                    // (server.cpp); a test wanting unfiltered wires a
+                                    // callback whose exec_visible is nullopt.
+                              : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
                 std::string command_id;
                 int agents_reached = 0;
                 try {
                     std::tie(command_id, agents_reached) = dispatch_fn(
-                        plugin, action, agent_ids, scope, params, execution_id, exec_visible);
+                        plugin, action, agent_ids, scope, params, execution_id, caller);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_instruction: dispatch failed: {}", e.what());
                     // 2f PR 3a: unwind the bridge record FIRST (unsubscribe waits
@@ -7727,15 +8164,34 @@ McpServer::HandlerFn McpServer::build_handler(
             // quarantine (mirror POST /api/v1/quarantine) AND dispatches the live
             // quarantine-plugin isolation via the same DispatchFn chain.
             if (tool_name == "quarantine_device") {
-                if (!quarantine_store) {
-                    res.set_content(
-                        error_response(id, kInternalError, "Quarantine store unavailable"),
-                        "application/json");
-                    return;
-                }
+                // Parsed before the is_open() check below (pure arg-map
+                // reads, no failure mode) so a store-outage audit row can
+                // still carry the target agent_id (gov-fix compliance-officer
+                // C-2) instead of the audit call being skipped for lack of
+                // one.
                 auto agent_id = param_str(args, "agent_id");
                 auto reason = param_str(args, "reason");
                 auto whitelist = param_str(args, "whitelist");
+                if (!quarantine_store || !quarantine_store->is_open()) {
+                    // gov-fix(consistency-auditor, Gate 8.2): "agent_id=<id>,
+                    // <message>" — same shape as the other two mcp_audit
+                    // calls in this handler, so one grep pattern extracts
+                    // agent_id from every quarantine_device audit row. The
+                    // prior round's fix only touched the write-failure call
+                    // site below; this one and the scope-gate-unwired call
+                    // still used the old "<message>, agent_id=<id>" shape.
+                    mcp_audit("failure",
+                              "agent_id=" + agent_id + ", service unavailable — store not open");
+                    // gov-fix(enterprise-readiness F5): A5 requires a
+                    // transient failure to carry an honest retry_after_ms,
+                    // matching the engine-principal-store/software-licensing
+                    // store-unavailable siblings above.
+                    res.set_content(
+                        a4_error(kInternalError, "Quarantine store unavailable",
+                                 "retry the request", /*retry_after_ms=*/5000),
+                        "application/json");
+                    return;
+                }
                 if (agent_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
                                     "application/json");
@@ -7747,7 +8203,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 // matching set_tag/delete_tag above — this was the last write tool
                 // still widening to the global perm_fn on an unwired scope gate.
                 if (!scoped_perm_fn) {
-                    mcp_audit("failure", "scope gate not configured");
+                    // gov-fix(compliance-officer C-3): carry agent_id in the
+                    // detail — mcp_audit's target_id is fixed to the tool
+                    // name, not the agent, for every MCP audit row.
+                    // gov-fix(consistency-auditor, Gate 8.2): "agent_id=<id>,
+                    // <message>" shape, matching the other two mcp_audit
+                    // calls in this handler (see the is_open() branch above).
+                    mcp_audit("failure", "agent_id=" + agent_id + ", scope gate not configured");
                     res.set_content(error_response(id, kInternalError, "scope gate not configured"),
                                     "application/json");
                     return;
@@ -7822,9 +8284,35 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
                 if (!quar_res) {
-                    mcp_audit("failure", agent_id);
-                    res.set_content(error_response(id, kInvalidParams, quar_res.error()),
-                                    "application/json");
+                    // gov-fix(compliance-officer C-3): carry the actual store
+                    // error, not just agent_id — REST's audit_fn call passes
+                    // result.error() as a distinct field from the target id;
+                    // mcp_audit only has one free-text `detail` slot, so both
+                    // go in it rather than dropping the error message.
+                    // gov-fix(consistency-auditor, Gate 8): "agent_id=<id>,
+                    // <message>" matches this handler's other two mcp_audit
+                    // detail strings (is_open()/scope-gate-unwired above) so
+                    // one grep pattern extracts agent_id from every
+                    // quarantine_device audit row.
+                    mcp_audit("failure", "agent_id=" + agent_id + ", " + quar_res.error());
+                    // Mirrors the REST twin's 503-vs-400 classification
+                    // (is_quarantine_db_error, rest_api_v1.cpp): a genuine
+                    // store/pool/query failure is kInternalError, a
+                    // business/state error ("already quarantined") is
+                    // kInvalidParams.
+                    // gov-fix(enterprise-readiness F5): a genuine store/pool
+                    // failure is retryable (A5) — carry retry_after_ms only
+                    // on that branch, matching the engine-principal-store
+                    // sibling above; a business/state error stays
+                    // non-retryable (null).
+                    if (quar_res.error().starts_with(kQuarantineDbErrorPrefix)) {
+                        res.set_content(a4_error(kInternalError, quar_res.error(),
+                                                 "retry the request", /*retry_after_ms=*/5000),
+                                        "application/json");
+                    } else {
+                        res.set_content(a4_error(kInvalidParams, quar_res.error()),
+                                        "application/json");
+                    }
                     return;
                 }
                 // 2. Dispatch the live isolation command (plugin quarantine,
@@ -7844,10 +8332,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         // defense in depth matching the bundle/execute_instruction
                         // dispatch arms (this was the last arm still passing
                         // unfiltered on a single already-authorized target).
+                        // PLAN-006: `session` was authenticated at handler entry and
+                        // is already used for the store write above — identify the
+                        // caller to dispatch_confined too, not just its visible set.
                         std::tie(command_id, agents_reached) = dispatch_fn(
                             "quarantine", "quarantine", {agent_id}, /*scope=*/"", qparams,
                             /*execution_id=*/"",
-                            yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{agent_id}});
+                            DispatchCaller{
+                                .principal = session->username,
+                                .principal_role = auth::role_to_string(session->role),
+                                .exec_visible = yuzu::server::authz::VisibleSet{
+                                    std::unordered_set<std::string>{agent_id}}});
                     } catch (const std::exception& e) {
                         spdlog::error("MCP quarantine_device: isolation dispatch failed: {}",
                                       e.what());
@@ -7884,7 +8379,7 @@ McpServer::HandlerFn McpServer::build_handler(
             // kToolSecurity).
             //
             // governance C4/sec-4: a bundle targets ONE device, so authorization is
-            // the per-target confinement below (exec_visible_fn + in_scope) — NOT
+            // the per-target confinement below (caller_fn + in_scope) — NOT
             // ALSO a targetless global Execution:Execute perm_fn gate. Keeping both
             // (as this handler previously did) is STRICTER than REST's
             // /api/v1/bundles twin (scoped_perm_fn only, no global gate), so a
@@ -7933,17 +8428,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 // #1788: a bundle targets ONE device, so confine it HERE (not in the
                 // orchestrator) — the single target must be in the caller's
                 // Execution:Execute visible set. Fail closed when unwired (CDX-R6-02).
-                auto exec_visible =
-                    exec_visible_fn ? exec_visible_fn(*session)
-                                    // CDX-R6-02: unwired == FAIL CLOSED. A present EMPTY set
-                                    // (not nullopt) means "no target visible" -> nothing
-                                    // dispatched. ADR-0033 §1 forbids inferring unfiltered
-                                    // authority from an omitted applicable filter (same
-                                    // posture as the tag ScopedPermFn, K-06). Production
-                                    // always wires it (server.cpp); a test wanting unfiltered
-                                    // wires a callback that returns nullopt.
-                                    : yuzu::server::authz::deny_all();
-                if (!yuzu::server::authz::in_scope(exec_visible, agent_id)) {
+                // PLAN-006: BundleOrchestrator's own DispatchFn is a separate,
+                // REST-shared typedef with no principal concept (see the adapter
+                // above) — this handler only needs `caller.exec_visible` here.
+                auto caller =
+                    caller_fn ? caller_fn(*session)
+                                    // CDX-R6-02: unwired == FAIL CLOSED on exec_visible. A
+                                    // present EMPTY set (not nullopt) means "no target
+                                    // visible" -> nothing dispatched. ADR-0033 §1 forbids
+                                    // inferring unfiltered authority from an omitted
+                                    // applicable filter (same posture as the tag
+                                    // ScopedPermFn, K-06). Production always wires it
+                                    // (server.cpp); a test wanting unfiltered wires a
+                                    // callback whose exec_visible is nullopt.
+                              : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+                if (!yuzu::server::authz::in_scope(caller.exec_visible, agent_id)) {
                     mcp_audit("failure", "agent_id=" + agent_id + " out_of_scope");
                     res.set_content(
                         error_response(id, kInvalidParams, "target agent not in your visible scope"),
@@ -7957,7 +8456,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     // default to unfiltered — defense in depth if a future dispatch_fn
                     // starts consulting it itself.
                     r = bundle_orch->dispatch(agent_id, *specs, session->username, bundle_audit,
-                                              exec_visible);
+                                              caller.exec_visible);
                 } catch (const std::exception& e) {
                     spdlog::error("MCP execute_bundle: dispatch failed: {}", e.what());
                     mcp_audit("failure", std::string("dispatch_exception: ") + e.what());
@@ -8666,6 +9165,702 @@ McpServer::HandlerFn McpServer::build_handler(
                     payload.add("lock_holder_captured_at", utc_iso_at(*result.lock_holder_captured_at));
                 else
                     payload.raw("lock_holder_captured_at", "null");
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── ADR-0031 operator surface (PR1.5c/1.6c, p14) ────────────────
+            // MCP twins of p5's /api/v1/plugin-config/* and p6's operator
+            // upload-grant routes — see the kTools[] entries above for each
+            // tool's A5 description/schema contract, and the comment block
+            // there for the upload-session exemption (spec item 3: NO MCP
+            // twin exists, or ever should, for POST /api/v1/uploads, PUT
+            // .../chunk, GET .../{upload_id}, POST .../commit, DELETE
+            // .../{upload_id} — those authenticate on a grant/session bearer
+            // credential, never an operator session).
+            //
+            // Every handler below: tier_allows + perm_fn with the SAME
+            // (securable, operation) its REST twin checks (plugin_config_routes.hpp
+            // / file_retrieval_routes.hpp doc comments) — never weaker; a
+            // pre-validation pass with the SAME plugin_config_parsers.hpp /
+            // upload_grant_parsers.hpp grammar the store enforces internally,
+            // matching every REST handler's own pre-validation; a domain
+            // audit_fn call on every mutation using the IDENTICAL verb its
+            // REST twin uses, so a table-driven cross-surface test can assert
+            // parity. Unlike plugin_config_routes.cpp's audit-before-mutate
+            // ordering (chosen there specifically to close a REST-only
+            // audit-store-outage gap), these mutate-then-audit and surface a
+            // dropped audit row via `audit_persisted:false` in the payload —
+            // the SAME established idiom every other MCP write tool in this
+            // file uses (rotate_kek, assign_engine_role, ...), so this
+            // surface stays consistent with its MCP siblings rather than
+            // importing a REST-specific ordering choice; the signal an
+            // agentic caller needs (the audit did not persist) is present
+            // either way, never silently dropped.
+
+            if (tool_name == "get_plugin_config") {
+                if (!tier_allows(tier, "PluginConfig", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "PluginConfig", "Read"))
+                    return;
+                if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "plugin config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                const auto plugin = param_str(args, "plugin");
+                const auto key = param_str(args, "key");
+                auto entry = plugin_config_store_->get_config(plugin, key);
+                if (!entry) {
+                    const auto info = plugin_config_error_info(entry.error());
+                    res.set_content(a4_error(info.code, info.message,
+                                             info.remediation ? std::string_view(info.remediation)
+                                                               : std::string_view{},
+                                             info.retry_after_ms),
+                                    "application/json");
+                    return;
+                }
+                JObj payload;
+                payload.add("plugin", entry->plugin)
+                    .add("key", entry->key)
+                    .add("value", entry->value)
+                    .add("updated_at_ms", entry->updated_at_ms)
+                    .add("updated_by", entry->updated_by);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_plugin_config") {
+                if (!tier_allows(tier, "PluginConfig", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "PluginConfig", "Read"))
+                    return;
+                if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "plugin config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                // ADR-0017 admit-then-filter list gate — mirrors
+                // plugin_config_routes.cpp's list handler exactly: AdmitAll
+                // (global grant, or RBAC loaded-and-disabled) serves the
+                // list; AdmitScoped is treated identically to DenyAll here
+                // (this resource is not agent-scoped, so a
+                // management-group-confined grant's visible_agents has no
+                // principled filter to apply — see that handler's doc
+                // comment for the full rationale).
+                if (!rbac_store || !rbac_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "authorization store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                const auto authz = rbac_store->authorize_list_read(session->username, "PluginConfig",
+                                                                   "Read", mgmt_store);
+                if (authz.decision != ListReadDecision::AdmitAll) {
+                    mcp_audit("denied", "PluginConfig:Read (list)");
+                    res.set_content(
+                        a4_error(kPermissionDenied, "permission denied: PluginConfig:Read"),
+                        "application/json");
+                    return;
+                }
+                const auto plugin_filter = param_str(args, "plugin");
+                bool truncated = false;
+                auto rows = plugin_config_store_->list_config(plugin_filter, &truncated);
+                if (!rows) {
+                    const auto info = plugin_config_error_info(rows.error());
+                    res.set_content(a4_error(info.code, info.message,
+                                             info.remediation ? std::string_view(info.remediation)
+                                                               : std::string_view{},
+                                             info.retry_after_ms),
+                                    "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& e : *rows) {
+                    arr.add(JObj()
+                                .add("plugin", e.plugin)
+                                .add("key", e.key)
+                                .add("value", e.value)
+                                .add("updated_at_ms", e.updated_at_ms)
+                                .add("updated_by", e.updated_by));
+                }
+                JObj payload;
+                payload.raw("data", arr.str()).add("truncated", truncated);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "set_plugin_config") {
+                if (!tier_allows(tier, "PluginConfig", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "PluginConfig", "Write"))
+                    return;
+                if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "plugin config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                const auto plugin = param_str(args, "plugin");
+                const auto key = param_str(args, "key");
+                const auto value = param_str(args, "value");
+                auto pk = plugin_config::parse_plugin_key(plugin, key);
+                if (!pk || !plugin_config::is_valid_config_value(value) ||
+                    !plugin_config::is_valid_actor(session->username)) {
+                    res.set_content(a4_error(kInvalidParams, "invalid plugin/key/value"),
+                                    "application/json");
+                    return;
+                }
+                // BR-005 (branch review): AUDIT BEFORE MUTATING and refuse the
+                // mutation if the row will not persist — the posture this
+                // feature's own REST twin takes via `audit_or_503`
+                // (plugin_config_routes.cpp). p14's contract for a twin is the
+                // SAME audit envelope as its REST sibling, "never weaker", and
+                // mutate-then-report-`audit_persisted:false` IS weaker: with a
+                // degraded audit backend the change commits, the caller sees
+                // success, and no evidence row exists precisely when evidence
+                // matters.
+                //
+                // BR-006: the pre-mutation row records `attempted`, never
+                // `success` — an earlier revision of this fix copied the REST
+                // twin's then-flawed `success` and inherited its defect, where
+                // a mutation that failed AFTER a persisted audit row (lease
+                // timeout, encrypt error, concurrent delete) left the log
+                // permanently asserting a change that never happened. The
+                // paired `plugin_config_outcome(...)` call after the store
+                // answers records what actually occurred, so the two rows
+                // together can neither assert a change that did not happen nor
+                // lose one that did.
+                //
+                // Scope: the FIVE plugin-config/secret/kill-switch mutations
+                // this PR introduces. The ~20 pre-existing MCP write tools keep
+                // their mutate-then-disclose posture; changing those is a
+                // separate, separately-reviewed decision.
+                if (!audit_fn(req, "plugin_config.set", "attempted", "PluginConfig",
+                              plugin + "." + key, "len=" + std::to_string(value.size()))) {
+                    res.set_content(
+                        a4_error(503, "the audit record could not be persisted; the configuration "
+                                      "was NOT changed — retry once the audit store recovers"),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
+                auto result = plugin_config_store_->set_config(plugin, key, value, session->username);
+                const std::string set_detail = "len=" + std::to_string(value.size());
+                if (!result) {
+                    plugin_config_outcome("plugin_config.set", false, "PluginConfig",
+                                          plugin + "." + key, set_detail);
+                    const auto info = plugin_config_error_info(result.error());
+                    res.set_content(a4_error(info.code, info.message,
+                                             info.remediation ? std::string_view(info.remediation)
+                                                               : std::string_view{},
+                                             info.retry_after_ms),
+                                    "application/json");
+                    return;
+                }
+                plugin_config_outcome("plugin_config.set", true, "PluginConfig", plugin + "." + key,
+                                      set_detail);
+                JObj payload;
+                payload.add("plugin", result->plugin)
+                    .add("key", result->key)
+                    .add("value", result->value)
+                    .add("updated_at_ms", result->updated_at_ms)
+                    .add("updated_by", result->updated_by);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "delete_plugin_config") {
+                if (!tier_allows(tier, "PluginConfig", "Delete")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "PluginConfig", "Delete"))
+                    return;
+                if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "plugin config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                const auto plugin = param_str(args, "plugin");
+                const auto key = param_str(args, "key");
+                auto pk = plugin_config::parse_plugin_key(plugin, key);
+                if (!pk) {
+                    res.set_content(a4_error(kInvalidParams, "invalid plugin/key"),
+                                    "application/json");
+                    return;
+                }
+                // BR-005: audit before mutating, refuse on failure — see
+                // set_plugin_config above for the full rationale.
+                if (!audit_fn(req, "plugin_config.delete", "attempted", "PluginConfig",
+                              plugin + "." + key, "deleted")) {
+                    res.set_content(
+                        a4_error(503, "the audit record could not be persisted; the configuration "
+                                      "was NOT deleted — retry once the audit store recovers"),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
+                auto result = plugin_config_store_->delete_config(plugin, key);
+                if (!result) {
+                    plugin_config_outcome("plugin_config.delete", false, "PluginConfig",
+                                          plugin + "." + key, "deleted");
+                    const auto info = plugin_config_error_info(result.error());
+                    res.set_content(a4_error(info.code, info.message,
+                                             info.remediation ? std::string_view(info.remediation)
+                                                               : std::string_view{},
+                                             info.retry_after_ms),
+                                    "application/json");
+                    return;
+                }
+                plugin_config_outcome("plugin_config.delete", true, "PluginConfig",
+                                      plugin + "." + key, "deleted");
+                JObj payload;
+                payload.add("deleted", true);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "set_plugin_secret") {
+                if (!tier_allows(tier, "PluginSecret", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "PluginSecret", "Write"))
+                    return;
+                if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "plugin config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                const auto plugin = param_str(args, "plugin");
+                const auto key = param_str(args, "key");
+                const auto value = param_str(args, "value");
+                auto pk = plugin_config::parse_plugin_key(plugin, key);
+                if (!pk || !plugin_config::is_valid_secret_value(value) ||
+                    !plugin_config::is_valid_actor(session->username)) {
+                    res.set_content(a4_error(kInvalidParams, "invalid plugin/key/value"),
+                                    "application/json");
+                    return;
+                }
+                // Redact-by-construction (same helper the REST route uses):
+                // no parameter through which `value` could reach the audit
+                // detail.
+                const std::string detail_str = plugin_config::redact_secret_for_audit(*pk);
+                // BR-005: audit before mutating, refuse on failure — see
+                // set_plugin_config above. `detail_str` is already redacted.
+                if (!audit_fn(req, "plugin_secret.set", "attempted", "PluginSecret",
+                              plugin + "." + key, detail_str)) {
+                    res.set_content(
+                        a4_error(503, "the audit record could not be persisted; the secret was NOT "
+                                      "changed — retry once the audit store recovers"),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
+                auto result = plugin_config_store_->set_secret(plugin, key, value, session->username);
+                if (!result) {
+                    plugin_config_outcome("plugin_secret.set", false, "PluginSecret",
+                                          plugin + "." + key, detail_str);
+                    const auto info = plugin_config_error_info(result.error());
+                    res.set_content(a4_error(info.code, info.message,
+                                             info.remediation ? std::string_view(info.remediation)
+                                                               : std::string_view{},
+                                             info.retry_after_ms),
+                                    "application/json");
+                    return;
+                }
+                plugin_config_outcome("plugin_secret.set", true, "PluginSecret", plugin + "." + key,
+                                      detail_str);
+                JObj payload;
+                payload.add("plugin", result->plugin)
+                    .add("key", result->key)
+                    .add("updated_at_ms", result->updated_at_ms)
+                    .add("updated_by", result->updated_by);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "delete_plugin_secret") {
+                if (!tier_allows(tier, "PluginSecret", "Delete")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "PluginSecret", "Delete"))
+                    return;
+                if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "plugin config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                const auto plugin = param_str(args, "plugin");
+                const auto key = param_str(args, "key");
+                auto pk = plugin_config::parse_plugin_key(plugin, key);
+                if (!pk) {
+                    res.set_content(a4_error(kInvalidParams, "invalid plugin/key"),
+                                    "application/json");
+                    return;
+                }
+                // BR-005: audit before mutating, refuse on failure — see
+                // set_plugin_config above.
+                if (!audit_fn(req, "plugin_secret.delete", "attempted", "PluginSecret",
+                              plugin + "." + key, "deleted")) {
+                    res.set_content(
+                        a4_error(503, "the audit record could not be persisted; the secret was NOT "
+                                      "deleted — retry once the audit store recovers"),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
+                auto result = plugin_config_store_->delete_secret(plugin, key);
+                if (!result) {
+                    plugin_config_outcome("plugin_secret.delete", false, "PluginSecret",
+                                          plugin + "." + key, "deleted");
+                    const auto info = plugin_config_error_info(result.error());
+                    res.set_content(a4_error(info.code, info.message,
+                                             info.remediation ? std::string_view(info.remediation)
+                                                               : std::string_view{},
+                                             info.retry_after_ms),
+                                    "application/json");
+                    return;
+                }
+                plugin_config_outcome("plugin_secret.delete", true, "PluginSecret",
+                                      plugin + "." + key, "deleted");
+                JObj payload;
+                payload.add("deleted", true);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_plugin_kill_switch") {
+                if (!tier_allows(tier, "PluginConfig", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "PluginConfig", "Read"))
+                    return;
+                if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "plugin config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                const auto plugin = param_str(args, "plugin");
+                const auto action = param_str(args, "action");
+                auto entry = plugin_config_store_->get_kill_switch(plugin, action);
+                if (!entry) {
+                    const auto info = plugin_config_error_info(entry.error());
+                    res.set_content(a4_error(info.code, info.message,
+                                             info.remediation ? std::string_view(info.remediation)
+                                                               : std::string_view{},
+                                             info.retry_after_ms),
+                                    "application/json");
+                    return;
+                }
+                JObj payload;
+                payload.add("plugin", entry->plugin)
+                    .add("action", entry->action)
+                    .add("enabled", entry->enabled)
+                    .add("reason", entry->reason)
+                    .add("set_by", entry->set_by)
+                    .add("updated_at_ms", entry->updated_at_ms);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "set_plugin_kill_switch") {
+                if (!tier_allows(tier, "PluginConfig", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "PluginConfig", "Write"))
+                    return;
+                if (!plugin_config_store_ || !plugin_config_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "plugin config store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                if (!args.contains("enabled") || !args["enabled"].is_boolean()) {
+                    res.set_content(a4_error(kInvalidParams, "enabled (boolean) is required"),
+                                    "application/json");
+                    return;
+                }
+                const bool enabled = args["enabled"].get<bool>();
+                const auto plugin = param_str(args, "plugin");
+                const auto action = param_str(args, "action");
+                const auto reason = param_str(args, "reason");
+                if (!plugin_config::parse_kill_switch_scope(plugin, action) ||
+                    !plugin_config::is_valid_reason(reason) ||
+                    !plugin_config::is_valid_actor(session->username)) {
+                    res.set_content(a4_error(kInvalidParams, "invalid plugin/action/reason"),
+                                    "application/json");
+                    return;
+                }
+                // BR-005: audit before mutating, refuse on failure — see
+                // set_plugin_config above. A kill-switch flip is the most
+                // consequential of the five: it disables a capability
+                // fleet-wide, which is exactly what an incident review needs
+                // evidence of and cannot reconstruct afterwards.
+                const std::string target_id = action.empty() ? plugin : plugin + "." + action;
+                if (!audit_fn(req, "plugin_config.kill_switch.set", "attempted", "PluginConfig",
+                              target_id, std::string("enabled=") + (enabled ? "true" : "false"))) {
+                    res.set_content(
+                        a4_error(503, "the audit record could not be persisted; the kill switch was "
+                                      "NOT changed — retry once the audit store recovers"),
+                        "application/json");
+                    mcp_audit("error");
+                    return;
+                }
+                auto result = plugin_config_store_->set_kill_switch(plugin, action, enabled, reason,
+                                                                    session->username);
+                const std::string ks_detail =
+                    std::string("enabled=") + (enabled ? "true" : "false");
+                if (!result) {
+                    plugin_config_outcome("plugin_config.kill_switch.set", false, "PluginConfig",
+                                          target_id, ks_detail);
+                    const auto info = plugin_config_error_info(result.error());
+                    res.set_content(a4_error(info.code, info.message,
+                                             info.remediation ? std::string_view(info.remediation)
+                                                               : std::string_view{},
+                                             info.retry_after_ms),
+                                    "application/json");
+                    return;
+                }
+                plugin_config_outcome("plugin_config.kill_switch.set", true, "PluginConfig",
+                                      target_id, ks_detail);
+                JObj payload;
+                payload.add("plugin", result->plugin)
+                    .add("action", result->action)
+                    .add("enabled", result->enabled)
+                    .add("reason", result->reason)
+                    .add("set_by", result->set_by)
+                    .add("updated_at_ms", result->updated_at_ms);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "mint_upload_grant") {
+                if (!tier_allows(tier, "UploadGrant", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "UploadGrant", "Write"))
+                    return;
+                if (!upload_grant_store_ || !upload_grant_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "upload grant store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                UploadGrantMintParams params;
+                params.agent_id = param_str(args, "agent_id");
+                params.source_path = param_str(args, "source_path");
+                params.expected_sha256 = param_str(args, "expected_sha256");
+                params.retention_class = param_str(args, "retention_class");
+                params.minted_by = session->username;
+                params.declared_max_size = param_int(args, "declared_max_size");
+                if (args.contains("ttl_secs") && args["ttl_secs"].is_number_integer())
+                    params.requested_ttl_secs = args["ttl_secs"].get<std::int64_t>();
+                auto minted = upload_grant_store_->mint(params, now_epoch());
+                if (!minted) {
+                    (void)audit_fn(req, "upload_grant.mint", "failure", "UploadGrant",
+                                   params.agent_id, minted.error().message);
+                    const bool retryable = minted.error().kind == MintError::kUnavailable;
+                    res.set_content(a4_error(retryable ? kInternalError : kInvalidParams,
+                                             minted.error().message,
+                                             retryable
+                                                 ? std::string_view("retry once the server reports "
+                                                                    "ready")
+                                                 : std::string_view{},
+                                             retryable ? 2000 : -1),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "upload_grant.mint", "success", "UploadGrant",
+                                              minted->grant_id, "agent_id=" + params.agent_id);
+                JObj payload;
+                payload.add("grant_id", minted->grant_id)
+                    .add("grant_secret", minted->grant_secret)
+                    .add("expires_at", minted->expires_at)
+                    .add("destination_key", minted->destination_key);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "list_upload_grants") {
+                if (!tier_allows(tier, "UploadGrant", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "UploadGrant", "Read"))
+                    return;
+                if (!upload_grant_store_ || !upload_grant_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "upload grant store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                // ADR-0017 admit-then-filter list gate — SAME resolver
+                // server.cpp wires into the REST route's list_read_fn
+                // (set_upload_grant_ops), so the two can never disagree.
+                // Unset (test harness) fails closed.
+                const UploadGrantListAuthorization authz =
+                    upload_grant_list_read_fn_ ? upload_grant_list_read_fn_(session->username)
+                                               : UploadGrantListAuthorization{};
+                if (authz.decision == UploadGrantListDecision::kDenyAll) {
+                    mcp_audit("denied", "UploadGrant:Read (list)");
+                    res.set_content(a4_error(kPermissionDenied, "permission denied"),
+                                    "application/json");
+                    return;
+                }
+                // No client-selected agent_id filter — the frozen protocol
+                // forbids one on every path (file_retrieval_routes.cpp's
+                // list handler comment).
+                auto rows = upload_grant_store_->list_for_agent();
+                if (!rows) {
+                    res.set_content(a4_error(kInternalError, rows.error(),
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                JArr arr;
+                for (const auto& g : *rows) {
+                    if (authz.decision == UploadGrantListDecision::kAdmitScoped &&
+                        std::find(authz.visible_agents.begin(), authz.visible_agents.end(),
+                                 g.agent_id) == authz.visible_agents.end())
+                        continue;
+                    arr.add(JObj()
+                                .add("grant_id", g.grant_id)
+                                .add("agent_id", g.agent_id)
+                                .add("source_path", g.source_path)
+                                .add("declared_max_size", g.declared_max_size)
+                                .add("expected_sha256", g.expected_sha256)
+                                .add("retention_class", g.retention_class)
+                                .add("destination_key", g.destination_key)
+                                .add("state", g.state)
+                                .add("minted_by", g.minted_by)
+                                .add("created_at", g.created_at)
+                                .add("expires_at", g.expires_at));
+                }
+                JObj payload;
+                payload.raw("data", arr.str());
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "revoke_upload_grant") {
+                if (!tier_allows(tier, "UploadGrant", "Delete")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "UploadGrant", "Delete"))
+                    return;
+                if (!upload_grant_store_ || !upload_grant_store_->is_open()) {
+                    res.set_content(a4_error(kInternalError, "upload grant store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                const auto grant_id = param_str(args, "grant_id");
+                if (grant_id.empty() ||
+                    grant_id.find_first_not_of("0123456789abcdef") != std::string::npos) {
+                    res.set_content(a4_error(kInvalidParams, "grant_id must be lowercase hex"),
+                                    "application/json");
+                    return;
+                }
+                auto result = upload_grant_store_->revoke(grant_id);
+                if (!result) {
+                    (void)audit_fn(req, "upload_grant.revoke", "failure", "UploadGrant", grant_id,
+                                   result.error());
+                    res.set_content(a4_error(kInternalError, result.error(),
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/2000),
+                                    "application/json");
+                    return;
+                }
+                if (!*result) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "grant not found or not revocable"),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "upload_grant.revoke", "success", "UploadGrant", grant_id, "");
+                JObj payload;
+                payload.add("revoked", true);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
@@ -10834,7 +12029,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 StreamRevalidateFn revalidate_fn,
                                 std::size_t mcp_max_streams_per_principal,
                                 StreamPrincipalAuditFn principal_audit_fn,
-                                ExecVisibleFn exec_visible_fn) {
+                                CallerFn caller_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -10860,7 +12055,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                            sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
                            std::move(allowed_origins),
                            software_licensing_store, engine_principal_store, access_review_store,
-                           auth_db, directory_sync, std::move(exec_visible_fn),
+                           auth_db, directory_sync, std::move(caller_fn),
                            // 2f PR 3b: the streamed-POST arm leases from the SAME
                            // budget as the GET channel above (which COPIED these, so
                            // moving here is safe) - one arithmetic for every

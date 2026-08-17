@@ -740,6 +740,95 @@ int do_drivers(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ABI4 capability declarations (#2204). Windows reads WMI throughout — the
+// ADR-3002 context section names this plugin's WMI usage as an existing
+// rung-1 example ("Windows plugins live here (hardware/bitlocker/
+// license_scan via WMI)"). Linux reads sysfs/dmi/proc files natively (rung
+// 1) except "disks", which shells out to `lsblk` (ungoverned rung 3 — no
+// stable /sys enumeration of disk model/transport exists). macOS shells out
+// via popen() for every action except "drivers" (unsupported — no public
+// per-driver/kext enumeration API is used here) — an ungoverned rung-3 shell
+// exec per ADR-3002's "27 of 49 plugins ... sit at an ungoverned rung 3".
+// "memory" is CONSTRAINED on Linux/macOS: both return a value, but only the
+// aggregate total, not full per-DIMM detail, without additional privilege /
+// API surface.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "manufacturer",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "/sys/class/dmi/id/sys_vendor", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(sysctl -n hw.manufacturer)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_ComputerSystem.Manufacturer", nullptr},
+    },
+    {
+        /* .action      = */ "model",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "/sys/class/dmi/id/product_name", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(sysctl -n hw.model)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_ComputerSystem.Model", nullptr},
+    },
+    {
+        /* .action      = */ "bios",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "/sys/class/dmi/id/bios_vendor + bios_version + bios_date", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "popen(system_profiler SPHardwareDataType, grep 'Boot ROM', awk)", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_BIOS", nullptr},
+    },
+    {
+        /* .action      = */ "processors",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/cpuinfo", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(sysctl machdep.cpu.*, hw.*cpu*)", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_Processor", nullptr},
+    },
+    {
+        /* .action      = */ "memory",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "popen(dmidecode -t memory)",
+         "falls back to the aggregate MemTotal from /proc/meminfo (no per-DIMM detail) when "
+         "dmidecode is unavailable or unprivileged"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "popen(sysctl -n hw.memsize)",
+         "aggregate total only, no per-DIMM breakdown (macOS has no public per-DIMM API)"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_PhysicalMemory", nullptr},
+    },
+    {
+        /* .action      = */ "disks",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "popen(lsblk)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "popen(system_profiler SPStorageDataType SPNVMeDataType SPSerialATADataType -json)",
+         nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_DiskDrive", nullptr},
+    },
+    {
+        /* .action      = */ "drivers",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/modules", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_PnPSignedDriver", nullptr},
+    },
+    {
+        /* .action      = */ "system",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "/sys/class/dmi/id/product_serial + product_uuid", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "popen(ioreg -rd1 -c IOPlatformExpertDevice, awk)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "WMI Win32_BIOS.SerialNumber + Win32_ComputerSystemProduct.UUID", nullptr},
+    },
+};
+
 } // namespace
 
 class HardwarePlugin final : public yuzu::Plugin {
@@ -755,6 +844,14 @@ public:
         static const char* acts[] = {"manufacturer", "model",   "bios",   "processors", "memory",
                                      "disks",        "drivers", "system", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

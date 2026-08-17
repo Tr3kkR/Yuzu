@@ -39,6 +39,16 @@
 #include "kek_routes.hpp"
 #include "key_provider.hpp"
 #include "scim_routes.hpp"
+// PR1.5c/1.6c (p14): ADR-0031 operator surface — server wiring for p5's
+// plugin-config/secret/kill-switch store + REST routes and p6's upload-grant
+// store + REST routes. http_route_sink.hpp is the HttplibRouteSink adapter
+// their free-function registrars take (they do not expose an httplib::Server&
+// overload the way KekRoutes does).
+#include "http_route_sink.hpp"
+#include "plugin_config_routes.hpp"
+#include "plugin_config_store.hpp"
+#include "upload_grant_store.hpp"
+#include "file_retrieval_routes.hpp"
 #include <yuzu/server/scim_json.hpp> // D7 (#2407 hardening): scim::error() for the pre-routing body-cap 4xx
 #include "x509_ca.hpp"
 #include "compliance_eval.hpp"
@@ -98,10 +108,21 @@
 #include "scope_yaml.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_confined
 #include "dispatch_target_shape.hpp" // check_targeting_shape / targeting_supplied (#2500)
 #include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
 #include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
+#include "command_capability.hpp" // PR1.9c: CommandCapabilityRegistry — the dispatch classification vocabulary
+#include "command_capability_parsers.hpp" // PR1.9c: encode_dispatch_tag / compute_plan_hash
+// PR1.9c: the six capability spans build_classified_command's registry composes over — declared
+// by other packages (p1/p7/p10-p13), included (never authored) here at the composition site.
+#include "capability_decls/core_dispatch_capabilities.hpp"
+#include "capability_decls/plugin_action_catalogue_a.hpp"
+#include "capability_decls/plugin_action_catalogue_b.hpp"
+#include "capability_decls/plugin_action_catalogue_c.hpp"
+#include "capability_decls/plugin_action_catalogue_d.hpp"
+#include "capability_decls/plugin_action_catalogue_content_dist.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -129,6 +150,7 @@
 #include "preflight_runner.hpp"
 #include "tar_tree_routes.hpp"
 #include "policy_evaluator.hpp"
+#include "schedule_arming_check.hpp"
 #include "schedule_routes.hpp"
 #include "schedule_runner.hpp"
 #include "dashboard_routes.hpp"
@@ -1050,6 +1072,46 @@ public:
         metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                          {{"route", "dispatch_closure"},
                           {"reason", std::string(yuzu::server::kReasonClosureNoTarget)}});
+        // ── Dispatch chokepoint + gateway wire-capability denials ─────────
+        //
+        // These three series answer "did the gate run and refuse?" — a question
+        // that has no answer at all while the counter is created lazily inside
+        // its own denial branch. Absent-vs-zero is exactly the distinction that
+        // matters here: an unseeded gateway-capability counter reads identically
+        // whether the gateway is advertising the capability correctly or the
+        // check never executed because the arming message was silently dropped
+        // (CC-03 — the gateway's CONNECTED advertisement is a `gen_server:cast`
+        // that `yuzu_gw_upstream.erl` drops on an open circuit or a full notify
+        // queue, with no retry). Seeding them makes the blind state visible.
+        //
+        // Both label sets are closed: `reason` is every `DispatchDenialReason`
+        // enumerator, `capability` is the one wire capability the server gates
+        // on today.
+        metrics_.describe("yuzu_server_dispatch_denied_total",
+                          "Dispatches refused by the classification/authorization chokepoint "
+                          "(`build_classified_command`), labelled by which gate refused. "
+                          "`kill_switched` is an operator-thrown emergency stop, deliberately "
+                          "distinct from the `forbidden` authorization verdict.",
+                          "counter");
+        for (auto reason : {"unclassified", "ambiguous", "anonymous_operator", "forbidden",
+                            "kill_switched"}) {
+            metrics_.counter("yuzu_server_dispatch_denied_total", {{"reason", reason}});
+        }
+        metrics_.describe("yuzu_server_dispatch_tag_invalid_total",
+                          "ClassifiedCommands whose dispatch_tag failed to decode at the send "
+                          "path — a defensive check behind the type invariant, so any non-zero "
+                          "value is a server-side defect.",
+                          "counter");
+        metrics_.counter("yuzu_server_dispatch_tag_invalid_total");
+        metrics_.describe("yuzu_server_gateway_capability_denied_total",
+                          "Dispatches refused because the routing gateway has not advertised the "
+                          "named wire capability in its most recent CONNECTED notification. Zero "
+                          "means the check ran and passed; absent would mean it never ran.",
+                          "counter");
+        metrics_.counter(
+            "yuzu_server_gateway_capability_denied_total",
+            {{"capability", std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}});
+
         // #2437 transport-layer body rejection (pre-routing, pre-auth). No
         // `tool` label: the body is never read, so nothing is known about the
         // call beyond its path — a tool label here would be a fabrication.
@@ -3438,6 +3500,80 @@ public:
             }
         }
 
+        // PR1.5c/1.6c (p14) — PluginConfigStore + UploadGrantStore (ADR-0031
+        // operator surface: p5/p6 built the stores + routes; this package
+        // wires them). Same fail-CLOSED construction posture as every other
+        // born-on-PG store (ADR-0012 §1): a reachable database whose schema
+        // can't migrate/open is a deploy error, not a serve-degraded state.
+        //
+        // PluginConfigStore's SecretCodec (ADR-3005/ADR-0010 per-store
+        // model, mirrors AuthDB's construction sequence exactly, see the
+        // AuthDB block above): construct the codec first (ctor only), THEN
+        // PluginConfigStore's own constructor registers its ONE secret
+        // column (plugin_config_store.secrets.sealed_value) immediately
+        // after its schema migration, THEN SecretCodec::init() runs on a
+        // pinned lease so the just-registered column is validated. Reuses
+        // auth_key_provider_ (constructed above; guaranteed non-null
+        // whenever this guard is reached — if pg_pool_ were null or startup
+        // already failed, both guards would be false identically) rather
+        // than minting a second FileKeyProvider over the identical keys
+        // directory: the KEK material is genuinely install-wide (one KEK
+        // per database, ADR-0010 §2 / secret_codec.cpp), so one KeyProvider
+        // instance backing two independent SecretCodec instances is the
+        // correct shape, not a shortcut.
+        //
+        // ARBITER FLEET DIRECTIVE (p5 adjudication, #2568/#2580): this
+        // dedicated instance is also enrolled into the live KEK
+        // rotate/rewrap/status surface below (kek_ops_), alongside
+        // auth_secret_codec_ — see kek_enrolled_codecs(). Closes the
+        // residual gap p5 recorded in docs/adr/3005-plugin-config-store.md:
+        // a plugin secret no longer stays pinned to whatever KEK version was
+        // active when it was written once this package lands.
+        if (pg_pool_ && !startup_failed_) {
+            plugin_config_secret_codec_ = std::make_unique<pg::SecretCodec>(*auth_key_provider_);
+            plugin_config_store_ =
+                std::make_unique<PluginConfigStore>(*pg_pool_, *plugin_config_secret_codec_);
+            if (!plugin_config_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: plugin config store migration/open "
+                              "failed");
+                startup_failed_ = true;
+            } else {
+                // Substrate-level boot init (ADR-0010 §2) — MUST run before
+                // any encrypt/decrypt through plugin_config_secret_codec_.
+                // PluginConfigStore above is the only registrant on this
+                // codec instance; init() is where its column is verified.
+                auto lease = pg_pool_->acquire();
+                if (!lease) {
+                    spdlog::error("[PG] Refusing to start: could not acquire a connection to run "
+                                  "SecretCodec::init() for plugin_config_store ({})",
+                                  pg_pool_->last_error());
+                    startup_failed_ = true;
+                } else {
+                    auto init_res = plugin_config_secret_codec_->init(lease.get());
+                    lease.reset();
+                    if (!init_res) {
+                        spdlog::error(
+                            "[PG] Refusing to start: plugin_config_store SecretCodec::init() "
+                            "failed — {}: {}",
+                            pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        startup_failed_ = true;
+                    }
+                }
+            }
+        }
+
+        // UploadGrantStore (PR1.6a/c) — no secret codec of its own: grant
+        // and session credentials are stored as SHA-256 digests, never a
+        // sealed SecretCodec blob (upload_grant_store.hpp file header).
+        if (pg_pool_ && !startup_failed_) {
+            upload_grant_store_ = std::make_unique<UploadGrantStore>(*pg_pool_);
+            if (!upload_grant_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: upload grant store migration/open failed");
+                startup_failed_ = true;
+            }
+        }
+
         // Response store — born-on-SQLite, migrated to Postgres (ADR-0006/0008/0039,
         // schema `response_store`). Construction fail-CLOSED per ADR-0012 §1 (same
         // template as ResultSetStore/ScimStore above). NO backfill (ADR-0009
@@ -3512,17 +3648,22 @@ public:
                 const auto command_id =
                     "tar-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
-                detail::pb::CommandRequest cmd;
-                cmd.set_command_id(command_id);
-                cmd.set_plugin("tar");
-                cmd.set_action("fleet_snapshot");
+                // PR1.9c: the ONE builder, under an explicit system caller —
+                // `tar.fleet_snapshot` is `system_reserved` (never a
+                // caller-attributable RBAC decision, capdecls::
+                // core_dispatch_capabilities.hpp).
+                auto classified = build_classified_command(
+                    yuzu::server::DispatchCaller{.system = true}, "tar", "fleet_snapshot",
+                    command_id);
+                if (!classified)
+                    return out; // denied/unclassified — already counted + logged
 
                 agent_service_.record_send_time(command_id);
 
                 std::unordered_set<std::string> dispatched;
                 dispatched.reserve(agent_ids.size());
                 for (const auto& aid : agent_ids) {
-                    if (registry_.send_to(aid, cmd))
+                    if (registry_.send_to(aid, *classified))
                         dispatched.insert(aid);
                 }
                 forward_gateway_pending();
@@ -4071,16 +4212,17 @@ public:
                             return member;
                         },
                         /*full_sync=*/true, current);
-                    ::yuzu::agent::v1::CommandRequest cmd;
                     // Unique per re-push (random suffix) so a same-generation reconcile
                     // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
-                    cmd.set_command_id(
+                    const auto command_id =
                         "__guard__-reconcile-" + std::to_string(current) + "-" +
-                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
-                    cmd.set_plugin("__guard__");
-                    cmd.set_action("push_rules");
-                    cmd.set_payload(push.SerializeAsString());
-                    if (registry_.send_to(agent_id, cmd)) {
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
+                    // PR1.9c: system caller — __guard__.push_rules is
+                    // `system_reserved` (capdecls::core_dispatch_capabilities.hpp).
+                    auto classified = build_classified_command(
+                        yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
+                        command_id, /*parameters=*/{}, push.SerializeAsString());
+                    if (classified && registry_.send_to(agent_id, *classified)) {
                         forward_gateway_pending();
                         metrics_
                             .counter("yuzu_server_guardian_reconciles_total",
@@ -4499,9 +4641,43 @@ public:
             if (gateway_service_)
                 gateway_service_->set_mgmt_group_store(mgmt_group_store_.get());
         }
-        {
-            auto quar_db = cfg_.db_dir() / "quarantine.db";
-            quarantine_store_ = std::make_unique<QuarantineStore>(quar_db);
+        // Guardian device quarantine (Guardian design §11.7). Migrated
+        // Postgres store (ADR-0006/ADR-0047, schema `quarantine_store`) —
+        // construction fail-CLOSED per ADR-0012 §1: a reachable database
+        // whose schema can't migrate/open is a fatal startup error, never a
+        // serve-degraded state. `migrate_from_sqlite` runs the one-time,
+        // idempotent legacy-`quarantine.db` backfill (ADR-0009) — an active
+        // quarantine record is live security containment state, so backfill
+        // is MANDATORY and a failure is ALSO fatal (never serve on top of
+        // partially-migrated quarantine data).
+        if (pg_pool_ && !startup_failed_) {
+            quarantine_store_ = std::make_unique<QuarantineStore>(*pg_pool_);
+            if (!quarantine_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: quarantine store migration/open failed "
+                              "(database reachable but the quarantine_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                quarantine_store_->set_metrics(&metrics_);
+                auto quar_db = cfg_.db_dir() / "quarantine.db";
+                if (!quarantine_store_->migrate_from_sqlite(quar_db)) {
+                    spdlog::error(
+                        "[PG] Refusing to start: quarantine legacy-SQLite backfill failed — "
+                        "quarantine_store is AUTHORITATIVE and must not serve partially-"
+                        "migrated data. Operator remediation depends on the SPECIFIC reason "
+                        "logged above, not on this line alone: if it names a corrupt/truncated/"
+                        "unreadable {} or a fingerprint refusal BEFORE any insert happened, "
+                        "nothing has been migrated yet and moving it aside safely skips the "
+                        "backfill (its quarantine history, including any ACTIVE record, will "
+                        "NOT carry over — verify no device should currently be quarantined "
+                        "before doing this). If it instead names a row-insert or completion-"
+                        "marker problem, this replica's rows may ALREADY be durably inserted "
+                        "in Postgres — do NOT move the file aside without first checking "
+                        "quarantine_store.quarantine_records for the affected agent_id(s).",
+                        quar_db.string());
+                    startup_failed_ = true;
+                }
+            }
         }
         // Scope-walking result sets (capability §30). Migrated Postgres store
         // (ADR-0006/ADR-0036, schema `result_set_store`) — construction fail-CLOSED
@@ -7027,6 +7203,17 @@ public:
         // thread that leased it is already joined above; every HTTP/gRPC handler
         // holding the raw pointer is quiesced by the drains above.
         result_set_store_.reset();
+        // QuarantineStore (ADR-0047) borrows pg_pool_ — drop explicitly rather
+        // than relying solely on reverse-declaration-order destruction (gov
+        // Gate 3 cpp-safety): declaration order alone is a real guarantee for
+        // the EVENTUAL ~ServerImpl teardown, but stop() calls pg_pool_.reset()
+        // directly, WHILE quarantine_store_ is still alive holding a bound
+        // pg::PgPool& — a window where that reference is dangling if anything
+        // still reached it. Every HTTP/gRPC handler holding the raw pointer is
+        // quiesced by the drains above; this reset makes that safety
+        // structural rather than incidental on nothing calling in during the
+        // window.
+        quarantine_store_.reset();
         // ResponseStore (ADR-0039) borrows pg_pool_ — unwire the consumer that
         // holds the raw pointer (agent_service_'s Subscribe-stream ingest) before
         // dropping it, then drop before the pool. The maintenance thread that
@@ -7073,6 +7260,22 @@ public:
         if (auth_secret_codec_)
             auth_secret_codec_->set_audit_hook({});
         auth_secret_codec_.reset();
+        // PR1.5c/1.6c (p14) — plugin_config_store_ borrows
+        // plugin_config_secret_codec_, which borrows the SAME
+        // auth_key_provider_ auth_secret_codec_ above borrows — so both
+        // stores/codecs must be gone before auth_key_provider_.reset()
+        // below (docs/postgres-store-playbook.md:112 destruct-before-pool,
+        // applied transitively to the shared key provider too). No audit
+        // hook to clear: PluginConfigStore's SecretCodec is never wired to
+        // audit_store_ (its own audit trail runs through
+        // plugin_config_routes.cpp's rest_audit.hpp calls, not the codec's
+        // ADR-0010 audit hook).
+        plugin_config_store_.reset();
+        plugin_config_secret_codec_.reset();
+        // UploadGrantStore borrows pg_pool_ only (no codec) — drop before
+        // the pool. Every HTTP handler holding the raw pointer is quiesced
+        // by the drains above.
+        upload_grant_store_.reset();
         auth_key_provider_.reset();
         // AuditStore (ADR-0040) borrows pg_pool_ via its retention thread — that
         // thread is joined at stop_cleanup() above; drop the store before the
@@ -8044,13 +8247,244 @@ private:
         return yuzu::server::authz::compose_exec_visible(facts);
     }
 
+    /// PLAN-006: wraps `derive_exec_visible` with the caller's IDENTITY, so a
+    /// dispatch surface with a live Session can hand `dispatch_confined` a
+    /// principal to work with, not only a visibility filter. Pure plumbing —
+    /// composes `derive_exec_visible` verbatim and adds no new decision.
+    /// `principal_role` mirrors the `role` audited on scope-evaluation rows
+    /// (see `dispatch_confined`'s own `principal_role` param below).
+    yuzu::server::DispatchCaller derive_dispatch_caller(const auth::Session& sess) {
+        return yuzu::server::DispatchCaller{
+            .principal = sess.username,
+            .principal_role = auth::role_to_string(sess.role),
+            .exec_visible = derive_exec_visible(sess),
+            .system = false,
+        };
+    }
+
+    /// Review finding (external PR review, #3133): ScheduleRunner has no live
+    /// Session to derive a caller from at fire time — it only has the stored
+    /// creator username. This is the headless analogue of derive_dispatch_caller
+    /// (which mirrors derive_exec_visible verbatim), NOT a synthesized Session:
+    /// `elevated` is unconditionally false (JIT admin elevation is a
+    /// recent-authentication-event property, auth::is_elevated's own doc
+    /// comment — a background fire has no session to re-establish one) and
+    /// `service_scoped` never applies (no API token on a scheduled fire). What
+    /// DOES get re-resolved is exactly what a live re-check needs:
+    /// `check_permission`/`visible_agents_for_permission` are username-keyed
+    /// RBAC lookups, independent of any session, so this re-derives the
+    /// creator's CURRENT grants rather than trusting a stale creation-time
+    /// snapshot.
+    ///
+    /// EXISTENCE IS THE GATE (round-2 review HIGH): every other dispatch
+    /// surface gets "the account still exists" for free from authentication —
+    /// a deleted account cannot mint a Session. Here the username is a bare
+    /// stored string, so existence must be enforced explicitly, and it is the
+    /// one input whose failure must deny INDEPENDENT of RBAC mode: on the
+    /// RBAC-off default posture the permission callback admits everyone and
+    /// legacy-open visibility is unfiltered, so an unresolvable creator that
+    /// kept its bare username as `principal` would fire with full authority
+    /// forever (ADR-0033 §7: a departed scheduler's schedule STOPS). The
+    /// decision lives in `caller_for_stored_username` (dispatch_caller.hpp,
+    /// pure, directly tested): unresolvable — deleted/unknown user, an auth
+    /// store error, or no auth store at all — yields an EMPTY-principal,
+    /// deny-all caller, which `build_classified_command` refuses as
+    /// `AnonymousOperator` before any permission check runs.
+    yuzu::server::DispatchCaller derive_dispatch_caller_for_username(const std::string& username) {
+        bool principal_resolves = false;
+        std::string role_label;
+        if (auth_db_ && !username.empty()) {
+            if (auto user = auth_db_->get_user(username)) {
+                principal_resolves = true;
+                role_label = auth::role_to_string(user->role);
+            } else {
+                spdlog::warn("schedule fire: creator '{}' no longer resolves ({}); denying "
+                             "fail-closed rather than firing on a stale identity",
+                             username,
+                             user.error() == AuthDBError::UserNotFound ? "account deleted/unknown"
+                                                                       : "auth store error");
+            }
+        } else if (!username.empty()) {
+            spdlog::warn("schedule fire: no auth store wired to verify creator '{}' exists; "
+                         "denying fail-closed",
+                         username);
+        }
+        if (!principal_resolves)
+            return yuzu::server::caller_for_stored_username(username, false, {}, {});
+
+        yuzu::server::authz::ExecVisibleFacts facts;
+        facts.legacy_open = !rbac_enforcement_in_effect(rbac_store_.get());
+        facts.global_grant =
+            rbac_store_ && rbac_store_->check_permission(username, "Execution", "Execute");
+        if (rbac_store_) {
+            if (auto v = rbac_store_->visible_agents_for_permission(username, "Execution",
+                                                                     "Execute",
+                                                                     mgmt_group_store_.get()))
+                facts.scoped_visible = std::unordered_set<std::string>(v->begin(), v->end());
+            // else: store error -> scoped_visible stays nullopt -> fail closed.
+        }
+        return yuzu::server::caller_for_stored_username(
+            username, true, std::move(role_label),
+            yuzu::server::authz::compose_exec_visible(facts));
+    }
+
+    /// PR1.9c: a stable string label for `DispatchArm`, fed into
+    /// `build_classified_command`'s `target_arm` (→ `compute_plan_hash`) so
+    /// two dispatches of the same `plugin.action` differing only in HOW
+    /// targets were selected (an explicit id list vs. a scope match that
+    /// happens to resolve to the same set) mint distinct plan identities.
+    /// Local to this translation unit, not the wire — never parsed back,
+    /// only hashed, so the exact spelling is a private implementation detail.
+    static std::string_view dispatch_arm_label(DispatchArm arm) {
+        switch (arm) {
+        case DispatchArm::Group: return "group";
+        case DispatchArm::Scope: return "scope";
+        case DispatchArm::Ids: return "ids";
+        case DispatchArm::Broadcast: return "broadcast";
+        case DispatchArm::None: return "none";
+        }
+        return "none";
+    }
+
+    /// PR1.9c (spec item 1): the ONE place a `detail::pb::CommandRequest` is
+    /// constructed — every former direct-construction site now calls this
+    /// instead. Classifies `plugin.action` via `capability_registry_`,
+    /// authorizes the result against `caller` (via
+    /// `classify_and_authorize_dispatch`, agent_registry.hpp — the pure,
+    /// independently-unit-tested decision this method wraps with the one live
+    /// dependency it needs: `rbac_store_`), and — ONLY on success — stamps
+    /// `dispatch_tag` and mints the `ClassifiedCommand` that alone can reach
+    /// `AgentRegistry::send_to`/`send_to_all`.
+    ///
+    /// `target_arm`/`execution_id` feed `compute_plan_hash` (via
+    /// `detail::compute_dispatch_tag`) so two dispatches that differ only in
+    /// HOW targets were selected, or which execution they belong to, mint
+    /// distinct plan identities; callers with no such concept (the system
+    /// dispatchers, the legacy sink) pass `{}` for both. `payload`/
+    /// `stagger_seconds`/`delay_seconds` are optional CommandRequest fields
+    /// only some call sites need — set post-classification, since a
+    /// classification/authorization DENIAL must never construct any part of
+    /// the wire command.
+    ///
+    /// Denial is reported, never thrown: every caller — background loops with
+    /// no `res` to answer on included — must handle
+    /// `std::unexpected` explicitly. Every denial is counted (one family,
+    /// `reason` label) and logged; no path returns a permissive default
+    /// (ADR-0033 §2).
+    std::expected<detail::ClassifiedCommand, detail::DispatchDenial> build_classified_command(
+        const yuzu::server::DispatchCaller& caller, const std::string& plugin,
+        const std::string& action, const std::string& command_id,
+        const std::unordered_map<std::string, std::string>& parameters = {},
+        const std::string& payload = {}, int stagger_seconds = 0, int delay_seconds = 0,
+        const std::string& target_arm = {}, const std::string& execution_id = {}) {
+        auto decision = yuzu::server::detail::classify_and_authorize_dispatch(
+            capability_registry_, caller, plugin, action,
+            [this](std::string_view principal, std::string_view securable,
+                   yuzu::server::authz::Operation op) {
+                // Mirrors every other dispatch-adjacent RBAC read in this file
+                // (e.g. derive_exec_visible's own `legacy_open` composition):
+                // a loaded-and-explicitly-disabled store is legacy-open, and
+                // legacy-open means "RBAC off, everyone may do everything" —
+                // the SAME bypass every other securable already grants here,
+                // not a new one minted for this chokepoint.
+                if (!rbac_enforcement_in_effect(rbac_store_.get()))
+                    return true;
+                return rbac_store_ != nullptr &&
+                       rbac_store_->check_permission(std::string(principal),
+                                                     std::string(securable),
+                                                     std::string(yuzu::server::authz::to_string(op)));
+            });
+
+        if (!decision) {
+            const auto& denial = decision.error();
+            std::string_view reason_label;
+            switch (denial.reason) {
+            case yuzu::server::detail::DispatchDenialReason::Unclassified:
+                reason_label = "unclassified";
+                break;
+            case yuzu::server::detail::DispatchDenialReason::Ambiguous:
+                reason_label = "ambiguous";
+                break;
+            case yuzu::server::detail::DispatchDenialReason::AnonymousOperator:
+                reason_label = "anonymous_operator";
+                break;
+            case yuzu::server::detail::DispatchDenialReason::Forbidden:
+                reason_label = "forbidden";
+                break;
+            case yuzu::server::detail::DispatchDenialReason::KillSwitched:
+                reason_label = "kill_switched";
+                break;
+            }
+            metrics_
+                .counter("yuzu_server_dispatch_denied_total",
+                         {{"reason", std::string(reason_label)}})
+                .increment();
+            spdlog::warn(
+                "dispatch denied: {}:{} reason={} securable={} caller={}", plugin, action,
+                reason_label, denial.securable.empty() ? "(none)" : denial.securable,
+                caller.system ? std::string("system")
+                             : (caller.principal.empty() ? std::string("(anonymous)")
+                                                          : caller.principal));
+            return std::unexpected(denial);
+        }
+
+        const auto& cap = *decision;
+
+        // PER-ACTION KILL SWITCH + BR-009 canonical wire names (branch review /
+        // adversarial HIGH + MEDIUM). Until the kill-switch wiring landed,
+        // `PluginConfigStore::action_allowed` had ZERO production callers while
+        // `/api/v1/plugin-config/{plugin}/kill-switch` told the operator it was
+        // "a reliable emergency stop" — an operator could throw the switch
+        // mid-incident, get a 200, and watch the action keep running. Both
+        // behaviours are composed by `finalize_classified_command`
+        // (agent_registry.hpp) rather than inlined here, so the composition
+        // itself — not just its two pieces in isolation — is directly
+        // unit-testable without a live `ServerImpl`/`PluginConfigStore` (M6,
+        // wave1 remediation: this composition previously had no discriminating
+        // test and was a silent revert target).
+        //
+        // Placed AFTER classification+authorization deliberately: an unclassified
+        // or forbidden dispatch should report that, not be masked by a kill
+        // switch, and the switch is keyed on a plugin.action we have confirmed
+        // exists. `action_allowed` is fail-closed by contract — a closed store, a
+        // lease timeout or a query failure all return false — so a degraded
+        // config store disables the action rather than silently permitting it
+        // (ADR-0036). It is checked on EVERY dispatch and never memoized: an
+        // emergency stop that takes effect on the next cache expiry is not one.
+        auto finalized = yuzu::server::detail::finalize_classified_command(
+            cap,
+            plugin_config_store_ != nullptr
+                ? std::function<bool(std::string_view, std::string_view)>(
+                      [this](std::string_view p, std::string_view a) {
+                          return plugin_config_store_->action_allowed(p, a);
+                      })
+                : std::function<bool(std::string_view, std::string_view)>{},
+            plugin, action, command_id, parameters, payload, stagger_seconds, delay_seconds,
+            target_arm, execution_id);
+
+        if (!finalized) {
+            // The only denial `finalize_classified_command` can produce is
+            // KillSwitched — classification/authorization already succeeded
+            // above.
+            metrics_.counter("yuzu_server_dispatch_denied_total", {{"reason", "kill_switched"}})
+                .increment();
+            spdlog::warn("dispatch denied: {}:{} reason=kill_switched caller={}", plugin, action,
+                         caller.system ? std::string("system")
+                                       : (caller.principal.empty() ? std::string("(anonymous)")
+                                                                   : caller.principal));
+            return std::unexpected(finalized.error());
+        }
+
+        return *finalized;
+    }
+
     /// A-3: the `ConfinedDispatchSink` literal both `dispatch_confined` and
     /// `/api/command` built by hand — byte-identical apart from the local
     /// name (`sink` vs `confined_sink`) — is the same sink because the two
     /// callers dispatch through the SAME registry_. `cmd` is captured by
     /// reference: the returned sink must not outlive it.
     yuzu::server::ConfinedDispatchSink
-    make_confined_dispatch_sink(const detail::pb::CommandRequest& cmd) {
+    make_confined_dispatch_sink(const detail::ClassifiedCommand& cmd) {
         return yuzu::server::ConfinedDispatchSink{
             [this, &cmd](const std::string& aid) { return registry_.send_to(aid, cmd); },
             [this, &cmd] { return registry_.send_to_all(cmd); },
@@ -8080,31 +8514,42 @@ private:
     /// empty selection into a deliberate fleet broadcast (dashboard + MCP —
     /// `true`). This is the seam #1714/#1715's core chokepoint will EXTEND, not
     /// a per-route copy to be forked.
-    /// `principal_role` (C5): carried alongside `principal` on the
-    /// scope-evaluation audit rows this seam emits. Defaulted so the four
-    /// existing callers (all wired through Deps/DispatchFn shapes owned by
-    /// other files — dashboard_routes.hpp, mcp_server.hpp, PolicyEvaluator —
-    /// this wave does not touch) keep compiling unchanged and keep emitting
-    /// role="" exactly as before; a caller updated in a later wave to thread
-    /// its live session's role through can now do so without a second seam.
+    /// `caller.principal_role` (C5): carried alongside `caller.principal` on
+    /// the scope-evaluation audit rows this seam emits.
     ///
-    /// CDX-P1-03/K-3 (adv-fix11): attempted widening McpServer::DispatchFn by
-    /// one param for exactly this — the session is already in scope at both
-    /// MCP call sites (execute_instruction, quarantine_device) via
-    /// ExecVisibleFn. Reverted: the typedef is reused verbatim by 18+ fake
-    /// DispatchFn lambdas in test_mcp_server.cpp alone (each would need
-    /// updating for a signature-only change), plus BundleOrchestrator::
-    /// DispatchFn (execute_bundle) is a SEPARATE, REST-shared typedef with no
-    /// role concept on its REST side — disproportionate blast radius for an
+    /// PLAN-006 (verified; supersedes CDX-P1-03/K-3 below): the calculus that
+    /// declined this widening no longer holds once a principal is the actual
+    /// FEATURE a chokepoint wave needs, not merely audit completeness. The
+    /// widening happened: `DispatchCaller` (dispatch_caller.hpp) replaces the
+    /// bare `exec_visible`/`principal_role` pair on this signature AND on the
+    /// three DispatchFn/CommandDispatchFn typedefs that feed it
+    /// (McpServer::DispatchFn, DashboardRoutes::DispatchFn,
+    /// WorkflowRoutes::CommandDispatchFn); every fake dispatch lambda in
+    /// test_mcp_server.cpp / test_dashboard_tar_fragments.cpp /
+    /// test_workflow_routes.cpp was updated for the signature-only change.
+    /// `BundleOrchestrator::DispatchFn` (execute_bundle) is left as the
+    /// original CDX-P1-03/K-3 comment found it — a SEPARATE, REST-shared
+    /// typedef with no role concept on its REST side; mcp_server.cpp now
+    /// adapts the widened DispatchFn down to it at construction rather than
+    /// touch that shared type. `principal`/`principal_role` are empty for a
+    /// caller not yet wired to identify itself (present-empty `exec_visible`
+    /// still denies); `DispatchCaller::system` marks a genuine
+    /// background/system dispatcher (no Session at all) explicitly.
+    ///
+    /// Original CDX-P1-03/K-3 (adv-fix11) rationale, preserved for context: a
+    /// prior wave attempted widening McpServer::DispatchFn by one param for
+    /// exactly this — the session is already in scope at both MCP call sites
+    /// (execute_instruction, quarantine_device) via ExecVisibleFn — and
+    /// reverted, judging the blast radius (18+ fake DispatchFn lambdas plus
+    /// the BundleOrchestrator coupling above) disproportionate for an
     /// audit-completeness LOW both external reviewers graded non-blocking.
-    /// Still open for a future wave willing to touch those call sites.
     std::pair<std::string, int> dispatch_confined(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id,
-        const yuzu::server::authz::VisibleSet& exec_visible,
-        bool broadcast_on_none, const std::string& principal_role = {}) {
+        const yuzu::server::DispatchCaller& caller,
+        bool broadcast_on_none) {
         // Normalize action to lowercase — agent plugins register actions in
         // lowercase and match case-sensitively (was implicit on the MCP path
         // via upstream lowercasing; a safe superset here).
@@ -8115,26 +8560,35 @@ private:
         auto command_id =
             plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
-        detail::pb::CommandRequest cmd;
-        cmd.set_command_id(command_id);
-        cmd.set_plugin(plugin);
-        cmd.set_action(norm_action);
-        for (const auto& [k, v] : parameters)
-            (*cmd.mutable_parameters())[k] = v;
+        // Same classifier as the /api/command handler (#2500): an explicit
+        // agent_ids list ALWAYS wins over a broadcast request; `__all__` is
+        // treated as "no scope expression", never a first-wins broadcast.
+        // Computed here (in addition to inside resolve_and_dispatch_confined,
+        // which is pure and cheap to call twice) for TWO reasons now: the
+        // None-arm observability below (specific to this seam, not something
+        // dispatch_confined_arms itself emits), AND — PR1.9c — to feed
+        // build_classified_command's plan-hash `target_arm` below.
+        const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+
+        // PR1.9c (spec item 1): the ONE builder. Classification/authorization
+        // gates BEFORE any targeting decision — a denial (unclassified,
+        // ambiguous, or `caller` not authorized for the resolved
+        // securable/operation) reaches nobody, exactly like the None-arm
+        // no-target case below. Already counted + logged by
+        // build_classified_command; nothing further to do here on refusal.
+        auto classified =
+            build_classified_command(caller, plugin, norm_action, command_id, parameters,
+                                     /*payload=*/{}, /*stagger_seconds=*/0, /*delay_seconds=*/0,
+                                     std::string(dispatch_arm_label(arm)), execution_id);
+        if (!classified)
+            return {command_id, 0};
+
         agent_service_.record_send_time(command_id);
         // PR 2 / UP2-4: register command_id -> execution_id BEFORE any RPC.
         if (!execution_id.empty()) {
             agent_service_.record_execution_id(command_id, execution_id);
         }
 
-        // Same classifier as the /api/command handler (#2500): an explicit
-        // agent_ids list ALWAYS wins over a broadcast request; `__all__` is
-        // treated as "no scope expression", never a first-wins broadcast.
-        // Computed here (in addition to inside resolve_and_dispatch_confined,
-        // which is pure and cheap to call twice) ONLY to decide the
-        // None-arm observability below, which is specific to this seam and
-        // not something dispatch_confined_arms itself emits.
-        const auto arm = classify_dispatch_arm(!agent_ids.empty(), scope_expr);
         if (arm == DispatchArm::None && !broadcast_on_none) {
             // Shared closure: NO TARGET NAMED AT ALL — reach NOBODY, not
             // everybody (#2500). COUNTED, not just logged: this branch is
@@ -8174,8 +8628,8 @@ private:
                    const std::string& cmd_id, const std::string& reason) {
                 audit_scope_evaluation_aborted(principal, role, cmd_id, reason);
             },
-            command_id, execution_id, principal_role, agent_ids, scope_expr, exec_visible,
-            broadcast_on_none, cmd);
+            command_id, execution_id, caller.principal_role, agent_ids, scope_expr,
+            caller.exec_visible, broadcast_on_none, *classified);
         (void)ignored_command_id; // always == command_id, minted above
 
         forward_gateway_pending();
@@ -8347,22 +8801,22 @@ private:
             return;
 
         // Build the sync command with all 4 structured category values
-        ::yuzu::agent::v1::CommandRequest cmd;
-        cmd.set_command_id("asset-tag-sync-" +
-                           std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                              std::chrono::system_clock::now().time_since_epoch())
-                                              .count()));
-        cmd.set_plugin("asset_tags");
-        cmd.set_action("sync");
-
-        auto* params = cmd.mutable_parameters();
+        std::unordered_map<std::string, std::string> parameters;
         for (auto cat_key : kCategoryKeys) {
             std::string key_str{cat_key};
-            auto val = tag_store_->get_tag(agent_id, key_str);
-            (*params)[key_str] = val;
+            parameters[key_str] = tag_store_->get_tag(agent_id, key_str);
         }
 
-        if (registry_.send_to(agent_id, cmd)) {
+        const auto command_id =
+            "asset-tag-sync-" +
+            std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::system_clock::now().time_since_epoch())
+                               .count());
+        // PR1.9c: system caller — asset_tags.sync is `system_reserved`
+        // (capdecls::core_dispatch_capabilities.hpp).
+        auto classified = build_classified_command(yuzu::server::DispatchCaller{.system = true},
+                                                    "asset_tags", "sync", command_id, parameters);
+        if (classified && registry_.send_to(agent_id, *classified)) {
             spdlog::debug("Pushed asset tag sync to agent {}", agent_id);
             forward_gateway_pending();
         }
@@ -9819,11 +10273,23 @@ private:
             // readyz/healthz wiring; construction is already fail-closed, this
             // is belt-and-braces against a runtime is_open() flip.
             bool deployment_ok = deployment_store_ && deployment_store_->is_open();
+            // QuarantineStore (ADR-0047) — wired into /readyz; adding here
+            // too so this store never joins the readyz-vs-healthz drift
+            // class the rows above were added to fix.
+            bool quarantine_ok = quarantine_store_ && quarantine_store_->is_open();
             // NotificationStore (ADR-0046) — born-on-PG (as of this migration),
             // same readyz-vs-healthz drift class the rows above document; wire
             // it into both from the start rather than shipping the gap and
             // fixing it in a later governance round (Gate 3 sre, Pattern E).
             bool notification_ok = notification_store_ && notification_store_->is_open();
+            // UploadGrantStore (ADR-3004, PR1.6a) — review finding (#3135):
+            // constructed fail-closed at boot (server.cpp startup_failed_ flip
+            // if migration/open fails) but was absent from both /healthz and
+            // /readyz, the same readyz-vs-healthz drift class the rows above
+            // document. Startup fail-closed limits the immediate blast radius,
+            // but if is_open() ever flips false post-startup, /api/v1/upload-
+            // grants* would 503 while both probes still reported healthy.
+            bool upload_grant_ok = upload_grant_store_ && upload_grant_store_->is_open();
 
             // Determine overall status
             bool all_stores_ok =
@@ -9832,7 +10298,7 @@ private:
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
-                deployment_ok && notification_ok;
+                deployment_ok && quarantine_ok && notification_ok && upload_grant_ok;
             std::string status = all_stores_ok ? "healthy" : "degraded";
 
             nlohmann::json health = {
@@ -9861,7 +10327,9 @@ private:
                   {"management_group_store", mgmt_group_ok ? "ok" : "error"},
                   {"discovery_store", discovery_ok ? "ok" : "error"},
                   {"deployment_store", deployment_ok ? "ok" : "error"},
-                  {"notification_store", notification_ok ? "ok" : "error"}}},
+                  {"quarantine_store", quarantine_ok ? "ok" : "error"},
+                  {"notification_store", notification_ok ? "ok" : "error"},
+                  {"upload_grant_store", upload_grant_ok ? "ok" : "error"}}},
                 // #401: was hardcoded "0.1.0" — now derived from the
                 // meson-generated yuzu/version.hpp so the health endpoint
                 // tracks the actual build instead of a stale literal.
@@ -10116,6 +10584,15 @@ private:
                 // serves), so this is belt-and-braces against a runtime
                 // is_open() flip, matching result_set_store's equivalent row.
                 {"discovery_store", discovery_store_ && discovery_store_->is_open()},
+                // Wave 2 migrated Postgres store (ADR-0006/0009/0047, schema
+                // `quarantine_store`). AUTHORITATIVE per ADR-0012 §1 — an
+                // active quarantine record is live security containment
+                // state. Construction fail-closed already makes a not-open
+                // state unreachable in production (startup_failed_ stops
+                // the server before it serves), so this is belt-and-braces
+                // against a runtime is_open() flip, matching
+                // discovery_store's equivalent row.
+                {"quarantine_store", quarantine_store_ && quarantine_store_->is_open()},
                 // ADR-0046 born-on-PG (as of this migration) store — same
                 // rationale as the other rows above: fail-closed at boot, but
                 // a not-open post-boot state would leave the notification
@@ -10123,6 +10600,13 @@ private:
                 // Pattern E).
                 {"notification_store",
                  notification_store_ && notification_store_->is_open()},
+                // ADR-3004 (PR1.6a) — review finding (#3135): same
+                // readyz-vs-healthz drift class as the rows above.
+                // Fail-closed at boot, but a not-open post-boot state would
+                // leave /api/v1/upload-grants* silently 503ing while
+                // /readyz still reported "ready".
+                {"upload_grant_store",
+                 upload_grant_store_ && upload_grant_store_->is_open()},
             };
 
             std::string failed_list;
@@ -11286,6 +11770,19 @@ private:
             }
             const bool named_target = yuzu::server::targeting_supplied(body);
 
+            // Resolved ONCE for the whole handler (was resolved a second time,
+            // redundantly, inside the destructive-action block below, and a
+            // third time implicitly via derive_exec_visible's need for a
+            // Session — PR1.9c consolidates to the one call every other path
+            // in this file already treats as the rule: "require_auth writes an
+            // error response on failure, so calling it twice could emit two"
+            // (forward_legacy_command's own comment, same file). Placed AFTER
+            // require_permission(Execution,Execute) so a bare-unauthenticated
+            // caller was already turned away by that coarser gate first.
+            auto sess = require_auth(req, res);
+            if (!sess)
+                return; // require_auth already wrote the response
+
             // Per-action securable elevation + scope confinement for DESTRUCTIVE
             // generic-dispatch actions (governance HIGH #2). /api/command otherwise
             // base-gates only Execution:Execute and applies NO per-device visibility to
@@ -11299,18 +11796,24 @@ private:
             // purge via /api/command audits under the generic `command.dispatch` verb +
             // yuzu_commands_dispatched_total, not tar.source.purge / the domain metric —
             // domain-verb emission on this path is tracked in Tr3kkR/Yuzu#1787.)
+            //
+            // PR1.9c (spec item 4): PRESERVES this behaviour exactly for
+            // `tar.purge_source` — same securable (`Infrastructure`), same
+            // operation (`Delete`), same 400/404 shapes, same visible-agents
+            // confinement — but sources the securable/operation from
+            // `capability_registry_` instead of a hand-maintained one-row map,
+            // so it generalizes automatically to every OTHER row the registry
+            // classifies `Destructive` (e.g. `filesystem.delete_lines`,
+            // `registry.delete_key`) rather than silently exempting them from
+            // the same targeting-safety treatment `tar.purge_source` alone used
+            // to get.
             {
-                static const std::unordered_map<std::string,
-                                                std::pair<std::string, std::string>>
-                    kDestructiveActionSecurable = {
-                        {"tar.purge_source", {"Infrastructure", "Delete"}},
-                    };
-                std::string dkey = plugin + "." + action;
-                std::transform(dkey.begin(), dkey.end(), dkey.begin(),
-                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (auto it = kDestructiveActionSecurable.find(dkey);
-                    it != kDestructiveActionSecurable.end()) {
-                    if (!require_permission(req, res, it->second.first, it->second.second))
+                const auto classified_for_gate = capability_registry_.classify(plugin, action);
+                if (classified_for_gate &&
+                    classified_for_gate->dispatch_class == yuzu::server::DispatchClass::Destructive) {
+                    const auto& cap = *classified_for_gate;
+                    if (!require_permission(req, res, std::string(cap.securable),
+                                            std::string(yuzu::server::authz::to_string(cap.operation))))
                         return;
                     // Destructive dispatch must be explicitly targeted + in scope.
                     if (agent_ids.empty() || !extract_json_string(body, "scope").empty()) {
@@ -11325,10 +11828,8 @@ private:
                     // dashboard fragment). Out-of-scope ids are silently dropped.
                     std::vector<std::string> filtered;
                     if (mgmt_group_store_) {
-                        auto s = require_auth(req, res);
-                        if (!s) return;
                         // ADR-0042: nullopt (store degraded) → empty visible set → 404.
-                        auto vis = mgmt_group_store_->get_visible_agents(s->username);
+                        auto vis = mgmt_group_store_->get_visible_agents(sess->username);
                         std::unordered_set<std::string> visible;
                         if (vis)
                             visible.insert(vis->begin(), vis->end());
@@ -11372,11 +11873,11 @@ private:
             // emptied out below. Fail-closed: any store error narrows to
             // "nothing visible", never "everything" — never re-decides the
             // frozen #1715/INV-7 precedence those RbacStore calls already
-            // resolve, only composes on top of it.
-            auto sess = require_auth(req, res);
-            if (!sess)
-                return; // require_auth already wrote the response
-
+            // resolve, only composes on top of it. `sess` was already
+            // resolved once, above the destructive-action block (PR1.9c
+            // consolidation) — re-authenticating here would risk a second
+            // written response on failure for no benefit.
+            //
             // D3: the no-agent 503 short-circuit sits BEFORE deriving
             // exec_visible — that derivation runs an RBAC/tag-store lookup
             // that is wasted work on the (common, cheap-to-detect) no-agent
@@ -11389,39 +11890,74 @@ private:
                 return;
             }
 
-            yuzu::server::authz::VisibleSet exec_visible = derive_exec_visible(*sess);
+            // PLAN-006: the caller's IDENTITY, not merely their visibility
+            // filter — `caller.exec_visible` is byte-identical to the
+            // `exec_visible` this handler derived directly before PR1.9c
+            // (`derive_dispatch_caller` composes `derive_exec_visible`
+            // verbatim), kept as a reference alias so every arm-dispatch use
+            // of `exec_visible` below is unchanged.
+            const auto caller = derive_dispatch_caller(*sess);
+            const auto& exec_visible = caller.exec_visible;
 
             auto command_id =
                 plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
-            detail::pb::CommandRequest cmd;
-            cmd.set_command_id(command_id);
-            cmd.set_plugin(plugin);
-            cmd.set_action(action);
+            // Parameters: pass-through key-value pairs to the agent plugin.
+            auto parameters = extract_json_string_map(body, "params");
 
-            // Parameters: pass-through key-value pairs to the agent plugin
-            {
-                auto params_map = extract_json_string_map(body, "params");
-                for (const auto& [k, v] : params_map) {
-                    (*cmd.mutable_parameters())[k] = v;
-                }
-            }
-
-            // Stagger/delay: prevent thundering herd on large-fleet dispatch
+            // Stagger/delay: prevent thundering herd on large-fleet dispatch.
             auto stagger = extract_json_int(body, "stagger", 0);
             auto delay = extract_json_int(body, "delay", 0);
-            if (stagger > 0)
-                cmd.set_stagger_seconds(stagger);
-            if (delay > 0)
-                cmd.set_delay_seconds(delay);
-
-            agent_service_.record_send_time(command_id);
 
             // Check for scope-based targeting. Reuses the parsed body like the
             // other post-auth reads; this site was missed when the rest were
             // converted and re-parsed the whole body to read a key the handler
-            // already had (governance).
+            // already had (governance). Computed here (moved up from just
+            // before the arm dispatch below) because PR1.9c's builder needs
+            // `arm` for its plan-hash `target_arm` before any dispatch
+            // decision is made.
             auto scope_expr = extract_json_string(body, "scope");
+            const auto arm = yuzu::server::classify_dispatch_arm(!agent_ids.empty(), scope_expr);
+
+            // PR1.9c (spec item 1): the ONE builder — the only place a
+            // `detail::pb::CommandRequest` is constructed. A denial (unknown/
+            // ambiguous plugin.action, or `caller` not authorized for the
+            // resolved securable/operation) is answered here — unlike the
+            // background dispatch seams, this route has a `res` to write to.
+            // Already counted (`yuzu_server_dispatch_denied_total{reason=}`)
+            // and logged by build_classified_command; this block only shapes
+            // the HTTP response and the route-local audit row.
+            auto classified = build_classified_command(
+                caller, plugin, action, command_id, parameters, /*payload=*/{}, stagger, delay,
+                std::string(dispatch_arm_label(arm)), /*execution_id=*/{});
+            if (!classified) {
+                const auto& denial = classified.error();
+                const bool is_classification_error =
+                    denial.reason == yuzu::server::detail::DispatchDenialReason::Unclassified ||
+                    denial.reason == yuzu::server::detail::DispatchDenialReason::Ambiguous;
+                const int status = is_classification_error ? 400 : 403;
+                const std::string message =
+                    is_classification_error
+                        ? std::string{"unknown or ambiguous plugin.action"}
+                        : "permission denied: " + denial.securable + ":" +
+                              std::string(yuzu::server::authz::to_string(denial.operation));
+                const bool audit_ok =
+                    audit_log(req, "command.dispatch", "denied", "command", "",
+                             std::string("reason=dispatch_denied ") +
+                                 onbehalf::sanitize_for_log(plugin, 128) + ":" +
+                                 onbehalf::sanitize_for_log(action, 128));
+                if (!audit_ok)
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = status;
+                nlohmann::json err{{"error", {{"code", status}, {"message", message}}},
+                                   {"meta", {{"api_version", "v1"}}}};
+                if (audit_store_)
+                    err["audit_emitted"] = audit_ok;
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+
+            agent_service_.record_send_time(command_id);
 
             int sent = 0;
             // `__all__` is the PUBLISHED ground scope kind (/discover/scope-kinds,
@@ -11439,14 +11975,13 @@ private:
             // shaping — which is why it is not simply absorbed by that seam —
             // but the DECISION OF WHO IS REACHED is the shared one, so the two
             // can no longer drift.
-            const auto confined_sink = make_confined_dispatch_sink(cmd);
+            const auto confined_sink = make_confined_dispatch_sink(*classified);
             const auto dispatch_broadcast = [&]() -> int {
                 return yuzu::server::dispatch_confined_arms(
                     yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
                     /*broadcast_on_none=*/true, confined_sink);
             };
 
-            const auto arm = yuzu::server::classify_dispatch_arm(!agent_ids.empty(), scope_expr);
             if (arm == yuzu::server::DispatchArm::Group) {
                 // Group-based dispatch — resolve group members here, then let the
                 // shared seam intersect (#1788): a management group is a targeting
@@ -13371,6 +13906,14 @@ private:
                                                   httplib::Response& res) {
             if (!require_permission(req, res, "Schedule", "Read"))
                 return;
+            // guardian-confinement-2298 hardening sweep: ITServiceOwner grants
+            // full CRUD on Schedule, and query_schedules has no owner/service
+            // filter at all — a bare Schedule:Read gate lets a service-scoped
+            // token enumerate every schedule from every other service. No
+            // single schedule to confine per-target, so this is a blanket
+            // deny, same shape as the fleet-wide dashboard fragment twin.
+            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.list", ""))
+                return;
             if (!schedule_engine_) {
                 res.status = 503;
                 res.set_content(
@@ -13421,6 +13964,14 @@ private:
             }
 
             auto id = req.matches[1].str();
+            // Interim deny (schedule_routes.hpp): delete_schedule is
+            // username-owner-scoped below, and a service-scoped token shares
+            // its creating principal's username (ApiToken::principal_id) —
+            // without this it could delete a fleet-wide schedule its own
+            // principal created interactively.
+            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id,
+                                             "Schedule:Delete"))
+                return;
             // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
             // deletes only schedules the caller created, not the whole
             // fleet's. auth_routes_->resolve_session, not require_permission's
@@ -13450,8 +14001,12 @@ private:
             }
 
             auto id = req.matches[1].str();
-            auto enabled_str = extract_json_string(req.body, "enabled");
-            bool enabled = (enabled_str != "false");
+            // guardian-confinement-2298: parse_schedule_enabled (schedule_routes.hpp)
+            // — extract_json_string only matches a JSON *string*, so a real
+            // JSON boolean {"enabled":false} used to silently fall through
+            // to the "absent" default (true), inverting the request and
+            // defeating the disable-always-reachable kill switch (H-01).
+            bool enabled = parse_schedule_enabled(req.body);
             // H-01 (#1806): re-enabling arms the schedule to fire unattended
             // through ScheduleRunner — the same fleet-wide-dispatch concern
             // as create, so it needs the same Execution:Execute gate.
@@ -13459,6 +14014,15 @@ private:
             // Schedule:Write alone — an operator must be able to kill a
             // runaway schedule even without Execution:Execute.
             if (enabled && !require_permission(req, res, "Execution", "Execute"))
+                return;
+            // Interim deny (schedule_routes.hpp), enable(true) only — a
+            // re-enabled schedule arms unattended fleet-wide dispatch through
+            // ScheduleRunner, the same concern as create. Disabling stays
+            // reachable: it only ever stops a schedule, never arms one, so a
+            // service-scoped token keeps its kill-switch (H-01's own
+            // rationale for gating disable on Schedule:Write alone).
+            if (enabled && deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.enable",
+                                                        id, "Schedule:Write"))
                 return;
 
             // M-01 (#1806): owner-scoped enable/disable, same as delete above.
@@ -14032,6 +14596,14 @@ private:
                 auto session = require_auth(req, res);
                 if (!session)
                     return;
+                // Gate on Approval:Read, mirroring the REST sibling GET /api/approvals
+                // (#3040): this fragment renders the full approvals population
+                // (submitted_by / status / scope_expression) and must not disclose it
+                // to any authenticated session, only to Approval:Read holders (seeded
+                // to Viewer). Approvals are workflow rows, not per-agent fleet data, so
+                // a bare require_permission is correct here (not authorize_list_read).
+                if (!require_permission(req, res, "Approval", "Read"))
+                    return;
                 if (!approval_manager_) {
                     res.set_content("<div class=\"empty-state\">Not available</div>", "text/html");
                     return;
@@ -14304,37 +14876,59 @@ private:
         };
 
         // Shared command-dispatch closure — sends a CommandRequest to agents via
-        // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so the
-        // PolicyEvaluator and WorkflowRoutes drive the EXACT same dispatch path.
+        // gRPC. Hoisted here (was inline in the WorkflowRoutes block) so every
+        // background consumer drives the EXACT same dispatch path.
+        //
+        // PLAN-006 (caller list corrected per #3133 round-2 review — it used to
+        // claim PolicyEvaluator was the only caller): the production consumers
+        // are PolicyEvaluator (compliance-check tick), PreflightRunner +
+        // PreflightRoutes (read-only preflight dispatch/re-dispatch), and the
+        // DexRoutes / DeviceRoutes live-info panels' canned read-only queries.
+        // All are either genuine background engines with no Session in the
+        // loop, or pre-existing read-only surfaces behind their own scoped
+        // gates (the latter tracked for caller-widening as a follow-up — see
+        // the #3133 round-1/2 review minors). It constructs
+        // `DispatchCaller{.system = true}` explicitly rather than leaving
+        // `principal` merely empty by default: a background dispatch is a
+        // deliberate, greppable statement.
         auto command_dispatch_fn =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
                    const std::string& execution_id) -> std::pair<std::string, int> {
             // Background engines + legacy callers dispatch as SYSTEM (unfiltered):
-            // exec_visible = nullopt. Operator surfaces that must confine call the
-            // 7-param command_dispatch_confined_fn (below) instead. Both funnel
-            // through the ONE dispatch_confined seam. broadcast_on_none=false: an
-            // unnamed target here reaches nobody (#2500), never the fleet.
+            // exec_visible = nullopt (DispatchCaller's default). Operator surfaces
+            // that must confine call command_dispatch_caller_fn / the caller-typed
+            // sibling below instead. Both funnel through the ONE dispatch_confined
+            // seam. broadcast_on_none=false: an unnamed target here reaches nobody
+            // (#2500), never the fleet.
             return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                     execution_id, /*exec_visible=*/std::nullopt,
+                                     execution_id, yuzu::server::DispatchCaller{.system = true},
                                      /*broadcast_on_none=*/false);
         };
 
         // #1788 / CDX-R7-02 / K-R7-02: the operator-facing confined entry.
-        // Identical to command_dispatch_fn but carries the caller's
-        // Execution:Execute visible set so dashboard + workflow dispatch narrow
-        // to it, exactly as /api/command and MCP do. Same seam
-        // (dispatch_confined), one extra parameter.
-        auto command_dispatch_confined_fn =
+        // Identical to command_dispatch_fn but carries the caller (identity +
+        // Execution:Execute visible set) so every operator dispatch surface —
+        // REST v1, dashboard, workflow, MCP — narrows to it, exactly as
+        // /api/command does. Same seam (dispatch_confined), one extra parameter.
+        //
+        // PR1.9c: there used to be a second, bare-VisibleSet sibling here
+        // (`command_dispatch_confined_fn`) kept only because
+        // `RestApiV1::CommandDispatchFn` had not been widened. It built a
+        // `DispatchCaller` with an EMPTY principal, which
+        // `build_classified_command` refuses as `AnonymousOperator` before the
+        // legacy-open bypass — so every REST v1 dispatch was undeliverable.
+        // REST now takes the caller like everyone else and that closure is
+        // deleted; there is deliberately only ONE confined entry point again.
+        auto command_dispatch_caller_fn =
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
                    const std::string& execution_id,
-                   const yuzu::server::authz::VisibleSet& exec_visible)
-            -> std::pair<std::string, int> {
+                   const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
             return dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                     execution_id, exec_visible, /*broadcast_on_none=*/false);
+                                     execution_id, caller, /*broadcast_on_none=*/false);
         };
 
         // PolicyEvaluator — drives the compliance check -> verdict pipeline.
@@ -14492,6 +15086,16 @@ private:
         metrics_.describe("yuzu_schedule_tick_errors_total",
                           "Schedule runner tick() exceptions caught (alertable on sustained rate)",
                           "counter");
+        // The one sibling that was never described. It is also the one whose
+        // absent-vs-zero distinction carries a security meaning: the arming
+        // check is fail-closed on an UNSET callback, so "no denials" and "the
+        // re-verification never ran" must not read alike on a dashboard.
+        metrics_.describe("yuzu_schedule_arming_denied_total",
+                          "Scheduled occurrences refused because the arming principal failed "
+                          "re-verification at fire time (or the arming callback was unwired, "
+                          "which denies fail-closed). Zero means the check ran and passed.",
+                          "counter");
+        metrics_.counter("yuzu_schedule_arming_denied_total");
         schedule_runner_ = std::make_unique<ScheduleRunner>(ScheduleRunner::Deps{
             .schedule_engine = schedule_engine_.get(),
             .instruction_store = instruction_store_.get(),
@@ -14499,7 +15103,50 @@ private:
             .approval_manager = approval_manager_.get(),
             .audit_store = audit_store_.get(),
             .metrics = &metrics_,
-            .dispatch_fn = command_dispatch_fn,
+            // Review finding (#3133, merged): was command_dispatch_fn
+            // (hardcoded system=true, unfiltered) — every scheduled fire
+            // bypassed the classify+authorize chokepoint's per-action check
+            // regardless of the creator's actual permissions. Now carries the
+            // caller resolve_caller derives, exactly like every other operator
+            // dispatch surface. NOTE for future rebases: this must stay
+            // `command_dispatch_caller_fn` — reverting it to the system
+            // closure silently reopens that bypass.
+            .dispatch_fn = command_dispatch_caller_fn,
+            .resolve_caller =
+                [this](const std::string& username) {
+                return derive_dispatch_caller_for_username(username);
+            },
+            // D7/PLAN-003 (p14) — re-verify the arming principal's CURRENT
+            // authority for this plugin.action before every fire (both the
+            // auto and approval-gated arms — schedule_runner.hpp's fire()
+            // doc comment). p4 left this fail-closed and unset; wired here
+            // against the SAME classification seam build_classified_command
+            // consults on every other dispatch (capability_registry_,
+            // PR1.9c) so a schedule's required (securable, operation) can
+            // never drift from what a live dispatch of the same
+            // plugin.action would require.
+            //
+            // COMPLEMENTARY to resolve_caller above, not redundant with it:
+            // this answers "may the ARMING principal still fire this
+            // plugin.action at all", the chokepoint answers "is the caller
+            // this dispatch runs as authorized for the resolved
+            // securable/operation". Both must pass; neither substitutes for
+            // the other.
+            //
+            // The decision rule itself lives in `schedule_arming_check.hpp`
+            // and is NOT restated here. It used to be inline, with a
+            // hand-copied mirror in the tests that had already drifted —
+            // BR-003's system_reserved branch landed here and never reached
+            // the copy, so the confused-deputy fix was untested. The header
+            // is now the single copy both this lambda and
+            // `test_operator_surface_twins.cpp` exercise; the fail-closed
+            // cases and the legacy-open posture are documented there.
+            .arming_check = [this](const std::string& principal, const std::string& plugin,
+                                   const std::string& action) -> bool {
+                return yuzu::server::schedule_arming_permitted(capability_registry_,
+                                                               rbac_store_.get(), principal,
+                                                               plugin, action);
+            },
         });
         schedule_tick_thread_ = std::thread([this]() {
             spdlog::info("Schedule runner thread started (cadence=30s)");
@@ -14969,12 +15616,18 @@ private:
             // It feeds only fleet AGGREGATES (the crash-free rate denominator + the
             // score-distribution histogram). The device-id LISTS the re-review flagged
             // get their ids from the per-OBSERVATION store queries (dex_top_devices /
-            // dex_signal_devices / dex_app_devices / dex_perf_devices), which ARE
-            // scoped to the caller's management groups (VisibleSetFn). So the
-            // enumeration is closed independent of this provider. True per-TENANT
-            // aggregate RATES would also need the store-side crash/signal NUMERATORS
-            // (dex_crash_summary / dex_signal_summary) scoped — a tracked follow-up;
-            // scoping the denominator here without them would ship a misleading rate.
+            // dex_signal_devices / dex_app_devices / dex_perf_devices), which the
+            // dashboard fragments narrow via VisibleSetFn (username-keyed) — this
+            // closes the enumeration for a management-group-confined OPERATOR
+            // session, but NOT for a service-scoped API token: VisibleSetFn has no
+            // token_scope_service branch (same gap SEC-2/SEC-3 fixed elsewhere), so a
+            // service token whose username resolves to an unscoped grant still sees
+            // the whole fleet through these fragments. That axis is closed by an
+            // explicit deny_service_scoped_-style gate on each fragment, not by this
+            // provider or by VisibleSetFn. True per-TENANT aggregate RATES would also
+            // need the store-side crash/signal NUMERATORS (dex_crash_summary /
+            // dex_signal_summary) scoped — a tracked follow-up; scoping the
+            // denominator here without them would ship a misleading rate.
             [this]() -> DexFleet {
                 DexFleet f;
                 const auto ids = registry_.all_ids();
@@ -15168,7 +15821,7 @@ private:
         };
 
         network_routes_ = std::make_unique<NetworkRoutes>();
-        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, net_perf_fn);
+        network_routes_->register_routes(*web_server_, auth_fn, perm_fn, audit_fn, net_perf_fn);
 
         // DeviceRoutes — /devices (fleet list) + /device?id= (the shared device
         // page; Device-info lens). Sourced from the live registry (the CONNECTED
@@ -15575,13 +16228,22 @@ private:
         // installer (content_dist) on the cleared-so-far devices, tracking the
         // per-device stage→execute state machine. Reuses the scoped
         // device provider (devices_fn) for the live re-authorization the MUTATING
-        // execute step requires, the SAME 6-param untracked dispatch (execution_id
+        // execute step requires, the SAME untracked dispatch (execution_id
         // "deployment-<id>-{stage,exec}" → skipped by notify_exec_tracker, like
         // preflight-), and a narrow ResponseStore poll seam (query_by_execution +
         // latest_per_agent). The cohort is read from preflight_run_store_.
+        //
+        // command_dispatch_CALLER_fn, not the bare system closure: every deploy
+        // advance is operator-triggered (a page load, poll, or create), never a
+        // background dispatcher, and the chokepoint must authorize
+        // content_dist.stage/execute_staged against the live caller's own
+        // SoftwareDeployment:Write grant rather than admit them unconditionally
+        // as a `.system = true` caller would (governance finding, review round
+        // following the origin/dev merge — the caller-carrying seam did not
+        // exist on dev when this route was written).
         deployment_routes_ = std::make_unique<DeploymentRoutes>();
         deployment_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, devices_fn, command_dispatch_fn,
+            *web_server_, auth_fn, perm_fn, devices_fn, command_dispatch_caller_fn,
             // Poll seam: execution_id → best (status, output) per agent. Same
             // scoring as the pre-flight collect (terminal beats running, then
             // non-empty output, then later arrival).
@@ -15597,7 +16259,17 @@ private:
                     response_store_->query_by_execution(execution_id, q)
                         .value_or(std::vector<StoredResponse>{}));
             },
-            audit_fn, preflight_run_store_.get(), deployment_run_store_.get());
+            audit_fn, preflight_run_store_.get(), deployment_run_store_.get(),
+            // #1788 gov finding: the SAME chokepoint-level Execution:Execute
+            // visible-set derivation every other operator-facing dispatch surface
+            // carries — devices_fn(viewer)∩cohort above is TARGETING confinement
+            // (Infrastructure:Read/flat group-membership), a different dimension
+            // from this. Without it, caller.exec_visible defaulted to nullopt
+            // (unfiltered), so the chokepoint's own per-target intersection
+            // (dispatch_confined_arms.hpp) was a no-op for every deployment
+            // dispatch — the exact failure shape dispatch_caller.hpp's contract
+            // reserves for a genuine `.system = true` background dispatcher only.
+            [this](const auth::Session& sess) { return derive_exec_visible(sess); });
 
         // TarTreeRoutes — /tar Frame 3 process tree viewer. Reuses DeviceRoutes'
         // scoped device picker (devices_fn) + identity lookup (lookup_fn) + the SAME
@@ -15609,13 +16281,20 @@ private:
         tar_tree_routes_ = std::make_unique<TarTreeRoutes>();
         tar_tree_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
-            [command_dispatch_fn](const std::string& plugin, const std::string& action,
-                                  const std::vector<std::string>& agent_ids,
-                                  const std::string& scope_expr,
-                                  const std::unordered_map<std::string, std::string>& parameters)
-                -> std::pair<std::string, int> {
-                return command_dispatch_fn(plugin, action, agent_ids, scope_expr, parameters,
-                                           /*execution_id=*/"");
+            // Review finding (#3133): was command_dispatch_fn (hardcoded
+            // system=true, unfiltered) — the capture-source push dispatches
+            // the mutating, Infrastructure:Write-classified tar.configure
+            // action, and this route only ever gated Infrastructure:Read.
+            // Now forwards through command_dispatch_caller_fn with the real
+            // caller TarTreeRoutes derives via caller_fn below, so the
+            // chokepoint's own classify+authorize check actually runs.
+            [command_dispatch_caller_fn](
+                const std::string& plugin, const std::string& action,
+                const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+                const std::unordered_map<std::string, std::string>& parameters,
+                const yuzu::server::DispatchCaller& caller) -> std::pair<std::string, int> {
+                return command_dispatch_caller_fn(plugin, action, agent_ids, scope_expr,
+                                                  parameters, /*execution_id=*/"", caller);
             },
             [this](const std::string& command_id,
                    const std::string& agent_id) -> std::vector<DexAgentResponse> {
@@ -15628,7 +16307,18 @@ private:
                     out.push_back({r.agent_id, r.status, r.output, r.error_detail});
                 return out;
             },
-            audit_fn);
+            audit_fn,
+            [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
+                // Resolve the session from a throwaway Response (never written back);
+                // an unresolved session yields an empty principal alongside a
+                // present-EMPTY set (fail CLOSED on visibility) — same idiom as
+                // WorkflowRoutes' caller_fn above.
+                httplib::Response throwaway;
+                if (auto s = require_auth(req, throwaway))
+                    return derive_dispatch_caller(*s);
+                return yuzu::server::DispatchCaller{
+                    .exec_visible = yuzu::server::authz::deny_all()};
+            });
 
         // VizRoutes — /api/v1/viz/fleet/topology + /fragments/viz/fleet/topology
         // (PR 3 of feat/viz-engine ladder)
@@ -15651,24 +16341,25 @@ private:
             // DispatchFn — the dashboard execute surface, now routed through the
             // shared dispatch_confined seam exactly as /api/command and MCP are.
             //
-            // CDX-R7-02: carries the operator's Execution:Execute visible set
-            // (`exec_visible`, derived per-request by the ExecVisibleFn below)
-            // and narrows every arm to it — a management group / scope / id-list
-            // / broadcast is a targeting mechanism, never an authz exemption
-            // (#1788). execution_id is empty (dashboard is the legacy untracked
-            // UI path). broadcast_on_none=true preserves the legacy UI contract
-            // that an OMITTED `scope` means the whole fleet. It is NOT about
-            // `__all__`: dashboard_routes passes that through by name (the
-            // Broadcast arm), and refuses a supplied-but-empty `scope=`, so None
-            // reaches here only when no targeting argument was supplied at all.
+            // CDX-R7-02 / PLAN-006: carries the operator's identity + its
+            // Execution:Execute visible set (`caller`, derived per-request by
+            // the CallerFn below) and narrows every arm to it — a management
+            // group / scope / id-list / broadcast is a targeting mechanism,
+            // never an authz exemption (#1788). execution_id is empty (dashboard
+            // is the legacy untracked UI path). broadcast_on_none=true preserves
+            // the legacy UI contract that an OMITTED `scope` means the whole
+            // fleet. It is NOT about `__all__`: dashboard_routes passes that
+            // through by name (the Broadcast arm), and refuses a
+            // supplied-but-empty `scope=`, so None reaches here only when no
+            // targeting argument was supplied at all.
             [this](const std::string& plugin, const std::string& action,
                    const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                    const std::unordered_map<std::string, std::string>& parameters,
-                   const yuzu::server::authz::VisibleSet& exec_visible)
+                   const yuzu::server::DispatchCaller& caller)
                 -> std::pair<std::string, int> {
                 auto [command_id, sent] = dispatch_confined(plugin, action, agent_ids, scope_expr,
                                                             parameters, /*execution_id=*/std::string{},
-                                                            exec_visible, /*broadcast_on_none=*/true);
+                                                            caller, /*broadcast_on_none=*/true);
 
                 if (sent > 0) {
                     // Publish RUNNING status + clear results via SSE.
@@ -15696,17 +16387,19 @@ private:
                 }
                 return {command_id, sent};
             },
-            // ExecVisibleFn — CDX-R7-02: resolve the caller's Execution:Execute
-            // visible set from the request. The dashboard execute handlers gate
-            // via perm_fn and hold no Session at the dispatch site, so resolve it
-            // here from a throwaway Response (never written back). A session that
-            // cannot be resolved yields a present-EMPTY set — fail CLOSED, deny
-            // all — never nullopt.
-            [this](const httplib::Request& req) -> yuzu::server::authz::VisibleSet {
+            // CallerFn — CDX-R7-02 / PLAN-006: resolve the caller's identity +
+            // Execution:Execute visible set from the request. The dashboard
+            // execute handlers gate via perm_fn and hold no Session at the
+            // dispatch site, so resolve it here from a throwaway Response
+            // (never written back). A session that cannot be resolved yields an
+            // empty principal alongside a present-EMPTY set — fail CLOSED on
+            // visibility, deny all — never nullopt.
+            [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
                 httplib::Response throwaway;
                 if (auto s = require_auth(req, throwaway))
-                    return derive_exec_visible(*s);
-                return std::unordered_set<std::string>{};
+                    return derive_dispatch_caller(*s);
+                return yuzu::server::DispatchCaller{
+                    .exec_visible = yuzu::server::authz::deny_all()};
             },
             // ResolveFn — resolve instruction text → (plugin, action)
             [this](const std::string& text) -> std::pair<std::string, std::string> {
@@ -15775,19 +16468,22 @@ private:
         wf_deps.product_pack_store = product_pack_store_.get();
         wf_deps.instruction_store = instruction_store_.get();
         wf_deps.policy_store = policy_store_.get();
-        // K-R7-02: workflow + instruction dispatch is an OPERATOR surface, so it
-        // routes through the CONFINED 7-param sibling (carries the caller's
-        // Execution:Execute visible set), not the system 6-param command_dispatch_fn.
-        // Both funnel through the ONE dispatch_confined seam.
-        wf_deps.command_dispatch_fn = command_dispatch_confined_fn;
-        wf_deps.exec_visible_fn =
-            [this](const httplib::Request& req) -> yuzu::server::authz::VisibleSet {
+        // K-R7-02 / PLAN-006: workflow + instruction dispatch is an OPERATOR
+        // surface, so it routes through the caller-carrying sibling (carries
+        // the caller's identity + Execution:Execute visible set), not the
+        // system command_dispatch_fn. Both funnel through the ONE
+        // dispatch_confined seam.
+        wf_deps.command_dispatch_fn = command_dispatch_caller_fn;
+        wf_deps.caller_fn =
+            [this](const httplib::Request& req) -> yuzu::server::DispatchCaller {
             // Resolve the session from a throwaway Response (never written back);
-            // an unresolved session yields a present-EMPTY set (fail CLOSED).
+            // an unresolved session yields an empty principal alongside a
+            // present-EMPTY set (fail CLOSED on visibility).
             httplib::Response throwaway;
             if (auto s = require_auth(req, throwaway))
-                return derive_exec_visible(*s);
-            return std::unordered_set<std::string>{};
+                return derive_dispatch_caller(*s);
+            return yuzu::server::DispatchCaller{
+                .exec_visible = yuzu::server::authz::deny_all()};
         };
         wf_deps.approval_manager = approval_manager_.get();
         wf_deps.response_store = response_store_.get();
@@ -16088,6 +16784,54 @@ private:
                     return result;
                 }
                 result.new_version = *rotated_version;
+
+                // #2568/#2580 (p14) — MINT ONCE (above, auth_secret_codec_
+                // only), then bring every OTHER enrolled codec onto the
+                // freshly-minted version under this SAME secrets_kek_op
+                // lock hold: resync its in-memory active_version_ via
+                // init() (a no-mutation re-verify against the kek_meta row
+                // rotate_kek just committed — see kek_enrolled_codecs()'s
+                // doc comment), then rewrap_all() its own registered
+                // columns onto it. This is NOT a second rotate_kek() call
+                // — calling rotate_kek() again per codec would mint N
+                // independent KEK versions and leave the codecs on
+                // divergent generations, exactly the bug this loop exists
+                // to prevent. A failure here means the mint committed but a
+                // secondary codec's rows did not follow it — the SAME
+                // half-committed shape as rotate_kek's own internal
+                // rewrap_all() failing, so it is classified identically
+                // (HalfCommitted) and resumed the identical way: POST
+                // /secrets/kek/rewrap, never a retried /rotate.
+                for (auto* codec : kek_enrolled_codecs()) {
+                    if (codec == auth_secret_codec_.get())
+                        continue; // already minted + self-rewrapped above
+                    auto init_res = codec->init(lease.get());
+                    if (!init_res) {
+                        spdlog::critical(
+                            "KEK rotate: minted v{} on auth_secret_codec_ but a secondary "
+                            "codec's init() resync failed ({}: {}) — the mint COMMITTED; "
+                            "resume with /rewrap, do NOT retry /rotate",
+                            *rotated_version, pg::SecretCodec::to_string(init_res.error().kind),
+                            init_res.error().message);
+                        result.failure = KekOpResult::Failure::HalfCommitted;
+                        record_kek_op_outcome("rotate",
+                                              detail::kek_op_outcome_label(result.failure));
+                        return result;
+                    }
+                    auto rewrapped = codec->rewrap_all(lease.get());
+                    if (!rewrapped) {
+                        spdlog::critical(
+                            "KEK rotate: minted v{} on auth_secret_codec_ but a secondary "
+                            "codec's rewrap_all() failed ({}) — the mint COMMITTED; resume "
+                            "with /rewrap, do NOT retry /rotate",
+                            *rotated_version, rewrapped.error().internal_message);
+                        result.failure = KekOpResult::Failure::HalfCommitted;
+                        record_kek_op_outcome("rotate",
+                                              detail::kek_op_outcome_label(result.failure));
+                        return result;
+                    }
+                }
+
                 // rotate_kek() runs its own internal rewrap_all() as part of
                 // minting (secret_codec.cpp ~824-838) but DISCARDS that call's
                 // row count, returning only the new version. Rather than
@@ -16097,10 +16841,11 @@ private:
                 // `rotation_complete` instead. That is the signal an operator
                 // actually needs (the ADR-0010 §3 completion signal), and it is
                 // one we can produce truthfully: reaching here means
-                // rotate_kek's internal rewrap_all() returned success, so no
-                // row is left on a superseded version. An operator who wants a
-                // count can call /rewrap, which reports a real one (0 when
-                // there is genuinely nothing left to do).
+                // rotate_kek's internal rewrap_all() returned success (and every
+                // enrolled secondary codec's own rewrap_all() above too), so no
+                // row on ANY enrolled codec is left on a superseded version. An
+                // operator who wants a count can call /rewrap, which reports a
+                // real one (0 when there is genuinely nothing left to do).
                 result.rotation_complete = true;
                 record_kek_op_outcome("rotate", detail::kek_op_outcome_label(result.failure));
                 return result;
@@ -16159,7 +16904,46 @@ private:
                     record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
                     return result;
                 }
-                result.rows_rewrapped = *rewrapped;
+                std::size_t total_rewrapped = *rewrapped;
+
+                // #2568/#2580 (p14) — resume every OTHER enrolled codec too,
+                // under this SAME lock hold. init() first (a no-mutation
+                // resync of THIS instance's active_version_ from the shared
+                // kek_meta table — necessary because a PRIOR /rotate call
+                // may have minted a version this process's copy of the
+                // secondary codec never learned about; see
+                // kek_enrolled_codecs()'s doc comment), then rewrap_all().
+                // Idempotent like the primary above: rows already on the
+                // active version are simply skipped, so calling this
+                // repeatedly with nothing left to do is a normal 0-row
+                // outcome, never an error.
+                for (auto* codec : kek_enrolled_codecs()) {
+                    if (codec == auth_secret_codec_.get())
+                        continue; // already rewrapped above
+                    auto init_res = codec->init(lease.get());
+                    if (!init_res) {
+                        spdlog::error("KEK rewrap: a secondary codec's init() resync failed: {}: {}",
+                                     pg::SecretCodec::to_string(init_res.error().kind),
+                                     init_res.error().message);
+                        result.failure = KekOpResult::Failure::Internal;
+                        record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
+                        return result;
+                    }
+                    auto secondary_rewrapped = codec->rewrap_all(lease.get());
+                    if (!secondary_rewrapped) {
+                        spdlog::error("KEK rewrap: a secondary codec's rewrap_all() failed: {}",
+                                     secondary_rewrapped.error().internal_message);
+                        result.failure =
+                            (secondary_rewrapped.error().kind ==
+                             pg::SecretCodec::LifecycleError::Kind::query_canceled)
+                                ? KekOpResult::Failure::QueryCanceled
+                                : KekOpResult::Failure::Internal;
+                        record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
+                        return result;
+                    }
+                    total_rewrapped += *secondary_rewrapped;
+                }
+                result.rows_rewrapped = total_rewrapped;
                 record_kek_op_outcome("rewrap", detail::kek_op_outcome_label(result.failure));
                 return result;
             };
@@ -16204,32 +16988,63 @@ private:
                 // STILL never takes `secrets_kek_op` itself; the lock-holder
                 // observation below only ever OBSERVES via pg_locks.
                 result.active_version = auth_secret_codec_->active_kek_version();
-                auto oldest = auth_secret_codec_->oldest_kek_version_in_use(lease.get());
-                if (!oldest) {
-                    spdlog::error("KEK status: oldest_kek_version_in_use failed: {}",
-                                 oldest.error().internal_message);
-                    result.failure =
-                        (oldest.error().kind == pg::SecretCodec::LifecycleError::Kind::query_canceled)
-                            ? KekOpResult::Failure::QueryCanceled
-                            : KekOpResult::Failure::Internal;
-                    record_kek_op_outcome("status", detail::kek_op_outcome_label(result.failure));
-                    return result;
+
+                // #2568/#2580 (p14) — oldest_in_use must reflect EVERY
+                // enrolled codec's own registered columns, not just
+                // auth_secret_codec_'s: each codec's
+                // oldest_kek_version_in_use() scan only ever sees the
+                // secret columns THAT instance registered (columns_ is
+                // per-instance, SecretCodec::register_secret_column), so a
+                // plugin-config secret stuck on an old KEK version would be
+                // invisible to this field if only the primary codec were
+                // consulted here. Combine as the MIN across every codec
+                // that has secret rows at all (nullopt = "no secret rows on
+                // this codec", excluded from the min; the combined result
+                // is nullopt only when EVERY enrolled codec has none). A
+                // query failure on ANY codec is still a hard failure — same
+                // posture as the pre-generalisation single-codec original —
+                // a status response must never silently omit one codec's
+                // contribution to the fleet-wide oldest-in-use signal.
+                std::optional<std::uint32_t> combined_oldest;
+                bool any_anomaly = false;
+                for (auto* codec : kek_enrolled_codecs()) {
+                    auto oldest_result = codec->oldest_kek_version_in_use(lease.get());
+                    if (!oldest_result) {
+                        spdlog::error("KEK status: oldest_kek_version_in_use failed: {}",
+                                     oldest_result.error().internal_message);
+                        result.failure = (oldest_result.error().kind ==
+                                          pg::SecretCodec::LifecycleError::Kind::query_canceled)
+                                             ? KekOpResult::Failure::QueryCanceled
+                                             : KekOpResult::Failure::Internal;
+                        record_kek_op_outcome("status", detail::kek_op_outcome_label(result.failure));
+                        return result;
+                    }
+                    const std::optional<std::uint32_t>& codec_oldest = *oldest_result;
+                    if (!codec_oldest.has_value())
+                        continue; // this codec has no secret rows at all
+                    // Completion is `== active_version`, NOT `>=` (gov
+                    // unhappy-path UP-6). A row whose header references a
+                    // version HIGHER than the active one is an anomaly — a
+                    // restore against a newer keys dir, or a blob from
+                    // another install — and `>=` would report that state as
+                    // "complete", the worst possible false comfort: it says
+                    // "every secret is on the current key" about rows whose
+                    // key is not even registered here.
+                    if (*codec_oldest > result.active_version) {
+                        spdlog::error(
+                            "KEK status: oldest referenced version v{} EXCEEDS the active "
+                            "version v{} — a secret row references a KEK this install has "
+                            "not registered (restore skew?); reporting NOT complete",
+                            *codec_oldest, result.active_version);
+                        any_anomaly = true;
+                    }
+                    if (!combined_oldest.has_value() || *codec_oldest < *combined_oldest)
+                        combined_oldest = *codec_oldest;
                 }
-                result.oldest_in_use = *oldest;
-                // Completion is `== active_version`, NOT `>=` (gov unhappy-path
-                // UP-6). A row whose header references a version HIGHER than the
-                // active one is an anomaly — a restore against a newer keys dir,
-                // or a blob from another install — and `>=` would report that
-                // state as "complete", which is the worst possible false
-                // comfort: it says "every secret is on the current key" about
-                // rows whose key is not even registered here.
+                result.oldest_in_use = combined_oldest;
                 if (!result.oldest_in_use.has_value()) {
-                    result.rotation_complete = true; // no secret rows at all
-                } else if (*result.oldest_in_use > result.active_version) {
-                    spdlog::error("KEK status: oldest referenced version v{} EXCEEDS the active "
-                                  "version v{} — a secret row references a KEK this install has "
-                                  "not registered (restore skew?); reporting NOT complete",
-                                  *result.oldest_in_use, result.active_version);
+                    result.rotation_complete = true; // no secret rows at all, on ANY enrolled codec
+                } else if (any_anomaly) {
                     result.rotation_complete = false;
                 } else {
                     result.rotation_complete = (*result.oldest_in_use == result.active_version);
@@ -16293,6 +17108,73 @@ private:
                 return result;
             };
             kek_routes_->register_routes(*web_server_, perm_fn, audit_fn, kek_ops);
+        }
+
+        // PR1.5c/1.6c (p14) — ADR-0031 operator surface REST registration:
+        // p5's /api/v1/plugin-config/* and p6's /api/v1/upload-grants* +
+        // /api/v1/uploads* (mint/list/revoke are operator routes; the five
+        // /api/v1/uploads/* routes are the agent-authenticated chunked-
+        // receive protocol — see file_retrieval_routes.hpp's file header
+        // for the two-trust-domain split). Both registrars take an
+        // HttpRouteSink& (neither offers an httplib::Server& overload the
+        // way KekRoutes does above), so wrap web_server_ once and pass the
+        // same sink to both — the idiom http_route_sink.hpp's file header
+        // documents.
+        {
+            HttplibRouteSink operator_surface_sink{*web_server_};
+
+            plugin_config::register_plugin_config_routes(
+                operator_surface_sink,
+                plugin_config::Deps{
+                    .store = plugin_config_store_.get(),
+                    .rbac_store = rbac_store_.get(),
+                    .mgmt_store = mgmt_group_store_.get(),
+                    .auth_fn = auth_fn,
+                    .perm_fn = perm_fn,
+                    .audit_fn = audit_fn,
+                });
+
+            register_file_retrieval_routes(
+                operator_surface_sink,
+                yuzu::server::Deps{
+                    .auth_fn = auth_fn,
+                    .perm_fn = perm_fn,
+                    // ADR-0017 admit-then-filter list gate
+                    // (RbacStore::authorize_list_read) for GET
+                    // /api/v1/upload-grants — decoupled from RbacStore/
+                    // ManagementGroupStore at the file_retrieval_routes.hpp
+                    // boundary (its file header), wired here the same way
+                    // visible_set_fn above wires the analogous DEX seam.
+                    // Fail-closed (kDenyAll default) when rbac_store_ is
+                    // unset or closed.
+                    .list_read_fn =
+                        [this](const std::string& username) -> UploadGrantListAuthorization {
+                        UploadGrantListAuthorization out;
+                        if (!rbac_store_ || !rbac_store_->is_open())
+                            return out;
+                        auto authz = rbac_store_->authorize_list_read(
+                            username, "UploadGrant", "Read", mgmt_group_store_.get());
+                        switch (authz.decision) {
+                        case ListReadDecision::AdmitAll:
+                            out.decision = UploadGrantListDecision::kAdmitAll;
+                            break;
+                        case ListReadDecision::AdmitScoped:
+                            out.decision = UploadGrantListDecision::kAdmitScoped;
+                            out.visible_agents = std::move(authz.visible_agents);
+                            break;
+                        case ListReadDecision::DenyAll:
+                            break; // out already kDenyAll (default)
+                        }
+                        return out;
+                    },
+                    .audit_fn = audit_fn,
+                    .store = upload_grant_store_.get(),
+                    .blob_root = cfg_.db_dir() / "upload-blobs",
+                    .tls_enabled = cfg_.https_enabled,
+                    // now_fn left unset — production default reads
+                    // system_clock::now() (Deps::ClockFn doc comment,
+                    // file_retrieval_routes.hpp); only tests pin it.
+                });
         }
 
         // -- SCIM v2 provisioning (/scim/v2/*) — enterprise IdP auto-(de)provisioning --
@@ -16533,7 +17415,7 @@ private:
             // longer type-compatible with this parameter at all: the wrong
             // choice stopped being available rather than merely being avoided.
             // Empty closure would 503 those routes.
-            command_dispatch_confined_fn,
+            command_dispatch_caller_fn,
             // PR2 MFA step-up gate for the high-risk REST handlers; empty
             // closure disables the gate (preserves pre-PR2 behaviour).
             step_up_fn,
@@ -16645,19 +17527,20 @@ private:
                         [&](const std::string& expr) { return agent_in_scope(aid, expr); },
                         full_sync, generation);
 
-                    ::yuzu::agent::v1::CommandRequest cmd;
                     // Unique per push (random suffix) so two pushes in the same second
                     // can't collide on the agent's replay-dedup set (hp-F2/cons-S1).
-                    cmd.set_command_id(
+                    const auto push_command_id =
                         "__guard__-push-" + std::to_string(now_s) + "-" +
-                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8)));
-                    cmd.set_plugin("__guard__");
-                    cmd.set_action("push_rules");
+                        auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
                     // Binary serialized proto rides in the `payload` bytes field, not the
                     // `parameters` string map: proto3 string values must be valid UTF-8, and
                     // raw GuaranteedStatePush bytes are not. See agent.proto CommandRequest.payload.
-                    cmd.set_payload(push.SerializeAsString());
-                    if (registry_.send_to(aid, cmd)) {
+                    // PR1.9c: system caller — __guard__.push_rules is
+                    // `system_reserved` (capdecls::core_dispatch_capabilities.hpp).
+                    auto classified = build_classified_command(
+                        yuzu::server::DispatchCaller{.system = true}, "__guard__", "push_rules",
+                        push_command_id, /*parameters=*/{}, push.SerializeAsString());
+                    if (classified && registry_.send_to(aid, *classified)) {
                         ++sent;
                         metrics_
                             .counter("yuzu_server_guardian_pushes_dispatched_total",
@@ -16828,6 +17711,43 @@ private:
             // was null while the REST twins worked fine — two surfaces
             // disagreeing about whether the same capability exists (ADR-1005 A1).
             mcp_server_->set_kek_ops(kek_ops_); // same seam instance as the REST twins
+            // PR1.5c/1.6c (p14) — ADR-0031 operator surface MCP twins,
+            // wired UNCONDITIONALLY exactly like kek_ops above (never
+            // gated behind an unrelated conditional — see the KEK comment
+            // immediately above for why that matters: two surfaces
+            // disagreeing about whether the same capability exists is an
+            // ADR-1005 A1 violation). Also closes review finding #3135
+            // (operator upload-grant mint/list/revoke shipped REST-only,
+            // with no MCP twin — an ADR-1005 gap for an ordinary
+            // authenticated operator action).
+            mcp_server_->set_plugin_config_store(plugin_config_store_.get());
+            mcp_server_->set_upload_grant_ops(
+                upload_grant_store_.get(),
+                // SAME logic as the REST list_read_fn wired at the
+                // /api/v1/upload-grants registration site below — not the
+                // same std::function instance, but the identical
+                // RbacStore::authorize_list_read call with the identical
+                // (securable, operation), so the two surfaces cannot
+                // observe a different admit decision for the same caller.
+                [this](const std::string& username) -> UploadGrantListAuthorization {
+                    UploadGrantListAuthorization out;
+                    if (!rbac_store_ || !rbac_store_->is_open())
+                        return out;
+                    auto authz = rbac_store_->authorize_list_read(username, "UploadGrant", "Read",
+                                                                  mgmt_group_store_.get());
+                    switch (authz.decision) {
+                    case ListReadDecision::AdmitAll:
+                        out.decision = UploadGrantListDecision::kAdmitAll;
+                        break;
+                    case ListReadDecision::AdmitScoped:
+                        out.decision = UploadGrantListDecision::kAdmitScoped;
+                        out.visible_agents = std::move(authz.visible_agents);
+                        break;
+                    case ListReadDecision::DenyAll:
+                        break; // out already kDenyAll (default)
+                    }
+                    return out;
+                });
             if (engine_principal_store_) {
                 mcp_server_->set_engine_principal_store(engine_principal_store_.get());
                 mcp_server_->set_engine_credential_store(api_token_store_.get());
@@ -16861,14 +17781,14 @@ private:
                        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
                        const std::unordered_map<std::string, std::string>& parameters,
                        const std::string& execution_id,
-                       const yuzu::server::authz::VisibleSet& exec_visible)
+                       const yuzu::server::DispatchCaller& caller)
                     -> std::pair<std::string, int> {
                     // MCP normalises an omitted target to kBroadcastScope upstream
                     // (mcp_server.cpp), so broadcast_on_none=true states its
                     // deliberate broadcast-on-empty contract. Same seam as the
                     // shared closure and the dashboard — one confined arm logic.
                     auto r = dispatch_confined(plugin, action, agent_ids, scope_expr, parameters,
-                                               execution_id, exec_visible,
+                                               execution_id, caller,
                                                /*broadcast_on_none=*/true);
                     spdlog::info("MCP execute_instruction: {}:{} → {} agent(s)", plugin, action,
                                  r.second);
@@ -16991,11 +17911,12 @@ private:
                                                                  principal.role, target_type,
                                                                  target_id, detail, principal.cls);
                 },
-                // #1788: per-request Execution:Execute visible-set deriver, so the MCP
-                // execute_instruction / execute_bundle dispatch confines to the caller's
-                // visible device set — the SAME derivation /api/command uses.
-                [this](const auth::Session& s) -> yuzu::server::authz::VisibleSet {
-                    return derive_exec_visible(s);
+                // #1788 / PLAN-006: per-request DispatchCaller deriver, so the MCP
+                // execute_instruction / execute_bundle / quarantine_device dispatch
+                // confines to AND identifies the caller — the SAME derivation
+                // /api/command's visible-set half uses, now carrying identity too.
+                [this](const auth::Session& s) -> yuzu::server::DispatchCaller {
+                    return derive_dispatch_caller(s);
                 });
         }
 
@@ -17101,24 +18022,35 @@ private:
         auto command_id =
             plugin + "-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(8));
 
-        detail::pb::CommandRequest cmd;
-        cmd.set_command_id(command_id);
-        cmd.set_plugin(plugin);
-        cmd.set_action(action);
-
-        agent_service_.record_send_time(command_id);
         // Resolve the session ONCE — require_auth writes an error response on
         // failure, so calling it twice could emit two. Fail CLOSED to a
-        // present-empty set (reaches nobody), never nullopt (unfiltered);
-        // the permission gate above has already admitted the caller, so this
-        // only bites if the session vanished between the two.
+        // present-empty visible set AND an empty principal, never nullopt
+        // (unfiltered); the permission gate above has already admitted the
+        // caller, so this only bites if the session vanished between the two.
         auto sess = require_auth(req, res);
-        const yuzu::server::authz::VisibleSet exec_visible =
-            sess ? derive_exec_visible(*sess)
-                 : yuzu::server::authz::deny_all();
+        const yuzu::server::DispatchCaller caller =
+            sess ? derive_dispatch_caller(*sess)
+                 : yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+        const yuzu::server::authz::VisibleSet& exec_visible = caller.exec_visible;
+
+        // PR1.9c (spec item 1): the ONE builder. A vanished session denies
+        // here (empty principal, non-system caller) — reaching nobody exactly
+        // as the pre-existing deny_all() fallback did, just at the chokepoint
+        // rather than after resolving targets. Already counted + logged by
+        // build_classified_command.
+        auto classified = build_classified_command(caller, plugin, action, command_id);
+        if (!classified) {
+            res.status = 403;
+            res.set_content(
+                R"({"error":{"code":403,"message":"command denied"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+
+        agent_service_.record_send_time(command_id);
         const yuzu::server::ConfinedDispatchSink sink{
-            [&](const std::string& aid) { return registry_.send_to(aid, cmd); },
-            [&] { return registry_.send_to_all(cmd); },
+            [&](const std::string& aid) { return registry_.send_to(aid, *classified); },
+            [&] { return registry_.send_to_all(*classified); },
             [&] { return registry_.all_ids(); }};
         int sent = yuzu::server::dispatch_confined_arms(
             yuzu::server::DispatchArm::Broadcast, {}, exec_visible,
@@ -17150,6 +18082,7 @@ private:
         } catch (...) {}
         return {};
     }
+
 
     static std::vector<std::string> extract_json_string_array(const std::string& body,
                                                               const std::string& key) {
@@ -17236,6 +18169,22 @@ private:
     auth::AuthManager& auth_mgr_;
     auth::AutoApproveEngine auto_approve_;
     yuzu::MetricsRegistry metrics_;
+    /// PR1.9c: the composed classification ruleset `build_classified_command`
+    /// consults on every dispatch — core (this package) plus the five
+    /// per-group plugin catalogues (p7/p10-p13). A STATIC ruleset, constructed
+    /// once: composing it is not itself a cached DECISION (ADR-0012 §4) —
+    /// `classify_and_authorize_dispatch` still re-classifies and re-authorizes
+    /// on every call; nothing about a dispatch OUTCOME is memoized here. No
+    /// dependency on any other member, so declaration order carries no
+    /// constraint.
+    yuzu::server::CommandCapabilityRegistry capability_registry_{
+        yuzu::server::capdecls::core_dispatch_capabilities(),
+        yuzu::server::capdecls::plugin_action_catalogue_a(),
+        yuzu::server::capdecls::plugin_action_catalogue_b(),
+        yuzu::server::capdecls::plugin_action_catalogue_c(),
+        yuzu::server::capdecls::plugin_action_catalogue_d(),
+        yuzu::server::capdecls::plugin_action_catalogue_content_dist(),
+    };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
     /// closed if the DSN is empty or unreachable), reset in stop() AFTER the
@@ -17388,6 +18337,15 @@ private:
     // destruct-before-pool discipline).
     std::unique_ptr<EnginePrincipalStore> engine_principal_store_;
     std::unique_ptr<ApiTokenStore> api_token_store_;
+    /// Migrated Postgres store (ADR-0006/ADR-0047, schema `quarantine_store`).
+    /// Borrows pg_pool_ (declared earlier, destructs later) and is declared
+    /// after it, so normal reverse-declaration-order destruction destructs
+    /// this before the pool for the EVENTUAL ~ServerImpl teardown (ADR-0012
+    /// destruct-before-pool discipline). That alone does NOT cover stop()'s
+    /// own explicit `pg_pool_.reset()` call, which runs while this member is
+    /// still alive (gov Gate 3 cpp-safety) — see the explicit
+    /// `quarantine_store_.reset()` in stop(), alongside
+    /// api_token_store_/engine_principal_store_/result_set_store_'s.
     std::unique_ptr<QuarantineStore> quarantine_store_;
     /// Migrated Postgres store (ADR-0006/ADR-0036, schema `result_set_store`).
     /// Borrows pg_pool_ (declared earlier, destructs later) — declared here so
@@ -17562,6 +18520,38 @@ private:
         ++kek_op_outcome_counts_[{std::string(op), std::string(outcome)}];
     }
 
+    // #2568/#2580 (p14, ARBITER FLEET DIRECTIVE from p5's adjudication) —
+    // every `SecretCodec` instance enrolled in the live KEK
+    // rotate/rewrap/status surface, GENERALISED from a single hard-coded
+    // `auth_secret_codec_` member so a future third consumer needs only an
+    // addition to this list, never another round of kek_ops lambda surgery.
+    // `auth_secret_codec_` is ALWAYS first — the kek_ops.rotate seam treats
+    // index 0 as the sole MINTING codec (see its doc comment): every other
+    // entry is brought onto the freshly-minted version by `init()` (a
+    // no-mutation re-verify/refresh of that instance's own
+    // `active_version_`/`key_refs_` from the shared `secrets.kek_meta`
+    // table — safe to call repeatedly post-boot, see SecretCodec::init's
+    // n>0 path) followed by `rewrap_all()`, NEVER by an independent
+    // `rotate_kek()` call, which would mint a second, spurious KEK version
+    // (the divergent-generations bug this generalisation exists to avoid).
+    // Every codec here shares the SAME underlying `secrets.kek_meta` table
+    // and KEK material (one KEK per database, ADR-0010 §2) — only each
+    // instance's in-memory `active_version_`/`key_refs_`/registered-column
+    // set is per-instance, which is exactly what makes the resync step
+    // necessary. Entries are skipped (not asserted) when null so a codec
+    // that failed to construct — impossible in production once startup
+    // succeeds, since a failed construction sets `startup_failed_` and the
+    // server never reaches request-serving — cannot crash a live request;
+    // defensive, matching every other raw-pointer null-check in this file.
+    [[nodiscard]] std::vector<pg::SecretCodec*> kek_enrolled_codecs() const {
+        std::vector<pg::SecretCodec*> out;
+        if (auth_secret_codec_)
+            out.push_back(auth_secret_codec_.get());
+        if (plugin_config_secret_codec_)
+            out.push_back(plugin_config_secret_codec_.get());
+        return out;
+    }
+
     // ── Postgres-backed AuthDB (ADR-0006 substrate migration) + its
     // dependency chain ──────────────────────────────────────────────────
     // Declared in this EXACT order — FileKeyProvider → SecretCodec → AuthDB
@@ -17587,6 +18577,26 @@ private:
     std::unique_ptr<ScimStore> scim_store_;
     std::unique_ptr<ScimRoutes> scim_routes_;
     std::unique_ptr<DiscoverRoutes> discover_routes_; // A2: /api/v1/discover/* (Issue 17.1)
+
+    // PR1.5c/1.6c (p14) — the ADR-0031 operator-surface stores. Declared in
+    // this EXACT order — plugin_config_secret_codec_ -> plugin_config_store_
+    // -> upload_grant_store_ — same reverse-declaration-destruction reasoning
+    // as the AuthDB chain above: plugin_config_store_ borrows
+    // plugin_config_secret_codec_ by reference (ADR-0010 per-store codec
+    // model, same shape as AuthDB(pg::PgPool&, pg::SecretCodec&)), so it must
+    // destruct BEFORE the codec it borrows — true here because it is
+    // declared AFTER the codec. Both borrow pg_pool_ (declared far above,
+    // near metrics_) by reference too, so both must destruct before it —
+    // true here since every member below this point destructs before
+    // pg_pool_ does (docs/postgres-store-playbook.md:112 — "declare the
+    // store so it destructs before the pool"). upload_grant_store_ borrows
+    // only pg_pool_ (no codec of its own — UploadGrantStore never seals a
+    // secret column, see upload_grant_store.hpp), so its position relative
+    // to the codec/plugin_config_store_ pair is unconstrained; declared last
+    // here purely to group the whole p14 surface together.
+    std::unique_ptr<pg::SecretCodec> plugin_config_secret_codec_;
+    std::unique_ptr<PluginConfigStore> plugin_config_store_;
+    std::unique_ptr<UploadGrantStore> upload_grant_store_;
 
     // Fleet visualization (PR 3 of feat/viz-engine ladder)
     std::unique_ptr<FleetTopologyStore> fleet_topology_store_;

@@ -168,6 +168,26 @@ void check_thread_fn() {
     }
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// All 4 actions (including "sync", the server-initiated structured-tag
+// push) are pure in-process reads/writes of <data_dir>/asset_tags.json — no
+// subprocess on any OS (rung 1, "local_json_store" on all three legs).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"sync", {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr}},
+    {"status", {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr}},
+    {"get", {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr}},
+    {"changes", {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr},
+     {YUZU_SUPPORT_SUPPORTED, 1, "local_json_store", nullptr}},
+};
+
 } // namespace
 
 class AssetTagsPlugin final : public yuzu::Plugin {
@@ -182,6 +202,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"sync", "status", "get", "changes", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

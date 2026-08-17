@@ -115,6 +115,19 @@ abi4_declared_fixture_plugin = shared_library(
   install: false,
 )
 
+# Sibling of abi4_declared_fixture_plugin, built identically, but written
+# through the C++ `yuzu::Plugin` + YUZU_PLUGIN_EXPORT path rather than
+# hand-rolling the C descriptor. It is the regression proving the descriptor
+# seam (the two non-pure virtuals on yuzu::Plugin) actually reaches
+# capmatrix-gen — the path all 49 real plugins take.
+abi4_cpp_wrapper_fixture_plugin = shared_library(
+  'abi4_cpp_wrapper_fixture_plugin',
+  files('fixtures/abi4/abi4_cpp_wrapper_fixture_plugin.cpp'),
+  name_prefix: '',
+  dependencies: [yuzu_sdk_dep],
+  install: false,
+)
+
 # ── Agent unit tests ──────────────────────────────────────────────────────────
 #
 # Proto-dep choice is platform-conditional (#572 + Windows MSVC follow-up):
@@ -166,6 +179,7 @@ agent_test_exe = executable(
     # above.
     'unit/test_runner_main.cpp',
     'unit/test_plugin_loader.cpp',
+    'unit/test_capability_registry_tables.cpp',
     'unit/test_sdk_utilities.cpp',
     'unit/test_temp_file.cpp',
     'unit/test_updater.cpp',
@@ -254,6 +268,7 @@ agent_test_exe = executable(
     'unit/test_registry_local_dispatcher.cpp', # PR1.7 remediation fix #3: real registry.dll driven
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
+    'unit/test_content_dist_upload_parsers.cpp', # PR1.6b: pure upload-protocol planner/classifier (no I/O)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -274,6 +289,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/event_logs/src'),    # event_logs_macos.hpp (BR-08)
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
     include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
+    include_directories('../agents/plugins/content_dist/src'),  # content_dist_upload_parsers.hpp (PR1.6b pure helpers)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
@@ -414,6 +430,7 @@ tar_test_exe = executable(
     'unit/test_tar_software.cpp',
     'unit/test_tar_store.cpp',
     'unit/test_tar_schema_registry.cpp',
+    'unit/test_tar_capability_table.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
     'unit/test_tar_perf.cpp',
@@ -490,6 +507,7 @@ if build_server
       'unit/server/test_deployment_parse.cpp',
       'unit/server/test_deployment_run_store.cpp',
       'unit/server/test_deployment_engine.cpp',
+      'unit/server/test_deployment_routes.cpp',
       'unit/server/test_bundle_service.cpp',
       'unit/server/test_bundle_orchestrator.cpp',
       'unit/server/test_rest_bundle.cpp',
@@ -503,6 +521,7 @@ if build_server
       'unit/server/test_web_utils.cpp',
       'unit/server/test_mcp_body_cap.cpp',
       'unit/server/test_dispatch_target_shape.cpp',
+      'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_agent_service_impl.cpp',
       'unit/server/test_analytics_event.cpp',
@@ -546,6 +565,11 @@ if build_server
       # kept OFF the production link line so the private cached path has no
       # public trampoline in server_core.
       'unit/server/engine_liveness_test_access.cpp',
+      # PR1.9c: same #2367 pattern for ClassifiedCommandTestAccess::make — the
+      # ONLY definition, deliberately off the production link line so a
+      # production caller that tries to forge a ClassifiedCommand (bypassing
+      # classification and authorization) fails to LINK rather than compiling.
+      'unit/server/classified_command_test_access.cpp',
       'unit/server/test_rest_engine_principal_roles.cpp',
       'unit/server/test_mcp_engine_principal_roles.cpp',
       'unit/server/test_engine_principal_lifecycle.cpp',
@@ -553,8 +577,18 @@ if build_server
       'unit/server/test_rotation_confirm_state.cpp',
       'unit/server/test_access_review_model.cpp',
       'unit/server/test_access_review_store.cpp',
+      'unit/server/test_dispatch_chokepoint.cpp',
       'unit/server/test_capability_catalogue.cpp',
+      'unit/server/test_operator_surface_twins.cpp',
+      'unit/server/test_schedule_params.cpp',
+      'unit/server/test_plugin_config_parsers.cpp',
+      'unit/server/test_plugin_config_store_pg.cpp',
+      'unit/server/test_plugin_config_routes.cpp',
+      'unit/server/test_upload_grant_parsers.cpp',
+      'unit/server/test_upload_grant_store_pg.cpp',
+      'unit/server/test_file_retrieval_routes.cpp',
       'unit/server/test_command_capability.cpp',
+      'unit/server/test_dex_obs_table.cpp',
       'unit/server/test_rest_access_review.cpp',
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
@@ -828,13 +862,17 @@ if build_server
   # job-level timeouts (90-120 min in ci.yml, 60 min in nightly.yml). The Catch2
   # cleanup/sweep listener (test_pg_template_cleanup.cpp) fires in all shards —
   # idempotent, harmless without a DSN. Constraints the shards must keep:
-  #   - only tag-filter specs may appear in args (flake-retry.py strips
-  #     positional tag specs before an isolated case retry — Catch2 ORs
+  #   - only tag-filter specs may appear as POSITIONAL args (flake-retry.py
+  #     strips positional tag specs before an isolated case retry — Catch2 ORs
   #     positional specs). Each [pg] half is ONE comma-OR spec (Catch2 ORs
-  #     inside a single arg; multiple positional args would AND, not OR);
+  #     inside a single arg; multiple positional args would AND, not OR).
+  #     Catch2 OPTION flags (--long form, e.g. --allow-running-no-tests on an
+  #     all-skip-on-macOS shard) are permitted: they are not positional, so the
+  #     retry surgery preserves them and the selftest exempts them from the
+  #     tag-spec pin;
   #   - no entry name may be a substring of another (flake-retry maps
-  #     meson-junit names by longest substring match) — 'shard A'/'shard B'
-  #     and 'server unit tests' are pairwise non-substring.
+  #     meson-junit names by longest substring match) — 'shard A'/'shard B'/
+  #     'shard C'/'shard D' and 'server unit tests' are pairwise non-substring.
   # If a quiet leg pushes a shard past the #2093 80%-of-budget warning, the first
   # move is the concurrency gate / per-op cost (Defender TEMP exclusion, RAM disk),
   # then split or rebalance — raising the number is the last resort, not the first.
@@ -866,11 +904,97 @@ if build_server
   # change and is not addressed here. The partition is preserved
   # (N([pg]) == N(A) + N(B)); if you add a tag to one side, exclude it on the
   # other in the same edit.
+  #
+  # RE-BALANCED 2026-08-15: measured case counts had drifted to 586 (A) vs 1361
+  # (B) — a 2.3x split, up from the ~1.9x already flagged above — and B was
+  # TIMEOUT-ing at 600s on Linux and Windows both (#2092/#2093's own warning:
+  # "split the suite or rebalance before this flakes"). [rbac_store],
+  # [guaranteed_state_store] and [response_store] moved to A by the same
+  # AUDIT_STORE precedent above — each is a dedicated store's own tag, confined
+  # to that one test file, same shape as [audit_store] (verified: `grep -rl`
+  # each tag matches exactly one file). Moves 207 cases (93+61+53), landing at
+  # 793 (A) / 1154 (B) — better, not perfect; [custom_props] was considered and
+  # left out because it also tags test_props_scope_authz.cpp (a scope-authz
+  # suite, not pure store CRUD), so its per-case PG cost isn't confirmed uniform
+  # with the others.
+  #
+  # PR1.6a review remediation (same day) additionally moved [operator_surface]
+  # (the 3 new upload-grant MCP-twin PG integration tests) to A the same way —
+  # untagged, all 3 would land in B, which is already the heavier half and had
+  # separately reached 600.57/600s (killed by TIMEOUT) on CI before this move.
+  # Partition preserved: N([pg]) == N(A) + N(B).
+  #
+  # RE-BALANCED (ADR-0048, LicenseStore, 2026-08-15/16): B kept growing as
+  # sibling Wave 2 stores merged in and kept TIMEOUT-ing on Windows (and
+  # eventually Linux) even after this store's own [license_store] (33 cases,
+  # confined to test_license_store.cpp) was moved off it once already.
+  #
+  # RE-BALANCED AGAIN 2026-08-16 (PR #3156 review-response round, cherry-picked
+  # here — 3f0796777, now also merged to dev via #3156 itself): the day after
+  # the rebalance above, B TIMEOUT-ed again — 66 new/extended PG-backed cases
+  # split 25/41, landing B's already-heavier share disproportionately. A
+  # same-day two-shard fix (moving more tags onto A) was reviewed and rejected
+  # before merge: A's own prior measurement (0.616s/case, already 84% of
+  # budget) is a HIGHER per-case rate than B's, contradicting the
+  # "near-uniform per-case cost" premise these rebalances lean on —
+  # concentrating more cases onto the already-more-expensive shard projected
+  # to ~577s (96%), likely relocating the timeout rather than fixing it.
+  #
+  # SPLIT INTO THREE SHARDS instead. The store-heavy tag set (expensive: real
+  # CREATE DATABASE ... TEMPLATE clones per case, unlike lighter route/handler
+  # tests) is itself split across two shards rather than concentrated in one:
+  #   shard A = [routes]/[store]/[token]
+  #   shard B = [audit_store]/[rbac_store]/[guaranteed_state_store]/
+  #             [response_store]/[operator_surface]/[guardian_routes]/
+  #             [workflow]/[deployment_store]/[license_store], minus anything
+  #             already in A
+  #   shard C = everything else [pg]-tagged
+  # [license_store] folded into shard B's tag list on the cherry-pick (not
+  # present on PR #3156's branch, which has no reason to know about this
+  # store) — same confined-to-one-file precedent as every other tag in that
+  # list, re-verified against this merge's actual case counts via --list-tests
+  # on the built binary, not assumed from either side's pre-merge numbers.
+  # Partition preserved: N([pg]) == N(A) + N(B) + N(D) + N(C). (shard B split
+  # into B+D on 2026-08-16 — see the block above the B/D entries below.)
   test('server pg unit tests shard A', server_test_exe,
-       args: ['[pg][routes],[pg][store],[pg][token],[pg][audit_store]'],
+       args: ['[pg][routes],[pg][store],[pg][token]'],
        suite: 'server', timeout: 600)
+  # shard B SPLIT into B+D on 2026-08-16 (#2092/#2093): the store-tag half had
+  # reached 600/600s (100%) and flaked. BALANCED BY TIME, NOT COUNT — case count
+  # is not proportional to wall-time (shard C carries ~1082 cases comfortably;
+  # this store-tag set of ~428 was timing out, because each store-behaviour case
+  # does heavy per-test PG DDL / pre-migrated-template clones). Measured per-tag
+  # wall-time (isolated, local :5433 — a proxy; CI under c4 contention is ~2x+):
+  # [rbac_store] alone is the whale at ~57s, vs ~48s for the OTHER EIGHT tags
+  # COMBINED. So shard B = [rbac_store] alone; shard D = the other eight. This is
+  # count-lopsided (93 vs 335) ON PURPOSE — it is the time-balanced split (~57s
+  # vs ~48s), and time is what blows the 600s ceiling. Each shard is a strict
+  # SUBSET of the former at-600s run, so both are well under budget; B and D are
+  # disjoint and together cover exactly the tag set shard C excludes, so the
+  # partition N([pg]) == N(A)+N(B)+N(D)+N(C) is preserved (shard C UNCHANGED).
+  # When adding a new [pg] store tag: measure it, put it in whichever of B/D is
+  # lighter by TIME, AND add it to shard C's exclusion list (both or neither).
+  # If [rbac_store] itself grows toward the ceiling, split IT next (it is already
+  # the single densest tag).
   test('server pg unit tests shard B', server_test_exe,
-       args: ['[pg]~[routes]~[store]~[token]~[audit_store]'], suite: 'server', timeout: 600)
+       args: ['[pg][rbac_store]~[routes]~[store]~[token]'],
+       suite: 'server', timeout: 600)
+  # --allow-running-no-tests: shard D's eight tags are ALL DSN-gated store
+  # behaviour tests, so on a DSN-less platform (macOS, ADR-0035) every case
+  # SKIPs and Catch2 exits 4 on an all-skipped run — reddening the leg (#2092,
+  # found on the B/D split's first CI). Shards A/B/C survive the same all-skip
+  # only because each happens to carry a non-DSN case that runs to completion;
+  # D has none, so it needs the flag explicitly. The flag is a no-op where PG is
+  # present (Linux/Windows CI): the cases run normally. It is an OPTION, not a
+  # positional tag spec — flake-retry.py's isolated-retry surgery preserves it,
+  # and its hygiene selftest exempts --flags from the tag-spec pin.
+  test('server pg unit tests shard D', server_test_exe,
+       args: ['[pg][audit_store]~[routes]~[store]~[token],[pg][response_store]~[routes]~[store]~[token],[pg][operator_surface]~[routes]~[store]~[token],[pg][guaranteed_state_store]~[routes]~[store]~[token],[pg][workflow]~[routes]~[store]~[token],[pg][license_store]~[routes]~[store]~[token],[pg][deployment_store]~[routes]~[store]~[token],[pg][guardian_routes]~[routes]~[store]~[token]',
+              '--allow-running-no-tests'],
+       suite: 'server', timeout: 600)
+  test('server pg unit tests shard C', server_test_exe,
+       args: ['[pg]~[routes]~[store]~[token]~[audit_store]~[rbac_store]~[guaranteed_state_store]~[response_store]~[operator_surface]~[guardian_routes]~[workflow]~[deployment_store]~[license_store]'],
+       suite: 'server', timeout: 600)
 endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
@@ -1047,7 +1171,11 @@ if _bash_test.found() and meson.can_run_host_binaries() and build_agent and buil
     args: [files('shell/test_capability_matrix_gate.sh'), meson.project_build_root()],
     suite: 'docs',
     timeout: 120,
-    depends: [abi3_fixture_plugin, abi4_declared_fixture_plugin],
+    depends: [
+      abi3_fixture_plugin,
+      abi4_declared_fixture_plugin,
+      abi4_cpp_wrapper_fixture_plugin,
+    ],
   )
 endif
 

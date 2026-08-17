@@ -247,6 +247,25 @@ int do_product_codes(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// windows: MsiEnumProductsA/MsiGetProductInfoA -- native MSI API, rung 1.
+// macos: pkgutil --pkgs / --pkg-info via run_bounded_subprocess({"/bin/sh",
+// "-c", cmd}, ...) -- rung 3, ships via msi_packages_macos.hpp's pure
+// parsers.
+// linux: no MSI/pkgutil equivalent -- the code returns "platform not
+// supported" outright.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"list",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "pkgutil", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "msi_api", nullptr}},
+    {"product_codes",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "pkgutil", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "msi_api", nullptr}},
+};
+
 } // namespace
 
 class MsiPackagesPlugin final : public yuzu::Plugin {
@@ -260,6 +279,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"list", "product_codes", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

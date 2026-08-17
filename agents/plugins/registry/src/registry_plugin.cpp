@@ -90,6 +90,73 @@ HKEY parse_hive(std::string_view hive) {
 using yuzu::profiles::reg_type_name;
 #endif
 
+// ── ABI4 capability declarations (#2204) ─────────────────────────────────
+//
+// One row per entry in actions() below, same names/order. The plugin is
+// Windows-only by construction (the #ifndef _WIN32 branch of execute() above
+// never touches the registry at all — it emits the honest
+// "registry|unsupported|..." sentinel for every action) so every leg on
+// Linux/macOS is UNSUPPORTED: the OS has no registry to supply. Every
+// Windows leg is a direct Win32 Reg*W call — native, in-process, rung 1;
+// get_user_value additionally uses RegLoadKeyW to mount an offline
+// NTUSER.DAT (still a native in-process Win32 call, still rung 1).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        "get_value",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "set_value",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "delete_value",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "delete_key",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "key_exists",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "enumerate_keys",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "enumerate_values",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "get_user_value",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry+hive_mount", nullptr},
+    },
+    {
+        "list_profiles",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+};
+
 } // namespace
 
 class RegistryPlugin final : public yuzu::Plugin {
@@ -105,6 +172,14 @@ public:
                                      "key_exists", "enumerate_keys", "enumerate_values",
                                      "get_user_value", "list_profiles", nullptr};
         return acts;
+    }
+
+    [[nodiscard]] const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    [[nodiscard]] size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override { g_ctx = ctx.raw(); return {}; }

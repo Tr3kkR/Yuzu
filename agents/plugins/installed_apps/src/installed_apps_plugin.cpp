@@ -579,6 +579,57 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     return 0;
 }
 
+// ABI4 capability declarations (#2204). Windows reads the registry
+// Uninstall key(s) natively for all four actions (including the
+// RegLoadKeyW-mounted per-user hive walk in "list_per_user") — rung 1.
+// Linux and macOS collect through this plugin's local popen()-based
+// run_command()/system() (dpkg-query/rpm/pacman/apk, and
+// system_profiler/brew respectively) for every action — an ungoverned
+// rung-3 shell exec per ADR-3002's "27 of 49 plugins ... sit at an
+// ungoverned rung 3" (not yet migrated onto the shared argv runner).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "list",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query / rpm / pacman)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler SPApplicationsDataType)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W enumeration of the Uninstall key(s)", nullptr},
+    },
+    {
+        /* .action      = */ "query",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query / rpm / pacman)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler SPApplicationsDataType)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W enumeration of the Uninstall key(s)", nullptr},
+    },
+    {
+        /* .action      = */ "list_per_user",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query / rpm / pacman)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "popen(system_profiler SPApplicationsDataType) + popen(brew list --versions)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via "
+         "RegLoadKeyW when not already loaded",
+         nullptr},
+    },
+    {
+        /* .action      = */ "list_inventory",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query / rpm / pacman / apk)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler SPApplicationsDataType)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W enumeration of the Uninstall key(s)", nullptr},
+    },
+};
+
 } // namespace
 
 class InstalledAppsPlugin final : public yuzu::Plugin {
@@ -592,6 +643,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"list", "query", "list_per_user", "list_inventory", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
