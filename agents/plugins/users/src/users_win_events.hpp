@@ -21,6 +21,7 @@
 // one at a time -- both produce).
 #pragma once
 
+#include <cstdlib>
 #include <format>
 #include <map>
 #include <string>
@@ -63,6 +64,62 @@ inline bool find_between(std::string_view s, std::string_view open, std::string_
     return true;
 }
 
+// XML is a transport, not the value: a rendered field containing `&`, `<`,
+// `>`, `'`, or `"` comes back entity-escaped (e.g. a `TargetUserName` of
+// "R&D" renders as "R&amp;D"), so every extractor below decodes before
+// handing text to a caller. Decodes the five predefined entities plus
+// numeric character references (&#NN; and &#xHH;); anything else (an
+// unrecognised/malformed entity) passes through byte-for-byte rather than
+// being dropped, so a decode miss degrades to "still readable", not silent
+// data loss.
+inline std::string decode_xml_entities(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size();) {
+        if (s[i] != '&') {
+            out.push_back(s[i++]);
+            continue;
+        }
+        auto semi = s.find(';', i);
+        if (semi == std::string_view::npos) {
+            out.push_back(s[i++]);
+            continue;
+        }
+        const std::string_view entity = s.substr(i + 1, semi - i - 1);
+        if (entity == "amp") {
+            out.push_back('&');
+        } else if (entity == "lt") {
+            out.push_back('<');
+        } else if (entity == "gt") {
+            out.push_back('>');
+        } else if (entity == "quot") {
+            out.push_back('"');
+        } else if (entity == "apos") {
+            out.push_back('\'');
+        } else if (entity.size() > 1 && entity.front() == '#') {
+            const bool is_hex = entity.size() > 2 && (entity[1] == 'x' || entity[1] == 'X');
+            const std::string_view digits = entity.substr(is_hex ? 2 : 1);
+            char* end = nullptr;
+            const std::string digits_str(digits);
+            const long code = std::strtol(digits_str.c_str(), &end, is_hex ? 16 : 10);
+            if (!digits.empty() && end == digits_str.c_str() + digits_str.size() && code > 0 &&
+                code < 0x80) {
+                // ASCII-range only: every field this parser extracts (account/
+                // domain/workstation/IP names) is ASCII, and a full UTF-8
+                // encoder is unneeded complexity for a range this parser never
+                // sees in practice.
+                out.push_back(static_cast<char>(code));
+            } else {
+                out.append(s.substr(i, semi - i + 1)); // unrecognised: pass through
+            }
+        } else {
+            out.append(s.substr(i, semi - i + 1)); // unrecognised: pass through
+        }
+        i = semi + 1;
+    }
+    return out;
+}
+
 inline std::string extract_tag_text(std::string_view s, std::string_view tag, std::size_t from,
                                     std::size_t limit) {
     const std::string open_tag = std::format("<{}>", tag);
@@ -70,7 +127,7 @@ inline std::string extract_tag_text(std::string_view s, std::string_view tag, st
     std::size_t vb = 0, ve = 0;
     if (!find_between(s, open_tag, close_tag, from, limit, vb, ve))
         return {};
-    return std::string(s.substr(vb, ve - vb));
+    return decode_xml_entities(s.substr(vb, ve - vb));
 }
 
 // <TimeCreated SystemTime='...'/> -- an empty-element tag, not open/close, so
@@ -101,7 +158,7 @@ inline std::string extract_data_field(std::string_view s, std::string_view name,
     std::size_t vb = 0, ve = 0;
     if (!find_between(s, open_tag, "</Data>", from, limit, vb, ve))
         return {};
-    return std::string(s.substr(vb, ve - vb));
+    return decode_xml_entities(s.substr(vb, ve - vb));
 }
 
 } // namespace detail

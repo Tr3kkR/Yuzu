@@ -5,6 +5,12 @@
  * discovery, network_actions, wol, quarantine, services, interaction) — the
  * first forwarders of a bounded-runner outcome through this seam.
  *
+ * Lives in agents/core (not agents/shared): classify_runner_failure takes a
+ * yuzu::agent::SubprocessResult, so it carries a core dependency edge and
+ * doesn't qualify as an agents/shared zero-dependency leaf (cpp-conventions.md).
+ * Every plugin already links yuzu_agent_core_dep, so this needs no extra
+ * meson wiring at any consumer.
+ *
  * Maps only the NON-EXIT outcomes: whether a nonzero exit code is an error is
  * the caller's domain (a nonzero `ping` exit means "host down", not a plugin
  * failure), so `exited` — and the deliberate `line_limit` clean stop — return
@@ -21,7 +27,7 @@
 
 #include <optional>
 
-namespace yuzu::shared {
+namespace yuzu::agent {
 
 struct RunnerFailureStatus {
     YuzuResultStatus status;
@@ -32,8 +38,7 @@ struct RunnerFailureStatus {
 // Pure. nullopt => the child exited (incl. a clean line_limit stop): the
 // CALLER owns exit-code semantics.
 inline std::optional<RunnerFailureStatus> classify_runner_failure(
-    const yuzu::agent::SubprocessResult& r) {
-    using yuzu::agent::TerminationReason;
+    const SubprocessResult& r) {
     switch (r.termination_reason) {
     case TerminationReason::spawn_error:
         return RunnerFailureStatus{YUZU_RESULT_STATUS_UNAVAILABLE,
@@ -62,7 +67,7 @@ inline std::optional<RunnerFailureStatus> classify_runner_failure(
 // seam. Returns true when a status was set (the caller should usually stop
 // treating the output as complete).
 inline bool forward_runner_failure(yuzu::CommandContext& ctx,
-                                   const yuzu::agent::SubprocessResult& r) {
+                                   const SubprocessResult& r) {
     const auto s = classify_runner_failure(r);
     if (!s)
         return false;
@@ -70,4 +75,4 @@ inline bool forward_runner_failure(yuzu::CommandContext& ctx,
     return true;
 }
 
-} // namespace yuzu::shared
+} // namespace yuzu::agent

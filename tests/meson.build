@@ -272,7 +272,11 @@ agent_test_exe = executable(
     'unit/test_runner_status.cpp',             # Wave 2 WP-0: pure runner-outcome -> ABI4 result-seam table
     'unit/test_host_arg.cpp',                 # Wave 2 WP-0: shared leading-'-' host-arg gate (Decision 6)
     'unit/test_sudo_argv.cpp',                # Wave 2 WP-0: Decision-8 canonical sudo argv form (POSIX-only TU)
+    'unit/test_icmp_probe.cpp',               # Wave 2 WP-0: RFC-1071 checksum + numeric-literal resolve/set_port
     'unit/test_users_win_events.cpp',         # Wave 2 WP-A: pure wevtapi event-XML -> LogonEvent parser
+    'unit/test_users_posix_actions.cpp',      # Wave 2 WP-A remediation: real users.dylib/.so driven
+                                                # end to end via LocalDispatcher (POSIX-only; a no-op
+                                                # TU on Windows via the file's own #ifndef _WIN32 guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp

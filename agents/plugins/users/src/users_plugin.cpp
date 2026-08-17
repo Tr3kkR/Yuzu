@@ -20,7 +20,7 @@
 #ifndef _WIN32
 #include <chrono>
 #include <spdlog/spdlog.h>
-#include <runner_status.hpp> // yuzu::shared::forward_runner_failure (ABI4 result seam)
+#include <yuzu/agent/runner_status.hpp> // yuzu::agent::forward_runner_failure (ABI4 result seam)
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (K-7/CDX-07, ADR-3002 rung 2)
 #endif
 
@@ -101,12 +101,13 @@ bool is_safe_identifier(std::string_view s) {
 #ifndef _WIN32
 // Per-call wall-clock bound for the local account tools (dscl/last/lastlog/
 // who/w). Generous enough never to fire in practice, short enough that a
-// wedged tool cannot pin the instruction worker indefinitely.
-constexpr std::chrono::seconds kUsersCmdDeadline{20};
+// wedged tool cannot pin the instruction worker indefinitely. Read-only
+// tools stay within the plan's binding runner-idiom ceiling (5-10s).
+constexpr std::chrono::seconds kUsersCmdDeadline{10};
 
 /// Outcome of run_tool(): the captured output PLUS the raw runner result, so
 /// a caller can forward the latter through the ABI4 result seam
-/// (yuzu::shared::forward_runner_failure) itself instead of this helper
+/// (yuzu::agent::forward_runner_failure) itself instead of this helper
 /// deciding that on the caller's behalf.
 struct ToolOutcome {
     std::string output;
@@ -206,10 +207,12 @@ std::string render_event_xml(EVT_HANDLE event) {
 
 // Queries the Security channel with `xpath`, newest-first, rendering up to
 // `cap` events to XML and folding each through
-// yuzu::users_win::parse_logon_events into `out`. Returns false ONLY when
-// EvtQuery itself failed (missing/ACL-denied channel) — the caller owns the
-// fallback/error path for that case; a successful query that yields zero
-// events still returns true with `out` left empty (a real, distinct fact
+// yuzu::users_win::parse_logon_events into `out`. Returns false when EvtQuery
+// itself failed (missing/ACL-denied channel) OR when EvtNext failed with
+// anything other than ERROR_NO_MORE_ITEMS (a genuine I/O/access error mid-
+// query must not be reported as a clean, if partial, success) — either way
+// the caller owns the fallback/error path. A successful, fully-exhausted
+// query still returns true with `out` possibly empty (a real, distinct fact
 // from "couldn't query at all"). Every EVT_HANDLE — including EvtNext batch
 // handles seen after the cap is hit — is owned by an EvtGuard.
 bool query_logon_events(const wchar_t* xpath, std::size_t cap,
@@ -223,8 +226,11 @@ bool query_logon_events(const wchar_t* xpath, std::size_t cap,
     while (taken < cap) {
         EVT_HANDLE raw[64]{};
         DWORD got = 0;
-        if (!::EvtNext(q.h, static_cast<DWORD>(std::size(raw)), raw, INFINITE, 0, &got))
-            break; // ERROR_NO_MORE_ITEMS or a hard error — either way, done
+        if (!::EvtNext(q.h, static_cast<DWORD>(std::size(raw)), raw, INFINITE, 0, &got)) {
+            if (::GetLastError() != ERROR_NO_MORE_ITEMS)
+                return false; // a genuine I/O/access error, not clean exhaustion
+            break; // ERROR_NO_MORE_ITEMS — legitimately exhausted, done
+        }
         for (DWORD i = 0; i < got; ++i) {
             EvtGuard ev{raw[i]};
             if (taken >= cap)
@@ -273,7 +279,7 @@ int do_logged_on(yuzu::CommandContext& ctx) {
     // exposes no native enumeration API for this (unlike Linux's utmp above).
     auto who_res = run_tool({who_path});
     if (!status_forwarded)
-        status_forwarded = yuzu::shared::forward_runner_failure(ctx, who_res.res);
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, who_res.res);
     auto& who_out = who_res.output;
     if (!who_out.empty()) {
         std::istringstream ss(who_out);
@@ -356,7 +362,7 @@ int do_sessions(yuzu::CommandContext& ctx) {
     // lacks idle time).
     auto w_res = run_tool({w_path, "-h"});
     if (!status_forwarded)
-        status_forwarded = yuzu::shared::forward_runner_failure(ctx, w_res.res);
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, w_res.res);
     auto& w_out = w_res.output;
     if (!w_out.empty()) {
         std::istringstream ss(w_out);
@@ -381,7 +387,7 @@ int do_sessions(yuzu::CommandContext& ctx) {
     // info; no equivalent native macOS API is wired in this plugin.
     auto w_res = run_tool({w_path, "-h"});
     if (!status_forwarded)
-        status_forwarded = yuzu::shared::forward_runner_failure(ctx, w_res.res);
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, w_res.res);
     auto& w_out = w_res.output;
     if (!w_out.empty()) {
         std::istringstream ss(w_out);
@@ -526,7 +532,7 @@ int do_local_users(yuzu::CommandContext& ctx) {
             // line" selection.
             auto res = run_tool({lastlog_path, "-u", user});
             if (!status_forwarded)
-                status_forwarded = yuzu::shared::forward_runner_failure(ctx, res.res);
+                status_forwarded = yuzu::agent::forward_runner_failure(ctx, res.res);
             std::istringstream ll_ss(res.output);
             std::string ll_line;
             while (std::getline(ll_ss, ll_line)) {
@@ -562,7 +568,7 @@ int do_local_users(yuzu::CommandContext& ctx) {
     // C API this plugin already links against.
     auto dscl_res = run_tool({"/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"});
     if (!status_forwarded)
-        status_forwarded = yuzu::shared::forward_runner_failure(ctx, dscl_res.res);
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, dscl_res.res);
     auto& dscl_out = dscl_res.output;
     // Queried once per call, not per user: the console/GUI-login user via the
     // shared helper (agents/shared/macos_console_user.hpp). nullopt (no
@@ -597,7 +603,7 @@ int do_local_users(yuzu::CommandContext& ctx) {
             auto shell_res = run_tool(
                 {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "UserShell"});
             if (!status_forwarded)
-                status_forwarded = yuzu::shared::forward_runner_failure(ctx, shell_res.res);
+                status_forwarded = yuzu::agent::forward_runner_failure(ctx, shell_res.res);
             auto& shell = shell_res.output;
             // Extract second field (the shell path) without piping to awk
             bool enabled = true;
@@ -617,7 +623,7 @@ int do_local_users(yuzu::CommandContext& ctx) {
             auto desc_res = run_tool(
                 {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "RealName"});
             if (!status_forwarded)
-                status_forwarded = yuzu::shared::forward_runner_failure(ctx, desc_res.res);
+                status_forwarded = yuzu::agent::forward_runner_failure(ctx, desc_res.res);
             auto& desc_raw = desc_res.output;
             // Extract real name: skip first line ("RealName:"), trim leading space
             std::string desc;
@@ -663,7 +669,7 @@ int do_local_users(yuzu::CommandContext& ctx) {
                 auto last_res =
                     run_tool({"/usr/bin/env", "LC_ALL=C", last_path, "-y", "-1", user});
                 if (!status_forwarded)
-                    status_forwarded = yuzu::shared::forward_runner_failure(ctx, last_res.res);
+                    status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
                 auto& last_out = last_res.output;
                 bool saw_record = false;
                 std::istringstream last_ss(last_out);
@@ -794,7 +800,7 @@ int do_local_admins(yuzu::CommandContext& ctx) {
     auto admin_res =
         run_tool({"/usr/bin/dscl", ".", "-read", "/Groups/admin", "GroupMembership"});
     if (!status_forwarded)
-        status_forwarded = yuzu::shared::forward_runner_failure(ctx, admin_res.res);
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, admin_res.res);
     auto& admin_out = admin_res.output;
     if (!admin_out.empty()) {
         // Format: GroupMembership: user1 user2 user3
@@ -925,7 +931,7 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
     auto dscl_res = run_tool(
         {"/usr/bin/dscl", ".", "-read", std::format("/Groups/{}", group_name), "GroupMembership"});
     if (!status_forwarded)
-        status_forwarded = yuzu::shared::forward_runner_failure(ctx, dscl_res.res);
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, dscl_res.res);
     auto& dscl_out = dscl_res.output;
     if (!dscl_out.empty()) {
         auto colon = dscl_out.find(':');
@@ -1011,7 +1017,7 @@ int do_primary_user(yuzu::CommandContext& ctx) {
     // max_lines/stop_after_max_lines (was `| head -200`).
     auto last_res = run_tool({last_path, "-F"}, 200);
     if (!status_forwarded)
-        status_forwarded = yuzu::shared::forward_runner_failure(ctx, last_res.res);
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
     auto& last_out = last_res.output;
     if (!last_out.empty()) {
         std::map<std::string, int> login_counts;
@@ -1056,7 +1062,7 @@ int do_primary_user(yuzu::CommandContext& ctx) {
     // max_lines/stop_after_max_lines (was `| head -200`).
     auto last_res = run_tool({last_path}, 200);
     if (!status_forwarded)
-        status_forwarded = yuzu::shared::forward_runner_failure(ctx, last_res.res);
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
     auto& last_out = last_res.output;
     if (!last_out.empty()) {
         std::map<std::string, int> login_counts;
@@ -1152,7 +1158,7 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
     // output, so no max_lines cap is needed here.
     auto last_res = run_tool({last_path, "-F", "-n", std::to_string(count)});
     if (!status_forwarded)
-        status_forwarded = yuzu::shared::forward_runner_failure(ctx, last_res.res);
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
     auto& last_out = last_res.output;
     if (!last_out.empty()) {
         std::istringstream ss(last_out);
@@ -1202,7 +1208,7 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
     // output, so no max_lines cap is needed here.
     auto last_res = run_tool({last_path, "-n", std::to_string(count)});
     if (!status_forwarded)
-        status_forwarded = yuzu::shared::forward_runner_failure(ctx, last_res.res);
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
     auto& last_out = last_res.output;
     if (!last_out.empty()) {
         std::istringstream ss(last_out);

@@ -140,6 +140,66 @@ TEST_CASE("parse_logon_events: a machine account ('$') is parsed, not dropped by
     CHECK(events[0].target_user == "DESKTOP-04DNSIG$");
 }
 
+TEST_CASE("parse_logon_events: XML entity-escaped account text decodes to the real value",
+          "[users][win_events]") {
+    // EvtRender escapes '&' in element text as-rendered: a real account or
+    // domain name containing '&' (e.g. an "R&D" AD domain) comes back over
+    // the wire as "R&amp;D", not the literal string. Un-decoded, that literal
+    // would be counted and reported under the wrong name.
+    auto events = parse_logon_events(make_event("4624", "t", "R&amp;D User", "3"));
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].target_user == "R&D User");
+}
+
+TEST_CASE("parse_logon_events: entity decoding covers all five predefined entities + numeric refs",
+          "[users][win_events]") {
+    auto events = parse_logon_events(
+        make_event("4624", "t", "&lt;a&gt;&amp;&apos;b&apos;&quot;c&quot;&#65;&#x42;", "3"));
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].target_user == "<a>&'b'\"c\"AB");
+}
+
+TEST_CASE("parse_logon_events: an unrecognised entity passes through unchanged",
+          "[users][win_events]") {
+    // Never silently drops text on a malformed/unrecognised entity -- degrade
+    // to "still readable" rather than data loss.
+    auto events = parse_logon_events(make_event("4624", "t", "weird&nbsp;name", "3"));
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].target_user == "weird&nbsp;name");
+}
+
+TEST_CASE("parse_logon_events: entity decoding also applies to TargetDomainName",
+          "[users][win_events]") {
+    const std::string xml =
+        "<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'>"
+        "<System><Provider Name='Microsoft-Windows-Security-Auditing'/>"
+        "<EventID>4624</EventID><TimeCreated SystemTime='t'/></System>"
+        "<EventData><Data Name='TargetUserSid'>S-1-5-21-0-0-0-1</Data>"
+        "<Data Name='TargetUserName'>Alex</Data>"
+        "<Data Name='TargetDomainName'>R&amp;D</Data>"
+        "<Data Name='LogonType'>3</Data></EventData></Event>";
+    auto events = parse_logon_events(xml);
+    REQUIRE(events.size() == 1);
+    CHECK(events[0].target_domain == "R&D");
+}
+
+TEST_CASE("primary_user_from_events / session_history_rows: entity-decoded text flows through "
+          "both projections",
+          "[users][win_events]") {
+    auto events = parse_logon_events(make_event("4624", "2026-08-14T20:10:49.0000000Z",
+                                                 "R&amp;D User", "3"));
+    REQUIRE(events.size() == 1);
+
+    auto [primary, count] = primary_user_from_events(events);
+    CHECK(primary == "R&D User");
+    CHECK(count == 1);
+
+    auto rows = session_history_rows(events);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] ==
+          "session_history|R&D User|logon|network|-|2026-08-14T20:10:49.0000000Z|4624");
+}
+
 // ---------------------------------------------------------------------------
 // primary_user_from_events
 // ---------------------------------------------------------------------------
