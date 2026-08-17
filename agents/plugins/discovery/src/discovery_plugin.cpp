@@ -7,10 +7,14 @@
  * Output is pipe-delimited via write_output():
  *   host|ip_address|mac_address|hostname|managed
  *
- * Platform support:
- *   Windows — arp -a parsing + ping sweep via subprocess
- *   Linux   — arp -n parsing + ping sweep via subprocess
- *   macOS   — arp -a parsing + ping sweep via subprocess
+ * Platform support (zero spawn sites, all native/rung 1):
+ *   Windows — GetIpNetTable2 ARP read + IcmpSendEcho ping sweep.
+ *   Linux   — /proc/net/arp read + unprivileged SOCK_DGRAM ICMP ping sweep
+ *             (net.ipv4.ping_group_range-gated; see the honest-degrade
+ *             branch in do_scan_subnet for the CONSTRAINED/UNAVAILABLE
+ *             fallback when the kernel refuses the socket).
+ *   macOS   — sysctl NET_RT_FLAGS/RTF_LLINFO ARP read + SOCK_DGRAM ICMP
+ *             ping sweep.
  *
  * Input validation: subnet parameter is validated as a CIDR block.
  * Only alphanumeric, dots, slashes, and colons are allowed to prevent
@@ -26,7 +30,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <format>
+#include <fstream>
 #include <map>
+#include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -44,10 +51,21 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <netioapi.h> // GetIpNetTable2 / MIB_IPNET_ROW2 (tar_arp_collector.cpp precedent)
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#endif
+
+#include "icmp_probe.hpp" // yuzu::shared::IcmpSession — shared unprivileged ping sweep
+
+#ifdef __linux__
+#include "discovery_parsers.hpp" // yuzu::discovery::parse_proc_net_arp — pure /proc/net/arp parser
+#endif
+
+#ifdef __APPLE__
+#include "route_sysctl_arp.hpp" // yuzu::shared::{fetch,parse}_rt_flags_llinfo — sysctl ARP read
 #endif
 
 namespace {
@@ -142,28 +160,6 @@ std::vector<std::string> enumerate_hosts(uint32_t base_ip, int prefix_len) {
     return result;
 }
 
-// ── subprocess helper ──────────────────────────────────────────────────────
-
-std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-#ifdef _WIN32
-    FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
-    if (!pipe) return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
-    }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
-    return result;
-}
-
 struct ArpEntry {
     std::string ip;
     std::string mac;
@@ -174,106 +170,86 @@ struct ArpEntry {
 #ifdef _WIN32
 
 /**
- * Parse Windows ARP table. Windows `arp -a` output format:
- *   Interface: 192.168.1.100 --- 0xb
- *     Internet Address      Physical Address      Type
- *     192.168.1.1           aa-bb-cc-dd-ee-ff     dynamic
+ * Read the Windows ARP table via GetIpNetTable2(AF_INET) — the neighbour
+ * cache, native (no popen). FreeMibTable is called on every exit path.
  */
 std::vector<ArpEntry> get_arp_table() {
     std::vector<ArpEntry> entries;
 
-    // Use Win32 API for reliable ARP table access
-    DWORD size = 0;
-    GetIpNetTable(nullptr, &size, FALSE);
-    if (size == 0) return entries;
-
-    std::vector<BYTE> buffer(size);
-    if (GetIpNetTable(reinterpret_cast<MIB_IPNETTABLE*>(buffer.data()),
-                      &size, FALSE) != NO_ERROR)
+    PMIB_IPNET_TABLE2 table = nullptr;
+    DWORD rc = GetIpNetTable2(AF_INET, &table);
+    // RAII: FreeMibTable runs on every exit path below, early returns
+    // included, without needing to remember to call it manually.
+    std::unique_ptr<MIB_IPNET_TABLE2, decltype(&FreeMibTable)> table_owner{
+        table, &FreeMibTable};
+    if (rc != NO_ERROR || table == nullptr)
         return entries;
 
-    auto* table = reinterpret_cast<MIB_IPNETTABLE*>(buffer.data());
-    for (DWORD i = 0; i < table->dwNumEntries; ++i) {
-        auto& row = table->table[i];
-        // Only dynamic and static entries
-        if (row.dwType != MIB_IPNET_TYPE_DYNAMIC && row.dwType != MIB_IPNET_TYPE_STATIC)
+    for (ULONG i = 0; i < table->NumEntries; ++i) {
+        const MIB_IPNET_ROW2& row = table->Table[i];
+
+        // Accept resolved/reachable states only, equivalent to the old
+        // MIB_IPNET_TYPE_DYNAMIC|MIB_IPNET_TYPE_STATIC filter.
+        switch (row.State) {
+        case NlnsReachable:
+        case NlnsStale:
+        case NlnsDelay:
+        case NlnsProbe:
+        case NlnsPermanent:
+            break;
+        default:
+            continue;
+        }
+
+        if (row.PhysicalAddressLength < 6)
             continue;
 
-        struct in_addr addr{};
-        addr.S_un.S_addr = static_cast<ULONG>(row.dwAddr);
         char ip[INET_ADDRSTRLEN]{};
-        inet_ntop(AF_INET, &addr, ip, sizeof(ip));
+        if (!inet_ntop(AF_INET, const_cast<IN_ADDR*>(&row.Address.Ipv4.sin_addr), ip, sizeof(ip)))
+            continue;
 
-        // Format MAC address
-        if (row.dwPhysAddrLen >= 6) {
-            char mac[18]{};
-            snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                     row.bPhysAddr[0], row.bPhysAddr[1], row.bPhysAddr[2],
-                     row.bPhysAddr[3], row.bPhysAddr[4], row.bPhysAddr[5]);
-            entries.push_back({ip, mac});
-        }
+        char mac[18]{};
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 row.PhysicalAddress[0], row.PhysicalAddress[1], row.PhysicalAddress[2],
+                 row.PhysicalAddress[3], row.PhysicalAddress[4], row.PhysicalAddress[5]);
+
+        entries.push_back({ip, mac});
     }
+
     return entries;
 }
 
 #elif defined(__APPLE__)
 
 /**
- * Parse macOS ARP table. macOS `arp -a` output format:
- *   ? (192.168.1.1) at aa:bb:cc:dd:ee:ff on en0 ifscope [ethernet]
+ * Read the macOS ARP table via the routing socket sysctl
+ * (route_sysctl_arp.hpp) — the same data `arp -a` reads, native (no popen).
  */
 std::vector<ArpEntry> get_arp_table() {
     std::vector<ArpEntry> entries;
-    std::string output = run_command("arp -a 2>/dev/null");
-    std::istringstream iss(output);
-    std::string line;
-
-    while (std::getline(iss, line)) {
-        // Find IP in parentheses
-        auto paren_start = line.find('(');
-        auto paren_end = line.find(')');
-        if (paren_start == std::string::npos || paren_end == std::string::npos)
-            continue;
-
-        std::string ip = line.substr(paren_start + 1, paren_end - paren_start - 1);
-
-        // Find MAC after " at "
-        auto at_pos = line.find(" at ");
-        if (at_pos == std::string::npos) continue;
-        auto mac_start = at_pos + 4;
-        auto mac_end = line.find(' ', mac_start);
-        if (mac_end == std::string::npos) mac_end = line.size();
-        std::string mac = line.substr(mac_start, mac_end - mac_start);
-
-        if (mac != "(incomplete)" && !mac.empty())
-            entries.push_back({ip, mac});
-    }
+    auto blob = yuzu::shared::fetch_rt_flags_llinfo();
+    for (auto& rec : yuzu::shared::parse_rt_flags_llinfo(blob))
+        entries.push_back({std::move(rec.ip), std::move(rec.mac)});
     return entries;
 }
 
 #elif defined(__linux__)
 
 /**
- * Parse Linux ARP table. Linux `arp -n` output format:
- *   Address         HWtype  HWaddress           Flags Mask  Iface
- *   192.168.1.1     ether   aa:bb:cc:dd:ee:ff   C           eth0
+ * Read the Linux ARP table from /proc/net/arp (discovery_parsers.hpp) —
+ * native, no `arp -n` subprocess.
  */
 std::vector<ArpEntry> get_arp_table() {
     std::vector<ArpEntry> entries;
-    std::string output = run_command("arp -n 2>/dev/null");
-    std::istringstream iss(output);
-    std::string line;
+    std::ifstream in("/proc/net/arp");
+    if (!in)
+        return entries;
 
-    // Skip header
-    std::getline(iss, line);
+    std::ostringstream contents;
+    contents << in.rdbuf();
 
-    while (std::getline(iss, line)) {
-        std::istringstream lss(line);
-        std::string ip, hwtype, mac;
-        if (!(lss >> ip >> hwtype >> mac)) continue;
-        if (mac != "(incomplete)" && !mac.empty() && hwtype == "ether")
-            entries.push_back({ip, mac});
-    }
+    for (auto& e : yuzu::discovery::parse_proc_net_arp(contents.str()))
+        entries.push_back({std::move(e.ip), std::move(e.mac)});
     return entries;
 }
 
@@ -315,42 +291,60 @@ std::string resolve_hostname(const std::string& ip) {
 // ── Ping sweep ────────────────────────────────────────────────────────────
 
 /**
- * Ping a single host with a short timeout.
+ * Sample one host over the shared ICMP session. Builds the destination
+ * address from the (already-validated, dotted-quad) IP string and delegates
+ * to yuzu::shared::IcmpSession::sample — no subprocess, no per-host socket.
+ */
+#ifdef _WIN32
+std::optional<double> icmp_sample(yuzu::shared::IcmpSession& session, const std::string& ip,
+                                  int timeout_ms) {
+    struct in_addr addr{};
+    if (inet_pton(AF_INET, ip.c_str(), &addr) != 1)
+        return std::nullopt;
+    return session.sample(addr.S_un.S_addr, timeout_ms);
+}
+#else
+std::optional<double> icmp_sample(yuzu::shared::IcmpSession& session, const std::string& ip,
+                                  int timeout_ms) {
+    sockaddr_in sin{};
+    sin.sin_family = AF_INET;
+    if (inet_pton(AF_INET, ip.c_str(), &sin.sin_addr) != 1)
+        return std::nullopt;
+    return session.sample(sin, timeout_ms);
+}
+#endif
+
+/**
+ * Ping a single host over the shared session with a short timeout.
  * Returns true if the host responds.
  */
-bool ping_host(const std::string& ip, int timeout_ms) {
-#ifdef _WIN32
-    std::string cmd = std::format("ping -n 1 -w {} {} >NUL 2>NUL", timeout_ms, ip);
-    return system(cmd.c_str()) == 0;
-#elif defined(__APPLE__)
-    int timeout_sec = std::max(1, timeout_ms / 1000);
-    std::string cmd = std::format("ping -c 1 -t {} {} >/dev/null 2>&1", timeout_sec, ip);
-    return system(cmd.c_str()) == 0;
-#else
-    int timeout_sec = std::max(1, timeout_ms / 1000);
-    std::string cmd = std::format("ping -c 1 -W {} {} >/dev/null 2>&1", timeout_sec, ip);
-    return system(cmd.c_str()) == 0;
-#endif
+bool ping_host(yuzu::shared::IcmpSession& session, const std::string& ip, int timeout_ms) {
+    return icmp_sample(session, ip, timeout_ms).has_value();
 }
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
-// scan_subnet combines an ARP-table read with a ping sweep. The ARP read is
-// native on Windows (GetIpNetTable) but shells out via popen on Linux/macOS
-// (get_arp_table above); the ping sweep shells out via system() on EVERY
-// platform, including Windows (ping_host above) — so even the Windows leg
-// cannot be called a native GetIpNetTable2-only leg: the action still
-// popens arp/ping today (rung 3 on all three platforms), not a native
-// netlink/GetIpNetTable2-only implementation.
+// scan_subnet combines an ARP-table read with an ICMP ping sweep, all
+// native now (zero spawn sites, rung 1 on every platform): Windows reads
+// GetIpNetTable2 and pings via IcmpSendEcho; macOS reads the routing socket
+// (sysctl NET_RT_FLAGS/RTF_LLINFO) and pings via an unprivileged SOCK_DGRAM
+// ICMP socket; Linux reads /proc/net/arp and pings the same way, but the
+// ICMP socket depends on net.ipv4.ping_group_range admitting the agent's
+// gid — see do_scan_subnet's honest-degrade branch for the CONSTRAINED /
+// UNAVAILABLE fallback this leg documents.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "scan_subnet",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "arp table + ping sweep via popen/system()", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "/proc/net/arp + unprivileged SOCK_DGRAM ICMP",
+         "the ICMP sweep needs net.ipv4.ping_group_range to admit the agent's gid; "
+         "ARP-only results with a CONSTRAINED/PARTIAL status otherwise, or "
+         "UNAVAILABLE/PARTIAL when the ICMP socket cannot be created at all. netlink "
+         "RTM_GETNEIGH is a recorded future promotion over /proc/net/arp"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "arp table + ping sweep via popen/system()", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sysctl NET_RT_FLAGS/RTF_LLINFO + SOCK_DGRAM ICMP", nullptr},
         /* .windows_leg = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "GetIpNetTable + ping sweep via system()", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "GetIpNetTable2 + IcmpSendEcho", nullptr},
     },
 };
 
@@ -452,39 +446,78 @@ private:
         int done = 0;
         std::set<std::string> alive_ips;
 
-        for (const auto& ip : hosts) {
-            // Check overall scan timeout
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - scan_start).count();
-            if (elapsed >= kScanTimeoutSeconds) {
-                timed_out = true;
-                ctx.write_output(std::format("status|warning|scan timed out after {}s, "
-                                             "returning partial results ({}/{})",
-                                             elapsed, done, total));
-                break;
-            }
+        // ONE ICMP session per scan (never per host — a /24 must not open
+        // 254 sockets). Each probe gets a short per-host timeout separate
+        // from the caller's overall timeout_ms.
+        yuzu::shared::IcmpSession session;
+        const int probe_timeout_ms = std::min(timeout_ms, 300);
 
-            // If already in ARP table, it's alive
-            if (arp_ips.count(ip)) {
-                alive_ips.insert(ip);
+        if (!session.ok()) {
+            // HONEST DEGRADE — two distinct failure states, both resolved
+            // before any probe is attempted. Never probe through an invalid
+            // session; fall back to the ARP-derived host set and warn once.
+            if (!session.permitted) {
+                // net.ipv4.ping_group_range refused the unprivileged
+                // SOCK_DGRAM ICMP socket (POSIX only — see IcmpSession's
+                // ctor; Windows' permitted is always true).
+                ctx.write_output(
+                    "status|warning|unprivileged ICMP socket denied by "
+                    "net.ipv4.ping_group_range — reporting ARP-table hosts only");
+                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                      "icmp:ping_group_range");
             } else {
-                // Ping it
-                if (ping_host(ip, timeout_ms)) {
+                // Generic socket failure (EMFILE/ENFILE/ENOMEM on POSIX, or
+                // IcmpCreateFile failing on Windows) — not a permissions
+                // issue, the ICMP socket is simply unavailable.
+                ctx.write_output(
+                    "status|warning|ICMP socket unavailable — reporting ARP-table hosts only");
+                ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                      "icmp:socket_error");
+            }
+            // Confine the degrade fallback to the requested subnet — never
+            // surface unrelated cached ARP neighbors (other subnets,
+            // multicast/broadcast entries) as scan results.
+            for (const auto& ip : hosts) {
+                if (arp_ips.count(ip))
                     alive_ips.insert(ip);
+            }
+        } else {
+            for (const auto& ip : hosts) {
+                // Check overall scan timeout
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - scan_start).count();
+                if (elapsed >= kScanTimeoutSeconds) {
+                    timed_out = true;
+                    ctx.write_output(std::format("status|warning|scan timed out after {}s, "
+                                                 "returning partial results ({}/{})",
+                                                 elapsed, done, total));
+                    break;
                 }
-            }
 
-            ++done;
-            int progress = 10 + (done * 80 / total);
-            if (done % 10 == 0 || done == total) {
-                ctx.report_progress(progress);
-            }
+                // If already in ARP table, it's alive
+                if (arp_ips.count(ip)) {
+                    alive_ips.insert(ip);
+                } else {
+                    // Ping it
+                    if (ping_host(session, ip, probe_timeout_ms)) {
+                        alive_ips.insert(ip);
+                    }
+                }
 
-            // Progress reporting every 50 hosts
-            if (done % 50 == 0) {
-                ctx.write_output(std::format("progress|scanned {} of {} hosts, "
-                                             "{} alive so far",
-                                             done, total, alive_ips.size()));
+                ++done;
+                int progress = 10 + (done * 80 / total);
+                if (done % 10 == 0 || done == total) {
+                    ctx.report_progress(progress);
+                }
+
+                // Progress reporting every 50 hosts
+                if (done % 50 == 0) {
+                    ctx.write_output(std::format("progress|scanned {} of {} hosts, "
+                                                 "{} alive so far",
+                                                 done, total, alive_ips.size()));
+                }
             }
         }
 
