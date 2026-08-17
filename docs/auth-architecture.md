@@ -2484,7 +2484,10 @@ resulting latency bounds.
   tokens are referentially checked against `EnginePrincipalStore` at mint
   time, always `mcp_tier=readonly`, and always carry a ≤90-day expiry.
 - **Session-authorization semantics — RBAC-only, no fallback (PR 4.2 fix
-  round).** `AuthRoutes::require_permission`/`require_scoped_permission`
+  round).** `AuthRoutes::require_permission`/`require_scoped_permission`/
+  `require_list_read` (the last is the ADR-0017 admit-then-filter list-read
+  gate, #3038 — see the Authentication/RBAC row in
+  `.claude/routed-concerns-access-control.md`) all
   branch on `session->principal_kind == "engine"` **before** falling through
   to the legacy pre-RBAC path or the MCP-tier/service-scoped resolution used
   for human and agent sessions. An engine session's authority is resolved

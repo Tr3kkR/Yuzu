@@ -1124,6 +1124,30 @@ window later that is population churn, not a new incident.
 | `yuzu_fleet_guardian_journal_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** journal tag - the coverage denominator the 30 counters lack. **Published every sweep including `0`**, unlike them. Read `0` carefully: the writer is sparse, so this counts agents with a **non-zero** counter, not agents whose journal works - `0` means either the telemetry path is dark **or** nothing has been journalled anywhere since restart (a live journal on a fleet with no deployed Guardian rules reads `0` legitimately). It narrows the overloaded absence of the 30; it does not resolve it. **Counts the 30 counter tags only - an agent reporting only the three `_seconds` age tags does not count here** |
 | `yuzu_fleet_guardian_journal_tag_rejected` | gauge | Journal tags **present** on a heartbeat this sweep but rejected by the forged-value parse (non-numeric, negative, over 10 digits, or above the plausibility ceiling). **Published every sweep including `0`**. Without it a rejected value is a silent drop - if the rejecting agent were the only reporter, its family goes absent and absent reads as clean. `> 0` means some agent is shipping malformed journal telemetry |
 
+### Guardian M1 health-stream fleet gauges
+
+The M1 flood-guard telemetry ([Guaranteed State](guaranteed-state.md)'s errored-view
+staleness/priority-lane backstops): 3 sparse counters rolled up as an **unlabelled fleet
+sum**, same absent-not-zero rule and same forged-value posture as the journal family
+above - a healthy or inert (`prefer_spark` off) fleet reads all three **absent**, never
+a fabricated `0`. **Monitor-only**, same reasons as the journal family: no
+churn-robust alert form exists over an unlabelled fleet sum of per-agent cumulative
+counters.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_guardian_unhealthy_suppressed` | gauge | Fleet sum of convergence re-evals of a still-errored Guardian rule whose repeat `guard.unhealthy` was **not** re-emitted (the edge-suppression flood guard). Monitor-only |
+| `yuzu_fleet_guardian_unhealthy_refreshed` | gauge | Fleet sum of `guard.unhealthy` **re-emissions** for a rule still stuck errored, sent at `errored_refresh_ms` cadence (default 300 s) so a lost/coalesced edge cannot leave the server's errored view stale forever. Sibling to `_unhealthy_suppressed` - together they partition every committed repeat-errored eval into "put on the wire" vs "not this tick" |
+| `yuzu_fleet_guardian_priority_demoted` | gauge | Fleet sum of rule_ids demoted off the 5 s convergence priority lane to their normal type-lane cadence after K consecutive Unknown sweeps or T elapsed (defaults 12 sweeps / 120 s) - the read-flood guard for a rule stuck pending-initial |
+| `yuzu_fleet_guardian_health_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** health tag - the coverage denominator for the 3 counters. **Published every sweep including `0`**. Read `0` carefully, same caveat as the journal family's reporting gauge: the writer is sparse, so this counts agents with a non-zero counter, not agents whose health pipeline is working - a live fleet with nothing currently errored/refreshed/demoted reads `0` legitimately |
+| `yuzu_fleet_guardian_health_tag_rejected` | gauge | Health tags **present** on a heartbeat this sweep but rejected by the forged-value parse. **Published every sweep including `0`**. `> 0` means some agent is shipping malformed Guardian health telemetry |
+
+`errored_rules` on `GET /api/v1/guaranteed-state/status` and `/status/{agent_id}`
+(#2298 item 6d) is a **separate**, REST-surfaced count derived from the
+`guardian_agent_rule_status` census table, not from these heartbeat gauges - the two
+answer different questions (this family: how much flood-guard activity occurred;
+`errored_rules`: how many rules are errored right now).
+
 ## NVD CVE sync metrics
 
 The server maintains a local mirror of the NVD (National Vulnerability Database)
