@@ -81,6 +81,12 @@ int deny_tag_read(void*, int action, const char* arg1, const char*, const char*,
     return SQLITE_OK;
 }
 
+// Unconditionally interrupts the VM — used to force sqlite3_step to return
+// SQLITE_INTERRUPT rather than SQLITE_ROW/SQLITE_DONE, exercising the
+// mid-scan (not prepare-time) failure path agents_with_tag_checked's fix
+// distinguishes from a genuine end-of-results.
+int force_interrupt(void*) { return 1; }
+
 // Distinct template name from every other file's "rbacstore*" registrations
 // (test_list_read_confinement.cpp's "rbacstore", test_engine_principal_
 // integration.cpp's "rbacstore_integ") — same registry, no shared-state risk.
@@ -344,6 +350,49 @@ TEST_CASE("authorize_fleet_read: degraded tag-store prepare on a service token �
     CHECK(res.status == 503);
 
     sqlite3_set_authorizer(db, nullptr, nullptr);
+}
+
+TEST_CASE("authorize_fleet_read: mid-scan tag-store failure (not prepare-time) on a service "
+          "token ⇒ Degraded, never a partial admit",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
+    auto token = r.mint("printers");
+    auto req = bearer_request(token);
+    httplib::Response res;
+
+    sqlite3* db = TagStoreFaultHook::db(r.tags);
+    REQUIRE(db != nullptr);
+    // Fires during the VM run, after prepare succeeds — unlike deny_tag_read
+    // above, this exercises agents_with_tag_checked's terminal-rc check
+    // (any sqlite3_step rc other than SQLITE_DONE), not its prepare guard.
+    sqlite3_progress_handler(db, 1, force_interrupt, nullptr);
+
+    auto result = r.ar->authorize_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Degraded);
+    CHECK(res.status == 503);
+
+    sqlite3_progress_handler(db, 0, nullptr, nullptr);
+}
+
+TEST_CASE("authorize_fleet_read: genuinely empty service set ⇒ admitted-empty witness, "
+          "not denied (present-empty != degraded)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value()); // AdmitAll
+    auto token = r.mint("no-such-service"); // no agent carries this tag value
+    auto req = bearer_request(token);
+    httplib::Response res;
+
+    auto result = r.ar->authorize_fleet_read(req, res, "Response", "Read");
+    REQUIRE(result.has_value()); // present, not an error — a real answer, not a degradation
+    CHECK_FALSE(result->unfiltered());
+    CHECK_FALSE(result->in_scope("a_p"));
+    CHECK_FALSE(result->in_scope("a_c1"));
+    CHECK_FALSE(result->in_scope("a_s"));
 }
 
 TEST_CASE("authorize_fleet_read: null rbac store ⇒ Forbidden (not a crash)",
