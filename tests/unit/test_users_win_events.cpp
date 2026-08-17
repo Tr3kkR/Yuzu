@@ -327,6 +327,30 @@ TEST_CASE("session_history_rows: a decoded pipe/CR/LF entity cannot corrupt row 
     CHECK(field_count == 7);
 }
 
+TEST_CASE("session_history_rows: a malicious TimeCreated/EventID cannot corrupt row framing",
+          "[users][win_events]") {
+    // TimeCreated's SystemTime attribute is never entity-decoded (unlike
+    // TargetUserName/EventID), so a raw '|'/CR/LF byte reaching it -- e.g.
+    // from a malformed or replayed capture -- must still be safe_output_field
+    // escaped, same as event_id (which IS entity-decoded via extract_tag_text
+    // before this fix). Neither field was covered by the earlier pipe/CR/LF
+    // regression test above, which only exercised TargetUserName.
+    auto events = parse_logon_events(
+        make_event("4624&#124;evil", "mal|icious\r\ntime", "Alex", "3"));
+    REQUIRE(events.size() == 1);
+    auto rows = session_history_rows(events);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].find('\n') == std::string::npos);
+    CHECK(rows[0].find('\r') == std::string::npos);
+    CHECK(rows[0].find("\\|") != std::string::npos);
+    int field_count = 1;
+    for (std::size_t i = 0; i < rows[0].size(); ++i) {
+        if (rows[0][i] == '|' && (i == 0 || rows[0][i - 1] != '\\'))
+            ++field_count;
+    }
+    CHECK(field_count == 7);
+}
+
 TEST_CASE("session_history_rows: full field-by-field assertion on one real 4634 event",
           "[users][win_events]") {
     auto events = parse_logon_events(kFixtureMixed);
