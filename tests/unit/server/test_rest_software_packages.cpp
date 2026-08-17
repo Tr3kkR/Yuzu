@@ -471,7 +471,10 @@ TEST_CASE("REST software-deployment routes answer 503 (not 400) on a genuine sto
         // confirm none of that text reached the client.
         CHECK(res->body.find("does not exist") == std::string::npos);
         CHECK(res->body.find("software_deployment_store") == std::string::npos);
-        REQUIRE(h.audit_log.empty()); // create_package's route has no failure-path audit call
+        // No STORE-failure audit call on this route -- denial audits (the
+        // emit_denial path above) fire only on a validation failure, and
+        // this request's body passes validation, failing only at the store.
+        REQUIRE(h.audit_log.empty());
     }
     SECTION("GET /api/v1/software-packages") {
         auto res = h.get_packages();

@@ -1635,9 +1635,18 @@ TEST_CASE("SoftwareDeploymentStore::migrate_from_sqlite reads one consistent cro
 
     std::atomic<bool> migrate_done{false};
     std::atomic<bool> writer_landed_mid_migrate{false};
+    // Catch2's assertion macros are not documented/supported from a non-main
+    // thread (thread-local state tracking the current test case) -- a
+    // REQUIRE in here could misbehave instead of cleanly failing the test.
+    // Record failure via atomic and let the main thread REQUIRE it after
+    // join(), same as writer_open_failed below.
+    std::atomic<bool> writer_open_failed{false};
     std::thread writer([&] {
         SqliteDb w;
-        REQUIRE(sqlite3_open(legacy_path.string().c_str(), w.addr()) == SQLITE_OK);
+        if (sqlite3_open(legacy_path.string().c_str(), w.addr()) != SQLITE_OK) {
+            writer_open_failed = true;
+            return;
+        }
         sqlite3_busy_timeout(w.get(), 0); // fail fast; we retry ourselves, never block the reader
         while (!migrate_done.load(std::memory_order_acquire)) {
             if (sqlite3_exec(w.get(), "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
@@ -1694,6 +1703,7 @@ TEST_CASE("SoftwareDeploymentStore::migrate_from_sqlite reads one consistent cro
     migrate_done.store(true, std::memory_order_release);
     writer.join();
 
+    REQUIRE_FALSE(writer_open_failed.load());
     INFO("writer's swap landed while migrate_from_sqlite was still running: "
          << (writer_landed_mid_migrate.load() ? "yes" : "no (benign -- see comment above)"));
     if (!migrated)
