@@ -205,16 +205,25 @@ std::string render_event_xml(EVT_HANDLE event) {
     return from_wide(buf.c_str());
 }
 
+// ADR-3002 rung-1 bounded-broker-call requirement: EvtNext is a daemon-
+// mediated call (the Event Log service) that offers a bounded wait mode, so
+// INFINITE is not an option here -- a wedged/heavily-contended service would
+// otherwise pin the instruction worker forever, with no runner deadline to
+// catch it (unlike the POSIX rung-2 argv sites, which run under
+// kUsersCmdDeadline). 10s matches that same ceiling.
+constexpr DWORD kEvtNextTimeoutMs = 10'000;
+
 // Queries the Security channel with `xpath`, newest-first, rendering up to
 // `cap` events to XML and folding each through
 // yuzu::users_win::parse_logon_events into `out`. Returns false when EvtQuery
 // itself failed (missing/ACL-denied channel) OR when EvtNext failed with
 // anything other than ERROR_NO_MORE_ITEMS (a genuine I/O/access error mid-
-// query must not be reported as a clean, if partial, success) — either way
-// the caller owns the fallback/error path. A successful, fully-exhausted
-// query still returns true with `out` possibly empty (a real, distinct fact
-// from "couldn't query at all"). Every EVT_HANDLE — including EvtNext batch
-// handles seen after the cap is hit — is owned by an EvtGuard.
+// query, including a timeout against a wedged service, must not be reported
+// as a clean, if partial, success) — either way the caller owns the
+// fallback/error path. A successful, fully-exhausted query still returns
+// true with `out` possibly empty (a real, distinct fact from "couldn't
+// query at all"). Every EVT_HANDLE — including EvtNext batch handles seen
+// after the cap is hit — is owned by an EvtGuard.
 bool query_logon_events(const wchar_t* xpath, std::size_t cap,
                         std::vector<yuzu::users_win::LogonEvent>& out) {
     EvtGuard q{::EvtQuery(nullptr, L"Security", xpath,
@@ -226,9 +235,10 @@ bool query_logon_events(const wchar_t* xpath, std::size_t cap,
     while (taken < cap) {
         EVT_HANDLE raw[64]{};
         DWORD got = 0;
-        if (!::EvtNext(q.h, static_cast<DWORD>(std::size(raw)), raw, INFINITE, 0, &got)) {
+        if (!::EvtNext(q.h, static_cast<DWORD>(std::size(raw)), raw, kEvtNextTimeoutMs, 0,
+                       &got)) {
             if (::GetLastError() != ERROR_NO_MORE_ITEMS)
-                return false; // a genuine I/O/access error, not clean exhaustion
+                return false; // a genuine I/O/access error (incl. ERROR_TIMEOUT), not clean exhaustion
             break; // ERROR_NO_MORE_ITEMS — legitimately exhausted, done
         }
         for (DWORD i = 0; i < got; ++i) {
@@ -1105,7 +1115,10 @@ int do_primary_user(yuzu::CommandContext& ctx) {
     if (query_logon_events(L"*[System[EventID=4624]]", 200, events)) {
         auto [primary, max_count] = yuzu::users_win::primary_user_from_events(events);
         if (!primary.empty()) {
-            ctx.write_output(std::format("primary_user|{}|{}|event_log_4624", primary, max_count));
+            // primary originates from decoded Security-channel event XML --
+            // see session_history_rows' identical safe_output_field rationale.
+            ctx.write_output(std::format("primary_user|{}|{}|event_log_4624",
+                                         yuzu::util::safe_output_field(primary), max_count));
         } else {
             ctx.write_output("primary_user|unknown|0|no logon events found");
         }

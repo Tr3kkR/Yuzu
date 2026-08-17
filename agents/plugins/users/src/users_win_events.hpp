@@ -30,6 +30,8 @@
 #include <utility>
 #include <vector>
 
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
+
 namespace yuzu::users_win {
 
 struct LogonEvent {
@@ -301,8 +303,16 @@ inline std::vector<std::string> session_history_rows(const std::vector<LogonEven
         const std::string source = ev.ip_address.empty() ? "-" : ev.ip_address;
         const std::string time = ev.time_created.empty() ? "-" : ev.time_created;
 
-        out.push_back(std::format("session_history|{}|{}|{}|{}|{}|{}", ev.target_user,
-                                  event_type, logon_type, source, time, ev.event_id));
+        // target_user/logon_type(fallback branch)/source all originate from
+        // decoded Security-channel event XML -- a numeric entity reference
+        // (e.g. "&#124;") decodes to a literal '|'/CR/LF that would otherwise
+        // corrupt this row's pipe-delimited framing. safe_output_field is the
+        // same escape this codebase already applies to other externally-
+        // sourced row fields (e.g. users_plugin.cpp's macOS RealName).
+        out.push_back(std::format(
+            "session_history|{}|{}|{}|{}|{}|{}", yuzu::util::safe_output_field(ev.target_user),
+            event_type, yuzu::util::safe_output_field(logon_type),
+            yuzu::util::safe_output_field(source), time, ev.event_id));
     }
     return out;
 }

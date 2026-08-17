@@ -14,6 +14,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <array>
 #include <format>
 #include <string>
@@ -275,6 +276,36 @@ TEST_CASE("session_history_rows: full field-by-field assertion on one real 4624 
     // logon); time = the SystemTime attribute verbatim; event_id = 4624.
     CHECK(rows[0] ==
           "session_history|Alex|logon|network|-|2026-08-14T20:10:49.4173297Z|4624");
+}
+
+TEST_CASE("session_history_rows: a decoded pipe/CR/LF entity cannot corrupt row framing",
+          "[users][win_events]") {
+    // A TargetUserName/IpAddress containing an XML numeric entity for '|'
+    // (&#124;), CR (&#13;), or LF (&#10;) decodes to that literal byte --
+    // safe_output_field must fold it back to a harmless form so this row
+    // still parses as exactly 7 pipe-delimited fields downstream.
+    auto events =
+        parse_logon_events(make_event("4624", "t", "Ev&#124;il&#13;&#10;User", "3"));
+    REQUIRE(events.size() == 1);
+    // Un-decoded/unescaped, this row would gain extra '|'-delimited fields
+    // and an embedded newline that splits it into multiple lines.
+    auto rows = session_history_rows(events);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].find('\n') == std::string::npos);
+    CHECK(rows[0].find('\r') == std::string::npos);
+    // The decoded '|' is present but backslash-escaped (safe_output_field's
+    // contract, matching the shared server decoder's "\|" -> "|" unescape)
+    // -- it must never appear as a bare, unescaped delimiter.
+    CHECK(rows[0].find("\\|") != std::string::npos);
+    // Splitting on UNESCAPED '|' only (the server decoder's own rule: a
+    // literal '|' is preceded by '\\') must yield exactly 7 fields --
+    // session_history|user|type|logon_type|source|time|event_id -- not more.
+    int field_count = 1;
+    for (std::size_t i = 0; i < rows[0].size(); ++i) {
+        if (rows[0][i] == '|' && (i == 0 || rows[0][i - 1] != '\\'))
+            ++field_count;
+    }
+    CHECK(field_count == 7);
 }
 
 TEST_CASE("session_history_rows: full field-by-field assertion on one real 4634 event",
