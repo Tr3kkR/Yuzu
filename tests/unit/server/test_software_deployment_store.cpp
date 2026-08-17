@@ -34,11 +34,14 @@
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
+#include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using yuzu::server::AgentDeploymentStatus;
@@ -1542,4 +1545,169 @@ TEST_CASE("SoftwareDeploymentStore::migrate_from_sqlite aborts unstamped on a mi
     auto pkgs2 = store.list_packages();
     REQUIRE(pkgs2.has_value());
     CHECK(pkgs2->size() == 1);
+}
+
+// Reproduces (and proves fixed) the torn cross-table read a code-review
+// adversarial pass found in migrate_from_sqlite: before the enclosing
+// snapshot transaction was added, each of the three per-table reads was its
+// own separate autocommit transaction, so a concurrent writer could commit a
+// change in the GAP between them -- e.g. atomically replacing a package
+// (delete old id, insert new id, repoint the deployment) between the
+// packages-read and the deployments-read, leaving the migrated snapshot with
+// a deployment pointing at a package that was never captured.
+//
+// The writer thread below busy-retries a fast-failing (busy_timeout=0)
+// BEGIN IMMEDIATE throughout migrate_from_sqlite's run, doing one atomic
+// package-replace-and-repoint the instant it gets a window. 10,000 padding
+// packages (measured: ~2-3ms to scan on this hardware, vs. microsecond-scale
+// thread start-up) give it a comfortably wide, reliable target -- but the
+// test's CORRECTNESS does not depend on hitting an exact window. Whether the
+// writer's swap lands before, during, or after migrate_from_sqlite's read
+// phase, the ONLY property this test asserts is the one that actually
+// matters: the migrated snapshot is self-consistent (its deployment's
+// package_id resolves to a package that was itself backfilled). A torn
+// cross-table read is exactly the scenario where that property fails despite
+// referential closure appearing to hold -- see migrate_from_sqlite's own
+// header comment on this file. (Asserting "the writer never succeeds mid-run"
+// would be the wrong, and non-portable, invariant: SQLite's default
+// rollback-journal locking already makes the writer's FIRST attempt likely
+// to win outright before migrate_from_sqlite's own BEGIN, on a fast box --
+// that is a benign race for who-gets-there-first, not evidence of a torn
+// read, so this test does not assert on it.)
+TEST_CASE("SoftwareDeploymentStore::migrate_from_sqlite reads one consistent cross-table "
+          "snapshot under a concurrent writer (no torn read)",
+          "[software_deployment][pg][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, sw_deploy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto legacy_path =
+        yuzu::test::unique_temp_path("yuzu_test_swdep_torn") / "software-deployment.db";
+    std::filesystem::create_directories(legacy_path.parent_path());
+
+    std::vector<SoftwarePackage> bulk;
+    SoftwarePackage pkg_old = make_package("Original");
+    pkg_old.id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    pkg_old.created_at = 9999999; // sorts LAST -- read-1 reaches it only after all padding rows
+
+    SoftwareDeployment dep = make_deployment(pkg_old.id);
+    dep.id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    dep.status = "staged";
+    dep.created_at = 1;
+
+    write_legacy_sqlite_db(legacy_path, {pkg_old}, {dep}, {});
+
+    // Bulk-pad AFTER write_legacy_sqlite_db (which deliberately does one
+    // fsync'd autocommit transaction per row, to mirror a real legacy
+    // process's own writes elsewhere in this file's other tests) -- wrapped
+    // in a single transaction here purely for setup speed, since this
+    // padding's only job is to widen the read-side race window below, not
+    // to exercise the write path itself. Kept small (10,000, not the
+    // 50,000+ some other tests in this file use) because every one of these
+    // rows also gets individually round-tripped into Postgres once
+    // migrate_from_sqlite's own backfill runs -- padding wide enough for the
+    // SQLite-side race, not wider than that.
+    {
+        SqliteDb padder;
+        REQUIRE(sqlite3_open(legacy_path.string().c_str(), padder.addr()) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(padder.get(), "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
+        SqliteStmt s;
+        REQUIRE(sqlite3_prepare_v2(padder.get(),
+                                   "INSERT INTO software_packages (id, name, created_at) "
+                                   "VALUES (?, ?, ?)",
+                                   -1, s.addr(), nullptr) == SQLITE_OK);
+        for (int i = 0; i < 10000; ++i) {
+            char idbuf[33];
+            std::snprintf(idbuf, sizeof(idbuf), "%032x", i + 1);
+            std::string name =
+                "bulk-pkg-" + std::to_string(i) + "-padding-for-size-xxxxxxxxxxxxxxxxxxxxx";
+            sqlite3_bind_text(s.get(), 1, idbuf, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(s.get(), 2, name.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s.get(), 3, 1000 + i);
+            REQUIRE(sqlite3_step(s.get()) == SQLITE_DONE);
+            sqlite3_reset(s.get());
+        }
+        REQUIRE(sqlite3_exec(padder.get(), "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+
+    const std::string pkg_new_id = "cccccccccccccccccccccccccccccccc";
+
+    std::atomic<bool> migrate_done{false};
+    std::atomic<bool> writer_landed_mid_migrate{false};
+    std::thread writer([&] {
+        SqliteDb w;
+        REQUIRE(sqlite3_open(legacy_path.string().c_str(), w.addr()) == SQLITE_OK);
+        sqlite3_busy_timeout(w.get(), 0); // fail fast; we retry ourselves, never block the reader
+        while (!migrate_done.load(std::memory_order_acquire)) {
+            if (sqlite3_exec(w.get(), "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+                continue; // lock held by the reader's transaction -- retry
+            bool ok = true;
+            {
+                SqliteStmt s;
+                ok = ok &&
+                     sqlite3_prepare_v2(w.get(), "DELETE FROM software_packages WHERE id=?", -1,
+                                        s.addr(), nullptr) == SQLITE_OK;
+                if (ok) {
+                    sqlite3_bind_text(s.get(), 1, pkg_old.id.c_str(), -1, SQLITE_TRANSIENT);
+                    ok = sqlite3_step(s.get()) == SQLITE_DONE;
+                }
+            }
+            {
+                SqliteStmt s;
+                ok = ok && sqlite3_prepare_v2(w.get(),
+                                              "INSERT INTO software_packages (id, name, "
+                                              "created_at) VALUES (?, 'Replacement', 999999)",
+                                              -1, s.addr(), nullptr) == SQLITE_OK;
+                if (ok) {
+                    sqlite3_bind_text(s.get(), 1, pkg_new_id.c_str(), -1, SQLITE_TRANSIENT);
+                    ok = sqlite3_step(s.get()) == SQLITE_DONE;
+                }
+            }
+            {
+                SqliteStmt s;
+                ok = ok && sqlite3_prepare_v2(
+                               w.get(), "UPDATE software_deployments SET package_id=? WHERE id=?",
+                               -1, s.addr(), nullptr) == SQLITE_OK;
+                if (ok) {
+                    sqlite3_bind_text(s.get(), 1, pkg_new_id.c_str(), -1, SQLITE_TRANSIENT);
+                    sqlite3_bind_text(s.get(), 2, dep.id.c_str(), -1, SQLITE_TRANSIENT);
+                    ok = sqlite3_step(s.get()) == SQLITE_DONE;
+                }
+            }
+            if (ok && sqlite3_exec(w.get(), "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK) {
+                if (!migrate_done.load(std::memory_order_acquire))
+                    writer_landed_mid_migrate = true;
+                return; // one successful swap is all this test needs
+            }
+            sqlite3_exec(w.get(), "ROLLBACK", nullptr, nullptr, nullptr);
+        }
+    });
+
+    std::string captured;
+    bool migrated;
+    {
+        LogCapture capture;
+        migrated = store.migrate_from_sqlite(legacy_path);
+        captured = capture.str();
+    }
+    migrate_done.store(true, std::memory_order_release);
+    writer.join();
+
+    INFO("writer's swap landed while migrate_from_sqlite was still running: "
+         << (writer_landed_mid_migrate.load() ? "yes" : "no (benign -- see comment above)"));
+    if (!migrated)
+        UNSCOPED_INFO("migrate_from_sqlite log: " << captured);
+    REQUIRE(migrated);
+
+    auto got_dep = store.get_deployment(dep.id);
+    REQUIRE(got_dep.has_value());
+    REQUIRE(got_dep->has_value());
+    // Whichever package the migrated snapshot captured, it must actually be
+    // one that was itself backfilled -- never a torn reference to a package
+    // version the migration never saw. This is the property that fails on a
+    // torn cross-table read despite referential closure appearing to hold.
+    auto got_pkg = store.get_package((*got_dep)->package_id);
+    REQUIRE(got_pkg.has_value());
+    CHECK(got_pkg->has_value());
 }

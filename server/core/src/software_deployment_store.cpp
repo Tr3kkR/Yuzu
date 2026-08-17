@@ -512,6 +512,26 @@ bool SoftwareDeploymentStore::migrate_from_sqlite(const std::filesystem::path& l
             return false;
         }
 
+        // A deferred transaction fixes ONE consistent snapshot for the table
+        // probes AND all three reads below (custom_properties_store.cpp's
+        // read_legacy_snapshot is the precedent for this exact hazard): without
+        // it, this connection's default autocommit mode makes each probe/read
+        // its own independent transaction, so a legacy file still being written
+        // by another process mid-backfill (e.g. a stale pre-migration binary)
+        // can interleave a write between them — producing a torn cross-table
+        // read that still passes the referential-closure check below and gets
+        // permanently stamped complete. `BEGIN` (not `BEGIN IMMEDIATE`) is
+        // sufficient: this connection is SQLITE_OPEN_READONLY, so there is
+        // nothing for this connection to write that a reserved lock would need
+        // to protect.
+        if (sqlite3_exec(legacy.get(), "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
+            spdlog::error("SoftwareDeploymentStore::migrate_from_sqlite: failed to start a "
+                          "snapshot transaction on legacy {}: {}",
+                          legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+            return false;
+        }
+        SqliteTxn legacy_txn(legacy.get());
+
         const LegacyTableStatus pkg_status = legacy_has_table(legacy.get(), "software_packages");
         const LegacyTableStatus dep_status = legacy_has_table(legacy.get(), "software_deployments");
         const LegacyTableStatus agent_status =
@@ -702,6 +722,17 @@ bool SoftwareDeploymentStore::migrate_from_sqlite(const std::filesystem::path& l
                     return false;
                 }
             }
+        }
+        // Every prior early return in this scope leaves legacy_txn uncommitted,
+        // so its destructor ROLLBACKs (harmless — SQLITE_OPEN_READONLY, nothing
+        // written). Reaching here means the probes + reads all shared one
+        // consistent snapshot; commit closes it cleanly before `legacy` itself
+        // closes below.
+        if (legacy_txn.commit() != SQLITE_OK) {
+            spdlog::error("SoftwareDeploymentStore::migrate_from_sqlite: failed to close the "
+                          "snapshot transaction on legacy {}: {}",
+                          legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+            return false;
         }
     }
     // `legacy` (if opened) closed here via SqliteDb's destructor.
