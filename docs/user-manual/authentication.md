@@ -647,7 +647,7 @@ not automatically admin unless its creator is. Two mechanisms narrow a token bel
 `mcp_tier` bounds what it can do through the MCP endpoint (see [MCP Token
 Restrictions](#mcp-token-restrictions) below), and a `scope_service` floors its session role to
 `user` regardless of the creator's role, so an `ITServiceOwner` RBAC grant becomes its sole
-authority ceiling (see [Service-Scoped Tokens](#service-scoped-tokens) above).
+authority ceiling (see [Service-Scoped Tokens](#service-scoped-tokens) below).
 
 ### Listing Tokens
 

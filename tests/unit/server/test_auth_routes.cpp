@@ -18,6 +18,7 @@
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "oidc_provider.hpp"
 #include "pg/pg_raii.hpp" // PgConn/PgResult — the CH-4 saboteur's second connection
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
 
@@ -43,6 +44,7 @@ namespace {
 /// setup minimal — see auth_routes.cpp:289-344 for the read set.
 struct AuthRoutesFixture {
     Config cfg{};
+    yuzu::MetricsRegistry metrics; // wired so synthesize_token_session's counters fire (review #DG-5)
     auth::AuthManager auth_mgr{};
     fs::path tmp_dir;
     // ApiTokenStore ported to Postgres (PR 4.1) — clones an ephemeral database
@@ -69,6 +71,7 @@ struct AuthRoutesFixture {
 
         // Register a known user so synthesize_token_session resolves a real role.
         REQUIRE(auth_mgr.upsert_user("test_user", "test_password", auth::Role::admin));
+        auth_mgr.set_metrics_registry(&metrics);
 
         ar = std::make_unique<AuthRoutes>(
             cfg, auth_mgr,
@@ -94,6 +97,13 @@ struct AuthRoutesFixture {
         auto raw = api_tokens->create_token("unit-test", "test_user");
         REQUIRE(raw.has_value());
         return *raw;
+    }
+
+    // Read a metric counter value (matches HardenedHarness::counter,
+    // test_auth_routes_hardened.cpp — same review-#1735-derived pattern).
+    double counter(const std::string& name, const yuzu::Labels& labels = {}) {
+        return labels.empty() ? metrics.counter(name).value()
+                              : metrics.counter(name, labels).value();
     }
 };
 
@@ -283,6 +293,8 @@ TEST_CASE("AuthRoutes::resolve_session — a service-scoped token from an admin 
     // independent guard (e.g. workflow/instruction role-gated step approval,
     // MCP bundle-ownership checks) — no longer see admin authority either.
     CHECK(session->role == auth::Role::user);
+    // DG-5: the debuggability counter fires exactly once for this capped session.
+    CHECK(fix.counter("yuzu_auth_service_token_role_capped_total") == 1.0);
 }
 
 TEST_CASE("AuthRoutes::resolve_session — a non-scoped token from an admin still "
@@ -296,6 +308,8 @@ TEST_CASE("AuthRoutes::resolve_session — a non-scoped token from an admin stil
     REQUIRE(session.has_value());
     CHECK(session->token_scope_service.empty());
     CHECK(session->role == auth::Role::admin);
+    // Negative control: an uncapped session must never increment the counter.
+    CHECK(fix.counter("yuzu_auth_service_token_role_capped_total") == 0.0);
 }
 
 TEST_CASE("AuthRoutes::resolve_session — a service-scoped token from a plain "
@@ -335,6 +349,8 @@ TEST_CASE("AuthRoutes::resolve_session — a token carrying BOTH scope_service a
     CHECK(session->token_scope_service == "finance-svc");
     CHECK(session->mcp_tier == "supervised");
     CHECK(session->role == auth::Role::user);
+    // The counter fires regardless of mcp_tier, matching the cap's own condition.
+    CHECK(fix.counter("yuzu_auth_service_token_role_capped_total") == 1.0);
 }
 
 TEST_CASE("AuthRoutes::require_admin — MCP token from admin is rejected",
