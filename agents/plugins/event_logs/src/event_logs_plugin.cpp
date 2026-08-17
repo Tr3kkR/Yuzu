@@ -344,6 +344,26 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
     return 0;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// windows: powershell Get-WinEvent via _popen -- rung 3 (an interpreter
+// payload, same principle as the other powershell-cmdlet legs in this
+// group). wevtapi (rung 1) is not yet built.
+// linux: journalctl via run_bounded_subprocess({"/bin/sh", "-c", cmd}, ...)
+// -- rung 3. sd_journal (rung 1) is not yet built.
+// macos: /usr/bin/log show invoked with a pre-split argv (never /bin/sh -c)
+// through run_bounded_subprocess -- rung 2, ships via event_logs_macos.hpp.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"errors",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "journalctl", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "log_show", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_getwinevent", nullptr}},
+    {"query",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "journalctl", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "log_show", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_getwinevent", nullptr}},
+};
+
 } // namespace
 
 class EventLogsPlugin final : public yuzu::Plugin {
@@ -357,6 +377,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"errors", "query", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

@@ -310,6 +310,32 @@ const char* derive_rdp_verdict(bool deny_known, bool deny_allows, bool fw_known,
 }
 #endif
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Windows-only, entirely native: the registry (RegSetValueExW/
+// RegGetValueW), the Windows Firewall via INetFwPolicy2 COM, and the
+// Service Control Manager (StartServiceW/QueryServiceStatusEx) — zero
+// subprocesses (rung 1). Linux/macOS have no implementation at all: both
+// actions on both platforms return the honest "rdp_control|unsupported|..."
+// sentinel without attempting anything (there is no macOS/Linux equivalent
+// surface this plugin targets — see the file header comment).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "set_state",
+        /* .linux_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Win32 registry + INetFwPolicy2 COM + SCM", nullptr},
+    },
+    {
+        /* .action      = */ "status",
+        /* .linux_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Win32 registry + INetFwPolicy2 COM + SCM", nullptr},
+    },
+};
+
 } // namespace
 
 class RdpControlPlugin final : public yuzu::Plugin {
@@ -323,6 +349,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"set_state", "status", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext&) override { return {}; }

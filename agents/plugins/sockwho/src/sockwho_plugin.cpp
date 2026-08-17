@@ -635,6 +635,23 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 
 #endif // platform
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// One action, native in-process on every platform: Linux reads
+// /proc/net/* + /proc/[pid]/{comm,exe,fd}, macOS uses libproc, Windows uses
+// the IP Helper API + QueryFullProcessImageNameW — zero subprocesses
+// anywhere (rung 1).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "sockwho_list",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/* + /proc/[pid]/{comm,exe,fd}", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "libproc", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "IP Helper API + QueryFullProcessImageNameW", nullptr},
+    },
+};
+
 } // namespace
 
 class SockwhoPlugin final : public yuzu::Plugin {
@@ -648,6 +665,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"sockwho_list", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
