@@ -271,12 +271,16 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
             // A service-scoped token is capped at the user floor regardless of
             // the minter's live role — ITServiceOwner (an RBAC grant, resolved
             // elsewhere) is the sole authority ceiling for such a token, never
-            // the minter's legacy role. Without this cap, a service-scoped
-            // token minted by a currently-admin user inherited `role == admin`
-            // below and bypassed require_admin plus every inline
-            // effective_role(*session) == admin check (e.g. the workflow/
-            // instruction step-approval gates meant to require a human
-            // decision, workflow_routes.cpp).
+            // the minter's legacy role. require_admin() already denies every
+            // service-scoped token outright on token_scope_service alone
+            // (below, pre-dating this cap) — the exposure this closes is the
+            // OTHER consumers of role/effective_role() that have no such
+            // independent guard: a service-scoped token minted by a
+            // currently-admin user inherited `role == admin` and satisfied
+            // inline `effective_role(*session) == admin` checks such as the
+            // workflow/instruction step-approval gates (workflow_routes.cpp,
+            // meant to require a human decision) and MCP bundle-ownership
+            // checks (mcp_server.cpp).
             synth.role = auth::Role::user;
         } else {
             // Resolve the creator's actual legacy role fresh (not unconditional
