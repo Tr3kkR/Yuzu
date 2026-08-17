@@ -112,6 +112,31 @@ bool is_safe_host(std::string_view host) {
     return true;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Every leg on every platform shells out via a raw popen()/_popen() (never
+// the bounded subprocess runner) — rung 3 throughout. flush_dns on Linux
+// silently reports status|ok even when neither resolvectl nor
+// systemd-resolve is present (the trailing `|| true`), so that leg is
+// CONSTRAINED rather than unconditionally SUPPORTED.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "flush_dns",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "resolvectl/systemd-resolve via popen",
+         "silently reports ok even when neither resolvectl nor systemd-resolve is present"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "dscacheutil/mDNSResponder via sudo popen", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "ipconfig via popen", nullptr},
+    },
+    {
+        /* .action      = */ "ping",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "system ping via popen", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "system ping via popen", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "system ping via popen", nullptr},
+    },
+};
+
 } // namespace
 
 class NetworkActionsPlugin final : public yuzu::Plugin {
@@ -125,6 +150,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"flush_dns", "ping", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

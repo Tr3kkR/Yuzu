@@ -355,6 +355,58 @@ int do_uptime(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ABI4 capability declarations (#2204). Linux and Windows read native
+// kernel/OS surfaces throughout (sysfs/proc reads, uname(2), the registry,
+// RtlGetVersion, GetNativeSystemInfo, sysctl(2), GetTickCount64) — rung 1
+// everywhere on those two. macOS mixes: os_name/os_build shell out to
+// `sw_vers` via the plugin's local popen()-based run_command() (an
+// ungoverned rung-3 shell exec, per ADR-3002's "27 of 49 plugins ... sit at
+// an ungoverned rung 3" — not yet migrated onto the shared argv runner);
+// os_version calls uname(2) for its primary fields but ALSO shells out to
+// `sw_vers -productVersion` unconditionally for the supplementary
+// os_product_version field, so the action as a whole still spawns a
+// process on macOS; os_arch and uptime use uname(2) / sysctl(2) only, so
+// those two stay rung 1 on macOS.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "os_name",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/etc/os-release", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(sw_vers -productName/-productVersion)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W CurrentVersion\\ProductName + build-number correction",
+         nullptr},
+    },
+    {
+        /* .action      = */ "os_version",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "uname(2)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "uname(2) + popen(sw_vers -productVersion)", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "RtlGetVersion (ntdll)", nullptr},
+    },
+    {
+        /* .action      = */ "os_build",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/version", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(sw_vers -buildVersion)", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "Reg*W CurrentBuildNumber + UBR", nullptr},
+    },
+    {
+        /* .action      = */ "os_arch",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "uname(2)", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "uname(2)", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetNativeSystemInfo", nullptr},
+    },
+    {
+        /* .action      = */ "uptime",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/uptime", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "sysctl(2) KERN_BOOTTIME", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetTickCount64", nullptr},
+    },
+};
+
 } // namespace
 
 class OsInfoPlugin final : public yuzu::Plugin {
@@ -369,6 +421,14 @@ public:
         static const char* acts[] = {"os_name", "os_version", "os_build",
                                      "os_arch", "uptime",     nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

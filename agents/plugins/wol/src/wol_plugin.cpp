@@ -343,6 +343,27 @@ int do_check(yuzu::CommandContext& ctx, yuzu::Params params) {
     return 0;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// wake builds and sends the magic packet over a raw UDP broadcast socket —
+// native in-process on every platform (rung 1). check still popens the
+// system `ping` binary on every platform (run_command above) — rung 3, not
+// a native reachability check.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "wake",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "raw UDP broadcast socket", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "raw UDP broadcast socket", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "raw UDP broadcast socket", nullptr},
+    },
+    {
+        /* .action      = */ "check",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "system ping via popen", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "system ping via popen", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 3, "system ping via popen", nullptr},
+    },
+};
+
 } // namespace
 
 class WolPlugin final : public yuzu::Plugin {
@@ -356,6 +377,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"wake", "check", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

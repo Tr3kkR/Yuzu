@@ -25,13 +25,18 @@
 # runs; a missing artifact is a hard failure, never a silent skip (that
 # silent-skip is exactly the drift this gate exists to catch).
 #
-# RATCHET MODE (do NOT flip to hard-fail on any undeclared plugin — that is a
-# later PR, #2204's follow-up): the regenerated "Undeclared plugins" count is
-# compared against RATCHET_BASELINE_UNDECLARED below. It may stay the same or
-# SHRINK (a plugin adopting the ABI4 descriptor); it must never GROW. The
-# baseline lives here (not a separate tracked file) so there is exactly one
-# place to update when the discovered plugin set changes or a plugin adopts
-# the descriptor.
+# RATCHET MODE: the regenerated "Undeclared plugins" count is compared
+# against RATCHET_BASELINE_UNDECLARED below. It may stay the same or SHRINK
+# (a plugin adopting the ABI4 descriptor); it must never GROW. The baseline
+# lives here (not a separate tracked file) so there is exactly one place to
+# update when the discovered plugin set changes or a plugin adopts the
+# descriptor.
+#
+# With the baseline now at 0 (every plugin declares), ratchet mode and
+# hard-fail-on-any-undeclared have converged: a new plugin landing without
+# descriptors grows the count above 0 and fails here. The gate did not need
+# a separate mode flip to get there — lowering the baseline was the whole
+# mechanism, which is why the ratchet was built this way.
 #
 # build-ci B1: -Dbuild_examples=false is a supported, default-true option
 # that skips every agents/plugins/*/ subdir (and, matching that, the
@@ -41,12 +46,14 @@
 # failing on an artifact that was never supposed to exist.
 set -euo pipefail
 
-# Every discovered plugin is undeclared today (none has adopted the ABI4
-# action_descriptors array yet — #2204 is the machinery, per-plugin adoption
-# is follow-up work). DECREASE this the moment a plugin adopts the
-# descriptor — increasing it requires a deliberate, reviewed decision (e.g.
-# a new plugin directory added to agents/plugins/).
-RATCHET_BASELINE_UNDECLARED=49
+# Every discovered plugin now declares its ABI4 action_descriptors array —
+# #2204 shipped the machinery, and per-plugin adoption completed across all
+# 49 in this PR, so the floor is 0. DECREASE this the moment the count
+# drops further (it cannot from 0); increasing it requires a deliberate,
+# reviewed decision — and at 0 that means a NEW plugin directory landed
+# under agents/plugins/ without descriptors, which is exactly the
+# regression this ratchet now blocks outright.
+RATCHET_BASELINE_UNDECLARED=0
 
 usage() {
   echo "usage: check-capability-matrix.sh <BUILDDIR>" >&2
