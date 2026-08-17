@@ -79,6 +79,13 @@ invalid_name_fixture_plugin = shared_library(
 agent_test_native_deps = []
 if host_machine.system() == 'darwin'
   agent_test_native_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'])
+elif host_machine.system() == 'windows'
+  # test_icmp_probe.cpp (Wave 2 WP-0): ws2_32 for WSAStartup/getaddrinfo/
+  # htons, iphlpapi for IcmpCreateFile/IcmpCloseHandle -- icmp_probe.hpp's
+  # own consumers (discovery/wol) link these themselves; the test TU needs
+  # its own copy, same shape as tar_test_deps' Windows block below.
+  agent_test_native_deps += cxx.find_library('ws2_32')
+  agent_test_native_deps += cxx.find_library('iphlpapi')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
