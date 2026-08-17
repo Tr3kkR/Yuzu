@@ -271,6 +271,9 @@ jobs:
       # Exact Wee Tam pool gate matching the Windows job's runs-on labels.
       # Shulgi is an operator testbed, not a production scheduling fallback.
       weetam_pool_healthy: ${{ steps.health.outputs.weetam_pool_healthy }}
+      # Exact BigMags pool gate matching the macOS job's runs-on labels.
+      # No GitHub-hosted or Shulgi fallback can satisfy the Apple-Silicon job.
+      bigmags_pool_healthy: ${{ steps.health.outputs.bigmags_pool_healthy }}
       yuzu_wsl2_linux_healthy: ${{ steps.health.outputs.yuzu_wsl2_linux_healthy }}
       yuzu_local_windows_healthy: ${{ steps.health.outputs.yuzu_local_windows_healthy }}
       all_healthy: ${{ steps.health.outputs.all_healthy }}
@@ -1217,11 +1220,15 @@ jobs:
   macos:
     name: "macOS ${{ matrix.build_type }}"
     needs: [preflight]
-    # code_changed (issue #1978): docs-only PRs skip this required job
-    # (skipped == satisfied). No self-hosted pool gate — GitHub-hosted — so
-    # it otherwise runs on every code PR.
-    if: needs.preflight.outputs.code_changed == 'true'
-    runs-on: macos-15  # Apple Silicon, Xcode 16 / Apple Clang 16
+    # Pinned to the BigMags macOS pool: the Apple-Silicon toolchain exists only
+    # on the BigMags Mac Minis; no GitHub-hosted or Shulgi fallback can satisfy
+    # it, so gate on bigmags_pool_healthy (>=1 yuzu-bigmags-macos runner online).
+    # Fail-closed `== 'true'` (NOT `!= 'false'`) — an offline pool skips this job
+    # fast instead of queueing against an empty pool.
+    # `&& code_changed` (issue #1978): docs-only PRs skip this required job
+    # (skipped == satisfied).
+    if: needs.preflight.outputs.bigmags_pool_healthy == 'true' && needs.preflight.outputs.code_changed == 'true'
+    runs-on: [self-hosted, macOS, ARM64, yuzu-bigmags-macos]
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -1257,7 +1264,11 @@ jobs:
           # cmake-method dependency lookup in the same configure. Broke macOS CI
           # fleet-wide across unrelated PRs simultaneously (e.g. #2224). Pin like
           # meson below so a future brew bump can't repeat this.
-          brew install ninja ccache pipx autoconf automake libtool
+          # pkg-config: the self-hosted BigMags box does not ship the hosted
+          # image's baked-in pkg-config, which the Configure step's
+          # PKG_CONFIG_PATH (vcpkg_installed/arm64-osx/lib/pkgconfig) assumes
+          # exists. The GitHub-hosted macos-15 image bundled it implicitly.
+          brew install ninja ccache pipx autoconf automake libtool pkg-config
           # Belt-and-suspenders: the macos-15 image pre-bakes its own cmake
           # (that's what the log line "cmake 4.4.0 is already installed and
           # up-to-date" was reporting) independent of this workflow's brew
@@ -1293,57 +1304,28 @@ jobs:
           # at meson configure time for the content embed.
           pip3 install --break-system-packages --require-hashes -r requirements-ci.txt
 
-      # Split restore + always-save: `save-always: true` is deprecated and
-      # documented as "does not work as intended" by the actions/cache
-      # maintainers (https://github.com/actions/cache/tree/main/save#always-save-cache).
-      # Pattern: restore on the way in, then a paired `actions/cache/save`
-      # at the job tail gated on `if: always() && cache-hit != 'true'`. The
-      # `always()` lets the save run even if the build step failed (which
-      # is the only behaviour `save-always` was meant to deliver); the
-      # `cache-hit != 'true'` gate skips the upload when the primary key
-      # already exists, matching the default `actions/cache` semantics.
-      - name: Restore ccache
-        id: cache-ccache-macos
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/ccache
-          key: ccache-macos-${{ matrix.build_type }}-${{ hashFiles('**/*.cpp', '**/*.hpp', '**/*.h') }}
-          restore-keys: |
-            ccache-macos-${{ matrix.build_type }}-
-            ccache-macos-
-
+      # ccache cache lives at ~/Library/Caches/ccache on the self-hosted
+      # BigMags runner, which persists in the runner user's home between
+      # jobs by definition. No actions/cache round-trip needed — paying the
+      # GHA upload cost would just reupload data that's already on disk.
+      # Mirrors the Linux/Windows self-hosted pattern. Issue #569.
       - name: Reset ccache stats
         run: ccache -z
 
-      - name: Export GitHub Actions cache variables
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        with:
-          script: |
-            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+      # ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN export was previously done
+      # here for the in-process GHA cache backend that lukka/run-vcpkg used to
+      # support. We don't consume those vars anywhere on this self-hosted
+      # runner (binary cache lives in runner.tool_cache, ccache writes to the
+      # runner's HOME), so the export was dead wiring. Issue #569.
 
-      - name: Restore vcpkg installed packages
-        # Cache-key contract: vcpkg.json (ports/features) + vcpkg-configuration.json
-        # (registry/baseline) + the pinned VCPKG_COMMIT baseline (in the key
-        # prefix) catch the D3 staleness cases — a port edit or baseline bump.
-        # This leg installs the BUILTIN `arm64-osx` triplet (no
-        # `triplets/arm64-osx.cmake` overlay exists), so the repo's custom
-        # triplet descriptors (x64-linux-asan/tsan/static, x64-windows) cannot
-        # change its vcpkg output — hashing `triplets/*.cmake` only cold-starts
-        # this cache on unrelated sanitizer-triplet edits. We hash the specific
-        # `triplets/arm64-osx.cmake` instead: empty today (stable key), and
-        # auto-tracked the moment an arm64-osx overlay is ever added.
-        # Save side is the paired `actions/cache/save` step at the job tail
-        # — see comment on `Restore ccache` above for the save-always
-        # deprecation rationale.
-        id: cache-vcpkg-macos
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json', 'triplets/arm64-osx.cmake') }}
-          restore-keys: |
-            vcpkg-arm64-osx-${{ env.VCPKG_COMMIT }}-
-            vcpkg-arm64-osx-
+      # No actions/cache round-trip for vcpkg. This job keeps actions/checkout's
+      # default clean:true (unlike the Linux/Windows legs' PR-5 clean:false,
+      # which is safe only with their companion branch-switch wipe step + vcpkg
+      # sentinel — not yet ported here), so vcpkg_installed/ is wiped each run.
+      # That's cheap: `vcpkg install` below restores it fast from the warm
+      # binary cache in runner.tool_cache, which lives OUTSIDE the workspace and
+      # so survives the clean. ccache likewise persists in the runner's HOME.
+      # Full clean:false incrementality on macOS is a deferred follow-up.
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2 # v11.6
@@ -1352,7 +1334,18 @@ jobs:
           vcpkgGitCommitId: '${{ env.VCPKG_COMMIT }}'
 
       - name: Install vcpkg packages
+        env:
+          # Persistent binary cache outside the workspace on the self-hosted
+          # BigMags runner. Without this, lukka/run-vcpkg defaults to a per-run
+          # temp dir → 0% hit rate every run → every port rebuilt from source.
+          # runner.tool_cache survives actions/checkout's default clean.
+          # A trusted fork uses a per-run temp dir instead of the shared cache
+          # so an untrusted-fork build cannot poison the pool's binary cache;
+          # trusted (non-fork) runs resolve to the shared tool_cache dir.
+          # Mirrors the Linux/Windows self-hosted pattern verbatim. Issue #569.
+          VCPKG_DEFAULT_BINARY_CACHE: ${{ needs.preflight.outputs.trusted_execution == 'true' && format('{0}/yuzu-trusted-fork-vcpkg-{1}', runner.temp, github.run_id) || format('{0}/yuzu-vcpkg-binary-cache-macos', runner.tool_cache) }}
         run: |
+          mkdir -p "$VCPKG_DEFAULT_BINARY_CACHE"
           ${{ github.workspace }}/vcpkg/vcpkg install \
             --triplet arm64-osx \
             --x-manifest-root=${{ github.workspace }}
@@ -1371,7 +1364,13 @@ jobs:
             ${{ matrix.build_type == 'release' && '-Db_lto=true' || '' }}
 
       - name: Build
-        run: meson compile -C build-macos
+        # Bound ninja fan-out by YUZU_BUILD_JOBS (from the runner .env), like the
+        # Linux/Windows self-hosted legs. On BigMags this is load-bearing: 2 agents
+        # share 12 cores / 24 GiB, so an unbounded ninja (all cores per agent) can
+        # oversubscribe memory when both build at once. Guarded default keeps it
+        # bounded even if the var is unset (unlike the bare Linux/Windows form,
+        # because macOS is the only pool where uncontrolled -j risks OOM here).
+        run: meson compile -C build-macos -j "${YUZU_BUILD_JOBS:-6}"
 
       # Link-provenance assertion (#1331 review HIGH-2): hosted macOS images can
       # carry a system PostgreSQL, so prove the canary linked vcpkg's static
@@ -1430,10 +1429,10 @@ jobs:
           # Informational only — never fail the job from here (set +e).
           set +e
           ccache -s
-          # Mirror the Linux/Windows job-summary (P3 observability). macOS is a
-          # GHA-hosted ephemeral runner with an actions/cache-backed ccache, so
-          # a cold restore is expected on a cache-key miss — no cold-cache
-          # ::warning:: here (that signal is self-hosted-only).
+          # Mirror the Linux/Windows job-summary (P3 observability). macOS now
+          # runs on the self-hosted BigMags pool with a persistent on-disk
+          # ccache in the runner user's HOME (~/Library/Caches/ccache), so a
+          # warm cache is the steady-state expectation across runs.
           s="$(ccache --print-stats 2>/dev/null)"
           get(){ printf '%s\n' "$s" | awk -F'\t' -v k="$1" '$1==k{v=$2} END{print v+0}'; }
           hits=$(( $(get direct_cache_hit) + $(get preprocessed_cache_hit) ))
@@ -1451,25 +1450,6 @@ jobs:
             echo "| LTO | ${{ matrix.build_type == 'release' && 'yes (link-time, ccache cannot accelerate)' || 'no' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
-
-      # Paired saves for the two restore-only steps above. `if: always()`
-      # is the documented replacement for `save-always: true` and lets
-      # the cache populate even when Build/Test failed. The
-      # `cache-hit != 'true'` gate skips the upload when the primary key
-      # already matched on restore (no new content to save).
-      - name: Save ccache
-        if: always() && steps.cache-ccache-macos.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/Library/Caches/ccache
-          key: ${{ steps.cache-ccache-macos.outputs.cache-primary-key }}
-
-      - name: Save vcpkg installed packages
-        if: always() && steps.cache-vcpkg-macos.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ github.workspace }}/vcpkg_installed
-          key: ${{ steps.cache-vcpkg-macos.outputs.cache-primary-key }}
 
   # ── Docs-only required-check stubs (issue #1978) ──────────────────────
   # The linux/windows/macos required contexts are MATRIX-expanded names
