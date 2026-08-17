@@ -364,7 +364,7 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 7.6 Software Deployment (Install/Upgrade) :white_check_mark: `T2`
 
-`SoftwareDeploymentStore` (SQLite) with package registration, deployment lifecycle (staged/deploying/verifying/completed/rolled_back/failed), per-agent status tracking. REST endpoints: `GET/POST /api/v1/software-packages`, `GET/POST /api/v1/software-deployments`, `/start`, `/rollback`, `/cancel`.
+`SoftwareDeploymentStore` (PostgreSQL, ADR-0051) with package registration, deployment lifecycle (staged/deploying/verifying/completed/cancelled/rolled_back/failed), per-agent status tracking. REST endpoints: `GET/POST /api/v1/software-packages`, `GET/POST /api/v1/software-deployments`, `/start`, `/rollback`, `/cancel`. **Dormant** (same family as `LicenseStore`/ADR-0048) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
 
 ---
 
