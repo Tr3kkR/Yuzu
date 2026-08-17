@@ -16,9 +16,12 @@
  *   macOS   — sysctl NET_RT_FLAGS/RTF_LLINFO ARP read + SOCK_DGRAM ICMP
  *             ping sweep.
  *
- * Input validation: subnet parameter is validated as a CIDR block.
- * Only alphanumeric, dots, slashes, and colons are allowed to prevent
- * command injection.
+ * Input validation: the subnet parameter is validated as a CIDR block —
+ * digits, dots and a single slash only (is_valid_cidr), then re-parsed into
+ * octets and a prefix length. There is no longer a shell to inject into (the
+ * action spawns nothing at all); the validation is retained because every
+ * downstream step — host enumeration, inet_pton, the ICMP destination — is
+ * entitled to assume a well-formed dotted quad.
  */
 
 #include <yuzu/plugin.hpp>
@@ -59,6 +62,8 @@
 #endif
 
 #include "icmp_probe.hpp" // yuzu::shared::IcmpSession — shared unprivileged ping sweep
+
+#include "discovery_scan_plan.hpp" // pure sweep bounds + honest-degrade decisions
 
 #ifdef __linux__
 #include "discovery_parsers.hpp" // yuzu::discovery::parse_proc_net_arp — pure /proc/net/arp parser
@@ -447,42 +452,31 @@ private:
         std::set<std::string> alive_ips;
 
         // ONE ICMP session per scan (never per host — a /24 must not open
-        // 254 sockets). Each probe gets a short per-host timeout separate
-        // from the caller's overall timeout_ms.
+        // 254 sockets). Each probe gets a short per-host budget, capped
+        // independently of the caller's timeout_ms so the sweep stays finite;
+        // both bounds are decided by discovery_scan_plan.hpp (tested there).
         yuzu::shared::IcmpSession session;
-        const int probe_timeout_ms = std::min(timeout_ms, 300);
+        const int probe_timeout_ms = yuzu::discovery::probe_budget_ms(timeout_ms);
+        const auto availability =
+            yuzu::discovery::classify_icmp_session(session.ok(), session.permitted);
 
-        if (!session.ok()) {
-            // HONEST DEGRADE — two distinct failure states, both resolved
-            // before any probe is attempted. Never probe through an invalid
-            // session; fall back to the ARP-derived host set and warn once.
-            if (!session.permitted) {
-                // net.ipv4.ping_group_range refused the unprivileged
-                // SOCK_DGRAM ICMP socket (POSIX only — see IcmpSession's
-                // ctor; Windows' permitted is always true).
-                ctx.write_output(
-                    "status|warning|unprivileged ICMP socket denied by "
-                    "net.ipv4.ping_group_range — reporting ARP-table hosts only");
-                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                      "icmp:ping_group_range");
-            } else {
-                // Generic socket failure (EMFILE/ENFILE/ENOMEM on POSIX, or
-                // IcmpCreateFile failing on Windows) — not a permissions
-                // issue, the ICMP socket is simply unavailable.
-                ctx.write_output(
-                    "status|warning|ICMP socket unavailable — reporting ARP-table hosts only");
-                ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
-                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                      "icmp:socket_error");
-            }
+        if (const auto degrade = yuzu::discovery::degrade_for(availability); degrade.has_report) {
+            // HONEST DEGRADE — resolved before any probe is attempted. Never
+            // probe through an invalid session; fall back to the ARP-derived
+            // host set, warn once, and stamp the ABI4 result so a machine
+            // consumer cannot read a dead network as a successful empty scan.
+            // Denied (Linux net.ipv4.ping_group_range refusing the
+            // unprivileged SOCK_DGRAM ICMP socket) and Unavailable
+            // (EMFILE/ENFILE/ENOMEM, or IcmpCreateFile failing on Windows)
+            // carry distinct statuses and reason tags.
+            ctx.write_output(std::format("status|warning|{}", degrade.report.message));
+            ctx.set_result_status(degrade.report.status, degrade.report.completeness,
+                                  degrade.report.reason);
             // Confine the degrade fallback to the requested subnet — never
             // surface unrelated cached ARP neighbors (other subnets,
             // multicast/broadcast entries) as scan results.
-            for (const auto& ip : hosts) {
-                if (arp_ips.count(ip))
-                    alive_ips.insert(ip);
-            }
+            for (const auto& ip : yuzu::discovery::arp_hosts_in_subnet(hosts, arp_ips))
+                alive_ips.insert(ip);
         } else {
             for (const auto& ip : hosts) {
                 // Check overall scan timeout
@@ -519,6 +513,17 @@ private:
                                                  done, total, alive_ips.size()));
                 }
             }
+        }
+
+        // A sweep cut short by its own deadline is PARTIAL, not a clean scan.
+        // The warning line above says so to a human; this says so to the ABI4
+        // result seam, which is what a machine consumer reads — without it a
+        // scan that stopped at host 40 of 254 is indistinguishable from a
+        // complete one. Not set on the degrade path above, which has already
+        // reported its own (more specific) status.
+        if (timed_out) {
+            const auto t = yuzu::discovery::timeout_degrade();
+            ctx.set_result_status(t.status, t.completeness, t.reason);
         }
 
         // Step 3: Re-read ARP table after ping sweep to get MACs

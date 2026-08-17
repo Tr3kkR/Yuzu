@@ -281,6 +281,7 @@ agent_test_exe = executable(
     'unit/test_sudo_argv.cpp',                # Wave 2 WP-0: Decision-8 canonical sudo argv form (POSIX-only TU)
     'unit/test_icmp_probe.cpp',               # Wave 2 WP-0: RFC-1071 checksum + numeric-literal resolve/set_port
     'unit/test_discovery_parsers.cpp',        # Wave 2 WP-C: pure /proc/net/arp parser
+    'unit/test_discovery_scan_plan.cpp',      # Wave 2 WP-C: pure sweep bounds + honest-degrade decisions
     'unit/test_route_sysctl_arp.cpp',         # Wave 2 WP-C: pure sysctl NET_RT_FLAGS/RTF_LLINFO binary parser
   ),
   include_directories: [
