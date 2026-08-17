@@ -62,6 +62,7 @@
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
+#include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
 #include "instruction_store.hpp"
 #include "instruction_yaml.hpp"
@@ -1804,6 +1805,16 @@ public:
                           detail::kGuardianJournalReportingHelp, "gauge");
         metrics_.describe(detail::kGuardianJournalTagRejectedGauge,
                           detail::kGuardianJournalTagRejectedHelp, "gauge");
+        // Guardian M1 health-stream fleet rollup (#2298 gate 3, item 6d). Registered
+        // from the SAME table AgentHealthStore::recompute_metrics clears and publishes
+        // from (guardian_health_fleet_tags.hpp), same reason as the journal block
+        // above: a new signal cannot ship with a gauge but no HELP.
+        for (const auto& m : detail::kGuardianHealthMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        metrics_.describe(detail::kGuardianHealthReportingGauge,
+                          detail::kGuardianHealthReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianHealthTagRejectedGauge,
+                          detail::kGuardianHealthTagRejectedHelp, "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -8183,6 +8194,13 @@ private:
                                    const std::string& agent_id) {
         return auth_routes_->require_scoped_permission(req, res, securable_type, operation,
                                                        agent_id);
+    }
+
+    yuzu::server::ListReadGate require_list_read(const httplib::Request& req,
+                                                 httplib::Response& res,
+                                                 const std::string& securable_type,
+                                                 const std::string& operation) {
+        return auth_routes_->require_list_read(req, res, securable_type, operation);
     }
 
     /// #1788: the per-caller Execution:Execute visible set (nullopt == unfiltered),
@@ -14841,6 +14859,14 @@ private:
                                      const std::string& agent_id) -> bool {
             return require_scoped_permission(req, res, type, op, agent_id);
         };
+        // ADR-0017 admit-then-filter list-read gate (wraps require_list_read).
+        // The fleet guaranteed-state status route's SOLE authorization gate —
+        // never stacked with perm_fn (see rest_api_v1.cpp's route comment).
+        auto list_read_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                   const std::string& type,
+                                   const std::string& op) -> yuzu::server::ListReadGate {
+            return require_list_read(req, res, type, op);
+        };
         // Visible-agent SET resolver for filtering device-id-rendering lists (DEX
         // device drills). SAME policy as get_visible_agents_json / the /devices list:
         // nullopt = caller sees the whole fleet (global Infrastructure:Read OR RBAC
@@ -17626,7 +17652,11 @@ private:
             // bundle dispatch gets the identical defense-in-depth confinement
             // check as its MCP execute_bundle twin (the scoped_perm_fn gate at
             // the handler remains the primary authorization).
-            [this](const auth::Session& sess) { return derive_exec_visible(sess); });
+            [this](const auth::Session& sess) { return derive_exec_visible(sess); },
+            // ADR-0017: the fleet guaranteed-state status route's SOLE
+            // authorization gate — see rest_api_v1.cpp's route comment for why
+            // it must never be stacked with perm_fn.
+            list_read_fn);
 
         // -- Register MCP server routes ----------------------------------------
 

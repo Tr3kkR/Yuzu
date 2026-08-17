@@ -27,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -60,6 +61,23 @@ std::string sanitize_detail_value(std::string_view v);
 struct Config;
 class EnginePrincipalStore;
 class ScimStore;
+
+/// Result of `AuthRoutes::require_list_read` — the transport-layer twin of
+/// `RbacStore::ListReadAuthorization` (ADR-0017). Lives here, not in
+/// rbac_store.hpp, because it carries a `Session` (an auth/transport concept;
+/// RbacStore is a data-layer primitive and must not depend on it) and at
+/// namespace scope, not nested in `AuthRoutes`, for consistency with its
+/// sibling `ListReadDecision`/`ListReadAuthorization`.
+struct ListReadGate {
+    /// false ⇒ the response is already fully rendered (401/403/503) —
+    /// mirrors require_permission/require_scoped_permission's bool contract.
+    bool admitted{false};
+    /// nullopt = unfiltered (whole fleet); engaged (including empty, INV-2)
+    /// = filter to exactly these agents.
+    std::optional<std::vector<std::string>> scope;
+    /// The resolved session, so a caller doesn't have to re-resolve it.
+    std::optional<auth::Session> session;
+};
 
 /// Extracted auth helpers and route handlers (Phase 2 of god-object decomposition).
 ///
@@ -131,9 +149,54 @@ public:
                                    const std::string& securable_type, const std::string& operation,
                                    const std::string& agent_id);
 
+    /// The transport-layer ADR-0017 admit-then-filter list-read gate — the
+    /// SOLE authorization gate for a list/fan-out route reading per-agent
+    /// data under management-group confinement. Replicates the SAME
+    /// session-class ladder as `require_permission` (auth → elevation →
+    /// engine → MCP tier → service-scoped token → legacy/RBAC) but the
+    /// ordinary-RBAC-enforced case delegates to `RbacStore::authorize_list_read`
+    /// instead of `check_permission`, because `check_permission` never
+    /// consults `ManagementGroupStore` — stacking the two gates (one calling
+    /// the other) does NOT compose; a caller whose only grant is
+    /// management-group-scoped is denied by `require_permission` before
+    /// `authorize_list_read` is ever reached. This method must be the
+    /// route's ONLY gate — no `perm_fn` in front of or behind it.
+    ///
+    /// Structurally Read-only: `operation != "Read"` is denied outright, so
+    /// the MCP approval-ticket branch (`mcp::requires_approval`) never
+    /// applies — approval gating exists only for destructive operations.
+    ///
+    /// A JIT-elevated session is admitted unfiltered WITHOUT calling
+    /// `authorize_list_read` — elevation intentionally needs no underlying
+    /// RBAC grant, and consulting the primitive anyway would deny a
+    /// legitimately-elevated caller who holds no base grant (the regression
+    /// the first #3038 fix attempt shipped).
+    ///
+    /// An engine principal is special-cased (RBAC-only, never legacy-open)
+    /// rather than delegated to `authorize_list_read` directly:
+    /// `authorize_list_read`'s legacy-open branch returns `AdmitAll` when
+    /// RBAC is disabled, which would hand an engine credential fleet-wide
+    /// read — forbidden by the engine default-deny model (design §4.2).
+    ///
+    /// CONSTRAINT for future callers: `authorize_list_read`'s legacy-open
+    /// branch does not apply `authz_topology_floor.hpp`'s `kTopologyFloor`
+    /// (that floor is applied only inside `require_permission`'s own legacy
+    /// branch). This is moot for every caller today (GuaranteedState:Read is
+    /// not a floored securable) but a FUTURE floored securable routed
+    /// through `require_list_read` must re-apply the floor explicitly —
+    /// do not assume this wrapper inherits it for free.
+    ListReadGate require_list_read(const httplib::Request& req, httplib::Response& res,
+                                   const std::string& securable_type,
+                                   const std::string& operation);
+
     // -- Phase 0 confinement primitives (service-scope-confinement design doc
     //    §7.2/§8) — wired here, called by NO route yet. See authz_gates.hpp
-    //    for `ListAuthority`/`GateFailure`, authz_gates.cpp for bodies. --------
+    //    for `ListAuthority`/`GateFailure`, authz_gates.cpp for bodies.
+    //    RELATED BUT DISTINCT from `require_list_read` above: both compose
+    //    `RbacStore::authorize_list_read`, but for different purposes
+    //    (general ADR-0017 confinement vs. service-scope confinement) and
+    //    with different return shapes. Not yet reconciled — a real question
+    //    for later, not decided here. ------------------------------------
 
     /// The two-axis list-read gate: management-group visibility (the
     /// existing ADR-0017 `RbacStore::authorize_list_read` chokepoint, reused

@@ -26,6 +26,18 @@ context-refs: #1634 (response-reader ruling), PR #1711 (per-row filter foundatio
 > wrappers (`require_list_read` etc.) land with their first caller in PR-B rather than uncalled here.
 > Ships alongside the decision-independent **#1717** fail-closed gate fix (`require_permission` /
 > `require_scoped_permission` gate on `rbac_enforcement_in_effect`).
+>
+> **Update (2026-08-15) — `AuthRoutes::require_list_read` has a live first caller, outside the
+> PR-B…E ladder.** `GET /api/v1/guaranteed-state/status` (#2298 item 6d / #3038) now gates via
+> `require_list_read` as its sole authorization primitive — the transport wrapper this ADR names
+> is no longer "uncalled." An earlier attempt (commit `9269b5636`) stacked a direct
+> `authorize_list_read` call behind the pre-existing flat `require_permission` gate instead of
+> replacing it, which does not compose (`require_permission`'s RBAC branch never consults
+> `ManagementGroupStore`); the corrected wiring (`369643caf`) replaced both with the single
+> `require_list_read` gate this ADR anticipated. This landed independently of the PR-B…E
+> enumeration below (which still tracks `responses`/device-list/inventory/audit-log/DEX/TAR) —
+> update that list's own status per-surface as each one actually switches, don't infer this
+> route's completion applies to any of them.
 
 ## Context
 
