@@ -6,6 +6,7 @@
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "authz_gates.hpp"
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "saml_provider.hpp"
@@ -18,6 +19,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <expected>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -128,6 +130,50 @@ public:
     bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,
                                    const std::string& securable_type, const std::string& operation,
                                    const std::string& agent_id);
+
+    // -- Phase 0 confinement primitives (service-scope-confinement design doc
+    //    §7.2/§8) — wired here, called by NO route yet. See authz_gates.hpp
+    //    for `ListAuthority`/`GateFailure`, authz_gates.cpp for bodies. --------
+
+    /// The two-axis list-read gate: management-group visibility (the
+    /// existing ADR-0017 `RbacStore::authorize_list_read` chokepoint, reused
+    /// as the subordinate primitive here, never rewritten) intersected
+    /// (`authz::meet`) with service-scope visibility (a service-scoped
+    /// session's `service`-tagged agents; TOP/unfiltered for a non-service
+    /// session, so the result is byte-identical to `authorize_list_read`
+    /// alone in that case). Per-axis fail-closed BEFORE the intersection:
+    /// the management axis collapses "no grant" and "store error" both to
+    /// `GateFailure::Forbidden` (403) — a deliberate weakening of
+    /// `authorize_list_read`'s own promise, not a new gap (see
+    /// implementation plan §2c); the service axis returns
+    /// `GateFailure::Degraded` (503) on a null or query-failed tag store,
+    /// which stays distinguishable.
+    [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
+    authorize_fleet_read(const httplib::Request& req, httplib::Response& res,
+                         const std::string& securable_type, const std::string& operation);
+
+    /// The single-agent confinement gate: does `agent_id` carry the
+    /// `service` tag matching this session's `token_scope_service`?
+    /// CONFINEMENT-AXIS ONLY — this is NOT a full authority decision and
+    /// does not re-check the `ITServiceOwner` RBAC grant `require_permission`
+    /// already verifies for the same `(securable_type, operation)`; a caller
+    /// pairs this with `require_permission`, exactly as `authorize_fleet_read`
+    /// pairs `meet` with `authorize_list_read` for the list-read case. For a
+    /// NON-service session the axis is TOP (unfiltered) by definition, so
+    /// this returns `true` unconditionally — it answers only "is this
+    /// target inside the token's service scope," never "is this caller
+    /// authorized at all."
+    ///
+    /// Empty `agent_id` is a 400, never an admit — the fix for
+    /// `require_scoped_permission`'s existing bug (auth_routes.cpp, service
+    /// branch: an empty `agent_id` today skips the only comparison that
+    /// could deny and falls through to `return true`). Fail-closed 503 on a
+    /// null or degraded tag store, matching that same function's tag-store-
+    /// unavailable case.
+    [[nodiscard]] bool authorize_agent_target(const httplib::Request& req, httplib::Response& res,
+                                              const std::string& securable_type,
+                                              const std::string& operation,
+                                              const std::string& agent_id);
 
     /// Build a synthetic session from a validated API token. Two-branch on the
     /// token's persisted `principal_kind` (design doc §6):
