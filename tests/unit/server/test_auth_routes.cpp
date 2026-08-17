@@ -276,9 +276,12 @@ TEST_CASE("AuthRoutes::resolve_session — a service-scoped token from an admin 
     REQUIRE(session.has_value());
     CHECK(session->token_scope_service == "finance-svc");
     // The token's minter ("test_user") is admin — before the cap this would
-    // have inherited role == admin, defeating require_admin AND every inline
-    // effective_role(*session) == admin check elsewhere (e.g. workflow/
-    // instruction role-gated step approval).
+    // have inherited role == admin. require_admin() already independently
+    // denies any service-scoped token on token_scope_service alone (see the
+    // test above), so this specifically proves the OTHER consumers — the
+    // inline effective_role(*session) == admin checks that have no such
+    // independent guard (e.g. workflow/instruction role-gated step approval,
+    // MCP bundle-ownership checks) — no longer see admin authority either.
     CHECK(session->role == auth::Role::user);
 }
 
@@ -295,8 +298,8 @@ TEST_CASE("AuthRoutes::resolve_session — a non-scoped token from an admin stil
     CHECK(session->role == auth::Role::admin);
 }
 
-TEST_CASE("AuthRoutes::resolve_session — a service-scoped token from a demoted-to-user "
-          "creator still resolves to the user floor",
+TEST_CASE("AuthRoutes::resolve_session — a service-scoped token from a plain "
+          "user-role creator resolves to the user floor (no double-application)",
           "[pg][auth_routes][scope]") {
     AuthRoutesFixture fix;
     REQUIRE(fix.auth_mgr.upsert_user("plain_user", "password1234", auth::Role::user));
@@ -310,6 +313,27 @@ TEST_CASE("AuthRoutes::resolve_session — a service-scoped token from a demoted
 
     auto session = fix.ar->resolve_session(req);
     REQUIRE(session.has_value());
+    CHECK(session->token_scope_service == "finance-svc");
+    CHECK(session->role == auth::Role::user);
+}
+
+TEST_CASE("AuthRoutes::resolve_session — a token carrying BOTH scope_service and "
+          "mcp_tier still resolves to the user floor (the cap does not consult "
+          "mcp_tier)",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    auto raw = fix.api_tokens->create_token("scoped-and-tiered", "test_user", now + 3600,
+                                            "finance-svc", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+
+    auto session = fix.ar->resolve_session(req);
+    REQUIRE(session.has_value());
+    CHECK(session->token_scope_service == "finance-svc");
+    CHECK(session->mcp_tier == "supervised");
     CHECK(session->role == auth::Role::user);
 }
 
