@@ -178,7 +178,7 @@ full-fleet (their actual authority, not a bypass); the derivation fails
 store is unavailable. (2026-08-17: "unavailable" now also covers a mid-scan
 read failure on an otherwise-reachable tag store, not just prepare-time/
 connection failures — `TagStore::agents_with_tag_checked`, closed by the
-service-scope-confinement PR 2 hardening round.) Credit as a CC6.1
+PR #3216's hardening round.) Credit as a CC6.1
 least-privilege control and a CC6.3 access-enforcement control with
 consistent enforcement across every listed surface; operator-facing
 reference is `docs/authz-model.md`. **Residual, not
