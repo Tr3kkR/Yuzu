@@ -26,6 +26,7 @@
 
 #include "audit_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "rest_api_v1.hpp"
 #include "software_deployment_store.hpp"
 #include "test_route_sink.hpp"
@@ -35,6 +36,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include "../test_helpers.hpp"
 
@@ -160,6 +162,14 @@ struct SwPkgHarness {
     }
 
     auto post(const std::string& body) { return sink.Post("/api/v1/software-packages", body); }
+    auto get_packages() { return sink.Get("/api/v1/software-packages"); }
+    auto post_deployment(const std::string& body) {
+        return sink.Post("/api/v1/software-deployments", body);
+    }
+    auto get_deployments() { return sink.Get("/api/v1/software-deployments"); }
+    auto post_start(const std::string& id) {
+        return sink.Post("/api/v1/software-deployments/" + id + "/start", "");
+    }
 };
 
 } // namespace
@@ -407,4 +417,85 @@ TEST_CASE("REST POST software-packages: missing verify_command field defaults to
     auto res = h.post(body);
     REQUIRE(res);
     CHECK(res->status == 201);
+}
+
+// gov review (Doomgoose, PR #3174, important): sw_deploy_error_status /
+// sw_deploy_client_message (rest_api_v1.cpp) map a genuine store failure to
+// 503 + a generic message, and a business/validation error to 400 + the
+// message echoed verbatim -- but nothing exercised either branch through an
+// actual route. A store-level test proving create_package() et al. return a
+// kSwDeployDbErrorPrefix-tagged error on a genuine failure does not prove
+// the ROUTE actually maps that to 503 without leaking the raw Postgres text.
+//
+// Technique matches test_rest_quarantine_routes.cpp's "REST routes answer
+// 503... on a genuine store failure" precedent: DROP the store's own schema
+// out from under an already-open store. `is_open()` is cached at
+// construction and never re-verified, so the route's guard still passes and
+// the next query fails live with a real libpq error.
+TEST_CASE("REST software-deployment routes answer 503 (not 400) on a genuine store failure, "
+          "never leaking the raw Postgres error",
+          "[rest][software_deployment][pg]") {
+    SwPkgHarness h;
+    // Seed one package + deployment before dropping the schema, so the
+    // lifecycle-action route (start) has a real id to target -- the
+    // store-level FK/lookup logic is bypassed entirely once the schema is
+    // gone (the query itself fails), so any pre-existing id would do, but a
+    // genuinely-created one keeps the fixture honest.
+    auto seeded_pkg = h.post(SwPkgHarness::make_body("dpkg -s firefox"));
+    REQUIRE(seeded_pkg);
+    REQUIRE(seeded_pkg->status == 201);
+    auto pkg_id = nlohmann::json::parse(seeded_pkg->body)["data"]["id"].get<std::string>();
+
+    auto seeded_dep =
+        h.post_deployment(R"({"package_id":")" + pkg_id + R"(","scope_expression":"all"})");
+    REQUIRE(seeded_dep);
+    REQUIRE(seeded_dep->status == 201);
+    auto dep_id = nlohmann::json::parse(seeded_dep->body)["data"]["id"].get<std::string>();
+
+    h.audit_log.clear(); // isolate the failures under test from the seed calls' own audit rows
+
+    {
+        pg::PgConn conn{PQconnectdb(h.sw_deploy_db->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(), "DROP SCHEMA software_deployment_store CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    SECTION("POST /api/v1/software-packages") {
+        auto res = h.post(SwPkgHarness::make_body("dpkg -s other-package"));
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("service unavailable") != std::string::npos);
+        // The failure is a genuine libpq error (relation does not exist) --
+        // confirm none of that text reached the client.
+        CHECK(res->body.find("does not exist") == std::string::npos);
+        CHECK(res->body.find("software_deployment_store") == std::string::npos);
+        REQUIRE(h.audit_log.empty()); // create_package's route has no failure-path audit call
+    }
+    SECTION("GET /api/v1/software-packages") {
+        auto res = h.get_packages();
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("does not exist") == std::string::npos);
+    }
+    SECTION("POST /api/v1/software-deployments") {
+        auto res = h.post_deployment(R"({"package_id":")" + pkg_id + R"(","scope_expression":"all"})");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("service unavailable") != std::string::npos);
+        CHECK(res->body.find("does not exist") == std::string::npos);
+    }
+    SECTION("GET /api/v1/software-deployments") {
+        auto res = h.get_deployments();
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("does not exist") == std::string::npos);
+    }
+    SECTION("POST /api/v1/software-deployments/{id}/start") {
+        auto res = h.post_start(dep_id);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("service unavailable") != std::string::npos);
+        CHECK(res->body.find("does not exist") == std::string::npos);
+    }
 }
