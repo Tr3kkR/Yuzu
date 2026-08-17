@@ -251,9 +251,6 @@ int do_list_networks(yuzu::CommandContext& ctx) {
             if (line.size() < 40)
                 continue;
 
-            // Find BSSID pattern (XX:XX:XX:XX:XX:XX) to anchor parsing
-            auto bssid_start = line.find_first_of("0123456789abcdef", 0);
-            // Look for MAC address pattern
             std::string ssid, bssid, rssi, channel, security;
 
             // Simple approach: split from the right where fixed fields are
@@ -503,6 +500,57 @@ int do_connected(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Windows is native WLAN API throughout (rung 1). Linux routes nmcli/iw
+// through the bounded subprocess runner, but run_command (above) hands the
+// command line to `/bin/sh -c` rather than an argv array — a governed
+// shell payload, ADR-3002 rung 3 — with a raw-text iw/iwlist fallback when
+// nmcli is absent. macOS's list_networks scan path is CONSTRAINED, not
+// unsupported: it really does run `airport -s` and then a
+// `system_profiler SPAirPortDataType` fallback through the same governed
+// shell (rung 3, exactly like the Linux leg — the mechanism is what sets
+// the rung, and both go through run_command), and it really does parse
+// results into `wifi|SSID|…` records. What it cannot promise is an ANSWER:
+// `airport` was removed in macOS 14 (Sonoma) and the system_profiler
+// fallback needs Location Services authorisation a background daemon may
+// not hold, so on a modern, unauthorised host both legs yield nothing and
+// the honest "wifi|info|…" sentinel is emitted. That is the definition of
+// CONSTRAINED — a real mechanism with a named limitation — whereas
+// UNSUPPORTED asserts the OS cannot supply the capability at all, which is
+// false for macOS ≤13 and for any host where Location Services is granted.
+// Declaring rung 0 with a null mechanism additionally understated a path
+// that spawns /bin/sh on every invocation. macOS connected instead ships via CoreWLAN
+// (wifi_corewlan.mm), a native framework — rung 1 — though Location
+// Services (macOS 14+) can withhold the SSID/BSSID from a background
+// daemon.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "list_networks",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "nmcli via governed shell runner",
+         "falls back to a raw, unstructured iw/iwlist text dump when nmcli is unavailable"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "airport -s via governed shell runner",
+         "airport was removed in macOS 14 (Sonoma); the system_profiler "
+         "SPAirPortDataType fallback needs Location Services authorisation a "
+         "background daemon may lack, so an unauthorised modern host yields no "
+         "networks and an honest wifi|info sentinel"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "WlanGetAvailableNetworkList", nullptr},
+    },
+    {
+        /* .action      = */ "connected",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "nmcli via governed shell runner",
+         "falls back to a raw iwconfig text blob (ESSID/Signal only) when nmcli reports no SSID"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "CoreWLAN",
+         "Location Services (macOS 14+) may withhold SSID/BSSID from a background daemon"},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "WlanQueryInterface", nullptr},
+    },
+};
+
 } // namespace
 
 class WifiPlugin final : public yuzu::Plugin {
@@ -516,6 +564,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"list_networks", "connected", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

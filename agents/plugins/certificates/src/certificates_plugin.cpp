@@ -1442,6 +1442,57 @@ bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
 
 #endif // __APPLE__
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Windows enumerates/deletes via CryptoAPI natively (rung 1). Linux
+// enumerates PEM files from /etc/ssl/certs via native filesystem I/O, but
+// every field (subject/issuer/dates/serial/thumbprint/key usage) is parsed
+// from `openssl x509` output run through run_command (above), which hands
+// the command line to `/bin/sh -c` rather than an argv array — a governed
+// shell payload, ADR-3002 rung 3, and the leg's defining mechanism. macOS
+// reads the System/root keychains via a direct `/usr/bin/security
+// find-certificate` argv call through the bounded subprocess runner (rung
+// 2), but the login-keychain leg additionally routes that call through
+// "/bin/sh -c" for the outer `~username` expansion — so list/details, which
+// read all keychains including login by default, are rung 3 overall; only
+// delete's macOS leg (System/MY only, login unsupported — see below) stays
+// a clean rung-2 argv call. delete on macOS also rejects
+// SystemRootCertificates.keychain outright (sealed under System Integrity
+// Protection) — a genuine, permanent capability limitation, not merely an
+// error path.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "list",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "openssl x509 via governed shell runner", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "security find-certificate with login shell fallback", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "CryptoAPI (CertEnumCertificatesInStore)",
+                              nullptr},
+    },
+    {
+        /* .action      = */ "details",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "openssl x509 via governed shell runner", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "security find-certificate with login shell fallback", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "CryptoAPI (CertEnumCertificatesInStore)",
+                              nullptr},
+    },
+    {
+        /* .action      = */ "delete",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "openssl lookup via governed shell + filesystem remove",
+         nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_CONSTRAINED, 2, "security delete-certificate via subprocess runner",
+         "SystemRootCertificates.keychain is sealed under SIP and rejected outright; only "
+         "System/MY store deletes are supported"},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "CryptoAPI (CertDeleteCertificateFromStore)",
+                              nullptr},
+    },
+};
+
 } // namespace
 
 // ── Plugin class ─────────────────────────────────────────────────────────────
@@ -1460,6 +1511,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"list", "details", "delete", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

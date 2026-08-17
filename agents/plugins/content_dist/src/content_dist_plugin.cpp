@@ -550,6 +550,63 @@ int safe_execute(const fs::path& exe_path, std::string_view args_str, std::strin
 
 #endif
 
+// ── ABI4 per-OS capability declaration (#2204) ──────────────────────────────
+//
+// `rung` is the ADR-3002 ACQUISITION rung (docs/adr/3002-acquisition-ladder.md:66-73):
+// 1 = native OS interface (zero subprocesses), 2 = argv via a runner (no
+// shell), 3 = shell/interpreter payload. One row per `actions()` entry,
+// same order, same names — capmatrix-gen hard-errors on any mismatch.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "stage",
+        // httplib download over a socket this plugin opens itself — zero
+        // subprocesses, rung 1 on every OS. HTTPS is a build-time REQUIRED
+        // OpenSSL dependency on Linux/macOS (content_dist/meson.build:
+        // `dependency('openssl', required: true, ...)`) but only
+        // best-effort on Windows (`required: false`) — CPPHTTPLIB_OPENSSL_SUPPORT
+        // is conditionally undefined there (see `download_file`'s #else
+        // branch above), so Windows is CONSTRAINED, not SUPPORTED.
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "httplib_tls", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "httplib_tls", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "httplib_tls",
+         "requires OpenSSL to be found at build time; HTTPS unavailable if absent"},
+    },
+    {
+        /* .action      = */ "execute_staged",
+        // Spawns the staged binary directly from a pre-split argv —
+        // CreateProcessW on Windows, fork+execvp on POSIX — never a shell
+        // (see `safe_execute` above): rung 2 on every OS.
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "fork_execvp", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 2, "fork_execvp", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 2, "createprocessw", nullptr},
+    },
+    {
+        /* .action      = */ "list_staged",
+        // std::filesystem directory iteration — in-process, rung 1.
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+    },
+    {
+        /* .action      = */ "cleanup",
+        // std::filesystem removal — in-process, rung 1.
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+    },
+    {
+        /* .action      = */ "upload_file",
+        // Same httplib-socket transport as `stage`, same Windows OpenSSL
+        // caveat.
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "httplib_tls", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "httplib_tls", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_CONSTRAINED, 1, "httplib_tls",
+         "requires OpenSSL to be found at build time; HTTPS unavailable if absent"},
+    },
+};
+
 } // namespace
 
 class ContentDistPlugin final : public yuzu::Plugin {
@@ -565,6 +622,14 @@ public:
         static const char* acts[] = {"stage",   "execute_staged", "list_staged",
                                      "cleanup", "upload_file",    nullptr};
         return acts;
+    }
+
+    [[nodiscard]] const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    [[nodiscard]] size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

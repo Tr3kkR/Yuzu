@@ -268,6 +268,26 @@ void xprotect_status_macos(yuzu::CommandContext& ctx) {
 
 #endif
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Every populated leg shells out via raw popen/_popen (never the governed
+// runner) -- powershell Get-CimInstance/Get-MpComputerStatus on Windows,
+// pgrep/filesystem probes on Linux, PlistBuddy/systemextensionsctl/pgrep/
+// stat on macOS -- rung 3 throughout. "status" has no Linux implementation
+// at all (execute() falls through to a static "not_available" row) --
+// UNSUPPORTED there rather than a fabricated leg.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"products",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "pgrep+filesystem_probe", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "plistbuddy+systemextensionsctl", nullptr},
+     /* windows = */
+     {YUZU_SUPPORT_SUPPORTED, 3, "powershell_cim_securitycenter2", nullptr}},
+    {"status",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "plistbuddy+stat", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_defender_status", nullptr}},
+};
+
 } // namespace
 
 class AntivirusPlugin final : public yuzu::Plugin {
@@ -281,6 +301,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"products", "status", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

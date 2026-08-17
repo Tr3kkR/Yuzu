@@ -36,8 +36,18 @@ namespace yuzu::server::saml {
 /// are extracted from the configured group_attribute, across however many
 /// <Attribute Name="..."> elements carry that Name. Parsing stops once the
 /// cap is reached — remaining values (and remaining Attribute elements) are
-/// silently ignored rather than rejecting the whole assertion.
-inline constexpr std::size_t kMaxGroupValues = 64;
+/// silently ignored rather than rejecting the whole assertion. Aligned with
+/// `RbacStore::kMaxIdpGroupsPerLogin` (200) — SAML fine-grained RBAC
+/// reconciles `groups` into the RBAC store the same way OIDC does, and the
+/// two caps must agree or a SAML assertion could pass this parser only to
+/// be rejected (or worse, silently under-reconciled) at the RBAC boundary.
+/// `group_cap_truncated` (below) trips once an assertion carries more than
+/// 200 non-empty group values; the ACS route (auth_routes.cpp) DENIES the
+/// login in that case rather than reconciling a truncated (i.e. incomplete)
+/// membership set. Raising this from 64 to 200 also improves the coarse
+/// `--saml-admin-group` path: an admin group asserted at position 65-200
+/// was previously silently missed.
+inline constexpr std::size_t kMaxGroupValues = 200;
 
 /// Configuration for the SAML 2.0 SP. All string fields are UTF-8.
 struct SamlConfig {

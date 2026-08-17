@@ -284,10 +284,14 @@ cadence, so (a) backstops (b)'s resulting wire staleness. Both land in
 existing type-lane sweeps already re-drive a demoted key's `evaluate_key`).
 
 Still OPEN and still gating the `prefer_spark` flip (folded into #2298 gate 6):
-(c) the **server-side rollup/consumer** for the suppression/refresh/demotion tags (all three
-are agent-heartbeat-only today) - this is **pilot-trust-blocking**, not just SOC2
-evidence, because after suppression the only current-errored-state view is the no-TTL census, and
-`/status.errored_rules` is still the fail-closed placeholder (tracked as F6). **(d) the four-artefact egress for
+(c) **DONE (F6).** The **server-side rollup/consumer** for the suppression/refresh/demotion
+tags now exists two ways: an unlabelled fleet-sum gauge family (`yuzu_fleet_guardian_unhealthy_
+suppressed`/`_refreshed`/`_priority_demoted`, `guardian_health_fleet_tags.hpp`, mirroring the
+guardian-journal pattern), and `/status.errored_rules` / `/status/{agent_id}.errored_rules` are
+now real, derived from the `guardian_agent_rule_status` census (the same no-TTL current-state
+view the dashboard reads) rather than the former hardcoded placeholder `0`. `compliant_rules`/
+`drifted_rules` remain placeholder `0` - full status ingest (`action=="status"`) is a separate,
+later rung. **(d) the four-artefact egress for
 `arm_race_unwatch_failures_total` AND `disarm_unwatch_failures_total` (#2270)** - both heartbeat
 tags ship and both keys are registered in `spark_fleet_tags.hpp`, but no rollup consumes either,
 there is no `docs/user-manual/metrics.md` row and no alert rule, and no REST route or dashboard
