@@ -393,6 +393,9 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("TRUSTED_FORK_CI_GATE: ${{ secrets.TRUSTED_FORK_CI_GATE }}", wrapper)
         self.assertIn("RUNNER_INVENTORY_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN }}", wrapper)
 
+        # linux + windows carry the full boundary: conditional clean:false
+        # (safe only with their branch-switch wipe step + vcpkg sentinel) plus
+        # the trusted-fork cache-isolation trio.
         for job_name in ("linux", "windows"):
             with self.subTest(job=job_name):
                 job = self.job("ci.yml", job_name)
@@ -403,6 +406,24 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertIn("VCPKG_BINARY_SOURCES=clear", job)
                 self.assertIn("CCACHE_DIR=$cache_root/ccache", job)
                 self.assertIn("Purge trusted-fork workspace", job)
+
+        # macOS deliberately keeps actions/checkout's default clean:true (a
+        # fresh workspace every run is a *stronger* fork-isolation boundary; the
+        # conditional clean:false form is not adopted here because its
+        # branch-switch wipe step + vcpkg sentinel companions are not ported to
+        # macOS — cross-run incrementality is deferred). So macOS is asserted
+        # for the SAME cache-isolation trio but NOT the conditional clean
+        # expression — asserting that would force clean:false with no wipe
+        # companion, shipping cross-run staleness.
+        with self.subTest(job="macos"):
+            job = self.job("ci.yml", "macos")
+            self.assertNotIn(
+                "clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}",
+                job,
+            )
+            self.assertIn("VCPKG_BINARY_SOURCES=clear", job)
+            self.assertIn("CCACHE_DIR=$cache_root/ccache", job)
+            self.assertIn("Purge trusted-fork workspace", job)
 
     def test_nightly_alert_does_not_open_a_merge_block_after_cancellation(self) -> None:
         nightly = (ROOT / ".github" / "workflows" / "nightly.yml").read_text(encoding="utf-8")

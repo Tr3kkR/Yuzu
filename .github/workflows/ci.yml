@@ -1243,7 +1243,25 @@ jobs:
           repository: ${{ needs.preflight.outputs.checkout_repository }}
           ref: ${{ needs.preflight.outputs.checkout_ref }}
           submodules: recursive
+          # Deliberately NOT the linux/windows conditional clean:false — this
+          # job keeps actions/checkout's default clean:true. A fresh workspace
+          # every run is a *stronger* fork-isolation boundary; the conditional
+          # clean:false form is not adopted here because it requires the
+          # branch-switch wipe step + vcpkg sentinel companions that are not
+          # ported to macOS (cross-run incrementality is deferred). See the
+          # vcpkg-section comment below and docs/ci-architecture.md.
           persist-credentials: false
+
+      - name: Isolate trusted-fork build caches
+        if: needs.preflight.outputs.trusted_execution == 'true'
+        run: |
+          cache_root="$RUNNER_TEMP/yuzu-trusted-fork-${GITHUB_RUN_ID}-${GITHUB_JOB}"
+          mkdir -p "$cache_root/ccache"
+          echo "CCACHE_DIR=$cache_root/ccache" >> "$GITHUB_ENV"
+          # Do not read or write runner.tool_cache. The trusted review is an
+          # explicit code-execution decision, not permission to poison a
+          # cache consumed by later normal CI jobs.
+          echo "VCPKG_BINARY_SOURCES=clear" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: |
@@ -1450,6 +1468,14 @@ jobs:
             echo "| LTO | ${{ matrix.build_type == 'release' && 'yes (link-time, ccache cannot accelerate)' || 'no' }} |"
           } >> "$GITHUB_STEP_SUMMARY"
           exit 0
+
+      - name: Purge trusted-fork workspace
+        if: ${{ always() && needs.preflight.outputs.trusted_execution == 'true' }}
+        run: |
+          # Keep this narrow to the Actions checkout. runner.tool_cache and
+          # the runner-local telemetry DB are deliberately outside this path.
+          git reset --hard
+          git clean -ffdx
 
   # ── Docs-only required-check stubs (issue #1978) ──────────────────────
   # The linux/windows/macos required contexts are MATRIX-expanded names

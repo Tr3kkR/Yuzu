@@ -154,9 +154,13 @@ Use `register-bigmags-runner.sh` (this dir) per agent index. It applies the
 drain gate, mints a registration token, lays down `.env`/`.path`, configures the
 runner with the exact labels, and installs the launchd service as `yuzuci`:
 
+Run it **as your admin user (NOT under `sudo`)** — it mints the registration
+token with *your* `gh` auth and `sudo`s internally for the root-only steps.
+`sudo ./register…` would run `gh` as root, whose `HOME`/keychain has no auth.
+
 ```bash
-sudo ./deploy/macos/register-bigmags-runner.sh 0
-sudo ./deploy/macos/register-bigmags-runner.sh 1
+./deploy/macos/register-bigmags-runner.sh 0
+./deploy/macos/register-bigmags-runner.sh 1
 ```
 
 Then self-test and record the manifest:

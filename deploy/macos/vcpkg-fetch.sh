@@ -26,11 +26,14 @@ set -o pipefail
 url="${1:?url}"; sha="${2:-}"; dst="${3:?dst}"
 
 auth=()
-# Host-ANCHORED match (https://<host>/…), not a substring: an unanchored
-# *github.com* would also match https://github.com.attacker.example/… and leak
-# the token to it. The trailing slash after the host is what defeats that.
-case "$url" in
-  https://github.com/*|https://api.github.com/*|https://codeload.github.com/*|https://*.githubusercontent.com/*)
+# Match the AUTHORITY (host), never the whole URL. A shell `case` glob's `*`
+# crosses `/`, so `https://*.githubusercontent.com/*` ALSO matches an attacker
+# host that merely carries the string in its PATH
+# (https://attacker.invalid/x.githubusercontent.com/…) and would leak the token
+# to it. Extracting the host first removes every `/` for the glob to cross.
+host="${url#*://}"; host="${host%%/*}"
+case "$host" in
+  github.com|api.github.com|codeload.github.com|*.githubusercontent.com)
     tok="${GH_TOKEN:-$(gh auth token 2>/dev/null || true)}"
     [ -n "$tok" ] && auth=(-H "Authorization: token $tok")
     ;;

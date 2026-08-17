@@ -18,6 +18,9 @@ warn() { printf '  \033[33mwarn\033[0m %s\n' "$1"; }
 echo "== BigMags toolchain self-test =="
 
 # --- platform ---------------------------------------------------------------
+# OS family first, so a wrong-OS box fails with a clear message instead of a pile
+# of confusingly-worded macOS-specific probe failures (sw_vers/xcode-select absent).
+[ "$(uname -s)" = Darwin ] && ok "OS Darwin" || bad "OS $(uname -s) (expected Darwin)"
 [ "$(uname -m)" = arm64 ] && ok "arch arm64" || bad "arch $(uname -m) (expected arm64)"
 
 ver="$(sw_vers -productVersion 2>/dev/null || echo 0)"
@@ -68,7 +71,7 @@ done
 [ -x /opt/ci/vcpkg-fetch.sh ] && ok "vcpkg-fetch.sh installed" || warn "/opt/ci/vcpkg-fetch.sh absent (bootstrapping aid only)"
 
 slp="$(pmset -g 2>/dev/null | awk '/[^a-z]sleep[^A-Za-z]/{print $2}' | head -1)"
-[ "${slp:-1}" = 0 ] && ok "system sleep disabled" || warn "system sleep = ${slp:-?} (a sleeping runner hangs jobs: sudo pmset -a sleep 0)"
+[ "${slp:-1}" = 0 ] && ok "system sleep disabled" || bad "system sleep = ${slp:-?} — a sleeping runner hangs jobs (sudo pmset -a sleep 0). This gates: the self-test exists to catch exactly this drift."
 
 echo
 if [ "$fail" -eq 0 ]; then
