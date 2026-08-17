@@ -21,6 +21,7 @@
 // one at a time -- both produce).
 #pragma once
 
+#include <algorithm>
 #include <cstdlib>
 #include <format>
 #include <map>
@@ -80,8 +81,15 @@ inline std::string decode_xml_entities(std::string_view s) {
             out.push_back(s[i++]);
             continue;
         }
+        // Bound the search: the longest legal entity is a numeric hex ref
+        // like "&#x10FFFF;" (11 chars incl. delimiters), so a ';' beyond
+        // that can't start a real entity -- capping here avoids an
+        // unbounded scan (and the resulting large substr/append) on a
+        // stray/malformed '&' followed eventually by an unrelated ';'.
+        constexpr std::size_t kMaxEntityLen = 12;
+        const std::size_t window_end = std::min(s.size(), i + kMaxEntityLen);
         auto semi = s.find(';', i);
-        if (semi == std::string_view::npos) {
+        if (semi == std::string_view::npos || semi >= window_end) {
             out.push_back(s[i++]);
             continue;
         }

@@ -21,7 +21,7 @@ elif host_machine.system() == 'darwin'
   endif
 endif
 
-shared_library(
+users_plugin_lib = shared_library(
   'users',
   files('src/users_plugin.cpp'),
   name_prefix: '',

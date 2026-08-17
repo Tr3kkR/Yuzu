@@ -323,7 +323,12 @@ agent_test_exe = executable(
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp / test_capability_descriptor.cpp find them
   # under MESON_BUILD_ROOT/tests/.
-  link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
+  # users_plugin_lib (agents/plugins/users/meson.build): test_users_posix_actions.cpp
+  # loads the real users plugin by path -- without this, the plugin build isn't
+  # ordered ahead of the test binary, and a not-yet-built plugin makes those
+  # cases WARN-and-skip instead of failing (code-review re-verification finding).
+  link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
+                users_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
