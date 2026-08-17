@@ -310,6 +310,43 @@ TEST_CASE("authorize_fleet_read: AdmitScoped-M × service S ⇒ real intersectio
     CHECK(contains(filtered, "a_c1"));
 }
 
+TEST_CASE("authorize_fleet_read: documented pairing — require_permission-then-this-gate is "
+          "the wrong sequence and denies a mgmt-scoped-only caller; this gate alone admits them",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    // Falsifier for the BLOCKING finding fjarvis's review caught (2026-08-17,
+    // PR #3216): the doc comment on authorize_fleet_read used to instruct
+    // callers to pair it with require_permission for the same
+    // (securable_type, operation). require_permission's ordinary RBAC branch
+    // decides on RbacStore::check_permission ALONE — no mgmt_group_store_ —
+    // so a caller whose only grant is management-group-scoped is rejected by
+    // require_permission before ever reaching authorize_fleet_read's own
+    // authorize_list_read call, making the AdmitScoped branch unreachable
+    // for exactly the confined reader ADR-0017 exists to serve. The doc
+    // comment is now corrected to say the opposite (do NOT pair with
+    // require_permission — this gate is self-sufficient for that axis).
+    // This test pins both halves of that correction as executable facts.
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    r.group_assign(r.gP, "minter", "RespReader"); // ONLY a group-scoped grant — no global grant
+    auto token = r.mint(); // non-service
+    auto req_a = bearer_request(token);
+    httplib::Response res_a;
+
+    // The OLD documented (broken) sequence: require_permission first.
+    bool old_sequence_admitted = r.ar->require_permission(req_a, res_a, "Response", "Read");
+    CHECK_FALSE(old_sequence_admitted); // denied — the finding, demonstrated
+    CHECK(res_a.status == 403);
+
+    // The CORRECTED sequence: authorize_fleet_read alone, no require_permission
+    // in front of or behind it. Same caller, same grant, fresh request/response.
+    auto req_b = bearer_request(token);
+    httplib::Response res_b;
+    auto result = r.ar->authorize_fleet_read(req_b, res_b, "Response", "Read");
+    REQUIRE(result.has_value()); // admitted — the gate is self-sufficient
+    CHECK_FALSE(result->unfiltered());
+    CHECK(result->in_scope("a_p")); // exactly this group's witness
+}
+
 // ── Degradation and store-unavailable failure modes ─────────────────────────
 
 TEST_CASE("authorize_fleet_read: null tag store on a service token ⇒ Degraded",
