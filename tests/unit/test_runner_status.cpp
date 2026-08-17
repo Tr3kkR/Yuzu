@@ -4,16 +4,15 @@
 // fixture-testable here without a live subprocess.
 #include <catch2/catch_test_macros.hpp>
 
-#include <runner_status.hpp>
-
+#include <yuzu/agent/runner_status.hpp>
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/plugin.h>
 
 #include <string>
 
+using yuzu::agent::classify_runner_failure;
 using yuzu::agent::SubprocessResult;
 using yuzu::agent::TerminationReason;
-using yuzu::shared::classify_runner_failure;
 
 namespace {
 
