@@ -50,6 +50,7 @@ using yuzu::server::SoftwareDeploymentStore;
 using yuzu::server::SoftwarePackage;
 using yuzu::server::SqliteDb;
 using yuzu::server::SqliteStmt;
+using yuzu::server::SqliteTxn;
 using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
@@ -1547,33 +1548,53 @@ TEST_CASE("SoftwareDeploymentStore::migrate_from_sqlite aborts unstamped on a mi
     CHECK(pkgs2->size() == 1);
 }
 
-// Reproduces (and proves fixed) the torn cross-table read a code-review
-// adversarial pass found in migrate_from_sqlite: before the enclosing
-// snapshot transaction was added, each of the three per-table reads was its
-// own separate autocommit transaction, so a concurrent writer could commit a
-// change in the GAP between them -- e.g. atomically replacing a package
-// (delete old id, insert new id, repoint the deployment) between the
-// packages-read and the deployments-read, leaving the migrated snapshot with
-// a deployment pointing at a package that was never captured.
+// Exercises migrate_from_sqlite under a genuinely concurrent writer and
+// proves the enclosing snapshot transaction makes the outcome deterministic.
+// Gate 8 re-review (security-guardian) found the honest scope is narrower
+// than this test's first version claimed, worth stating precisely:
+//
+// For the SPECIFIC interleaving this test constructs (atomically replacing a
+// package -- delete old id, insert new id, repoint the deployment -- between
+// the packages-read and the deployments-read), a torn read always produces
+// an orphaned package_id reference, which the PRE-EXISTING referential-
+// closure check already catches and fails closed on. Measured directly:
+// reverting only the transaction fix (keeping this test) and running it
+// repeatedly against the un-fixed code never produced a silent
+// migrated=true with a torn snapshot -- every failure was either a closure
+// rejection or a SQLITE_BUSY/"database is locked" error from the
+// uncoordinated autocommit reads. So this test does not, on its own,
+// reproduce the closure-BLIND silent-corruption shape (e.g. an
+// agent_software_status row vanishing between the deployments-read and the
+// agent-status-read -- closure checks that every child's parent id exists,
+// never that a parent's children are complete, so a vanished child leaves
+// no orphan to catch).
+//
+// What this test DOES prove, and why that is still the right fix and the
+// right regression test: without the transaction, migrate_from_sqlite's
+// behavior under a concurrent writer is NONDETERMINISTIC -- sometimes a
+// spurious fail-closed refusal (closure rejection or lock contention) that
+// would force an operator to just retry and hope the write finishes first.
+// ADR-0051 states the three tables are read as "one atomic snapshot" as a
+// normative requirement independent of which failure mode a given
+// interleaving happens to hit; the fix makes that literally true, and this
+// test proves the concurrent-writer case now succeeds deterministically
+// (10/10 runs) instead of racing between two different failure shapes.
 //
 // The writer thread below busy-retries a fast-failing (busy_timeout=0)
 // BEGIN IMMEDIATE throughout migrate_from_sqlite's run, doing one atomic
 // package-replace-and-repoint the instant it gets a window. 10,000 padding
 // packages (measured: ~2-3ms to scan on this hardware, vs. microsecond-scale
 // thread start-up) give it a comfortably wide, reliable target -- but the
-// test's CORRECTNESS does not depend on hitting an exact window. Whether the
+// test's CORRECTNESS does not depend on hitting an exact window: whether the
 // writer's swap lands before, during, or after migrate_from_sqlite's read
-// phase, the ONLY property this test asserts is the one that actually
-// matters: the migrated snapshot is self-consistent (its deployment's
-// package_id resolves to a package that was itself backfilled). A torn
-// cross-table read is exactly the scenario where that property fails despite
-// referential closure appearing to hold -- see migrate_from_sqlite's own
-// header comment on this file. (Asserting "the writer never succeeds mid-run"
-// would be the wrong, and non-portable, invariant: SQLite's default
-// rollback-journal locking already makes the writer's FIRST attempt likely
-// to win outright before migrate_from_sqlite's own BEGIN, on a fast box --
-// that is a benign race for who-gets-there-first, not evidence of a torn
-// read, so this test does not assert on it.)
+// phase, the assertion is the same -- migrate_from_sqlite succeeds, and the
+// migrated snapshot is self-consistent (its deployment's package_id resolves
+// to a package that was itself backfilled). (Asserting "the writer never
+// succeeds mid-run" would be the wrong, and non-portable, invariant:
+// SQLite's default rollback-journal locking already makes the writer's
+// FIRST attempt likely to win outright before migrate_from_sqlite's own
+// BEGIN, on a fast box -- that is a benign race for who-gets-there-first,
+// not evidence of anything, so this test does not assert on it.)
 TEST_CASE("SoftwareDeploymentStore::migrate_from_sqlite reads one consistent cross-table "
           "snapshot under a concurrent writer (no torn read)",
           "[software_deployment][pg][backfill]") {
@@ -1612,6 +1633,11 @@ TEST_CASE("SoftwareDeploymentStore::migrate_from_sqlite reads one consistent cro
         SqliteDb padder;
         REQUIRE(sqlite3_open(legacy_path.string().c_str(), padder.addr()) == SQLITE_OK);
         REQUIRE(sqlite3_exec(padder.get(), "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
+        // SqliteTxn (not a bare exec("COMMIT")) for the same discipline the
+        // production fix above this test now uses -- declared before the
+        // SqliteStmt below per sqlite_raii.hpp's ordering rule, so the
+        // statement finalizes before a would-be rollback on any early exit.
+        SqliteTxn txn(padder.get());
         SqliteStmt s;
         REQUIRE(sqlite3_prepare_v2(padder.get(),
                                    "INSERT INTO software_packages (id, name, created_at) "
@@ -1628,7 +1654,7 @@ TEST_CASE("SoftwareDeploymentStore::migrate_from_sqlite reads one consistent cro
             REQUIRE(sqlite3_step(s.get()) == SQLITE_DONE);
             sqlite3_reset(s.get());
         }
-        REQUIRE(sqlite3_exec(padder.get(), "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK);
+        REQUIRE(txn.commit() == SQLITE_OK);
     }
 
     const std::string pkg_new_id = "cccccccccccccccccccccccccccccccc";
@@ -1692,6 +1718,18 @@ TEST_CASE("SoftwareDeploymentStore::migrate_from_sqlite reads one consistent cro
             sqlite3_exec(w.get(), "ROLLBACK", nullptr, nullptr, nullptr);
         }
     });
+    // Anything between here and the explicit writer.join() below that could
+    // throw (LogCapture's make_shared, migrate_from_sqlite's own allocations,
+    // capture.str()) would otherwise unwind past a still-joinable `writer`
+    // and std::terminate -- same guard shape as test_rbac_store.cpp's own
+    // ThreadJoiner precedent for this exact hazard class.
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() {
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{writer};
 
     std::string captured;
     bool migrated;

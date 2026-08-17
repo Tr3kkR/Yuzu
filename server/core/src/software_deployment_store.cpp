@@ -516,6 +516,14 @@ bool SoftwareDeploymentStore::migrate_from_sqlite(const std::filesystem::path& l
                           legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
             return false;
         }
+        // Matches custom_properties_store.cpp's legacy_fingerprint/
+        // read_legacy_snapshot precedent: without this, a legacy file held
+        // by a concurrent writer (even just a RESERVED lock, not necessarily
+        // an EXCLUSIVE one) makes this connection's very first read fail
+        // SQLITE_BUSY immediately instead of waiting briefly — found in Gate
+        // 8 re-review via a controlled A/B (taskset-pinned, 30 runs each):
+        // 2/30 SQLITE_BUSY failures without this pragma, 0/30 with it.
+        sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
 
         // A deferred transaction fixes ONE consistent snapshot for the table
         // probes AND all three reads below (custom_properties_store.cpp's
