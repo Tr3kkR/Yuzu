@@ -301,6 +301,44 @@ int do_ou(yuzu::CommandContext& ctx) {
 }
 #endif
 
+// ABI4 capability declarations (#2204). "device_name" is a native call on
+// every OS. "domain" and "ou" read a native surface first on Linux/macOS
+// (resolv.conf / sssd.conf) but ALSO shell out unconditionally through this
+// plugin's local popen()-based run_command() (`realm list` / `dsconfigad
+// -show`) to determine AD-join status, so the action as executed today
+// still spawns a process on those two — an ungoverned rung-3 shell exec per
+// ADR-3002's "27 of 49 plugins ... sit at an ungoverned rung 3" (not yet
+// migrated onto the shared argv runner). Windows uses only native
+// NetGetJoinInformation / GetComputerObjectNameA — rung 1.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "device_name",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "gethostname(3)", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "gethostname(3)", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetComputerNameExA", nullptr},
+    },
+    {
+        /* .action      = */ "domain",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "/etc/resolv.conf read + popen(realm list) [fallback: /etc/sssd/sssd.conf read]",
+         nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "popen(dsconfigad -show) [fallback: popen(hostname -f)]", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "NetGetJoinInformation", nullptr},
+    },
+    {
+        /* .action      = */ "ou",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "popen(realm list) [fallback: /etc/sssd/sssd.conf read]", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "popen(dsconfigad -show)", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetComputerObjectNameA", nullptr},
+    },
+};
+
 } // namespace
 
 class DeviceIdentityPlugin final : public yuzu::Plugin {
@@ -314,6 +352,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"device_name", "domain", "ou", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

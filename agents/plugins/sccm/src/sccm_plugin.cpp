@@ -177,6 +177,25 @@ int do_site(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// windows: registry reads (rung 1) plus an unconditional/fallback shell-out
+// -- "sc query" (client_version) or a PowerShell COM-object call (site) --
+// via _popen (rung 3). Declared at the worse rung genuinely exercised.
+// macos/linux: no SCCM/ConfigMgr equivalent -- the code returns an explicit
+// honest sentinel on both ("no macOS equivalent" / "platform not
+// supported"), never a fabricated result.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"client_version",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* macos   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "registry+sc_query", nullptr}},
+    {"site",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* macos   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "registry+powershell_com", nullptr}},
+};
+
 } // namespace
 
 class SccmPlugin final : public yuzu::Plugin {
@@ -190,6 +209,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"client_version", "site", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

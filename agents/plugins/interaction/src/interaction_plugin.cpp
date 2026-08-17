@@ -990,6 +990,50 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& /*title*/,
 
 #endif
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// linux/macos: notify/message_box/input/survey all shell out via
+// run_bounded_subprocess({"/bin/sh", "-c", cmd}, ...) -- rung 3 (a shell
+// string executed through the runner) -- notify-send/zenity on Linux,
+// osascript on macOS. macOS additionally has no reachable Aqua/GUI session
+// when running as a root LaunchDaemon (docs/agent-privilege-model.md); the
+// code explicitly detects and reports that ("no reachable GUI session" /
+// "not_reachable"), so those 4 legs are CONSTRAINED rather than SUPPORTED.
+// windows: notify/message_box are native Win32 (Shell_NotifyIconW /
+// MessageBoxW, rung 1); input/survey spawn powershell.exe via _popen
+// (rung 3 -- an interpreter payload, same principle as osascript).
+// set_dnd is a pure in-process KV-store write on every OS (rung 1).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"notify",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "notify_send", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
+      "no reachable GUI session under a headless/root LaunchDaemon"},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "shell_notifyicon", nullptr}},
+    {"message_box",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "zenity", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
+      "no reachable GUI session under a headless/root LaunchDaemon"},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "messageboxw", nullptr}},
+    {"input",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "zenity", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
+      "no reachable GUI session under a headless/root LaunchDaemon"},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_inputbox", nullptr}},
+    {"survey",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "zenity", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
+      "no reachable GUI session under a headless/root LaunchDaemon"},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_winforms", nullptr}},
+    {"set_dnd",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 1, "local_kv_store", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 1, "local_kv_store", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "local_kv_store", nullptr}},
+};
+
 } // namespace
 
 class InteractionPlugin final : public yuzu::Plugin {
@@ -1004,6 +1048,13 @@ public:
         static const char* acts[] = {
             "notify", "message_box", "input", "survey", "set_dnd", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

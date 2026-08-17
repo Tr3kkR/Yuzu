@@ -792,6 +792,23 @@ void check_ports(yuzu::CommandContext& ctx, const std::vector<std::string>& port
     }
 }
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// windows: GetExtendedTcpTable/GetExtendedUdpTable + DnsGetCacheDataTable +
+// GetFileAttributesEx-family filesystem calls -- native Win32 APIs, rung 1.
+// linux: /proc/net/tcp[6] parsing + /etc/hosts read + stat()-based
+// filesystem checks -- native kernel-published surfaces, rung 1.
+// macos: connection enumeration shells out to `lsof -i -n -P` via raw
+// popen (rung 3) when ip_addresses/ports are checked; domain/file checks
+// stay native (rung 1). Declared at the worse rung this single action can
+// exercise.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {"check",
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 1, "procfs", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "lsof", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "iphlpapi_dnsapi", nullptr}},
+};
+
 } // namespace
 
 // ── Plugin class ─────────────────────────────────────────────────────────────
@@ -807,6 +824,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"check", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
