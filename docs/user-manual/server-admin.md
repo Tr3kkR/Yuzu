@@ -1039,7 +1039,7 @@ pending full status ingest, tracked separately.
   not apply a service-scoped token's own service-tag confinement (it only
   checks a role grant), so admitting it here would have let a token scoped
   to one service read a fleet-wide count.
-- **`403`**, and a **narrower `errored_rules` count**, on the fleet route
+- A **narrower `errored_rules` count** (still `200`) on the fleet route
   for a management-group-**confined** (not global) `GuaranteedState:Read`
   grant — new. This route moved from a bare global permission check (any
   authenticated `GuaranteedState:Read` holder got the unfiltered
@@ -1054,8 +1054,14 @@ pending full status ingest, tracked separately.
   confinement check ever ran) and was corrected before shipping; nothing
   described below was ever live under that broken attempt. A
   caller with no `GuaranteedState:Read` grant at all
-  (global or via any management group) now gets `403` instead of `200`. A
-  caller whose grant is confined to specific management groups now sees
+  (global or via any management group) now gets `403` instead of `200`
+  (this is a SEPARATE outcome from the narrower-count case above — a
+  confined grant that resolves to at least a scope, even an empty one,
+  never gets a `403` from the confinement decision itself; a `403` from
+  this route means either a service-scoped token, no usable grant, or,
+  rarer, a fail-closed authorization-store fault, which denies even a
+  caller who otherwise holds a resolvable confined grant — see
+  `rest-api.md` for the full 4xx taxonomy). A caller whose grant is confined to specific management groups now sees
   `errored_rules` scoped to their **visible agents only**, not the whole
   fleet — including `0` if their groups contain no agents at all, which is
   still `200`, not `403` (a real grant that resolves to an empty visible

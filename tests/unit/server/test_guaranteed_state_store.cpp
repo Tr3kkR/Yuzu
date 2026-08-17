@@ -1765,6 +1765,13 @@ TEST_CASE("GuaranteedStateStore: bad path yields closed store with sentinel retu
     // Batch insert on a closed store is also a graceful error.
     auto batch = bad.insert_events({make_event("e", "r", "a")});
     CHECK_FALSE(batch.has_value());
+    // errored_rule_count (ADR-0017 INV-3, #2298 item 6d) is std::expected like
+    // get_rule/list_rules above -> closed store is std::unexpected, never a
+    // silent 0 (that posture is exactly what this method exists to avoid on
+    // the confined read path). Both the unscoped and scoped forms degrade the
+    // same way.
+    CHECK_FALSE(bad.errored_rule_count(std::nullopt).has_value());
+    CHECK_FALSE(bad.errored_rule_count(std::vector<std::string>{"WS-1"}).has_value());
 }
 
 TEST_CASE("GuaranteedStateStore: migration is idempotent across re-open",

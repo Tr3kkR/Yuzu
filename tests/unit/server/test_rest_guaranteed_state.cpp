@@ -102,8 +102,6 @@ yuzu::test::PgTestTemplate guardianstate_tpl{"guardianstate", [](const std::stri
 }};
 
 struct RestGsHarness {
-    yuzu::server::test::TestRouteSink sink;
-
     // Each TempDbFile sits ABOVE its store unique_ptr: members destruct in
     // reverse order, so the store closes its SQLite handle before the backing
     // file (+ -wal/-shm) is removed. RAII replaces the old manual dtor and
@@ -219,6 +217,12 @@ struct RestGsHarness {
     std::string scoped_deny_agent;
     std::string last_scoped_agent_id;
 
+    // When true, a "GuaranteedState" scoped_perm_fn call delegates to the real
+    // AuthRoutes::require_scoped_permission instead of the local stand-in above —
+    // see scoped_perm_fn's own comment. Default false: every pre-existing test in
+    // this file is unaffected.
+    bool wire_real_gs_scoped_perm_{false};
+
     std::vector<AuditRecord> audit_log;
 
     yuzu::MetricsRegistry metrics;
@@ -263,6 +267,17 @@ struct RestGsHarness {
     /// false → register the fleet /status route with an EMPTY ListReadFn,
     /// exercising its fail-closed-503 path (mirrors wire_scoped_perm above).
     bool wire_list_read_fn_{true};
+
+    // Declared LAST (was first): sink's registered handlers capture `this` and
+    // dereference owner members (auth_routes_, rbac_/mgmt_ bundles, api, ...)
+    // declared above — CLAUDE.md's test-conventions rule ("fixtures must
+    // declare the sink AFTER the route owner it registers") means sink must be
+    // destroyed FIRST, before any of those owners. Moved here per cpp-safety
+    // scoped review during the PR #3175 review-response round (verified: no
+    // member's construction depends on sink already existing, and no
+    // registered handler is ever invoked outside a live harness's own
+    // synchronous sink.Get/Post calls, so this was latent, not a live UAF).
+    yuzu::server::test::TestRouteSink sink;
 
     // ADR-0039: ResponseStore is now a migrated Postgres store, so it needs a
     // live `pg::PgPool&` — but only the handful of `/live`-exercising
@@ -359,10 +374,27 @@ struct RestGsHarness {
         // operation matches deny_scoped_op (Execute-vs-Read isolation, #1549). Mirrors
         // require_scoped_permission's contract (global passes; otherwise in-scope);
         // last_scoped_agent_id proves the route scopes by the right device.
-        auto scoped_perm_fn = [this](const httplib::Request&, httplib::Response& res,
-                                     const std::string&, const std::string& operation,
+        //
+        // wire_real_gs_scoped_perm_ (default false, every existing test unaffected):
+        // when a test flips it on, a GuaranteedState-securable call delegates to the
+        // REAL AuthRoutes::require_scoped_permission (same auth_routes_ instance the
+        // fleet route's list_read_fn already uses) instead of this stand-in — closes
+        // the gap a review on PR #3175 raised: the per-agent status route's cross-
+        // management-group denial test previously only proved THIS local string-match
+        // stub denies, never that the real RBAC/ManagementGroupStore composition does.
+        // Scoped to "GuaranteedState" only (that securable is shared by 5 routes in
+        // this file — /status/{agent_id}, /device-compliance, /events, /dex/devices/*
+        // — so a test using this toggle must call only the one route it means to
+        // exercise; every other route's tests never flip the toggle, so they are
+        // unaffected regardless).
+        auto scoped_perm_fn = [this](const httplib::Request& req, httplib::Response& res,
+                                     const std::string& securable_type,
+                                     const std::string& operation,
                                      const std::string& agent_id) -> bool {
             last_scoped_agent_id = agent_id;
+            if (wire_real_gs_scoped_perm_ && securable_type == "GuaranteedState")
+                return auth_routes_->require_scoped_permission(req, res, securable_type, operation,
+                                                                agent_id);
             if (!grant_perms || (!deny_scoped_agent.empty() && agent_id == deny_scoped_agent) ||
                 (!scoped_deny_agent.empty() && agent_id == scoped_deny_agent) ||
                 (!deny_scoped_op.empty() && operation == deny_scoped_op)) {
@@ -1545,6 +1577,9 @@ TEST_CASE("REST gs.status/{agent_id}: per-device scope denies an out-of-scope ca
     // World-A / ADR-0017: this route now serves real per-agent data, so it must be
     // confined the same way GET /guaranteed-state/device-compliance is — a bare
     // global perm_fn would be exactly the confinement gap that concern forbids.
+    // NOTE: this proves the ROUTE calls scoped_perm_fn with the right agent_id and
+    // honors its denial — it does NOT exercise the real RBAC/ManagementGroupStore
+    // composition (see the two [adr0017] tests below for that).
     RestGsHarness h;
     h.deny_scoped_agent = "WS-9";
     h.seed_status("e1", "WS-9", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
@@ -1556,6 +1591,69 @@ TEST_CASE("REST gs.status/{agent_id}: per-device scope denies an out-of-scope ca
     CHECK(h.last_scoped_agent_id == "WS-9");
     // No data leaked in a denial.
     CHECK(res->body.find("errored_rules") == std::string::npos);
+}
+
+TEST_CASE("REST gs.status/{agent_id}: a management-group-confined grant that does NOT cover "
+          "the target device is denied by the REAL scoped gate (not a stand-in) — PR #3175 "
+          "review gap: this route's cross-management-group denial was previously only proven "
+          "against a local string-match stub, never AuthRoutes::require_scoped_permission",
+          "[pg][rest][guaranteed_state][status][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_gs_scoped_perm_ = true;
+    // Ordinary (non-admin) role — the point is to prove the RBAC/management-
+    // group grant itself is what's evaluated, not the harness's default
+    // legacy-admin session_role (which would pass independently of RBAC).
+    h.session_role = auth::Role::user;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value()); // WS-9 is NOT a member
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
+    h.session_user = "carol";
+    h.seed_status("e1", "WS-9", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status/WS-9", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("errored_rules") == std::string::npos);
+    // The route scoped by the right device before the real gate denied.
+    CHECK(h.last_scoped_agent_id == "WS-9");
+}
+
+TEST_CASE("REST gs.status/{agent_id}: a management-group-confined grant that DOES cover the "
+          "target device is admitted by the REAL scoped gate",
+          "[pg][rest][guaranteed_state][status][adr0017]") {
+    RestGsHarness h;
+    h.wire_real_gs_scoped_perm_ = true;
+    h.session_role = auth::Role::user; // see the negative test above for why
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value()); // WS-1 IS a member
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
+    h.session_user = "carol";
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status/WS-1", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["errored_rules"].get<int>() == 1);
+    CHECK(h.last_scoped_agent_id == "WS-1");
 }
 
 TEST_CASE("REST gs.status/{agent_id}: audit persistence failure -> 503, no data served, "
