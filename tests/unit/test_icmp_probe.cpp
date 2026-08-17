@@ -14,6 +14,30 @@
 
 using namespace yuzu::shared;
 
+#ifdef _WIN32
+// getaddrinfo (used by resolve_first below) is real Winsock and fails with
+// WSANOTINITIALISED until WSAStartup runs -- unlike IcmpCreateFile (IP
+// Helper API, a separate driver interface with no such requirement).
+// Production callers (network_interfaces.cpp, cloud_identity.cpp) each own
+// their own lazy WSAStartup; this TU owns its own the same way, once, before
+// any TEST_CASE below runs.
+namespace {
+struct WinsockInit {
+    WinsockInit() {
+        WSADATA wsa;
+        ::WSAStartup(MAKEWORD(2, 2), &wsa);
+    }
+    ~WinsockInit() { ::WSACleanup(); }
+};
+const WinsockInit kWinsockInit;
+} // namespace
+#endif
+
+// icmp_checksum is a POSIX-only helper (icmp_probe.hpp's #else branch) --
+// Windows uses IcmpSendEcho, which computes its own checksum internally, so
+// there's no equivalent free function to test on that platform.
+#ifndef _WIN32
+
 TEST_CASE("icmp_checksum: all-zero packet checksums to 0xFFFF (RFC 1071 identity)",
           "[agent][icmp_probe]") {
     unsigned char pkt[8] = {0};
@@ -35,6 +59,8 @@ TEST_CASE("icmp_checksum: an odd-length buffer pads the trailing byte high, not 
     CHECK(icmp_checksum(pkt, sizeof(pkt)) == static_cast<std::uint16_t>(~0xFF00));
 }
 
+#endif // !_WIN32
+
 TEST_CASE("resolve_first: a numeric IPv4 literal resolves without any DNS round-trip",
           "[agent][icmp_probe]") {
     auto r = resolve_first("127.0.0.1", AF_INET);
@@ -55,11 +81,19 @@ TEST_CASE("resolve_first: a numeric IPv6 literal resolves without any DNS round-
     CHECK(r->addr_len == sizeof(sockaddr_in6));
 }
 
+// POSIX-only: verified on Windows (MSVC/the-rig) that WinSock's getaddrinfo
+// resolves an empty node string to a wildcard/loopback address instead of
+// failing EAI_NONAME the way glibc/libSystem's implementation does -- a real
+// platform divergence, not a bug in resolve_first (it forwards getaddrinfo's
+// own answer either way, and neither platform's answer triggers a DNS
+// round-trip for an empty node).
+#ifndef _WIN32
 TEST_CASE("resolve_first: an empty target fails immediately (EAI_NONAME, no network I/O)",
           "[agent][icmp_probe]") {
     auto r = resolve_first("", AF_INET);
     CHECK_FALSE(r.has_value());
 }
+#endif
 
 TEST_CASE("set_port: writes the port in network byte order for both address families",
           "[agent][icmp_probe]") {
