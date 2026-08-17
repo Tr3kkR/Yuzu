@@ -1043,6 +1043,28 @@ bool ManagementGroupStore::migrate_from_sqlite(const std::filesystem::path& lega
         return false;
     }
     sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+
+    // A deferred transaction fixes ONE consistent snapshot for the corruption
+    // probe, the table-existence probe, and all three reads below (PR #3174's
+    // software_deployment_store.cpp fix is the precedent for this exact
+    // hazard, itself following custom_properties_store.cpp's
+    // read_legacy_snapshot): without it, this connection's default autocommit
+    // mode makes each probe/read its own independent transaction, so a legacy
+    // file still being written by another process mid-backfill can interleave
+    // a write between them — producing a torn cross-table read that could
+    // pass whatever consistency the backfill logic checks and get permanently
+    // stamped complete. `BEGIN` (not `BEGIN IMMEDIATE`) is sufficient: this
+    // connection is SQLITE_OPEN_READONLY, so there is nothing for it to write
+    // that a reserved lock would need to protect. (#3210)
+    if (sqlite3_exec(legacy.get(), "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        spdlog::error("ManagementGroupStore: backfill: failed to start a snapshot transaction on "
+                      "legacy {}: {}",
+                      legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+        backfill_metric("failed");
+        return false;
+    }
+    SqliteTxn legacy_txn(legacy.get());
+
     // Corruption probe: an unreadable legacy DB must NOT be silently skipped
     // (that would drop every operator's confinement scope → fail-open).
     {
@@ -1137,6 +1159,18 @@ bool ManagementGroupStore::migrate_from_sqlite(const std::filesystem::path& lega
     if (!read_ok) {
         spdlog::error("ManagementGroupStore: backfill: legacy read failed: {}",
                       sqlite3_errmsg(legacy.get()));
+        backfill_metric("failed");
+        return false;
+    }
+    // Every prior early return in this scope leaves legacy_txn uncommitted, so
+    // its destructor ROLLBACKs (harmless — SQLITE_OPEN_READONLY, nothing
+    // written). Reaching here means the probes + reads all shared one
+    // consistent snapshot; commit closes it cleanly before `legacy` itself
+    // closes at end of scope.
+    if (legacy_txn.commit() != SQLITE_OK) {
+        spdlog::error("ManagementGroupStore: backfill: failed to close the snapshot transaction "
+                      "on legacy {}: {}",
+                      legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
         backfill_metric("failed");
         return false;
     }

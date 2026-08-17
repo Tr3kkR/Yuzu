@@ -15,6 +15,7 @@
 
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "sqlite_raii.hpp"
 
 #include "../test_helpers.hpp"
 
@@ -24,9 +25,12 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace yuzu::server;
@@ -934,4 +938,329 @@ TEST_CASE("ManagementGroupStore: backfill refuses an over-deep legacy tree (fail
     CHECK(scalar(db.dsn(), "SELECT count(*) FROM management_group_store.mgmt_group_meta WHERE key = "
                            "'backfill_complete'") == "0");
     CHECK(std::filesystem::exists(legacy.path));
+}
+
+// Exercises migrate_from_sqlite under a genuinely concurrent writer and proves
+// the enclosing snapshot transaction (#3210, following PR #3174's
+// software_deployment_store.cpp precedent) makes the outcome deterministic.
+//
+// Same honest-scope caveat as that precedent: for the SPECIFIC interleaving
+// this test constructs (atomically replacing a group -- delete old id, insert
+// new id, repoint the member/role rows -- between the groups-read and the
+// members-read), a torn read produces a member/role row referencing a group
+// id the groups-read never saw, which the Postgres FK constraint
+// (management_group_members.group_id / management_group_roles.group_id
+// REFERENCES management_groups(id)) already catches at INSERT time and rolls
+// back the whole backfill -- not a silent corruption. What this test proves:
+// without the transaction, the outcome is NONDETERMINISTIC (sometimes a
+// spurious fail-closed FK-violation refusal that forces an operator to just
+// retry); with it, the concurrent-writer case succeeds deterministically and
+// the migrated snapshot is always self-consistent.
+TEST_CASE("ManagementGroupStore::migrate_from_sqlite reads one consistent group/member/role "
+          "snapshot under a concurrent writer (no torn read)",
+          "[pg][management_group][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::test::TempDbFile legacy{"yuzu_test_mgmt_torn_"};
+    std::filesystem::remove(legacy.path);
+
+    // IDs chosen to sort last under EITHER a natural rowid scan (inserted
+    // last, below) or a lexicographic index scan ("zzz..." > every "aaa..."
+    // padding id) -- the read-order assumption must not depend on which plan
+    // SQLite happens to pick for a predicate-less SELECT.
+    const std::string grp_old_id(32, 'z');
+    const std::string grp_new_id(32, 'c');
+
+    {
+        SqliteDb legacy_w;
+        REQUIRE(sqlite3_open_v2(legacy.path.string().c_str(), legacy_w.addr(),
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                                nullptr) == SQLITE_OK);
+        const char* ddl =
+            "CREATE TABLE management_groups (id TEXT PRIMARY KEY, name TEXT, description TEXT, "
+            "parent_id TEXT, membership_type TEXT, scope_expression TEXT, created_by TEXT, "
+            "created_at INTEGER, updated_at INTEGER);"
+            "CREATE TABLE management_group_members (group_id TEXT, agent_id TEXT, source TEXT, "
+            "added_at INTEGER);"
+            "CREATE TABLE management_group_roles (group_id TEXT, principal_type TEXT, "
+            "principal_id TEXT, role_name TEXT);";
+        REQUIRE(sqlite3_exec(legacy_w.get(), ddl, nullptr, nullptr, nullptr) == SQLITE_OK);
+
+        // 10,000 padding root groups (own rows, no parent, no members/roles)
+        // inserted FIRST so a full-table scan of management_groups reaches
+        // grp_old_id only after all of them -- widens the writer's race
+        // window (~2-3ms scan vs. microsecond-scale thread start-up, same
+        // sizing rationale as the software_deployment_store precedent).
+        REQUIRE(sqlite3_exec(legacy_w.get(), "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
+        SqliteTxn pad_txn(legacy_w.get());
+        SqliteStmt pad_stmt;
+        REQUIRE(sqlite3_prepare_v2(legacy_w.get(),
+                                   "INSERT INTO management_groups (id, name, description, "
+                                   "membership_type, created_by, created_at, updated_at) VALUES "
+                                   "(?, ?, '', 'static', 'admin', 1, 1)",
+                                   -1, pad_stmt.addr(), nullptr) == SQLITE_OK);
+        for (int i = 0; i < 10000; ++i) {
+            char idbuf[33];
+            std::snprintf(idbuf, sizeof(idbuf), "aaa%029x", i + 1);
+            std::string name = "pad-" + std::to_string(i);
+            sqlite3_bind_text(pad_stmt.get(), 1, idbuf, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(pad_stmt.get(), 2, name.c_str(), -1, SQLITE_TRANSIENT);
+            REQUIRE(sqlite3_step(pad_stmt.get()) == SQLITE_DONE);
+            sqlite3_reset(pad_stmt.get());
+        }
+        REQUIRE(pad_txn.commit() == SQLITE_OK);
+
+        // grp_old_id itself, inserted last, plus one member and one role
+        // referencing it -- the race target.
+        REQUIRE(sqlite3_exec(legacy_w.get(),
+                             ("INSERT INTO management_groups (id, name, description, "
+                              "membership_type, created_by, created_at, updated_at) VALUES ('" +
+                              grp_old_id + "','Original','','static','admin',1,1);")
+                                 .c_str(),
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(legacy_w.get(),
+                             ("INSERT INTO management_group_members VALUES ('" + grp_old_id +
+                              "','agent-1','static',1);")
+                                 .c_str(),
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(legacy_w.get(),
+                             ("INSERT INTO management_group_roles VALUES ('" + grp_old_id +
+                              "','user','alice','Operator');")
+                                 .c_str(),
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+
+    std::atomic<bool> migrate_done{false};
+    std::atomic<bool> writer_open_failed{false};
+    std::thread writer([&] {
+        SqliteDb w;
+        if (sqlite3_open(legacy.path.string().c_str(), w.addr()) != SQLITE_OK) {
+            writer_open_failed = true;
+            return;
+        }
+        sqlite3_busy_timeout(w.get(), 0); // fail fast; we retry ourselves, never block the reader
+        while (!migrate_done.load(std::memory_order_acquire)) {
+            if (sqlite3_exec(w.get(), "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+                continue; // lock held by the reader's transaction -- retry
+            bool ok = true;
+            auto exec1 = [&](const std::string& sql) {
+                ok = ok && sqlite3_exec(w.get(), sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK;
+            };
+            exec1("DELETE FROM management_groups WHERE id='" + grp_old_id + "'");
+            exec1("INSERT INTO management_groups (id, name, description, membership_type, "
+                  "created_by, created_at, updated_at) VALUES ('" +
+                  grp_new_id + "','Replacement','','static','admin',999999,999999)");
+            exec1("UPDATE management_group_members SET group_id='" + grp_new_id +
+                  "' WHERE group_id='" + grp_old_id + "'");
+            exec1("UPDATE management_group_roles SET group_id='" + grp_new_id +
+                  "' WHERE group_id='" + grp_old_id + "'");
+            if (ok && sqlite3_exec(w.get(), "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK)
+                return; // one successful swap is all this test needs
+            sqlite3_exec(w.get(), "ROLLBACK", nullptr, nullptr, nullptr);
+        }
+    });
+    // Same ThreadJoiner-shaped guard as test_rbac_store.cpp / the
+    // software_deployment_store precedent: anything between here and the
+    // explicit writer.join() below that could throw would otherwise unwind
+    // past a still-joinable `writer` and std::terminate.
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() {
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{writer};
+
+    bool migrated = store.migrate_from_sqlite(legacy.path);
+    migrate_done.store(true, std::memory_order_release);
+    writer.join();
+
+    REQUIRE_FALSE(writer_open_failed.load());
+    REQUIRE(migrated);
+
+    // Whichever group ended up referenced by the migrated member/role row, it
+    // must actually be one of the groups the migration itself backfilled --
+    // never a torn reference the FK constraint should have (but might not,
+    // under a torn read) caught. Since the FK constraint enforces this at
+    // INSERT time, a `migrated == true` result already proves self-
+    // consistency for THIS interleaving -- this second check is redundant
+    // insurance, verifying the exact row rather than trusting the fail-closed
+    // gate alone.
+    auto member_group = scalar(db.dsn(), "SELECT group_id FROM "
+                                         "management_group_store.management_group_members "
+                                         "WHERE agent_id='agent-1'");
+    REQUIRE_FALSE(member_group.empty());
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM management_group_store.management_groups WHERE "
+                           "id='" +
+                               member_group + "'") == "1");
+}
+
+// Exercises migrate_from_sqlite under a genuinely concurrent writer, proving
+// the enclosing snapshot transaction (#3210, mirroring PR #3174's
+// software_deployment_store.cpp fix for the identical hazard) makes the
+// outcome deterministic. Race shape: a writer atomically deletes one group
+// and inserts a replacement while repointing that group's member/role rows
+// to the new id -- in the same transaction, on a second live connection.
+// Without the snapshot transaction, a torn read could see the OLD groups
+// table (still containing grpOld) but the NEW member/role rows (already
+// repointed to grpNew) -- an orphaned group_id the immediate (non-deferred)
+// FK on management_group_members/roles.group_id would reject at the
+// Postgres INSERT step, aborting the whole backfill. With the fix, the
+// writer's commit can only land wholly before or wholly after the reader's
+// single BEGIN..COMMIT window (SQLite's shared-lock isolation), so the
+// backfill always sees one fully-consistent snapshot and succeeds.
+TEST_CASE("ManagementGroupStore::migrate_from_sqlite reads one consistent cross-table snapshot "
+          "under a concurrent writer (no torn read)",
+          "[pg][management_group][backfill]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::test::TempDbFile legacy{"yuzu_test_mgmt_torn_"};
+    std::filesystem::remove(legacy.path);
+
+    const std::string grp_old = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const std::string grp_new = "cccccccccccccccccccccccccccccccc";
+
+    {
+        sqlite3* db_raw = nullptr;
+        REQUIRE(sqlite3_open_v2(legacy.path.string().c_str(), &db_raw,
+                                SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) == SQLITE_OK);
+        SqliteDb legacy_setup{db_raw};
+        const char* ddl =
+            "CREATE TABLE management_groups (id TEXT PRIMARY KEY, name TEXT, description TEXT, "
+            "parent_id TEXT, membership_type TEXT, scope_expression TEXT, created_by TEXT, "
+            "created_at INTEGER, updated_at INTEGER);"
+            "CREATE TABLE management_group_members (group_id TEXT, agent_id TEXT, source TEXT, "
+            "added_at INTEGER);"
+            "CREATE TABLE management_group_roles (group_id TEXT, principal_type TEXT, "
+            "principal_id TEXT, role_name TEXT);";
+        REQUIRE(sqlite3_exec(legacy_setup.get(), ddl, nullptr, nullptr, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(legacy_setup.get(),
+                             ("INSERT INTO management_groups VALUES ('" + grp_old +
+                              "','Original','desc',NULL,'static',NULL,'admin',1,1);")
+                                 .c_str(),
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(legacy_setup.get(),
+                             ("INSERT INTO management_group_members VALUES ('" + grp_old +
+                              "','agent-1','static',1);")
+                                 .c_str(),
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_exec(legacy_setup.get(),
+                             ("INSERT INTO management_group_roles VALUES ('" + grp_old +
+                              "','user','alice','Operator');")
+                                 .c_str(),
+                             nullptr, nullptr, nullptr) == SQLITE_OK);
+
+        // Pad the groups table so the reader's own BEGIN..COMMIT window
+        // (probe + all 3 table reads) takes long enough in wall-clock time
+        // for the writer thread's busy-retry loop below to get a fair shot
+        // at contending during it -- mirrors test_software_deployment_store
+        // .cpp's identical padding rationale. Wrapped in one transaction
+        // purely for setup speed (not exercising the write path).
+        REQUIRE(sqlite3_exec(legacy_setup.get(), "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
+        SqliteTxn pad_txn(legacy_setup.get());
+        SqliteStmt s;
+        REQUIRE(sqlite3_prepare_v2(legacy_setup.get(),
+                                   "INSERT INTO management_groups (id, name, description, "
+                                   "parent_id, membership_type, scope_expression, created_by, "
+                                   "created_at, updated_at) VALUES (?, ?, 'padding', NULL, "
+                                   "'static', NULL, 'admin', ?, 1)",
+                                   -1, s.addr(), nullptr) == SQLITE_OK);
+        for (int i = 0; i < 8000; ++i) {
+            char idbuf[33];
+            std::snprintf(idbuf, sizeof(idbuf), "%032x", i + 1);
+            std::string name = "bulk-grp-" + std::to_string(i) + "-padding";
+            sqlite3_bind_text(s.get(), 1, idbuf, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(s.get(), 2, name.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(s.get(), 3, 1000 + i);
+            REQUIRE(sqlite3_step(s.get()) == SQLITE_DONE);
+            sqlite3_reset(s.get());
+        }
+        REQUIRE(pad_txn.commit() == SQLITE_OK);
+    }
+
+    std::atomic<bool> migrate_done{false};
+    // Catch2's assertion macros are not documented/supported from a non-main
+    // thread -- record failure via atomic and REQUIRE it on the main thread
+    // after join(), matching test_software_deployment_store.cpp's precedent.
+    std::atomic<bool> writer_open_failed{false};
+    std::thread writer([&] {
+        SqliteDb w;
+        if (sqlite3_open(legacy.path.string().c_str(), w.addr()) != SQLITE_OK) {
+            writer_open_failed = true;
+            return;
+        }
+        sqlite3_busy_timeout(w.get(), 0); // fail fast; we retry ourselves, never block the reader
+        while (!migrate_done.load(std::memory_order_acquire)) {
+            if (sqlite3_exec(w.get(), "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+                continue; // lock held by the reader's transaction -- retry
+            bool ok = true;
+            ok = ok && sqlite3_exec(w.get(),
+                                    ("DELETE FROM management_groups WHERE id='" + grp_old + "'")
+                                        .c_str(),
+                                    nullptr, nullptr, nullptr) == SQLITE_OK;
+            ok = ok && sqlite3_exec(w.get(),
+                                    ("INSERT INTO management_groups VALUES ('" + grp_new +
+                                     "','Replacement','desc',NULL,'static',NULL,'admin',999999,"
+                                     "999999)")
+                                        .c_str(),
+                                    nullptr, nullptr, nullptr) == SQLITE_OK;
+            ok = ok && sqlite3_exec(w.get(),
+                                    ("UPDATE management_group_members SET group_id='" + grp_new +
+                                     "' WHERE group_id='" + grp_old + "'")
+                                        .c_str(),
+                                    nullptr, nullptr, nullptr) == SQLITE_OK;
+            ok = ok && sqlite3_exec(w.get(),
+                                    ("UPDATE management_group_roles SET group_id='" + grp_new +
+                                     "' WHERE group_id='" + grp_old + "'")
+                                        .c_str(),
+                                    nullptr, nullptr, nullptr) == SQLITE_OK;
+            if (ok && sqlite3_exec(w.get(), "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK)
+                return; // one successful swap is all this test needs
+            sqlite3_exec(w.get(), "ROLLBACK", nullptr, nullptr, nullptr);
+        }
+    });
+    // Anything between here and the explicit writer.join() below that could
+    // throw would otherwise unwind past a still-joinable `writer` and
+    // std::terminate -- same ThreadJoiner guard shape as
+    // test_rbac_store.cpp / test_software_deployment_store.cpp.
+    struct ThreadJoiner {
+        std::thread& t;
+        ~ThreadJoiner() {
+            if (t.joinable())
+                t.join();
+        }
+    } joiner{writer};
+
+    const bool migrated = store.migrate_from_sqlite(legacy.path);
+    migrate_done.store(true, std::memory_order_release);
+    writer.join();
+
+    REQUIRE_FALSE(writer_open_failed.load());
+    REQUIRE(migrated);
+
+    // Whichever group the migrated snapshot captured (grpOld or grpNew,
+    // depending on when the writer's swap landed), the member and role rows
+    // must reference a group that was ITSELF backfilled -- never a torn
+    // reference to a group version the migration never saw. This is the
+    // property that fails on a torn cross-table read despite the immediate
+    // FK constraint appearing to have caught it (the FK only rejects an
+    // orphan; it can't silently repair a torn-but-still-self-consistent
+    // read, so the real assertion is on referential consistency, not merely
+    // "some group exists").
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM management_group_store.management_groups") ==
+          "8001"); // 8000 padding + exactly one of {grpOld, grpNew}
+    const std::string member_group =
+        scalar(db.dsn(), "SELECT group_id FROM management_group_store.management_group_members");
+    const std::string role_group =
+        scalar(db.dsn(), "SELECT group_id FROM management_group_store.management_group_roles");
+    CHECK(member_group == role_group);
+    CHECK(scalar(db.dsn(), "SELECT count(*) FROM management_group_store.management_groups WHERE "
+                           "id = '" +
+                               member_group + "'") == "1");
 }
