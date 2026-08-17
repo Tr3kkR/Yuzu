@@ -34,9 +34,7 @@ enum class GateFailure : std::uint8_t {
 
 /// Move-only witness over an already-composed `VisibleSet` — the product of
 /// `AuthRoutes::authorize_fleet_read`. `in_scope`/`filter` are the only
-/// operations exposed, so a route that holds a `ListAuthority` cannot
-/// accidentally fall back to an unfiltered query for the same read: getting
-/// one at all already required calling the gate.
+/// operations exposed on the witness itself.
 ///
 /// Ergonomic, not structural: the stores this wraps still accept ordinary
 /// unfiltered queries called directly, so `ListAuthority` does not make an

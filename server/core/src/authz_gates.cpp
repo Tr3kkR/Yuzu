@@ -126,7 +126,7 @@ bool AuthRoutes::authorize_agent_target(const httplib::Request& req, httplib::Re
         return true;
 
     if (!tag_store_) {
-        audit_log(req, "auth.agent_target_required", "denied", agent_id,
+        audit_log(req, "auth.agent_target_required", "denied", "Agent", agent_id,
                   "agent target blocked: tag store unavailable");
         res.status = 503;
         res.set_content(detail::a4_denial(res, 503, "tag store unavailable, cannot verify scope",
@@ -136,7 +136,7 @@ bool AuthRoutes::authorize_agent_target(const httplib::Request& req, httplib::Re
     }
     auto tagged = tag_store_->agents_with_tag_checked("service", session->token_scope_service);
     if (!tagged) {
-        audit_log(req, "auth.agent_target_required", "denied", agent_id,
+        audit_log(req, "auth.agent_target_required", "denied", "Agent", agent_id,
                   "agent target blocked: tag store degraded resolving service scope");
         res.status = 503;
         res.set_content(detail::a4_denial(res, 503, "tag store degraded, cannot verify scope",
@@ -146,7 +146,7 @@ bool AuthRoutes::authorize_agent_target(const httplib::Request& req, httplib::Re
     }
     const authz::VisibleSet service_scope{std::unordered_set<std::string>(tagged->begin(), tagged->end())};
     if (!authz::in_scope(service_scope, agent_id)) {
-        audit_log(req, "auth.agent_target_required", "denied", agent_id,
+        audit_log(req, "auth.agent_target_required", "denied", "Agent", agent_id,
                   "agent is not in service '" + session->token_scope_service + "'");
         res.status = 403;
         res.set_content(
