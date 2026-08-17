@@ -3869,9 +3869,32 @@ public:
                     }
                 }
             }
-            // Internal-CA store (ca.db) — cert inventory + CRL versions. The CA
-            // root key itself is a 0600 file via default_certs, never in this DB.
-            ca_store_ = std::make_unique<CaStore>(cfg_.db_dir() / "ca.db");
+            // Internal-CA store — PostgreSQL (ADR-0053, schema ca_store): cert inventory + CRL
+            // versions. The CA root key itself is a 0600 file via default_certs, never in this
+            // DB. Born-on-PG like the other migrated stores: fail-closed on open, then a
+            // MANDATORY backfill of the legacy ca.db (issued-cert + CRL history is compliance
+            // evidence, ADR-0053 — refuse boot rather than serve a knowingly-incomplete trail).
+            if (pg_pool_ && !startup_failed_) {
+                ca_store_ = std::make_unique<CaStore>(*pg_pool_);
+                if (!ca_store_->is_open()) {
+                    spdlog::error("[PG] Refusing to start: ca store migration/open failed "
+                                  "(database reachable but the ca_store schema could not be "
+                                  "created/opened)");
+                    startup_failed_ = true;
+                } else {
+                    auto ca_db = cfg_.db_dir() / "ca.db";
+                    if (!ca_store_->migrate_from_sqlite(ca_db)) {
+                        spdlog::error("[PG] Refusing to start: ca store backfill from legacy {} "
+                                      "failed (ADR-0009 mandatory-backfill fail-closed; see prior "
+                                      "log lines). The issued-cert/CRL evidence chain must be "
+                                      "complete before serving; the next boot retries. Operator "
+                                      "remediation: repair the file, or quarantine it aside if it "
+                                      "is unrecoverable.",
+                                      ca_db.string());
+                        startup_failed_ = true;
+                    }
+                }
+            }
             // PR 10 hardening — wire AuditStore into FleetTopologyStore
             // so push success (first-per-agent) and rejections emit
             // AuditEvents (F-1 / CC6.1 / CC7.3 evidence chain). Must
@@ -5475,8 +5498,8 @@ public:
             // a presented client leaf against OUR CA specifically (Hermes CRITICAL-1
             // / LOW-5 — a foreign cert in a multi-CA trust bundle must not be
             // mistaken for a Yuzu agent identity or a revoked Yuzu serial).
-            if (auto r = ca_store_->get_root())
-                agent_ca_cert_pem_ = r->cert_pem;
+            if (auto r = ca_store_->get_root(); r && r->has_value())
+                agent_ca_cert_pem_ = (*r)->cert_pem;
             // ONE guarded signer, shared by the direct (AgentServiceImpl) and
             // gateway-proxied (GatewayUpstreamServiceImpl::ProxyRegister, PR5d)
             // Register paths — so an agent enrolling through the gateway receives a
@@ -7518,7 +7541,13 @@ private:
         const char* const via = to_audit_via(src);
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: agent CSR signing aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return std::nullopt;
+        }
+        auto& root = *root_or_err;
         if (!root) {
             spdlog::warn("PKI: agent CSR signing requested but ca.db has no root");
             return std::nullopt;
@@ -7557,8 +7586,17 @@ private:
         // (fine at realistic revocation counts; a subject-indexed query is the
         // follow-up if it ever grows).
         {
+            auto revoked_or_err = ca_store_->list_revoked();
+            if (!revoked_or_err) {
+                // ADR-0036: a silently-empty read here would silently BYPASS the HIGH-2
+                // revocation-bypass guard below — fail closed (refuse to issue) rather than
+                // treat "couldn't read the revoked set" as "nothing is revoked".
+                spdlog::error("PKI: agent CSR signing aborted — list_revoked failed: {}",
+                              revoked_or_err.error());
+                return std::nullopt;
+            }
             const auto now_epoch = static_cast<int64_t>(std::time(nullptr));
-            for (const auto& rev : ca_store_->list_revoked()) {
+            for (const auto& rev : *revoked_or_err) {
                 if (rev.subject == agent_id && rev.not_after > now_epoch) {
                     spdlog::warn("PKI: refusing to re-issue for agent {} — a revoked, "
                                  "non-expired cert (serial {}) exists; an operator must clear "
@@ -7678,10 +7716,11 @@ private:
         if (auto kid = pki::issuer_key_id(root->cert_pem))
             rec.issuer_key_id = *kid;
         rec.issuer_fingerprint = root->fingerprint_sha256;
-        if (!ca_store_->record_issued(rec)) {
+        if (auto rec_result = ca_store_->record_issued(rec); !rec_result) {
             // Fail closed: an unrecorded cert can't be revoked, so don't hand it
             // out — the agent stays on the bootstrap posture and retries.
-            spdlog::error("PKI: failed to record issued agent cert for {} — not issuing", agent_id);
+            spdlog::error("PKI: failed to record issued agent cert for {} — not issuing: {}",
+                          agent_id, rec_result.error());
             return std::nullopt;
         }
 
@@ -7726,7 +7765,13 @@ private:
     std::optional<std::string> export_ca_csr() {
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: CA CSR export aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return std::nullopt;
+        }
+        auto& root = *root_or_err;
         if (!root) {
             spdlog::warn("PKI: CA CSR export requested but ca.db has no root");
             return std::nullopt;
@@ -7770,7 +7815,13 @@ private:
                                                      const std::string& parent_chain_pem) {
         if (!ca_store_ || !ca_store_->is_open())
             return CaRoutes::ImportOutcome::StoreError;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: subordinate import aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return CaRoutes::ImportOutcome::StoreError;
+        }
+        auto& root = *root_or_err;
         if (!root)
             return CaRoutes::ImportOutcome::NoRoot;
 
@@ -7832,8 +7883,9 @@ private:
         updated.not_after = std::chrono::duration_cast<std::chrono::seconds>(
                                 details->not_after.time_since_epoch())
                                 .count();
-        if (!ca_store_->set_root(updated)) {
-            spdlog::error("PKI: subordinate import validated but set_root failed");
+        if (auto set_result = ca_store_->set_root(updated); !set_result) {
+            spdlog::error("PKI: subordinate import validated but set_root failed: {}",
+                          set_result.error());
             return CaRoutes::ImportOutcome::StoreError;
         }
         spdlog::warn("PKI: issuing identity switched to SUBORDINATE — intermediate {} now chains "
@@ -7888,7 +7940,13 @@ private:
         std::lock_guard<std::mutex> publish_lock(crl_publish_mu_);
         if (!ca_store_ || !ca_store_->is_open())
             return std::nullopt;
-        auto root = ca_store_->get_root();
+        auto root_or_err = ca_store_->get_root();
+        if (!root_or_err) {
+            spdlog::error("PKI: CRL publish aborted — ca_store read failed: {}",
+                          root_or_err.error());
+            return std::nullopt;
+        }
+        auto& root = *root_or_err;
         if (!root)
             return std::nullopt;
         const std::filesystem::path dir =
@@ -7902,15 +7960,34 @@ private:
         }
         detail::ScopedKeyZero ca_key_zero{*ca_key};
 
+        auto revoked_or_err = ca_store_->list_revoked();
+        if (!revoked_or_err) {
+            // ADR-0036/ADR-0053: never build a CRL over a possibly-incomplete revoked set — a
+            // degraded read here would publish a CRL that silently un-revokes every real
+            // revocation in every cache that trusts it. Abort the whole publish instead.
+            spdlog::error("PKI: CRL publish aborted — list_revoked failed: {}",
+                          revoked_or_err.error());
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
         std::vector<pki::CrlRevocation> revoked;
-        for (const auto& r : ca_store_->list_revoked()) {
+        for (const auto& r : *revoked_or_err) {
             revoked.push_back(
                 {r.serial_hex,
                  std::chrono::system_clock::time_point{std::chrono::seconds{r.revoked_at}}});
         }
         const auto now = std::chrono::system_clock::now();
         const pki::Validity validity{now, now + std::chrono::hours(24 * 7)}; // 7-day nextUpdate
-        const std::uint64_t number = ca_store_->next_crl_number();
+        auto number_or_err = ca_store_->next_crl_number();
+        if (!number_or_err) {
+            // ADR-0053: never substitute a default number on error — see next_crl_number()'s
+            // doc comment for why the pre-migration "silently return 1" default is unsafe here.
+            spdlog::error("PKI: CRL publish aborted — next_crl_number failed: {}",
+                          number_or_err.error());
+            metrics_.counter("yuzu_server_ca_crl_publish_failures_total").increment();
+            return std::nullopt;
+        }
+        const std::uint64_t number = *number_or_err;
         auto der = pki::build_crl(root->cert_pem, *ca_key, revoked, validity, number);
         if (!der) {
             spdlog::error("PKI: build_crl failed");

@@ -10,6 +10,7 @@
 #include "default_certs.hpp"
 
 #include "ca_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "x509_ca.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -40,6 +41,16 @@
 using namespace yuzu::server;
 
 namespace {
+
+// Shared with test_ca_store.cpp's "castore" key — identical setup, replay-verified by the
+// PgTestTemplate registry (docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate ca_store_tpl{
+    "castore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::CaStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("ca_store template: store failed to migrate");
+    }};
 
 struct TempDir {
     std::filesystem::path path;
@@ -343,10 +354,11 @@ TEST_CASE("default_certs: regenerates the whole set when a key is missing",
     REQUIRE(std::filesystem::exists(second.server_key));
 }
 
-TEST_CASE("default_certs: records root + leaves in ca_store", "[default_certs][ca_store]") {
+TEST_CASE("default_certs: records root + leaves in ca_store", "[default_certs][ca_store][pg]") {
     TempDir dir;
-    yuzu::test::TempDbFile db{std::string_view{"defcerts-ca-"}};
-    CaStore store(db.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
     REQUIRE(store.is_open());
 
     DefaultCertSet set;
@@ -354,44 +366,48 @@ TEST_CASE("default_certs: records root + leaves in ca_store", "[default_certs][c
 
     REQUIRE(store.has_root());
     auto root = store.get_root();
-    REQUIRE(root);
-    REQUIRE(root->algo == "EcP384");
-    REQUIRE(root->mode == CaMode::Builtin);
-    REQUIRE(root->fingerprint_sha256 == set.ca_fingerprint_sha256);
+    REQUIRE(root.has_value());
+    REQUIRE(root->has_value());
+    REQUIRE((*root)->algo == "EcP384");
+    REQUIRE((*root)->mode == CaMode::Builtin);
+    REQUIRE((*root)->fingerprint_sha256 == set.ca_fingerprint_sha256);
 
     auto issued = store.list_issued();
-    REQUIRE(issued.size() == 3); // https + server + gateway
-    for (const auto& rec : issued) {
+    REQUIRE(issued.has_value());
+    REQUIRE(issued->size() == 3); // https + server + gateway
+    for (const auto& rec : *issued) {
         REQUIRE_FALSE(rec.cert_pem.empty());
         REQUIRE(rec.issued_by == "system:default-certs");
     }
 }
 
 TEST_CASE("default_certs: refuses to re-root a populated ca.db (B-2)",
-          "[default_certs][ca_store][security]") {
-    // B-2 (#1238): a wiped/corrupt on-disk cert dir on a PERSISTENT ca.db must NOT
+          "[default_certs][ca_store][security][pg]") {
+    // B-2 (#1238): a wiped/corrupt on-disk cert dir on a PERSISTENT ca_store must NOT
     // silently regenerate a fresh CA — that would re-root the fleet and orphan
     // every agent enrolled under the old root. ensure_default_certs must refuse;
     // the bootstrap caller turns that into a refuse-to-start with a restore hint.
     TempDir dir;
-    yuzu::test::TempDbFile db{std::string_view{"defcerts-ca-"}};
-    CaStore store(db.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
     DefaultCertSet a;
     REQUIRE(ensure_default_certs(dir.path, "host", &store, a));
     REQUIRE(store.has_root());
-    REQUIRE(store.list_issued().size() == 3);
+    REQUIRE(store.list_issued()->size() == 3);
 
-    // Corrupt the on-disk set while ca.db stays populated.
+    // Corrupt the on-disk set while ca_store stays populated.
     std::error_code ec;
     std::filesystem::remove(a.server_key, ec);
     DefaultCertSet b;
     REQUIRE_FALSE(ensure_default_certs(dir.path, "host", &store, b)); // refuse, don't re-root
     REQUIRE_FALSE(b.freshly_generated);
-    // ca.db root + inventory left intact (not REPLACEd, not purged).
+    // ca_store root + inventory left intact (not REPLACEd, not purged).
     auto root_after = store.get_root();
-    REQUIRE(root_after);
-    REQUIRE(root_after->fingerprint_sha256 == a.ca_fingerprint_sha256);
-    REQUIRE(store.list_issued().size() == 3);
+    REQUIRE(root_after.has_value());
+    REQUIRE(root_after->has_value());
+    REQUIRE((*root_after)->fingerprint_sha256 == a.ca_fingerprint_sha256);
+    REQUIRE(store.list_issued()->size() == 3);
 }
 
 TEST_CASE("default_certs: returns false (refuse) when the cert dir cannot be created",

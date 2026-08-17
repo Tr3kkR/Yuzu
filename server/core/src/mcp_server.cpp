@@ -8886,7 +8886,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 offset = std::clamp(offset, 0, 1000000);
                 // REST/MCP parity with GET /api/v1/ca/issued: probe limit+1 for a
                 // precise has_more so an agentic client can paginate deterministically.
-                auto records = ca_store->list_issued(limit + 1, offset);
+                auto records_or_err = ca_store->list_issued(limit + 1, offset);
+                if (!records_or_err) {
+                    res.set_content(error_response(id, kInternalError, "CA store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto records = std::move(*records_or_err);
                 const bool has_more = static_cast<int>(records.size()) > limit;
                 if (has_more)
                     records.resize(static_cast<std::size_t>(limit));
@@ -8956,7 +8962,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 for (auto& c : serial)
                     c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                if (!ca_store->revoke(serial, reason)) {
+                auto revoked_or_err = ca_store->revoke(serial, reason);
+                if (!revoked_or_err) {
+                    // ADR-0053: a genuine DB/lease failure — distinct from "not found or
+                    // already revoked" (a business fact). Must NOT be audited "denied": that
+                    // would falsely record a database outage as a rejected revoke attempt.
+                    (void)audit_fn(req, "ca.cert.revoked", "failure", "AgentCertificate", serial,
+                                   revoked_or_err.error());
+                    res.set_content(error_response(id, kInternalError, "CA store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                if (!*revoked_or_err) {
                     // Idempotent reject-without-state-change → "denied" (matches REST).
                     // M1 (#1240): surface a dropped denied-row via the error data.
                     const bool denied_audit_ok = audit_fn(req, "ca.cert.revoked", "denied",

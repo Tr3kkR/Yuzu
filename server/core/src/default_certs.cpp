@@ -542,20 +542,36 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
     // root) or removes ca.db too for a deliberate clean re-root. We refuse on ANY
     // existing root (not only a fingerprint mismatch): the regen path always mints
     // a brand-new CA, so proceeding would re-root regardless.
-    if (ca_store && ca_store->is_open() && ca_store->has_root()) {
-        const auto root = ca_store->get_root();
-        const std::string on_disk = file_present(out.ca_cert)
-                                        ? ("on-disk CA " + pki::fingerprint_sha256(
-                                                               read_text_file(out.ca_cert))
-                                                               .value_or(std::string{"unreadable"}))
-                                        : std::string{"no on-disk CA cert"};
-        spdlog::error("default_certs: ca.db already holds a CA root ({}) but the on-disk default "
-                      "certs in {} are missing/corrupt ({}). Refusing to regenerate — a fresh CA "
-                      "would re-root the fleet and orphan every enrolled agent. Restore "
-                      "default-*.{{pem,key}} from backup (matching the ca.db root), or remove ca.db "
-                      "for a deliberate clean re-root.",
-                      root ? root->fingerprint_sha256 : std::string{"?"}, dir.string(), on_disk);
-        return false;
+    if (ca_store && ca_store->is_open()) {
+        // ADR-0036/ADR-0053: get_root() directly, NOT has_root() — this is the ONE call site
+        // where a degraded read must NOT collapse to "no root". A DB blip misread as "no root"
+        // here would let a fresh CA generation proceed and silently re-root a fleet that already
+        // has one (the exact danger this guard exists to prevent).
+        auto root_or_err = ca_store->get_root();
+        if (!root_or_err) {
+            spdlog::error("default_certs: cannot determine whether ca.db already holds a CA root "
+                          "({}) — refusing to regenerate. A fresh CA would re-root the fleet if "
+                          "one already exists and this read simply failed to see it; resolve the "
+                          "database error and retry.",
+                          root_or_err.error());
+            return false;
+        }
+        if (root_or_err->has_value()) {
+            const auto& root = **root_or_err;
+            const std::string on_disk =
+                file_present(out.ca_cert)
+                    ? ("on-disk CA " +
+                       pki::fingerprint_sha256(read_text_file(out.ca_cert)).value_or(std::string{"unreadable"}))
+                    : std::string{"no on-disk CA cert"};
+            spdlog::error(
+                "default_certs: ca.db already holds a CA root ({}) but the on-disk default "
+                "certs in {} are missing/corrupt ({}). Refusing to regenerate — a fresh CA "
+                "would re-root the fleet and orphan every enrolled agent. Restore "
+                "default-*.{{pem,key}} from backup (matching the ca.db root), or remove ca.db "
+                "for a deliberate clean re-root.",
+                root.fingerprint_sha256, dir.string(), on_disk);
+            return false;
+        }
     }
 
     // ── (Re)generate the whole set ────────────────────────────────────────────
@@ -684,10 +700,10 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
             rec.issued_by = "system:default-certs";
             rec.issuer_fingerprint = *ca_fp;
             rec.issuer_key_id = ca_key_id;
-            if (!ca_store->record_issued(rec)) {
+            if (auto rec_result = ca_store->record_issued(rec); !rec_result) {
                 spdlog::error("default_certs: failed to record issued '{}' in ca.db — aborting "
-                              "(the inventory must be consistent for revocation / rotation)",
-                              spec.purpose);
+                              "(the inventory must be consistent for revocation / rotation): {}",
+                              spec.purpose, rec_result.error());
                 ok = false;
             }
         }
@@ -715,9 +731,33 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         root.not_after = to_epoch(ca_info->not_after);
         root.fingerprint_sha256 = *ca_fp;
         root.mode = CaMode::Builtin;
-        if (!ca_store->set_root(root)) {
-            spdlog::error("default_certs: failed to record CA root in ca.db — aborting");
+        // ADR-0053 "Root-singleton first-boot race": try_insert_root(), NOT set_root() — a
+        // shared Postgres substrate makes it possible for two instances to independently
+        // generate root material and race to establish it (impossible under per-instance
+        // SQLite, where this call used to be an unconditional INSERT OR REPLACE). ON CONFLICT
+        // DO NOTHING means at most one caller's row is ever inserted; every caller reads back
+        // whichever root is now canonical.
+        auto established = ca_store->try_insert_root(root);
+        if (!established) {
+            spdlog::error("default_certs: failed to record CA root in ca.db — aborting: {}",
+                          established.error());
             return false; // before the marker — next boot regenerates
+        }
+        if (established->fingerprint_sha256 != *ca_fp) {
+            // Lost the race — another instance already established a DIFFERENT root. This
+            // instance's freshly-generated key material is unusable (nobody else holds its
+            // private key): refuse to write the marker / proceed as though our own material is
+            // authoritative, rather than silently operating under, or clobbering, a root nobody
+            // else recognises.
+            spdlog::error(
+                "default_certs: lost the first-boot CA-root race — ca.db already holds a "
+                "DIFFERENT root (fingerprint {}) established by another instance. This "
+                "instance's freshly generated CA (fingerprint {}) is discarded; its default "
+                "certs are NOT written. If instances are meant to share one cert volume, restart "
+                "this instance to pick up the winning root's certs from disk; otherwise "
+                "investigate why two instances raced first-boot generation concurrently.",
+                established->fingerprint_sha256, *ca_fp);
+            return false;
         }
     }
 

@@ -6733,10 +6733,23 @@ TEST_CASE("MCP CA: list_issued_certs + revoke_certificate are advertised in tool
     CHECK(names.count("revoke_certificate") == 1);
 }
 
+namespace {
+// Shared with test_ca_store.cpp's "castore" key — identical setup, replay-verified by the
+// PgTestTemplate registry (docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate mcp_ca_store_tpl{
+    "castore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::CaStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("ca_store template: store failed to migrate");
+    }};
+} // namespace
+
 TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
-          "[mcp][integration][pki]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
-    yuzu::server::CaStore store(db.path);
+          "[mcp][integration][pki][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     REQUIRE(store.is_open());
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "AB12";
@@ -6744,7 +6757,7 @@ TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
     rec.purpose = "agent";
     rec.not_after = 4102444800; // 2100
     rec.issued_at = 1700000000;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     McpTestServer ts;
     ts.ca_store_for_test = &store;
@@ -6767,18 +6780,19 @@ TEST_CASE("MCP CA: list_issued_certs returns the CA inventory (Security:Read)",
 }
 
 TEST_CASE("MCP CA: list_issued_certs is allowed on the readonly tier (Security:Read)",
-          "[mcp][integration][pki][security]") {
+          "[mcp][integration][pki][security][pg]") {
     // #1240 L3: the readonly tier permits ALL Read ops, so a read-only agentic
     // worker can inventory the CA. Pin this so a tier_allows regression can't
     // silently narrow (or widen) the access boundary.
-    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
-    yuzu::server::CaStore store(db.path);
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "C0DE";
     rec.subject = "agent-ro";
     rec.purpose = "agent";
     rec.not_after = 4102444800;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     McpTestServer ts;
     ts.ca_store_for_test = &store;
@@ -6804,15 +6818,16 @@ TEST_CASE("MCP CA: list_issued_certs without a CA returns an error, not a crash"
 }
 
 TEST_CASE("MCP CA: revoke_certificate is tier-denied below supervised (Security:Delete)",
-          "[mcp][integration][pki][security]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
-    yuzu::server::CaStore store(db.path);
+          "[mcp][integration][pki][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "DEAD";
     rec.subject = "agent-x";
     rec.purpose = "agent";
     rec.not_after = 4102444800;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     McpTestServer ts;
     ts.ca_store_for_test = &store;
@@ -6829,15 +6844,16 @@ TEST_CASE("MCP CA: revoke_certificate is tier-denied below supervised (Security:
 }
 
 TEST_CASE("MCP CA: revoke_certificate supervised, no approval manager, degraded deny",
-          "[mcp][integration][pki][security]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
-    yuzu::server::CaStore store(db.path);
+          "[mcp][integration][pki][security][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "BEEF";
     rec.subject = "agent-y";
     rec.purpose = "agent";
     rec.not_after = 4102444800;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     McpTestServer ts;
     ts.ca_store_for_test = &store;
@@ -6855,15 +6871,16 @@ TEST_CASE("MCP CA: revoke_certificate supervised, no approval manager, degraded 
 }
 
 TEST_CASE("MCP CA: revoke_certificate supervised + approval manager mints a ticket (#289)",
-          "[mcp][integration][pki][security][approval]") {
-    yuzu::test::TempDbFile db{std::string_view{"mcp-ca-"}};
-    yuzu::server::CaStore store(db.path);
+          "[mcp][integration][pki][security][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "BEEF";
     rec.subject = "agent-y";
     rec.purpose = "agent";
     rec.not_after = 4102444800;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
     sqlite3* raw = nullptr;
@@ -6892,15 +6909,16 @@ TEST_CASE("MCP CA: revoke_certificate supervised + approval manager mints a tick
 
 TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches revoked:true "
           "(#2712)",
-          "[mcp][integration][pki][security][approval]") {
-    yuzu::test::TempDbFile db{std::string_view{"yuzu_test_mcp_ca_"}};
-    yuzu::server::CaStore store(db.path);
+          "[mcp][integration][pki][security][approval][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
     yuzu::server::IssuedCertRecord rec;
     rec.serial_hex = "CAFE";
     rec.subject = "agent-z";
     rec.purpose = "agent";
     rec.not_after = 4102444800;
-    REQUIRE(store.record_issued(rec));
+    REQUIRE(store.record_issued(rec).has_value());
 
     yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_"}};
     // RAII, not a trailing sqlite3_close: every REQUIRE below throws, and a
