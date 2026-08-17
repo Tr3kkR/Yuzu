@@ -47,7 +47,11 @@ cadences.
 - **No end-user profiles / personal data.** We do **not** use the plugin's
   per-user enumeration (`list_per_user`), so no logged-in-user profiles and no
   usernames are collected — no end-user PII. (The only `HKCU` read is the agent's
-  own service-account hive, which is benign.) It carries **lower behavioral
+  own service-account hive, which is benign: the agent runs outside any
+  interactive login session, so `HKCU` is that service account's profile. Note
+  the account is **LocalSystem** today, not the intended `NT SERVICE\YuzuAgent`
+  — a tracked deviation, #1442. The conclusion is unaffected; LocalSystem's
+  profile is no more an end user's than the virtual account's would be.) It carries **lower behavioral
   sensitivity** than the process/performance tiers (no run-time, no resource
   attribution). **Note for works-council jurisdictions:** the data is still
   device-attributable, and on personally-assigned devices installed-software

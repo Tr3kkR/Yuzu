@@ -16,11 +16,14 @@
  *   per_user_hives  — user-scope ProbeSpec rows probed in each profile's
  *                     registry hive: loaded HKU\<SID> hives FIRST, offline
  *                     NTUSER.DAT via RegLoadKeyW only as fallback (roadmap
- *                     C-1 — clone of installed_apps' HiveUnloadGuard +
- *                     close-every-hive-HKEY-before-unload; the registry
- *                     plugin's manual-unload pattern is a known-broken
- *                     precedent, issue I-5). Reports `privilege_missing`
- *                     when SeBackup/SeRestore cannot be enabled (R15).
+ *                     C-1). Since #2771 the ladder itself lives in
+ *                     agents/shared/win_profiles.hpp — this file was the
+ *                     reference it was ported from and now consumes it, so
+ *                     the close-every-hive-HKEY-before-unload rule and the
+ *                     privilege handling are enforced in one place rather
+ *                     than cloned. Reports `privilege_missing` when
+ *                     SeBackup/SeRestore cannot be enabled for a profile
+ *                     that actually needed the offline fallback (R15).
  *   per_user_files  — per-profile licence files (JetBrains
  *                     %APPDATA%-shaped .key paths, Adobe NGL sign-in
  *                     artefact), resolved via ProfileList — no hive needed.
@@ -30,8 +33,10 @@
  *
  * ADR-0024 D11 (binds the emission): per-user records carry
  * user_scope=user and user_ref=<local profile name>; when the profile name
- * cannot be resolved user_ref stays EMPTY — NEVER a SID. Deliberately does
- * NOT clone installed_apps' `username = sid` fallback.
+ * cannot be resolved user_ref stays EMPTY — NEVER a SID. That invariant now
+ * belongs to yuzu::profiles::build_profile_list, which every per-user
+ * consumer shares; installed_apps' contradicting `username = sid` fallback
+ * was removed in #2771 rather than worked around here.
  */
 
 #ifdef _WIN32
@@ -50,6 +55,14 @@
 #include <windows.h>
 
 #include <win_str.hpp> // shared yuzu::win wide<->UTF-8 helpers (#1681, R17)
+
+// Shared per-user profile/hive ladder (#2771). This file's own copy of the
+// ProfileList walk, the privilege enable and the hive mount was the reference
+// the shared version was ported FROM; it now consumes it instead, which also
+// retires this file's process-wide privilege leak.
+#include <user_profile_model.hpp>
+#include <win_profiles.hpp>
+#include <win_reg_handle.hpp>
 
 #include <cstdlib>
 #include <optional>
@@ -83,44 +96,10 @@ struct HKeyCloser {
     HKeyCloser& operator=(const HKeyCloser&) = delete;
 };
 
-// RAII: unload the mounted hive on EVERY exit, including exceptions thrown
-// mid-probe. A leaked mount is system-wide, survives process death, and
-// locks the user's NTUSER.DAT until reboot (clone of
-// installed_apps_plugin.cpp:676-683, roadmap C-1).
-struct HiveUnloadGuard {
-    const std::wstring& mount;
-    bool* unload_failed{nullptr}; ///< set (never cleared) when RegUnLoadKeyW fails
-    ~HiveUnloadGuard() {
-        // A failed unload leaves the offline NTUSER.DAT mounted under HKEY_USERS
-        // and the profile file locked, with nothing to explain it. A destructor
-        // cannot throw and must not allocate, so the failure rides a plain flag
-        // that the caller folds into the per_user_hives probe diagnostic
-        // (`hive_unload_failed`) — the plugin's official reporting channel.
-        if (RegUnLoadKeyW(HKEY_USERS, mount.c_str()) != ERROR_SUCCESS && unload_failed)
-            *unload_failed = true;
-    }
-};
-
-// ── environment expansion ──────────────────────────────────────────────────
-
-// Two-pass ExpandEnvironmentStringsW. The single-pass form SILENTLY TRUNCATES:
-// on overflow the API does not fail — it returns the REQUIRED wchar count
-// (including the terminating NUL), which a bare `> 0` test reads as success, so
-// an over-long ProfileImagePath yields a valid-LOOKING but wrong path. Pass 1
-// sizes (dest=nullptr, size=0); pass 2 fills. Returns `in` unchanged if the API
-// fails, or if the environment grew between the two calls — an unexpanded
-// literal is a VISIBLY wrong path, never a plausible-but-wrong one.
-std::wstring expand_env_strings(const std::wstring& in) {
-    const DWORD needed = ExpandEnvironmentStringsW(in.c_str(), nullptr, 0);
-    if (needed == 0)
-        return in;
-    std::wstring buf(needed, L'\0'); // `needed` INCLUDES the terminating NUL
-    const DWORD written = ExpandEnvironmentStringsW(in.c_str(), buf.data(), needed);
-    if (written == 0 || written > needed)
-        return in;
-    buf.resize(written - 1); // drop the NUL from the string's size
-    return buf;
-}
+// This file's HiveUnloadGuard and its local two-pass expand_env_strings are
+// retired (#2771): agents/shared/win_reg_handle.hpp's ScopedUserHive and
+// win_profiles.hpp's expand_env_strings are the canonical copies, and the
+// shared ladder calls both on this plugin's behalf.
 
 // ── ProbeHost with Reg*W registry access (R17) ─────────────────────────────
 
@@ -352,112 +331,26 @@ void run_office_c2r_surface(ProbeHost& host, std::vector<LicRecord>& records,
 
 // ── per-user surfaces (C-1 hive mounting; R15 privileges; D11 user_ref) ────
 
-struct ProfileEntry {
-    std::string sid;
-    std::string profile_name; // last path component; EMPTY when unresolvable —
-                              // NEVER the SID (ADR-0024 D11)
-    std::wstring profile_path_w; // expanded; empty when ProfileImagePath unreadable
-};
-
-std::vector<ProfileEntry> enumerate_profiles(std::string& error) {
-    std::vector<ProfileEntry> out;
-    static constexpr const char* kProfileListKey =
-        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
-
-    HKEY profiles_key{};
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, to_wide(kProfileListKey).c_str(), 0,
-                      KEY_READ | KEY_ENUMERATE_SUB_KEYS, &profiles_key) != ERROR_SUCCESS) {
-        error = "profile_list_unreadable";
-        return out;
-    }
-    HKeyCloser profiles_guard{profiles_key};
-
-    constexpr DWORD kSidBufLen = 256;
-    wchar_t sid_buf[kSidBufLen]{};
-    DWORD idx = 0;
-    DWORD sid_len = kSidBufLen; // WCHAR count, not bytes
-    while (RegEnumKeyExW(profiles_key, idx++, sid_buf, &sid_len, nullptr, nullptr, nullptr,
-                         nullptr) == ERROR_SUCCESS) {
-        std::string sid = from_wide(sid_buf, static_cast<int>(sid_len));
-        sid_len = kSidBufLen;
-
-        // Skip system profiles (LocalSystem / LocalService / NetworkService).
-        if (sid == "S-1-5-18" || sid == "S-1-5-19" || sid == "S-1-5-20")
-            continue;
-
-        ProfileEntry entry;
-        entry.sid = sid;
-
-        HKEY sid_key{};
-        if (RegOpenKeyExW(profiles_key, to_wide(sid).c_str(), 0, KEY_READ, &sid_key) ==
-            ERROR_SUCCESS) {
-            HKeyCloser sid_guard{sid_key};
-            wchar_t path_buf[512]{};
-            DWORD path_size = sizeof(path_buf); // size in BYTES
-            DWORD type = 0;
-            if (RegQueryValueExW(sid_key, L"ProfileImagePath", nullptr, &type,
-                                 reinterpret_cast<LPBYTE>(path_buf), &path_size) ==
-                    ERROR_SUCCESS &&
-                (type == REG_SZ || type == REG_EXPAND_SZ)) {
-                size_t nch = path_size / sizeof(wchar_t);
-                while (nch > 0 && path_buf[nch - 1] == L'\0')
-                    --nch;
-                const std::wstring raw(path_buf, nch);
-                // ProfileImagePath may be REG_EXPAND_SZ — expand once, here.
-                entry.profile_path_w = expand_env_strings(raw);
-                const std::string path_utf8 =
-                    from_wide(entry.profile_path_w.c_str(),
-                              static_cast<int>(entry.profile_path_w.size()));
-                const auto last_sep = path_utf8.find_last_of("\\/");
-                if (last_sep != std::string::npos && last_sep + 1 < path_utf8.size())
-                    entry.profile_name = path_utf8.substr(last_sep + 1);
-            }
-            // Unresolvable name → entry.profile_name stays EMPTY. The D11 SID
-            // ban binds the emission: no `= sid` fallback here, ever.
-        }
-        out.push_back(std::move(entry));
-    }
-    return out;
-}
-
-/// Enable a token privilege the service account holds but which starts
-/// disabled. RegLoadKeyW requires BOTH SeBackupPrivilege and
-/// SeRestorePrivilege enabled (granted by scripts/install-agent-user.ps1:404-
-/// 405; a hardened install may strip them — R15).
-bool enable_privilege(const wchar_t* name) {
-    HANDLE token{};
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
-        return false;
-    // RAII, not a manual CloseHandle at the tail — the HKeyCloser/HiveUnloadGuard
-    // in-file convention: the handle closes on EVERY exit path, including any
-    // future early return added between acquire and release.
-    struct TokenCloser {
-        HANDLE h;
-        ~TokenCloser() { CloseHandle(h); }
-    } token_guard{token};
-    bool ok = false;
-    LUID luid{};
-    if (LookupPrivilegeValueW(nullptr, name, &luid)) {
-        TOKEN_PRIVILEGES tp{};
-        tp.PrivilegeCount = 1;
-        tp.Privileges[0].Luid = luid;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        if (AdjustTokenPrivileges(token, FALSE, &tp, 0, nullptr, nullptr) &&
-            GetLastError() == ERROR_SUCCESS) {
-            // ERROR_NOT_ALL_ASSIGNED means the privilege is absent from the
-            // token entirely — AdjustTokenPrivileges "succeeds" but the
-            // enable did not happen.
-            ok = true;
-        }
-    }
-    return ok;
-}
+// ProfileEntry / enumerate_profiles / enable_privilege are retired (#2771).
+// This file was the reference the shared ladder was ported FROM; it now
+// consumes agents/shared/win_profiles.hpp instead of carrying the third copy
+// of the ProfileList walk. enable_privilege in particular left
+// SeBackupPrivilege/SeRestorePrivilege ENABLED for the remaining life of the
+// agent process; PrivilegeScope restores the token's prior attributes on
+// scope exit, which is the security fix this migration buys.
 
 void stamp_user_records(std::vector<LicRecord>& records, std::size_t from,
                         const std::string& profile_name) {
     for (std::size_t i = from; i < records.size(); ++i) {
         records[i].user_scope = "user";
-        records[i].user_ref = profile_name; // may be EMPTY — never a SID (D11)
+        // Stays EMPTY, never "-" -- deliberately DIFFERENT from
+        // installed_apps' operator-facing row, which renders "-" for
+        // display (code-review Standards question). user_ref feeds
+        // sync_source_software_licensing.cpp's HMAC pseudonym; a cosmetic
+        // "-" substituted here would change what gets hashed for every
+        // profile with an unresolvable name, not just how it displays.
+        // Never a SID either way (D11).
+        records[i].user_ref = profile_name;
     }
 }
 
@@ -491,90 +384,86 @@ void per_user_file_probes(ProbeHost& fs_host, const std::string& profile_path_ut
 }
 
 void run_per_user_surfaces(std::vector<LicRecord>& records, std::vector<ProbeOutcome>& outcomes) {
-    std::string enum_error;
-    const auto profiles = enumerate_profiles(enum_error);
-    if (!enum_error.empty()) {
-        outcomes.push_back({"per_user_hives", false, 0, enum_error});
-        outcomes.push_back({"per_user_files", false, 0, enum_error});
+    bool profiles_ok = false;
+    bool truncated = false;
+    const auto raw_profiles = yuzu::win::enumerate_profile_records(profiles_ok, &truncated);
+    if (!profiles_ok) {
+        outcomes.push_back({"per_user_hives", false, 0, "profile_list_unreadable"});
+        outcomes.push_back({"per_user_files", false, 0, "profile_list_unreadable"});
         return;
     }
-
-    // R15: the offline-hive fallback rides SeBackupPrivilege/SeRestorePrivilege.
-    const bool priv_ok =
-        enable_privilege(L"SeBackupPrivilege") && enable_privilege(L"SeRestorePrivilege");
+    const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
+    // System SIDs are filtered inside build_profile_list, and the D11
+    // never-the-SID rule for profile_name is an invariant of that header —
+    // this file no longer restates either.
+    const auto profiles = yuzu::profiles::build_profile_list(raw_profiles, hku_subkeys);
 
     WinRegProbeHost fs_host; // filesystem defaults only (per-user file probes)
     std::size_t hive_rows = 0;
     std::size_t file_rows = 0;
-    bool hive_unload_failed = false; // any profile's RegUnLoadKeyW failed (guard flag)
+    bool hive_unload_failed = false; // any profile's RegUnLoadKeyW failed
+    bool privilege_missing = false;  // some profile NEEDED an offline mount and could not
 
     for (const auto& profile : profiles) {
-        // ── registry hive: loaded HKU\<SID> FIRST (C-1 probe order) ─────────
+        // ── registry hive: loaded HKU\<SID> FIRST, offline NTUSER.DAT as the
+        // fallback (C-1 probe order) — both now inside the shared ladder,
+        // which also closes every HKEY into the mount before unloading and
+        // restores the privilege token state on the way out.
         std::size_t before = records.size();
         std::vector<ProbeOutcome> scratch; // aggregated into one surface below
-        HKEY loaded{};
-        if (RegOpenKeyExW(HKEY_USERS, to_wide(profile.sid).c_str(), 0, KEY_READ, &loaded) ==
-            ERROR_SUCCESS) {
-            HKeyCloser loaded_guard{loaded};
-            WinRegProbeHost user_host{loaded};
-            run_probe_specs(user_host, Platform::windows_os, Scope::user, records, scratch);
-        } else if (priv_ok && !profile.profile_path_w.empty()) {
-            // Offline fallback: mount NTUSER.DAT under a private name.
-            const std::wstring ntuser = profile.profile_path_w + L"\\NTUSER.DAT";
-            const std::wstring mount_w = to_wide("YUZU_LIC_" + profile.sid);
-            if (RegLoadKeyW(HKEY_USERS, mount_w.c_str(), ntuser.c_str()) == ERROR_SUCCESS) {
-                HiveUnloadGuard unload_guard{mount_w, &hive_unload_failed};
-                {
-                    HKEY mounted{};
-                    if (RegOpenKeyExW(HKEY_USERS, mount_w.c_str(), 0, KEY_READ, &mounted) ==
-                        ERROR_SUCCESS) {
-                        HKeyCloser mounted_guard{mounted};
-                        WinRegProbeHost user_host{mounted};
-                        run_probe_specs(user_host, Platform::windows_os, Scope::user, records,
-                                        scratch);
-                    }
-                } // every HKEY into the hive is closed HERE, before the
-                  // unload guard runs (installed_apps :165-166 rule)
-            }
-            // A per-profile load failure (hive corrupt/locked) is not a
-            // surface failure: per-user hives are never a primary surface
-            // (ADR-0024 D3/R15) — the profile is skipped, the cycle proceeds.
-        }
+        yuzu::win::HiveAccessReport report;
+        const auto status = yuzu::win::with_user_hive(
+            profile.sid, profile.profile_path,
+            [&](HKEY root) {
+                WinRegProbeHost user_host{root};
+                run_probe_specs(user_host, Platform::windows_os, Scope::user, records, scratch);
+            },
+            &report);
+        if (report.unload_failed)
+            hive_unload_failed = true;
+        if (status == yuzu::win::HiveAccessStatus::privilege_missing)
+            privilege_missing = true;
+        // A per-profile load failure (hive corrupt/locked) is still not a
+        // surface failure: per-user hives are never a primary surface
+        // (ADR-0024 D3/R15) — the profile is skipped, the cycle proceeds.
         stamp_user_records(records, before, profile.profile_name);
         hive_rows += records.size() - before;
 
         // ── profile licence files (no hive required) ───────────────────────
         before = records.size();
-        const std::string profile_path_utf8 =
-            profile.profile_path_w.empty()
-                ? std::string{}
-                : from_wide(profile.profile_path_w.c_str(),
-                            static_cast<int>(profile.profile_path_w.size()));
-        per_user_file_probes(fs_host, profile_path_utf8, records);
+        per_user_file_probes(fs_host, profile.profile_path, records);
         stamp_user_records(records, before, profile.profile_name);
         file_rows += records.size() - before;
     }
 
-    if (priv_ok) {
-        if (hive_unload_failed) {
-            // A RegUnLoadKeyW failure (exotic — the inner scope closes every HKEY
-            // into the hive before the guard runs) leaves that profile's
-            // NTUSER.DAT mounted + locked until reboot. The rows probed are still
-            // valid (rides `list` regardless), but the condition must be visible:
-            // ok=false + rows, the privilege_missing precedent. Never a silent
-            // leak of a system-wide mount. Non-cycle-blocking — per-user hives
-            // are never a primary surface (sync source, ADR-0024 D3/R15).
-            outcomes.push_back({"per_user_hives", false, hive_rows, "hive_unload_failed"});
-        } else {
-            outcomes.push_back({"per_user_hives", true, hive_rows, {}});
-        }
-    } else {
-        // R15: hardened installs that strip SeBackup/SeRestore surface as
-        // privilege_missing through the live `surfaces` diagnostics. Loaded
-        // hives were still probed (their records ride `list` regardless);
-        // offline NTUSER.DAT hives were unreadable, so availability is
-        // honestly degraded.
+    // Precedence unchanged: privilege_missing outranks an unload failure.
+    // What DID change is when it fires — previously a single process-wide
+    // enable was attempted up front, so a hardened install reported
+    // privilege_missing even when every profile was live-loaded and no
+    // offline mount was ever needed. Now it reflects a profile that actually
+    // required the fallback and could not get it.
+    if (privilege_missing) {
+        // R15: hardened installs that strip SeBackup/SeRestore surface here
+        // through the live `surfaces` diagnostics. Loaded hives were still
+        // probed (their records ride `list` regardless); offline NTUSER.DAT
+        // hives were unreadable, so availability is honestly degraded.
         outcomes.push_back({"per_user_hives", false, hive_rows, "privilege_missing"});
+    } else if (hive_unload_failed) {
+        // A RegUnLoadKeyW failure (exotic — the ladder closes every HKEY into
+        // the hive before unloading) leaves that profile's NTUSER.DAT mounted
+        // and locked. The rows probed are still valid (they ride `list`
+        // regardless), but the condition must be visible: ok=false + rows,
+        // the privilege_missing precedent. Never a silent leak of a
+        // system-wide mount. Non-cycle-blocking — per-user hives are never a
+        // primary surface (sync source, ADR-0024 D3/R15).
+        outcomes.push_back({"per_user_hives", false, hive_rows, "hive_unload_failed"});
+    } else if (truncated) {
+        // New with the shared ladder, which caps the walk at kMaxProfiles
+        // where this file's own enumerate_profiles was unbounded. Reported
+        // rather than silently returning a short list.
+        outcomes.push_back({"per_user_hives", false, hive_rows, "profile_list_truncated"});
+    } else {
+        outcomes.push_back({"per_user_hives", true, hive_rows, {}});
     }
     outcomes.push_back({"per_user_files", true, file_rows, {}});
 }
