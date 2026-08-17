@@ -300,31 +300,23 @@ std::string resolve_hostname(const std::string& ip) {
  * to yuzu::shared::IcmpSession::sample — no subprocess, no per-host socket.
  */
 #ifdef _WIN32
-std::optional<double> icmp_sample(yuzu::shared::IcmpSession& session, const std::string& ip,
-                                  int timeout_ms) {
+yuzu::shared::ProbeOutcome icmp_sample(yuzu::shared::IcmpSession& session, const std::string& ip,
+                                       int timeout_ms) {
     struct in_addr addr{};
     if (inet_pton(AF_INET, ip.c_str(), &addr) != 1)
-        return std::nullopt;
+        return {std::nullopt, yuzu::shared::ProbeFailure::TransmitFailed};
     return session.sample(addr.S_un.S_addr, timeout_ms);
 }
 #else
-std::optional<double> icmp_sample(yuzu::shared::IcmpSession& session, const std::string& ip,
-                                  int timeout_ms) {
+yuzu::shared::ProbeOutcome icmp_sample(yuzu::shared::IcmpSession& session, const std::string& ip,
+                                       int timeout_ms) {
     sockaddr_in sin{};
     sin.sin_family = AF_INET;
     if (inet_pton(AF_INET, ip.c_str(), &sin.sin_addr) != 1)
-        return std::nullopt;
+        return {std::nullopt, yuzu::shared::ProbeFailure::TransmitFailed};
     return session.sample(sin, timeout_ms);
 }
 #endif
-
-/**
- * Ping a single host over the shared session with a short timeout.
- * Returns true if the host responds.
- */
-bool ping_host(yuzu::shared::IcmpSession& session, const std::string& ip, int timeout_ms) {
-    return icmp_sample(session, ip, timeout_ms).has_value();
-}
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
@@ -455,6 +447,7 @@ private:
         // independently of the caller's timeout_ms so the sweep stays finite;
         // both bounds are decided by discovery_scan_plan.hpp (tested there).
         yuzu::shared::IcmpSession session;
+        yuzu::discovery::SweepTally sweep_tally;
         const int probe_timeout_ms = yuzu::discovery::probe_budget_ms(timeout_ms);
         const auto availability =
             yuzu::discovery::classify_icmp_session(session.ok(), session.permitted);
@@ -493,9 +486,17 @@ private:
                 if (arp_ips.count(ip)) {
                     alive_ips.insert(ip);
                 } else {
-                    // Ping it
-                    if (ping_host(session, ip, probe_timeout_ms)) {
+                    // Probe it. A non-reply is only "down" when the packet
+                    // actually left the machine — sweep_tally carries the
+                    // difference so a blocked sweep degrades instead of
+                    // reporting a dead network (see degrade_for_sweep).
+                    const auto outcome = icmp_sample(session, ip, probe_timeout_ms);
+                    ++sweep_tally.probed;
+                    if (outcome.replied()) {
+                        ++sweep_tally.replied;
                         alive_ips.insert(ip);
+                    } else if (outcome.transmit_blocked()) {
+                        ++sweep_tally.transmit_blocked;
                     }
                 }
 
@@ -512,6 +513,17 @@ private:
                                                  done, total, alive_ips.size()));
                 }
             }
+        }
+
+        // A sweep that constructed a session but could not transmit through it
+        // is NOT an empty network. Checked before the timeout branch because a
+        // blocked sweep explains the missing hosts more precisely than the
+        // deadline does.
+        if (const auto blocked = yuzu::discovery::degrade_for_sweep(sweep_tally);
+            blocked.has_report) {
+            ctx.write_output(std::format("status|warning|{}", blocked.report.message));
+            ctx.set_result_status(blocked.report.status, blocked.report.completeness,
+                                  blocked.report.reason);
         }
 
         // A sweep cut short by its own deadline is PARTIAL, not a clean scan.

@@ -188,3 +188,51 @@ TEST_CASE("arp_hosts_in_subnet: output follows subnet order, not ARP-set order",
     CHECK(out[0] == "192.168.1.8");
     CHECK(out[1] == "192.168.1.10");
 }
+
+// ── degrade_for_sweep (runtime transmit-blocked degrade) ─────────────────────
+// /adversarial-review (Codex CDX-1, Kimi F4, confirmed independently) found
+// that a session which CONSTRUCTS but cannot transmit produced a confidently
+// empty network with an OK status — the agent maps rc==0 plus an undeclared
+// status straight to OK, so no later layer caught it either.
+
+TEST_CASE("degrade_for_sweep: a healthy sweep declares nothing",
+          "[agent][discovery_scan_plan]") {
+    CHECK_FALSE(degrade_for_sweep(SweepTally{/*probed=*/254, /*blocked=*/0, /*replied=*/12})
+                    .has_report);
+    // Zero replies is a legitimate result when the packets genuinely went out:
+    // an empty subnet must not masquerade as a degraded scan.
+    CHECK_FALSE(degrade_for_sweep(SweepTally{254, 0, 0}).has_report);
+}
+
+TEST_CASE("degrade_for_sweep: a fully blocked sweep reports CONSTRAINED/PARTIAL",
+          "[agent][discovery_scan_plan]") {
+    const auto d = degrade_for_sweep(SweepTally{254, 254, 0});
+    REQUIRE(d.has_report);
+    CHECK(d.report.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(d.report.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(std::string_view{d.report.reason} == "icmp:transmit_blocked");
+    // Never OK/FULL — that is the false-clean-scan failure mode itself.
+    CHECK(d.report.status != YUZU_RESULT_STATUS_OK);
+    CHECK(d.report.completeness != YUZU_RESULT_COMPLETENESS_FULL);
+    // A reason distinct from the construction-time ones, so an operator can
+    // tell "socket refused" from "socket fine, send refused".
+    CHECK(std::string_view{d.report.reason} !=
+          std::string_view{degrade_for(IcmpAvailability::Denied).report.reason});
+    CHECK(std::string_view{d.report.reason} !=
+          std::string_view{degrade_for(IcmpAvailability::Unavailable).report.reason});
+}
+
+TEST_CASE("degrade_for_sweep: a partially blocked sweep still yields real results",
+          "[agent][discovery_scan_plan]") {
+    // One blocked probe among many must not condemn the whole scan — the
+    // replies that did land are real findings.
+    CHECK_FALSE(degrade_for_sweep(SweepTally{254, 1, 30}).has_report);
+    CHECK_FALSE(degrade_for_sweep(SweepTally{254, 253, 1}).has_report);
+}
+
+TEST_CASE("degrade_for_sweep: a sweep that never probed declares nothing",
+          "[agent][discovery_scan_plan]") {
+    // Every host already in the ARP table, or the degrade path taken before
+    // probing: 0/0 must not divide-by-zero into a false degrade.
+    CHECK_FALSE(degrade_for_sweep(SweepTally{0, 0, 0}).has_report);
+}

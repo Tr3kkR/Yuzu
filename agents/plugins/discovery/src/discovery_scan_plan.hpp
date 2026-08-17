@@ -103,6 +103,40 @@ inline MaybeDegrade degrade_for(IcmpAvailability availability) {
 }
 
 /**
+ * Tally of what a completed sweep actually managed to do. `probed` counts
+ * hosts we attempted to transmit to; `transmit_blocked` counts attempts that
+ * never left the machine (send denied or failed).
+ */
+struct SweepTally {
+    int probed{0};
+    int transmit_blocked{0};
+    int replied{0};
+};
+
+/**
+ * The degrade report for a sweep whose probes could not be transmitted.
+ *
+ * This is the runtime twin of degrade_for(): the session CONSTRUCTED fine, so
+ * the pre-flight check passed, but a policy denied transmission afterwards
+ * (seatbelt/SELinux/nftables all do this). Without this the sweep marks every
+ * unanswered host dead and returns a confidently empty network with an OK
+ * status — the agent maps rc==0 plus an undeclared status straight to OK, so
+ * no later layer catches it either.
+ *
+ * Reported only when EVERY probe was blocked: a partially blocked sweep still
+ * yields real replies, and the ARP half is independent, so a single blocked
+ * probe should not condemn a whole scan.
+ */
+inline MaybeDegrade degrade_for_sweep(const SweepTally& tally) {
+    if (tally.probed == 0 || tally.transmit_blocked < tally.probed)
+        return {};
+    return {true,
+            {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+             "icmp:transmit_blocked",
+             "ICMP probes could not be transmitted — reporting ARP-table hosts only"}};
+}
+
+/**
  * The degrade report for a sweep cut short by its own overall deadline. The
  * hosts already probed are real findings, so this is CONSTRAINED/PARTIAL for
  * the same reason a denied socket is — not a clean success. Separate from
