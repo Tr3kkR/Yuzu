@@ -675,6 +675,53 @@ TEST_CASE("parse_der_cert: valid DER decodes to the same fields as the PEM parse
     CHECK(cert->serial == "5ADDA35CA512C4386EE0ED2AB71B31229AA395A7");
 }
 
+// Regression vector for the adversarial-review finding that `parse_der_cert`
+// accepted a valid certificate followed by arbitrary trailing bytes while
+// documenting a "valid single DER certificate" contract. d2i_X509 decodes the
+// first object and advances its cursor past only that object, so without an
+// explicit end-of-span check the caller silently gets the first certificate of
+// a framed or concatenated buffer and believes the whole buffer was validated.
+// Both halves matter: the exact-length input must still parse (this is the
+// shape the production SecItem caller always supplies, so a too-strict check
+// would break the live path), and every non-exact variant must be rejected.
+TEST_CASE("parse_der_cert: rejects trailing bytes after a valid certificate",
+          "[certificates_x509]") {
+    auto der = pem_to_der(kEcdsaCertPem);
+    REQUIRE_FALSE(der.empty());
+
+    // Exact length -- the production shape -- still parses.
+    REQUIRE(parse_der_cert(std::span<const unsigned char>(der.data(), der.size())).has_value());
+
+    // One trailing byte is enough to make the buffer "not exactly one cert".
+    auto one_extra = der;
+    one_extra.push_back(0x00);
+    CHECK_FALSE(
+        parse_der_cert(std::span<const unsigned char>(one_extra.data(), one_extra.size()))
+            .has_value());
+
+    // Arbitrary trailing garbage.
+    auto junk = der;
+    for (unsigned char b : {0x00u, 0xFFu, 0xDEu, 0xADu, 0xBEu, 0xEFu})
+        junk.push_back(b);
+    CHECK_FALSE(
+        parse_der_cert(std::span<const unsigned char>(junk.data(), junk.size())).has_value());
+
+    // Two concatenated certificates: the caller asked for ONE, so this is a
+    // rejection, not "return the first".
+    auto concatenated = der;
+    concatenated.insert(concatenated.end(), der.begin(), der.end());
+    CHECK_FALSE(parse_der_cert(
+                    std::span<const unsigned char>(concatenated.data(), concatenated.size()))
+                    .has_value());
+
+    // Truncating the certificate is a decode failure, not a trailing-byte one
+    // -- pinned here so the two rejection reasons can't silently merge.
+    std::vector<unsigned char> truncated(der.begin(), der.begin() + (der.size() / 2));
+    CHECK_FALSE(
+        parse_der_cert(std::span<const unsigned char>(truncated.data(), truncated.size()))
+            .has_value());
+}
+
 TEST_CASE("parse_der_cert: empty/garbage input yields std::nullopt, not a throw",
           "[certificates_x509]") {
     std::vector<unsigned char> empty;

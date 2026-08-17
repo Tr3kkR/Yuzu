@@ -300,14 +300,27 @@ inline std::vector<CertFields> parse_pem_certs(std::string_view pem) {
     return out;
 }
 
-/// Parse a single DER-encoded certificate (the macOS SecItem path: each
+/// Parse EXACTLY ONE DER-encoded certificate (the macOS SecItem path: each
 /// SecCertificateCopyData result is one certificate's raw DER, never a PEM
 /// stream) via d2i_X509. std::nullopt for empty input, a decode failure, or
 /// anything that isn't a valid single DER certificate -- never a thrown
-/// exception. d2i_X509 advances its `p` cursor past the consumed bytes;
-/// that advanced value is discarded here since the caller hands in exactly
-/// one certificate's bytes per call (SecCertificateCopyData's own contract),
-/// not a concatenated stream.
+/// exception.
+///
+/// "Exactly one" is ENFORCED, not merely documented. d2i_X509 decodes the
+/// FIRST DER object it finds and advances `p` past just that object; it does
+/// not care what follows. Discarding that cursor (as this function first did)
+/// meant a buffer holding a valid certificate followed by arbitrary trailing
+/// bytes -- or two concatenated certificates -- was accepted, and the caller
+/// silently got only the first one while believing the whole buffer had been
+/// validated. That contradicted this function's own "a valid single DER
+/// certificate" contract, so the cursor is now checked against the end of the
+/// span and any unconsumed tail is a rejection.
+///
+/// This cannot change the behaviour of the production caller: SecItem hands
+/// over exactly one certificate's DER per SecCertificateCopyData result, so
+/// the cursor always lands precisely on the end. It closes the contract for
+/// every FUTURE caller, where a framed or concatenated buffer is the
+/// realistic input.
 inline std::optional<CertFields> parse_der_cert(std::span<const unsigned char> der) {
     if (der.empty() || der.size() > static_cast<std::size_t>(LONG_MAX))
         return std::nullopt;
@@ -315,6 +328,13 @@ inline std::optional<CertFields> parse_der_cert(std::span<const unsigned char> d
     detail::X509Ptr cert(d2i_X509(nullptr, &p, static_cast<long>(der.size())));
     if (!cert) {
         ERR_clear_error();
+        return std::nullopt;
+    }
+    if (p != der.data() + der.size()) {
+        // A valid certificate, but not the WHOLE input -- reject rather than
+        // silently authenticate a prefix of a buffer the caller handed over
+        // as one certificate. No OpenSSL error was queued (the decode itself
+        // succeeded), so there is nothing to ERR_clear_error() here.
         return std::nullopt;
     }
     return detail::extract_all(cert.get());
