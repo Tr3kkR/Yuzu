@@ -370,6 +370,150 @@ std::vector<std::string> load_stabilization_exclusions(yuzu::tar::TarDatabase& d
     return {};
 }
 
+// ── ABI4 capability declarations (#2204) ─────────────────────────────────
+//
+// One row per entry in actions() below, same names/order. Legs are grounded
+// in two places: reading each collector's own #ifdef structure directly, and
+// cross-checking against the pre-existing per-capture-source support table
+// this plugin already ships (tar_schema_registry.cpp build_sources(),
+// consumed by the `compatibility` action) — its OsSupportStatus enumerators
+// alias the SAME YuzuSupportLevel values (tar_schema_registry.hpp:66-70), so
+// its judgments are reused directly rather than re-derived from scratch.
+//
+//   - status/query/export/configure/rollup/sql/compatibility/purge_source:
+//     pure in-process SQLite reads/writes against tar.db (TarDatabase) — no
+//     OS acquisition at all, native in-process on every OS (rung 1).
+//   - collect_fast: process (ETW/Endpoint-Security/procfs) + network
+//     (iphlpapi/procfs/libproc, always the poll — see
+//     effective_network_capture_method) + opt-in netqual are each native
+//     (rung 1) on every OS. macOS's process/tcp legs self-heal to a poll
+//     without the ES entitlement / nstat root privilege
+//     (tar_schema_registry.cpp process/tcp rows: kSupportedConstrained); on
+//     both Linux and macOS the opt-in arp/dns sub-sources are kPlanned
+//     (tar_arp_collector.cpp / tar_dns_collector.cpp) — CONSTRAINED, not a
+//     bare SUPPORTED, on those two legs.
+//   - collect_slow: service (SCM native / systemctl+launchctl popen) + user
+//     (native WTS/utmp/utmpx) + opt-in netconn/mapdrive. Windows is all
+//     native (scm/wts/wnet/wevtapi, rung 1). Linux/macOS service enumeration
+//     shells out via popen (tar_service_collector.cpp, rung 3 — the worst
+//     rung actually exercised on that OS); mapdrive is popen on Linux
+//     (tar_mapdrive_collector.cpp run_command, smbstatus) but a kPlanned
+//     empty stub on macOS, and netconn is kPlanned (no-op) on both non-
+//     Windows OSes (tar_netconn_win.cpp #else).
+//   - collect_perf: device counters (tar_perf.cpp) native on Windows/Linux,
+//     kPlanned (host_statistics) on macOS — the target rung is still 1
+//     (native syscalls once wired).
+//   - collect_software: HKLM Uninstall registry walk on Windows (native,
+//     rung 1); kPlanned (dpkg_rpm / pkgutil, tar_software_collector.cpp
+//     #else) on Linux/macOS — an argv subprocess once wired (target rung 2).
+//   - fleet_snapshot: enumerate_processes()/enumerate_connections() only —
+//     ALWAYS the poll, never nstat (tar_schema_registry.cpp:1093-1105
+//     effective_network_capture_method). Native on every OS; macOS's poll
+//     (proc_pidfdinfo) carries the same TOCTOU caveat the schema table
+//     records for that leg (tar "tcp" row 2) — CONSTRAINED there.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        "status",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "query",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "snapshot",
+        {YUZU_SUPPORT_CONSTRAINED, 3, "procfs+systemctl+dpkg_rpm(planned)",
+         "software inventory collection is PLANNED (dpkg/rpm not yet wired) on Linux; "
+         "service enumeration shells out via popen(systemctl)"},
+        {YUZU_SUPPORT_CONSTRAINED, 3, "endpoint_security+nstat+launchctl+pkgutil(planned)",
+         "software and mapdrive collection are PLANNED on macOS; service enumeration "
+         "shells out via popen(launchctl); process/tcp fall back to a poll without the "
+         "Endpoint Security entitlement or nstat root privilege"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "etw+iphlpapi+scm+wts+wnet+wevtapi+registry", nullptr},
+    },
+    {
+        "export",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "configure",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "collect_fast",
+        {YUZU_SUPPORT_CONSTRAINED, 1, "procfs",
+         "arp/dns opt-in sub-sources are PLANNED (no-op) on Linux; core "
+         "process/network/netqual collection is native"},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "endpoint_security+nstat",
+         "process/tcp fall back to a KERN_PROC_ALL/proc_pidfdinfo poll without the "
+         "Endpoint Security entitlement or nstat root privilege; arp/dns opt-in "
+         "sub-sources are PLANNED (no-op) on macOS"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "etw+iphlpapi", nullptr},
+    },
+    {
+        "collect_slow",
+        {YUZU_SUPPORT_CONSTRAINED, 3, "systemctl+utmp",
+         "service enumeration shells out via popen(systemctl); startup_type reads "
+         "'unknown'; netconn opt-in source is PLANNED (no-op) on Linux"},
+        {YUZU_SUPPORT_CONSTRAINED, 3, "launchctl+utmpx",
+         "service enumeration shells out via popen(launchctl); no startup_type; "
+         "mapdrive and netconn opt-in sources are PLANNED (no-op) on macOS"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "scm+wts+wnet+wevtapi", nullptr},
+    },
+    {
+        "collect_perf",
+        {YUZU_SUPPORT_SUPPORTED, 1, "procfs", nullptr},
+        {YUZU_SUPPORT_PLANNED, 1, "host_statistics", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "ntcounters", nullptr},
+    },
+    {
+        "collect_software",
+        {YUZU_SUPPORT_PLANNED, 2, "dpkg_rpm", nullptr},
+        {YUZU_SUPPORT_PLANNED, 2, "pkgutil", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "registry", nullptr},
+    },
+    {
+        "rollup",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "sql",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "compatibility",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+    {
+        "fleet_snapshot",
+        {YUZU_SUPPORT_SUPPORTED, 1, "procfs", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "libproc(proc_pidfdinfo)",
+         "inherent TOCTOU between pid enumeration and per-fd query; short-lived "
+         "sockets may be missed"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "iphlpapi+win32_process_enum", nullptr},
+    },
+    {
+        "purge_source",
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sqlite", nullptr},
+    },
+};
+
 } // namespace
 
 class TarPlugin final : public yuzu::Plugin {
@@ -387,6 +531,14 @@ public:
                                      "rollup",         "sql",           "compatibility",
                                      "fleet_snapshot", "purge_source",  nullptr};
         return acts;
+    }
+
+    [[nodiscard]] const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    [[nodiscard]] size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

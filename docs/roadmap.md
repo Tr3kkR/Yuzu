@@ -698,7 +698,7 @@ New `wmi` plugin (Windows-only):
 **Capability:** 7.5 | **Scope:** Plugin | **Status:** Done
 
 Extend `installed_apps` plugin:
-- Enumerate per-user installations from HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall for each user profile.
+- Enumerate per-user installations (`list_per_user`) via each profile's `Software\Microsoft\Windows\CurrentVersion\Uninstall`, read from the live `HKEY_USERS\<SID>` hive or an offline `NTUSER.DAT` mount — the shared ladder in `agents/shared/win_profiles.hpp` (#2771), not a literal `HKCU` read.
 - Distinguish system-wide from user-specific installs in output.
 
 **Files:** `agents/plugins/installed_apps/src/installed_apps_plugin.cpp`

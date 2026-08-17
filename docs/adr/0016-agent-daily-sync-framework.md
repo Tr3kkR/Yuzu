@@ -164,8 +164,11 @@ Therefore we **coexist, not replace**:
   enumerates every user profile + carries usernames. So no end-user PII and no
   works-council co-determination trigger. The Windows `HKCU` and the macOS
   user-domain context are benign **by run identity**: the agent runs as a service
-  account (`NT SERVICE\YuzuAgent` / `_yuzu`) or root, never the console user, so
-  neither crawls a logged-in user's hive / `~/Applications`. (If macOS ever moves
+  account or root, never the console user, so neither crawls a logged-in user's
+  hive / `~/Applications`. (On Windows the account is **LocalSystem** today, not
+  the intended virtual `NT SERVICE\YuzuAgent` — tracked as #1442. That deviation
+  does not weaken this argument: LocalSystem's own profile is no more an end
+  user's than the virtual account's. Linux/macOS are `_yuzu` / root as stated.) (If macOS ever moves
   to a console-scoped account, re-evaluate.) Per-user enumeration is a later,
   gated, pseudonymized addition if needed.
 - Reuse the existing `installed_apps` plugin (already 3-OS) **in-process via

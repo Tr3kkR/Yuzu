@@ -360,11 +360,11 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 7.5 Per-User Application Inventory :white_check_mark: `T2`
 
-`installed_apps` plugin extended with per-user hive enumeration (HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall for each user profile). Distinguishes system-wide from user-specific installs in output.
+`installed_apps` plugin extended with per-user hive enumeration (`list_per_user`): each local profile's `Software\Microsoft\Windows\CurrentVersion\Uninstall` is read from the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `NTUSER.DAT` mount otherwise — via the shared ladder in `agents/shared/win_profiles.hpp` (#2771), not a literal `HKCU` read (which under the agent's system-context identity resolves to the service account's own profile, not an end user's — see §12.7). Distinguishes system-wide from user-specific installs in output; on Linux/macOS `list_per_user` reports system-scope packages/apps plus (macOS) the calling account's own Homebrew formulae, not a per-profile walk.
 
 ### 7.6 Software Deployment (Install/Upgrade) :white_check_mark: `T2`
 
-`SoftwareDeploymentStore` (SQLite) with package registration, deployment lifecycle (staged/deploying/verifying/completed/rolled_back/failed), per-agent status tracking. REST endpoints: `GET/POST /api/v1/software-packages`, `GET/POST /api/v1/software-deployments`, `/start`, `/rollback`, `/cancel`.
+`SoftwareDeploymentStore` (PostgreSQL, ADR-0051) with package registration, deployment lifecycle (staged/deploying/verifying/completed/cancelled/rolled_back/failed), per-agent status tracking. REST endpoints: `GET/POST /api/v1/software-packages`, `GET/POST /api/v1/software-deployments`, `/start`, `/rollback`, `/cancel`. **Dormant** (same family as `LicenseStore`/ADR-0048) — the store is migrated and tested but not constructed by the server, so these routes do not register today.
 
 ---
 
@@ -603,7 +603,9 @@ gRPC streaming delivers output in real time.
 
 ### 12.7 Per-User Registry Operations :white_check_mark: `T2`
 
-`registry` plugin with `list_profiles` (enumerate local profiles: SID, resolved name, profile path, live hive-load state) and `get_user_value` (read a value from a resolved profile's hive) actions. Both resolve the target profile via `HKLM\...\ProfileList`; `get_user_value` reads the live `HKEY_USERS\<SID>` hive when the user is logged in, or loads that profile's NTUSER.DAT via `RegLoadKey` as a fallback (unloaded via RAII on every exit path). SE_RESTORE_NAME and SE_BACKUP_NAME privileges are required only for that offline fallback, which the agent account already holds — no new privilege grant; reading an already-loaded live hive needs no elevated privilege.
+`registry` plugin with `list_profiles` (enumerate local profiles: SID, resolved name, profile path, live hive-load state) and `get_user_value` (read a value from a resolved profile's hive) actions. Both resolve the target profile via `HKLM\...\ProfileList`; `get_user_value` reads the live `HKEY_USERS\<SID>` hive when the user is logged in, or loads that profile's NTUSER.DAT via `RegLoadKey` as a fallback (unloaded via RAII on every exit path, under a per-call salted mount name). SE_RESTORE_NAME and SE_BACKUP_NAME privileges are required only for that offline fallback, which the agent account already holds — no new privilege grant; reading an already-loaded live hive needs no elevated privilege.
+
+The ladder itself lives in `agents/shared/win_profiles.hpp` and is the single implementation for every per-user consumer: `registry`, `installed_apps.list_per_user`, `license_scan`'s per-user surfaces, and `tar`'s outbound mapdrive history. Its offline arm is serialised process-wide, because privilege enabling acts on the process token and all four plugins load into one agent process.
 
 ---
 

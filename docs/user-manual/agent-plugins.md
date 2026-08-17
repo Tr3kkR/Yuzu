@@ -333,8 +333,9 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | Action | Description |
 |---|---|
-| `list` | All installed applications with name, version, publisher, and install date. |
+| `list` | All installed applications with name, version, publisher, and install date. Windows machine-scope only — the `HKCU` read is the agent's own service-account hive, never a logged-in user's; see `list_per_user` for per-user apps. |
 | `query` | Search installed applications by name pattern. |
+| `list_per_user` | Available on all three platforms as an alternative to the machine-scope `list` path, but only Windows is a genuine per-local-profile walk — see each platform's actual scope below. **Windows**: walks each local profile's registry hive via the shared ladder in `agents/shared/win_profiles.hpp` (#2771) — loaded `HKU\<SID>` hives read live, logged-out profiles mounted offline. Rows: `user_app\|<username>\|<name>\|<version>\|<publisher>\|<install_date>`; `username` is the resolved profile name or `-` when unresolvable (never the SID, ADR-0024 D11). May also emit `error\|profile_list_unreadable`, `warning\|profile_list_truncated at 512 entries`, `warning\|privilege_missing: …` (a logged-out profile's apps could not be read because the offline-mount privileges could not be enabled), and `warning\|hive_unload_failed: …` (a leaked offline mount). **Linux**: system-wide packages (dpkg/rpm/pacman), reported with `username=system` since Linux package managers have no per-user install concept. **macOS**: system apps (`system_profiler`) reported with `username=system`, plus per-user Homebrew formulae (`brew list --versions`, run as the calling account) reported with `username=brew`. |
 
 ### msi_packages
 
@@ -778,8 +779,45 @@ Plugins for Windows-specific system management: registry operations and WMI quer
 | `key_exists` | Check whether a registry key exists. Parameters: `hive`, `key`. Returns boolean. |
 | `enumerate_keys` | List all subkeys under a registry key. Parameters: `hive`, `key`. |
 | `enumerate_values` | List all value names and types under a registry key. Parameters: `hive`, `key`. |
-| `get_user_value` | Read a registry value from a specific user's hive. Resolves the profile via ProfileList (by `username` or an explicit `sid`), then reads the live `HKEY_USERS\<SID>` hive if the user is logged in, or loads that profile's NTUSER.DAT via `RegLoadKey` as a fallback. Requires `SE_RESTORE_NAME` and `SE_BACKUP_NAME` privileges for the offline-hive fallback only. Parameters: `username` or `sid` (one required), `key`, `name` (optional). Known limitation: two concurrent reads against the same logged-out user's hive can collide on the offline mount — the second surfaces an honest `error|failed to load hive`, self-resolving on retry. |
+| `get_user_value` | Read a registry value from a specific user's hive. Resolves the profile via ProfileList (by `username` or an explicit `sid`), then reads the live `HKEY_USERS\<SID>` hive if the user is logged in, or loads that profile's NTUSER.DAT via `RegLoadKey` as a fallback. Requires `SE_RESTORE_NAME` and `SE_BACKUP_NAME` privileges for the offline-hive fallback only. Parameters: `username` or `sid` (one required), `key`, `name` (optional). Two concurrent reads against the **same logged-out** user's hive, from within this agent process, are serialised (queue and both succeed) rather than racing — a process-wide lock covers the whole offline-mount sequence. The remaining limitation is a mount from **outside** this process (a second agent instance, or an external `reg load`), which still contends for the same exclusive file lock and can surface `error|failed to load hive`. |
 | `list_profiles` | Enumerate local user profiles: SID, resolved profile name, profile path, and whether the profile's hive is currently loaded under `HKEY_USERS`. System profiles (LocalSystem, LocalService, NetworkService) are excluded. No parameters. |
+
+#### registry: `hive_state` values
+
+`list_profiles` reports each profile's hive reachability as one of:
+
+| `hive_state` | Meaning |
+|---|---|
+| `loaded` | `HKEY_USERS\<SID>` is present — the user is logged in (or the hive is mounted by something else). `get_user_value` reads it directly, needing no elevated privilege. |
+| `loaded_classes_only` | Only `HKEY_USERS\<SID>_Classes` is present — a rare partial/COM-only load. The main hive is not reachable live, so `get_user_value` falls back to the offline mount. |
+| `not_loaded` | Neither is present — the user is logged out. `get_user_value` must mount NTUSER.DAT offline, which is the only path that needs SeBackup/SeRestore. |
+
+#### registry: `get_user_value` error and warning lines
+
+Every non-success outcome is reported as its own line rather than an empty result, so an operator can tell absence from a failure to look:
+
+| Line | Meaning | Operator action |
+|---|---|---|
+| `error\|missing required parameters: username or sid` | Neither `username` nor `sid` was supplied. | Supply one; `sid` takes precedence if both are given. |
+| `error\|missing required parameter: key` | `key` was not supplied. | Supply the registry key path to read. |
+| `error\|profile_list_unreadable` | `HKLM\...\ProfileList` itself could not be opened. | Check the agent account can read ProfileList; this is not a per-profile fault. |
+| `error\|sid '<x>' not found in enumerated profiles` | The supplied `sid` is not a non-system profile on this host. | Run `list_profiles` and use a SID it reports. |
+| `error\|no profile found for username '<x>'` | No profile folder name matched (case-insensitively). | Use `list_profiles`; the profile *folder* name is not always the account name. |
+| `error\|no reachable hive for sid '<x>' (not logged in and no profile path)` | The user is logged out **and** ProfileList carries no usable profile path, so there is nothing to mount. | Check that profile's `ProfileImagePath`. |
+| `error\|privilege_missing: SeBackupPrivilege/SeRestorePrivilege could not be enabled` | An offline mount was required but the agent account could not enable both privileges. | Expected on a hardened install that strips them; re-grant, or query while the user is logged in. |
+| `error\|failed to load hive for sid '<x>'` | The mount was attempted with privileges in hand and failed — hive locked (see the concurrency note above), corrupt, or missing. | Retry; if persistent, check the NTUSER.DAT. |
+| `error\|access denied opening key '<k>' in user hive` | The hive was reached but the key could not be opened — an ACL or a lock, **not** an absent key. | Distinct from the next line by design; the key may well exist. |
+| `error\|key or value not found in user hive` | The hive was reached and the key or value genuinely does not exist. | Key-absent and value-absent are deliberately not distinguished. |
+| `error\|value exceeds 1 MiB limit` | The value exists but is over the read cap. | Not truncated silently — the read is refused. |
+| `error\|value size too small for its declared type` | e.g. a `REG_DWORD` under 4 bytes. | Malformed value on the host. |
+| `error\|value changed while reading -- a concurrent writer kept growing it faster than the bounded retry could keep up; retry the read` | The value demonstrably exists — it changed size faster than a bounded 3-attempt retry could pin down. **Not** a claim of absence. | Retry the read; this is a narrow, honest failure mode, not a fault. |
+| `warning\|hive_unload_failed: HKU\<mount> …` | The offline hive could not be unloaded, so it stays mounted system-wide and the profile's NTUSER.DAT stays locked. **The read itself succeeded.** | Run the `reg unload` command in the message once whatever holds the branch (Search Indexer, AV, System Restore) releases it. |
+
+`list_profiles` additionally emits `warning|profile_list_truncated at 512 entries` when the profile cap is hit **and confirmed against the registry that a further profile actually exists** (a host with exactly 512 raw `ProfileList` entries does not get a false warning), and `warning|profile_path_unreadable for N profile(s)` when a `ProfileImagePath` exists but cannot be read or decoded — both report a shortfall rather than silently returning less. Note "512 entries" counts raw `ProfileList` subkeys before the three system SIDs are filtered out, so the effective cap on *user* profiles reported is 509, not 512.
+
+**Value-type notes (`get_user_value`).** `REG_MULTI_SZ` values are decoded into their records and joined with `;`. A record containing `;`, `|`, CR or LF is lossy: `|`/CR/LF are replaced with `_` so a value cannot forge a column or row in the output protocol, and `;` is indistinguishable from the join. `REG_LINK` is decoded as its target string, sanitised the same way (`|`/CR/LF replaced with `_`) for the same reason. `REG_NONE`, `REG_BINARY` and anything unrecognised are hex-encoded — inert against this class of injection by construction.
+
+**`get_value` / `enumerate_values` — type naming only, not value decoding.** These two actions share `get_user_value`'s type-naming table, so `type|` now correctly reports `REG_NONE`, `REG_LINK` and `REG_DWORD_BIG_ENDIAN` instead of the previous blanket `REG_UNKNOWN`. They do **not** share its value decoding: `REG_MULTI_SZ` and `REG_LINK` **values** are still hex-encoded on these two actions, unlike `get_user_value`, which decodes both. This is a real, declared inconsistency between actions in the same plugin, not an oversight — closing it means changing `get_value`'s output for existing callers, which is out of scope for this change.
 
 ### wmi
 

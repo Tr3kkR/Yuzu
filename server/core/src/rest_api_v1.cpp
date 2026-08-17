@@ -346,6 +346,36 @@ static int access_review_error_status(const std::string& err) {
     return err.starts_with("not_found:") ? 404 : 503;
 }
 
+// SoftwareDeploymentStore error classifier — mirrors discovery_routes.cpp's
+// is_deployment_db_error (DeploymentStore/ADR-0043): the majority of a
+// route's `unexpected` values here are caller-input validation or
+// not-found/wrong-state business errors (400 territory, matching how
+// DeploymentStore's own REST routes classify — see cancel_job's route,
+// which 400s "job not found" too, not 404; none of these store methods have
+// a REST get-by-id twin that would need the separate nullopt-vs-unexpected
+// 404 split). Keys off the SHARED constant (software_deployment_store.hpp),
+// never a local copy of the literal.
+static int sw_deploy_error_status(const std::string& err) {
+    return err.starts_with(kSwDeployDbErrorPrefix) ? 503 : 400;
+}
+
+// Never echoes a genuine DB/lease failure's raw text to the client — it can
+// embed PQerrorMessage() fragments (schema/constraint/DETAIL names, and on a
+// connection-phase failure occasionally a host:port) that are internal
+// implementation detail, not information the caller needs (gov Gate 2
+// security-guardian MEDIUM). Logs the real error server-side and returns a
+// generic constant instead, matching DeploymentStore's discovery_routes.cpp
+// precedent (`is_deployment_db_error` branch). A validation/business-rule
+// error (never carries the prefix) is safe to echo verbatim — it's
+// operator-authored request feedback, not database internals.
+static std::string sw_deploy_client_message(const char* op, const std::string& err) {
+    if (err.starts_with(kSwDeployDbErrorPrefix)) {
+        spdlog::error("{}: {}", op, err);
+        return "service unavailable";
+    }
+    return err;
+}
+
 // LicenseStore (docs/adr/0048-...md) error mapping — three-way, unlike
 // access_review_error_status's binary shape: LicenseStore's own methods still validate some
 // inputs internally (e.g. "license key already activated", "organization cannot be empty")
@@ -581,10 +611,12 @@ const std::string& openapi_spec() {
       "GuaranteedStateStatus": {
         "type": "object",
         "properties": {
+          "agent_id": {"type": "string", "description": "Present on the per-agent route only (GET /guaranteed-state/status/{agent_id}); absent on the fleet route."},
           "total_rules": {"type": "integer"},
           "compliant_rules": {"type": "integer"},
           "drifted_rules": {"type": "integer"},
-          "errored_rules": {"type": "integer"}
+          "errored_rules": {"type": "integer"},
+          "note": {"type": "string", "description": "Human-readable caveats about which fields above are real vs. still placeholder — see the route description, not a stable machine-readable contract."}
         }
       },)json"
         // Split literal: MSVC caps a single string literal at ~16 KB (C2026).
@@ -954,11 +986,17 @@ const std::string& openapi_spec() {
       "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Two gated shapes behind one route. An agent-scoped query (non-empty agent_id, max 256 chars, no control characters) requires per-device-scoped GuaranteedState:Read (management-group aware; a service-scoped token is confined to its own service's agents) and returns that device's individual-identifying behavioural signal history. A fleet-wide query (no agent_id) requires global GuaranteedState:Read AND denies a service-scoped token outright (403) — the fleet fan-out returns every reporting agent's agent_id + detail_json, which the bare service-token role check alone would not confine. BOTH shapes emit a dex.device.view audit (target_type Agent for the per-device shape, GuaranteedState for the fleet shape) and FAIL CLOSED — 503 + Sec-Audit-Failed: true (retryable, A4 envelope with retry_after_ms) — if that audit row cannot persist, parity with GET /api/v1/dex/devices/{id}. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit/offset, or agent_id too long / contains a control character"}, "403": {"description": "A service-scoped token queried the fleet-wide (no agent_id) shape, or an agent-scoped query named a device outside the caller's scope"}, "503": {"description": "Audit row could not persist — behavioural data withheld on both the agent-scoped and fleet-wide shapes; carries Sec-Audit-Failed: true and is retryable (A4 envelope).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/guaranteed-state/status": {
-      "get": {"summary": "Fleet Guaranteed State status rollup", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. PR 2 returns a placeholder with zero compliant/drifted/errored counts; real fleet aggregation lands in Guardian PR 4.", "responses": {"200": {"description": "Status rollup", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}}}
+      "get": {"summary": "Fleet Guaranteed State status rollup", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read via AuthRoutes::require_list_read, this route's SOLE authorization gate (ADR-0017 admit-then-filter). NON-service-scoped (a service-scoped API token is refused with 403 outright — this route aggregates across every agent's census, which a token scoped to one service must not read). A global grant sees the fleet-wide count; a management-group-confined grant sees errored_rules scoped to visible agents only (applied in SQL before the aggregate, INV-3), including a real grant that resolves to zero visible agents (200 + 0, not a denial, INV-2); no GuaranteedState:Read grant anywhere (including an unreachable/corrupt RBAC store, which fails closed) is refused with 403, not 503 — the store-unreachable and no-grant cases are not currently distinguished in the response code. errored_rules is REAL (#2298 item 6d), derived from the guardian_agent_rule_status census intersected against the live rule catalogue (a census row for a since-deleted rule is excluded) and, for a confined caller, against their visible-agent set: the count of distinct rule_ids with at least one VISIBLE agent reporting state=errored. total_rules is the global rule-catalogue size and is never confined (a rule has no agent/management-group dimension). compliant_rules/drifted_rules stay 0 — full status ingest lands in a later rung. 503 if the guaranteed-state store degrades, or the list-read gate itself is unwired (server misconfiguration) — never a silent 0.", "responses": {"200": {"description": "Status rollup", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}, "403": {"description": "Caller presented a service-scoped API token, or holds no GuaranteedState:Read grant anywhere — including when the RBAC store itself is unreachable or corrupt, which fails closed to this same 403 rather than a distinct 503 (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Guaranteed-state store degraded, or the list-read gate is unwired (A4 envelope) — never rendered as a silent 0", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/guaranteed-state/status/{agent_id}": {
-      "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — per-agent aggregation lands in Guardian PR 4.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status"}}}
-    },
+      "get": {"summary": "Per-agent Guaranteed State status", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in, and a service-scoped token is confined to its own service tag) — same World-A confinement shape as GET /guaranteed-state/device-compliance. errored_rules is REAL (#2298 item 6d), derived from this agent's guardian_agent_rule_status census rows intersected against the live rule catalogue; total_rules is the count of rules with ANY census entry for this agent still present in that catalogue, not the fleet catalogue size. compliant_rules/drifted_rules stay 0 — full status ingest lands in a later rung. Audited as guardian.device.view; FAILS CLOSED (503 + Sec-Audit-Failed) if the audit row cannot persist, parity with GET /dex/devices/{id} and GET /guaranteed-state/device-compliance.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Agent status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateStatus"}}}}, "400": {"description": "agent_id exceeds the canonical enrolled-agent-id length ceiling (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "Caller lacks GuaranteedState:Read on this agent's scope — RBAC denial, or a service-scoped token whose own service tag does not match this agent's (an unwired scoped-permission fn is 503, not this) — A4 envelope (require_scoped_permission's denial path is detail::a4_denial, itself error_json_a4)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Either the route is misconfigured (scoped-permission fn/store unwired) OR the guardian.device.view audit row could not persist (FAIL-CLOSED, CC7.2) OR the guaranteed-state store is degraded (A4 envelope)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the read was refused because the audit row could not persist (CC7.2 fail-closed); retry after the audit subsystem recovers."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    })json"
+        // Split here (MSVC C2026 ~16,380-byte per-literal cap): the two
+        // guaranteed-state/status route descriptions grew this segment past the
+        // cap (#2298 item 6d governance re-review, cpp-expert). Adjacent string
+        // literals are concatenated at compile time, so the emitted OpenAPI JSON
+        // is byte-identical to the unsplit form.
+        R"json(,
     "/guaranteed-state/device-compliance": {
       "get": {"summary": "Name-anchored, device-applicable Guardian compliance", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Looks up the Baseline by NAME (a stable constant such as 'ServiceNow Compliance', not a churning baseline_id) and returns the Guards ACTUALLY APPLICABLE to this device, each with the device's last reported (Observe-mode) verdict. One Baseline carries a SUPERSET of Guards, each scoped via scope_expr so the push arms a different subset per machine; the denominator here is the deployed_snapshot intersected with the Guards this device has reported, so an out-of-scope Guard is absent and each machine shows only its own applicable Guards. total_guards is that applicable count, not the snapshot size. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). updated_at carries staleness. Audited as guardian.device.view (success/not_found); a behavioral-PII read, so it FAILS CLOSED (503 + Sec-Audit-Failed) if the audit row cannot persist — parity with GET /dex/devices/{id}. Honest in-scope-but-unreported 'pending' (per-device scope_expr evaluation) is a deferred upgrade.", "parameters": [{"name": "baseline", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Baseline NAME (unique). URL-encode spaces, e.g. ServiceNow%20Compliance."}, {"name": "agent_id", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device applicable baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateDeviceComplianceStatus"}}}}, "400": {"description": "Missing baseline/agent_id, over-length query parameter, or a parameter containing control characters (bytes < 0x20) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline name not found (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Either the route is misconfigured (stores / scoped-permission fn unwired — non-transient, do not retry) OR the guardian.device.view audit row could not persist so the read is refused without durable evidence (FAIL-CLOSED, CC7.2 — transient: Sec-Audit-Failed: true + retry_after_ms, retry after the audit subsystem recovers). A4 envelope.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the read was refused because the audit row could not persist (CC7.2 fail-closed); retry after the audit subsystem recovers."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
@@ -1353,7 +1391,7 @@ void RestApiV1::register_routes(
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1367,7 +1405,8 @@ void RestApiV1::register_routes(
                     std::move(scoped_perm_fn), software_inventory_store,
                     std::move(inventory_scope_fn), std::move(response_scope_fn),
                     std::move(app_perf_providers), engine_principal_store, access_review_store,
-                    auth_db, directory_sync, stream_budget, std::move(exec_visible_fn));
+                    auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
+                    std::move(list_read_fn));
 }
 
 void RestApiV1::register_routes(
@@ -1388,7 +1427,7 @@ void RestApiV1::register_routes(
     ResponseScopeFn response_scope_fn, AppPerfProviders app_perf_providers,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
-    ExecVisibleFn exec_visible_fn) {
+    ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -7975,8 +8014,16 @@ void RestApiV1::register_routes(
                      if (!perm_fn(req, res, "SoftwareDeployment", "Read"))
                          return;
                      auto pkgs = sw_deploy_store->list_packages();
+                     if (!pkgs) {
+                         res.status = sw_deploy_error_status(pkgs.error());
+                         res.set_content(
+                             detail::a4_error(res, sw_deploy_client_message(
+                                                       "GET /api/v1/software-packages", pkgs.error())),
+                             "application/json");
+                         return;
+                     }
                      JArr arr;
-                     for (const auto& p : pkgs) {
+                     for (const auto& p : *pkgs) {
                          arr.add(JObj()
                                      .add("id", p.id)
                                      .add("name", p.name)
@@ -7988,7 +8035,7 @@ void RestApiV1::register_routes(
                                      .add("created_at", p.created_at)
                                      .add("created_by", p.created_by));
                      }
-                     res.set_content(list_json(arr.str(), static_cast<int64_t>(pkgs.size())),
+                     res.set_content(list_json(arr.str(), static_cast<int64_t>(pkgs->size())),
                                      "application/json");
                  });
 
@@ -8016,10 +8063,16 @@ void RestApiV1::register_routes(
             // header if the audit_fn signals failure. Matches the W1.1 /
             // PR #883 pattern used by the session-revoke handlers — the
             // operator must learn from the response whether the security
-            // event was actually persisted.
+            // event was actually persisted. try_persist_audit (not a bare
+            // audit_fn call) for the same reason as the 5 success-path
+            // sites below: a throwing audit sink must not turn this denial
+            // into an uncaught-exception 500 (no exception_handler_ is
+            // installed) -- gov review (security-guardian + docs-writer,
+            // Gate 2, b77952416..HEAD review round).
             auto emit_denial = [&](const char* detail_msg) {
-                bool emitted = audit_fn(req, "software_package.create", "denied", "SoftwarePackage",
-                                        "", detail_msg);
+                bool emitted = detail::try_persist_audit(audit_fn, req, "software_package.create",
+                                                         "denied", "SoftwarePackage", "",
+                                                         detail_msg);
                 if (!emitted)
                     res.set_header("Sec-Audit-Failed", "true");
             };
@@ -8099,12 +8152,21 @@ void RestApiV1::register_routes(
 
             auto result = sw_deploy_store->create_package(pkg);
             if (!result) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                res.status = sw_deploy_error_status(result.error());
+                res.set_content(detail::a4_error(res, sw_deploy_client_message(
+                                                          "POST /api/v1/software-packages",
+                                                          result.error())),
+                                "application/json");
                 return;
             }
-            audit_fn(req, "software_package.create", "success", "SoftwarePackage", *result,
-                     pkg.name);
+            // try_persist_audit (not a bare audit_fn call): a throwing audit
+            // sink must not turn this 201 into an uncaught-exception 500 (no
+            // exception_handler_ is installed) after the mutation already
+            // committed — same rationale as deny_fleet_wide_service_scoped
+            // above, unhappy-path Gate 4 (b77952416..HEAD review round).
+            if (!detail::try_persist_audit(audit_fn, req, "software_package.create", "success",
+                                           "SoftwarePackage", *result, pkg.name))
+                res.set_header("Sec-Audit-Failed", "true");
             res.status = 201;
             res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
         });
@@ -8116,8 +8178,16 @@ void RestApiV1::register_routes(
                 return;
             auto status = req.has_param("status") ? req.get_param_value("status") : std::string{};
             auto deps = sw_deploy_store->list_deployments(status);
+            if (!deps) {
+                res.status = sw_deploy_error_status(deps.error());
+                res.set_content(
+                    detail::a4_error(res, sw_deploy_client_message(
+                                              "GET /api/v1/software-deployments", deps.error())),
+                    "application/json");
+                return;
+            }
             JArr arr;
-            for (const auto& d : deps) {
+            for (const auto& d : *deps) {
                 arr.add(JObj()
                             .add("id", d.id)
                             .add("package_id", d.package_id)
@@ -8130,7 +8200,7 @@ void RestApiV1::register_routes(
                             .add("agents_success", static_cast<int64_t>(d.agents_success))
                             .add("agents_failure", static_cast<int64_t>(d.agents_failure)));
             }
-            res.set_content(list_json(arr.str(), static_cast<int64_t>(deps.size())),
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(deps->size())),
                             "application/json");
         });
 
@@ -8154,12 +8224,18 @@ void RestApiV1::register_routes(
                       dep.created_by = session->username;
                       auto result = sw_deploy_store->create_deployment(dep);
                       if (!result) {
-                          res.status = 400;
-                          res.set_content(detail::a4_error(res, result.error()), "application/json");
+                          res.status = sw_deploy_error_status(result.error());
+                          res.set_content(detail::a4_error(res, sw_deploy_client_message(
+                                                                    "POST /api/v1/software-deployments",
+                                                                    result.error())),
+                                          "application/json");
                           return;
                       }
-                      audit_fn(req, "software_deployment.create", "success", "SoftwareDeployment",
-                               *result, "");
+                      // try_persist_audit — see software_package.create above.
+                      if (!detail::try_persist_audit(audit_fn, req, "software_deployment.create",
+                                                     "success", "SoftwareDeployment", *result,
+                                                     dep.package_id))
+                          res.set_header("Sec-Audit-Failed", "true");
                       res.status = 201;
                       res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
                   });
@@ -8179,13 +8255,20 @@ void RestApiV1::register_routes(
                     !step_up_fn(req, res, *session, "POST /api/v1/software-deployments/{id}/start"))
                     return;
                 auto id = req.matches[1].str();
-                if (sw_deploy_store->start_deployment(id)) {
-                    audit_fn(req, "software_deployment.start", "success", "SoftwareDeployment", id,
-                             "");
+                auto result = sw_deploy_store->start_deployment(id);
+                if (result) {
+                    // try_persist_audit — see software_package.create above.
+                    if (!detail::try_persist_audit(audit_fn, req, "software_deployment.start",
+                                                   "success", "SoftwareDeployment", id, ""))
+                        res.set_header("Sec-Audit-Failed", "true");
                     res.set_content(ok_json(JObj().add("started", true).str()), "application/json");
                 } else {
-                    res.status = 400;
-                    res.set_content(detail::a4_error(res, "cannot start deployment"), "application/json");
+                    res.status = sw_deploy_error_status(result.error());
+                    res.set_content(
+                        detail::a4_error(res, sw_deploy_client_message(
+                                                  "POST /api/v1/software-deployments/{id}/start",
+                                                  result.error())),
+                        "application/json");
                 }
             });
 
@@ -8198,15 +8281,23 @@ void RestApiV1::register_routes(
                       if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
                           return;
                       auto id = req.matches[1].str();
-                      if (sw_deploy_store->rollback_deployment(id)) {
-                          audit_fn(req, "software_deployment.rollback", "success",
-                                   "SoftwareDeployment", id, "");
+                      auto result = sw_deploy_store->rollback_deployment(id);
+                      if (result) {
+                          // try_persist_audit — see software_package.create above.
+                          if (!detail::try_persist_audit(audit_fn, req,
+                                                         "software_deployment.rollback", "success",
+                                                         "SoftwareDeployment", id, ""))
+                              res.set_header("Sec-Audit-Failed", "true");
                           res.set_content(ok_json(JObj().add("rolled_back", true).str()),
                                           "application/json");
                       } else {
-                          res.status = 400;
-                          res.set_content(detail::a4_error(res, "cannot rollback deployment"),
-                                          "application/json");
+                          res.status = sw_deploy_error_status(result.error());
+                          res.set_content(
+                              detail::a4_error(
+                                  res, sw_deploy_client_message(
+                                           "POST /api/v1/software-deployments/{id}/rollback",
+                                           result.error())),
+                              "application/json");
                       }
                   });
 
@@ -8219,15 +8310,23 @@ void RestApiV1::register_routes(
                       if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
                           return;
                       auto id = req.matches[1].str();
-                      if (sw_deploy_store->cancel_deployment(id)) {
-                          audit_fn(req, "software_deployment.cancel", "success",
-                                   "SoftwareDeployment", id, "");
+                      auto result = sw_deploy_store->cancel_deployment(id);
+                      if (result) {
+                          // try_persist_audit — see software_package.create above.
+                          if (!detail::try_persist_audit(audit_fn, req,
+                                                         "software_deployment.cancel", "success",
+                                                         "SoftwareDeployment", id, ""))
+                              res.set_header("Sec-Audit-Failed", "true");
                           res.set_content(ok_json(JObj().add("cancelled", true).str()),
                                           "application/json");
                       } else {
-                          res.status = 400;
-                          res.set_content(detail::a4_error(res, "cannot cancel deployment"),
-                                          "application/json");
+                          res.status = sw_deploy_error_status(result.error());
+                          res.set_content(
+                              detail::a4_error(
+                                  res, sw_deploy_client_message(
+                                           "POST /api/v1/software-deployments/{id}/cancel",
+                                           result.error())),
+                              "application/json");
                       }
                   });
     }
@@ -10719,44 +10818,280 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
-    // GET /status, /status/:agent_id, /alerts — placeholders that respond
-    // with empty rollups for PR 2. Real fleet aggregation arrives in PR 4
-    // (status) and PR 11 (alerts). Returning empty structures now keeps
-    // dashboard fragments and audit tooling exercisable against the API.
-    // Field names match the agent-side proto `GuaranteedStateStatus`
-    // (compliant_rules / drifted_rules / errored_rules) so REST and proto
-    // schemas do not diverge when PR 4 wires real aggregation.
+    // GET /status — fleet Guaranteed State rollup (#2298 gate 3, item 6d). errored_rules
+    // is now REAL, derived from the guardian_agent_rule_status CENSUS table — the single
+    // source of truth for current per-(agent,rule) state (guardian_routes.cpp's
+    // rollup_by_rule invariant) — never the event log, which is reaped at 30 days and
+    // would silently lose a quiet-but-still-errored rule. compliant_rules/drifted_rules
+    // stay placeholder 0 deliberately: this rung is minimal by design (#2298 D3) and
+    // full status ingest (action=="status") lands separately at a later rung.
+    //
+    // Count = DISTINCT rule_ids with >=1 census row in state "errored" AND still present
+    // in the live rule catalogue, fleet-wide — intersected against rule_names() the same
+    // way guardian_routes.cpp's dashboard rollup_by_rule is. A census row is NOT
+    // guaranteed to be deleted atomically with its rule: delete_rule's own status
+    // cleanup is a SEPARATE, explicitly best-effort statement (no changes-count check,
+    // warn-only on failure) with no FK enforcing it, and a late/racing event can upsert
+    // a row after deletion — an earlier version of this comment claimed an orphan row
+    // was "impossible"; that was wrong (adversarial-review finding). One remaining
+    // deliberate delta from the dashboard: no offline-agent fold to "unknown" (this
+    // route counts a rule as errored if ANY agent currently reports it errored,
+    // regardless of that agent's liveness) — documented in the note field.
+    //
+    // World-A / ADR-0017: this route's SOLE authorization gate is
+    // AuthRoutes::require_list_read (list_read_fn below) — never perm_fn, and
+    // never perm_fn stacked with a direct authorize_list_read call. An earlier
+    // commit on this branch (9269b5636) tried the stacked shape — perm_fn first,
+    // then a direct rbac_store->authorize_list_read(...) call inside the handler
+    // — and shipped a no-op: require_permission's ordinary RBAC branch calls
+    // ONLY RbacStore::check_permission, which never consults ManagementGroupStore
+    // (collect_roles_locked unions only rbac.db's own principal_roles/group_members
+    // arms, a different and older mechanism). So a caller whose only grant was
+    // management-group-scoped was denied 403 by perm_fn before authorize_list_read
+    // was ever reached, and a global-grant caller passed both unfiltered — #3038
+    // was not actually fixed by that commit. It also broke JIT-elevated sessions
+    // (elevation passes perm_fn, then authorize_list_read — which has no elevation
+    // concept — denies it). require_list_read replicates require_permission's full
+    // session-class ladder (auth / Read-only / elevation / engine / MCP tier /
+    // service-scoped token / legacy) itself, delegating ONLY the ordinary-RBAC
+    // case to authorize_list_read, so the two mechanisms never stack.
+    //
+    // A service-scoped API token is denied outright by require_list_read (a flat
+    // list-read gate has no single agent_id to scope the token's service tag
+    // against, unlike require_scoped_permission's per-target check — admitting it
+    // would hand a service-scoped token the whole fleet's data). This MUST-use of
+    // the admit-then-filter chokepoint is a POLICY FLOOR (CLAUDE.md
+    // severity-derivation rule 2: "violation of any explicit MUST / never ...
+    // invariant ... closed to three sources: a routed-concern row's catastrophic
+    // clause") — it bypasses the ordinary impact/exposure derivation regardless of
+    // how narrow the exploit surface looks; ADR-0017 itself is explicit that this
+    // applies to AGGREGATES too ("the visible set MUST be applied in SQL before the
+    // aggregate", INV-3, COUNT/SUM/AVG/GROUP BY) — errored_rules is computed by
+    // GuaranteedStateStore::errored_rule_count with the visible scope applied via a
+    // SQL `agent_id = ANY($1::text[])` predicate before the COUNT(DISTINCT ...),
+    // never a C++ post-filter over the whole fleet census.
+    //
+    // total_rules stays UNSCOPED by the visible set deliberately: it is
+    // rule_names().size() — the size of the global rule-definition catalogue
+    // (guaranteed_state_rules), which carries no agent dimension at all (a rule is
+    // not owned by a management group; it becomes applicable to an agent only via
+    // scope_expr at push time). Confining it would filter data that was never
+    // per-agent to begin with. errored_rules IS the per-agent aggregate ADR-0017
+    // governs, and is scoped via errored_rule_count's agent_scope parameter.
+    //
+    // ADR-1005 MCP-twin note: both status routes below are GRANDFATHERED, not new
+    // capability — they existed pre-ADR-1005 as hardcoded placeholders; this rung only
+    // makes one stub field (errored_rules) real. No MCP tool exposes
+    // compliant_rules/errored_rules/etc today. Recorded here (rather than left silently
+    // unrecorded) so a future rung completing another placeholder field on this same
+    // grandfathered route doesn't keep dodging the twin obligation one field at a time
+    // without ever tripping it — a real MCP twin (or a formal exception-ledger entry
+    // alongside guardian_health_fleet_tags.hpp's ADR-1005 note, which covers only the
+    // /metrics gauge family, not this REST route) is still owed.
     sink.Get(
         "/api/v1/guaranteed-state/status",
-        [perm_fn, guaranteed_state_store](const httplib::Request& req, httplib::Response& res) {
-            if (!perm_fn(req, res, "GuaranteedState", "Read"))
+        [list_read_fn, guaranteed_state_store](const httplib::Request& req,
+                                               httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!list_read_fn) {
+                spdlog::error("guaranteed-state.status: list_read_fn unwired — "
+                              "misconfigured call site; failing closed; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
                 return;
-            const auto rules = guaranteed_state_store ? guaranteed_state_store->rule_count() : 0;
-            res.set_content(ok_json(JObj()
-                                        .add("total_rules", static_cast<int64_t>(rules))
-                                        .add("compliant_rules", 0)
-                                        .add("drifted_rules", 0)
-                                        .add("errored_rules", 0)
-                                        .add("note", "fleet aggregation lands in Guardian PR 4")
-                                        .str()),
-                            "application/json");
+            }
+            // require_list_read is the SOLE gate — see the comment above the route
+            // registration for why it must never be stacked with perm_fn. It
+            // renders 401/403/503 and returns !admitted itself on denial.
+            auto gate = list_read_fn(req, res, "GuaranteedState", "Read");
+            if (!gate.admitted)
+                return;
+            if (!guaranteed_state_store) {
+                spdlog::error("guaranteed-state.status: store null — registration-order "
+                              "defect; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            // ADR-0038 catastrophic-read: a degrade must render 503, never a silent "0
+            // errored"/"0 rules" that would misreport the fleet as compliant.
+            // ADR-0017 INV-3: gate.scope (nullopt = unfiltered; engaged, incl.
+            // empty = INV-2) is applied IN SQL by errored_rule_count, before the
+            // aggregate — never a C++ post-filter over the full fleet census.
+            auto rule_names_result = guaranteed_state_store->rule_names();
+            auto errored_result = guaranteed_state_store->errored_rule_count(gate.scope);
+            if (!rule_names_result || !errored_result) {
+                res.status = 503;
+                // Transient (unlike the unwired-gate/null-store 503s above, which
+                // are misconfiguration and stay retry_after_ms=null) — a query-time
+                // degrade may well clear on the next attempt.
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          /*retry_after_ms=*/5000, /*remediation=*/{}),
+                    "application/json");
+                spdlog::warn("guaranteed-state.status store degraded (503) cid={}", cid);
+                return;
+            }
+            res.set_content(
+                ok_json(JObj()
+                            .add("total_rules", static_cast<int64_t>(rule_names_result->size()))
+                            .add("compliant_rules", 0)
+                            .add("drifted_rules", 0)
+                            .add("errored_rules", static_cast<int64_t>(*errored_result))
+                            .add("note", "errored_rules is real (M1 census-derived, #2298 "
+                                        "item 6d), intersected against the live rule "
+                                        "catalogue via a SQL JOIN, and counts a rule as "
+                                        "errored regardless of the reporting agent's "
+                                        "liveness (not the dashboard's "
+                                        "offline-agent-folds-to-unknown rollup); "
+                                        "compliant_rules/drifted_rules land with full status "
+                                        "ingest in a later rung. errored_rules is "
+                                        "management-group-confined via "
+                                        "AuthRoutes::require_list_read (ADR-0017): a "
+                                        "group-scoped caller sees the count for their "
+                                        "visible agents only, not the whole fleet; "
+                                        "total_rules is the global rule-catalogue size "
+                                        "and is never confined")
+                            .str()),
+                "application/json");
         });
 
-    sink.Get(R"(/api/v1/guaranteed-state/status/([A-Za-z0-9._\-]+))",
-             [perm_fn](const httplib::Request& req, httplib::Response& res) {
-                 if (!perm_fn(req, res, "GuaranteedState", "Read"))
-                     return;
-                 auto agent_id = req.matches[1].str();
-                 res.set_content(ok_json(JObj()
-                                             .add("agent_id", agent_id)
-                                             .add("total_rules", 0)
-                                             .add("compliant_rules", 0)
-                                             .add("drifted_rules", 0)
-                                             .add("errored_rules", 0)
-                                             .add("note", "per-agent status lands in Guardian PR 4")
-                                             .str()),
-                                 "application/json");
-             });
+    // GET /status/{agent_id} — per-agent Guaranteed State rollup (#2298 gate 3, item 6d).
+    // errored_rules is the SAME census derivation as the fleet route above, scoped to
+    // this one agent's rows and intersected against the live rule catalogue (a census
+    // row can outlive its rule — see the fleet route's comment above for why; an
+    // earlier version of this claimed otherwise and was wrong). Per-device behavioral
+    // read: adopts the same scoped_perm_fn + guardian.device.view audit shape as GET
+    // /guaranteed-state/device-compliance (World-A / ADR-0017 routed concern) — wiring
+    // real per-agent data behind only the bare global perm_fn would be exactly the
+    // confinement gap that concern forbids. `require_scoped_permission` (behind
+    // scoped_perm_fn) DOES apply a service-scoped token's own service-tag confinement
+    // per target (agent_service != token_scope_service -> deny), unlike the bare
+    // `require_permission` the fleet route above had to defend against separately.
+    // total_rules here means "rules with ANY census entry for this agent, still present
+    // in the live catalogue" — NOT the fleet catalogue size, and NOT a baseline-scoped
+    // "applicable rules" count (that needs baseline+scope evaluation, the same tradeoff
+    // device-compliance's own header comment documents; out of this rung's minimal
+    // scope).
+    sink.Get(
+        R"(/api/v1/guaranteed-state/status/([A-Za-z0-9._\-]+))",
+        [scoped_perm_fn, audit_fn, guaranteed_state_store](const httplib::Request& req,
+                                                            httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            auto agent_id = req.matches[1].str();
+            // Same length ceiling as GET /guaranteed-state/device-compliance's agent_id
+            // query param (auth::kMaxAgentIdLength, 256 — the cap enrollment enforces).
+            // The route regex already excludes control/most special characters; this
+            // closes the remaining unbounded-length gap on the path segment.
+            if (agent_id.size() > auth::kMaxAgentIdLength) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "agent_id too long", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn) {
+                spdlog::error("guaranteed-state.status.agent: scoped_perm_fn unwired — "
+                              "misconfigured call site; failing closed; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                return;
+            if (!guaranteed_state_store) {
+                spdlog::error("guaranteed-state.status.agent: store null — "
+                              "registration-order defect; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto statuses_result = guaranteed_state_store->agent_rule_statuses_for_agent(agent_id);
+            // Behavioral-PII access audit — FAIL-CLOSED via the shared #1647 kernel,
+            // same HELPER as GET /guaranteed-state/device-compliance, but NOT identical
+            // fault-handling: device-compliance has a separate PRE-audit baseline_store_ok
+            // check that, on fault, emits no audit row at all ("no PII was looked up yet").
+            // This route has a single store call that IS the access attempt, so a degrade
+            // here is audited as result="failure" rather than left unaudited — over-audit
+            // rather than under-audit, consistent with the codebase-wide posture, but a
+            // SOC2/SIEM consumer correlating guardian.device.view rows across both routes
+            // should not assume identical fault-audit behavior from the "same shape" framing
+            // above. `result` otherwise records success/failure (this route has no "not
+            // found" branch of its own — an unrecognised agent_id simply has zero census
+            // rows, which is a legitimate empty result, not an error).
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "guardian.device.view",
+                    statuses_result ? "success" : "failure", "Agent", agent_id,
+                    "per-agent Guaranteed State status via REST")) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
+                                               "device data without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                spdlog::warn("guaranteed-state.status.agent audit fail-closed (503) cid={} "
+                             "agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+            if (!statuses_result) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
+                                "application/json");
+                spdlog::warn("guaranteed-state.status.agent store degraded (503) cid={} "
+                             "agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+            // Intersect against the live rule catalogue, bounded to just this agent's
+            // reported rule_ids (same shape as device-compliance's rule_names_for call).
+            std::vector<std::string> rule_ids;
+            rule_ids.reserve(statuses_result->size());
+            for (const auto& st : *statuses_result)
+                rule_ids.push_back(st.rule_id);
+            auto rule_names_result = guaranteed_state_store->rule_names_for(rule_ids);
+            if (!rule_names_result) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
+                                "application/json");
+                spdlog::warn("guaranteed-state.status.agent store degraded (503) cid={} "
+                             "agent_id={}",
+                             cid, agent_id);
+                return;
+            }
+            const auto& rule_names = *rule_names_result;
+            int64_t total_rules = 0, errored = 0;
+            for (const auto& st : *statuses_result) {
+                if (!rule_names.count(st.rule_id))
+                    continue; // orphan census row for a since-deleted rule
+                ++total_rules;
+                if (st.state == "errored")
+                    ++errored;
+            }
+            res.set_content(
+                ok_json(JObj()
+                            .add("agent_id", agent_id)
+                            .add("total_rules", total_rules)
+                            .add("compliant_rules", 0)
+                            .add("drifted_rules", 0)
+                            .add("errored_rules", errored)
+                            .add("note", "total_rules and errored_rules are both real (M1 "
+                                        "census-derived, #2298 item 6d) and both intersected "
+                                        "against the live rule catalogue; "
+                                        "compliant_rules/drifted_rules land with full status "
+                                        "ingest in a later rung")
+                            .str()),
+                "application/json");
+        });
 
     // ── Name-anchored, device-applicable Guardian compliance (ServiceNow CI) ──
     //

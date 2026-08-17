@@ -11,6 +11,7 @@
 
 #include "custom_properties_store.hpp"
 #include "dex_perf_rules.hpp"
+#include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet telemetry table (#2298 gate 3, item 6d)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
@@ -1624,6 +1625,12 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // all went dark as "fresh forever".
     for (const auto& m : kGuardianJournalAgeMetrics)
         metrics.clear_gauge_family(m.gauge);
+    // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d) - same absent-not-
+    // zero rule and same reason it bites hardest here: the writer is sparse, so a
+    // healthy or inert (prefer_spark off) fleet must see all 3 families ABSENT, never
+    // a fabricated 0.
+    for (const auto& m : kGuardianHealthMetrics)
+        metrics.clear_gauge_family(m.gauge);
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -1752,6 +1759,21 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         std::array<std::string, kNGuardianJournalAgeMetrics> keys;
         for (std::size_t i = 0; i < kNGuardianJournalAgeMetrics; ++i)
             keys[i] = kGuardianJournalAgeMetrics[i].tag;
+        return keys;
+    }();
+    // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d) - table-driven off
+    // kGuardianHealthMetrics exactly like the journal family above: unlabelled fleet
+    // SUM (no os split, no agent-controlled cardinality), `reported` tracked
+    // separately from the sum for the same non-conforming-explicit-"0" reason.
+    std::array<double, kNGuardianHealthMetrics> gh_sum{};
+    std::array<bool, kNGuardianHealthMetrics> gh_reported{};
+    int gh_reporting = 0;
+    int gh_tag_rejected = 0;
+    // Same static-destruction-safety rationale as gj_keys above.
+    static const std::array<std::string, kNGuardianHealthMetrics> gh_keys = [] {
+        std::array<std::string, kNGuardianHealthMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i)
+            keys[i] = kGuardianHealthMetrics[i].tag;
         return keys;
     }();
     // `yuzu.os` is an agent-CONTROLLED heartbeat tag; using it raw as a metric
@@ -2024,6 +2046,26 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                 ++gj_tag_rejected;
             }
         }
+
+        // Guardian M1 health-stream telemetry (#2298 gate 3, item 6d). Same
+        // absent-vs-rejected split as the journal accumulate above: an empty view is
+        // the sparse writer's "nothing to report", not a rejection; a present value
+        // that fails the parse is.
+        bool health_reported_any = false;
+        for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i) {
+            const auto raw = get_view(gh_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_health_count(raw)) {
+                gh_sum[i] += *v;
+                gh_reported[i] = true;
+                health_reported_any = true;
+            } else {
+                ++gh_tag_rejected;
+            }
+        }
+        if (health_reported_any)
+            ++gh_reporting;
     }
 
     metrics.gauge("yuzu_fleet_agents_healthy").set(static_cast<double>(healthy_count));
@@ -2160,6 +2202,16 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.gauge(kGuardianJournalReportingGauge).set(static_cast<double>(gj_reporting));
     metrics.gauge(kGuardianJournalTagRejectedGauge)
         .set(static_cast<double>(gj_tag_rejected));
+
+    // Guardian M1 health-stream rollup (#2298 gate 3, item 6d). Same absent-not-zero
+    // rule as the journal family: cleared at the top, so a signal nobody reported this
+    // cycle stays ABSENT.
+    for (std::size_t i = 0; i < kNGuardianHealthMetrics; ++i)
+        if (gh_reported[i])
+            metrics.gauge(kGuardianHealthMetrics[i].gauge).set(gh_sum[i]);
+    metrics.gauge(kGuardianHealthReportingGauge).set(static_cast<double>(gh_reporting));
+    metrics.gauge(kGuardianHealthTagRejectedGauge)
+        .set(static_cast<double>(gh_tag_rejected));
 }
 
 } // namespace yuzu::server::detail

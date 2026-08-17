@@ -1198,6 +1198,104 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
     return 0;
 }
 
+// ABI4 capability declarations (#2204).
+//
+// Windows: every action reads a native Win32/WTS/NetAPI surface
+// (WTSEnumerateSessionsW, NetUserEnum, NetLocalGroupGetMembers) EXCEPT
+// "primary_user" and "session_history", which shell out via this plugin's
+// own `_popen`-based run_command() to `wevtutil`/`reg query` — a raw,
+// ungoverned shell exec (not routed through the shared runner at all on
+// this platform) — so those two are rung 3 on Windows despite the rest of
+// the plugin being native there.
+//
+// Linux/macOS: "local_admins" and "group_members" read native libc group/
+// passwd surfaces (getgrnam/getpwuid) on Linux only — rung 1. Every other
+// action, and both of those on macOS, goes through run_command(), which
+// (for non-Windows) IS routed through the shared, bounded, fork-lock-covered
+// agent-core runner as `{"/bin/sh", "-c", cmd}` (K-7/CDX-07) — this is
+// ADR-3002 rung 3's OWN definition to the letter ("a shell string ... but
+// executed through the runner"), i.e. the GOVERNED shell exception, not the
+// raw popen()/system() this ADR bans outright. "local_users" on Linux/macOS
+// mixes a native read (passwd/dscl enumeration) with a per-account runner
+// shell-out (lastlog/last) for the last-logon field, so the action as a
+// whole is rung 3 there too.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "logged_on",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "utmp (setutent/getutent)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'who'", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "WTSEnumerateSessionsW + WTSQuerySessionInformationW",
+         nullptr},
+    },
+    {
+        /* .action      = */ "sessions",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'w -h'", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'w -h'", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "WTSEnumerateSessionsW + WTSQuerySessionInformationW",
+         nullptr},
+    },
+    {
+        /* .action      = */ "local_users",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "/etc/passwd read + runner /bin/sh -c 'lastlog -u <user>' per account", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "runner /bin/sh -c 'dscl . -list/-read UserShell/RealName' + 'last -y -1 <user>' per "
+         "account",
+         nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "NetUserEnum", nullptr},
+    },
+    {
+        /* .action      = */ "local_admins",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam(sudo/wheel) + getpwuid(0)", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "runner /bin/sh -c 'dscl . -read /Groups/admin GroupMembership'", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "NetLocalGroupGetMembers", nullptr},
+    },
+    {
+        /* .action      = */ "group_members",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam + /etc/passwd primary-group scan", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3,
+         "runner /bin/sh -c 'dscl . -read /Groups/<name> GroupMembership'", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "NetLocalGroupGetMembers", nullptr},
+    },
+    {
+        /* .action      = */ "primary_user",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'last -F, piped through head -200'",
+         nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'last, piped through head -200'", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "_popen(wevtutil qe Security EventID=4624)",
+         "falls back to an ungoverned _popen(reg query ProfileList) scan (no login-count) when "
+         "the Security event log is inaccessible"},
+    },
+    {
+        /* .action      = */ "session_history",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'last -F -n <count>'", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'last -n <count>'", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_CONSTRAINED, 3, "_popen(wevtutil qe Security EventID=4624/4634)",
+         "requires an elevated/administrative token to read the Security event log; reports "
+         "an error otherwise"},
+    },
+};
+
 } // namespace
 
 class UsersPlugin final : public yuzu::Plugin {
@@ -1214,6 +1312,14 @@ public:
                                      "local_admins",    "group_members", "primary_user",
                                      "session_history", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
