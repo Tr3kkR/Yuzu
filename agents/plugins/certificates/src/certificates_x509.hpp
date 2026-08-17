@@ -15,7 +15,9 @@
 // file's own comments). It deliberately does NOT touch the macOS
 // login-keychain path, which stays on its existing `security
 // find-certificate` + certificates_macos_parsers.hpp combined-output parse
-// (a Decision-7 governed-shell exception; see WAVE2-HANDOFF.md).
+// (a Decision-7 governed-shell exception, registered as sinks
+// `certificates/list_certs_macos#1` / `certificates/details_cert_macos#1` in
+// docs/agent-spawn-sink-manifest.md).
 //
 // Every field-extraction recipe below is EMPIRICALLY PINNED against the
 // verified host OpenSSL 3.6.2 at /opt/homebrew/opt/openssl@3/bin/openssl
@@ -35,13 +37,7 @@
 // PEM_read_bio_X509/d2i_X509 call as "no more certificates here", never a
 // thrown exception.
 
-#include <openssl/bio.h>
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
-
+// Include order per docs/cpp-conventions.md: STL -> third-party -> project.
 #include <climits>
 #include <cstddef>
 #include <format>
@@ -52,6 +48,13 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <openssl/bio.h>
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 namespace yuzu::certificates_x509 {
 

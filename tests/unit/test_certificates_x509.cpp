@@ -18,9 +18,27 @@
  * output is recorded as a comment directly above each embedded PEM. Two
  * certificates (kRealSystemDefaultCertPem, used by the single-cert and
  * thumbprint-pinning vectors) are REAL bytes trimmed from a captured
- * System.keychain read, not synthetic -- their own provenance comment
- * records the capture command/host/date/rc from
- * ~/.claude/wave2-prestage/fixtures/macos/manifest.txt.
+ * System.keychain read, not synthetic -- their own provenance comment records
+ * the capture command/host/date/rc verbatim. The raw pre-migration capture
+ * itself is a local development artifact and is deliberately NOT committed:
+ * the PEM bytes embedded below ARE the committed evidence (byte-for-byte from
+ * that capture), and every expected string is re-derivable from them with the
+ * commands recorded here -- nothing in this file depends on a path outside the
+ * repository.
+ *
+ * ADR-3002 PARITY RECORD (the "parity diff before spawn deletion" obligation).
+ * Verified 2026-08-17 on macOS 26.5.2 arm64 against the real
+ * /opt/homebrew/opt/openssl@3/bin/openssl 3.6.2 CLI, reproducing the EXACT
+ * pipeline the deleted subprocess code used per field -- `-subject`/`-issuer`
+ * with the leading-space strip, `-startdate`/`-enddate -dateopt iso_8601`
+ * truncated to 10 characters, `-serial`, `-fingerprint -sha1` with the colons
+ * removed, and `-ext keyUsage` reduced by the left-trim/skip-X509v3/skip-
+ * critical/take-last-line selection -- all under LC_ALL=C, for EVERY PEM
+ * vector in this file. Result: all 7 fields IDENTICAL to parse_pem_certs()
+ * output on all 11 certificate vectors, zero mismatches. That comparison
+ * shells out to openssl and so deliberately does NOT live in this suite (unit
+ * tests here spawn no processes); re-run it out-of-tree when changing any
+ * extractor in certificates_x509.hpp.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -39,12 +57,13 @@ namespace {
 
 // ── Real capture: System.keychain, first block ──────────────────────────────
 //
-// Captured 2026-08-14T19:06:27Z host=Alexs-MacBook-Air.local macos=26.5.2
-// (~/.claude/wave2-prestage/fixtures/macos/manifest.txt, row
-// "security-system-keychain|rc=0|cmd=sh -c security find-certificate -a -p
-// /Library/Keychains/System.keychain | head -c 500000") -- this is the FIRST
-// PEM block trimmed from that capture's security-system-keychain.out, a
-// genuine macOS system-identity certificate, byte-for-byte as captured.
+// Captured 2026-08-14T19:06:27Z host=Alexs-MacBook-Air.local macos=26.5.2,
+// rc=0, by: sh -c "security find-certificate -a -p
+// /Library/Keychains/System.keychain | head -c 500000" -- this is the FIRST PEM
+// block of that capture, a genuine macOS system-identity certificate,
+// byte-for-byte as captured. Re-capturing on another host yields a DIFFERENT
+// certificate (the system identity is per-machine), so this block, not the
+// command, is the fixture.
 //
 // Verified against it (verified host OpenSSL 3.6.2):
 //   $ openssl x509 -noout -subject -issuer -serial -fingerprint -sha1 -ext keyUsage -in cert1.pem

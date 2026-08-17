@@ -78,11 +78,12 @@
 #endif
 #endif
 
-#ifdef __linux__
-// The Linux openssl x509 shell-out routes through the bounded, fork-lock-covered
-// runner too (review blocker); macOS already includes this above.
-#include <yuzu/agent/subprocess_runner.hpp>
-#endif
+// NOTE: the Linux leg deliberately includes NO subprocess header. WP-B removed
+// the `openssl x509` shell-out that used to need one, so the Linux
+// list/details/delete paths below spawn nothing at all -- the previous
+// `#ifdef __linux__ #include <yuzu/agent/subprocess_runner.hpp>` block is gone
+// with the mechanism it served. Every remaining spawn site in this file is
+// inside the __APPLE__ region.
 
 #if defined(__linux__) || defined(__APPLE__)
 // yuzu::certificates_x509 -- in-process libcrypto PEM/DER parsing (WP-B).
@@ -407,9 +408,19 @@ void delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
 // represents" (read_linux_cert_record below and delete_cert_linux further
 // down) go through this ONE helper and consume only certs.front() -- never
 // anything past index 0. Widening either caller to consider a 2nd-or-later
-// certificate would turn a single-cert delete into a bulk trust-anchor
-// removal for any multi-cert CA bundle file (see test_certificates_x509.cpp's
-// delete-parity vector). Returns std::nullopt for a file that cannot be
+// certificate would make MANY MORE thumbprints match a bundle file, and since
+// `delete` removes the whole FILE (`std::filesystem::remove`, the only
+// mechanism available for a PEM-directory store), every extra match is
+// another way to reach a bulk trust-anchor removal. Note carefully what this
+// guard does and does NOT buy: matching only certs.front() is a strict
+// REDUCTION in the number of requests that can trigger a bundle-wide delete,
+// and it is byte-parity with the replaced subprocess -- but it does not make
+// the delete granular. A request naming a bundle's FIRST certificate still
+// removes the entire bundle, exactly as the pre-migration code did. That
+// pre-existing coarseness is out of WP-B's scope (a granular delete means
+// rewriting the file, a different and mutating design); do not read this
+// comment as a claim that bundle files are safe from bulk removal.
+// Returns std::nullopt for a file that cannot be
 // opened OR that yields zero parseable certificates (empty, garbage, a
 // truncated PEM block) -- both are "no certificate available from this
 // path" as far as every caller here is concerned.
@@ -649,7 +660,9 @@ CheckedCommandResult run_bounded_checked(const std::vector<std::string>& argv,
 // System.keychain and SystemRootCertificates.keychain ONLY -- the login
 // keychain stays on the `security find-certificate` subprocess path via
 // build_login_keychain_read_command() below (Decision-7 governed-shell
-// exception; see WAVE2-HANDOFF.md). Gated on YUZU_HAVE_SECURITY_FRAMEWORK
+// exception, registered as sink `certificates/list_certs_macos#1` +
+// `certificates/details_cert_macos#1` in docs/agent-spawn-sink-manifest.md).
+// Gated on YUZU_HAVE_SECURITY_FRAMEWORK
 // (meson.build, required:false + -D flag -- same shape as
 // agents/plugins/users/meson.build's YUZU_HAVE_SYSTEMCONFIGURATION gate) so
 // a box without the Security framework still builds; the #else fallback
@@ -671,11 +684,17 @@ struct SecItemKeychainResult {
  * result's DER encoding (SecCertificateCopyData) to
  * yuzu::certificates_x509::parse_der_cert. test_certificates_x509.cpp is a
  * fixture-only unit suite and cannot exercise this function directly (it
- * needs a real keychain); this mechanism was instead validated
- * interactively against this host's real System.keychain during
- * development, confirming it returns the SAME certificates, by thumbprint,
- * that `security find-certificate -a -p` emits for the same keychain --
- * recorded in WAVE2-HANDOFF.md.
+ * needs a real keychain), so the mechanism's equivalence to the
+ * `security find-certificate -a -p` subprocess it replaces was established
+ * empirically instead, and the check is REPRODUCIBLE rather than anecdotal:
+ * enumerate each keychain through this function's query and compare the
+ * resulting uppercase SHA-1 thumbprint SET to the set obtained by piping
+ * `security find-certificate -a -p <keychain>` through
+ * `openssl x509 -noout -fingerprint -sha1` per PEM block. Measured
+ * 2026-08-17 on macOS 26.5.2 arm64: System.keychain 3/3 and
+ * SystemRootCertificates.keychain 158/158 thumbprints, both sets IDENTICAL
+ * (zero diff either way). Re-run that comparison, not a re-read of this
+ * comment, when changing the query below.
  *
  * Every CoreFoundation object here is ScopedCFRef-owned (scoped_cfref.hpp)
  * -- read that header's reset()/same-identity contract before touching this
@@ -872,6 +891,9 @@ CertRecord parse_pem_block_macos(const std::string& pem_block, const std::string
     // rejects). Absolute path, matching the /usr/bin/security convention
     // used by every other privileged subprocess call in this file (PATH is
     // not trusted for a process that can run as root).
+    // sink: certificates/parse_pem_block_macos#1 — rung-2 runner argv (LibreSSL
+    // rejects -ext keyUsage, so this login-keychain block parse stays on the CLI),
+    // see manifest
     auto result = yuzu::agent::run_bounded_subprocess(
         {"/usr/bin/openssl", "x509", "-noout", "-in", tmp_file.path(), "-subject", "-issuer",
          "-startdate", "-enddate", "-serial", "-fingerprint", "-sha1", "-text"},
@@ -955,6 +977,8 @@ std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
     auto stat_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
     if (stat_deadline <= std::chrono::milliseconds::zero())
         return std::nullopt;
+    // sink: certificates/resolve_console_user#1 — rung-2 runner argv (no
+    // SystemConfiguration access from this LaunchDaemon), see manifest
     auto stat_result = run_bounded_checked({"/usr/bin/stat", "-f%Su", "/dev/console"},
                                            yuzu::agent::SubprocessOptions{
                                                .deadline = stat_deadline},
@@ -972,6 +996,8 @@ std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
     auto id_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
     if (id_deadline <= std::chrono::milliseconds::zero())
         return std::nullopt;
+    // sink: certificates/resolve_console_user#2 — rung-2 runner argv, same
+    // constraint as #1, see manifest
     auto id_result = run_bounded_checked({"/usr/bin/id", "-u", username},
                                          yuzu::agent::SubprocessOptions{
                                              .deadline = id_deadline},
@@ -1459,6 +1485,8 @@ std::optional<bool> keychain_contains_thumbprint(
     if (read_deadline <= std::chrono::milliseconds::zero()) {
         return std::nullopt;
     }
+    // sink: certificates/keychain_contains_thumbprint#1 — rung-2 runner argv,
+    // fixed literal keychain path, see manifest
     auto result = run_bounded_checked(
         {"/usr/bin/security", "find-certificate", "-a", "-p", keychain_path},
         yuzu::agent::SubprocessOptions{.deadline = read_deadline}, "keychain verify read");
@@ -1598,6 +1626,8 @@ bool delete_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // ...). merge_stderr=true (was the shell string's `2>&1`) so a failure
     // diagnostic -- `security` writes those to stderr -- is captured into
     // `.output` for the error message below.
+    // sink: certificates/delete_cert_macos#1 — rung-2 runner argv, MUTATING,
+    // hex-validated thumbprint + fixed literal keychain path, see manifest
     auto delete_result = run_bounded_checked(
         {"/usr/bin/security", "delete-certificate", "-Z", needle, *target},
         yuzu::agent::SubprocessOptions{.deadline = delete_deadline, .merge_stderr = true},
