@@ -12,6 +12,7 @@
  * gates with RBAC enabled AND a real tag store.
  */
 
+#include "audit_store.hpp"
 #include "auth_routes.hpp"
 #include "authz_gates.hpp"
 #include "service_scope_policy.hpp"
@@ -119,14 +120,25 @@ struct GatesRig {
     yuzu::test::ApiTokenStorePg api_tokens;
     yuzu::test::TempDbFile tag_db{"yuzu_test_authzgates_tags-"};
     TagStore tags{tag_db.path};
+    // Shares the rbac database via a second pool (its own `audit_store`
+    // schema, no conflict) — same pattern as test_rest_api_tokens.cpp's
+    // CSPRNG-failure audit test. Real AuditStore, not nullptr, so denial
+    // paths' audit_log calls are regression-testable (quality-engineer,
+    // governance Gate 8 re-review 2026-08-17: the cc93f499c arg-order bug
+    // this fixed had zero coverage until this rig wired one in).
+    PgPool audit_pool;
+    AuditStore audit_store;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
     std::unique_ptr<AuthRoutes> ar;
     std::string gP, gC1, gC2, gS;
 
-    explicit GatesRig(const std::string& dsn) : pool{{.conninfo = dsn, .size = 4}}, rbac{pool} {
+    explicit GatesRig(const std::string& dsn)
+        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool},
+          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool} {
         REQUIRE(pool.valid());
         REQUIRE(rbac.is_open());
+        REQUIRE(audit_store.is_open());
         rbac.set_rbac_enabled(true); // enforcement in effect, not legacy-open
 
         REQUIRE(rbac.create_role({"RespReader", "", false, 0}).has_value());
@@ -151,8 +163,8 @@ struct GatesRig {
 
         REQUIRE(auth_mgr.upsert_user("minter", "correct-horse-battery-staple", auth::Role::admin));
 
-        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(),
-                                          /*audit_store=*/nullptr, &mgmt, &tags,
+        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(), &audit_store,
+                                          &mgmt, &tags,
                                           /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
     }
 
@@ -474,6 +486,35 @@ TEST_CASE("authorize_agent_target: non-matching service tag ⇒ 403",
     bool ok = r.ar->authorize_agent_target(req, res, "Response", "Read", "a_c2");
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
+}
+
+TEST_CASE("authorize_agent_target: denial audit row carries agent_id in target_id and the "
+          "reason in detail, not swapped",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    // Regression test for cc93f499c: the three denial-path audit_log calls in
+    // authorize_agent_target originally omitted target_type, so agent_id
+    // landed in that slot and the message landed in target_id, leaving
+    // detail empty. GatesRig now wires a real AuditStore (previously
+    // nullptr, so this was unverifiable — quality-engineer, governance
+    // Gate 8 re-review 2026-08-17) to pin the correct field placement.
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    auto token = r.mint("printers");
+    auto req = bearer_request(token);
+    httplib::Response res;
+
+    bool ok = r.ar->authorize_agent_target(req, res, "Response", "Read", "a_c2");
+    CHECK_FALSE(ok);
+
+    auto rows = r.audit_store.query({});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    const auto& row = (*rows)[0];
+    CHECK(row.action == "auth.agent_target_required");
+    CHECK(row.result == "denied");
+    CHECK(row.target_type == "Agent");
+    CHECK(row.target_id == "a_c2"); // was landing in target_type pre-cc93f499c
+    CHECK(row.detail.find("not in service") != std::string::npos); // was empty pre-cc93f499c
 }
 
 TEST_CASE("authorize_agent_target: null tag store on a service token ⇒ 503",
