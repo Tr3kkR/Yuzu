@@ -8091,8 +8091,9 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            audit_fn(req, "software_package.create", "success", "SoftwarePackage", *result,
-                     pkg.name);
+            if (!audit_fn(req, "software_package.create", "success", "SoftwarePackage", *result,
+                          pkg.name))
+                res.set_header("Sec-Audit-Failed", "true");
             res.status = 201;
             res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
         });
@@ -8157,8 +8158,9 @@ void RestApiV1::register_routes(
                                           "application/json");
                           return;
                       }
-                      audit_fn(req, "software_deployment.create", "success", "SoftwareDeployment",
-                               *result, dep.package_id);
+                      if (!audit_fn(req, "software_deployment.create", "success",
+                                    "SoftwareDeployment", *result, dep.package_id))
+                          res.set_header("Sec-Audit-Failed", "true");
                       res.status = 201;
                       res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
                   });
@@ -8180,8 +8182,9 @@ void RestApiV1::register_routes(
                 auto id = req.matches[1].str();
                 auto result = sw_deploy_store->start_deployment(id);
                 if (result) {
-                    audit_fn(req, "software_deployment.start", "success", "SoftwareDeployment", id,
-                             "");
+                    if (!audit_fn(req, "software_deployment.start", "success",
+                                  "SoftwareDeployment", id, ""))
+                        res.set_header("Sec-Audit-Failed", "true");
                     res.set_content(ok_json(JObj().add("started", true).str()), "application/json");
                 } else {
                     res.status = sw_deploy_error_status(result.error());
@@ -8204,8 +8207,9 @@ void RestApiV1::register_routes(
                       auto id = req.matches[1].str();
                       auto result = sw_deploy_store->rollback_deployment(id);
                       if (result) {
-                          audit_fn(req, "software_deployment.rollback", "success",
-                                   "SoftwareDeployment", id, "");
+                          if (!audit_fn(req, "software_deployment.rollback", "success",
+                                        "SoftwareDeployment", id, ""))
+                              res.set_header("Sec-Audit-Failed", "true");
                           res.set_content(ok_json(JObj().add("rolled_back", true).str()),
                                           "application/json");
                       } else {
@@ -8230,8 +8234,9 @@ void RestApiV1::register_routes(
                       auto id = req.matches[1].str();
                       auto result = sw_deploy_store->cancel_deployment(id);
                       if (result) {
-                          audit_fn(req, "software_deployment.cancel", "success",
-                                   "SoftwareDeployment", id, "");
+                          if (!audit_fn(req, "software_deployment.cancel", "success",
+                                        "SoftwareDeployment", id, ""))
+                              res.set_header("Sec-Audit-Failed", "true");
                           res.set_content(ok_json(JObj().add("cancelled", true).str()),
                                           "application/json");
                       } else {
