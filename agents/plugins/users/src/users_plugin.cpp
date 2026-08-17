@@ -213,23 +213,70 @@ std::string render_event_xml(EVT_HANDLE event) {
 // kUsersCmdDeadline). 10s matches that same ceiling.
 constexpr DWORD kEvtNextTimeoutMs = 10'000;
 
+// Distinguishes WHY a Security-channel query failed, so the caller can give
+// an operator an honest message and set the correct ABI4 result status
+// instead of a single hardcoded "requires elevated privileges" that also
+// fires for a missing/uninstalled channel or a mid-query timeout against a
+// wedged (not stopped) Event Log service — three different operational
+// facts that a governance chaos-injector pass found collapsed to one,
+// possibly-misleading, message (I4: guidance that conceals the real state).
+enum class EvtQueryOutcome { kOk, kAccessDenied, kChannelNotFound, kTimeout, kOtherError };
+
+struct EvtQueryFailureInfo {
+    const char* message;
+    YuzuResultStatus status;
+    YuzuResultCompleteness completeness;
+    const char* provenance;
+};
+
+inline EvtQueryFailureInfo describe_evt_query_failure(EvtQueryOutcome outcome) {
+    switch (outcome) {
+    case EvtQueryOutcome::kAccessDenied:
+        return {"Cannot access Security event log (requires elevated privileges)",
+               YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+               "users_win_events:access_denied"};
+    case EvtQueryOutcome::kChannelNotFound:
+        return {"Security event log channel not found or unavailable",
+               YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+               "users_win_events:channel_not_found"};
+    case EvtQueryOutcome::kTimeout:
+        return {"Security event log query timed out (service may be degraded)",
+               YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+               "users_win_events:evt_next_timeout"};
+    case EvtQueryOutcome::kOk:
+    case EvtQueryOutcome::kOtherError:
+    default:
+        return {"Security event log query failed", YUZU_RESULT_STATUS_UNAVAILABLE,
+               YUZU_RESULT_COMPLETENESS_PARTIAL, "users_win_events:evt_query_failed"};
+    }
+}
+
 // Queries the Security channel with `xpath`, newest-first, rendering up to
 // `cap` events to XML and folding each through
-// yuzu::users_win::parse_logon_events into `out`. Returns false when EvtQuery
-// itself failed (missing/ACL-denied channel) OR when EvtNext failed with
-// anything other than ERROR_NO_MORE_ITEMS (a genuine I/O/access error mid-
-// query, including a timeout against a wedged service, must not be reported
-// as a clean, if partial, success) — either way the caller owns the
+// yuzu::users_win::parse_logon_events into `out`. Returns a non-kOk outcome
+// when EvtQuery itself failed (missing/ACL-denied channel) OR when EvtNext
+// failed with anything other than ERROR_NO_MORE_ITEMS (a genuine I/O/access
+// error mid-query, including a timeout against a wedged service, must not be
+// reported as a clean, if partial, success) — either way the caller owns the
 // fallback/error path. A successful, fully-exhausted query still returns
-// true with `out` possibly empty (a real, distinct fact from "couldn't
-// query at all"). Every EVT_HANDLE — including EvtNext batch handles seen
-// after the cap is hit — is owned by an EvtGuard.
-bool query_logon_events(const wchar_t* xpath, std::size_t cap,
-                        std::vector<yuzu::users_win::LogonEvent>& out) {
+// kOk with `out` possibly empty (a real, distinct fact from "couldn't query
+// at all"). Every EVT_HANDLE — including EvtNext batch handles seen after
+// the cap is hit — is owned by an EvtGuard.
+EvtQueryOutcome query_logon_events(const wchar_t* xpath, std::size_t cap,
+                                   std::vector<yuzu::users_win::LogonEvent>& out) {
     EvtGuard q{::EvtQuery(nullptr, L"Security", xpath,
                           EvtQueryChannelPath | EvtQueryReverseDirection)};
-    if (!q)
-        return false;
+    if (!q) {
+        switch (::GetLastError()) {
+        case ERROR_ACCESS_DENIED:
+            return EvtQueryOutcome::kAccessDenied;
+        case ERROR_EVT_CHANNEL_NOT_FOUND:
+        case ERROR_FILE_NOT_FOUND:
+            return EvtQueryOutcome::kChannelNotFound;
+        default:
+            return EvtQueryOutcome::kOtherError;
+        }
+    }
 
     std::size_t taken = 0;
     while (taken < cap) {
@@ -237,8 +284,14 @@ bool query_logon_events(const wchar_t* xpath, std::size_t cap,
         DWORD got = 0;
         if (!::EvtNext(q.h, static_cast<DWORD>(std::size(raw)), raw, kEvtNextTimeoutMs, 0,
                        &got)) {
-            if (::GetLastError() != ERROR_NO_MORE_ITEMS)
-                return false; // a genuine I/O/access error (incl. ERROR_TIMEOUT), not clean exhaustion
+            const DWORD err = ::GetLastError();
+            if (err != ERROR_NO_MORE_ITEMS) {
+                // A genuine I/O/access error (incl. ERROR_TIMEOUT), not clean
+                // exhaustion -- distinguish a mid-query timeout from every
+                // other failure so it doesn't read as "access denied".
+                return err == ERROR_TIMEOUT ? EvtQueryOutcome::kTimeout
+                                            : EvtQueryOutcome::kOtherError;
+            }
             break; // ERROR_NO_MORE_ITEMS — legitimately exhausted, done
         }
         for (DWORD i = 0; i < got; ++i) {
@@ -255,7 +308,7 @@ bool query_logon_events(const wchar_t* xpath, std::size_t cap,
             }
         }
     }
-    return true;
+    return EvtQueryOutcome::kOk;
 }
 #endif // _WIN32
 
@@ -603,9 +656,22 @@ int do_local_users(yuzu::CommandContext& ctx) {
             if (user.starts_with("_"))
                 continue;
 
-            // Validate username before using it in an argv element
-            if (!is_safe_identifier(user))
+            // Validate username before using it in an argv element. A bare
+            // `continue` here would silently drop the account from output
+            // entirely -- an admin-privileged actor could rename an account
+            // to a name outside is_safe_identifier's charset specifically to
+            // blind this enumeration, with the tool reporting a clean,
+            // complete-looking result (governance chaos-injector finding,
+            // I3/HIGH). Emit a degraded row instead: the account stays
+            // visible, and no further dscl/last call ever reaches the
+            // unsafe name as an argv element. Matches the Linux branch
+            // above, which already degrades (last_logon stays "unknown")
+            // rather than dropping the row on the same condition.
+            if (!is_safe_identifier(user)) {
+                ctx.write_output(
+                    std::format("local_user|{}|unknown|unknown|-|unknown", user));
                 continue;
+            }
 
             // Check if account is enabled
             // sink: users/do_local_users#3 — `dscl . -read UserShell` reads
@@ -823,6 +889,13 @@ int do_local_admins(yuzu::CommandContext& ctx) {
                 ctx.write_output(std::format("admin|{}|user|admin", member));
             }
         }
+    } else if (status_forwarded) {
+        // A runner failure (dscl timeout/spawn_error) must not read
+        // identically to "queried cleanly, zero admins" -- the caller's
+        // result_status already carries the failure (forward_runner_failure
+        // above), but the text output alone was previously indistinguishable
+        // from a genuinely admin-free host (Gate 4 unhappy-path finding).
+        ctx.write_output("admin|error|query failed");
     }
 
 #elif defined(_WIN32)
@@ -953,6 +1026,14 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
                 ctx.write_output(std::format("group_member|{}|{}|user", member, group_name));
             }
         }
+    } else if (status_forwarded) {
+        // A runner failure (dscl timeout/spawn_error) is a different fact
+        // than "queried cleanly, group doesn't exist" -- the Windows branch
+        // below already distinguishes NERR_GroupNotFound from a generic
+        // query failure; this branch previously asserted "Group not found"
+        // regardless of cause (Gate 4 unhappy-path finding).
+        ctx.write_output(std::format("group_member|error|Query failed for group: {}", group_name));
+        return 1;
     } else {
         ctx.write_output(std::format("group_member|error|Group not found: {}", group_name));
         return 1;
@@ -1112,7 +1193,8 @@ int do_primary_user(yuzu::CommandContext& ctx) {
     // Windows: read the Security Event Log natively via wevtapi (EvtQuery/
     // EvtRender), newest-first, capped at 200 events — no wevtutil shell-out.
     std::vector<yuzu::users_win::LogonEvent> events;
-    if (query_logon_events(L"*[System[EventID=4624]]", 200, events)) {
+    const auto evt_outcome = query_logon_events(L"*[System[EventID=4624]]", 200, events);
+    if (evt_outcome == EvtQueryOutcome::kOk) {
         auto [primary, max_count] = yuzu::users_win::primary_user_from_events(events);
         if (!primary.empty()) {
             // primary originates from decoded Security-channel event XML --
@@ -1139,7 +1221,15 @@ int do_primary_user(yuzu::CommandContext& ctx) {
                 last_user = name;
         }
         if (!ok) {
-            ctx.write_output("primary_user|unknown|0|cannot query event log or registry");
+            // Both the event-log path and the ProfileList fallback failed --
+            // surface the more specific event-log failure reason/status
+            // rather than a bare "cannot query" (the same message-conflation
+            // gap fixed for session_history below).
+            const auto info = describe_evt_query_failure(evt_outcome);
+            ctx.set_result_status(info.status, info.completeness, info.provenance);
+            ctx.write_output(std::format("primary_user|unknown|0|cannot query event log or "
+                                         "registry ({})",
+                                         info.message));
         } else if (!last_user.empty()) {
             ctx.write_output(std::format("primary_user|{}|0|profile_list", last_user));
         } else {
@@ -1269,13 +1359,22 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
     // yuzu::users_win::session_history_rows, shared with the pure-parser
     // unit tests.
     std::vector<yuzu::users_win::LogonEvent> events;
-    if (query_logon_events(L"*[System[(EventID=4624 or EventID=4634)]]",
-                           static_cast<std::size_t>(count), events)) {
+    const auto evt_outcome = query_logon_events(L"*[System[(EventID=4624 or EventID=4634)]]",
+                                                static_cast<std::size_t>(count), events);
+    if (evt_outcome == EvtQueryOutcome::kOk) {
         for (const auto& row : yuzu::users_win::session_history_rows(events))
             ctx.write_output(row);
     } else {
-        ctx.write_output("session_history|error|Cannot access Security event log (requires "
-                         "elevated privileges)");
+        // Access-denied / channel-missing / EvtNext-timeout are distinct
+        // operational facts (a chaos-injector governance pass found them
+        // collapsed into one hardcoded "requires elevated privileges"
+        // message, which misleads an operator when the real cause is a
+        // stopped/degraded service rather than a permissions gap) --
+        // describe_evt_query_failure() picks the honest message + ABI4
+        // status for whichever one actually occurred.
+        const auto info = describe_evt_query_failure(evt_outcome);
+        ctx.set_result_status(info.status, info.completeness, info.provenance);
+        ctx.write_output(std::format("session_history|error|{}", info.message));
     }
 #endif
     return 0;
