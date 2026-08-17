@@ -482,6 +482,14 @@ TEST_CASE("REST software-deployment routes answer 503 (not 400) on a genuine sto
         // emit_denial path above) fire only on a validation failure, and
         // this request's body passes validation, failing only at the store.
         REQUIRE(h.audit_log.empty());
+        // gov-fix(consistency-auditor, Gate 4, b77952416..HEAD review round):
+        // this test asserted status+message but never the A4 envelope's
+        // other required fields -- matching test_rest_quarantine_routes.cpp's
+        // precedent (added there after the identical gap was found on that
+        // route). This route sets no explicit retry hint, so retry_after_ms
+        // is the A4-required-but-null shape, not a concrete value.
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        CHECK(res->body.find(R"("retry_after_ms":null)") != std::string::npos);
     }
     SECTION("GET /api/v1/software-packages") {
         auto res = h.get_packages();
