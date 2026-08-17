@@ -110,13 +110,26 @@ TEST_CASE("set_port: writes the port in network byte order for both address fami
     CHECK(sin6->sin6_port == htons(443));
 }
 
-TEST_CASE("IcmpSession: constructs an unprivileged, usable session on this host",
+TEST_CASE("IcmpSession: construction lands in a state the honest-degrade path handles",
           "[agent][icmp_probe]") {
-    // Matches the live proof already captured pre-authoring (unprivileged
-    // echo to 127.0.0.1, RTT 0.15ms, no entitlement) -- this asserts the
-    // session construction succeeds and reports itself permitted, without
-    // repeating the live-network round-trip in the unit suite.
+    // DELIBERATELY NOT a live capability assertion. An earlier cut asserted
+    // CHECK(session.ok()) && CHECK(session.permitted) unconditionally, which
+    // makes the unit suite depend on host kernel policy: on a Linux host whose
+    // net.ipv4.ping_group_range excludes the agent's gid -- the exact
+    // deployment state this plugin's CONSTRAINED/PARTIAL degrade exists to
+    // support, and a plausible CI runner config -- the constructor correctly
+    // sets fd<0/permitted=false and both CHECKs would fail. A supported
+    // runtime state must never turn a unit leg red.
+    //
+    // What IS environment-independent, and is what discovery's degrade branch
+    // actually reads: a usable session never reports itself unpermitted, so
+    // ok() implies permitted. The three states the plugin switches on are
+    // therefore exactly {ok && permitted}, {!ok && !permitted} (denied ->
+    // CONSTRAINED), {!ok && permitted} (socket error -> UNAVAILABLE).
     IcmpSession session;
-    CHECK(session.ok());
-    CHECK(session.permitted);
+    if (session.ok())
+        CHECK(session.permitted);
+    else
+        SUCCEED("no unprivileged ICMP socket on this host — the honest-degrade "
+                "state, asserted by the pure classifier tests instead");
 }

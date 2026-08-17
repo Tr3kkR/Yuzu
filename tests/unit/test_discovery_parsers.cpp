@@ -61,6 +61,22 @@ TEST_CASE("parse_proc_net_arp drops an entry without the ATF_COM complete bit",
     CHECK(parse_proc_net_arp(kIncomplete).empty());
 }
 
+TEST_CASE("parse_proc_net_arp keeps a row whose flags carry ATF_COM plus extra bits",
+         "[agent][discovery_parsers]") {
+    // 0x6 == ATF_COM|ATF_PERM: a permanent, complete entry. The test above
+    // proves flags WITHOUT 0x2 are dropped; this proves the check is a
+    // BITMASK test and not an equality test -- a parser written
+    // `flags == kAtfCom` passes every other case in this file and drops
+    // every permanent ARP entry on a real host.
+    constexpr std::string_view kCompletePermanent =
+        "IP address       HW type     Flags       HW address            Mask     Device\n"
+        "192.168.1.95     0x1         0x6         aa:bb:cc:dd:ee:ff     *        eth0\n";
+    const auto entries = parse_proc_net_arp(kCompletePermanent);
+    REQUIRE(entries.size() == 1);
+    CHECK(entries[0].ip == "192.168.1.95");
+    CHECK(entries[0].mac == "aa:bb:cc:dd:ee:ff");
+}
+
 TEST_CASE("parse_proc_net_arp drops a non-Ethernet hardware type",
          "[agent][discovery_parsers]") {
     // hwtype 0x6 (IEEE 802 / token ring family) is complete and has a
