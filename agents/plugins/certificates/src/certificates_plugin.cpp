@@ -667,6 +667,26 @@ SecItemKeychainResult read_keychain_secitem(const char* keychain_path) {
         return out;
     yuzu::agent::ScopedCFRef<SecKeychainRef> keychain(raw_keychain);
 
+    // SecKeychainOpen DOES NOT VALIDATE THE PATH -- it returns errSecSuccess
+    // and a live SecKeychainRef for a path that does not exist, and for a
+    // file that is not a keychain at all. SecItemCopyMatching over such a
+    // reference then returns errSecItemNotFound, which is indistinguishable
+    // from a genuinely empty keychain -- so without this check a missing,
+    // deleted or corrupt System.keychain would be reported as "read fine,
+    // zero certificates" rather than as a read failure, silently dropping
+    // the entire trust store from a certificate inventory. That is exactly
+    // the class of silent failure the subprocess path's PLAN-12 checked-read
+    // discipline exists to prevent, and `security find-certificate -a -p`
+    // (the call this replaces) DID fail non-zero on both inputs.
+    //
+    // SecKeychainGetStatus is the cheap discriminator (measured on macOS
+    // 26.5.2, arm64): errSecSuccess for a real keychain,
+    // errSecNoSuchKeychain (-25294) for a non-existent path,
+    // errSecInvalidKeychain (-25295) for an existing non-keychain file.
+    SecKeychainStatus keychain_status = 0;
+    if (SecKeychainGetStatus(keychain.get(), &keychain_status) != errSecSuccess)
+        return out; // ok stays false -> the caller emits its read-failed sentinel
+
     const void* keychain_values[] = {keychain.get()};
     yuzu::agent::ScopedCFRef<CFArrayRef> search_list(
         CFArrayCreate(nullptr, keychain_values, 1, &kCFTypeArrayCallBacks));
