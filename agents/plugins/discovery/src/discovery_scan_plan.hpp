@@ -137,6 +137,35 @@ inline MaybeDegrade degrade_for_sweep(const SweepTally& tally) {
 }
 
 /**
+ * The degrade report for an ARP half that did not fully run.
+ *
+ * `scan_subnet` is documented as ARP + ICMP. When the ARP read fails, the ICMP
+ * sweep can still find responsive hosts, but everything only ARP could supply
+ * is lost — MAC attribution, and any cached neighbour that does not answer
+ * ICMP. That is a PARTIAL result, not a clean one, and every leg previously
+ * expressed the failure as an empty table, which is indistinguishable from a
+ * quiet network.
+ *
+ * `ok=false` (the read failed) is UNAVAILABLE; a merely truncated parse is
+ * CONSTRAINED — we got some of the table, just not all of it.
+ */
+inline MaybeDegrade degrade_for_arp(bool ok, bool complete) {
+    if (!ok)
+        return {true,
+                {YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                 "arp:read_failed",
+                 "ARP table could not be read — reporting ICMP-discovered hosts only, "
+                 "without MAC attribution"}};
+    if (!complete)
+        return {true,
+                {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                 "arp:table_truncated",
+                 "ARP table was only partially decodable — some cached neighbours "
+                 "may be missing"}};
+    return {};
+}
+
+/**
  * The degrade report for a sweep cut short by its own overall deadline. The
  * hosts already probed are real findings, so this is CONSTRAINED/PARTIAL for
  * the same reason a denied socket is — not a clean success. Separate from

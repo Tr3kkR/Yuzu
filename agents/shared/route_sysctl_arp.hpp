@@ -13,10 +13,18 @@
  *       sockaddr_dl (RTA_GATEWAY) into an ArpRecord. Never trusts the blob:
  *       every length it reads is bounds-checked against the buffer before
  *       the corresponding bytes are dereferenced, and any malformed record
- *       (zero or undersized rtm_msglen, a record that would run past the
- *       buffer end, a sockaddr whose sa_len overruns its record) stops the
- *       walk and returns whatever was parsed so far rather than looping or
- *       reading out of bounds.
+ *       (zero or undersized rtm_msglen, an unrecognised rtm_version, a record
+ *       that would run past the buffer end, a sockaddr whose sa_len overruns
+ *       its record) stops the walk rather than looping or reading out of
+ *       bounds — and SETS ArpParse::truncated so the caller learns the table
+ *       is incomplete instead of receiving a silent subset.
+ *
+ * BOTH halves report failure rather than encoding it as emptiness: an
+ * ArpFetch with ok=false is a failed sysctl, not an empty neighbour table,
+ * and a truncated parse is a partial table, not a complete small one. An
+ * earlier cut collapsed all of these into an empty vector, which let a failed
+ * or truncated ARP read reach the operator as a successful empty result
+ * (/adversarial-review Codex CDX-3/CDX-5, Kimi F6/F8).
  *
  * A record without a resolved 6-byte link-layer address (sdl_alen != 6 —
  * e.g. an in-flight ARP probe) is skipped, same selectivity as the old
@@ -58,28 +66,70 @@ struct ArpRecord {
     std::string mac;
 };
 
+/**
+ * A parse that reports whether it saw the whole table.
+ *
+ * `truncated` is set when the OUTER record walk stopped early — a malformed
+ * or oversized rtm_msglen, or an unrecognised routing-message version — i.e.
+ * whole records after that point are MISSING.
+ *
+ * It is deliberately NOT set when a single record's internal sockaddr chain
+ * ends before RTAX_MAX: that is the normal shape of a routing message (the
+ * chain simply runs out, and padding can leave a couple of trailing bytes), so
+ * flagging it marked every healthy real-world capture as partial. Such a
+ * record yields no ip/mac and is skipped like any unresolved entry. The
+ * records already decoded are still returned, because an ARP table is a SET
+ * and the entries that parsed are individually true.
+ *
+ * NOTE the deliberate difference from net_quality_sampler.cpp's NET_RT_IFLIST2
+ * walk, which discards the whole sample on any malformation. That one produces
+ * an AGGREGATE (summed byte counters): a partial sum is a WRONG NUMBER, so it
+ * must be thrown away. This produces a SET of independently-valid neighbours,
+ * where discarding everything on one bad trailing record loses good data and
+ * makes the scan worse. The honesty requirement is met by REPORTING the
+ * truncation to the caller (which degrades the scan to PARTIAL) rather than by
+ * silently returning a subset, which is what the previous version did.
+ */
+struct ArpParse {
+    std::vector<ArpRecord> records;
+    bool truncated{false};
+};
+
+/**
+ * Raw sysctl buffer plus whether the fetch actually succeeded. Previously an
+ * empty vector meant BOTH "no neighbours" and "the sysctl failed", so a failed
+ * ARP read was reported to the operator as an empty neighbour table.
+ */
+struct ArpFetch {
+    std::vector<unsigned char> blob;
+    bool ok{false};
+};
+
 // ── impure half: raw sysctl fetch ────────────────────────────────────────
 
 /**
  * Fetch the raw NET_RT_FLAGS/RTF_LLINFO routing-socket buffer — the same
- * data `arp -a` reads. Size-then-fill sysctl(2); no popen/exec. Empty
- * vector on any failure (including a zero-sized table) — indistinguishable
- * from an empty neighbour table by design, since both mean "no ARP-derived
- * hosts" to every caller. A caller wanting to log the difference should
- * check errno itself; this leaf carries no logging dependency (see the
- * include block above).
+ * data `arp -a` reads. Size-then-fill sysctl(2); no popen/exec.
+ *
+ * Returns ok=false when either sysctl call fails, and ok=true with an empty
+ * blob when the table is genuinely empty. The caller needs that distinction to
+ * decide between "no neighbours" and "the ARP half of this scan did not run";
+ * this leaf carries no logging dependency (see the include block above), so
+ * reporting is the caller's job.
  */
-inline std::vector<unsigned char> fetch_rt_flags_llinfo() {
+inline ArpFetch fetch_rt_flags_llinfo() {
     int mib[6] = {CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_LLINFO};
     std::size_t needed = 0;
-    if (::sysctl(mib, 6, nullptr, &needed, nullptr, 0) != 0 || needed == 0)
-        return {};
+    if (::sysctl(mib, 6, nullptr, &needed, nullptr, 0) != 0)
+        return {}; // ok=false — the read FAILED, distinct from an empty table
+    if (needed == 0)
+        return {{}, true}; // ok=true — genuinely no neighbours
 
     std::vector<unsigned char> buf(needed);
     if (::sysctl(mib, 6, buf.data(), &needed, nullptr, 0) != 0)
         return {};
     buf.resize(needed);
-    return buf;
+    return {std::move(buf), true};
 }
 
 namespace detail {
@@ -108,20 +158,36 @@ inline std::string mac_to_string(const unsigned char* addr) {
  * and the walk stops (returning what it has) rather than looping or
  * reading past the end on a malformed record.
  */
-inline std::vector<ArpRecord> parse_rt_flags_llinfo(std::span<const unsigned char> blob) {
-    std::vector<ArpRecord> out;
+inline ArpParse parse_rt_flags_llinfo(std::span<const unsigned char> blob) {
+    ArpParse out;
     std::size_t off = 0;
 
     while (off + sizeof(rt_msghdr) <= blob.size()) {
         rt_msghdr hdr{};
         std::memcpy(&hdr, blob.data() + off, sizeof(hdr));
 
-        if (hdr.rtm_msglen == 0)
+        if (hdr.rtm_msglen == 0) {
+            out.truncated = true;
             break; // malformed — would spin forever advancing by zero
-        if (hdr.rtm_msglen < sizeof(rt_msghdr))
+        }
+        if (hdr.rtm_msglen < sizeof(rt_msghdr)) {
+            out.truncated = true;
             break; // malformed — shorter than its own fixed header
-        if (off + hdr.rtm_msglen > blob.size())
+        }
+        if (off + hdr.rtm_msglen > blob.size()) {
+            out.truncated = true;
             break; // record claims more bytes than the buffer has left
+        }
+        // Reject a routing-message ABI version we don't know how to lay out.
+        // Apple has changed routing-socket structure layout across releases
+        // with no ABI promise, and decoding a future layout with today's
+        // offsets yields plausible-but-wrong IPs and MACs rather than an
+        // obvious failure. Same guard as net_quality_sampler.cpp's
+        // NET_RT_IFLIST2 walk (docs/darwin-compat.md).
+        if (hdr.rtm_version != RTM_VERSION) {
+            out.truncated = true;
+            break;
+        }
 
         const unsigned char* rec_end = blob.data() + off + hdr.rtm_msglen;
         const unsigned char* p = blob.data() + off + sizeof(rt_msghdr);
@@ -135,7 +201,7 @@ inline std::vector<ArpRecord> parse_rt_flags_llinfo(std::span<const unsigned cha
 
             const std::size_t remaining = static_cast<std::size_t>(rec_end - p);
             if (remaining < 2)
-                break; // not enough bytes left for sa_len + sa_family
+                break; // this record's address chain ends here
 
             // Read the two-byte sockaddr prefix straight from the blob —
             // no alignment requirement for byte access, unlike casting `p`
@@ -185,10 +251,18 @@ inline std::vector<ArpRecord> parse_rt_flags_llinfo(std::span<const unsigned cha
         }
 
         if (!ip.empty() && !mac.empty())
-            out.push_back(ArpRecord{std::move(ip), std::move(mac)});
+            out.records.push_back(ArpRecord{std::move(ip), std::move(mac)});
 
         off += hdr.rtm_msglen;
     }
+
+    // Bytes left over that cannot form another header: the buffer ends
+    // mid-record. The while condition above simply stops in that case, so
+    // without this the trailing partial record is dropped silently — which is
+    // the same "quietly returns a subset" failure the truncated flag exists to
+    // prevent.
+    if (off < blob.size())
+        out.truncated = true;
 
     return out;
 }

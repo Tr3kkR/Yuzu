@@ -170,6 +170,24 @@ struct ArpEntry {
     std::string mac;
 };
 
+/**
+ * An ARP-table read that reports its own health.
+ *
+ * `ok=false`  — the acquisition FAILED (GetIpNetTable2 error, /proc/net/arp
+ *               unopenable, sysctl error). NOT the same as an empty table.
+ * `complete=false` — the table was read but is known to be partial.
+ *
+ * Every leg previously returned a bare empty vector for all three of "no
+ * neighbours", "the API failed" and "the parse stopped early", so a scan whose
+ * ARP half never ran reported a clean result with no machine-readable reason
+ * (/adversarial-review Codex CDX-3, Kimi F6).
+ */
+struct ArpRead {
+    std::vector<ArpEntry> entries;
+    bool ok{true};
+    bool complete{true};
+};
+
 // ── ARP table parsing ─────────────────────────────────────────────────────
 
 #ifdef _WIN32
@@ -178,8 +196,8 @@ struct ArpEntry {
  * Read the Windows ARP table via GetIpNetTable2(AF_INET) — the neighbour
  * cache, native (no popen). FreeMibTable is called on every exit path.
  */
-std::vector<ArpEntry> get_arp_table() {
-    std::vector<ArpEntry> entries;
+ArpRead get_arp_table() {
+    ArpRead out;
 
     PMIB_IPNET_TABLE2 table = nullptr;
     DWORD rc = GetIpNetTable2(AF_INET, &table);
@@ -187,8 +205,10 @@ std::vector<ArpEntry> get_arp_table() {
     // included, without needing to remember to call it manually.
     std::unique_ptr<MIB_IPNET_TABLE2, decltype(&FreeMibTable)> table_owner{
         table, &FreeMibTable};
-    if (rc != NO_ERROR || table == nullptr)
-        return entries;
+    if (rc != NO_ERROR || table == nullptr) {
+        out.ok = false; // the API failed — NOT an empty neighbour cache
+        return out;
+    }
 
     for (ULONG i = 0; i < table->NumEntries; ++i) {
         const MIB_IPNET_ROW2& row = table->Table[i];
@@ -217,10 +237,10 @@ std::vector<ArpEntry> get_arp_table() {
         // docs/cpp-conventions.md's "Forbidden in new code" list, and the
         // shared helper is portable so this formatting is unit-tested on
         // every leg rather than only on Windows.
-        entries.push_back({ip, yuzu::discovery::format_mac48(row.PhysicalAddress)});
+        out.entries.push_back({ip, yuzu::discovery::format_mac48(row.PhysicalAddress)});
     }
 
-    return entries;
+    return out;
 }
 
 #elif defined(__APPLE__)
@@ -229,12 +249,18 @@ std::vector<ArpEntry> get_arp_table() {
  * Read the macOS ARP table via the routing socket sysctl
  * (route_sysctl_arp.hpp) — the same data `arp -a` reads, native (no popen).
  */
-std::vector<ArpEntry> get_arp_table() {
-    std::vector<ArpEntry> entries;
-    auto blob = yuzu::shared::fetch_rt_flags_llinfo();
-    for (auto& rec : yuzu::shared::parse_rt_flags_llinfo(blob))
-        entries.push_back({std::move(rec.ip), std::move(rec.mac)});
-    return entries;
+ArpRead get_arp_table() {
+    ArpRead out;
+    auto fetched = yuzu::shared::fetch_rt_flags_llinfo();
+    if (!fetched.ok) {
+        out.ok = false; // the sysctl failed — NOT an empty neighbour table
+        return out;
+    }
+    auto parsed = yuzu::shared::parse_rt_flags_llinfo(fetched.blob);
+    out.complete = !parsed.truncated;
+    for (auto& rec : parsed.records)
+        out.entries.push_back({std::move(rec.ip), std::move(rec.mac)});
+    return out;
 }
 
 #elif defined(__linux__)
@@ -243,24 +269,34 @@ std::vector<ArpEntry> get_arp_table() {
  * Read the Linux ARP table from /proc/net/arp (discovery_parsers.hpp) —
  * native, no `arp -n` subprocess.
  */
-std::vector<ArpEntry> get_arp_table() {
-    std::vector<ArpEntry> entries;
+ArpRead get_arp_table() {
+    ArpRead out;
     std::ifstream in("/proc/net/arp");
-    if (!in)
-        return entries;
+    if (!in) {
+        out.ok = false; // procfs absent or denied — NOT an empty table
+        return out;
+    }
 
     std::ostringstream contents;
     contents << in.rdbuf();
+    if (in.bad()) {
+        out.ok = false; // read error mid-stream
+        return out;
+    }
 
     for (auto& e : yuzu::discovery::parse_proc_net_arp(contents.str()))
-        entries.push_back({std::move(e.ip), std::move(e.mac)});
-    return entries;
+        out.entries.push_back({std::move(e.ip), std::move(e.mac)});
+    return out;
 }
 
 #else
 
-std::vector<ArpEntry> get_arp_table() {
-    return {};
+ArpRead get_arp_table() {
+    // No native ARP mechanism on this platform. Honest: the read did not
+    // happen, so it must not present as an empty neighbour table.
+    ArpRead out;
+    out.ok = false;
+    return out;
 }
 
 #endif
@@ -426,12 +462,23 @@ private:
         bool timed_out = false;
 
         // Step 1: Get current ARP table (fast, pre-populated entries)
-        auto arp_entries = get_arp_table();
+        auto arp_read = get_arp_table();
         std::set<std::string> arp_ips;
         std::map<std::string, std::string> ip_to_mac;
-        for (const auto& entry : arp_entries) {
+        for (const auto& entry : arp_read.entries) {
             arp_ips.insert(entry.ip);
             ip_to_mac[entry.ip] = entry.mac;
+        }
+
+        // An ARP half that did not run is a PARTIAL scan, not a quiet network.
+        // Reported before the sweep so the reason survives even if a later
+        // degrade also fires.
+        if (const auto arp_degrade =
+                yuzu::discovery::degrade_for_arp(arp_read.ok, arp_read.complete);
+            arp_degrade.has_report) {
+            ctx.write_output(std::format("status|warning|{}", arp_degrade.report.message));
+            ctx.set_result_status(arp_degrade.report.status, arp_degrade.report.completeness,
+                                  arp_degrade.report.reason);
         }
 
         ctx.report_progress(10);
@@ -537,9 +584,11 @@ private:
             ctx.set_result_status(t.status, t.completeness, t.reason);
         }
 
-        // Step 3: Re-read ARP table after ping sweep to get MACs
+        // Step 3: Re-read ARP table after ping sweep to get MACs. A failure
+        // here is not separately reported: the pre-sweep read already
+        // classified the ARP half, and this pass only enriches MACs.
         auto fresh_arp = get_arp_table();
-        for (const auto& entry : fresh_arp) {
+        for (const auto& entry : fresh_arp.entries) {
             ip_to_mac[entry.ip] = entry.mac;
         }
 

@@ -236,3 +236,59 @@ TEST_CASE("degrade_for_sweep: a sweep that never probed declares nothing",
     // probing: 0/0 must not divide-by-zero into a false degrade.
     CHECK_FALSE(degrade_for_sweep(SweepTally{0, 0, 0}).has_report);
 }
+
+// ── degrade_for_arp (ARP acquisition honesty) ───────────────────────────────
+// /adversarial-review Codex CDX-3 / Kimi F6: every leg returned a bare empty
+// vector for "no neighbours", "the API failed" and "the parse stopped early"
+// alike, so a scan whose ARP half never ran reported a clean result.
+
+TEST_CASE("degrade_for_arp: a healthy complete read declares nothing",
+          "[agent][discovery_scan_plan]") {
+    CHECK_FALSE(degrade_for_arp(/*ok=*/true, /*complete=*/true).has_report);
+}
+
+TEST_CASE("degrade_for_arp: a FAILED read is UNAVAILABLE, not an empty table",
+          "[agent][discovery_scan_plan]") {
+    const auto d = degrade_for_arp(/*ok=*/false, /*complete=*/true);
+    REQUIRE(d.has_report);
+    CHECK(d.report.status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(d.report.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(std::string_view{d.report.reason} == "arp:read_failed");
+    CHECK(d.report.status != YUZU_RESULT_STATUS_OK);
+}
+
+TEST_CASE("degrade_for_arp: a TRUNCATED read is CONSTRAINED and distinctly labelled",
+          "[agent][discovery_scan_plan]") {
+    const auto d = degrade_for_arp(/*ok=*/true, /*complete=*/false);
+    REQUIRE(d.has_report);
+    CHECK(d.report.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(d.report.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(std::string_view{d.report.reason} == "arp:table_truncated");
+    // Distinct from a failed read: partially decoding a table and not being
+    // able to read one at all are different operator problems.
+    CHECK(std::string_view{d.report.reason} !=
+          std::string_view{degrade_for_arp(false, true).report.reason});
+}
+
+TEST_CASE("degrade_for_arp: a failed read outranks truncation", "[agent][discovery_scan_plan]") {
+    // Both bad: report the stronger, more specific failure.
+    const auto d = degrade_for_arp(/*ok=*/false, /*complete=*/false);
+    REQUIRE(d.has_report);
+    CHECK(d.report.status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(std::string_view{d.report.reason} == "arp:read_failed");
+}
+
+TEST_CASE("degrade_for_arp: ARP reasons never collide with the ICMP ones",
+          "[agent][discovery_scan_plan]") {
+    // An operator reading the reason tag must be able to tell which half of
+    // the scan degraded.
+    const std::string_view arp_failed{degrade_for_arp(false, true).report.reason};
+    const std::string_view arp_trunc{degrade_for_arp(true, false).report.reason};
+    for (const auto& icmp : {degrade_for(IcmpAvailability::Denied).report.reason,
+                             degrade_for(IcmpAvailability::Unavailable).report.reason,
+                             degrade_for_sweep(SweepTally{2, 2, 0}).report.reason,
+                             timeout_degrade().reason}) {
+        CHECK(arp_failed != std::string_view{icmp});
+        CHECK(arp_trunc != std::string_view{icmp});
+    }
+}

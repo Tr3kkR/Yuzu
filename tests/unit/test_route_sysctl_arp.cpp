@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <cstring>
 #include <iterator>
 #include <span>
 #include <vector>
@@ -246,7 +247,9 @@ constexpr unsigned char kRtFlagsLlinfo[] = {
 
 TEST_CASE("parse_rt_flags_llinfo decodes the real captured routing-socket blob",
          "[agent][route_sysctl_arp]") {
-    const auto entries = parse_rt_flags_llinfo(std::span{kRtFlagsLlinfo});
+    const auto parsed = parse_rt_flags_llinfo(std::span{kRtFlagsLlinfo});
+    const auto& entries = parsed.records;
+    CHECK_FALSE(parsed.truncated); // a real, whole capture must not look partial
     REQUIRE(entries.size() == 15);
 
     CHECK(entries[0].ip == "169.254.230.249");
@@ -290,15 +293,21 @@ TEST_CASE("parse_rt_flags_llinfo never crashes or loops on a malformed blob",
          "[agent][route_sysctl_arp]") {
     SECTION("zero-length blob") {
         std::vector<unsigned char> blob;
-        const auto entries = parse_rt_flags_llinfo(std::span{blob});
-        CHECK(entries.empty());
+        const auto parsed = parse_rt_flags_llinfo(std::span{blob});
+        CHECK(parsed.records.empty());
+        // Nothing to truncate: an empty table is COMPLETE, not partial, or
+        // every quiet network would report itself degraded.
+        CHECK_FALSE(parsed.truncated);
     }
 
     SECTION("blob truncated before a single full rt_msghdr") {
         // Real leading bytes of record 0, but far short of sizeof(rt_msghdr).
         std::vector<unsigned char> blob(std::begin(kRtFlagsLlinfo), std::begin(kRtFlagsLlinfo) + 10);
-        const auto entries = parse_rt_flags_llinfo(std::span{blob});
-        CHECK(entries.empty());
+        const auto parsed = parse_rt_flags_llinfo(std::span{blob});
+        CHECK(parsed.records.empty());
+        // Fewer bytes than one full header, but MORE THAN ZERO: the buffer
+        // ends mid-record, so the table is genuinely incomplete.
+        CHECK(parsed.truncated);
     }
 
     SECTION("rtm_msglen == 0") {
@@ -308,16 +317,18 @@ TEST_CASE("parse_rt_flags_llinfo never crashes or loops on a malformed blob",
                                         std::begin(kRtFlagsLlinfo) + sizeof(rt_msghdr));
         blob[0] = 0x00;
         blob[1] = 0x00;
-        const auto entries = parse_rt_flags_llinfo(std::span{blob});
-        CHECK(entries.empty());
+        const auto parsed = parse_rt_flags_llinfo(std::span{blob});
+        CHECK(parsed.records.empty());
+        CHECK(parsed.truncated); // stopped early on a malformed record
     }
 
     SECTION("rtm_msglen extends past the buffer end") {
         // First real record's header (msglen=144) but the buffer is cut
         // well short of that — must stop cleanly, no out-of-bounds read.
         std::vector<unsigned char> blob(std::begin(kRtFlagsLlinfo), std::begin(kRtFlagsLlinfo) + 100);
-        const auto entries = parse_rt_flags_llinfo(std::span{blob});
-        CHECK(entries.empty());
+        const auto parsed = parse_rt_flags_llinfo(std::span{blob});
+        CHECK(parsed.records.empty());
+        CHECK(parsed.truncated);
     }
 
     SECTION("second record truncated mid-way — first record still parses") {
@@ -326,10 +337,31 @@ TEST_CASE("parse_rt_flags_llinfo never crashes or loops on a malformed blob",
         // ones and stop cleanly on the partial tail, no OOB read.
         std::vector<unsigned char> blob(std::begin(kRtFlagsLlinfo),
                                         std::begin(kRtFlagsLlinfo) + 288 + 50);
-        const auto entries = parse_rt_flags_llinfo(std::span{blob});
-        REQUIRE(entries.size() == 1); // only the 2nd real record has a resolved MAC
-        CHECK(entries[0].ip == "169.254.230.249");
-        CHECK(entries[0].mac == "fc:34:97:65:1e:0a");
+        const auto parsed = parse_rt_flags_llinfo(std::span{blob});
+        REQUIRE(parsed.records.size() == 1); // only the 2nd real record has a resolved MAC
+        CHECK(parsed.records[0].ip == "169.254.230.249");
+        CHECK(parsed.records[0].mac == "fc:34:97:65:1e:0a");
+        // THE POINT of the type: the records returned are individually true,
+        // but the caller must learn the table is INCOMPLETE. Returning this
+        // subset silently is what let a truncated read reach the operator as a
+        // complete small ARP table (/adversarial-review CDX-5 / Kimi F8).
+        CHECK(parsed.truncated);
+    }
+
+    SECTION("unrecognised rtm_version stops the walk") {
+        // Apple has changed routing-socket layout across releases with no ABI
+        // promise. Decoding a future layout with today's offsets yields
+        // plausible-but-wrong IPs/MACs rather than an obvious failure, so an
+        // unknown version must stop the walk and report truncation --
+        // matching net_quality_sampler.cpp's NET_RT_IFLIST2 guard.
+        std::vector<unsigned char> blob(std::begin(kRtFlagsLlinfo), std::end(kRtFlagsLlinfo));
+        rt_msghdr hdr{};
+        std::memcpy(&hdr, blob.data(), sizeof(hdr));
+        hdr.rtm_version = static_cast<unsigned char>(RTM_VERSION + 1);
+        std::memcpy(blob.data(), &hdr, sizeof(hdr));
+        const auto parsed = parse_rt_flags_llinfo(std::span{blob});
+        CHECK(parsed.records.empty()); // stopped at the very first record
+        CHECK(parsed.truncated);
     }
 }
 
