@@ -48,6 +48,8 @@ Routes that serve per-person behavioural / compliance PII (the `dex.device.view`
 
 This is intentional cross-surface behaviour: during an audit-store blip a browsing operator sees data while a wired REST integration receives `503`. Alert on `Sec-Audit-Failed: true` (or `audit_persisted: false`) from any surface as a SOC 2 CC7.2 evidence-gap signal. (Mutating routes such as token/session revoke use the related `audit_emitted` body field — see those endpoints.)
 
+A separate, narrower shape applies to ordinary mutation routes that audit a change **after** it already durably committed (not the behavioural-PII read routes above): `POST /api/v1/software-packages`, `POST /api/v1/software-deployments`, and its `.../start`, `.../rollback`, `.../cancel` actions. These **always set-and-proceed** — the mutation cannot be un-committed, so the response stays `2xx` and only `Sec-Audit-Failed: true` signals a dropped audit row, with no `audit_emitted`/`audit_persisted` body field. Treat the header the same way as the behavioural-PII surfaces: a CC7.2 evidence-gap signal, not an error.
+
 ---
 
 ## Table of Contents
@@ -4859,7 +4861,11 @@ Revoke a device token.
 
 ### Software Deployment
 
-Manage software packages and their deployments to agents.
+Manage software packages and their deployments to agents. `SoftwareDeploymentStore` is
+currently not constructed by the server (capability 7.6 is deliberately shelved — same family
+as [License Management](#license-management), `docs/adr/0051-software-deployment-store-postgres-migration.md`
+Context), so these routes do not register today; documented for when a future change re-wires
+them.
 
 #### `GET /api/v1/software-packages`
 
@@ -4887,6 +4893,12 @@ List all registered software packages.
   "meta": { "api_version": "v1" }
 }
 ```
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| A genuine database read failure | `503` |
 
 #### `POST /api/v1/software-packages`
 
@@ -4918,6 +4930,15 @@ Register a new software package.
 }
 ```
 
+May carry `Sec-Audit-Failed: true` — see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture) above.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Malformed JSON body, a required field wrong-typed or empty, or `verify_command`/`rollback_command`/`silent_args` fails the shell-metacharacter/length check | `400` |
+| A genuine database write failure | `503` |
+
 #### `GET /api/v1/software-deployments`
 
 List software deployments, optionally filtered by status.
@@ -4928,7 +4949,7 @@ List software deployments, optionally filtered by status.
 
 | Param | Type | Description |
 |---|---|---|
-| `status` | string | Filter by status: `pending`, `running`, `completed`, `failed`, `rolled_back` |
+| `status` | string | Filter by status: `staged`, `deploying`, `verifying`, `completed`, `cancelled`, `rolled_back`, `failed` |
 
 **Response:**
 
@@ -4952,9 +4973,15 @@ List software deployments, optionally filtered by status.
 }
 ```
 
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| A genuine database read failure | `503` |
+
 #### `POST /api/v1/software-deployments`
 
-Create a new software deployment.
+Create a new software deployment. Starts in status `staged`.
 
 **Permission:** `SoftwareDeployment:Execute`
 
@@ -4974,29 +5001,61 @@ Create a new software deployment.
 }
 ```
 
+May carry `Sec-Audit-Failed: true` — see [`Sec-Audit-Failed`](#sec-audit-failed-and-the-behavioural-pii-audit-posture) above.
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| Malformed JSON body, or `package_id` empty | `400` |
+| `package_id` does not reference a registered package | `400` |
+| A genuine database write failure | `503` |
+
 #### `POST /api/v1/software-deployments/{id}/start`
 
-Start a pending deployment.
+Start a `staged` deployment (transitions to `deploying`).
 
 **Permission:** `SoftwareDeployment:Execute`
 
-**Response:** `{"data": {"started": true}, "meta": {"api_version": "v1"}}`
+**Response:** `{"data": {"started": true}, "meta": {"api_version": "v1"}}` — may carry `Sec-Audit-Failed: true` (see above).
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| No deployment with this id, or it is not `staged` | `400` |
+| A genuine database write failure | `503` |
 
 #### `POST /api/v1/software-deployments/{id}/rollback`
 
-Roll back a deployment.
+Roll back a `deploying`, `verifying`, or `completed` deployment (transitions to
+`rolled_back`).
 
 **Permission:** `SoftwareDeployment:Execute`
 
-**Response:** `{"data": {"rolled_back": true}, "meta": {"api_version": "v1"}}`
+**Response:** `{"data": {"rolled_back": true}, "meta": {"api_version": "v1"}}` — may carry `Sec-Audit-Failed: true` (see above).
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| No deployment with this id, or it is not `deploying`/`verifying`/`completed` | `400` |
+| A genuine database write failure | `503` |
 
 #### `POST /api/v1/software-deployments/{id}/cancel`
 
-Cancel a running or pending deployment.
+Cancel a `staged` or `deploying` deployment (transitions to `cancelled`).
 
 **Permission:** `SoftwareDeployment:Execute`
 
-**Response:** `{"data": {"cancelled": true}, "meta": {"api_version": "v1"}}`
+**Response:** `{"data": {"cancelled": true}, "meta": {"api_version": "v1"}}` — may carry `Sec-Audit-Failed: true` (see above).
+
+**Errors:**
+
+| Condition | Response |
+|---|---|
+| No deployment with this id, or it is not `staged`/`deploying` | `400` |
+| A genuine database write failure | `503` |
 
 ---
 

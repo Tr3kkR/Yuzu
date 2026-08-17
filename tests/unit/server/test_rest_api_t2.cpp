@@ -32,9 +32,10 @@
 using namespace yuzu::server;
 namespace fs = std::filesystem;
 
-// LicenseStore is Postgres-backed (ADR-0048) — every other store in this file (DeviceTokenStore,
-// SoftwareDeploymentStore, ExecutionTracker) remains pre-migration SQLite. Mirrors
-// test_deployment_store.cpp's PgTestTemplate declaration.
+// LicenseStore (ADR-0048) and SoftwareDeploymentStore (ADR-0051) are both
+// Postgres-backed; DeviceTokenStore/ExecutionTracker in this file remain
+// pre-migration SQLite. Mirrors test_deployment_store.cpp's PgTestTemplate
+// declaration.
 namespace {
 yuzu::test::PgTestTemplate license_store_tpl{
     "licensestore_t2", [](const std::string& dsn) {
@@ -42,6 +43,17 @@ yuzu::test::PgTestTemplate license_store_tpl{
         LicenseStore store{pool};
         if (!store.is_open())
             throw std::runtime_error("license_store template: store failed to migrate");
+    }};
+
+// Pre-migrated template — shares the "swdeploystore" key with
+// test_software_deployment_store.cpp's own template (identical setup,
+// replay-verified per docs/postgres-store-playbook.md step 7).
+yuzu::test::PgTestTemplate t2_sw_deploy_tpl{
+    "swdeploystore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        SoftwareDeploymentStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("software_deployment_store template: failed to migrate");
     }};
 } // namespace
 
@@ -446,10 +458,11 @@ TEST_CASE("T2 REST: device token expired token fails validation", "[rest_api_t2]
 // Software Deployment flow (software deployment endpoints)
 // ============================================================================
 
-TEST_CASE("T2 REST: create package and list packages", "[rest_api_t2][software_deployment]") {
-    auto path = unique_temp_path("sw-deploy-pkg");
-    TempFileGuard guard(path);
-    SoftwareDeploymentStore store(path);
+TEST_CASE("T2 REST: create package and list packages",
+          "[rest_api_t2][software_deployment][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store(pool);
     REQUIRE(store.is_open());
 
     SoftwarePackage pkg;
@@ -467,17 +480,18 @@ TEST_CASE("T2 REST: create package and list packages", "[rest_api_t2][software_d
     CHECK(!id->empty());
 
     auto packages = store.list_packages();
-    REQUIRE(packages.size() == 1);
-    CHECK(packages[0].name == "Firefox");
-    CHECK(packages[0].version == "125.0");
-    CHECK(packages[0].platform == "windows");
+    REQUIRE(packages.has_value());
+    REQUIRE(packages->size() == 1);
+    CHECK((*packages)[0].name == "Firefox");
+    CHECK((*packages)[0].version == "125.0");
+    CHECK((*packages)[0].platform == "windows");
 }
 
 TEST_CASE("T2 REST: deployment lifecycle: create, start, status, refresh",
-          "[rest_api_t2][software_deployment]") {
-    auto path = unique_temp_path("sw-deploy-lifecycle");
-    TempFileGuard guard(path);
-    SoftwareDeploymentStore store(path);
+          "[rest_api_t2][software_deployment][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store(pool);
     REQUIRE(store.is_open());
 
     // Create package first
@@ -505,11 +519,12 @@ TEST_CASE("T2 REST: deployment lifecycle: create, start, status, refresh",
 
     // Start deployment
     auto started = store.start_deployment(*dep_id);
-    CHECK(started == true);
+    CHECK(started.has_value());
 
     auto fetched = store.get_deployment(*dep_id);
     REQUIRE(fetched.has_value());
-    CHECK(fetched->status == "deploying");
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->status == "deploying");
 
     // Add agent statuses
     AgentDeploymentStatus s1;
@@ -517,14 +532,14 @@ TEST_CASE("T2 REST: deployment lifecycle: create, start, status, refresh",
     s1.agent_id = "agent-1";
     s1.status = "success";
     s1.completed_at = 2000;
-    store.update_agent_status(*dep_id, s1);
+    REQUIRE(store.update_agent_status(*dep_id, s1).has_value());
 
     AgentDeploymentStatus s2;
     s2.deployment_id = *dep_id;
     s2.agent_id = "agent-2";
     s2.status = "success";
     s2.completed_at = 2001;
-    store.update_agent_status(*dep_id, s2);
+    REQUIRE(store.update_agent_status(*dep_id, s2).has_value());
 
     AgentDeploymentStatus s3;
     s3.deployment_id = *dep_id;
@@ -532,22 +547,23 @@ TEST_CASE("T2 REST: deployment lifecycle: create, start, status, refresh",
     s3.status = "failed";
     s3.completed_at = 2002;
     s3.error = "checksum mismatch";
-    store.update_agent_status(*dep_id, s3);
+    REQUIRE(store.update_agent_status(*dep_id, s3).has_value());
 
     // Refresh counts
-    store.refresh_counts(*dep_id);
+    REQUIRE(store.refresh_counts(*dep_id).has_value());
 
     auto summary = store.get_deployment(*dep_id);
     REQUIRE(summary.has_value());
-    CHECK(summary->agents_success == 2);
-    CHECK(summary->agents_failure == 1);
+    REQUIRE(summary->has_value());
+    CHECK((*summary)->agents_success == 2);
+    CHECK((*summary)->agents_failure == 1);
 }
 
 TEST_CASE("T2 REST: deployment cancel stops active deployment",
-          "[rest_api_t2][software_deployment]") {
-    auto path = unique_temp_path("sw-deploy-cancel");
-    TempFileGuard guard(path);
-    SoftwareDeploymentStore store(path);
+          "[rest_api_t2][software_deployment][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store(pool);
     REQUIRE(store.is_open());
 
     SoftwarePackage pkg;
@@ -568,20 +584,21 @@ TEST_CASE("T2 REST: deployment cancel stops active deployment",
     auto dep_id = store.create_deployment(dep);
     REQUIRE(dep_id.has_value());
 
-    store.start_deployment(*dep_id);
+    REQUIRE(store.start_deployment(*dep_id).has_value());
     auto cancelled = store.cancel_deployment(*dep_id);
-    CHECK(cancelled == true);
+    CHECK(cancelled.has_value());
 
     auto fetched = store.get_deployment(*dep_id);
     REQUIRE(fetched.has_value());
-    CHECK(fetched->status == "cancelled");
+    REQUIRE(fetched->has_value());
+    CHECK((*fetched)->status == "cancelled");
 }
 
 TEST_CASE("T2 REST: deployment agent statuses are retrievable",
-          "[rest_api_t2][software_deployment]") {
-    auto path = unique_temp_path("sw-deploy-statuses");
-    TempFileGuard guard(path);
-    SoftwareDeploymentStore store(path);
+          "[rest_api_t2][software_deployment][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store(pool);
     REQUIRE(store.is_open());
 
     SoftwarePackage pkg;
@@ -602,26 +619,27 @@ TEST_CASE("T2 REST: deployment agent statuses are retrievable",
     auto dep_id = store.create_deployment(dep);
     REQUIRE(dep_id.has_value());
 
-    store.start_deployment(*dep_id);
+    REQUIRE(store.start_deployment(*dep_id).has_value());
 
     AgentDeploymentStatus s1;
     s1.deployment_id = *dep_id;
     s1.agent_id = "mac-1";
     s1.status = "downloading";
     s1.started_at = 3000;
-    store.update_agent_status(*dep_id, s1);
+    REQUIRE(store.update_agent_status(*dep_id, s1).has_value());
 
     auto statuses = store.get_agent_statuses(*dep_id);
-    REQUIRE(statuses.size() == 1);
-    CHECK(statuses[0].agent_id == "mac-1");
-    CHECK(statuses[0].status == "downloading");
+    REQUIRE(statuses.has_value());
+    REQUIRE(statuses->size() == 1);
+    CHECK((*statuses)[0].agent_id == "mac-1");
+    CHECK((*statuses)[0].status == "downloading");
 }
 
 TEST_CASE("T2 REST: active_count reflects running deployments",
-          "[rest_api_t2][software_deployment]") {
-    auto path = unique_temp_path("sw-deploy-active");
-    TempFileGuard guard(path);
-    SoftwareDeploymentStore store(path);
+          "[rest_api_t2][software_deployment][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore store(pool);
     REQUIRE(store.is_open());
 
     SoftwarePackage pkg;
@@ -635,7 +653,9 @@ TEST_CASE("T2 REST: active_count reflects running deployments",
     auto pkg_id = store.create_package(pkg);
     REQUIRE(pkg_id.has_value());
 
-    CHECK(store.active_count() == 0);
+    auto ac0 = store.active_count();
+    REQUIRE(ac0.has_value());
+    CHECK(*ac0 == 0);
 
     SoftwareDeployment dep;
     dep.package_id = *pkg_id;
@@ -644,8 +664,10 @@ TEST_CASE("T2 REST: active_count reflects running deployments",
     auto dep_id = store.create_deployment(dep);
     REQUIRE(dep_id.has_value());
 
-    store.start_deployment(*dep_id);
-    CHECK(store.active_count() >= 1);
+    REQUIRE(store.start_deployment(*dep_id).has_value());
+    auto ac1 = store.active_count();
+    REQUIRE(ac1.has_value());
+    CHECK(*ac1 >= 1);
 }
 
 // ============================================================================
@@ -851,15 +873,15 @@ TEST_CASE("T2 REST: execution statistics work with concurrent agent updates",
 }
 
 TEST_CASE("T2 REST: device tokens and software deployment independent stores",
-          "[rest_api_t2][cross_store]") {
+          "[rest_api_t2][cross_store][pg]") {
     auto token_path = unique_temp_path("cross-token");
-    auto deploy_path = unique_temp_path("cross-deploy");
     TempFileGuard tg1(token_path);
-    TempFileGuard tg2(deploy_path);
-
     DeviceTokenStore token_store(token_path);
-    SoftwareDeploymentStore deploy_store(deploy_path);
     REQUIRE(token_store.is_open());
+
+    YUZU_REQUIRE_PG_DB_TPL(db, t2_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SoftwareDeploymentStore deploy_store(pool);
     REQUIRE(deploy_store.is_open());
 
     // Create a device token
@@ -890,7 +912,8 @@ TEST_CASE("T2 REST: device tokens and software deployment independent stores",
     auto validated = token_store.validate_token(*token, "device-001");
     CHECK(validated.has_value());
     auto deployment = deploy_store.get_deployment(*dep_id);
-    CHECK(deployment.has_value());
+    REQUIRE(deployment.has_value());
+    CHECK(deployment->has_value());
 }
 
 TEST_CASE("T2 REST: license store and execution tracker independent operation",
