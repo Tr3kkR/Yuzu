@@ -97,7 +97,7 @@ duplicates.
 | content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS |
 | device_identity | ✅ | ✅ | ✅ | all three branches implemented |
 | diagnostics | ✅ | ✅ | ✅ | portable — `std::filesystem` checks |
-| discovery | ✅ | ✅ | ✅ | all three branches implemented |
+| discovery | ✅ | ✅ | ✅ | all three legs are native (`GetIpNetTable2` / `/proc/net/arp` / sysctl routing table), and the sweep uses a shared unprivileged ICMP socket, constrained on Linux by `net.ipv4.ping_group_range` |
 | disk_space | ✅ | ✅ | ✅ | linux/apple/win branches; `#else` unsupported only |
 | event_logs | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `log show` now runs under the bounded `SubprocessRunner` with a hard wall-clock deadline (no built-in timeout in the tool), classified by pure `event_logs_macos.hpp` (`decide_log_show_output`) — a timed-out/degraded run surfaces a sentinel row + non-zero rc, never a silent empty result |
 | example | ✅ | ✅ | ✅ | portable — sample plugin |
@@ -262,9 +262,9 @@ implementation is.
 | diagnostics | connection_info | linux | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
 | diagnostics | connection_info | macos | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
 | diagnostics | connection_info | windows | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
-| discovery | scan_subnet | linux | supported | 3 | arp table + ping sweep via popen/system() | - |
-| discovery | scan_subnet | macos | supported | 3 | arp table + ping sweep via popen/system() | - |
-| discovery | scan_subnet | windows | supported | 3 | GetIpNetTable + ping sweep via system() | - |
+| discovery | scan_subnet | linux | constrained | 1 | /proc/net/arp + unprivileged SOCK_DGRAM ICMP | the ICMP sweep needs net.ipv4.ping_group_range to admit the agent's gid; ARP-only results with a CONSTRAINED/PARTIAL status otherwise, or UNAVAILABLE/PARTIAL when the ICMP socket cannot be created at all. netlink RTM_GETNEIGH is a recorded future promotion over /proc/net/arp |
+| discovery | scan_subnet | macos | supported | 1 | sysctl NET_RT_FLAGS/RTF_LLINFO + SOCK_DGRAM ICMP | - |
+| discovery | scan_subnet | windows | supported | 1 | GetIpNetTable2 + IcmpSendEcho | - |
 | disk_space | free | linux | supported | 1 | statvfs(2) | - |
 | disk_space | free | macos | supported | 1 | statfs(2) | - |
 | disk_space | free | windows | supported | 1 | GetDiskFreeSpaceExW | - |

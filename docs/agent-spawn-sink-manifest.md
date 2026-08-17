@@ -44,12 +44,16 @@ private helpers). Site-level transcription is #2380's first work item —
 these rows are pointers, not evidence.
 
 **Raw `popen`/`system` helpers:** antivirus, bitlocker, certificates,
-device_identity, discovery, event_logs, firewall, hardware, installed_apps,
+device_identity, event_logs, firewall, hardware, installed_apps,
 interaction, ioc, license_scan, network_actions, network_config,
 network_diag, os_info, processes, quarantine, sccm, services,
 software_actions, tar, users, vuln_scan, wifi, windows_updates, wol.
 (`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —
 sequence that cleanup against migrating it, tracked in #2380.)
+
+**Migrated off raw spawn (Wave 2, PR2.1c):** `discovery` (0 spawn sites, was
+5 — GetIpNetTable2/`/proc/net/arp`/sysctl ARP + a shared `IcmpSession`
+sweep; no manifest rows since none survive).
 
 **Direct exec via private helpers:** script_exec, content_dist, filesystem
 (filesystem is fully migrated onto the runner on the #2321 branch).
