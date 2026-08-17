@@ -267,11 +267,25 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
         synth.mcp_tier = api_token.mcp_tier;
         synth.principal_kind = "human";
 
-        // Resolve the creator's actual legacy role fresh (not unconditional admin).
-        // get_user_role() queries the current role on every call, so a creator who's
-        // been demoted since the token was issued will produce a user-role session.
-        auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
-        synth.role = legacy_role.value_or(auth::Role::user);
+        if (!api_token.scope_service.empty()) {
+            // A service-scoped token is capped at the user floor regardless of
+            // the minter's live role — ITServiceOwner (an RBAC grant, resolved
+            // elsewhere) is the sole authority ceiling for such a token, never
+            // the minter's legacy role. Without this cap, a service-scoped
+            // token minted by a currently-admin user inherited `role == admin`
+            // below and bypassed require_admin plus every inline
+            // effective_role(*session) == admin check (e.g. the workflow/
+            // instruction step-approval gates meant to require a human
+            // decision, workflow_routes.cpp).
+            synth.role = auth::Role::user;
+        } else {
+            // Resolve the creator's actual legacy role fresh (not unconditional
+            // admin). get_user_role() queries the current role on every call, so
+            // a creator who's been demoted since the token was issued will
+            // produce a user-role session.
+            auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
+            synth.role = legacy_role.value_or(auth::Role::user);
+        }
 
         return synth;
     }

@@ -257,6 +257,62 @@ TEST_CASE("AuthRoutes::require_admin — service-scoped token from admin is reje
           j["error"]["correlation_id"].get<std::string>());
 }
 
+// ---------------------------------------------------------------------------
+// synthesize_token_session role cap for service-scoped tokens
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::resolve_session — a service-scoped token from an admin "
+          "resolves to the user floor, not the minter's live role",
+          "[pg][auth_routes][scope]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    auto raw = fix.api_tokens->create_token("scoped", "test_user", now + 3600, "finance-svc", "");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+
+    auto session = fix.ar->resolve_session(req);
+    REQUIRE(session.has_value());
+    CHECK(session->token_scope_service == "finance-svc");
+    // The token's minter ("test_user") is admin — before the cap this would
+    // have inherited role == admin, defeating require_admin AND every inline
+    // effective_role(*session) == admin check elsewhere (e.g. workflow/
+    // instruction role-gated step approval).
+    CHECK(session->role == auth::Role::user);
+}
+
+TEST_CASE("AuthRoutes::resolve_session — a non-scoped token from an admin still "
+          "carries the minter's live admin role (regression)",
+          "[pg][auth_routes][scope]") {
+    AuthRoutesFixture fix;
+    auto raw = fix.mint_token(); // no scope_service — plain token minted by test_user (admin)
+    auto req = request_with_header("Authorization", "Bearer " + raw);
+
+    auto session = fix.ar->resolve_session(req);
+    REQUIRE(session.has_value());
+    CHECK(session->token_scope_service.empty());
+    CHECK(session->role == auth::Role::admin);
+}
+
+TEST_CASE("AuthRoutes::resolve_session — a service-scoped token from a demoted-to-user "
+          "creator still resolves to the user floor",
+          "[pg][auth_routes][scope]") {
+    AuthRoutesFixture fix;
+    REQUIRE(fix.auth_mgr.upsert_user("plain_user", "password1234", auth::Role::user));
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    auto raw =
+        fix.api_tokens->create_token("scoped", "plain_user", now + 3600, "finance-svc", "");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+
+    auto session = fix.ar->resolve_session(req);
+    REQUIRE(session.has_value());
+    CHECK(session->role == auth::Role::user);
+}
+
 TEST_CASE("AuthRoutes::require_admin — MCP token from admin is rejected",
           "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
