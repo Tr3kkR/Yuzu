@@ -57,6 +57,67 @@
 
 namespace yuzu::shared {
 
+// Move-only RAII owner for a getaddrinfo() result list -- zero-dependency
+// (agents/shared leaf rule: no core/plugin type, just the platform socket
+// headers this file already includes).
+struct AddrInfoGuard {
+    addrinfo* p{nullptr};
+    AddrInfoGuard() = default;
+    explicit AddrInfoGuard(addrinfo* ptr) : p(ptr) {}
+    ~AddrInfoGuard() {
+        if (p)
+            ::freeaddrinfo(p);
+    }
+    AddrInfoGuard(const AddrInfoGuard&) = delete;
+    AddrInfoGuard& operator=(const AddrInfoGuard&) = delete;
+    AddrInfoGuard(AddrInfoGuard&& other) noexcept : p(other.p) { other.p = nullptr; }
+    AddrInfoGuard& operator=(AddrInfoGuard&& other) noexcept {
+        if (this != &other) {
+            if (p)
+                ::freeaddrinfo(p);
+            p = other.p;
+            other.p = nullptr;
+        }
+        return *this;
+    }
+};
+
+#ifdef _WIN32
+using SocketHandle = SOCKET;
+constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
+inline void close_socket(SocketHandle s) { ::closesocket(s); }
+#else
+using SocketHandle = int;
+constexpr SocketHandle kInvalidSocket = -1;
+inline void close_socket(SocketHandle s) { ::close(s); }
+#endif
+
+// Move-only RAII owner for a socket fd/SOCKET, same shape as wol_plugin.cpp's
+// SocketGuard (that copy is plugin-local; this is the shared-leaf twin so
+// icmp_probe.hpp's own socket acquisitions don't manually close).
+struct SocketGuard {
+    SocketHandle s{kInvalidSocket};
+    SocketGuard() = default;
+    explicit SocketGuard(SocketHandle sock) : s(sock) {}
+    ~SocketGuard() {
+        if (s != kInvalidSocket)
+            close_socket(s);
+    }
+    SocketGuard(const SocketGuard&) = delete;
+    SocketGuard& operator=(const SocketGuard&) = delete;
+    SocketGuard(SocketGuard&& other) noexcept : s(other.s) { other.s = kInvalidSocket; }
+    SocketGuard& operator=(SocketGuard&& other) noexcept {
+        if (this != &other) {
+            if (s != kInvalidSocket)
+                close_socket(s);
+            s = other.s;
+            other.s = kInvalidSocket;
+        }
+        return *this;
+    }
+    bool ok() const { return s != kInvalidSocket; }
+};
+
 inline double probe_elapsed_ms(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
         .count();
@@ -76,14 +137,14 @@ inline std::optional<Resolved> resolve_first(const std::string& target, int fami
     addrinfo hints{};
     hints.ai_family = family;
     hints.ai_socktype = SOCK_STREAM;
-    addrinfo* res = nullptr;
-    if (getaddrinfo(target.c_str(), nullptr, &hints, &res) != 0 || !res)
+    addrinfo* raw_res = nullptr;
+    if (getaddrinfo(target.c_str(), nullptr, &hints, &raw_res) != 0 || !raw_res)
         return std::nullopt;
+    AddrInfoGuard res{raw_res};
     Resolved r;
-    std::memcpy(&r.addr, res->ai_addr, res->ai_addrlen);
-    r.addr_len = static_cast<int>(res->ai_addrlen);
-    r.family = res->ai_family;
-    freeaddrinfo(res);
+    std::memcpy(&r.addr, res.p->ai_addr, res.p->ai_addrlen);
+    r.addr_len = static_cast<int>(res.p->ai_addrlen);
+    r.family = res.p->ai_family;
     return r;
 }
 
@@ -100,9 +161,10 @@ inline void set_port(Resolved& r, int port) {
 
 #ifdef _WIN32
 inline std::optional<double> tcp_sample(const Resolved& dst, int timeout_ms) {
-    SOCKET s = ::socket(dst.family, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET)
+    SocketGuard sock{::socket(dst.family, SOCK_STREAM, IPPROTO_TCP)};
+    if (!sock.ok())
         return std::nullopt;
+    const SOCKET s = sock.s;
     u_long nonblock = 1;
     ::ioctlsocket(s, FIONBIO, &nonblock);
     const auto t0 = std::chrono::steady_clock::now();
@@ -126,14 +188,14 @@ inline std::optional<double> tcp_sample(const Resolved& dst, int timeout_ms) {
                 out = probe_elapsed_ms(t0);
         }
     }
-    ::closesocket(s);
     return out;
 }
 #else
 inline std::optional<double> tcp_sample(const Resolved& dst, int timeout_ms) {
-    int s = ::socket(dst.family, SOCK_STREAM, IPPROTO_TCP);
-    if (s < 0)
+    SocketGuard sock{::socket(dst.family, SOCK_STREAM, IPPROTO_TCP)};
+    if (!sock.ok())
         return std::nullopt;
+    const int s = sock.s;
     ::fcntl(s, F_SETFL, ::fcntl(s, F_GETFL, 0) | O_NONBLOCK);
     const auto t0 = std::chrono::steady_clock::now();
     int rc = ::connect(s, reinterpret_cast<const sockaddr*>(&dst.addr),
@@ -150,7 +212,6 @@ inline std::optional<double> tcp_sample(const Resolved& dst, int timeout_ms) {
                 out = probe_elapsed_ms(t0);
         }
     }
-    ::close(s);
     return out;
 }
 #endif
