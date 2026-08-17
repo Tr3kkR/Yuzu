@@ -8001,10 +8001,16 @@ void RestApiV1::register_routes(
             // header if the audit_fn signals failure. Matches the W1.1 /
             // PR #883 pattern used by the session-revoke handlers — the
             // operator must learn from the response whether the security
-            // event was actually persisted.
+            // event was actually persisted. try_persist_audit (not a bare
+            // audit_fn call) for the same reason as the 5 success-path
+            // sites below: a throwing audit sink must not turn this denial
+            // into an uncaught-exception 500 (no exception_handler_ is
+            // installed) -- gov review (security-guardian + docs-writer,
+            // Gate 2, b77952416..HEAD review round).
             auto emit_denial = [&](const char* detail_msg) {
-                bool emitted = audit_fn(req, "software_package.create", "denied", "SoftwarePackage",
-                                        "", detail_msg);
+                bool emitted = detail::try_persist_audit(audit_fn, req, "software_package.create",
+                                                         "denied", "SoftwarePackage", "",
+                                                         detail_msg);
                 if (!emitted)
                     res.set_header("Sec-Audit-Failed", "true");
             };
