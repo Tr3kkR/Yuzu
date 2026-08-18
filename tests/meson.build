@@ -311,6 +311,7 @@ agent_test_exe = executable(
                                                 # via LocalDispatcher (macOS-only; a no-op TU elsewhere
                                                 # via the file's own #if defined(__APPLE__) guard)
     'unit/test_windows_updates_parsers.cpp',  # Wave 3: pure installed/missing parse+format helpers
+    'unit/test_sccm_parsers.cpp',             # Wave 3 PR33d: pure SCM-status/authority-key/IDispatch mirrors
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp

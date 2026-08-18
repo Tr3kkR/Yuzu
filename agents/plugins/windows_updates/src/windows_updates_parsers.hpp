@@ -125,8 +125,13 @@ struct WmiFailureStatus {
     for (const auto& line : lines) {
         auto sep = line.find("  ");
         if (sep != std::string::npos) {
+            // rpm pads the name/date gap to a fixed column with a run of
+            // spaces, not exactly two -- skip the whole run so the date
+            // field doesn't retain leading padding.
+            auto date_start = line.find_first_not_of(' ', sep);
+            auto date = date_start == std::string::npos ? std::string{} : line.substr(date_start);
             out.push_back(std::format("package|{}|{}", safe_output_field(line.substr(0, sep)),
-                                      safe_output_field(line.substr(sep + 2))));
+                                      safe_output_field(date)));
         } else {
             out.push_back(std::format("package|{}|-", safe_output_field(line)));
         }

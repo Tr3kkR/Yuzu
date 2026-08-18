@@ -32,6 +32,7 @@
 #include <objbase.h> // CoInitializeEx / CoCreateInstance / CLSIDFromProgID
 #include <oleauto.h> // IDispatch / DISPPARAMS / VARIANT / VariantInit / VariantClear
 
+#include <win_com.hpp>        // shared yuzu::shared::win::ComInit/ComPtr
 #include <win_reg_handle.hpp> // shared yuzu::win::RegKey (PR1.7)
 #include <win_sc_handle.hpp>  // shared yuzu::win::ScHandle (#1822)
 #include <win_str.hpp>        // shared yuzu::win wide<->UTF-8 helpers (#1681)
@@ -237,41 +238,13 @@ std::string_view query_ccmexec_service_status() {
 // ── Microsoft.SMS.Client late-bound COM (site's site_code/management_point
 //    fallbacks) ────────────────────────────────────────────────────────────
 
-// RAII COM apartment init (clone of the wmi_plugin.cpp / licensing_wmi.cpp
-// ComInit shape -- no shared win_com.hpp exists in this tree to consume
-// instead; see this file's PR notes).
-class ComInit {
-public:
-    ComInit() { hr_ = CoInitializeEx(nullptr, COINIT_MULTITHREADED); }
-    ~ComInit() {
-        if (SUCCEEDED(hr_))
-            CoUninitialize();
-    }
-    ComInit(const ComInit&) = delete;
-    ComInit& operator=(const ComInit&) = delete;
-    [[nodiscard]] bool ok() const { return SUCCEEDED(hr_); }
-
-private:
-    HRESULT hr_;
-};
-
-// RAII owning COM pointer (clone of rdp_control_plugin.cpp's ComPtr shape).
-template <typename T> class ComPtr {
-public:
-    ComPtr() = default;
-    ~ComPtr() {
-        if (p_)
-            p_->Release();
-    }
-    ComPtr(const ComPtr&) = delete;
-    ComPtr& operator=(const ComPtr&) = delete;
-    T** put() { return &p_; }
-    T* operator->() const { return p_; }
-    explicit operator bool() const { return p_ != nullptr; }
-
-private:
-    T* p_ = nullptr;
-};
+// ComInit/ComPtr come from the shared agents/shared/win_com.hpp
+// (yuzu::shared::win) rather than a local clone -- it also tolerates
+// RPC_E_CHANGED_MODE (COM already initialised in a different apartment by an
+// earlier plugin on the same pool thread), which this file's earlier local
+// copy did not.
+using yuzu::shared::win::ComInit;
+using yuzu::shared::win::ComPtr;
 
 // RAII for the VARIANT Invoke() writes its result into (clone of
 // licensing_wmi.cpp's VariantGuard shape). VariantInit in the ctor is

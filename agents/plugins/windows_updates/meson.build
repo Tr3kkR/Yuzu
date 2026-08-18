@@ -1,4 +1,4 @@
-windows_updates_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
+windows_updates_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 if host_machine.system() == 'windows'
   # wmi_bounded.cpp (installed: bounded WMI query) + the WUA COM search API
   # (missing) used directly from windows_updates_plugin.cpp -- wuapi.h needs
