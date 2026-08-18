@@ -4365,12 +4365,6 @@ public:
         if (analytics_store_ && gateway_service_) {
             gateway_service_->set_analytics_store(analytics_store_.get());
         }
-        if (notification_store_)
-            agent_service_.set_notification_store(notification_store_.get());
-        if (webhook_store_)
-            agent_service_.set_webhook_store(webhook_store_.get());
-        if (offload_target_store_)
-            agent_service_.set_offload_target_store(offload_target_store_.get());
 
         // Initialize instruction store (Phase 2)
         {
@@ -5018,6 +5012,10 @@ public:
                     spdlog::info("NotificationStore initialized (schema notification_store; "
                                  "legacy backfill source {})",
                                  notif_db.string());
+                    // #3261: wire the consumer immediately after construction,
+                    // inside the full-success branch - the old top-of-ctor
+                    // wiring block ran before this store existed and never fired.
+                    agent_service_.set_notification_store(notification_store_.get());
                 }
             }
         }
@@ -5025,10 +5023,12 @@ public:
         {
             auto webhook_db = cfg_.db_dir() / "webhooks.db";
             webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
+            agent_service_.set_webhook_store(webhook_store_.get());
         }
         {
             auto offload_db = cfg_.db_dir() / "offload_targets.db";
             offload_target_store_ = std::make_unique<OffloadTargetStore>(offload_db);
+            agent_service_.set_offload_target_store(offload_target_store_.get());
         }
 
         // Phase 7: Inventory Store (Issue 7.17) — generic per-source blob store,
@@ -7359,6 +7359,23 @@ public:
         // declaration order alone.
         agent_service_.set_notification_store(nullptr);
         notification_store_.reset();
+        // WebhookStore / OffloadTargetStore (#3261) borrow no pool - each owns
+        // its own SQLite handle, so unlike the PG-backed stores above there is
+        // no pool-ordering requirement. Unwire the borrowed pointers anyway,
+        // matching the drain -> null -> reset discipline the gRPC shutdown
+        // above already established, so agent_service_ never dereferences a
+        // store past this point. Deliberately NO .reset() here: fire_event()
+        // and flush_all() (called just above, Phase 8.3 #255) both spawn
+        // detached std::thread deliveries that capture `this` and are never
+        // joined - resetting the store while one is still in flight is a
+        // use-after-free. This unwire only stops NEW deliveries from being
+        // queued; it does not prove already-in-flight ones have finished
+        // (pre-existing gap, not introduced or fixed here - the store has no
+        // join/quiescence primitive). Deferring destruction to normal member
+        // teardown narrows the risk window (bounded by the gRPC drain +
+        // flush_all above) but does not close it.
+        agent_service_.set_webhook_store(nullptr);
+        agent_service_.set_offload_target_store(nullptr);
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
         // pointer from agent_service_ (the Register sync_agent_tags ingest —
         // Register-only, heartbeats do not sync tags; governance perf-F8),
