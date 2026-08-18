@@ -285,6 +285,9 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
     'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
+    'unit/test_network_actions_parsers.cpp',  # Wave 2 WP-D: pure resolver-flush-flag selection
+    'unit/test_wol_check_plan.cpp',           # Wave 2 WP-E: pure check-mechanism decision logic
+    'unit/test_services_parsers.cpp',         # Wave 2 WP-G: pure systemctl/launchctl output parsers
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -306,6 +309,8 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/certificates/src'),  # certificates_macos_parsers.hpp (Gate-7 FIX A: pure helpers shared with the plugin)
     include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
     include_directories('../agents/plugins/content_dist/src'),  # content_dist_upload_parsers.hpp (PR1.6b pure helpers)
+    include_directories('../agents/plugins/network_actions/src'), # network_actions_parsers.hpp (Wave 2 WP-D)
+    include_directories('../agents/plugins/wol/src'),             # wol_check_plan.hpp (Wave 2 WP-E)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
