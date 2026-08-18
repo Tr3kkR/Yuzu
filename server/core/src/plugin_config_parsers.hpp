@@ -145,13 +145,38 @@ struct KillSwitchScope {
     std::string action; ///< "" = whole-plugin
 };
 
-/// Validates `plugin_raw` as an identifier and, if `action_raw` is
-/// non-empty, validates it as an identifier too (an action name is a single
-/// segment, never a dotted key — it names one REST/MCP action, not a nested
-/// config path).
+/// True iff `s` is a reserved-namespace plugin name of the form
+/// `__<identifier>__` (e.g. `__guard__`, `__observation__`) — the
+/// server-internal namespace convention used by `system_reserved` dispatch
+/// capabilities (`capability_decls/core_dispatch_capabilities.hpp`).
+/// Deliberately narrower than "starts and ends with `_`": the inner span
+/// must itself be a valid identifier, so `__`, `____`, `__GUARD__`, and
+/// `_guard_` are all rejected. Config/secret addressing
+/// (`is_valid_identifier`/`parse_plugin_key`) does NOT accept this form —
+/// only the kill-switch scope grammar below does (#3265: a reserved-plugin
+/// dispatch must be kill-switch-ADDRESSABLE, never kill-switch-UNREACHABLE).
+[[nodiscard]] inline bool is_reserved_plugin_name(std::string_view s) {
+    constexpr std::string_view kSentinel = "__";
+    if (s.size() < kSentinel.size() * 2 + 1)
+        return false;
+    if (!s.starts_with(kSentinel) || !s.ends_with(kSentinel))
+        return false;
+    return is_valid_identifier(s.substr(kSentinel.size(), s.size() - kSentinel.size() * 2));
+}
+
+/// Validates `plugin_raw` as an identifier OR a reserved-namespace plugin
+/// name (`__<identifier>__`, #3265), and, if `action_raw` is non-empty,
+/// validates it as an identifier too (an action name is a single segment,
+/// never a dotted key — it names one REST/MCP action, not a nested config
+/// path). The reserved-namespace allowance is scoped to the kill-switch
+/// grammar only: it lets a `system_reserved` dispatch capability such as
+/// `__guard__.push_rules` be explicitly kill-switched (or left alone, which
+/// must mean "not killed" — see `PluginConfigStore::action_allowed`'s
+/// no-row default), and does NOT extend to `is_valid_identifier`/
+/// `parse_plugin_key`, which continue to gate ordinary config/secret rows.
 [[nodiscard]] inline std::optional<KillSwitchScope>
 parse_kill_switch_scope(std::string_view plugin_raw, std::string_view action_raw) {
-    if (!is_valid_identifier(plugin_raw))
+    if (!is_valid_identifier(plugin_raw) && !is_reserved_plugin_name(plugin_raw))
         return std::nullopt;
     if (!action_raw.empty() && !is_valid_identifier(action_raw))
         return std::nullopt;

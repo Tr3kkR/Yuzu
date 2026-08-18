@@ -111,6 +111,63 @@ TEST_CASE("parse_kill_switch_scope: empty action is whole-plugin, non-empty must
     CHECK_FALSE(parse_kill_switch_scope("Email", "send").has_value());
 }
 
+TEST_CASE("is_reserved_plugin_name accepts __<identifier>__, rejects malformed reserved forms",
+          "[server][config]") {
+    CHECK(is_reserved_plugin_name("__guard__"));
+    CHECK(is_reserved_plugin_name("__observation__"));
+    CHECK(is_reserved_plugin_name("__a__")); // minimal valid inner identifier
+
+    CHECK_FALSE(is_reserved_plugin_name("__"));         // no inner identifier at all
+    CHECK_FALSE(is_reserved_plugin_name("____"));       // inner span is empty, not "_"
+    CHECK_FALSE(is_reserved_plugin_name("__GUARD__"));  // inner must itself be valid (lowercase)
+    CHECK_FALSE(is_reserved_plugin_name("_guard_"));    // single-underscore sentinel doesn't count
+    CHECK_FALSE(is_reserved_plugin_name("guard__"));    // missing leading sentinel
+    CHECK_FALSE(is_reserved_plugin_name("__guard"));    // missing trailing sentinel
+    CHECK_FALSE(is_reserved_plugin_name("__gu.ard__")); // inner must be one identifier, no dots
+    CHECK_FALSE(is_reserved_plugin_name("__1guard__")); // inner leading-digit rejected
+    CHECK_FALSE(is_reserved_plugin_name(""));
+    CHECK_FALSE(is_reserved_plugin_name("guard"));
+}
+
+TEST_CASE("parse_kill_switch_scope: #3265 — accepts a reserved-namespace plugin name so a "
+          "system_reserved dispatch capability like __guard__.push_rules can be kill-switch "
+          "addressed at all",
+          "[server][config]") {
+    auto whole = parse_kill_switch_scope("__guard__", "");
+    REQUIRE(whole.has_value());
+    CHECK(whole->plugin == "__guard__");
+    CHECK(whole->action.empty());
+
+    auto action = parse_kill_switch_scope("__guard__", "push_rules");
+    REQUIRE(action.has_value());
+    CHECK(action->plugin == "__guard__");
+    CHECK(action->action == "push_rules");
+
+    // Malformed reserved forms still fail — this isn't "anything starting
+    // with underscore", it's specifically the __<identifier>__ convention.
+    CHECK_FALSE(parse_kill_switch_scope("__GUARD__", "push_rules").has_value());
+    CHECK_FALSE(parse_kill_switch_scope("_guard_", "push_rules").has_value());
+    CHECK_FALSE(parse_kill_switch_scope("__", "push_rules").has_value());
+
+    // Action segment grammar is unchanged even under a reserved plugin name —
+    // still one identifier, never a dotted key.
+    CHECK_FALSE(parse_kill_switch_scope("__guard__", "push.rules").has_value());
+}
+
+TEST_CASE("kill_switch_scope_key for a reserved plugin name: <plugin> or <plugin>.<action>, "
+          "same form as an ordinary plugin",
+          "[server][config]") {
+    CHECK(kill_switch_scope_key({"__guard__", ""}) == "__guard__");
+    CHECK(kill_switch_scope_key({"__guard__", "push_rules"}) == "__guard__.push_rules");
+}
+
+TEST_CASE("#3265 asymmetry: config/secret addressing does NOT accept a reserved-namespace "
+          "plugin name — only the kill-switch scope grammar does",
+          "[server][config]") {
+    CHECK_FALSE(is_valid_identifier("__guard__"));
+    CHECK_FALSE(parse_plugin_key("__guard__", "some_key").has_value());
+}
+
 TEST_CASE("kill_switch_scope_key is <plugin> for whole-plugin, <plugin>.<action> otherwise",
           "[server][config]") {
     CHECK(kill_switch_scope_key({"email", ""}) == "email");
