@@ -30,8 +30,9 @@
 //     baseline doc; the Windows analogue is SCM notification handles).
 //   - RSS: GetProcessMemoryInfo().WorkingSetSize.
 //   - idle CPU%: GetProcessTimes() kernel+user delta over the wall-clock
-//     delta, normalized by core count (GetSystemInfo) so 100% consistently
-//     means "one full core", matching how the Linux side would report it.
+//     delta, UNBOUNDED per-process (100% = one full core busy, 200% = two
+//     full cores, etc. - never divided by core count), matching how the
+//     Linux side (ps/top convention) would report it.
 //   - wakeups/sec: PDH \Thread(*)\Context Switches/sec, summed across every
 //     thread instance whose \Thread(*)\ID Process matches the target PID.
 //     Chosen over an internal TP-callback counter (spark_engine.cpp has one)
@@ -80,6 +81,40 @@
 namespace {
 
 std::atomic<bool> g_stop{false};
+
+// RAII owner for the target-process HANDLE - CloseHandle on every exit path,
+// never leaving a future early return to remember it manually (governance
+// Gate 3 finding, 2026-08-18: manual cleanup here already leaked once before
+// this file was even committed, per the adversarial-review fix earlier the
+// same day - reordering acquire-after-fallible-open fixed that ONE path;
+// this closes the underlying pattern-fragility rather than the one instance).
+class UniqueProcessHandle {
+public:
+    explicit UniqueProcessHandle(HANDLE h = nullptr) noexcept : h_(h) {}
+    ~UniqueProcessHandle() { if (h_) CloseHandle(h_); }
+    UniqueProcessHandle(const UniqueProcessHandle&) = delete;
+    UniqueProcessHandle& operator=(const UniqueProcessHandle&) = delete;
+    [[nodiscard]] HANDLE get() const noexcept { return h_; }
+    explicit operator bool() const noexcept { return h_ != nullptr; }
+
+private:
+    HANDLE h_;
+};
+
+// RAII owner for the output FILE* - fclose on every exit path, EXCEPT when
+// aliased to stdout (never owned, never closed - matches the pre-existing
+// `out != stdout` guard this replaces).
+class UniqueOutFile {
+public:
+    explicit UniqueOutFile(FILE* f) noexcept : f_(f) {}
+    ~UniqueOutFile() { if (f_ && f_ != stdout) fclose(f_); }
+    UniqueOutFile(const UniqueOutFile&) = delete;
+    UniqueOutFile& operator=(const UniqueOutFile&) = delete;
+    [[nodiscard]] FILE* get() const noexcept { return f_; }
+
+private:
+    FILE* f_;
+};
 
 BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
@@ -145,18 +180,22 @@ uint64_t filetime_to_u64(const FILETIME& ft) {
     return u.QuadPart;
 }
 
-uint32_t core_count() {
-    SYSTEM_INFO si{};
-    GetSystemInfo(&si);
-    return si.dwNumberOfProcessors > 0 ? si.dwNumberOfProcessors : 1;
-}
-
 // PDH-based context-switch aggregator. Opens a query once, adds the two
 // wildcard Thread-object counters, and on each collect() sums
 // "Context Switches/sec" across every thread instance whose "ID Process"
 // matches the target PID.
 class CtxSwitchSampler {
 public:
+    CtxSwitchSampler() = default;
+    ~CtxSwitchSampler() {
+        if (query_) PdhCloseQuery(query_);
+    }
+    // Owns a PDH query handle; a copy would double-close it. Unused today (never
+    // copied/stored/returned by value anywhere in this file) - deleted so a future
+    // edit can't introduce that silently (governance Gate 3 finding, 2026-08-18).
+    CtxSwitchSampler(const CtxSwitchSampler&) = delete;
+    CtxSwitchSampler& operator=(const CtxSwitchSampler&) = delete;
+
     bool init() {
         if (PdhOpenQueryW(nullptr, 0, &query_) != ERROR_SUCCESS) return false;
         if (PdhAddEnglishCounterW(query_, L"\\Thread(*)\\ID Process", 0, &id_proc_counter_) != ERROR_SUCCESS) {
@@ -166,10 +205,6 @@ public:
             return false;
         }
         return true;
-    }
-
-    ~CtxSwitchSampler() {
-        if (query_) PdhCloseQuery(query_);
     }
 
     // Returns -1.0 on the first call (PDH rate counters need two collects to
@@ -268,29 +303,32 @@ int wmain(int argc, wchar_t** argv) {
     int interval_sec = argc >= 4 ? _wtoi(argv[3]) : 5;
     const wchar_t* out_path = argc >= 5 ? argv[4] : nullptr;
 
-    // Output file opened BEFORE OpenProcess (adversarial review finding, 2026-08-18):
-    // no HANDLE is acquired yet on this failure path, so there is nothing to leak -
-    // the alternative (a scope-guard/RAII HANDLE wrapper) would work too, but this
-    // file is deliberately zero-Yuzu-dependency and this reorder needs no new type.
-    FILE* out = stdout;
+    // Output file opened BEFORE OpenProcess (adversarial review finding, 2026-08-18)
+    // so the OpenProcess-failure path never held a HANDLE to release, and NOW
+    // RAII-owned (governance Gate 3 finding, same day) so no future edit that adds
+    // an early return needs to remember to release either resource by hand.
+    FILE* out_raw = stdout;
     if (out_path) {
-        if (_wfopen_s(&out, out_path, L"w") != 0 || !out) {
-            fwprintf(stderr, L"[resource_sampler] failed to open %s for write\n", out_path);
+        if (_wfopen_s(&out_raw, out_path, L"w") != 0 || !out_raw) {
+            fwprintf(stderr, L"[resource_sampler] failed to open %ls for write\n", out_path);
             return 1;
         }
     }
+    UniqueOutFile out_owner(out_raw);
+    FILE* out = out_owner.get();
 
     try_enable_debug_privilege();
 
-    HANDLE hproc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, target_pid);
-    if (!hproc) {
+    UniqueProcessHandle hproc_owner(
+        OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, target_pid));
+    if (!hproc_owner) {
         fwprintf(stderr, L"[resource_sampler] OpenProcess(%lu) failed, gle=%lu - target may run as a "
                           L"different account; needs an elevated (Administrator) console even with "
                           L"SeDebugPrivilege, and the target must actually exist\n",
                   target_pid, GetLastError());
-        if (out != stdout) fclose(out);
-        return 1;
+        return 1; // out_owner's destructor releases `out` on this path too
     }
+    HANDLE hproc = hproc_owner.get();
 
     CtxSwitchSampler ctxsw;
     bool have_pdh = ctxsw.init();
@@ -300,7 +338,6 @@ int wmain(int argc, wchar_t** argv) {
 
     fwprintf(out, L"elapsed_s,threads,handles,rss_bytes,cpu_pct,ctxsw_per_sec\n");
 
-    const uint32_t ncores = core_count();
     FILETIME ft_create{}, ft_exit{}, ft_kernel_prev{}, ft_user_prev{};
     GetProcessTimes(hproc, &ft_create, &ft_exit, &ft_kernel_prev, &ft_user_prev);
     uint64_t kernel_prev = filetime_to_u64(ft_kernel_prev);
@@ -332,8 +369,14 @@ int wmain(int argc, wchar_t** argv) {
         double cpu_100ns_delta = static_cast<double>((kernel_now - kernel_prev) + (user_now - user_prev));
         kernel_prev = kernel_now;
         user_prev = user_now;
+        // 100% = one full core busy, unbounded above that (matches ps/top's
+        // per-process convention on Linux, and this file's own header comment's
+        // stated intent) - NOT divided by core count. An earlier version divided
+        // by ncores, which silently contradicted that comment (a fully-busy
+        // single-core process would have read 100/ncores%, not 100%); fixed
+        // 2026-08-18 (governance Gate 3, cross-platform finding).
         double cpu_pct = wall_delta_s > 0.0
-            ? (cpu_100ns_delta / 10000000.0) / (wall_delta_s * ncores) * 100.0
+            ? (cpu_100ns_delta / 10000000.0) / wall_delta_s * 100.0
             : 0.0;
 
         double ctxsw_val = have_pdh ? ctxsw.collect_matching(target_pid) : -1.0;
@@ -358,8 +401,8 @@ int wmain(int argc, wchar_t** argv) {
         if (duration_sec > 0 && s.elapsed_s >= static_cast<double>(duration_sec)) break;
     }
 
-    CloseHandle(hproc);
-    if (out != stdout) fclose(out);
+    // hproc_owner/out_owner release HANDLE/FILE* automatically at function exit
+    // (RAII) - nothing further reads or writes either after this point.
 
     // Steady-state summary: drop first 2 samples (startup / first-PDH-collect
     // warm-up), average the rest.
@@ -384,7 +427,7 @@ int wmain(int argc, wchar_t** argv) {
     size_t n = samples.size() - warmup;
     fwprintf(stderr,
               L"\n[resource_sampler] steady-state (n=%zu, warmup=%zu dropped): "
-              L"threads=%.1f handles=%.1f rss_bytes=%.0f cpu_pct=%.2f wakeups_per_sec=%s\n",
+              L"threads=%.1f handles=%.1f rss_bytes=%.0f cpu_pct=%.2f wakeups_per_sec=%ls\n",
               n, warmup, sum_threads / n, sum_handles / n, sum_rss / n, sum_cpu / n,
               ctxsw_n > 0 ? std::to_wstring(sum_ctxsw / ctxsw_n).c_str() : L"n/a");
 
