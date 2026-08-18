@@ -494,6 +494,16 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
         ctx.write_output("status|error|failed to launch PowerShell");
         return 1;
     }
+    // A killed-at-deadline dialog can still have tool_ran=true with empty or
+    // partial output (subprocess_runner.hpp's documented contract) -- without
+    // this check, empty output falls through to the "cancelled" branch below
+    // and silently misreports a timeout as a user cancel. Report it honestly
+    // instead, matching classify_input_capture's macOS/Linux contract (a
+    // delivery failure is never silently reinterpreted as a real outcome).
+    if (res.timed_out) {
+        ctx.write_output("status|unavailable|PowerShell dialog timed out");
+        return 1;
+    }
 
     std::string output = res.output;
     // Trim trailing whitespace
@@ -755,6 +765,16 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
         yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadlineWin});
     if (!res.tool_ran) {
         ctx.write_output("status|error|failed to launch PowerShell");
+        return 1;
+    }
+    // A killed-at-deadline dialog can still have tool_ran=true with empty or
+    // partial output (subprocess_runner.hpp's documented contract). Without
+    // this check, empty output falls through to the answer-parse loop below
+    // and reports "cancelled|false" + "question_count|N" with zero answer_
+    // lines -- reading to a caller as "survey completed, nothing answered"
+    // rather than the honest truth: the dialog never delivered a result.
+    if (res.timed_out) {
+        ctx.write_output("status|unavailable|PowerShell dialog timed out");
         return 1;
     }
 
