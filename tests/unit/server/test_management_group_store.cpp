@@ -1074,9 +1074,10 @@ TEST_CASE("ManagementGroupStore::migrate_from_sqlite reads one consistent group/
     // batches against the unfixed production code (7/25, 4/25) landed in the
     // same noise band as the single-swap design's own two batches (7/25,
     // 5/25) that quality-engineer measured. Reverted to the simpler
-    // single-swap form; the underlying detectability is bounded by SQLite's
-    // own statement timing here, not by how many extra attempts this test
-    // makes.
+    // single-swap form rather than keep the added complexity for an
+    // unproven gain -- WHY looping didn't clearly help isn't established;
+    // don't assume a mechanism (e.g. "SQLite statement timing bounds it")
+    // that wasn't tested.
     std::atomic<bool> writer_swap_done{false};
     std::thread writer([&] {
         SqliteDb w;
