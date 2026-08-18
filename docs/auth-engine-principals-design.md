@@ -513,8 +513,14 @@ token sessions are already synthesized fresh per request rather than
 persisted, so `principal_kind` needs no storage beyond the `ApiToken` row
 it was read from:
 
-- `principal_kind=human` (all existing rows): exactly today's behavior —
-  attribute to the creating user, re-resolve their current role.
+- `principal_kind=human` (all existing rows): attribute to the creating
+  user. If the token is service-scoped (`scope_service` non-empty), the
+  role is floored to `user` regardless of the creator's live role — an
+  `ITServiceOwner` RBAC grant is the sole authority ceiling for such a
+  token (#3201, shipped after this design was written; closes a
+  privilege-inheritance gap the original "re-resolve their current role"
+  wording here didn't anticipate). Otherwise, unchanged from before this
+  design: re-resolve the creator's current role.
 - `principal_kind=engine`: the session **is** the engine principal —
   `username = principal_id` (the `engine:<slug>` id), `auth_source =
   "engine_token"` (a sixth value alongside

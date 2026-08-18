@@ -31,10 +31,24 @@ in one function; IDs are never reused after a site is deleted).
 ## Registered sites
 
 Populated as the migration reaches each site (and immediately for any new or
-interim site — ADR-3002 Decisions 1 and 2). No site-level rows yet.
+interim site — ADR-3002 Decisions 1 and 2).
 
 | Site ID | Location | Mechanism | Platform | Provenance | Mutating | Shell features | Privilege | Ladder review | Rung + evidence | Registration |
 |---|---|---|---|---|---|---|---|---|---|---|
+| `users/do_logged_on#1` | `agents/plugins/users/src/users_plugin.cpp:do_logged_on` | runner argv | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `users/do_sessions#1` | `agents/plugins/users/src/users_plugin.cpp:do_sessions` | runner argv | Linux | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `users/do_sessions#2` | `agents/plugins/users/src/users_plugin.cpp:do_sessions` | runner argv | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `users/do_local_users#1` | `agents/plugins/users/src/users_plugin.cpp:do_local_users` | runner argv | Linux | compile-time literal + account name derived from a local-system enumeration (dscl -list / getpwent) | read-only | none — pipeline eliminated (tail -1 replicated in-process, last non-empty line; max_lines caps the FIRST N and would invert the selection) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `users/do_local_users#2` | `agents/plugins/users/src/users_plugin.cpp:do_local_users` | runner argv | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no public OpenDirectory C API in-tree; .mm ruled out of this run by the architect | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no public OpenDirectory C API in-tree, .mm ruled out this run | n/a |
+| `users/do_local_users#3` | `agents/plugins/users/src/users_plugin.cpp:do_local_users` | runner argv | macOS | compile-time literal + account name derived from a local-system enumeration (dscl -list / getpwent) | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no public OpenDirectory C API in-tree; .mm ruled out of this run by the architect | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no public OpenDirectory C API in-tree, .mm ruled out this run | n/a |
+| `users/do_local_users#4` | `agents/plugins/users/src/users_plugin.cpp:do_local_users` | runner argv | macOS | compile-time literal + account name derived from a local-system enumeration (dscl -list / getpwent) | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no public OpenDirectory C API in-tree; .mm ruled out of this run by the architect | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no public OpenDirectory C API in-tree, .mm ruled out this run | n/a |
+| `users/do_local_users#5` | `agents/plugins/users/src/users_plugin.cpp:do_local_users` | runner argv | macOS | compile-time literal + account name derived from a local-system enumeration (dscl -list / getpwent) | read-only | none — env-var prefix carried by /usr/bin/env LC_ALL=C, an exec wrapper not an interpreter | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin; rung stays 2: /usr/bin/env is an exec wrapper, not an interpreter | n/a |
+| `users/do_local_admins#1` | `agents/plugins/users/src/users_plugin.cpp:do_local_admins` | runner argv | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no public OpenDirectory C API in-tree; .mm ruled out of this run by the architect | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no public OpenDirectory C API in-tree, .mm ruled out this run | n/a |
+| `users/do_group_members#1` | `agents/plugins/users/src/users_plugin.cpp:do_group_members` | runner argv | macOS | operator param (group), gated by is_safe_identifier | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no public OpenDirectory C API in-tree; .mm ruled out of this run by the architect | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no public OpenDirectory C API in-tree, .mm ruled out this run | n/a |
+| `users/do_primary_user#1` | `agents/plugins/users/src/users_plugin.cpp:do_primary_user` | runner argv | Linux | compile-time literal argv | read-only | none — pipeline eliminated (head -200 -> max_lines=200, stop_after_max_lines=true) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `users/do_primary_user#2` | `agents/plugins/users/src/users_plugin.cpp:do_primary_user` | runner argv | macOS | compile-time literal argv | read-only | none — pipeline eliminated (head -200 -> max_lines=200, stop_after_max_lines=true) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `users/do_session_history#1` | `agents/plugins/users/src/users_plugin.cpp:do_session_history` | runner argv | Linux | operator param (count), numeric | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `users/do_session_history#2` | `agents/plugins/users/src/users_plugin.cpp:do_session_history` | runner argv | macOS | operator param (count), numeric | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for this data on this OS in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
 
 ## Seed inventory — known spawn surfaces awaiting transcription
 
@@ -47,9 +61,13 @@ these rows are pointers, not evidence.
 device_identity, event_logs, firewall, hardware, installed_apps,
 interaction, ioc, license_scan, network_actions, network_config,
 network_diag, os_info, processes, quarantine, sccm, services,
-software_actions, tar, users, vuln_scan, wifi, windows_updates, wol.
+software_actions, tar, vuln_scan, wifi, windows_updates, wol.
 (`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —
 sequence that cleanup against migrating it, tracked in #2380.)
+
+**Migrated off raw spawn (Wave 2, PR2.1a):** `users` (Windows session
+history moved to wevtapi/EvtQuery, ProfileList to native enumeration; POSIX
+sites moved to direct runner argv — see Registered sites above).
 
 **Migrated off raw spawn (Wave 2, PR2.1c):** `discovery` (0 spawn sites, was
 5 — GetIpNetTable2/`/proc/net/arp`/sysctl ARP + a shared `IcmpSession`

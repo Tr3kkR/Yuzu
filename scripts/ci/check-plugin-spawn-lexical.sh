@@ -502,7 +502,6 @@ GRANDFATHERED = {
     "agents/plugins/software_actions/src/software_actions_plugin.cpp",
     "agents/plugins/tar/src/tar_mapdrive_collector.cpp",
     "agents/plugins/tar/src/tar_service_collector.cpp",
-    "agents/plugins/users/src/users_plugin.cpp",
     "agents/plugins/vuln_scan/src/config_checks.hpp",
     "agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp",
     "agents/plugins/windows_updates/src/windows_updates_plugin.cpp",

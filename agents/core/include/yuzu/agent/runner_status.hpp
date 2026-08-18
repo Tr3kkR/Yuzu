@@ -10,7 +10,6 @@
  * doesn't qualify as an agents/shared zero-dependency leaf (cpp-conventions.md).
  * Every plugin already links yuzu_agent_core_dep, so this needs no extra
  * meson wiring at any consumer.
- *
  * Maps every outcome EXCEPT `exited`: whether a nonzero exit code is an error
  * is the caller's domain (a nonzero `ping` exit means "host down", not a plugin
  * failure), so `exited` returns nullopt and the caller owns the status (or

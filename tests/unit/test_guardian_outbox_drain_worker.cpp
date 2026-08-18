@@ -1841,11 +1841,20 @@ TEST_CASE("CH-5: a forward clock step does not delete the whole journal in one p
     const auto paged = rig.journal->page_into_window(*rig.rt, kT + kThirtyDays);
     CHECK(paged.records_paged == 6);
 
-    // ...and the guard is ONE pass, not a permanent disabling of retention: having now observed
-    // the new clock, later passes age the batches out normally.
-    const auto after = rig.journal->prune(kT + kThirtyDays + 1000);
+    // The pass right after the jump no longer LOOKS like a step (last_prune_now_ms_ has already
+    // re-anchored to the jumped value), but the journal is still fully expired under the new
+    // clock - a fact set (wipe, no step) `jumped` never recorded. It must decline again on its
+    // own merits (#2573 GJ half) rather than ride `jumped`'s still-set latch into a silent
+    // eviction.
+    const auto settling = rig.journal->prune(kT + kThirtyDays + 1000);
+    CHECK(settling.evicted == 0);
+    CHECK(rig.journal->clock_jump_skips() == 2);
+
+    // ...and the guard is not a permanent disabling of retention: the SAME fact shape recurring
+    // is a suppressed repeat, so this pass finally proceeds.
+    const auto after = rig.journal->prune(kT + kThirtyDays + 2000);
     CHECK(after.evicted == 3);
-    CHECK(rig.journal->clock_jump_skips() == 1); // not re-counted: the clock is stable again
+    CHECK(rig.journal->clock_jump_skips() == 2); // not re-counted a third time
 }
 
 TEST_CASE("CH-5b: one retention pass cannot age out the whole journal",
@@ -1863,12 +1872,15 @@ TEST_CASE("CH-5b: one retention pass cannot age out the whole journal",
         rig.persist_batch("b" + std::to_string(i), 1);
 
     constexpr std::int64_t kThirtyDays = 30LL * 86400 * 1000;
-    REQUIRE(rig.journal->prune(kT).evicted == 0);           // baseline
-    REQUIRE(rig.journal->prune(kT + kThirtyDays).evicted == 0); // the jump itself: declined
+    REQUIRE(rig.journal->prune(kT).evicted == 0);                // baseline
+    REQUIRE(rig.journal->prune(kT + kThirtyDays).evicted == 0);  // the jump itself: declined
+    // As in CH-5: the pass right after the jump presents a DISTINCT fact set (wipe, no step)
+    // and declines again on its own merits before the cap-paced drain proceeds (#2573 GJ half).
+    REQUIRE(rig.journal->prune(kT + kThirtyDays + 1000).evicted == 0);
 
-    const auto accepted = rig.journal->prune(kT + kThirtyDays + 1000);
+    const auto accepted = rig.journal->prune(kT + kThirtyDays + 2000);
     CHECK(accepted.evicted == kMaxAgeEvictionsPerPass); // paced, not wholesale
-    const auto rest = rig.journal->prune(kT + kThirtyDays + 2000);
+    const auto rest = rig.journal->prune(kT + kThirtyDays + 3000);
     CHECK(rest.evicted == 10); // and the remainder follows on the next pass
 }
 

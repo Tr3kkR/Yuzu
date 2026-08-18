@@ -45,6 +45,9 @@
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/plugin.h>
 
+#include <win_profiles.hpp>   // enumerate_profile_records (#2771 code-review C-M3)
+#include <win_reg_handle.hpp> // unique_hive_mount_name (#2771 code-review CFX-2)
+
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp" // process_random_salt -- Wee Tam runs 4 runner
                             // agents as ONE shared LOCAL SYSTEM identity, so
@@ -55,6 +58,7 @@
                             // "Test conventions" section) -- match it rather
                             // than rely on PID non-reuse alone.
 
+#include <algorithm>
 #include <cstdlib>
 #include <cwchar>
 #include <filesystem>
@@ -283,6 +287,59 @@ TEST_CASE("registry plugin: list_profiles + get_user_value live-hive round-trip 
         CHECK(result.rc != 0);
         CHECK(result.captured.find("not found in enumerated profiles") != std::string::npos);
     }
+}
+
+TEST_CASE("unique_hive_mount_name: produces distinct, well-formed names",
+         "[registry][windows]") {
+    // #2771 code-review CFX-2: the salted-name behaviour that #2771 up-S1
+    // exists to fix had no test against the REAL production function -- only
+    // against a literal string passed into render_hive_access_lines. This
+    // calls the actual yuzu::win::unique_hive_mount_name, which is only
+    // reachable from a Windows-gated TU (it lives in an #ifdef _WIN32
+    // header), which is why it lives here rather than in the portable
+    // test_user_profile_model.cpp.
+    const std::wstring sid = L"S-1-5-21-1111111111-2222222222-3333333333-1001";
+
+    const auto m1 = yuzu::win::unique_hive_mount_name(sid);
+    const auto m2 = yuzu::win::unique_hive_mount_name(sid);
+
+    CHECK(m1 != m2);
+    CHECK(m1.rfind(L"YUZU_HIVE_" + sid + L"_", 0) == 0);
+    CHECK(m2.rfind(L"YUZU_HIVE_" + sid + L"_", 0) == 0);
+    // Registry key names are capped at 255 chars; a typical SID leaves ample
+    // headroom, but this pins that the salt scheme doesn't blow the budget.
+    CHECK(m1.size() < 255);
+    CHECK(m2.size() < 255);
+
+    // 1000 calls, no collisions -- a distinctness sample, NOT a wraparound
+    // test (code-review CODEX-P1-06): the counter is std::uint64_t, so 1000
+    // iterations is nowhere near reachable wraparound territory. Same check
+    // the orchestrator ran manually during code review.
+    std::vector<std::wstring> names;
+    names.reserve(1000);
+    for (int i = 0; i < 1000; ++i)
+        names.push_back(yuzu::win::unique_hive_mount_name(sid));
+    std::sort(names.begin(), names.end());
+    CHECK(std::adjacent_find(names.begin(), names.end()) == names.end());
+}
+
+TEST_CASE("enumerate_profile_records: ordinary host reports untruncated",
+         "[registry][windows]") {
+    // Real end-to-end sanity check against the actual Win32 shell, on
+    // whatever real profile count this host has (far under kMaxProfiles).
+    // NOT the C-M3 regression pin (#2771 code-review P2-N3): a host far
+    // under the cap reports truncated=false under BOTH the pre-fix and
+    // post-fix logic, so this alone cannot discriminate the boundary case --
+    // it only proves the ordinary path still works after the refactor. The
+    // actual regression coverage is the DECISION function
+    // (profile_list_actually_truncated) tested directly in the portable
+    // test_user_profile_model.cpp, which can exercise the exact
+    // cap-reached-but-nothing-dropped case no real host here can fabricate.
+    bool ok = false;
+    bool truncated = true; // pre-set to the WRONG answer -- must be cleared
+    yuzu::win::enumerate_profile_records(ok, &truncated);
+    REQUIRE(ok);
+    CHECK_FALSE(truncated);
 }
 
 #endif // _WIN32

@@ -1020,6 +1020,106 @@ same DSN. If you run single-replica, treat any sustained non-zero
 `yuzu_rotation_sweep_lock_skipped_total` as a fault to investigate, not
 background noise; see `docs/ops-runbooks/rotation-sweep-clock-guard.md`.
 
+### vNEXT — Guardian status routes gain real data, new denial/failure modes (#2298 item 6d) (breaking)
+
+**What changed.** `GET /api/v1/guaranteed-state/status` and
+`/status/{agent_id}` previously returned a hardcoded placeholder
+(`errored_rules: 0`, always `200`). `errored_rules` is now real, derived
+from the same per-agent compliance census (`guardian_agent_rule_status`)
+the dashboard's Unhealthy Guards card reads, intersected against the live
+rule catalogue. `compliant_rules`/`drifted_rules` remain placeholder `0`
+pending full status ingest, tracked separately.
+
+**What a client sees.**
+
+- **`403`** on the fleet route (`/status`, no `{agent_id}`) — new. A
+  service-scoped API token is now refused outright rather than admitted to
+  a fleet-wide aggregate outside its own scope: this route aggregates
+  across every agent's census, and the underlying permission check does
+  not apply a service-scoped token's own service-tag confinement (it only
+  checks a role grant), so admitting it here would have let a token scoped
+  to one service read a fleet-wide count.
+- A **narrower `errored_rules` count** (still `200`) on the fleet route
+  for a management-group-**confined** (not global) `GuaranteedState:Read`
+  grant — new. This route moved from a bare global permission check (any
+  authenticated `GuaranteedState:Read` holder got the unfiltered
+  fleet-wide count) to `AuthRoutes::require_list_read` — the route's SOLE
+  gate (ADR-0017 admit-then-filter; never stacked with the flat
+  `require_permission`, which does not consult management groups and
+  cannot compose with a separate confinement check bolted on afterward). An
+  earlier, unreleased attempt at this exact fix stacked a direct
+  `authorize_list_read` call BEHIND the flat `require_permission` gate
+  instead of replacing it — that composition never actually confined
+  anyone (a confined caller was denied by the flat gate before the
+  confinement check ever ran) and was corrected before shipping; nothing
+  described below was ever live under that broken attempt. A
+  caller with no `GuaranteedState:Read` grant at all
+  (global or via any management group) now gets `403` instead of `200`
+  (this is a SEPARATE outcome from the narrower-count case above — a
+  confined grant that resolves to at least a scope, even an empty one,
+  never gets a `403` from the confinement decision itself; a `403` from
+  this route means either a service-scoped token, no usable grant, or,
+  rarer, a fail-closed authorization-store fault, which denies even a
+  caller who otherwise holds a resolvable confined grant — see
+  `rest-api.md` for the full 4xx taxonomy). A caller whose grant is confined to specific management groups now sees
+  `errored_rules` scoped to their **visible agents only**, not the whole
+  fleet — including `0` if their groups contain no agents at all, which is
+  still `200`, not `403` (a real grant that resolves to an empty visible
+  set is a legitimate answer, not a denial). `total_rules` is unaffected
+  by this change on either route: it counts the rule *catalogue*, which
+  has no agent dimension to confine. A global (non-group-confined) grant
+  is unaffected on the fleet route too — it still sees the full fleet
+  count, same as before.
+- **`403`** on the per-agent route (`/status/{agent_id}`) — new. This route
+  moved from a bare global permission check (any authenticated
+  `GuaranteedState:Read` holder got `200`, even with a management-group
+  scope that does not cover the requested device) to the same per-device
+  scoped check `GET /guaranteed-state/device-compliance` uses. A caller
+  whose `GuaranteedState:Read` grant is confined to management groups that
+  do not include the requested `agent_id` now gets `403` instead of a
+  `200` carrying placeholder-zero data for a device outside their scope. A
+  global (non-group-confined) grant is unaffected — it still passes
+  fleet-wide, same as before.
+- **`503`** on the per-agent route (`/status/{agent_id}`) — new failure
+  mode. This route now performs a **behavioral-PII access audit**
+  (`guardian.device.view`, same verb as `GET
+  /guaranteed-state/device-compliance` and `GET /dex/devices/{id}`) before
+  serving per-device data, and fails **closed**
+  (`503` + `Sec-Audit-Failed: true`) if that audit row cannot persist —
+  the audit subsystem being unavailable is not itself new, but this route
+  could not previously return `503` for it because it served no real
+  per-device data before.
+- **`503`** on either route if the Guaranteed State store degrades — new;
+  previously the route degraded silently to `0` on any store fault.
+
+**Who this affects.** Any integration polling either route that (a) uses a
+service-scoped API token against the fleet route — that call now needs
+either a non-service-scoped credential or a per-agent call against
+`/status/{agent_id}` instead, and the per-agent route is not an
+unconditional substitute: `require_scoped_permission` additionally checks
+that the *target* `agent_id`'s own `service` tag matches the token's scope
+(`tag_store`-backed), so a service-scoped token still gets `403` there for
+any device outside its own service, distinct from the fleet route's
+simpler "any service-scoped token, unconditionally" denial; (b) holds a
+management-group-**confined**
+(not global) `GuaranteedState:Read` grant and polls `/status/{agent_id}`
+for a device outside that scope — that call now gets `403` where it
+previously got `200` with placeholder data, the same confinement
+`/guaranteed-state/device-compliance` has always enforced; (c) holds a
+management-group-**confined** grant and polls the **fleet** route
+(`/status`) — that call still gets `200`, but `errored_rules` now reflects
+only the caller's visible agents rather than the whole fleet; a real grant
+that resolves to ZERO visible agents (an empty or agent-less management
+group) is still `200` with `errored_rules: 0` (ADR-0017 INV-2 — a real
+grant that is simply narrow is not a denial), distinct from holding no
+`GuaranteedState:Read` grant anywhere, which is `403` on either route; or (d)
+treats every response as `200` — both routes can now return `403`/`503`
+and a client that does not already retry on `5xx` (standard practice for
+every other Guaranteed State route) should add that handling. No change
+for a global-permission, non-service-scoped caller on the happy path
+beyond `errored_rules` becoming a real, changing number instead of a
+constant `0`.
+
 ### vNEXT — macOS antivirus posture is now probed, not asserted
 
 The `antivirus` plugin's macOS leg previously hardcoded `av|XProtect|active`
