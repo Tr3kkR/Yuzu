@@ -6,8 +6,8 @@
 /// @file service_scope_policy.hpp
 /// The service-scope global-safe allow-list: `(securable_type, operation)`
 /// pairs a service-scoped token may exercise UNCONFINED — i.e. without the
-/// per-agent/`service`-tag narrowing `AuthRoutes::authorize_fleet_read` /
-/// `authorize_agent_target` (authz_gates.hpp) otherwise apply.
+/// per-agent/`service`-tag narrowing `AuthRoutes::require_fleet_read` /
+/// `confine_agent_target` (authz_gates.hpp) otherwise apply.
 ///
 /// Seeded EMPTY. This is deliberate, not a placeholder to fill in "later":
 /// the whole point of the default-deny flip (`require_permission`'s
