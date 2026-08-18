@@ -130,24 +130,45 @@ public:
             return ok ? 0 : 1;
 #elif defined(__linux__)
             // network_actions/flush_dns_linux#1 — resolvectl (systemd-
-            // resolved's modern CLI) is tried first; if probe_tool_path can't
-            // find it, the older systemd-resolve CLI is used instead.
-            // Whichever was found is run via `sudo -n` per the NOPASSWD
-            // grants install-agent-user.sh installs for exactly these tools.
-            // Unlike the old `resolvectl ... || systemd-resolve ... || true`
-            // shell chain, the real exit code is reported — no `|| true`
-            // swallowing a real failure into a blind status|ok.
-            auto tool = yuzu::agent::probe_tool_path({"/usr/bin/resolvectl", "/usr/bin/systemd-resolve"});
-            std::vector<std::string> argv;
-            if (!tool.empty()) {
-                argv = yuzu::shared::sudo_wrap(
+            // resolved's modern CLI) is tried first; systemd-resolve (the
+            // legacy CLI) is tried next on ANY failure of the first attempt
+            // -- absent, or present but failing at runtime (service
+            // stopped/masked, dbus unreachable). This restores the old
+            // `resolvectl ... || systemd-resolve ... || true` shell chain's
+            // retry-ON-FAILURE semantics, which a presence-only probe (try
+            // resolvectl if the file exists, never retry if it then fails)
+            // silently narrowed away (code-review Functional finding, this
+            // session). Whichever attempt is used is run via `sudo -n` per
+            // the NOPASSWD grants install-agent-user.sh installs; the real
+            // exit code of the last attempt is reported -- never a blind
+            // status|ok the way `|| true` used to guarantee.
+            yuzu::agent::SubprocessResult res;
+            bool attempted = false;
+            bool ok = false;
+            for (const char* candidate : {"/usr/bin/resolvectl", "/usr/bin/systemd-resolve"}) {
+                auto tool = yuzu::agent::probe_tool_path({candidate});
+                if (tool.empty())
+                    continue;
+                auto argv = yuzu::shared::sudo_wrap(
                     {tool, std::string(yuzu::network_actions::resolver_flush_flag(tool))});
+                res = yuzu::agent::run_bounded_subprocess(
+                    argv, yuzu::agent::SubprocessOptions{.deadline = kNetworkActionsCmdDeadline,
+                                                         .merge_stderr = true});
+                attempted = true;
+                if (res.tool_ran && res.exit_code == 0) {
+                    ok = true;
+                    break; // success -- do not try the next candidate
+                }
+                // this attempt failed (spawn error or nonzero exit); fall
+                // through to the next candidate, matching the old `||` chain
             }
-            auto res = yuzu::agent::run_bounded_subprocess(
-                argv, yuzu::agent::SubprocessOptions{.deadline = kNetworkActionsCmdDeadline,
-                                                     .merge_stderr = true});
+            if (!attempted) {
+                ctx.write_output("status|error");
+                ctx.write_output("output|neither resolvectl nor systemd-resolve found");
+                return 1;
+            }
             bool status_forwarded = yuzu::agent::forward_runner_failure(ctx, res);
-            bool ok = !status_forwarded && res.tool_ran && res.exit_code == 0;
+            ok = ok && !status_forwarded;
             ctx.write_output(std::format("status|{}", ok ? "ok" : "error"));
             ctx.write_output(std::format("output|{}", res.output));
             return ok ? 0 : 1;

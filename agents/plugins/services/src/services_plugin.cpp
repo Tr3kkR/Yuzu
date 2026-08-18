@@ -221,6 +221,7 @@ std::vector<ServiceInfo> enumerate_services_win(bool running_only) {
 using ServiceInfo = yuzu::services::SystemdUnitEntry;
 
 std::vector<ServiceInfo> enumerate_services_linux(bool running_only) {
+    // services/enumerate_services_linux#1 (docs/agent-spawn-sink-manifest.md)
     // Resolve the tool across the two absolute paths systemctl actually
     // lives at across distros (mirrors the installed sudoers grant, which
     // covers both /usr/bin/systemctl and /bin/systemctl -- see
@@ -258,6 +259,7 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t
     total_seen = 0;
     std::vector<ServiceInfo> services;
 
+    // services/enumerate_services_macos#1 (docs/agent-spawn-sink-manifest.md)
     // launchctl lives at exactly one absolute path on macOS (no /usr/bin
     // alternative, unlike systemctl's cross-distro split) -- probe_tool_path
     // still verifies it exists+is executable before trusting it into argv[0],
@@ -281,6 +283,7 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t
                                        std::move(entry.status), /*startup_type=*/{}});
     }
 
+    // services/enumerate_services_macos#2 (docs/agent-spawn-sink-manifest.md)
     // P15 (verified): ONE bulk `launchctl print-disabled system` call for the
     // enabled/disabled map of ALL services, joined below -- NOT an N+1
     // `launchctl print system/<label>` per service (hundreds of services would
@@ -399,8 +402,9 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
         return 1;
     }
 
+    // services/set_start_mode_linux#1 (docs/agent-spawn-sink-manifest.md)
     // Privileged mutation, Decision-8 canonical form (ADR-3002, sudo_argv.hpp):
-    // these five call sites (enable/disable/mask/unmask) previously ran
+    // these four call sites (enable/disable/mask/unmask) previously ran
     // completely UNWRAPPED -- no sudo at all -- even though
     // scripts/install-agent-user.sh installs exactly this grant for a
     // privilege-dropped agent:
@@ -475,6 +479,7 @@ int do_set_start_mode_macos(yuzu::CommandContext& ctx, std::string_view name,
         return 1;
     }
 
+    // services/set_start_mode_macos#1 (docs/agent-spawn-sink-manifest.md)
     // Privileged mutation, Decision-8 canonical form (ADR-3002, sudo_argv.hpp):
     // these two call sites (enable/disable) previously ran completely
     // UNWRAPPED -- no sudo at all -- even though

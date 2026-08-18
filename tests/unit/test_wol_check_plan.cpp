@@ -7,12 +7,6 @@
  * the ICMP-primary/TCP-fallback/honest-degrade decision is pinned here
  * without a live network hop — the netprobe_stats.hpp / test_icmp_probe.cpp
  * pattern.
- *
- * NOT YET WIRED into tests/meson.build (owned centrally by the Wave-2
- * integrator, same as wol_check_plan.hpp's own consumer wol_plugin.cpp) —
- * needs a `unit/test_wol_check_plan.cpp` source entry plus
- * `include_directories('../agents/plugins/wol/src')` alongside the
- * existing netprobe_stats.hpp entry in tests/meson.build.
  */
 #include "wol_check_plan.hpp"
 
