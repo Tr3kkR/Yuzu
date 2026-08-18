@@ -379,11 +379,18 @@ committed (adversarial-review workflow output, not repo content) - reproducible 
      (`agent_service_impl.cpp:894`) and rejects every Subscribe attempt
      ("peer mismatch", `register_ip=`, `subscribe_ip=`, both empty). Switching the
      agent to an explicit `--server 127.0.0.1:50051` (forcing IPv4) worked around it -
-     the Subscribe stream opened successfully after a few retries. Whether
-     `context->peer()` genuinely percent-encodes IPv6 brackets on this Windows
-     gRPC/vcpkg build (a real, if narrow, product bug affecting any direct
-     non-gateway Windows agent that resolves its server address to IPv6) or whether
-     something specific to this throwaway rig produced it was not further isolated.
+     the Subscribe stream opened successfully after a few retries.
+
+     **NOT a new bug - this is issue #1791**, filed against a macOS repro of the exact
+     same symptom (`raw_peer=ipv6:%5B::1%5D:<port>`, empty `register_ip`/`subscribe_ip`,
+     same IPv4 workaround) and already fully root-caused there: gRPC >= 1.49
+     percent-encodes `[`/`]` in peer strings per RFC 3986, `extract_peer_ip`
+     (`server/core/src/peer_ip.hpp:129-155`) only handles the literal-bracket form, and
+     the existing unit tests only cover pre-1.49 unencoded vectors. This DGRHP
+     occurrence is added as corroborating evidence there (comment 2026-08-18) -
+     confirms the defect is genuinely cross-platform (any OS resolving loopback to
+     IPv6 first on an affected gRPC version), not macOS-specific as the issue title
+     implies. No new issue filed; see #1791 for the fix's acceptance criteria.
    - **With both worked around** (agent forced to IPv4; the kill-switch issue has no
      workaround short of a code fix, so this was NOT resolved) **delivery still did
      not happen**: a fresh `full_sync` push after the Subscribe stream opened
