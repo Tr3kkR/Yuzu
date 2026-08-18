@@ -28,14 +28,14 @@ Structured categories are enforced at the API layer:
 
 ## Setting Tags
 
-> **Tag source precedence.** Every tag carries a `source` field — `"server"` for operator/API
-> writes (REST `PUT /api/v1/tags`, MCP `set_tag`) and `"agent"` for tags an agent self-reports
-> via its heartbeat `scopable_tags`. An agent-reported tag is written only when the stored row
-> is itself `"agent"`-sourced or absent; an operator/API-set tag for the same `(agent_id, key)`
-> is **authoritative and cannot be overwritten by the agent**. This prevents a rogue or
-> misconfigured agent from self-assigning into an operator-declared benchmark cohort. To force a
-> value regardless of the current source, write it via the REST API or MCP `set_tag` (source
-> `"server"`).
+> **Tag source precedence.** Every tag carries a `source` field — `"api"` for REST/dashboard
+> writes (`PUT /api/v1/tags`), `"mcp"` for MCP `set_tag`, `"server"` for server-internal
+> writes, and `"agent"` for tags an agent self-reports via its heartbeat `scopable_tags`. An
+> agent-reported tag is written only when the stored row is itself `"agent"`-sourced or absent;
+> any non-`"agent"`-sourced tag for the same `(agent_id, key)` is **authoritative and cannot be
+> overwritten by the agent**. This prevents a rogue or misconfigured agent from self-assigning
+> into an operator-declared benchmark cohort. To force a value regardless of the current
+> source, write it via the REST API or MCP `set_tag`.
 
 ### Via the REST API
 
@@ -495,6 +495,12 @@ NOT tag:environment == "Dev"
 This allows you to target instructions, policies, and reports at specific device subsets based on their tags.
 
 For **presence** (a tag key exists on the device, regardless of value) use `EXISTS tag:<name>` rather than an equality. The YAML `spec.scope.selector.tags` block-form authoring surface lowers each listed tag to `EXISTS tag:<name>` — a presence check — so a `selector.tags: [production]` entry matches any device carrying a `production` tag with a non-empty value. For value-equality matching, use the explicit `tag:<key> == "<value>"` form shown above.
+
+**Failure behavior (ADR-0050):** a scope evaluation whose `tag:<key>` values cannot be read
+from the tag store (a degraded database) **fails the whole evaluation** — the operation
+reports an error rather than resolving to fewer or more devices than the expression names. A
+`NOT tag:...` expression in particular can never silently expand to the whole fleet because a
+tag read failed.
 
 ---
 
