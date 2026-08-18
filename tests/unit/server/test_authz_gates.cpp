@@ -485,6 +485,41 @@ TEST_CASE("require_fleet_read: null rbac store ⇒ Degraded (not a crash)",
     CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == 5000);
 }
 
+TEST_CASE("require_fleet_read: service-scoped token, RBAC genuinely disabled "
+          "⇒ Forbidden (#2298 PR 3 decision 1 — preserve require_permission's "
+          "hard-403, do not let the tag axis alone admit a narrowed result)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    r.rbac.set_rbac_enabled(false); // genuinely, freshly disabled — denied before the mgmt
+                                    // axis is even consulted, so no grant is needed here.
+    auto token = r.mint("printers");
+    auto req = bearer_request(token);
+    httplib::Response res;
+
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("require RBAC to be enabled") != std::string::npos);
+}
+
+TEST_CASE("require_fleet_read: non-service token, RBAC genuinely disabled ⇒ "
+          "unfiltered (regression — the new RBAC-off check is service-scoped "
+          "only, legacy-open AdmitAll is untouched for an ordinary caller)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    r.rbac.set_rbac_enabled(false);
+    auto token = r.mint(); // non-service
+    auto req = bearer_request(token);
+    httplib::Response res;
+
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE(result.has_value());
+    CHECK(result->unfiltered());
+}
+
 TEST_CASE("require_fleet_read: no bearer token ⇒ Unauthenticated",
           "[pg][auth_routes][authz_gates][service_scope]") {
     Config cfg{};

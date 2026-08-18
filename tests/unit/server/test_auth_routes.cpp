@@ -17,7 +17,11 @@
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "oidc_provider.hpp"
+#include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp" // PgConn/PgResult — the CH-4 saboteur's second connection
+#include "rbac_store.hpp"
+#include "service_scope_policy.hpp"
+#include "../test_helpers.hpp" // YUZU_REQUIRE_PG_DB_TPL / PgTestTemplate
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
@@ -28,13 +32,16 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <shared_mutex>
+#include <stdexcept>
 #include <string>
 
 namespace fs = std::filesystem;
 using namespace yuzu::server;
+namespace pg = yuzu::server::pg;
 
 namespace {
 
@@ -112,6 +119,70 @@ httplib::Request request_with_header(const std::string& name, const std::string&
     req.headers.emplace(name, value);
     return req;
 }
+
+int64_t service_scope_flip_now_epoch() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+// Distinct template name from every other file's "rbacstore*" registrations
+// (test_authz_gates.cpp's "rbacstore_authzgates", test_list_read_confinement.cpp's
+// "rbacstore", test_engine_principal_integration.cpp's "rbacstore_integ") —
+// same registry, no shared-state risk.
+yuzu::test::PgTestTemplate service_scope_flip_rbac_tpl{
+    "rbacstore_svcscopeflip", [](const std::string& dsn) {
+        pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        RbacStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("rbac (svc scope flip) template: store failed to migrate/seed");
+    }};
+
+/// Minimal real-RBAC rig for `AuthRoutes::require_permission`'s service-scoped
+/// branch (#2298 PR 3 — the flip). `require_permission` never touches
+/// `tag_store_`/`mgmt_group_store_` (only `require_scoped_permission`/
+/// `confine_agent_target` do), so both stay nullptr — `GatesRig`
+/// (test_authz_gates.cpp) is the fuller rig for those. Grants are set on
+/// synthetic securable names (e.g. "ZzzFlip...") rather than reusing real
+/// seeded ITServiceOwner grants, so a test's precondition is explicit and
+/// does not drift if the real seed data ever changes.
+struct ServiceScopeFlipRig {
+    Config cfg{};
+    yuzu::MetricsRegistry metrics; // wired so the default-deny counter fires
+    auth::AuthManager auth_mgr{};
+    pg::PgPool pool;
+    RbacStore rbac;
+    yuzu::test::ApiTokenStorePg api_tokens;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    std::unique_ptr<AuthRoutes> ar;
+
+    explicit ServiceScopeFlipRig(const std::string& dsn)
+        : pool{{.conninfo = dsn, .size = 2}}, rbac{pool} {
+        REQUIRE(pool.valid());
+        REQUIRE(rbac.is_open());
+        rbac.set_rbac_enabled(true); // enforcement in effect, not legacy-open
+        auth_mgr.set_metrics_registry(&metrics);
+        REQUIRE(auth_mgr.upsert_user("minter", "correct-horse-battery-staple", auth::Role::admin));
+        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(),
+                                          /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr,
+                                          /*tag_store=*/nullptr, /*analytics_store=*/nullptr,
+                                          oidc_mu, oidc_provider);
+    }
+
+    /// Mint a token as "minter" — empty `scope_service` ⇒ a non-service token.
+    std::string mint(const std::string& scope_service = {}) {
+        auto raw = api_tokens->create_token("svc-flip-test", "minter",
+                                            service_scope_flip_now_epoch() + 3600, scope_service);
+        REQUIRE(raw.has_value());
+        return *raw;
+    }
+
+    double counter(const std::string& name, const yuzu::Labels& labels = {}) {
+        return labels.empty() ? metrics.counter(name).value()
+                              : metrics.counter(name, labels).value();
+    }
+};
 
 }  // namespace
 
@@ -691,6 +762,116 @@ TEST_CASE("AuthRoutes::require_permission — supervised MCP token allows Read (
 
     bool ok = fix.ar->require_permission(req, res, "Infrastructure", "Read");
     CHECK(ok);
+}
+
+// ---------------------------------------------------------------------------
+// require_permission — service-scoped token default-deny flip (#2298 PR 3,
+// "the flip"). ITServiceOwner remains the authority CEILING (checked first,
+// unchanged) but is no longer sufficient on its own — a pair also has to
+// clear the seeded-EMPTY `kServiceScopeGlobalSafe` allow-list. Swept every
+// service-scoped-token test in the suite before writing these: every
+// existing one either drives a FAKE perm_fn/scoped_perm_fn (route-level and
+// MCP harnesses — test_rest_guaranteed_state.cpp, test_guardian_routes.cpp,
+// test_mcp_server.cpp, test_schedule_routes.cpp, etc. — none call the real
+// AuthRoutes gate) or already expects deny via an interim
+// deny_service_scoped_*/deny_fleet_wide_service_scoped helper that fires
+// BEFORE perm_fn is ever reached. None pinned the OLD "ITServiceOwner holds
+// it ⇒ admit" shape this flip removes, so none needed updating.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_permission — service-scoped token: ITServiceOwner "
+          "ceiling holds but the default-deny allow-list still denies (the flip)",
+          "[pg][auth_routes][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    // "Response"/"Read" is a real, catalogued (securable_type, operation)
+    // pair — role_permissions FK-references securable_types/operations, so a
+    // synthetic name is rejected by the store, not just untested. Granted
+    // EXPLICITLY here so the precondition is this test's own, not incidental
+    // to whatever ITServiceOwner's real seed happens to already grant.
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Response", "Read", "allow"}).has_value());
+    auto token = r.mint("printers");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    bool ok = r.ar->require_permission(req, res, "Response", "Read");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("global-safe allow-list") != std::string::npos);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["permission"] == "Response:Read");
+
+    // The metric drives Phase 2 prioritization — path_class="default" since
+    // this request never sets req.path (resolve_body_cap's catch-all row).
+    CHECK(r.counter("yuzu_auth_service_scope_default_denied_total",
+                     {{"permission", "Response:Read"}, {"path_class", "default"}}) == 1);
+}
+
+TEST_CASE("AuthRoutes::require_permission — service-scoped token lacking the "
+          "ITServiceOwner ceiling denies with the ceiling message, never reaching "
+          "the default-deny check (ceiling still enforced FIRST)",
+          "[pg][auth_routes][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    // Explicit DENY, not merely "not granted" — makes the precondition this
+    // test's own regardless of ITServiceOwner's real default seed.
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Response", "Read", "deny"}).has_value());
+    auto token = r.mint("printers");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    bool ok = r.ar->require_permission(req, res, "Response", "Read");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("ITServiceOwner permission required") != std::string::npos);
+    // Never reached the default-deny check for this pair.
+    CHECK(r.counter("yuzu_auth_service_scope_default_denied_total",
+                     {{"permission", "Response:Read"}, {"path_class", "default"}}) == 0);
+}
+
+TEST_CASE("AuthRoutes::require_permission — service-scoped token hard-403s when "
+          "RBAC enforcement is not in effect (decision: preserve hard-403, do NOT "
+          "let require_fleet_read's narrowed-not-denied posture leak in here)",
+          "[pg][auth_routes][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Response", "Read", "allow"}).has_value());
+    r.rbac.set_rbac_enabled(false); // genuinely, freshly disabled
+    auto token = r.mint("printers");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    bool ok = r.ar->require_permission(req, res, "Response", "Read");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("require RBAC to be enabled") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_permission — the seeded-empty allow-list's admit "
+          "path via the testonly override seam (kServiceScopeGlobalSafe is "
+          "constexpr-empty in production, so this wiring has no real-table path "
+          "to exercise otherwise)",
+          "[pg][auth_routes][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Response", "Read", "allow"}).has_value());
+    auto token = r.mint("printers");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    r.ar->set_service_scope_global_safe_override_for_test(
+        std::vector<authz::PermPair>{{"Response", "Read"}});
+    bool ok = r.ar->require_permission(req, res, "Response", "Read");
+    CHECK(ok);
+    CHECK(r.counter("yuzu_auth_service_scope_default_denied_total",
+                     {{"permission", "Response:Read"}, {"path_class", "default"}}) == 0);
+
+    // Clearing the override reverts to the real, empty, production table.
+    r.ar->set_service_scope_global_safe_override_for_test(std::nullopt);
+    httplib::Response res2;
+    bool ok2 = r.ar->require_permission(req, res2, "Response", "Read");
+    CHECK_FALSE(ok2);
+    CHECK(res2.status == 403);
 }
 
 // ---------------------------------------------------------------------------

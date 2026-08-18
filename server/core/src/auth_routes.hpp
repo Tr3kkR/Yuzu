@@ -11,6 +11,7 @@
 #include "oidc_provider.hpp"
 #include "saml_provider.hpp"
 #include "rbac_store.hpp"
+#include "service_scope_policy.hpp" // authz::PermPair — the test-override seam's element type
 #include "tag_store.hpp"
 
 #include <httplib.h>
@@ -245,14 +246,13 @@ public:
     /// What this gate genuinely does NOT cover — a caller needing either must
     /// check it WITHOUT re-deciding the RBAC/mgmt-group axis (i.e. not via
     /// `require_permission`'s full branch chain): `mcp_tier` enforcement
-    /// (`mcp::tier_allows`/`requires_approval`), and the RBAC-enabled
-    /// requirement for service-scoped sessions specifically (a disabled-RBAC
-    /// service session still gets a narrowed, non-empty result here, via the
-    /// service-tag axis alone, unlike `require_permission`'s service branch
-    /// which hard-403s in that case). No such standalone tier/RBAC-enabled
-    /// check exists yet as of this comment — a route wiring this gate to a
-    /// tier-sensitive or service-scope-sensitive operation must add one, not
-    /// assume `require_permission` supplies it. Also NOT covered: unlike
+    /// (`mcp::tier_allows`/`requires_approval`). The RBAC-enabled requirement
+    /// for service-scoped sessions IS now covered (#2298 PR 3, decision 1 —
+    /// corrected from an earlier version of this comment that said the
+    /// opposite): a disabled-RBAC service-scoped session hard-403s here too,
+    /// same predicate (`rbac_enforcement_in_effect`) and same outcome as
+    /// `require_permission`'s service branch, so the two gates cannot
+    /// disagree on this axis. Also NOT covered: unlike
     /// `require_list_read` above, this gate calls `authorize_list_read`
     /// directly with no JIT-elevation branch (an elevated session gets no
     /// special unfiltered treatment here) and no engine-principal branch (an
@@ -507,7 +507,30 @@ public:
     /// qe-B: the load-shed branch must be exercised.
     void set_mfa_pending_cap_for_test(std::size_t cap) { mfa_pending_cap_ = cap; }
 
+    /// Override the service-scope global-safe allow-list for a test
+    /// (`kServiceScopeGlobalSafe` is seeded EMPTY in production, #2298 PR 3 —
+    /// see `service_scope_policy.hpp` — so `require_permission`'s
+    /// "cleared the allow-list -> admit" wiring has no real-table path to
+    /// exercise otherwise). `std::nullopt` reverts to the real, empty,
+    /// production table. Test-only seam, same shape as
+    /// `set_mfa_pending_cap_for_test` above.
+    void set_service_scope_global_safe_override_for_test(
+        std::optional<std::vector<authz::PermPair>> table) {
+        service_scope_global_safe_override_for_test_ = std::move(table);
+    }
+
 private:
+    /// Whether `(securable_type, operation)` clears the service-scope
+    /// default-deny gate: the test override if one is set, else the real
+    /// `authz::kServiceScopeGlobalSafe` table via
+    /// `authz::service_scope_global_safe`. Shared by `require_permission`'s
+    /// service branch and its engine-branch belt-and-braces so both consult
+    /// the identical decision.
+    [[nodiscard]] bool service_scope_admits(std::string_view securable_type,
+                                            std::string_view operation) const;
+
+    std::optional<std::vector<authz::PermPair>> service_scope_global_safe_override_for_test_;
+
     std::size_t mfa_pending_cap_{kMaxPendingTokens};
     mutable std::mutex mfa_pending_mu_;
     std::unordered_map<std::string, MfaPending> mfa_pending_;
