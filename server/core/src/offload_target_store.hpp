@@ -4,8 +4,8 @@
 /// Phase 8.3 (#255) — Response Offloading. Configurable external HTTP
 /// endpoints that receive response data in real time.
 ///
-/// Reuses the WebhookStore delivery pattern (counting-semaphore-bounded
-/// detached thread per delivery, async record), and adds:
+/// Reuses the WebhookStore delivery pattern (bounded-worker-pool dispatch
+/// per delivery, async record - see store_worker_pool.hpp), and adds:
 ///   - typed auth (none / bearer / basic / hmac)
 ///   - server-side batching (`batch_size > 1` accumulates events into a
 ///     per-target buffer and flushes on threshold or on `flush_all()`)
@@ -13,8 +13,8 @@
 ///     `spec.offload.targets` in InstructionDefinition YAML
 ///
 /// Secrets (auth_credential) are persisted but NEVER returned by `list()`.
-/// The `fire_event` call path is fire-and-forget and acquires a 10-slot
-/// semaphore so a slow endpoint can't drown the server.
+/// The `fire_event` call path is fire-and-forget and dispatches onto the
+/// bounded worker pool so a slow endpoint can't drown the server.
 
 #include "store_worker_pool.hpp"
 

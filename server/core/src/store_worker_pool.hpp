@@ -38,7 +38,6 @@
 
 #include <spdlog/spdlog.h>
 
-#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -60,8 +59,26 @@ public:
         num_threads = std::max<std::size_t>(num_threads, 1);
         num_threads = std::min<std::size_t>(num_threads, 16);
         workers_.reserve(num_threads);
-        for (std::size_t i = 0; i < num_threads; ++i) {
-            workers_.emplace_back([this] { worker_loop(); });
+        // EXCEPTION-SAFE CONSTRUCTION (gov Gate 8 architect). std::thread's
+        // ctor throws std::system_error under EAGAIN (thread/pid
+        // exhaustion - plausible exactly at server boot, when both stores
+        // construct a pool each). Without this guard the throw propagates
+        // out of this constructor, which destroys the partially-filled
+        // `workers_` vector - and ~std::thread on a JOINABLE thread calls
+        // std::terminate(). Mirrors agents/core/src/thread_pool.hpp's
+        // identical guard (governance Gate-4 UP-3 there); this file could
+        // not reuse that one directly (server/agent are separate build
+        // targets with no shared internal library for something this
+        // small), but should have copied the safety net along with the
+        // idiom the header comment already credits it for - a first
+        // review round caught it not having done so.
+        try {
+            for (std::size_t i = 0; i < num_threads; ++i) {
+                workers_.emplace_back([this] { worker_loop(); });
+            }
+        } catch (...) {
+            quiesce_and_join_unconditional(); // signal + join whatever DID start
+            throw;                            // caller still learns construction failed
         }
     }
 
@@ -75,15 +92,7 @@ public:
         // member of any store that owns one: member destruction order is
         // reverse-declaration, so this join runs BEFORE that store's
         // db_/mtx_ are torn down.
-        {
-            std::lock_guard lock(mu_);
-            stop_ = true;
-        }
-        cv_.notify_all();
-        for (auto& w : workers_) {
-            if (w.joinable())
-                w.join();
-        }
+        quiesce_and_join_unconditional();
     }
 
     StoreWorkerPool(const StoreWorkerPool&) = delete;
@@ -112,15 +121,31 @@ public:
     /// running past the deadline - the caller must not destroy the pool
     /// in that case; see the header comment on `~StoreWorkerPool`).
     bool quiesce(std::chrono::milliseconds timeout) {
-        {
-            std::lock_guard lock(mu_);
-            closed_ = true;
-        }
         std::unique_lock lock(mu_);
+        closed_ = true;
         return idle_cv_.wait_for(lock, timeout, [this] { return pending_ == 0; });
     }
 
 private:
+    /// Signal every started worker to stop and join it. Safe to call on a
+    /// partially constructed pool (the ctor's failure path, where some
+    /// workers never started) and from the destructor. `noexcept` matches
+    /// agents/core/src/thread_pool.hpp's identical helper: a join that
+    /// throws here would terminate() us anyway (joining an already-joined
+    /// or not-joinable thread doesn't throw the way we call it, but the
+    /// noexcept documents the intent).
+    void quiesce_and_join_unconditional() noexcept {
+        {
+            std::lock_guard lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) {
+            if (w.joinable())
+                w.join();
+        }
+    }
+
     void worker_loop() {
         while (true) {
             std::function<void()> task;

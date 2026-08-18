@@ -1587,6 +1587,30 @@ public:
                           "Cooldown entries evicted at the capacity bound", "counter");
         metrics_.describe("yuzu_server_dex_alert_routed_types",
                           "Number of obs_types currently routed to alerts", "gauge");
+        // #3261 governance hardening (Gate 8 consistency-auditor) - the same
+        // parity gap DexAlertRouter's family above had before its own
+        // describe() calls were added: without this, these six counters
+        // emit no HELP/TYPE line and stay entirely absent until first
+        // incremented.
+        metrics_.describe("yuzu_server_webhook_delivery_success_total",
+                          "Webhook deliveries that completed with a 2xx response", "counter");
+        metrics_.describe("yuzu_server_webhook_delivery_failed_total",
+                          "Webhook deliveries that failed (connection error, non-2xx, exception)",
+                          "counter");
+        metrics_.describe("yuzu_server_webhook_delivery_dropped_total",
+                          "Webhook deliveries dropped because the delivery worker pool's queue "
+                          "was full or the store was quiescing",
+                          "counter");
+        metrics_.describe("yuzu_server_offload_delivery_success_total",
+                          "Offload-target deliveries that completed with a 2xx response", "counter");
+        metrics_.describe("yuzu_server_offload_delivery_failed_total",
+                          "Offload-target deliveries that failed (connection error, non-2xx, "
+                          "exception, or a tampered non-http(s) URL)",
+                          "counter");
+        metrics_.describe("yuzu_server_offload_delivery_dropped_total",
+                          "Offload-target deliveries dropped because the delivery worker pool's "
+                          "queue was full or the store was quiescing",
+                          "counter");
         // ADR-0010 §Decision 3. Carried in the gauge family because the
         // authoritative cumulative count lives in SecretCodec and is exported
         // pull-model at scrape time, but it IS a monotonic counter — declared
@@ -7354,50 +7378,95 @@ public:
         // WebhookStore / OffloadTargetStore (#3261 governance hardening).
         // flush_all() runs HERE, after the gRPC drain above, not before it -
         // an earlier version ran it before Shutdown(deadline), which missed
-        // any delivery fired by a Register/process_gateway_response call
-        // still in flight during the up-to-5s drain window (Gate 4
-        // unhappy-path UP-1). Both stores now dispatch deliveries onto a
-        // bounded StoreWorkerPool (store_worker_pool.hpp) instead of a raw
-        // detached std::thread, so quiesce(15s) below gives a real, bounded
-        // guarantee that no delivery thread is still touching the store
-        // before it is reset - closing the use-after-free that motivated
-        // this whole block (security-guardian/cpp-safety/sre, Gate 2/3) and
-        // the unbounded-thread-creation risk on a mass-reconnect burst
-        // (Gate 4 unhappy-path UP-2/UP-8), since the pool caps concurrent
-        // thread creation, not just concurrent HTTP work.
+        // any delivery fired by a Register/Subscribe/process_gateway_response
+        // call ARRIVING OVER gRPC still in flight during the up-to-5s drain
+        // window (Gate 4 unhappy-path UP-1). Both stores now dispatch
+        // deliveries onto a bounded StoreWorkerPool (store_worker_pool.hpp)
+        // instead of a raw detached std::thread, so quiesce(30s) below gives
+        // a real, bounded guarantee that no delivery thread already
+        // SUBMITTED to the pool is still touching the store before it is
+        // reset - closing the use-after-free for every producer that
+        // dispatches through fire_event() -> pool_.submit() (every
+        // Register/Subscribe/process_gateway_response call arriving over
+        // gRPC, security-guardian/cpp-safety/sre Gate 2/3) and the
+        // unbounded-thread-creation risk on a mass-reconnect burst (Gate 4
+        // unhappy-path UP-2/UP-8), since the pool caps concurrent thread
+        // creation, not just concurrent HTTP work.
+        //
+        // KNOWN GAP, filed as #3279, NOT fixed here (Gate 8 re-review):
+        // forward_gateway_pending()'s outbound-forward thread is a
+        // separate, pre-existing, untracked std::thread(...).detach() that
+        // also eventually calls process_gateway_response -> fire_event() on
+        // agent_service_'s plain (non-atomic) webhook_store_/
+        // offload_target_store_ pointers. This diff did not modify that
+        // thread - but per this same reachability rubric applied everywhere
+        // else in this PR, the diff DID make the race live: before #3261
+        // those two pointers were wired before construction and
+        // permanently null, so fire_event() on this path was always a
+        // no-op; now that they are correctly wired, this pre-existing
+        // thread reaches the exact defect class this block exists to
+        // close, via a producer neither Shutdown(deadline) above (gRPC
+        // handler threads only) nor quiesce() below (pool-submitted work
+        // only) drains. security-guardian's Gate 8 verdict on this point
+        // was PARTIALLY RESOLVED / recommend continued BLOCK; cpp-safety,
+        // architect and sre's independent Gate 8 passes over the same site
+        // characterized it as a separate subsystem (forward_gateway_
+        // pending needs its own pooling/draining story, #3279) rather than
+        // this PR's fix surface. Both readings are in #3279 verbatim -
+        // deferred to Dave to adjudicate, not resolved by this comment.
+        //
+        // On timeout: escalate via std::_Exit, the SAME choice web_thread_
+        // makes a few hundred lines up, and for the identical reason - NOT
+        // the nvd_sync leak-and-continue precedent (Gate 8 unhappy-path
+        // UP-9 caught this: an earlier version of this block DID leak, on
+        // the theory that db_/mtx_ staying valid-but-unreferenced was
+        // enough. It missed that both stores also borrow metrics_, a raw
+        // pointer into THIS ServerImpl's own metrics_ member - leaking the
+        // store does not extend metrics_'s lifetime, and ~ServerImpl runs
+        // moments after stop() returns. A worker that eventually finishes
+        // its delivery would then call metrics_->counter(...) against a
+        // freed object. The nvd_sync precedent is safe only when nothing
+        // else in this function touches what the leaked object references
+        // again; that does not hold here, exactly as the web_thread_
+        // comment above already warns.
+        //
+        // BOUND, derived from THIS workload, not copied from web_thread_'s
+        // 15s (advisor review post-Gate-8): deliver_single's httplib::Client
+        // allows connect(5s) + write(10s) + read(10s) = 25s for ONE
+        // legitimate, healthy, slow-endpoint delivery (webhook_store.cpp /
+        // offload_target_store.cpp set_*_timeout calls). web_thread_'s 15s
+        // is calibrated to ITS OWN workload (one post-close-signal
+        // keep-alive tick) and does not transfer - copying it here would
+        // let an ORDINARY slow-but-healthy delivery in flight at SIGTERM
+        // trip force-exit and skip all remaining teardown, on a path that
+        // is not even a bug. 30s gives >5s margin over the 25s legitimate
+        // worst case so escalation fires on a genuinely wedged delivery,
+        // not a slow one.
         if (offload_target_store_)
             offload_target_store_->flush_all();
         const bool webhook_drained =
-            !webhook_store_ || webhook_store_->quiesce(std::chrono::seconds(15));
+            !webhook_store_ || webhook_store_->quiesce(std::chrono::seconds(30));
         const bool offload_drained =
-            !offload_target_store_ || offload_target_store_->quiesce(std::chrono::seconds(15));
+            !offload_target_store_ || offload_target_store_->quiesce(std::chrono::seconds(30));
+        if (!webhook_drained || !offload_drained) {
+            // Async-signal-safe only (see the web_thread_ comment above for
+            // why spdlog is not used here): a raw write() of a fixed
+            // message, then _Exit. Skips the remaining teardown below,
+            // exactly as a supervisor SIGKILL would - strictly no worse.
+            const char msg[] =
+                "ServerImpl::stop: WebhookStore/OffloadTargetStore did not quiesce within "
+                "30s (#3261 governance hardening) - force-exiting.\n";
+#ifdef _WIN32
+            _write(2, msg, sizeof(msg) - 1);
+#else
+            (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            std::_Exit(1);
+        }
         agent_service_.set_webhook_store(nullptr);
         agent_service_.set_offload_target_store(nullptr);
-        if (webhook_drained) {
-            webhook_store_.reset();
-        } else {
-            // Mirrors the nvd_sync leak-and-continue precedent elsewhere in
-            // this function: a delivery is still in flight past the bound
-            // (a slow/unreachable operator-configured endpoint). Destroying
-            // the store now would be the exact use-after-free this pool
-            // exists to prevent; hanging stop() indefinitely is not
-            // acceptable either (it runs synchronously on the SIGTERM
-            // handler thread). Deliberately leak: release() so ~WebhookStore
-            // never runs, and the still-running worker keeps touching
-            // valid, merely-unreferenced memory instead of freed memory.
-            spdlog::critical("ServerImpl::stop: WebhookStore did not quiesce within 15s - "
-                              "leaking the store rather than risking a use-after-free "
-                              "against an in-flight delivery");
-            [[maybe_unused]] auto* leaked = webhook_store_.release();
-        }
-        if (offload_drained) {
-            offload_target_store_.reset();
-        } else {
-            spdlog::critical("ServerImpl::stop: OffloadTargetStore did not quiesce within 15s - "
-                              "leaking the store rather than risking a use-after-free "
-                              "against an in-flight delivery");
-            [[maybe_unused]] auto* leaked = offload_target_store_.release();
-        }
+        webhook_store_.reset();
+        offload_target_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
         // pointer from agent_service_ (the Register sync_agent_tags ingest —
         // Register-only, heartbeats do not sync tags; governance perf-F8),

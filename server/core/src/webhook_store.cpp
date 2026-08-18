@@ -8,7 +8,6 @@
 
 #include <chrono>
 #include <iomanip>
-#include <semaphore>
 #include <shared_mutex>
 #include <sstream>
 
@@ -129,9 +128,24 @@ WebhookStore::~WebhookStore() {
     // standalone WebhookStore) - bounded generously rather than
     // literally forever, so a std::chrono::milliseconds::max() overflow
     // in the wait's internal deadline arithmetic isn't a risk.
-    pool_.quiesce(std::chrono::hours(24));
-    if (db_)
-        sqlite3_close(db_);
+    //
+    // gov Gate 8 cpp-expert: the RETURN VALUE matters, not just the call.
+    // An earlier version discarded it and closed db_ unconditionally,
+    // which would have silently reintroduced the exact use-after-free
+    // this pool exists to prevent on the one path (a caller destroying
+    // this store WITHOUT going through stop()'s escalate-on-timeout
+    // first) this defensive call is supposed to cover. If still not
+    // drained after 24h, leak the SQLite handle rather than close it -
+    // spdlog is safe here (an ordinary destructor call stack, not the
+    // signal-handler context ServerImpl::stop() runs in).
+    if (pool_.quiesce(std::chrono::hours(24))) {
+        if (db_)
+            sqlite3_close(db_);
+    } else {
+        spdlog::critical("WebhookStore::~WebhookStore: pool did not quiesce within 24h - "
+                          "leaking the SQLite handle rather than risking a use-after-free "
+                          "against an in-flight delivery");
+    }
 }
 
 bool WebhookStore::is_open() const {
@@ -338,18 +352,10 @@ void WebhookStore::record_delivery(int64_t webhook_id, const std::string& event_
     sqlite3_finalize(stmt);
 }
 
-// ── Concurrency limiter for async delivery ──────────────────────────────────
-
-/// Counting semaphore limiting concurrent webhook deliveries to 10 threads.
-static std::counting_semaphore<10> delivery_semaphore{10};
-
-// ── Single webhook delivery (runs on a worker thread) ───────────────────────
+// ── Single webhook delivery (runs on a worker pool thread) ─────────────────
 
 void WebhookStore::deliver_single(const Webhook& wh, const std::string& event_type,
                                   const std::string& payload_json) {
-    // Acquire semaphore slot — blocks if 10 deliveries already in flight
-    delivery_semaphore.acquire();
-
     int status_code = 0;
     std::string error;
 
@@ -414,8 +420,6 @@ void WebhookStore::deliver_single(const Webhook& wh, const std::string& event_ty
         std::unique_lock lock(mtx_);
         record_delivery(wh.id, event_type, payload_json, status_code, error);
     }
-
-    delivery_semaphore.release();
 }
 
 // ── Event firing (async — returns immediately) ──────────────────────────────
@@ -457,12 +461,12 @@ void WebhookStore::fire_event(const std::string& event_type, const std::string& 
     }
 
     // Deliver to each matching webhook on the bounded pool (#3261 governance
-    // hardening - was a raw detached std::thread per event; see
-    // store_worker_pool.hpp for why). The counting semaphore inside
-    // deliver_single further limits concurrent HTTP work to 10; the pool
-    // itself bounds concurrent THREAD creation to 4, and a full queue
-    // drops the delivery (logged + counted) rather than spawning unbounded
-    // threads.
+    // hardening - was a raw detached std::thread per event, limited only by
+    // a counting semaphore acquired INSIDE the already-spawned thread; see
+    // store_worker_pool.hpp for why that didn't bound thread creation. The
+    // pool's 4 fixed workers now bound both concurrent HTTP work and thread
+    // creation in one place; a full queue drops the delivery (logged +
+    // counted) rather than spawning an unbounded thread.
     for (const auto& wh : matching) {
         const bool queued = pool_.submit(
             [this, wh, event_type, payload_json]() { deliver_single(wh, event_type, payload_json); });

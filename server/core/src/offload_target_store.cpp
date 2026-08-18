@@ -10,7 +10,6 @@
 #include <algorithm>
 #include <chrono>
 #include <iomanip>
-#include <semaphore>
 #include <shared_mutex>
 #include <sstream>
 
@@ -176,10 +175,28 @@ OffloadTargetStore::~OffloadTargetStore() {
     // destructors, so pool_ being the last-declared member does not, by
     // itself, stop this line from closing db_ while a worker is still
     // touching it. See webhook_store.cpp's identical destructor for the
-    // full rationale (mirrors WebhookStore's fix precisely).
-    pool_.quiesce(std::chrono::hours(24));
-    if (db_)
-        sqlite3_close(db_);
+    // full rationale.
+    //
+    // gov Gate 8 cpp-safety (re-review): the RETURN VALUE matters, not
+    // just the call - an earlier version of this destructor discarded it
+    // and closed db_ unconditionally, silently reintroducing the exact
+    // use-after-free this pool exists to prevent on the one path (a
+    // caller destroying this store without going through
+    // ServerImpl::stop()'s escalate-on-timeout first) this defensive call
+    // is supposed to cover. httplib's read/write timeouts reset PER CALL,
+    // not per connection (see the codebase's own httplib-write-timeout
+    // note), so a slow-dribbling remote endpoint can hold a delivery open
+    // well past 15s in practice - this is not a purely theoretical path.
+    // spdlog is safe here (an ordinary destructor call stack, not the
+    // signal-handler context ServerImpl::stop() runs in).
+    if (pool_.quiesce(std::chrono::hours(24))) {
+        if (db_)
+            sqlite3_close(db_);
+    } else {
+        spdlog::critical("OffloadTargetStore::~OffloadTargetStore: pool did not quiesce "
+                          "within 24h - leaking the SQLite handle rather than risking a "
+                          "use-after-free against an in-flight delivery");
+    }
 }
 
 bool OffloadTargetStore::is_open() const {
@@ -513,28 +530,7 @@ void OffloadTargetStore::record_delivery(int64_t target_id, const std::string& e
     sqlite3_finalize(stmt);
 }
 
-// ── Concurrency limiter for async delivery ──────────────────────────────────
-
-/// Counting semaphore limiting concurrent offload deliveries to 10 threads.
-/// Mirrors WebhookStore — both stores share the dispatch shape but each
-/// maintains its own quota (operator can run a ten-target SIEM fleet
-/// without it crowding webhook delivery slots).
-static std::counting_semaphore<10> offload_semaphore{10};
-
-namespace {
-/// RAII guard for the delivery semaphore — ensures release on every exit
-/// path including throw / unhandled exception. The hand-paired
-/// acquire/release was a slot-leak risk (sec-L7) if any delivery step
-/// threw between acquire and release.
-struct SemaGuard {
-    SemaGuard() { offload_semaphore.acquire(); }
-    ~SemaGuard() { offload_semaphore.release(); }
-    SemaGuard(const SemaGuard&) = delete;
-    SemaGuard& operator=(const SemaGuard&) = delete;
-};
-} // namespace
-
-// ── Single delivery (runs on a worker thread) ───────────────────────────────
+// ── Single delivery (runs on a worker pool thread) ──────────────────────────
 
 std::string OffloadTargetStore::build_batch_body(const std::vector<BufferedEvent>& events) {
     nlohmann::json arr = nlohmann::json::array();
@@ -565,8 +561,6 @@ void OffloadTargetStore::deliver_single(const OffloadTarget& tgt, const std::str
             metrics_->counter("yuzu_server_offload_delivery_failed_total").increment();
         return;
     }
-
-    SemaGuard guard;
 
     int status_code = 0;
     std::string error;
@@ -640,7 +634,6 @@ void OffloadTargetStore::deliver_single(const OffloadTarget& tgt, const std::str
             .increment();
     }
     record_delivery(tgt.id, event_type, event_count, payload_body, status_code, error);
-    // SemaGuard releases on scope exit.
 }
 
 // ── Event firing (async — returns immediately) ──────────────────────────────
