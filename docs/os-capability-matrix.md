@@ -135,7 +135,7 @@ duplicates.
 | wifi | ✅ | ✅ | ✅ | win/linux/apple all implemented; macOS `connected` via CoreWLAN (`wifi_corewlan.mm`), `list_networks` legacy `airport -s`/`system_profiler` (connection depth: the **Live — Wi-Fi current connection** row) |
 | windows_updates | ✅ | ✅ | ✅ | update history / rpm+apt / `system_profiler` install history (Linux/mac report installed-package history) |
 | wmi | ✅ | ⛔ | ⛔ | Windows-only (`#ifndef _WIN32` → not available) |
-| wol | ✅ | ✅ | ✅ | `wol_plugin.cpp` — `_WIN32` vs POSIX portable UDP broadcast (wake); macOS `check` reachability now uses `ping -t 2` (BSD whole-run deadline; the shared POSIX `-W 2` path meant 2 ms on Darwin → every live host falsely `unreachable`) |
+| wol | ✅ | ✅ | ✅ | `wol_plugin.cpp` — `_WIN32` vs POSIX portable UDP broadcast (wake); `check` reachability is native on every platform (unprivileged ICMP echo with a TCP-connect fallback on port 443, ADR-3002 rung 1) — no subprocess spawn, no `ping` shell-out |
 
 ## Why gaps happen (and how to not get surprised again)
 
@@ -816,8 +816,9 @@ verified against the cited code:
 - **New rows:** **Antivirus posture** (macOS 🟡 — real XProtect/EDR probes, no
   real-time-protection state) and **Live — Wi-Fi current connection** (macOS 🟡 —
   CoreWLAN, SSID/BSSID withheld from a daemon).
-- **Honesty-only** (cell unchanged): `wol` `check` (`ping -t 2`, was a false
-  `unreachable`), `wifi connected` (CoreWLAN vs dead `airport -I`), `flush_dns`
+- **Honesty-only** (cell unchanged): `wol` `check` (native ICMP + TCP-connect
+  fallback, no subprocess; was a false `unreachable`), `wifi connected`
+  (CoreWLAN vs dead `airport -I`), `flush_dns`
   (dual-step + real exit codes), `registry`/`sccm`/`rdp_control` off-Windows
   sentinels (no false success on writes), `bitlocker`/`services`/`users`/
   `network_config` macOS enrichments, DNS-cache `unsupported` sentinel.
