@@ -5,177 +5,233 @@
  *   "state" — BitLocker / LUKS / FileVault status per volume.
  *
  * Output is pipe-delimited via write_output().
+ *
+ * Acquisition, per OS (Wave-3 native/argv migration — this plugin's raw
+ * `manage-bde -status` popen was the last raw spawn site in the file):
+ *   - windows: Win32_EncryptableVolume WMI query + a per-volume
+ *     GetConversionStatus() method call, both in-process (rung 1). No
+ *     subprocess at all.
+ *   - linux: libblkid TYPE=="crypto_LUKS" enumeration + plain
+ *     /sys/class/block/dm-N/dm/uuid reads for open-mapping state (rung 1).
+ *     No subprocess at all.
+ *   - macos: fdesetup/diskutil stay on the governed bounded-subprocess
+ *     runner, now as direct argv (rung 2) instead of a `/bin/sh -c` shell
+ *     wrapper (rung 3) — no acquisition-logic change, mechanical only.
  */
 
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (plg-L1)
 
-#include <array>
-#include <cstdio>
+#include <spdlog/spdlog.h>
+
 #include <format>
-#include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <win_str.hpp>   // yuzu::win::to_wide (#1681)
+#include <wmi_bounded.hpp> // yuzu::shared::wmi bounded WMI query/method call
+                            // (Windows-only; agents/shared, authored in
+                            // parallel on PR3.3a — see bitlocker_windows_wmi.hpp)
+#include "bitlocker_windows_wmi.hpp"
+#elif defined(__linux__)
+#include <blkid/blkid.h>
+
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <system_error>
+
+#include "bitlocker_linux_parsers.hpp"
+#elif defined(__APPLE__)
 #include <chrono>
-#include <spdlog/spdlog.h>
-#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
-#endif
 
-#ifdef __APPLE__
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
+
 #include "bitlocker_macos_apfs.hpp"
 #endif
 
 namespace {
 
-#ifndef _WIN32
+#ifdef __APPLE__
 // A generous per-call wall-clock bound for the local disk-encryption tools
-// (fdesetup/diskutil/lsblk/cryptsetup). Long enough never to fire in practice,
-// short enough that a wedged tool cannot pin the instruction worker forever.
+// (fdesetup/diskutil). Long enough never to fire in practice, short enough
+// that a wedged tool cannot pin the instruction worker forever.
 constexpr std::chrono::seconds kBitlockerCmdDeadline{20};
-#endif
 
-std::string run_command(const char* cmd) {
-#ifdef _WIN32
-    std::string result;
-    std::array<char, 256> buf{};
-    FILE* pipe = _popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
-    }
-    _pclose(pipe);
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-        result.pop_back();
-    return result;
-#else
-    // Route through the bounded, fork-lock-covered runner instead of a raw,
-    // deadline-less popen (K-7/CDX-07). `/bin/sh -c` preserves the exact shell
-    // semantics popen used (the commands rely on `2>/dev/null` redirects), so
-    // the returned stdout blob is byte-identical to the old path — only now it
-    // carries a hard deadline, an output cap, and the global fork-lock. stderr
-    // already goes to /dev/null (merge_stderr=false), matching the commands.
+// Runs one macOS disk-encryption tool through the bounded, fork-lock-covered
+// runner as a direct argv (no shell — rung 2). The `2>/dev/null` redirect
+// the old shell-wrapped form relied on is equivalent to merge_stderr=false,
+// the runner's default, so stderr is dropped the same way with no shell
+// needed to do it.
+std::string run_macos_tool(const std::vector<std::string>& argv, std::string_view operation) {
     auto res = yuzu::agent::run_bounded_subprocess(
-        {"/bin/sh", "-c", cmd},
-        yuzu::agent::SubprocessOptions{.deadline = kBitlockerCmdDeadline});
+        argv, yuzu::agent::SubprocessOptions{.deadline = kBitlockerCmdDeadline});
     // A deadline-killed or exec-failed tool returns empty/partial output that
     // would otherwise parse as a legitimate "FileVault absent / no volumes" —
     // a silent false-negative. Warn so an operator can tell a cut-short scan
     // from a genuinely empty result (sre-M1; mirrors the event_logs pattern).
     if (res.timed_out || !res.tool_ran || res.output_truncated) {
-        spdlog::warn("bitlocker: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
-                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
+        spdlog::warn("bitlocker: degraded {} (timed_out={}, tool_ran={}, truncated={})", operation,
+                     res.timed_out, res.tool_ran, res.output_truncated);
     }
     std::string result = res.output;
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
         result.pop_back();
     return result;
-#endif
 }
+#endif
 
 #ifdef _WIN32
 
-void parse_bitlocker_status(yuzu::CommandContext& ctx, const std::string& output) {
-    std::istringstream iss(output);
-    std::string line;
-    std::string drive, conversion, pct_encrypted, method, protection;
+// root\CIMV2\Security\MicrosoftVolumeEncryption requires admin privilege
+// (MS docs) — shared by both WMI calls below.
+constexpr wchar_t kBitlockerWmiNamespace[] = L"root\\CIMV2\\Security\\MicrosoftVolumeEncryption";
 
-    auto emit_volume = [&]() {
-        if (!drive.empty()) {
-            ctx.write_output(std::format("volume|{}|{}|{}|{}|{}", drive, conversion, pct_encrypted,
-                                         method, protection));
+// Returns false on a total acquisition failure (query error) so execute()
+// can report a non-zero exit code, matching the pre-migration contract
+// (an empty/failed `manage-bde -status` also returned 1). An empty-but-
+// successful volume list is NOT a failure — it returns true.
+bool report_bitlocker_status(yuzu::CommandContext& ctx) {
+    // sink: bitlocker/report_bitlocker_status#1 — rung 1, in-process WMI
+    // query (Win32_EncryptableVolume) replacing the raw `manage-bde
+    // -status` popen this plugin used to run.
+    auto query = yuzu::shared::wmi::run_bounded_wmi_query(
+        kBitlockerWmiNamespace,
+        L"SELECT DeviceID, DriveLetter, ProtectionStatus FROM Win32_EncryptableVolume");
+
+    if (query.error.has_value()) {
+        // Unprivileged runs get a typed sentinel instead of a raw COM
+        // failure string or a crash — this namespace is admin-only.
+        if (yuzu::bitlocker::windows::is_permission_denied(query.error)) {
+            ctx.write_output(
+                "error|permission_denied: administrator privilege required to read BitLocker status");
+        } else {
+            ctx.write_output(
+                std::format("error|{}", yuzu::util::safe_output_field(*query.error)));
         }
-        drive.clear();
-        conversion.clear();
-        pct_encrypted.clear();
-        method.clear();
-        protection.clear();
-    };
-
-    while (std::getline(iss, line)) {
-        while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
-            line.pop_back();
-        if (line.empty())
-            continue;
-
-        // Volume lines look like: "Volume C: [OS]"
-        if (line.find("Volume") == 0 && line.find(':') != std::string::npos) {
-            emit_volume();
-            // Extract drive letter
-            auto colon = line.find(':');
-            if (colon > 0) {
-                drive = line.substr(colon - 1, 2); // e.g. "C:"
-            }
-            continue;
-        }
-
-        auto colon = line.find(':');
-        if (colon == std::string::npos)
-            continue;
-
-        auto key = line.substr(0, colon);
-        auto val = line.substr(colon + 1);
-        // Trim
-        while (!key.empty() && (key.front() == ' ' || key.front() == '\t'))
-            key.erase(key.begin());
-        while (!key.empty() && key.back() == ' ')
-            key.pop_back();
-        while (!val.empty() && val.front() == ' ')
-            val.erase(val.begin());
-        while (!val.empty() && val.back() == ' ')
-            val.pop_back();
-
-        if (key == "Conversion Status") {
-            conversion = val;
-        } else if (key == "Percentage Encrypted") {
-            pct_encrypted = val;
-        } else if (key == "Encryption Method") {
-            method = val;
-        } else if (key == "Protection Status") {
-            protection = val;
-        }
+        return false;
     }
-    emit_volume();
+
+    auto volumes = yuzu::bitlocker::windows::parse_encryptable_volumes(query.rows);
+    if (volumes.empty()) {
+        ctx.write_output("volume|none|no_encryptable_volumes");
+        return true;
+    }
+
+    for (const auto& vol : volumes) {
+        auto object_path = yuzu::bitlocker::windows::build_volume_object_path(vol.device_id);
+        // sink: bitlocker/report_bitlocker_status#2 — rung 1, in-process WMI
+        // method call (GetConversionStatus), one per enumerated volume.
+        auto conv = yuzu::shared::wmi::exec_object_method(
+            kBitlockerWmiNamespace, yuzu::win::to_wide(object_path), L"GetConversionStatus", {});
+
+        yuzu::bitlocker::windows::ConversionState state;
+        if (!conv.error.has_value() && !conv.rows.empty()) {
+            state = yuzu::bitlocker::windows::parse_conversion_status(conv.rows.front());
+        } else {
+            // A per-volume method-call failure degrades that one row to an
+            // honest "Unknown" rather than aborting the whole scan or
+            // fabricating a conversion state.
+            if (conv.error.has_value()) {
+                spdlog::warn("bitlocker: GetConversionStatus failed for {}: {}", vol.device_id,
+                             *conv.error);
+            }
+            state.conversion_text = "Unknown";
+            state.percent_text = "unknown";
+        }
+        ctx.write_output(yuzu::bitlocker::windows::format_volume_row(vol, state));
+    }
+    return true;
 }
 
 #elif defined(__linux__)
 
+// Enumerate raw LUKS-formatted block devices via libblkid — a system
+// pkg-config library (util-linux), not vcpkg. `blkid_probe_all` forces a
+// live device scan rather than trusting a possibly-stale/missing
+// /etc/blkid/blkid.tab cache file (the same thing the standalone `blkid`
+// CLI does when no cache exists), so this stays a genuine rung-1 read
+// rather than a cache hit that could go silently stale.
+std::vector<yuzu::bitlocker::linux_dm::LuksBlockDevice> enumerate_luks_devices() {
+    std::vector<yuzu::bitlocker::linux_dm::LuksBlockDevice> devices;
+
+    blkid_cache cache = nullptr;
+    if (blkid_get_cache(&cache, nullptr) != 0 || !cache)
+        return devices;
+    blkid_probe_all(cache);
+
+    blkid_dev_iterate iter = blkid_dev_iterate_begin(cache);
+    if (iter) {
+        blkid_dev_set_search(iter, "TYPE", "crypto_LUKS");
+        blkid_dev dev = nullptr;
+        while (blkid_dev_next(iter, &dev) == 0) {
+            dev = blkid_verify(cache, dev);
+            if (!dev)
+                continue;
+            const char* devname = blkid_dev_devname(dev);
+            if (!devname)
+                continue;
+            const char* uuid = blkid_get_tag_value(cache, "UUID", devname);
+            if (!uuid)
+                continue;
+
+            std::string full{devname};
+            auto slash = full.rfind('/');
+            std::string base = (slash == std::string::npos) ? full : full.substr(slash + 1);
+            devices.push_back({std::move(base), std::string(uuid)});
+        }
+        blkid_dev_iterate_end(iter);
+    }
+    blkid_put_cache(cache);
+    return devices;
+}
+
+// Enumerate currently-open (mapped) dm-crypt devices via plain
+// /sys/class/block/dm-*/dm/uuid reads — no subprocess, no cryptsetup.
+std::vector<yuzu::bitlocker::linux_dm::DmCryptMapping> enumerate_dm_mappings() {
+    std::vector<yuzu::bitlocker::linux_dm::DmCryptMapping> mappings;
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    fs::directory_iterator it{"/sys/class/block", ec};
+    if (ec)
+        return mappings; // no /sys/class/block (non-Linux kernel, container
+                          // without sysfs mounted, etc) — honest empty result
+    for (const auto& entry : it) {
+        auto name = entry.path().filename().string();
+        if (name.rfind("dm-", 0) != 0)
+            continue;
+
+        std::ifstream f(entry.path() / "dm" / "uuid");
+        if (!f)
+            continue;
+        std::string content{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+
+        auto parsed = yuzu::bitlocker::linux_dm::parse_dm_uuid(name, content);
+        if (parsed)
+            mappings.push_back(std::move(*parsed));
+    }
+    return mappings;
+}
+
 void list_luks_volumes(yuzu::CommandContext& ctx) {
-    // List block devices and check for LUKS
-    auto lsblk = run_command("lsblk -o NAME,TYPE,FSTYPE -n -l 2>/dev/null");
-    if (lsblk.empty()) {
-        ctx.write_output("volume|none|no_block_devices");
+    // sink: bitlocker/list_luks_volumes#1 — rung 1, in-process libblkid
+    // enumeration replacing the `lsblk` subprocess; open-state comes from a
+    // plain /sys read (sink#2 below), replacing `cryptsetup status`.
+    auto devices = enumerate_luks_devices();
+    if (devices.empty()) {
+        ctx.write_output("volume|none|no_encrypted_volumes");
         return;
     }
 
-    std::istringstream iss(lsblk);
-    std::string line;
-    bool found = false;
-    while (std::getline(iss, line)) {
-        std::istringstream ls(line);
-        std::string name, type, fstype;
-        ls >> name >> type >> fstype;
-
-        if (fstype == "crypto_LUKS" || type == "crypt") {
-            // Try to get status
-            auto status_cmd = std::format("cryptsetup status {} 2>/dev/null", name);
-            auto status = run_command(status_cmd.c_str());
-            std::string state = "unknown";
-            if (status.find("is active") != std::string::npos) {
-                state = "active";
-            } else if (status.find("is inactive") != std::string::npos) {
-                state = "inactive";
-            } else if (!status.empty()) {
-                state = "present";
-            }
-            ctx.write_output(std::format("volume|{}|{}|{}", name, type, state));
-            found = true;
-        }
-    }
-    if (!found) {
-        ctx.write_output("volume|none|no_encrypted_volumes");
+    // sink: bitlocker/list_luks_volumes#2 — rung 1, plain /sys file reads,
+    // no subprocess.
+    auto mappings = enumerate_dm_mappings();
+    for (const auto& dev : devices) {
+        bool active = yuzu::bitlocker::linux_dm::has_open_mapping(dev, mappings);
+        ctx.write_output(yuzu::bitlocker::linux_dm::format_volume_row(dev.dev_name, active));
     }
 }
 
@@ -191,7 +247,9 @@ void list_luks_volumes(yuzu::CommandContext& ctx) {
 //    percentage-encrypted to report, unlike BitLocker's conversion-in-
 //    progress state, so none is fabricated here.
 void report_filevault_status(yuzu::CommandContext& ctx) {
-    auto fdesetup_output = run_command("fdesetup status 2>/dev/null");
+    // sink: bitlocker/report_filevault_status#1 — rung 2, clean argv
+    // through the bounded runner (no shell).
+    auto fdesetup_output = run_macos_tool({"/usr/bin/fdesetup", "status"}, "fdesetup status");
     if (fdesetup_output.find("On") != std::string::npos ||
         fdesetup_output.find("FileVault is On") != std::string::npos) {
         ctx.write_output("filevault|enabled");
@@ -207,7 +265,9 @@ void report_filevault_status(yuzu::CommandContext& ctx) {
             std::format("filevault|unknown|{}", yuzu::util::safe_output_field(fdesetup_output)));
     }
 
-    auto diskutil_output = run_command("diskutil apfs list 2>/dev/null");
+    // sink: bitlocker/report_filevault_status#2 — rung 2, clean argv
+    // through the bounded runner (no shell).
+    auto diskutil_output = run_macos_tool({"/usr/bin/diskutil", "apfs", "list"}, "diskutil apfs list");
     auto volumes = yuzu::bitlocker::macos::parse_diskutil_apfs_list(diskutil_output);
     for (const auto& vol : volumes) {
         // plg-L1 (round-4 review): escape every dynamic field before the positional
@@ -227,16 +287,21 @@ void report_filevault_status(yuzu::CommandContext& ctx) {
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
-// windows: manage-bde -status via raw _popen -- rung 3.
-// linux: lsblk + cryptsetup status via run_bounded_subprocess({"/bin/sh",
-// "-c", cmd}, ...) -- rung 3, ships via the plugin's own list_luks_volumes.
-// macos: fdesetup status + diskutil apfs list via the same runner path --
-// rung 3, ships via bitlocker_macos_apfs.hpp's pure parser.
+// windows: Win32_EncryptableVolume WMI query + per-volume
+//   GetConversionStatus() method call, both in-process -- rung 1. Zero
+//   subprocess (Wave-3 migration; was manage-bde via raw _popen at rung 3).
+// linux: libblkid TYPE=="crypto_LUKS" enumeration + /sys/class/block/dm-*
+//   uuid reads, both in-process -- rung 1. Zero subprocess (was
+//   lsblk+cryptsetup via run_bounded_subprocess shell-c at rung 3).
+// macos: fdesetup status + diskutil apfs list via the bounded runner, now
+//   direct argv -- rung 2 (was the same two tools via a `/bin/sh -c`
+//   shell wrapper at rung 3). Ships via bitlocker_macos_apfs.hpp's pure
+//   parser, unchanged by this migration.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"state",
-     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "lsblk+cryptsetup", nullptr},
-     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "fdesetup+diskutil", nullptr},
-     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "manage_bde", nullptr}},
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 1, "libblkid+sysfs", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "fdesetup+diskutil", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "wmi_encryptable_volume", nullptr}},
 };
 
 } // namespace
@@ -269,12 +334,8 @@ public:
 
         if (action == "state") {
 #ifdef _WIN32
-            auto output = run_command("manage-bde -status");
-            if (output.empty()) {
-                ctx.write_output("error|manage-bde not available or access denied");
+            if (!report_bitlocker_status(ctx))
                 return 1;
-            }
-            parse_bitlocker_status(ctx, output);
 #elif defined(__linux__)
             list_luks_volumes(ctx);
 #elif defined(__APPLE__)

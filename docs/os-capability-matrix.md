@@ -91,7 +91,7 @@ duplicates.
 | agent_logging | ✅ | ✅ | ✅ | `_WIN32`/`__APPLE__`/Linux branches all implemented |
 | antivirus | ✅ | ✅ | ✅ | Defender/WMI (in-process, no more `powershell`) + exclusion-registry read · ClamAV+Falcon+Sophos with a real `status` leg · macOS real probes — XProtect bundle version + endpoint-security system-extension enumeration (`antivirus_plugin.cpp`, parsers `antivirus_parsers.hpp`), no longer a hardcoded assertion (posture depth: the **Antivirus posture** row) |
 | asset_tags | ✅ | ✅ | ✅ | portable — `std::filesystem` only |
-| bitlocker | ✅ | ✅ | ✅ | BitLocker `manage-bde` · LUKS `cryptsetup` · FileVault `fdesetup` + per-APFS-volume `diskutil apfs list` (encrypted/not_encrypted/unknown, parser `bitlocker_macos_apfs.hpp`) |
+| bitlocker | ✅ | ✅ | ✅ | BitLocker via in-process Win32_EncryptableVolume WMI (rung 1, no subprocess) · LUKS via in-process libblkid + `/sys/class/block/dm-*/dm/uuid` reads (rung 1, no subprocess) · FileVault `fdesetup` + per-APFS-volume `diskutil apfs list` via direct argv through the bounded runner (rung 2; encrypted/not_encrypted/unknown, parser `bitlocker_macos_apfs.hpp`) |
 | certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); Linux now parses in-process via libcrypto (rung 1); macOS System/SystemRoot keychains read natively via SecItem (rung 1), login keychain stays on its registered Decision-7 governed-shell path; macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
 | chargen | ✅ | ✅ | ✅ | portable — RFC 864 generator |
 | content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS |
@@ -214,9 +214,9 @@ implementation is.
 | asset_tags | changes | linux | supported | 1 | local_json_store | - |
 | asset_tags | changes | macos | supported | 1 | local_json_store | - |
 | asset_tags | changes | windows | supported | 1 | local_json_store | - |
-| bitlocker | state | linux | supported | 3 | lsblk+cryptsetup | - |
-| bitlocker | state | macos | supported | 3 | fdesetup+diskutil | - |
-| bitlocker | state | windows | supported | 3 | manage_bde | - |
+| bitlocker | state | linux | supported | 1 | libblkid + /sys/class/block/dm-*/dm/uuid (in-process) | - |
+| bitlocker | state | macos | supported | 2 | fdesetup+diskutil (direct argv, bounded runner) | - |
+| bitlocker | state | windows | supported | 1 | Win32_EncryptableVolume WMI query + GetConversionStatus() (in-process) | - |
 | certificates | list | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
 | certificates | list | macos | supported | 3 | SecItem (System/root, in-process) + security find-certificate via governed shell (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo ~user hop (Decision-7 governed-shell exception) |
 | certificates | list | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |

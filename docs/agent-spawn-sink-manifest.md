@@ -115,6 +115,8 @@ interim site — ADR-3002 Decisions 1 and 2).
 | `antivirus/xprotect_status_macos#2` | `agents/plugins/antivirus/src/antivirus_plugin.cpp:xprotect_status_macos` | runner argv (`stat -f %Sm -t %Y-%m-%dT%H:%M:%S <XProtect.bundle Info.plist>`) | macOS | fixed literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no rung-1 API for a bundle's mtime other than the filesystem itself (a plain `stat()` was ruled out here only because the operator-facing format string is easier to keep byte-identical via the CLI in this pass) | 2 — direct argv via yuzu::agent::run_bounded_subprocess. Decision-1 descent evidence: **disproportionate cost** — a plain `stat()` syscall is available and would remove this site entirely, but reformatting its output to match the exact `%Y-%m-%dT%H:%M:%S` string this action has always emitted is out of this pass's scope; tracked in #2380 | n/a |
 | `antivirus/xprotect_status_macos#3` | `agents/plugins/antivirus/src/antivirus_plugin.cpp:xprotect_status_macos` (via `read_plist_version`) | runner argv (`/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' <XProtect.app Info.plist>`) | macOS | fixed literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no public API reads a bundle's CFBundleShortVersionString without linking CoreFoundation's plist parser directly into this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no in-tree CoreFoundation plist-parsing dependency for this plugin | n/a |
 | `antivirus/xprotect_status_macos#4` | `agents/plugins/antivirus/src/antivirus_plugin.cpp:xprotect_status_macos` (via `read_plist_version`) | runner argv (`/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' <MRT.app Info.plist>`) | macOS | fixed literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none | no public API reads a bundle's CFBundleShortVersionString without linking CoreFoundation's plist parser directly into this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no in-tree CoreFoundation plist-parsing dependency for this plugin | n/a |
+| `bitlocker/report_filevault_status#1` | `agents/plugins/bitlocker/src/bitlocker_plugin.cpp:report_filevault_status` | runner argv (`/usr/bin/fdesetup status`) | macOS | none — fixed literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none beyond the LaunchDaemon's existing root context | No public rung-1 API reports FileVault's own on/off state (the SecItem/keychain APIs certificates.cpp uses answer a different question); `fdesetup` is Apple's own tool for this | Rung 2 — clean argv through the bounded subprocess runner (was rung 3, `/bin/sh -c "fdesetup status 2>/dev/null"`, before this migration) | n/a |
+| `bitlocker/report_filevault_status#2` | `agents/plugins/bitlocker/src/bitlocker_plugin.cpp:report_filevault_status` | runner argv (`/usr/bin/diskutil apfs list`) | macOS | none — fixed literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false) | none beyond the LaunchDaemon's existing root context | No public rung-1 API for per-APFS-volume encryption state; `diskutil` is Apple's own tool for this | Rung 2 — clean argv through the bounded subprocess runner (was rung 3, `/bin/sh -c "diskutil apfs list 2>/dev/null"`, before this migration) | n/a |
 
 ## Seed inventory — known spawn surfaces awaiting transcription
 
@@ -123,7 +125,7 @@ Plugin-granularity seed from the ADR-3002 review inventory (dev @ 2026-07-23,
 private helpers). Site-level transcription is #2380's first work item —
 these rows are pointers, not evidence.
 
-**Raw `popen`/`system` helpers:** bitlocker,
+**Raw `popen`/`system` helpers:**
 device_identity, event_logs, hardware, installed_apps,
 ioc, license_scan, network_config,
 network_diag, os_info, processes, sccm,
@@ -196,14 +198,22 @@ Registered sites above). Both plugins now carry zero raw spawn tokens and
 are removed from `scripts/ci/check-plugin-spawn-lexical.sh`'s GRANDFATHERED
 allowlist.
 
-**Migrated off raw spawn (Wave 3):** `antivirus` (Windows `products`/`status`
+**Migrated off raw spawn (Wave 3, PR3.3b):** `antivirus` (Windows `products`/`status`
 moved from `powershell Get-CimInstance`/`Get-MpComputerStatus` to the shared
 bounded WMI helper, rung 1, in-process; the new `av_exclusions` action reads
 Defender's exclusion registry keys directly, also rung 1; Linux/macOS
 `pgrep`/PlistBuddy/`systemextensionsctl`/`stat` sites moved to direct runner
 argv — see Registered sites above. Linux `status` also gained a real leg —
 ClamAV liveness + a rung-1 `stat()` definitions-mtime read, other EDRs
-presence-only — replacing the previous hardcoded `not_available`).
+presence-only — replacing the previous hardcoded `not_available`) and
+`bitlocker` (Windows: raw `manage-bde -status` popen replaced by an
+in-process Win32_EncryptableVolume WMI query + per-volume
+GetConversionStatus() method call, rung 1, 0 spawn sites. Linux:
+`lsblk`+`cryptsetup status` shell-outs replaced by in-process libblkid TYPE
+enumeration + plain `/sys/class/block/dm-*/dm/uuid` reads, rung 1, 0 spawn
+sites. macOS: `fdesetup`/`diskutil` stay on the bounded runner, promoted
+from a `/bin/sh -c` shell wrapper to direct argv, rung 2 — see Registered
+sites above).
 
 **Direct exec via private helpers:** script_exec, content_dist, filesystem
 (filesystem is fully migrated onto the runner on the #2321 branch).
