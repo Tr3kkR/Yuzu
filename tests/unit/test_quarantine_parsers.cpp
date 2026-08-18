@@ -8,9 +8,6 @@
  * the Windows/Linux parse rules it can never spawn netsh/iptables to
  * produce output for directly.
  *
- * NOT wired into tests/meson.build by this PR — the integrating senior adds
- * the target alongside the other Wave-2 quarantine wiring.
- *
  * Fixtures are hand-constructed (no live Windows/Linux host available this
  * session) but format-accurate to each tool's real captured output, based
  * on the exact strings quarantine_plugin.cpp's pre-migration code wrote and

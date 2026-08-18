@@ -1,13 +1,14 @@
 /**
- * quarantine_parsers.hpp — pure status-read parsing for the quarantine
- * plugin (Wave-2 ADR-3002 acquisition-ladder migration, quarantine
- * package). Portable and header-only, no platform guard: this file and its
- * test TU (test_quarantine_parsers.cpp) compile and run on every leg, byte-
- * for-byte lifted from the pre-migration parsing logic in
+ * quarantine_parsers.hpp — pure status-read parsing AND pure mutating-argv
+ * construction for the quarantine plugin (Wave-2 ADR-3002 acquisition-ladder
+ * migration, quarantine package). Portable and header-only, no platform
+ * guard: this file and its test TU (test_quarantine_parsers.cpp /
+ * test_quarantine_argv.cpp) compile and run on every leg. The status-read
+ * parsers are byte-for-byte lifted from the pre-migration parsing logic in
  * quarantine_plugin.cpp (no behaviour change — this PR moves the spawn
  * mechanism, not the parse rules).
  *
- * Three consumers in quarantine_plugin.cpp, one per platform's status reads:
+ * Three status-read consumers in quarantine_plugin.cpp, one per platform:
  *   - netsh_rules_present / netsh_matching_rule_names / netsh_whitelist_ips
  *     (win_is_quarantined, win_unquarantine, win_get_whitelist)
  *   - iptables_chain_referenced / iptables_whitelist_ips
@@ -19,9 +20,22 @@
  * captures `netsh advfirewall firewall show rule ...`, `iptables -L ...`
  * and `pfctl -s rules` output via yuzu::agent::run_bounded_subprocess and
  * hands the captured text here.
+ *
+ * A second group — netsh_allow_in_rule_argv / iptables_accept_source_argv /
+ * pfctl_load_ruleset_argv — is pure argv CONSTRUCTION for one representative
+ * mutating call site per platform, extracted so the argv shape (order,
+ * presence, and — for the POSIX two — the caller-applied sudo wrapping) is
+ * unit-testable without spawning anything. quarantine_plugin.cpp's mutating
+ * actions run iptables/pfctl/netsh against the real host firewall, so they
+ * are deliberately NOT exercised end-to-end in a unit test (unlike the
+ * read-only users/services LocalDispatcher pattern) — this is the structural
+ * substitute: it proves an argument can't be silently dropped, reordered, or
+ * de-sudo'd without a test failing, for the pattern every other of the 43
+ * migrated sites in this file follows.
  */
 #pragma once
 
+#include <format>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -51,6 +65,57 @@ inline bool is_safe_ip(std::string_view ip) {
             return false;
     }
     return true;
+}
+
+// ── Mutating argv construction (FN-03 structural coverage) ─────────────────
+//
+// One representative call site per platform. Each returns the exact argv
+// vector quarantine_plugin.cpp hands to yuzu::agent::run_bounded_subprocess
+// (Linux/macOS: BEFORE yuzu::shared::sudo_wrap — the caller applies that,
+// exactly as the production call sites do; sudo_wrap's own form is pinned by
+// test_sudo_argv.cpp, not re-tested here). No I/O, no spawn — argv[0] is a
+// caller-resolved absolute tool path, never looked up here.
+
+/**
+ * netsh argv to add a per-IP inbound ALLOW whitelist rule — the
+ * `YuzuQuarantine_AllowIn_<ip>` sink used by both win_quarantine's
+ * whitelist loop and do_whitelist's Windows "add" branch. `ip` is expected
+ * to already be is_safe_ip-validated by the caller.
+ */
+inline std::vector<std::string> netsh_allow_in_rule_argv(std::string_view netsh_path,
+                                                          std::string_view ip) {
+    return {std::string{netsh_path},
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            std::format("name={}AllowIn_{}", kRulePrefix, ip),
+            "dir=in",
+            "action=allow",
+            "enable=yes",
+            std::format("remoteip={}", ip)};
+}
+
+/**
+ * UNWRAPPED iptables argv to append a per-IP source ACCEPT rule to the
+ * yuzu-quarantine chain — linux_quarantine's whitelist-loop sink. `ip` is
+ * expected to already be is_safe_ip-validated by the caller.
+ */
+inline std::vector<std::string> iptables_accept_source_argv(std::string_view iptables_path,
+                                                             std::string_view ip) {
+    return {std::string{iptables_path}, "-A", "yuzu-quarantine", "-s", std::string{ip}, "-j",
+            "ACCEPT"};
+}
+
+/**
+ * UNWRAPPED pfctl argv to atomically load a generated ruleset file —
+ * macos_load_ruleset's sink, THE call this migration is bound not to change
+ * the shape of (see quarantine_plugin.cpp's header comment on the
+ * 672896112 incident: single atomic `pfctl -f`, never a named anchor).
+ */
+inline std::vector<std::string> pfctl_load_ruleset_argv(std::string_view pfctl_path,
+                                                         std::string_view ruleset_path) {
+    return {std::string{pfctl_path}, "-f", std::string{ruleset_path}};
 }
 
 // ── Windows: netsh advfirewall firewall show rule ──────────────────────────
