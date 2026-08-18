@@ -148,7 +148,13 @@ struct KillSwitchScope {
 /// True iff `s` is a reserved-namespace plugin name of the form
 /// `__<identifier>__` (e.g. `__guard__`, `__observation__`) — the
 /// server-internal namespace convention used by `system_reserved` dispatch
-/// capabilities (`capability_decls/core_dispatch_capabilities.hpp`).
+/// capabilities (`capability_decls/core_dispatch_capabilities.hpp`). Unrelated
+/// to the agent-side `yuzu::agent::is_reserved_plugin_name`
+/// (`agents/core/include/yuzu/agent/plugin_loader.hpp`) despite the identical
+/// name — that one is an exact-match check against a closed allowlist of
+/// literal AGENT PLUGIN names a `.so`/`.dll` cannot register as; this one is a
+/// shape-only grammar check for a SERVER dispatch-capability plugin name.
+/// Different components, different closed sets, no shared code.
 /// Deliberately narrower than "starts and ends with `_`": the inner span
 /// must itself be a valid identifier, so `__`, `____`, `__GUARD__`, and
 /// `_guard_` are all rejected. Config/secret addressing

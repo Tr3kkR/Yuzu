@@ -130,7 +130,9 @@ scope must never resolve to allowed") collapses to `false` — so `__guard__.pus
 **permanently kill-switched off**, with no kill-switch row ever having been set, on every
 Postgres-backed server (i.e. every server, ADR-0006/0007). This silently dropped every Guardian
 rule push (`/api/v1/guaranteed-state/push`, Baseline deploy, and the reconcile re-push) — the
-caller saw a normal `202`/"pushed" response with no error surfaced on either side.
+caller saw a normal `202 {"queued":true,"agents":0}` response and audit row — `agents=0` was technically
+present, but indistinguishable from any other ordinary zero-match case (no agents in scope, none online),
+so nothing identified a kill switch as the cause.
 `tar.fleet_snapshot` and `asset_tags.sync`, the other two `system_reserved` capabilities, were
 unaffected (neither plugin name starts with `_`).
 
