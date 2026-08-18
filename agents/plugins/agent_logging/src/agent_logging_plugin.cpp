@@ -196,6 +196,37 @@ void scan_directory(yuzu::CommandContext& ctx, const fs::path& dir) {
     }
 }
 
+// ABI4 capability declarations (#2204). Both actions are native, in-process
+// filesystem/config reads on every OS — no subprocess anywhere in this
+// plugin. "get_key_files"'s own-executable-path lookup differs per OS
+// (/proc/self/exe symlink on Linux, _NSGetExecutablePath+realpath on macOS
+// — the macOS path further below at ~331-363 — GetModuleFileNameA on
+// Windows) but each is a native, in-process OS API call, so all three legs
+// are rung 1.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "get_log",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "agent config lookup + std::ifstream tail read", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "agent config lookup + std::ifstream tail read", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "agent config lookup + std::ifstream tail read", nullptr},
+    },
+    {
+        /* .action      = */ "get_key_files",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "/proc/self/exe symlink + std::filesystem metadata", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "_NSGetExecutablePath + realpath(3) + std::filesystem metadata", nullptr},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "GetModuleFileNameA + std::filesystem metadata", nullptr},
+    },
+};
+
 } // namespace
 
 class AgentLoggingPlugin final : public yuzu::Plugin {
@@ -209,6 +240,14 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"get_log", "get_key_files", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

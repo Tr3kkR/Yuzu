@@ -27,7 +27,9 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <format>
 #include <string>
 #include <string_view>
@@ -79,18 +81,81 @@ HKEY parse_hive(std::string_view hive) {
     return nullptr;
 }
 
-std::string reg_type_name(DWORD type) {
-    switch (type) {
-        case REG_SZ:        return "REG_SZ";
-        case REG_DWORD:     return "REG_DWORD";
-        case REG_QWORD:     return "REG_QWORD";
-        case REG_BINARY:    return "REG_BINARY";
-        case REG_EXPAND_SZ: return "REG_EXPAND_SZ";
-        case REG_MULTI_SZ:  return "REG_MULTI_SZ";
-        default:            return "REG_UNKNOWN";
-    }
-}
+// Registry value-type naming now comes from the shared, portable table in
+// user_profile_model.hpp (#2771 up-S3) so all three emitting sites — this
+// plugin's get_value/enumerate_values and win_profiles.hpp's read_reg_value —
+// agree. The local copy reported REG_NONE, REG_LINK and REG_DWORD_BIG_ENDIAN
+// as "REG_UNKNOWN"; the shared table names them, which is a deliberate
+// (declared) honesty improvement rather than a silent change.
+using yuzu::profiles::reg_type_name;
 #endif
+
+// ── ABI4 capability declarations (#2204) ─────────────────────────────────
+//
+// One row per entry in actions() below, same names/order. The plugin is
+// Windows-only by construction (the #ifndef _WIN32 branch of execute() above
+// never touches the registry at all — it emits the honest
+// "registry|unsupported|..." sentinel for every action) so every leg on
+// Linux/macOS is UNSUPPORTED: the OS has no registry to supply. Every
+// Windows leg is a direct Win32 Reg*W call — native, in-process, rung 1;
+// get_user_value additionally uses RegLoadKeyW to mount an offline
+// NTUSER.DAT (still a native in-process Win32 call, still rung 1).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        "get_value",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "set_value",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "delete_value",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "delete_key",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "key_exists",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "enumerate_keys",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "enumerate_values",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+    {
+        "get_user_value",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry+hive_mount", nullptr},
+    },
+    {
+        "list_profiles",
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
+    },
+};
 
 } // namespace
 
@@ -107,6 +172,14 @@ public:
                                      "key_exists", "enumerate_keys", "enumerate_values",
                                      "get_user_value", "list_profiles", nullptr};
         return acts;
+    }
+
+    [[nodiscard]] const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+
+    [[nodiscard]] size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override { g_ctx = ctx.raw(); return {}; }
@@ -387,75 +460,60 @@ private:
             }
         }
 
-        bool found_value = false;
-        bool unload_failed = false;
-        auto read_status = yuzu::win::ReadValueStatus::not_found;
+        // up-S4: the key-open result is captured, not discarded. Before this,
+        // any non-ERROR_SUCCESS from RegOpenKeyExW simply returned, and the
+        // caller reported "key or value not found" — so an ACL'd or locked
+        // key was indistinguishable from an absent one.
+        auto key_status = yuzu::profiles::UserKeyStatus::key_not_found;
         std::string value, type_name;
+        yuzu::win::HiveAccessReport hive_report;
         auto status = yuzu::win::with_user_hive(
             resolved_sid, profile_path,
             [&](HKEY root) {
                 yuzu::win::RegKey opened;
-                if (RegOpenKeyExW(root, to_wide(key).c_str(), 0, KEY_READ, opened.put()) != ERROR_SUCCESS)
+                const LSTATUS open_rc =
+                    RegOpenKeyExW(root, to_wide(key).c_str(), 0, KEY_READ, opened.put());
+                if (open_rc != ERROR_SUCCESS) {
+                    key_status = (open_rc == ERROR_ACCESS_DENIED)
+                                     ? yuzu::profiles::UserKeyStatus::key_access_denied
+                                     : yuzu::profiles::UserKeyStatus::key_not_found;
                     return;
-                read_status = yuzu::win::read_reg_value(opened.get(), std::string{val_name}, value, type_name);
-                found_value = (read_status == yuzu::win::ReadValueStatus::ok);
+                }
+                switch (yuzu::win::read_reg_value(opened.get(), std::string{val_name}, value,
+                                                  type_name)) {
+                case yuzu::win::ReadValueStatus::ok:
+                    key_status = yuzu::profiles::UserKeyStatus::ok;
+                    break;
+                case yuzu::win::ReadValueStatus::oversized:
+                    key_status = yuzu::profiles::UserKeyStatus::value_oversized;
+                    break;
+                case yuzu::win::ReadValueStatus::malformed:
+                    key_status = yuzu::profiles::UserKeyStatus::value_malformed;
+                    break;
+                case yuzu::win::ReadValueStatus::changed_during_read:
+                    key_status = yuzu::profiles::UserKeyStatus::value_changed_during_read;
+                    break;
+                case yuzu::win::ReadValueStatus::not_found:
+                    key_status = yuzu::profiles::UserKeyStatus::value_not_found;
+                    break;
+                }
             },
-            &unload_failed);
+            &hive_report);
 
-        // Surface a failed offline-mount unload on EVERY exit path from here
-        // on -- not just the success path below. A leaked mount is
-        // system-wide and locks the profile's NTUSER.DAT until it is
-        // unloaded or the host reboots -- most commonly a transient
-        // ERROR_ACCESS_DENIED from a third party (Search Indexer, AV,
-        // System Restore) briefly holding a handle into the newly-mounted
-        // branch, recoverable without reboot once that holder releases; a
-        // genuinely stuck holder is the rarer case reboot actually resolves.
-        // It is exactly the failure mode installed_apps_plugin.cpp/
-        // licensing_win.cpp/tar_mapdrive_collector.cpp each independently
-        // hit. unload_failed can be true even on HiveAccessStatus::
-        // mount_failed (RegLoadKeyW itself can succeed while the subsequent
-        // root re-open inside with_root() fails), so this check must run
-        // before the switch below, not only after a full-success read.
-        if (unload_failed) {
-            ctx.write_output(std::format(
-                "warning|hive_unload_failed: HKU\\YUZU_HIVE_{} for sid '{}' may remain "
-                "mounted; retry `reg unload HKU\\YUZU_HIVE_{}` once any process holding "
-                "the branch (Search Indexer, AV, System Restore) releases it",
-                sanitize_field(resolved_sid), sanitize_field(resolved_sid),
-                sanitize_field(resolved_sid)));
-        }
+        // The unload warning and the terminal hive error are rendered
+        // together, in that order, by the pure renderer — which is what makes
+        // that control flow testable without a registry (qa-S2). The warning
+        // must precede the status check because unload_failed can be true
+        // even on mount_failed (RegLoadKeyW can succeed while the subsequent
+        // root re-open inside with_root() fails).
+        for (const auto& line : yuzu::profiles::render_hive_access_lines(
+                 status, hive_report.unload_failed, hive_report.mount_name, resolved_sid))
+            ctx.write_output(line);
+        if (status != yuzu::win::HiveAccessStatus::ok)
+            return 1;
 
-        switch (status) {
-        case yuzu::win::HiveAccessStatus::not_found:
-            ctx.write_output(std::format(
-                "error|no reachable hive for sid '{}' (not logged in and no profile path)",
-                sanitize_field(resolved_sid)));
-            return 1;
-        case yuzu::win::HiveAccessStatus::privilege_missing:
-            ctx.write_output(
-                "error|privilege_missing: SeBackupPrivilege/SeRestorePrivilege could not be enabled");
-            return 1;
-        case yuzu::win::HiveAccessStatus::mount_failed:
-            ctx.write_output(
-                std::format("error|failed to load hive for sid '{}'", sanitize_field(resolved_sid)));
-            return 1;
-        case yuzu::win::HiveAccessStatus::ok:
-            break;
-        }
-
-        if (!found_value) {
-            switch (read_status) {
-            case yuzu::win::ReadValueStatus::oversized:
-                ctx.write_output("error|value exceeds 1 MiB limit");
-                break;
-            case yuzu::win::ReadValueStatus::malformed:
-                ctx.write_output("error|value size too small for its declared type");
-                break;
-            case yuzu::win::ReadValueStatus::not_found:
-            case yuzu::win::ReadValueStatus::ok: // unreachable: found_value would be true
-                ctx.write_output("error|key or value not found in user hive");
-                break;
-            }
+        if (key_status != yuzu::profiles::UserKeyStatus::ok) {
+            ctx.write_output(yuzu::profiles::render_user_key_error(key_status, key));
             return 1;
         }
 
@@ -493,8 +551,20 @@ private:
             ctx.write_output(yuzu::profiles::render_profile_row(info));
         }
         if (truncated) {
-            ctx.write_output(std::format("warning|profile_list_truncated at {} entries",
-                                          yuzu::win::kMaxProfiles));
+            ctx.write_output(yuzu::profiles::render_profile_list_truncated_warning(
+                yuzu::win::kMaxProfiles));
+        }
+        // #2771 up-S2: a ProfileImagePath that exists but cannot be read or
+        // decoded now says so. Reported as ONE aggregate line rather than a
+        // fifth column, because render_profile_row's 4-field shape is exactly
+        // what the Gate 4 hp-B1 column-shift finding was about — and it
+        // matches the existing profile_list_truncated precedent above.
+        const auto unreadable = static_cast<std::size_t>(
+            std::count_if(profile_list.begin(), profile_list.end(),
+                          [](const auto& p) { return p.profile_path_unreadable; }));
+        if (unreadable > 0) {
+            ctx.write_output(
+                std::format("warning|profile_path_unreadable for {} profile(s)", unreadable));
         }
         return 0;
     }

@@ -171,6 +171,27 @@ void parse_proc_tcp(yuzu::CommandContext& ctx, const char* path, const std::stri
 
 #endif
 
+// ── ABI4 capability declarations (#2204) ────────────────────────────────────
+//
+// Windows reads the IP Helper API natively (rung 1); Linux reads
+// /proc/net/tcp[6] directly (rung 1); macOS shells out to `lsof` via a raw
+// popen() (run_command above, `~:47-61` — not the bounded subprocess
+// runner), so both macOS legs are rung 3.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "listening",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/tcp[6]", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "lsof via popen", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetExtendedTcpTable", nullptr},
+    },
+    {
+        /* .action      = */ "connections",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/tcp[6]", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "lsof via popen", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetExtendedTcpTable", nullptr},
+    },
+};
+
 } // namespace
 
 class NetworkDiagPlugin final : public yuzu::Plugin {
@@ -184,6 +205,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"listening", "connections", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }

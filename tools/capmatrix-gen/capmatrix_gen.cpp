@@ -12,7 +12,7 @@
  * plugin's real startup side effects (KV storage, trigger registration,
  * etc.). It only ever reads the static descriptor.
  *
- * Usage: capmatrix-gen --out <path> <plugin.so> [<plugin.so> ...]
+ * Usage: capmatrix-gen --out <path> [--registries <dir>] <plugin.so> [<plugin.so> ...]
  *
  * Every path given on the command line MUST exist and MUST export
  * yuzu_plugin_descriptor() returning non-null — a missing or unloadable
@@ -20,7 +20,15 @@
  * drift gate (scripts/ci/check-capability-matrix.sh) is to prove the
  * committed matrix reflects what actually got built; silently omitting a
  * plugin that failed to load would let the matrix pass while lying about
- * that plugin's absence.
+ * that plugin's absence. Likewise a declared plugin whose actions() list and
+ * action_descriptors array name different actions is a hard error, naming
+ * both the orphan action(s) and the orphan descriptor row(s) — see #2204.
+ *
+ * --registries <dir> is optional and additive: when given, it also renders
+ * the non-plugin capability registries (docs/capability-registries/*.tsv)
+ * as their own generated section — see render_registries() below for why
+ * this tool reads them from a checked-in table rather than linking the
+ * agent_core/server_core code that owns three of them.
  */
 
 #include <algorithm>
@@ -205,6 +213,107 @@ std::string escape_cell(std::string_view s) {
     return out;
 }
 
+// ── Non-plugin registry sections (#2204 point 4) ────────────────────────────
+//
+// Five capability registries live outside the plugin descriptor world: two
+// header-only constexpr arrays (Guardian registry-guard hives, service-guard
+// states) and three backed by real translation units (TAR capture sources,
+// Spark mechanism factories, DEX obs-type platform coverage). This host tool
+// dlopens agent plugins, so it must never link agent_core or server_core
+// (that pulls the very libraries whose plugins it loads, and drags libpq/
+// grpc transitively) — instead each registry is mirrored into a small
+// checked-in TSV under docs/capability-registries/, read here, with a suite
+// test per registry (which CAN link the real C++ source) failing if the
+// table and the code disagree. Opt-in via --registries <dir> so every
+// existing invocation (the CI gate, the shell-test fixtures) is byte-for-
+// byte unaffected by this addition.
+struct RegistryTable {
+    std::string_view file;  // filename under the --registries directory
+    std::string_view title; // markdown section heading
+};
+
+constexpr RegistryTable kRegistryTables[] = {
+    {"registry_hives.tsv", "Guardian registry-guard hives"},
+    {"service_states.tsv", "Guardian service-guard states"},
+    {"tar_capture_sources.tsv", "TAR capture sources"},
+    {"spark_mechanisms.tsv", "Spark detection mechanisms"},
+    {"dex_obs_platforms.tsv", "DEX observation-type platform coverage"},
+};
+
+/// Minimal tab-separated reader: one row per non-empty line, cells split on
+/// '\t'. The first row is the header. No quoting/escaping — the tables are
+/// small, hand-authored, and cross-checked by their own suite test, so a
+/// deliberately plain format keeps this reader (and the tables themselves)
+/// easy to eyeball-verify.
+std::expected<std::vector<std::vector<std::string>>, std::string> read_tsv(const fs::path& p) {
+    std::ifstream f(p);
+    if (!f)
+        return std::unexpected("capmatrix-gen: cannot open registry table: " + p.string());
+
+    std::vector<std::vector<std::string>> rows;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty())
+            continue;
+        std::vector<std::string> cells;
+        std::size_t start = 0;
+        while (true) {
+            const auto tab = line.find('\t', start);
+            if (tab == std::string::npos) {
+                cells.push_back(line.substr(start));
+                break;
+            }
+            cells.push_back(line.substr(start, tab - start));
+            start = tab + 1;
+        }
+        rows.push_back(std::move(cells));
+    }
+    if (rows.empty())
+        return std::unexpected("capmatrix-gen: registry table is empty: " + p.string());
+    return rows;
+}
+
+/// Renders every table in kRegistryTables under `dir` as its own Markdown
+/// section, appended to `out` inside one generated block. Returns false (and
+/// has already printed every failure to stderr) if any table failed to load
+/// — the caller must then abort before writing anything, matching the
+/// "never emit a partial/misleading matrix" rule the plugin-loading path
+/// above follows.
+bool render_registries(const fs::path& dir, std::ostringstream& out) {
+    out << "\n<!-- BEGIN GENERATED: capmatrix-gen-registries (#2204) — do not hand-edit; "
+           "regenerate with tools/capmatrix-gen --registries <dir>, verified by a per-registry "
+           "cross-check suite test against the live C++ registry -->\n";
+
+    bool ok = true;
+    for (const auto& reg : kRegistryTables) {
+        auto rows = read_tsv(dir / std::string{reg.file});
+        if (!rows) {
+            std::cerr << rows.error() << "\n";
+            ok = false;
+            continue;
+        }
+
+        out << "\n#### " << reg.title << "\n\n";
+        const auto& header = (*rows)[0];
+        out << "|";
+        for (const auto& h : header)
+            out << " " << escape_cell(h) << " |";
+        out << "\n|";
+        for (std::size_t i = 0; i < header.size(); ++i)
+            out << "---|";
+        out << "\n";
+        for (std::size_t r = 1; r < rows->size(); ++r) {
+            out << "|";
+            for (const auto& c : (*rows)[r])
+                out << " " << escape_cell(c) << " |";
+            out << "\n";
+        }
+    }
+
+    out << "<!-- END GENERATED -->\n";
+    return ok;
+}
+
 } // namespace
 } // namespace yuzu::tools
 
@@ -212,6 +321,7 @@ int main(int argc, char** argv) {
     using namespace yuzu::tools;
 
     std::string out_path;
+    std::string registries_dir; // optional: --registries <dir> (opt-in, see render_registries)
     std::vector<std::string> plugin_paths;
 
     for (int i = 1; i < argc; ++i) {
@@ -221,13 +331,19 @@ int main(int argc, char** argv) {
         } else if (arg == "--out") {
             std::cerr << "capmatrix-gen: --out requires a path argument\n";
             return 2;
+        } else if (arg == "--registries" && i + 1 < argc) {
+            registries_dir = argv[++i];
+        } else if (arg == "--registries") {
+            std::cerr << "capmatrix-gen: --registries requires a directory argument\n";
+            return 2;
         } else {
             plugin_paths.push_back(std::move(arg));
         }
     }
 
     if (out_path.empty() || plugin_paths.empty()) {
-        std::cerr << "usage: capmatrix-gen --out <path> <plugin.so> [<plugin.so> ...]\n";
+        std::cerr << "usage: capmatrix-gen --out <path> [--registries <dir>] "
+                     "<plugin.so> [<plugin.so> ...]\n";
         return 2;
     }
 
@@ -269,6 +385,7 @@ int main(int argc, char** argv) {
 
     std::vector<std::string> undeclared;
     std::size_t declared_rows = 0;
+    bool any_action_mismatch = false;
     for (const auto& lp : plugins) {
         const auto* d = lp.desc;
         const std::string name = d->name ? d->name : "(unnamed)";
@@ -277,6 +394,50 @@ int main(int argc, char** argv) {
             d->action_descriptors == nullptr) {
             undeclared.push_back(name);
             continue;
+        }
+
+        // #2204 completeness: actions() and action_descriptors are two
+        // independent hand-authored sources for the same set of action
+        // names — nothing enforced they agree until now. An action listed in
+        // actions() with no descriptor row silently drops out of the matrix;
+        // a descriptor row naming an action absent from actions() fabricates
+        // a capability row for something the plugin never dispatches. Both
+        // are hard errors, named explicitly, never a silent skip.
+        std::vector<std::string_view> declared_actions;
+        if (d->actions != nullptr) {
+            for (const char* const* p = d->actions; *p != nullptr; ++p)
+                declared_actions.emplace_back(*p);
+        }
+        std::vector<std::string_view> descriptor_actions;
+        descriptor_actions.reserve(d->action_descriptor_count);
+        for (std::size_t i = 0; i < d->action_descriptor_count; ++i) {
+            const auto& ad = d->action_descriptors[i];
+            descriptor_actions.emplace_back(ad.action ? ad.action : "");
+        }
+        auto contains = [](const std::vector<std::string_view>& hay, std::string_view needle) {
+            return std::find(hay.begin(), hay.end(), needle) != hay.end();
+        };
+        std::vector<std::string_view> orphan_actions;
+        for (auto a : declared_actions) {
+            if (!contains(descriptor_actions, a))
+                orphan_actions.push_back(a);
+        }
+        std::vector<std::string_view> orphan_descriptors;
+        for (auto a : descriptor_actions) {
+            if (!contains(declared_actions, a))
+                orphan_descriptors.push_back(a);
+        }
+        if (!orphan_actions.empty() || !orphan_descriptors.empty()) {
+            any_action_mismatch = true;
+            std::cerr << "capmatrix-gen: '" << name
+                      << "' actions()/action_descriptors disagree:\n";
+            for (auto a : orphan_actions)
+                std::cerr << "  - action '" << a
+                          << "' is listed in actions() but has no action_descriptors row\n";
+            for (auto a : orphan_descriptors)
+                std::cerr << "  - action_descriptors names '" << a
+                          << "' which is absent from actions()\n";
+            continue; // don't render a table for a plugin whose two sources disagree
         }
 
         struct LegRow {
@@ -304,6 +465,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (any_action_mismatch) {
+        // Never emit a partial/misleading matrix — same rule the load-failure
+        // path above follows: a plugin whose two capability sources disagree
+        // is exactly what this check exists to catch, so it must abort the
+        // whole run rather than silently drop that plugin's rows.
+        std::cerr << "capmatrix-gen: one or more declared plugins have mismatched "
+                     "actions()/action_descriptors — aborting\n";
+        return 1;
+    }
+
     // C-5: a header-only table (every built plugin still undeclared, the
     // common case today since no plugin has adopted the descriptor yet)
     // renders as an empty bordered box in several Markdown viewers — nothing
@@ -325,6 +496,13 @@ int main(int argc, char** argv) {
         }
     }
     out << "<!-- END GENERATED -->\n";
+
+    if (!registries_dir.empty()) {
+        if (!render_registries(fs::path{registries_dir}, out)) {
+            std::cerr << "capmatrix-gen: one or more registry tables failed to load — aborting\n";
+            return 1;
+        }
+    }
 
     std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
     if (!f) {
