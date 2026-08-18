@@ -479,7 +479,6 @@ RUNNER_ALLOWLIST = {
 GRANDFATHERED = {
     "agents/plugins/antivirus/src/antivirus_plugin.cpp",
     "agents/plugins/bitlocker/src/bitlocker_plugin.cpp",
-    "agents/plugins/certificates/src/certificates_plugin.cpp",
     "agents/plugins/content_dist/src/content_dist_plugin.cpp",
     "agents/plugins/device_identity/src/device_identity_plugin.cpp",
     "agents/plugins/event_logs/src/event_logs_plugin.cpp",
