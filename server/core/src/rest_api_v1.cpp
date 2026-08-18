@@ -2266,11 +2266,23 @@ void RestApiV1::register_routes(
                      auto session = auth_fn(req, res);
                      if (!session)
                          return;
-                     for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
-                         if (gr.principal_type == "user" && gr.principal_id == session->username &&
-                             gr.role_name == "ITServiceOwner") {
-                             authorized = true;
-                             break;
+                     // guardian-confinement-2298 PR3 §3e: the ITServiceOwner-of-
+                     // this-group fallback below checks GROUP MEMBERSHIP only —
+                     // it never consults token_scope_service, so a service-scoped
+                     // token whose minter is ITServiceOwner of ANY group would
+                     // otherwise read that group's role graph regardless of the
+                     // token's own service tag. The fleet-wide arm above already
+                     // gets the §3a flip's service-scope handling (via perm_fn);
+                     // a service-scoped token must go through THAT arm only —
+                     // never this membership fallback.
+                     if (session->token_scope_service.empty()) {
+                         for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
+                             if (gr.principal_type == "user" &&
+                                 gr.principal_id == session->username &&
+                                 gr.role_name == "ITServiceOwner") {
+                                 authorized = true;
+                                 break;
+                             }
                          }
                      }
                  }
@@ -2330,9 +2342,18 @@ void RestApiV1::register_routes(
                       return;
                   }
 
-                  bool authorized =
-                      rbac_store->check_permission(session->username, "ManagementGroup", "Write");
-                  if (!authorized) {
+                  // guardian-confinement-2298 PR3 §3e: was a direct
+                  // rbac_store->check_permission call, bypassing
+                  // require_permission (and therefore the §3a flip) entirely —
+                  // routed through perm_fn's probe-response form (matches the
+                  // GET handler above) so a service-scoped token gets the
+                  // flip's default-deny instead of an unfiltered role check.
+                  httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+                  bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
+                  // The ITServiceOwner-of-this-group fallback checks GROUP
+                  // MEMBERSHIP only, never token_scope_service — same reasoning
+                  // as the GET handler's identical guard above.
+                  if (!authorized && session->token_scope_service.empty()) {
                       auto group_roles = mgmt_store->get_group_roles(group_id);
                       for (const auto& gr : group_roles) {
                           if (gr.principal_type == "user" && gr.principal_id == session->username &&
@@ -2391,9 +2412,13 @@ void RestApiV1::register_routes(
             auto principal_id = body.value("principal_id", "");
             auto role_name = body.value("role_name", "");
 
-            bool authorized =
-                rbac_store->check_permission(session->username, "ManagementGroup", "Write");
-            if (!authorized) {
+            // guardian-confinement-2298 PR3 §3e: same fix as the POST handler
+            // above — routed through perm_fn instead of a direct
+            // rbac_store->check_permission call, and the ITServiceOwner
+            // membership fallback is skipped for a service-scoped token.
+            httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+            bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
+            if (!authorized && session->token_scope_service.empty()) {
                 auto group_roles = mgmt_store->get_group_roles(group_id);
                 for (const auto& gr : group_roles) {
                     if (gr.principal_type == "user" && gr.principal_id == session->username &&
@@ -2763,9 +2788,30 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            bool authorized =
-                rbac_store->check_permission(session->username, "ManagementGroup", "Write");
-            if (!authorized && mgmt_store) {
+            // guardian-confinement-2298 PR3 §3e sweep finding, DEFENSE-IN-
+            // DEPTH (verified NOT reachable by a service-scoped token today
+            // — do not describe this as closing a live gap): this whole
+            // `!scope_service.empty()` block is RBAC-on-only (see the guard
+            // just above), and the route's own top-of-handler
+            // `perm_fn(req, res, "ApiToken", "Write")` already denies every
+            // service-scoped session before it ever reaches here — the §3a
+            // flip's ceiling check is pinned to the ITServiceOwner ROLE's
+            // own grants regardless of the minter's other roles, and that
+            // role's seed list (rbac_store.cpp) carries no ApiToken entry.
+            // Was a direct rbac_store->check_permission call, bypassing
+            // require_permission entirely; swapped for perm_fn's probe-
+            // response form (same shape as the /management-groups/{id}/roles
+            // fix above) for MCP-tier + engine-principal correctness and
+            // consistency — behavior-identical to the old call for an
+            // ordinary RBAC-on caller, since both resolve to the same
+            // rbac_store->check_permission under require_permission's
+            // RBAC-enforced branch. The token_scope_service.empty() guard on
+            // the fallback below costs nothing and matches the roles fix's
+            // shape, guarding against a future change that grants
+            // ITServiceOwner an ApiToken permission.
+            httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+            bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
+            if (!authorized && mgmt_store && session->token_scope_service.empty()) {
                 auto svc_group = mgmt_store->find_group_by_name("Service: " + scope_service);
                 if (svc_group) {
                     auto group_roles = mgmt_store->get_group_roles(svc_group->id);
@@ -7217,8 +7263,25 @@ void RestApiV1::register_routes(
         };
 
         // GET /api/v1/result-sets — owner-scoped list.
-        sink.Get("/api/v1/result-sets", [auth_fn, result_set_store, rs_to_json](
+        sink.Get("/api/v1/result-sets", [auth_fn, result_set_store, rs_to_json,
+                                         deny_fleet_wide_service_scoped](
                                             const httplib::Request& req, httplib::Response& res) {
+            // guardian-confinement-2298 PR3 §3e sweep finding: owner-scoped via
+            // session->username — which for a service-scoped token is the
+            // MINTER's username, not the token's own service tag. Any OTHER
+            // service token the same minter holds (or the minter's own
+            // interactive session) shares the identical result-set cohort —
+            // cross-service reach beyond this token's own intended scope. Same
+            // gap class as the HTMX twin (/fragments/result-sets/sidebar).
+            // No `.permission` label (explicit "" overrides the helper's
+            // GuaranteedState:Read default): ResultSet is not a seeded RBAC
+            // securable and this is a blanket deny with no grant that would
+            // help — naming one would be a false self-remediation claim.
+            if (deny_fleet_wide_service_scoped(
+                    req, res, "result_set.list.access_denied", "ResultSet",
+                    "fleet-wide result-set list denied to a service-scoped token",
+                    "service-scoped tokens may not list result sets", "", ""))
+                return;
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -7245,7 +7308,19 @@ void RestApiV1::register_routes(
         // (e.g. dashboard "I have a CSV"). Synchronous → lands materialized.
         sink.Post("/api/v1/result-sets",
                   [auth_fn, audit_fn, result_set_store, metrics_registry, rs_to_json, rs_err,
-                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                   load_owned, deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                               httplib::Response& res) {
+            // guardian-confinement-2298 PR3 §3e sweep finding — same cross-
+            // service reach as the GET list above (session->username-keyed,
+            // not token-scope-keyed): a service-scoped token could create
+            // result sets under the minter's identity, reachable by any
+            // OTHER token the same minter holds.
+            // No `.permission` label — see the GET list handler above.
+            if (deny_fleet_wide_service_scoped(
+                    req, res, "result_set.create.access_denied", "ResultSet",
+                    "result-set create denied to a service-scoped token",
+                    "service-scoped tokens may not create result sets", "", ""))
+                return;
             auto session = auth_fn(req, res);
             if (!session)
                 return;
@@ -7309,11 +7384,27 @@ void RestApiV1::register_routes(
         // agent that matched. When parent_id is given, the candidate set is
         // narrowed to that set's current members.
         sink.Post("/api/v1/result-sets/from-inventory-query",
-                  [auth_fn, audit_fn, result_set_store, inventory_store, metrics_registry,
-                   rs_to_json, rs_err,
+                  [auth_fn, perm_fn, audit_fn, result_set_store, inventory_store,
+                   metrics_registry, rs_to_json, rs_err,
                    load_owned](const httplib::Request& req, httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
+                          return;
+                      // SECURITY (CWE-862, missing authorization) — guardian-
+                      // confinement-2298 PR3 §3e residual sweep finding. This
+                      // producer is a SYNCHRONOUS READ (queries inventory_store
+                      // directly, no command dispatch), not one of the three
+                      // DISPATCH producers the e7b47ca3/#2500 fix already gated
+                      // just below (from-tar-query, from-instruction-result,
+                      // re-eval) — it was never covered by that fix and has been
+                      // reachable by ANY authenticated session (service-scoped or
+                      // not) with no authorization check at all: up to 5000
+                      // fleet-wide inventory records queried and evaluated with
+                      // zero scoping. Gated on Inventory:Read (the same
+                      // securable/operation GET /api/v1/inventory/software uses
+                      // for the identical data class), not Execution:Execute —
+                      // there is no dispatch here to authorize.
+                      if (!perm_fn(req, res, "Inventory", "Read"))
                           return;
                       const auto audit_failure = [&](std::string_view reason) {
                           bool ok = true;
@@ -7672,8 +7763,17 @@ void RestApiV1::register_routes(
 
         // GET /api/v1/result-sets/{id}
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+))",
-                 [auth_fn, rs_to_json, load_owned](const httplib::Request& req,
-                                                   httplib::Response& res) {
+                 [auth_fn, rs_to_json, load_owned,
+                  deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                  httplib::Response& res) {
+                     // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                     // GET list handler above for the cross-service-reach reasoning.
+                     if (deny_fleet_wide_service_scoped(
+                             req, res, "result_set.detail.access_denied", "ResultSet",
+                             "result-set detail denied to a service-scoped token",
+                             "service-scoped tokens may not read result-set detail",
+                             req.matches[1].str(), ""))
+                         return;
                      auto session = auth_fn(req, res);
                      if (!session)
                          return;
@@ -7685,8 +7785,17 @@ void RestApiV1::register_routes(
 
         // GET /api/v1/result-sets/{id}/members
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/members)",
-                 [auth_fn, result_set_store, load_owned](const httplib::Request& req,
-                                                         httplib::Response& res) {
+                 [auth_fn, result_set_store, load_owned,
+                  deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                  httplib::Response& res) {
+                     // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                     // GET list handler above for the cross-service-reach reasoning.
+                     if (deny_fleet_wide_service_scoped(
+                             req, res, "result_set.members.access_denied", "ResultSet",
+                             "result-set members denied to a service-scoped token",
+                             "service-scoped tokens may not read result-set members",
+                             req.matches[1].str(), ""))
+                         return;
                      auto session = auth_fn(req, res);
                      if (!session)
                          return;
@@ -7716,8 +7825,17 @@ void RestApiV1::register_routes(
 
         // GET /api/v1/result-sets/{id}/lineage
         sink.Get(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/lineage)",
-                 [auth_fn, result_set_store, load_owned](const httplib::Request& req,
-                                                         httplib::Response& res) {
+                 [auth_fn, result_set_store, load_owned,
+                  deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                  httplib::Response& res) {
+                     // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                     // GET list handler above for the cross-service-reach reasoning.
+                     if (deny_fleet_wide_service_scoped(
+                             req, res, "result_set.lineage.access_denied", "ResultSet",
+                             "result-set lineage denied to a service-scoped token",
+                             "service-scoped tokens may not read result-set lineage",
+                             req.matches[1].str(), ""))
+                         return;
                      auto session = auth_fn(req, res);
                      if (!session)
                          return;
@@ -7739,8 +7857,17 @@ void RestApiV1::register_routes(
 
         // POST /api/v1/result-sets/{id}/pin
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/pin)",
-                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err,
-                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err, load_owned,
+                   deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                   httplib::Response& res) {
+                      // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                      // GET list handler above for the cross-service-reach reasoning.
+                      if (deny_fleet_wide_service_scoped(
+                              req, res, "result_set.pin.access_denied", "ResultSet",
+                              "result-set pin denied to a service-scoped token",
+                              "service-scoped tokens may not pin result sets",
+                              req.matches[1].str(), ""))
+                          return;
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
@@ -7760,8 +7887,17 @@ void RestApiV1::register_routes(
 
         // POST /api/v1/result-sets/{id}/unpin
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/unpin)",
-                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err,
-                   load_owned](const httplib::Request& req, httplib::Response& res) {
+                  [auth_fn, audit_fn, result_set_store, rs_to_json, rs_err, load_owned,
+                   deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                   httplib::Response& res) {
+                      // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                      // GET list handler above for the cross-service-reach reasoning.
+                      if (deny_fleet_wide_service_scoped(
+                              req, res, "result_set.unpin.access_denied", "ResultSet",
+                              "result-set unpin denied to a service-scoped token",
+                              "service-scoped tokens may not unpin result sets",
+                              req.matches[1].str(), ""))
+                          return;
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
@@ -7780,8 +7916,17 @@ void RestApiV1::register_routes(
 
         // DELETE /api/v1/result-sets/{id}
         sink.Delete(R"(/api/v1/result-sets/(rs_[0-9a-f]+))",
-                    [auth_fn, audit_fn, result_set_store, rs_err,
-                     load_owned](const httplib::Request& req, httplib::Response& res) {
+                    [auth_fn, audit_fn, result_set_store, rs_err, load_owned,
+                     deny_fleet_wide_service_scoped](const httplib::Request& req,
+                                                     httplib::Response& res) {
+                        // guardian-confinement-2298 PR3 §3e sweep finding: see the
+                        // GET list handler above for the cross-service-reach reasoning.
+                        if (deny_fleet_wide_service_scoped(
+                                req, res, "result_set.delete.access_denied", "ResultSet",
+                                "result-set delete denied to a service-scoped token",
+                                "service-scoped tokens may not delete result sets",
+                                req.matches[1].str(), ""))
+                            return;
                         auto session = auth_fn(req, res);
                         if (!session)
                             return;
