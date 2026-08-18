@@ -98,12 +98,22 @@ TEST_CASE("run_bounded_wmi_query fails fast with wmi_connect_failed_ on a bad na
     REQUIRE(result.rows.empty());
 }
 
-TEST_CASE("run_bounded_wmi_query fails fast with wmi_query_failed_ on malformed WQL") {
+TEST_CASE("run_bounded_wmi_query fails fast on malformed WQL") {
+    // Semisynchronous ExecQuery (WBEM_FLAG_RETURN_IMMEDIATELY) defers WQL
+    // parsing: it does not itself fail on bad syntax -- the provider only
+    // rejects it once the caller starts pulling results, so the error can
+    // legitimately surface at either ExecQuery() ("wmi_query_failed_") or the
+    // first Next() ("wmi_next_failed_"). Verified against real WMI: this
+    // specific malformed string fails at Next(), not ExecQuery(). Either is
+    // a correct instance of the fail-with-reason contract; what must always
+    // hold is that malformed WQL never produces a silent empty success.
     BoundedQueryOptions opts;
     opts.enumeration_deadline_ms = 5000;
     const auto result = run_bounded_wmi_query(L"root\\cimv2", L"THIS IS NOT WQL", opts);
     REQUIRE(result.error.has_value());
-    REQUIRE(starts_with(*result.error, "wmi_query_failed_"));
+    REQUIRE((starts_with(*result.error, "wmi_query_failed_") ||
+             starts_with(*result.error, "wmi_next_failed_")));
+    REQUIRE(result.rows.empty());
 }
 
 TEST_CASE("run_bounded_wmi_query succeeds against a universally-present class") {
