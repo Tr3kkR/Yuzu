@@ -7,6 +7,8 @@
 #include "http_route_sink.hpp"
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_scope_estimate) —
+                                     // mints/reuses X-Correlation-Id so header and body agree
 #include "scope_engine.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "web_utils.hpp"
@@ -928,14 +930,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return true; // auth_fn already wrote 401/redirect; caller returns.
         if (session->token_scope_service.empty())
             return false;
-        const auto cid = detail::make_correlation_id();
         // Write the 403 FIRST, audit after (mirrors GuardianRoutes'
         // deny_service_scoped_): a throwing audit_fn must not suppress the 403.
         res.status = 403;
+        // No `.permission`: `kServiceScopeGlobalSafe` is compile-time-empty,
+        // so no grant admits a service-scoped caller here (gov-fix, Gate 8,
+        // #2298 PR 3 hardening round — routed-concern MUST clause).
+        // `a4_denial` also fixes a second bug found in the same pass: the
+        // hand-built cid never reached the X-Correlation-Id header.
         res.set_content(
-            detail::error_json_a4(
-                403, "service-scoped tokens may not read the fleet-wide schedule list", cid,
-                detail::A4ErrorOpts{.permission = "Schedule:Read"}),
+            detail::a4_denial(res, 403,
+                              "service-scoped tokens may not read the fleet-wide schedule list"),
             "application/json");
         if (audit_fn) {
             try {
@@ -1022,19 +1027,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return true; // auth_fn already wrote 401/redirect; caller returns.
         if (session->token_scope_service.empty())
             return false;
-        const auto cid = detail::make_correlation_id();
         res.status = 403;
         // No `.permission` label: this route has no perm_fn gate at all — a
         // blanket deny with no grant that would admit a service-scoped
         // token, so naming one would be a false self-remediation claim.
+        //
+        // `a4_denial` (not a hand-built `error_json_a4` + bare correlation
+        // id): it mints/reuses the id via `ensure_correlation_id`, which
+        // ALSO sets the X-Correlation-Id response header — a hand-built id
+        // embeds a correlation_id in the body the header never carries,
+        // breaking the header/body-must-agree contract (consistency-auditor,
+        // Gate 4).
         res.set_content(
-            detail::error_json_a4(
-                403, "service-scoped tokens may not estimate scope expressions against the fleet",
-                cid),
+            detail::a4_denial(
+                res, 403,
+                "service-scoped tokens may not estimate scope expressions against the fleet"),
             "application/json");
         if (audit_fn) {
             try {
-                audit_fn(req, "scope.estimate.access_denied", "denied", "scope_expression", "",
+                audit_fn(req, "scope.estimate.access_denied", "denied", "ScopeExpression", "",
                          "fleet-wide scope estimate denied to a service-scoped token");
             } catch (const std::exception& e) {
                 spdlog::warn("scope.estimate.access_denied: audit_fn threw: {}", e.what());

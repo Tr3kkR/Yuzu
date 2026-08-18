@@ -8,7 +8,8 @@
 #include "dispatch_target_shape.hpp" // check_targeting_shape (#2500)
 
 #include "policy_evaluator.hpp"
-#include "rest_a4_envelope.hpp" // detail::error_json_a4, make_correlation_id (deny_service_scoped_)
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
+                                     // X-Correlation-Id so header and body always agree
 #include "store_errors.hpp"
 #include "web_utils.hpp"
 
@@ -270,7 +271,6 @@ bool ComplianceRoutes::deny_service_scoped_(const httplib::Request& req,
         return true; // auth_fn_ already wrote 401/redirect; caller returns.
     if (session->token_scope_service.empty())
         return false;
-    const auto cid = detail::make_correlation_id();
     // Write the 403 FIRST, audit after — a throwing audit_fn_ must not be
     // able to suppress the 403 (mirrors GuardianRoutes::deny_service_scoped_).
     res.status = 403;
@@ -278,9 +278,15 @@ bool ComplianceRoutes::deny_service_scoped_(const httplib::Request& req,
     // either fragment it covers — a service-scoped token HOLDING Policy:Read
     // is still denied here, so naming it as "the missing grant" would be a
     // false self-remediation claim (A4's permission field contract).
+    //
+    // `a4_denial` (not a hand-built `error_json_a4` + bare correlation id):
+    // it mints/reuses the id via `ensure_correlation_id`, which ALSO sets the
+    // X-Correlation-Id response header — a hand-built id embeds a
+    // correlation_id in the body that the header never carries, breaking the
+    // header/body-must-agree contract (found by consistency-auditor, Gate 4).
     res.set_content(
-        detail::error_json_a4(
-            403, "service-scoped tokens may not read this fleet-wide compliance view", cid),
+        detail::a4_denial(res, 403,
+                          "service-scoped tokens may not read this fleet-wide compliance view"),
         "application/json");
     if (audit_fn_) {
         try {

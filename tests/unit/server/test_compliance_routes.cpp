@@ -80,6 +80,11 @@ TEST_CASE("/fragments/compliance/summary: a service-scoped token is denied",
     // No permission field: this is a blanket deny with no perm_fn gate — the
     // A4 builder omits the field rather than name a grant that wouldn't help.
     CHECK_FALSE(j["error"].contains("permission"));
+    // Header/body correlation-id parity (consistency-auditor, Gate 4): a
+    // hand-built id used to land in the body only, never the header.
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
 
     bool saw_denied = false;
     for (const auto& c : h.audit_calls) {
@@ -115,6 +120,10 @@ TEST_CASE("/fragments/compliance/{policy_id}: a service-scoped token is denied",
     CHECK(res->status == 403);
     auto j = nlohmann::json::parse(res->body);
     CHECK(j["error"]["message"].get<std::string>().find("service-scoped") != std::string::npos);
+    // Header/body correlation-id parity (consistency-auditor, Gate 4).
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
 
     bool saw_denied = false;
     for (const auto& c : h.audit_calls) {

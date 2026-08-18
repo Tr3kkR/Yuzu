@@ -2123,11 +2123,21 @@ TEST_CASE("POST /api/scope/estimate: a service-scoped token is denied",
     REQUIRE(res);
     CHECK(res->status == 403);
     CHECK(res->body.find("service-scoped") != std::string::npos);
+    // Header/body correlation-id parity (consistency-auditor, Gate 4): a
+    // hand-built id used to land in the body only, never the header.
+    auto j = nlohmann::json::parse(res->body);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
 
     bool saw_denied = false;
     for (const auto& c : h.audit_calls) {
-        if (c.action == "scope.estimate.access_denied" && c.result == "denied")
+        if (c.action == "scope.estimate.access_denied" && c.result == "denied") {
             saw_denied = true;
+            // PascalCase convention (consistency-auditor, Gate 4): was
+            // "scope_expression".
+            CHECK(c.target_type == "ScopeExpression");
+        }
     }
     CHECK(saw_denied);
 }
