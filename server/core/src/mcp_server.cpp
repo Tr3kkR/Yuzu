@@ -3774,6 +3774,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!session->token_scope_service.empty() &&
                     sec_scope == ServiceScopeClass::denied) {
                     mcp_audit("denied", "service-scoped token blocked: default-deny (C8, #2298)");
+                    // sre Gate 6 (#2298 PR 3 hardening round): this C8
+                    // short-circuit returns before perm_fn/require_permission
+                    // ever runs, so that function's own increment site never
+                    // fires for `denied`-class tools — without this, the ADR's
+                    // "Phase 2 prioritized by this metric" claim would be false
+                    // for exactly the tools it names. `path_class="mcp"`
+                    // mirrors body_cap_policy.hpp's own `/mcp/` row (the
+                    // single source of truth for that label) rather than
+                    // pulling that header in for one constant string.
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_auth_service_scope_default_denied_total",
+                                     {{"permission", std::string(sec_type) + ":" + std::string(sec_op)},
+                                      {"path_class", "mcp"}})
+                            .increment();
+                    }
                     res.set_content(
                         a4_error(kPermissionDenied, "service-scoped tokens cannot call this tool",
                                  "this tool has no per-agent/service confinement; the "

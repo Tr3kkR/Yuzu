@@ -219,7 +219,12 @@ reasoning): `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md
   real downstream confinement mechanism today, and `confined` without one
   is exactly the unenforced claim this design exists to prevent.
   Re-admission is Phase 2 policy-table work, prioritized by the
-  `yuzu_auth_service_scope_default_denied_total` metric.
+  `yuzu_auth_service_scope_default_denied_total` metric — which C8's own
+  `denied`-class short-circuit increments directly (`path_class="mcp"`),
+  since it returns before `require_permission` ever runs and would
+  otherwise leave every `denied`-class MCP tool structurally invisible to
+  the signal this bullet names (found by `sre` in this PR's own governance
+  review, fixed in the same round).
 - **Service-tag writes are an accepted, unhardened boundary for now.**
   Whoever can set an agent's `service` tag effectively moves that agent's
   scope membership; this PR does not harden that write path. Tracked as

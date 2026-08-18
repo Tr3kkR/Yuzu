@@ -3470,8 +3470,10 @@ TEST_CASE("MCP DEX: tools report unavailable when no Guaranteed State store is w
 TEST_CASE("MCP C8: a service-scoped token is denied by the default-deny "
           "classification, before tier/approval (unclassified tool)",
           "[mcp][integration][security][service_scope]") {
+    yuzu::MetricsRegistry reg;
     McpTestServer ts;
     ts.mock_token_scope_service = "printers";
+    ts.metrics_for_test = &reg;
     ts.start("readonly");
 
     auto res =
@@ -3488,6 +3490,15 @@ TEST_CASE("MCP C8: a service-scoped token is denied by the default-deny "
         CHECK(a != "mcp.list_agents|success");
     }
     CHECK(saw_denied);
+
+    // sre Gate 6 (#2298 PR 3 hardening round): this C8 short-circuit returns
+    // before require_permission ever runs, so it must increment the same
+    // Phase-2-prioritization metric itself — otherwise every `denied`-class
+    // MCP tool (this one included) is structurally invisible to the signal
+    // the ADR's Consequences section names.
+    CHECK(reg.counter("yuzu_auth_service_scope_default_denied_total",
+                       {{"permission", "Infrastructure:Read"}, {"path_class", "mcp"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("MCP C8: a non-service session still reaches list_agents "
