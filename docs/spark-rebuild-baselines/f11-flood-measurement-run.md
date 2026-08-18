@@ -24,8 +24,12 @@ Two instruments, deliberately separated:
    registry_cadence_ms = 60'000`, `file_cadence_ms = 600'000`, `priority_poll_ms = 5'000`
    (`guardian_convergence_scheduler.hpp:68-75`). A test-driven clock advance per
    simulated scheduler tick stands in for `ConvergenceScheduler` itself, which received
-   **zero code change** from F5 (`docs/spark-stage2-guardian-consumer-design.md:283-284`)
-   - the real per-lane tick spacing is the scheduler's job, reproduced here by hand.
+   **zero code change** from F5 (`docs/spark-stage2-guardian-consumer-design.md`, the
+   "zero scheduler code change" note - cite the symbol/anchor, not a line number,
+   for exactly the reason this citation itself drifted once already: docs-writer
+   caught it at line 312 during governance, 2026-08-18, having been 283-284 when
+   written) - the real per-lane tick spacing is the scheduler's job, reproduced
+   here by hand.
 2. **A live DGRHP window** - spark forced active via a one-line, never-committed rig
    patch, real REST-armed errored load, real journal/outbox/heartbeat pipeline under
    wall clock. Confirms the pipeline moves the way the unit test says it should; it is
@@ -262,11 +266,27 @@ branch:
 - **LOW, confirmed by both:** the runbook's 30-minute sanity-window table said "~5
   refreshes" without noting the inclusive t=1800s boundary can land a 6th, and didn't
   account for jitter on the file-lane count. Fixed: reworded.
-- **LOW (Kimi only, rejected by Codex on cross-exam, I agree with the rejection):**
-  `guardian-c0-thread-reloc-design.md`'s item 7/9 resolutions record an operator
-  ruling without a paired code change. Not a defect - there was no code to change
-  (the shipped caps already matched the derivation; only stale TEXT was wrong), and
-  the doc is honest about being a recorded ruling, not a code-verified measurement.
+- **LOW (Kimi only, rejected by Codex on cross-exam) — REOPENED AND CORRECTED
+  post-adversarial-review, during full `/governance`:** `guardian-c0-thread-reloc-
+  design.md`'s item 7/9 resolutions recorded an operator ruling ("2000/64 MiB is
+  stale text") without a paired code change. Both Kimi and Codex, and my own
+  synthesis, accepted the premise that no code change was needed because "the
+  shipped caps already matched the derivation." **That premise was wrong.**
+  Governance's `architect` reviewer found `hard_max_batches_`/`hard_max_bytes_`
+  (`guardian_lifecycle_journal.hpp:682-683`) - a real, actively-enforced
+  write-capacity ceiling at exactly 2000/64 MiB, shipped BEFORE the doc text this
+  branch dismissed as stale, and already described correctly elsewhere in the
+  same doc (item 12: "the 2x-headroom hard ceiling"). The original ruling was
+  itself the error; both the adversarial review and my own first-pass synthesis
+  missed it because neither actually grepped for a `hard_max_*` constant before
+  accepting "no code to change" as settled. Item 7/9 reverted to the original
+  (correct) 2000/64 MiB hard-ceiling instruction - see
+  `guardian-c0-thread-reloc-design.md` item 7's 2026-08-18 correction note for
+  the full chronology. **Lesson for future adversarial/governance runs on this
+  branch's pattern:** "no code changed, so the doc-only ruling can't be
+  independently verified" is not the same as "the ruling is therefore
+  unfalsifiable" - a ruling ABOUT existing code is still checkable by reading the
+  code, even when the PR itself doesn't touch it.
 - **Withdrawn by both (already tracked, out of this branch's scope):** the
   `agent.cpp:1115` hardcoded log string - this branch doesn't touch `agent.cpp`;
   stays forward action item 3 below.
@@ -307,4 +327,15 @@ committed (adversarial-review workflow output, not repo content) - reproducible 
    `pending_demote_sweeps`, `pending_demote_ms`) have not changed before reusing these
    numbers in a later doc - they are cited by value, not by reference, in the "Claims"
    section above, and a future retune would silently stale this doc exactly the way F5
-   staled the ~17k/day figure.
+   staled the ~17k/day figure. Item 6 below is the same protection for the scheduler's
+   own jitter defaults.
+6. **Considered and declined: a `jittered()` bounds test** (governance Gate 3,
+   `quality-engineer` finding) - `ConvergenceScheduler::jittered()` is private with no
+   test hook, so pinning its output bounds would need a new test-only accessor added
+   to production `guardian_convergence_scheduler.hpp`. Declined as disproportionate
+   for a SHOULD-not-blocking finding: the actual 480s-floor claim this run doc makes
+   is already empirically verified by the fourth F11 Catch2 case, which drives the
+   real `GuardianSparkRuntime` at that exact interval - what's undefended is only a
+   FUTURE `jitter_pct`/`file_cadence_ms` retune silently staling the daily-rate
+   arithmetic, which is the same class of risk item 5 above already names. Revisit if
+   either constant is ever retuned.

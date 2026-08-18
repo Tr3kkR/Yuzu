@@ -594,13 +594,25 @@ Whichever PR flips `prefer_spark` MUST also:
    is meaningless). This also closes item 14 (see its note).
 7. **Run chaos scenario CH-5** (live-event latency under KvStore contention, UAT rig). It is
    the only scenario that measures the thing C0 was built to fix, so it is the flip's genuine
-   go/no-go rather than a formality. Run it at ~~the journal's HARD ceiling (2000 batches /
-   64 MiB)~~ **the journal's SHIPPED caps (1000 batches / 32 MiB, `kMaxJournalBatches`/
-   `kMaxJournalBytes`) - ruled 2026-08-18 (Dave): the "2000/64 MiB" figure was stale text
-   predating the finalized caps, not a deliberate 2x stress margin; see item 9's resolved
-   open question below**, not at the ~900 measured so far (Gate 6 sre): a full scan already
-   exceeded one second at 900, so the pass duration - not `kGuardianMinRefillInterval` - is
-   what actually paces chained forced pages during a large-backlog recovery.
+   go/no-go rather than a formality. Run it at the journal's HARD ceiling (2000 batches /
+   64 MiB, `hard_max_batches_`/`hard_max_bytes_` -
+   `guardian_lifecycle_journal.hpp:682-683`) - **CORRECTED 2026-08-18 (F11 #2298
+   governance, architect finding): a 2026-08-18 doc edit briefly claimed this figure was
+   stale text and substituted the SHIPPED soft caps (1000 batches / 32 MiB). That claim
+   was wrong and is reverted here. `hard_max_batches_`/`hard_max_bytes_` are a real,
+   actively-enforced write-capacity ceiling (`guardian_lifecycle_journal.cpp:207-208`,
+   `write_capacity_rejected_`), deliberately set at 2x the soft retention caps
+   (`agents/core/src/guardian_lifecycle_journal.hpp:224` doc comment: "Decoupled from
+   the retention caps... persist refuses to cross it so a chronically-failing prune
+   cannot grow the shared kv_store.db without bound") and shipped
+   (`84b6cc31a`, 2026-07-19) three days BEFORE this doc's own "2000 batches" text
+   (`b75e365d6`, 2026-07-22) - chronologically backwards for a "stale, pre-finalization"
+   reading. This doc's own item 12 already correctly describes it as "the 2x-headroom
+   hard ceiling," which the reverted edit should have caught as an internal
+   contradiction before shipping.** Not at the ~900 measured so far (Gate 6 sre): a full
+   scan already exceeded one second at 900, so the pass duration - not
+   `kGuardianMinRefillInterval` - is what actually paces chained forced pages during a
+   large-backlog recovery.
 8. ~~Persist pending lifecycle records BEFORE the drain-worker join~~ - **DONE (round 6,
    commit 882e2bf5)**,
    not deferred. Gate 6 compliance and Gate 8 security both declined the "or risk-accept"
@@ -668,14 +680,28 @@ Whichever PR flips `prefer_spark` MUST also:
    `kMaxJournalBatches`/`kMaxJournalBytes`). Unclear from the code alone whether
    2000/64 MiB is a deliberate 2x stress margin for the chaos run or stale text from
    before the caps were finalized - flagging for confirmation before CH-5 runs
-   rather than silently picking one reading.~~ - **RESOLVED 2026-08-18 (Dave, F11
-   #2298): confirmed stale text, not a deliberate margin. CH-5 runs at the shipped
-   caps (1000 batches / 32 MiB) - the thresholds above are internally consistent
-   with that reading and need no re-derivation. Item 7 updated to match.**
+   rather than silently picking one reading.~~ - **RESOLVED 2026-08-18, corrected
+   same day (F11 #2298 governance, architect finding): 2000/64 MiB IS the
+   deliberate figure - it is `hard_max_batches_`/`hard_max_bytes_`
+   (`guardian_lifecycle_journal.hpp:682-683`), a real, actively-enforced
+   write-capacity ceiling at 2x the soft retention caps, decoupled from them by
+   design, shipped (`84b6cc31a`, 2026-07-19) three days before this item's own
+   "2000 batches" text (`b75e365d6`, 2026-07-22). An earlier pass at this
+   resolution wrongly called it stale text and substituted the soft caps below -
+   that was wrong and is reverted; item 7 restored to the hard ceiling.** The
+   threshold derivation below (from the soft 1000/32 MiB caps) is UNAFFECTED and
+   still correct on its own terms - it characterizes loss tolerance under
+   sustained near-100%-occupancy starvation, a different regime from CH-5's
+   write-capacity stress test. A future CH-5 run at the hard ceiling should also
+   confirm `write_capacity_rejected_` behaves as a transient, self-clearing
+   backstop (matching the "Capacity-reject classes... transient-only" threshold
+   above) rather than a sustained rejection under load - not yet verified either
+   way.
 
-   Thresholds themselves also **CONFIRMED 2026-08-18 (Dave)** as posted above
-   (including the 2026-08-10 per-agent-attribution correction) - stand as written.
-   Posted for confirmation: issue #2364 and the #2340 chaos-campaign issue (CH-11).
+   Thresholds themselves (the occupancy-percentage-based loss tolerances derived
+   from the soft 1000/32 MiB caps) stand as written and are unaffected by the
+   above correction. Posted for confirmation: issue #2364 and the #2340
+   chaos-campaign issue (CH-11).
 10. ~~**Make the replay pass lazy-parse** (Gate 3 performance, measured). `page_into_window` and
     `prune` both parse the ENTIRE journal before applying the 128-candidate cap: ~680 ms and
     ~668 ms per pass at the byte ceiling, 97% of it in `parse_journal_batch`, with `rows` (raw)
