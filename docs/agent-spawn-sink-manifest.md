@@ -87,6 +87,13 @@ interim site — ADR-3002 Decisions 1 and 2).
 | `interaction/posix_zenity_survey_choice#1` | `agents/plugins/interaction/src/interaction_plugin.cpp:platform_survey` (Linux, choice leg) | runner argv (`zenity --list --title <t> --text <p> --column=Option -- <choice1> <choice2> ...`), clean argv | Linux | operator-supplied title/prompt/choices, sanitized, each choice its own trailing positional argv element (no longer a space-joined, individually-quoted shell string); a `--` separator precedes the choices (ADR-3002 Decision 6 argv hygiene — sanitize() permits a leading `-`, so an unguarded positional choice could be parsed as a zenity option instead of data) | read-only | none — no shell involved | same as above | same as above | Rung 2 — clean multi-element argv, same as above | Decision-1 ledger row (plain-binary argv through the bounded runner; NOT a Decision-5 interpreter site) |
 | `interaction/posix_zenity_survey_text#1` | `agents/plugins/interaction/src/interaction_plugin.cpp:platform_survey` (Linux, text leg) | runner argv (`zenity --entry --title <t> --text <p>`), clean argv | Linux | operator-supplied title/prompt, sanitized | read-only | none — no shell involved | same as above | same as above | Rung 2 — clean multi-element argv, same as above | Decision-1 ledger row (plain-binary argv through the bounded runner; NOT a Decision-5 interpreter site) |
 | `interaction/posix_notify_send#1` | `agents/plugins/interaction/src/interaction_plugin.cpp:platform_notify` (Linux) | runner argv (`notify-send -u <urgency> -- <title> <message>`), clean argv resolved via `probe_tool_path` | Linux | operator-supplied title/message, sanitized, each its own argv element; `type` maps to a fixed literal `-u` urgency value; a `--` separator precedes the positional title/message (ADR-3002 Decision 6 argv hygiene — sanitize() permits a leading `-`, so an unguarded title could be parsed as a notify-send option, e.g. `-i` as `--icon`) | read-only (posts a desktop notification, no host state change) | none — no shell involved | none beyond the LaunchDaemon's existing context | Reviewed — no rung-1 API gives a cross-desktop notification surface; `notify-send` is a plain binary with no interpreter role, so rung 2 is the floor | Rung 2 — clean multi-element argv through the bounded subprocess runner; no interpreter is invoked | Decision-1 ledger row (plain-binary argv through the bounded runner; NOT a Decision-5 interpreter site) |
+| `firewall/do_state_macos#1` | `agents/plugins/firewall/src/firewall_plugin.cpp:do_state_macos` | runner argv (`/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate`) | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false default) | none | no rung-1 API for Application Firewall global state in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `firewall/do_state_macos#2` | `agents/plugins/firewall/src/firewall_plugin.cpp:do_state_macos` | runner argv (`/sbin/pfctl -s info`) | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false default) | none | no rung-1 API for pf packet-filter status in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `firewall/do_rules_macos#1` | `agents/plugins/firewall/src/firewall_plugin.cpp:do_rules_macos` | runner argv (`/sbin/pfctl -s rules`) | macOS | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false default) | none | no rung-1 API for pf rule listing in this plugin | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for this data on this OS in this plugin | n/a |
+| `firewall/try_ufw_state#1` | `agents/plugins/firewall/src/firewall_plugin.cpp:try_ufw_state` | runner argv (`/usr/sbin/ufw status`) | Linux | compile-time literal argv | read-only | none — redirection eliminated (2>/dev/null -> merge_stderr=false default) | none | firewalld's D-Bus API answers this only when firewalld is the active backend; ufw has no D-Bus/library surface | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for ufw state | n/a |
+| `firewall/try_ufw_rules#1` | `agents/plugins/firewall/src/firewall_plugin.cpp:try_ufw_rules` | runner argv (`/usr/sbin/ufw status numbered`) | Linux | compile-time literal argv | read-only | none | none | same as `try_ufw_state#1` | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for ufw rules | n/a |
+| `firewall/try_iptables_state#1` | `agents/plugins/firewall/src/firewall_plugin.cpp:try_iptables_state` | runner argv (`/usr/sbin/iptables -S`) | Linux | compile-time literal argv | read-only | none | none | last fallback backend — no rung-1 API and no higher-level backend (firewalld/ufw) reachable at this point in the probe | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for raw iptables state | n/a |
+| `firewall/try_iptables_rules#1` | `agents/plugins/firewall/src/firewall_plugin.cpp:try_iptables_rules` | runner argv (`/usr/sbin/iptables -S`) | Linux | compile-time literal argv | read-only | none | none | same as `try_iptables_state#1` | 2 — direct argv via yuzu::agent::run_bounded_subprocess; rung 1 passed over: no rung-1 API for raw iptables rules | n/a |
 
 ## Seed inventory — known spawn surfaces awaiting transcription
 
@@ -96,7 +103,7 @@ private helpers). Site-level transcription is #2380's first work item —
 these rows are pointers, not evidence.
 
 **Raw `popen`/`system` helpers:** antivirus, bitlocker,
-device_identity, event_logs, firewall, hardware, installed_apps,
+device_identity, event_logs, hardware, installed_apps,
 ioc, license_scan, network_config,
 network_diag, os_info, processes, sccm,
 software_actions, tar, vuln_scan, wifi, windows_updates.
@@ -106,6 +113,19 @@ sequence that cleanup against migrating it, tracked in #2380.)
 **Migrated off raw spawn (Wave 2, PR2.1a):** `users` (Windows session
 history moved to wevtapi/EvtQuery, ProfileList to native enumeration; POSIX
 sites moved to direct runner argv — see Registered sites above).
+
+**Migrated off raw spawn (Wave 3, PR3.3-c1):** `firewall` (Windows netsh
+promoted to rung-1 `INetFwPolicy2` COM — zero subprocesses; macOS ALF/pfctl
+moved from `popen()` to rung-2 `run_bounded_subprocess` argv, same 3 sites —
+see Registered sites above; Linux firewalld promoted to rung-1 bounded
+sd-bus, ufw/iptables promoted to rung-2 `run_bounded_subprocess` argv with
+new structured per-backend parsers — `parse_ufw_status`/`parse_ufw_rules`/
+`parse_iptables_save` — replacing the single opaque `firewall-cmd --list-all
+|| ufw status numbered || iptables -L -n --line-numbers` shell chain and its
+`rule|<raw line>` passthrough. Linux nftables is intentionally left
+unimplemented as a clean seam for the sequential follow-up PR
+`feat/wave3-pr33c2-firewall-nftables`, which adds only rung-1 netlink code
+with no raw spawn — will not re-add a grandfather-list entry).
 
 **Migrated off raw spawn (Wave 2, PR2.1b):** `certificates` (Linux/macOS
 System+SystemRoot promoted to rung-1 libcrypto/SecItem; the login-keychain
