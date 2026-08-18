@@ -173,6 +173,14 @@ public:
     /// legitimately-elevated caller who holds no base grant (the regression
     /// the first #3038 fix attempt shipped).
     ///
+    /// Route-class distinction from `authz::AuthRoutes::require_fleet_read`
+    /// (#2298 PR 3 §3f, closes #3218): this method is the sole gate on
+    /// fleet-wide ROLLUP routes — it refuses a service-scoped session
+    /// outright, since a rollup has no per-service slice to narrow to.
+    /// `require_fleet_read` (`authz_gates.hpp`) is meant to be paired with
+    /// `require_permission` on routes migrating toward real per-request
+    /// service-scope confinement (Phase 2). They are not interchangeable.
+    ///
     /// An engine principal is special-cased (RBAC-only, never legacy-open)
     /// rather than delegated to `authorize_list_read` directly:
     /// `authorize_list_read`'s legacy-open branch returns `AdmitAll` when

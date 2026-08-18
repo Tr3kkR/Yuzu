@@ -712,11 +712,34 @@ curl -s -b cookies.txt -X POST http://localhost:8080/api/v1/tokens \
 Service-scoped tokens:
 - Cannot access any `/api/v1/admin/*` routes (403 Forbidden)
 - Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
-- Must have `ITServiceOwner` role permission for the target operation
-- Are scoped to agents tagged with the matching `service` tag
 - Carry a session role floored to the base `user` level regardless of the
   minting principal's own role — an `ITServiceOwner` RBAC grant is the sole
   authority ceiling for a service-scoped token, never the minter's role
+
+**Default-deny (guardian-confinement-2298 PR 3 — "the flip").** Holding
+`ITServiceOwner` for a given `securable:operation` is necessary but no
+longer sufficient. A service-scoped token is denied fleet-wide access by
+default — the operation must also appear on a server-side allow-list that
+ships **empty**, so today a fresh install denies every fleet-wide
+operation to every service-scoped token, full stop. This is the deliberate
+opposite of the token's `service` tag acting as an automatic per-service
+filter: there is no such filter today. A small, explicitly-reviewed set of
+routes have their own real per-request confinement instead (checked
+against a matching `service` tag on the target device) — the response
+body's `error.permission` field, when present, names the missing grant;
+its absence on a `403` means the route has no grant that would help at
+all, and reaching it as a service-scoped token is not currently possible
+by design. Widening what a service-scoped token can reach is a
+security-reviewed change to the server, not a per-token configuration
+option.
+
+**Bootstrap note.** A brand-new service token, on a brand-new install, has
+no other credential to fall back on — it cannot use itself to discover or
+claim a `service` tag for its own agents, or to widen its own reach. Stand
+up a new service's automation using an interactive session (or a plain,
+unscoped API token) for the one-time setup, and mint the service-scoped
+token only once the agents it should reach already carry the matching
+`service` tag.
 
 ### Revoking a Token
 

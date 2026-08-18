@@ -1,0 +1,14 @@
+- **Service-scoped API tokens are now denied fleet-wide access by default, not admitted by default.**
+  `AuthRoutes::require_permission`'s service-scoped branch previously admitted any operation the
+  `ITServiceOwner` role happened to grant — since that role holds broad CRUD across most securables,
+  this meant a token bound to one IT service's agents could, in practice, reach fleet-wide data with
+  no per-agent narrowing at all. A `(securable, operation)` pair must now *also* clear a server-side
+  allow-list that ships **empty**, so every route not yet migrated to real per-request confinement
+  denies a service-scoped token outright rather than admitting it unfiltered. Mirrored at the MCP
+  `tools/call` dispatch layer via a new per-tool `ServiceScopeClass` classification. Every route that
+  reached agent/fleet/execution/result data via no permission gate at all — including several found by
+  a residual sweep beyond the originally-scoped list, and one distinct pre-existing CWE-862
+  missing-authorization bug on the same surface — now has an explicit deny. See
+  `docs/adr/1006-service-scope-default-deny.md` for the full design and
+  `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md` for the closed route
+  inventory. (guardian-confinement-2298 PR 3 — "the flip")
