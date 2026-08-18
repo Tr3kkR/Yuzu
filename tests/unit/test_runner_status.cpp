@@ -8,6 +8,7 @@
 #include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/plugin.h>
 
+#include <set>
 #include <string>
 
 using yuzu::agent::classify_runner_failure;
@@ -62,8 +63,40 @@ TEST_CASE("classify_runner_failure: exited -> nullopt (caller owns exit-code sem
     CHECK_FALSE(s.has_value());
 }
 
-TEST_CASE("classify_runner_failure: line_limit -> nullopt (clean bounded stop)",
+TEST_CASE("classify_runner_failure: line_limit -> OK/PARTIAL, reason preserved",
          "[agent][runner_status]") {
+    // ADR-3002 "Honest termination reporting" names line_limit in the reason
+    // enum and requires the reason to survive to the wire, naming the plugin
+    // execute() integer return as the narrowing point that must not flatten
+    // it. An earlier cut grouped line_limit with `exited` and returned
+    // nullopt, so a run deliberately cut at N lines was indistinguishable
+    // from one that completed (/adversarial-review Codex CDX-4, Kimi F7).
     const auto s = classify_runner_failure(result_with(TerminationReason::line_limit));
-    CHECK_FALSE(s.has_value());
+    REQUIRE(s.has_value());
+    // OK, not CONSTRAINED: a bounded stop is a SUCCESSFUL bounded read, and
+    // calling it constrained would make every capped request look degraded.
+    CHECK(s->status == YUZU_RESULT_STATUS_OK);
+    // PARTIAL, because output was deliberately truncated.
+    CHECK(s->completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(s->completeness != YUZU_RESULT_COMPLETENESS_FULL);
+    CHECK(std::string(s->provenance) == "subprocess_runner:line_limit");
+}
+
+TEST_CASE("classify_runner_failure: every non-exited reason carries a distinct provenance",
+         "[agent][runner_status]") {
+    // The reason enum exists so an autonomous consumer can tell "killed at
+    // deadline" (escalate) from "spawn error" (never retry) from a bounded
+    // stop. Shared or missing tags collapse those decisions.
+    const TerminationReason reasons[] = {
+        TerminationReason::spawn_error, TerminationReason::deadline,
+        TerminationReason::cancelled,   TerminationReason::signaled,
+        TerminationReason::line_limit,
+    };
+    std::set<std::string> seen;
+    for (auto r : reasons) {
+        const auto s = classify_runner_failure(result_with(r));
+        REQUIRE(s.has_value()); // only `exited` may be nullopt
+        CHECK(seen.insert(std::string(s->provenance)).second); // no duplicates
+    }
+    CHECK(seen.size() == 5);
 }
