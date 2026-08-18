@@ -33,15 +33,22 @@ class AuthRoutes;
 
 namespace yuzu::server::authz {
 
-/// Why `require_fleet_read` did not produce a `ListAuthority`.
+/// Why `require_fleet_read` did not produce a `ListAuthority`. This is
+/// structural bookkeeping, not a caller dispatch surface — every failure
+/// path has already written `res` itself before returning one of these; a
+/// caller must not re-decode a `GateFailure` into a status code of its own.
 enum class GateFailure : std::uint8_t {
-    Forbidden, ///< 403 — the management-group axis returned DenyAll (a real
-               ///< deny OR a store/mgmt-store error; see rbac_store.hpp's
-               ///< `authorize_list_read` doc — the promise is deliberately
-               ///< weakened here rather than adding a discriminator).
-    Degraded,  ///< 503 — the service-scope axis's tag-store lookup failed
-               ///< (null `tag_store_`, or a degraded/failed query). Distinct
-               ///< from Forbidden because it is retryable.
+    Unauthenticated, ///< 401 — `require_auth` failed and already wrote the
+                     ///< response.
+    Forbidden,       ///< 403 — a real deny: the management-group axis
+                     ///< returned a genuine `ListReadDecision::DenyAll` (may
+                     ///< still mask an in-query store error —
+                     ///< `authorize_list_read`'s own documented weakening,
+                     ///< see rbac_store.hpp; unchanged here).
+    Degraded,        ///< 503 — infrastructure unavailable, retryable: a
+                     ///< null/not-open RBAC store, or the service-scope
+                     ///< axis's tag-store lookup failing (null `tag_store_`,
+                     ///< or a degraded/failed query).
 };
 
 /// Move-only witness over an already-composed `VisibleSet` — the product of

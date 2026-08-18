@@ -209,13 +209,15 @@ public:
     /// (`authz::meet`) with service-scope visibility (a service-scoped
     /// session's `service`-tagged agents; TOP/unfiltered for a non-service
     /// session, so the result is byte-identical to `authorize_list_read`
-    /// alone in that case). Per-axis fail-closed BEFORE the intersection:
-    /// the management axis collapses "no grant" and "store error" both to
-    /// `GateFailure::Forbidden` (403) — a deliberate weakening of
-    /// `authorize_list_read`'s own promise, not a new gap (see
-    /// implementation plan §2c); the service axis returns
-    /// `GateFailure::Degraded` (503) on a null or query-failed tag store,
-    /// which stays distinguishable.
+    /// alone in that case). Per-axis fail-closed BEFORE the intersection,
+    /// each axis's own infrastructure-unavailable case landing on
+    /// `GateFailure::Degraded` (503, retryable): a null/not-open RBAC store
+    /// on the management axis, and a null or query-failed tag store on the
+    /// service axis. Only a genuine `ListReadDecision::DenyAll` — real "no
+    /// grant," or an in-query store error surfacing through it, the one
+    /// residual weakening of `authorize_list_read`'s own promise this gate
+    /// does not add a discriminator for (implementation plan §2c) — lands on
+    /// `GateFailure::Forbidden` (403).
     ///
     /// SELF-SUFFICIENT for the RBAC/management-group authority decision — do
     /// NOT additionally gate the same `(securable_type, operation)` on

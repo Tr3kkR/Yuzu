@@ -16,32 +16,38 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         // require_auth already wrote the 401 response (unaudited — matches
         // require_admin/require_permission's existing convention: audit
         // trail begins at the first post-authentication decision, not at
-        // require_auth itself). Forbidden is the closest of the two
-        // GateFailure tags; callers must not re-decode it into a status
-        // code, res is already correct.
-        return std::unexpected(authz::GateFailure::Forbidden);
+        // require_auth itself).
+        return std::unexpected(authz::GateFailure::Unauthenticated);
 
     const std::string perm = securable_type + ":" + operation;
 
     // ── management-group axis: RbacStore::authorize_list_read (ADR-0017),
     // reused as the subordinate primitive — never rewritten. ──────────────
     if (!rbac_store_ || !rbac_store_->is_open()) {
-        // Mirrors every existing authorize_list_read call site's null-store
-        // guard (e.g. server.cpp's UploadGrant list_read_fn). Folds into the
-        // same Forbidden/403 as a real DenyAll per the decided weakening
-        // (implementation plan §2c) — no discriminator added here.
+        // Infrastructure unavailable, not a real authorization decision —
+        // Degraded/503, aligned with the three sibling
+        // "authorization store unavailable" sites in auth_routes.cpp
+        // (630/811/1035, the engine-principal RBAC-store-unavailable
+        // branches): same wording, same status code. The 403/Forbidden this
+        // used to return was the outlier — a caller doing exponential
+        // backoff on 503 would never retry a transient RBAC-store hiccup
+        // that surfaced as a permanent-looking 403 (fjarvis/Kimi K2.7, PR
+        // #3216 follow-up review). retry_after_ms matches this function's
+        // own two Degraded branches below (tag-store unavailable/degraded),
+        // not the auth_routes.cpp siblings, which don't set it — this
+        // branch is Degraded now, so it carries the same retry signal as
+        // every other Degraded branch here. The deliberate DenyAll
+        // weakening (implementation plan §2c) now covers only the
+        // management-group axis's real-deny-vs-in-query-store-error
+        // ambiguity below, not this null-store case.
         audit_log(req, "auth.fleet_read_required", "denied", "", "",
                   "fleet read blocked: RBAC store unavailable");
-        res.status = 403;
-        // Distinct wording from the 503 "authorization store unavailable"
-        // used elsewhere for this same underlying condition (auth_routes.cpp)
-        // — same literal string at two different status codes would let a
-        // SIEM/grep rule keyed on the text misclassify retry semantics
-        // (consistency-auditor, governance run 2026-08-17).
-        res.set_content(detail::a4_denial(res, 403, "authorization unavailable",
-                                          detail::A4ErrorOpts{.permission = perm}),
+        res.status = 503;
+        res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                              .permission = perm}),
                         "application/json");
-        return std::unexpected(authz::GateFailure::Forbidden);
+        return std::unexpected(authz::GateFailure::Degraded);
     }
 
     // Spelled via deny_all() rather than relying on the switch below to

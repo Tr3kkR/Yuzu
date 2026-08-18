@@ -456,7 +456,7 @@ TEST_CASE("require_fleet_read: genuinely empty service set ⇒ admitted-empty wi
     CHECK_FALSE(result->in_scope("a_s"));
 }
 
-TEST_CASE("require_fleet_read: null rbac store ⇒ Forbidden (not a crash)",
+TEST_CASE("require_fleet_read: null rbac store ⇒ Degraded (not a crash)",
           "[pg][auth_routes][authz_gates][service_scope]") {
     Config cfg{};
     auth::AuthManager auth_mgr{};
@@ -475,8 +475,28 @@ TEST_CASE("require_fleet_read: null rbac store ⇒ Forbidden (not a crash)",
 
     auto result = ar.require_fleet_read(req, res, "Response", "Read");
     REQUIRE_FALSE(result.has_value());
-    CHECK(result.error() == authz::GateFailure::Forbidden);
-    CHECK(res.status == 403);
+    CHECK(result.error() == authz::GateFailure::Degraded);
+    CHECK(res.status == 503);
+}
+
+TEST_CASE("require_fleet_read: no bearer token ⇒ Unauthenticated",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    yuzu::test::ApiTokenStorePg api_tokens;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider;
+    AuthRoutes ar(cfg, auth_mgr, /*rbac_store=*/nullptr, api_tokens.get(),
+                  /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                  /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
+
+    httplib::Request req; // no Authorization header at all
+    httplib::Response res;
+
+    auto result = ar.require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Unauthenticated);
+    CHECK(res.status == 401);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
