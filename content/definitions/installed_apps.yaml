@@ -18,6 +18,12 @@ metadata:
     Enumerates all installed applications on the endpoint. On Windows,
     reads the registry Uninstall keys (64-bit HKLM, 32-bit WoW64, and
     HKCU), deduplicates by name+version, and skips system components.
+    The HKCU read is the AGENT SERVICE ACCOUNT's own hive, not a
+    logged-in user's: the agent runs as a system-context service
+    (LocalSystem today, see #1442), so HKCU resolves to that account's
+    profile and carries no end-user applications. This is deliberate
+    machine scope, not a gap -- per-user applications are a separate
+    action (list_per_user) that this one never invokes.
     On Linux, auto-detects the package manager (dpkg, rpm, or pacman).
     On macOS, queries system_profiler for GUI applications. Returns
     application name, version, publisher, and install date.
@@ -154,8 +160,10 @@ metadata:
   version: 1.0.0
   description: >
     Enumerates installed applications on a per-user basis. On Windows,
-    iterates user profiles and loads each user's NTUSER.DAT registry hive
-    to read HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall.
+    iterates user profiles and reads each user's
+    Software\Microsoft\Windows\CurrentVersion\Uninstall -- from the LIVE
+    HKEY_USERS\<SID> hive when that user is logged in, falling back to an
+    offline mount of their NTUSER.DAT only when it is not loaded.
     On Linux, reports system-wide packages (dpkg/rpm). On macOS, reports
     system apps plus per-user Homebrew packages. Output includes the
     username (or "system") alongside each application record.

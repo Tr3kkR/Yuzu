@@ -26,6 +26,7 @@
 
 #include "guardian_journal_format.hpp"
 
+#include <yuzu/audit_retention_rules.hpp>
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
 #include <algorithm>
@@ -622,8 +623,16 @@ private:
     /// never disagree about what "expired" means. Written only under paging_mutex_.
     std::int64_t last_age_cutoff_{0};
     bool pruned_cutoff_valid_{false};
-    /// True while the last pass declined a whole-journal age wipe, so the next one proceeds.
-    bool age_wipe_declined_{false};
+    /// The fact set the last decline was reported against (#2573 GJ half). Presence is the
+    /// dedup key, not a bool: a bool cannot carry anomaly IDENTITY, so a DIFFERENT anomaly
+    /// arriving while a bool latch was still set was neither declined nor counted, and the
+    /// pass deleted (measured, same class as #2573's TAR half, PR #3101). Held for as long as
+    /// this pass's anomaly backlog is still being worked off (see the `pacing` comment at the
+    /// write site), cleared once it drains, at which point a fresh anomaly reports on its own
+    /// merits. In-memory only, like `last_prune_now_ms_` above - GJ persists no anchor across
+    /// restarts by design (unlike TAR/audit_store), so `Facts::no_anchor` and
+    /// `Facts::prev_unusable` are always false here; see the mapping comment in prune_locked_.
+    std::optional<yuzu::server::audit_retention::Facts> last_reported_facts_;
     /// Retention passes that declined to age-evict because the clock jumped implausibly far
     /// forward. Nonzero means an endpoint's clock moved; it is NOT an error in itself.
     std::atomic<std::uint64_t> clock_jump_skips_{0};

@@ -213,6 +213,34 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      - Design record: `docs/adr/3004-artifact-blob-storage.md`; wire
        reference: `docs/user-manual/rest-api.md`'s upload-grant section.
 
+   - **2026-08-15 — `GET /api/v1/guaranteed-state/status` fleet rollup
+     (#2298 item 6d / #3038).** REST-only, no MCP twin — a "no" on
+     Decision 1's both-surfaces requirement, already recorded in-code as
+     "GRANDFATHERED" (`rest_api_v1.cpp`) since the route's `errored_rules`
+     field was first made real, but not previously entered here. Recorded
+     now rather than fixed, because:
+     - **Pre-existing placeholder, not new capability.** The route existed
+       pre-ADR-1005 returning a hardcoded `errored_rules: 0`; this ladder's
+       #2298/item-6d work only made that one field real and, separately
+       (#3038), fixed its authorization gate from a bare global permission
+       check to the ADR-0017 admit-then-filter `AuthRoutes::require_list_read`
+       chokepoint. Neither change adds a NEW capability — both are
+       maintenance on an existing grandfathered surface (this ADR's own
+       "modifying one in place is maintenance, not a violation" rule,
+       "Prospective, not retroactive" section above).
+     - **No MCP tool reads `errored_rules`/`total_rules`/`compliant_rules`/
+       `drifted_rules` today** — the twin obligation has not yet attached in
+       the sense the fleet-gauge-family entry above describes ("attaches
+       when an operator-facing feature is built OVER the same data").
+     - **The authorization fix (#3038) does not itself trigger re-evaluation
+       against Decision 1/4** — it hardens the EXISTING REST surface's
+       access control, it does not add a capability or a new consumer.
+     - Design record: `docs/adr/0017-management-group-confinement-list-reads.md`;
+       operator-facing behavior: `docs/user-manual/guaranteed-state.md`
+       ("Fleet rollup" section), `docs/user-manual/server-admin.md` ("What a
+       client sees"); wire reference: `docs/user-manual/rest-api.md` (`GET
+       /api/v1/guaranteed-state/status`).
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

@@ -1,6 +1,7 @@
 #include "guaranteed_state_store.hpp"
 
 #include <yuzu/audit_retention_rules.hpp>
+#include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -2669,6 +2670,40 @@ GuaranteedStateStore::rule_names_for(const std::vector<std::string>& rule_ids) c
             out.emplace(text_col(res.get(), i, 0), text_col(res.get(), i, 1));
     }
     return out;
+}
+
+std::expected<std::size_t, std::string> GuaranteedStateStore::errored_rule_count(
+    const std::optional<std::vector<std::string>>& agent_scope) const {
+    // Engaged-empty scope (ADR-0017 INV-2): zero visible agents means zero
+    // rows, without issuing a query — mirrors rule_names_for's empty-input
+    // posture (success, not degrade).
+    if (agent_scope && agent_scope->empty())
+        return static_cast<std::size_t>(0);
+    if (!open_)
+        return std::unexpected("database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("no database connection: " + pool_.last_error());
+    std::string sql =
+        "SELECT COUNT(DISTINCT s.rule_id) FROM "
+        "guaranteed_state_store.guardian_agent_rule_status s JOIN "
+        "guaranteed_state_store.guaranteed_state_rules r ON r.rule_id = s.rule_id WHERE "
+        "s.state = 'errored'";
+    std::vector<std::string> params;
+    if (agent_scope) {
+        // ADR-0017 INV-3: the visible set is applied IN SQL, before the
+        // aggregate — never a C++ post-filter over the full fleet census.
+        std::vector<std::string_view> views;
+        views.reserve(agent_scope->size());
+        for (const std::string& a : *agent_scope)
+            views.emplace_back(a);
+        sql += " AND s.agent_id = ANY($1::text[])";
+        params.push_back(pg::to_text_array(views));
+    }
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
 std::size_t GuaranteedStateStore::rule_count() const {

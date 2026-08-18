@@ -1283,3 +1283,201 @@ TEST_CASE("REAL AgentHealthStore: one agent mixing parseable and rejected journa
     // coverage even though three of its five journal tags were refused.
     CHECK(unlabelled_series(out, "yuzu_fleet_guardian_journal_reporting") == 1.0);
 }
+
+// ── Guardian M1 health-stream rollup (#2298 gate 3, item 6d) ──────────────────────
+// Same coverage set as the journal family above, scoped to the 3-counter table.
+
+TEST_CASE("REAL AgentHealthStore: guardian health tags sum into unlabelled fleet gauges",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "windows";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    beat("h1", {{"yuzu.guardian_unhealthy_suppressed", "1"},
+                {"yuzu.guardian_unhealthy_refreshed", "3"}});
+    beat("h2", {{"yuzu.guardian_unhealthy_suppressed", "4"},
+                {"yuzu.guardian_priority_demoted", "2"}});
+    // A quiescent or inert (prefer_spark off) agent: the writer is sparse, ships no
+    // health tag, contributes nothing - not a fabricated 0.
+    beat("quiet", {});
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed") == 5.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_refreshed") == 3.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_priority_demoted") == 2.0);
+
+    // No agent-controlled label anywhere in this family (flat by design).
+    CHECK(out.find("yuzu_fleet_guardian_unhealthy_suppressed{") == std::string::npos);
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian health gauges go absent (not zero) when nobody "
+          "reports",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> reporting;
+    reporting["yuzu.os"] = "linux";
+    reporting["yuzu.guardian_unhealthy_suppressed"] = "7";
+    store.upsert("h1", reporting);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    REQUIRE(unlabelled_series(metrics.serialize(), "yuzu_fleet_guardian_unhealthy_suppressed") ==
+            7.0);
+
+    // The rule recovers (or prefer_spark turned off), so the sparse writer stops
+    // emitting the tag. A stale 7 and a fabricated 0 are BOTH lies - the family must
+    // clear.
+    google::protobuf::Map<std::string, std::string> quiet;
+    quiet["yuzu.os"] = "linux";
+    store.upsert("h1", quiet);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_refreshed"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_priority_demoted"));
+}
+
+TEST_CASE("REAL AgentHealthStore: a rogue agent cannot poison a guardian health fleet gauge",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id, const std::string& value) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        tags["yuzu.guardian_unhealthy_suppressed"] = value;
+        store.upsert(id, tags);
+    };
+
+    beat("honest", "5");
+    beat("inf", "inf");
+    beat("nan", "nan");
+    beat("neg", "-1");
+    beat("frac", "1.5");
+    beat("junk", "garbage");
+    beat("huge", "18446744073709551615"); // UINT64_MAX
+    beat("over", "1000000001");           // one past the implausibility ceiling
+    beat("long", std::string(4096, '9'));
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    const double sum = unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed");
+    CHECK(sum == 5.0); // only the honest agent contributed
+    CHECK(std::isfinite(sum));
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian health meta-signals publish even at zero",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> quiet;
+    quiet["yuzu.os"] = "linux";
+    store.upsert("no-health-tags", quiet);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") == 0.0);
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed"));
+}
+
+TEST_CASE("REAL AgentHealthStore: guardian health reporting counts agents, not tags",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    // Two reporters (one with all three tags, one with one) and two non-reporters.
+    beat("h1", {{"yuzu.guardian_unhealthy_suppressed", "10"},
+                {"yuzu.guardian_unhealthy_refreshed", "3"},
+                {"yuzu.guardian_priority_demoted", "1"}});
+    beat("h2", {{"yuzu.guardian_unhealthy_suppressed", "5"}});
+    beat("quiet-1", {});
+    beat("quiet-2", {});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 2.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed") == 15.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a rejected health tag is counted, not silently dropped",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> rogue;
+    rogue["yuzu.os"] = "linux";
+    rogue["yuzu.guardian_unhealthy_suppressed"] = "1000000001"; // past the ceiling
+    rogue["yuzu.guardian_priority_demoted"] = "garbage";
+    store.upsert("rogue", rogue);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") == 2.0);
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed"));
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_priority_demoted"));
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: an explicit health zero publishes as zero",
+          "[guardian][health][rollup][real]") {
+    // The real writer is sparse and never emits "0", but a non-conforming build can -
+    // an explicit "0" IS a report of zero, so it publishes as 0 rather than being
+    // suppressed into absence.
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_unhealthy_suppressed"] = "0";
+    store.upsert("nonconforming", tags);
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+
+    const std::string out = metrics.serialize();
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_unhealthy_suppressed") == 0.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 1.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_tag_rejected") == 0.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a stale agent's health counters leave the fleet sum",
+          "[guardian][health][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.guardian_priority_demoted"] = "9";
+    store.upsert("doomed", tags);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    REQUIRE(unlabelled_series(metrics.serialize(), "yuzu_fleet_guardian_priority_demoted") ==
+            9.0);
+
+    // Zero window: every snapshot is stale, so the agent is pruned before accumulation.
+    store.recompute_metrics(metrics, std::chrono::seconds{0});
+    const std::string out = metrics.serialize();
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_priority_demoted"));
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_health_reporting") == 0.0);
+}

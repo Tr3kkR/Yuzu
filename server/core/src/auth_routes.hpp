@@ -6,6 +6,7 @@
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
 #include "audit_store.hpp"
+#include "authz_gates.hpp"
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "saml_provider.hpp"
@@ -18,6 +19,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <expected>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -25,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace yuzu::server {
 
@@ -58,6 +61,23 @@ std::string sanitize_detail_value(std::string_view v);
 struct Config;
 class EnginePrincipalStore;
 class ScimStore;
+
+/// Result of `AuthRoutes::require_list_read` — the transport-layer twin of
+/// `RbacStore::ListReadAuthorization` (ADR-0017). Lives here, not in
+/// rbac_store.hpp, because it carries a `Session` (an auth/transport concept;
+/// RbacStore is a data-layer primitive and must not depend on it) and at
+/// namespace scope, not nested in `AuthRoutes`, for consistency with its
+/// sibling `ListReadDecision`/`ListReadAuthorization`.
+struct ListReadGate {
+    /// false ⇒ the response is already fully rendered (401/403/503) —
+    /// mirrors require_permission/require_scoped_permission's bool contract.
+    bool admitted{false};
+    /// nullopt = unfiltered (whole fleet); engaged (including empty, INV-2)
+    /// = filter to exactly these agents.
+    std::optional<std::vector<std::string>> scope;
+    /// The resolved session, so a caller doesn't have to re-resolve it.
+    std::optional<auth::Session> session;
+};
 
 /// Extracted auth helpers and route handlers (Phase 2 of god-object decomposition).
 ///
@@ -128,6 +148,132 @@ public:
     bool require_scoped_permission(const httplib::Request& req, httplib::Response& res,
                                    const std::string& securable_type, const std::string& operation,
                                    const std::string& agent_id);
+
+    /// The transport-layer ADR-0017 admit-then-filter list-read gate — the
+    /// SOLE authorization gate for a list/fan-out route reading per-agent
+    /// data under management-group confinement. Replicates the SAME
+    /// session-class ladder as `require_permission` (auth → elevation →
+    /// engine → MCP tier → service-scoped token → legacy/RBAC) but the
+    /// ordinary-RBAC-enforced case delegates to `RbacStore::authorize_list_read`
+    /// instead of `check_permission`, because `check_permission` never
+    /// consults `ManagementGroupStore` — stacking the two gates (one calling
+    /// the other) does NOT compose; a caller whose only grant is
+    /// management-group-scoped is denied by `require_permission` before
+    /// `authorize_list_read` is ever reached. This method must be the
+    /// route's ONLY gate — no `perm_fn` in front of or behind it.
+    ///
+    /// Structurally Read-only: `operation != "Read"` is denied outright, so
+    /// the MCP approval-ticket branch (`mcp::requires_approval`) never
+    /// applies — approval gating exists only for destructive operations.
+    ///
+    /// A JIT-elevated session is admitted unfiltered WITHOUT calling
+    /// `authorize_list_read` — elevation intentionally needs no underlying
+    /// RBAC grant, and consulting the primitive anyway would deny a
+    /// legitimately-elevated caller who holds no base grant (the regression
+    /// the first #3038 fix attempt shipped).
+    ///
+    /// An engine principal is special-cased (RBAC-only, never legacy-open)
+    /// rather than delegated to `authorize_list_read` directly:
+    /// `authorize_list_read`'s legacy-open branch returns `AdmitAll` when
+    /// RBAC is disabled, which would hand an engine credential fleet-wide
+    /// read — forbidden by the engine default-deny model (design §4.2).
+    ///
+    /// CONSTRAINT for future callers: `authorize_list_read`'s legacy-open
+    /// branch does not apply `authz_topology_floor.hpp`'s `kTopologyFloor`
+    /// (that floor is applied only inside `require_permission`'s own legacy
+    /// branch). This is moot for every caller today (GuaranteedState:Read is
+    /// not a floored securable) but a FUTURE floored securable routed
+    /// through `require_list_read` must re-apply the floor explicitly —
+    /// do not assume this wrapper inherits it for free.
+    ListReadGate require_list_read(const httplib::Request& req, httplib::Response& res,
+                                   const std::string& securable_type,
+                                   const std::string& operation);
+
+    // -- Phase 0 confinement primitives (service-scope-confinement design doc
+    //    §7.2/§8) — wired here, called by NO route yet. See authz_gates.hpp
+    //    for `ListAuthority`/`GateFailure`, authz_gates.cpp for bodies.
+    //    RELATED BUT DISTINCT from `require_list_read` above: both compose
+    //    `RbacStore::authorize_list_read`, but for different purposes
+    //    (general ADR-0017 confinement vs. service-scope confinement) and
+    //    with different return shapes. Not yet reconciled — a real question
+    //    for later, not decided here. ------------------------------------
+
+    /// The two-axis list-read gate: management-group visibility (the
+    /// existing ADR-0017 `RbacStore::authorize_list_read` chokepoint, reused
+    /// as the subordinate primitive here, never rewritten) intersected
+    /// (`authz::meet`) with service-scope visibility (a service-scoped
+    /// session's `service`-tagged agents; TOP/unfiltered for a non-service
+    /// session, so the result is byte-identical to `authorize_list_read`
+    /// alone in that case). Per-axis fail-closed BEFORE the intersection:
+    /// the management axis collapses "no grant" and "store error" both to
+    /// `GateFailure::Forbidden` (403) — a deliberate weakening of
+    /// `authorize_list_read`'s own promise, not a new gap (see
+    /// implementation plan §2c); the service axis returns
+    /// `GateFailure::Degraded` (503) on a null or query-failed tag store,
+    /// which stays distinguishable.
+    ///
+    /// SELF-SUFFICIENT for the RBAC/management-group authority decision — do
+    /// NOT additionally gate the same `(securable_type, operation)` on
+    /// `require_permission` before or after calling this. `require_permission`'s
+    /// ordinary RBAC branch decides on `check_permission` ALONE (a global-grant
+    /// check) and never consults `mgmt_group_store_` — pairing it with this gate
+    /// rejects a management-group-scoped-only caller before this gate's own
+    /// `authorize_list_read` call ever runs, making the `AdmitScoped` branch
+    /// below permanently unreachable for exactly the confined reader ADR-0017
+    /// exists to serve. Confirmed BLOCKING in code review (2026-08-17,
+    /// reviewer `fjarvis`, PR #3216) — the prior text here prescribed that
+    /// exact broken sequence; see `test_authz_gates.cpp`'s "documented pairing"
+    /// test for the falsifier (the broken sequence denies a management-group-
+    /// scoped-only caller; this gate alone, correctly, does not).
+    ///
+    /// What this gate genuinely does NOT cover — a caller needing either must
+    /// check it WITHOUT re-deciding the RBAC/mgmt-group axis (i.e. not via
+    /// `require_permission`'s full branch chain): `mcp_tier` enforcement
+    /// (`mcp::tier_allows`/`requires_approval`), and the RBAC-enabled
+    /// requirement for service-scoped sessions specifically (a disabled-RBAC
+    /// service session still gets a narrowed, non-empty result here, via the
+    /// service-tag axis alone, unlike `require_permission`'s service branch
+    /// which hard-403s in that case). No such standalone tier/RBAC-enabled
+    /// check exists yet as of this comment — a route wiring this gate to a
+    /// tier-sensitive or service-scope-sensitive operation must add one, not
+    /// assume `require_permission` supplies it.
+    [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
+    authorize_fleet_read(const httplib::Request& req, httplib::Response& res,
+                         const std::string& securable_type, const std::string& operation);
+
+    /// The single-agent confinement gate: does `agent_id` carry the
+    /// `service` tag matching this session's `token_scope_service`?
+    /// CONFINEMENT-AXIS ONLY — this is NOT a full authority decision and
+    /// does not re-check the RBAC grant a caller must independently verify
+    /// for the same `(securable_type, operation)`. Pair with
+    /// `require_scoped_permission`, NOT `require_permission` — this gate is
+    /// single-agent-shaped, and `require_scoped_permission` (unlike
+    /// `require_permission`) correctly passes `mgmt_group_store_` to
+    /// `check_scoped_permission` in the branch such a caller reaches (the
+    /// RBAC-enforced default; the `engine` branch also passes it correctly
+    /// but is reachable only by an `engine`-`principal_kind` session, a
+    /// structurally separate default-deny caller class a management-group-
+    /// scoped caller cannot be) — so such a caller is not incorrectly
+    /// rejected before ever reaching this gate's own check — the exact
+    /// BLOCKING defect found in
+    /// `authorize_fleet_read`'s sibling comment (2026-08-17, reviewer
+    /// `fjarvis`, PR #3216) does not apply here, but corrected proactively
+    /// since the wrong function name was named for the same reason. For a
+    /// NON-service session the axis is TOP (unfiltered) by definition, so
+    /// this returns `true` unconditionally — it answers only "is this
+    /// target inside the token's service scope," never "is this caller
+    /// authorized at all."
+    ///
+    /// Empty `agent_id` is a 400, never an admit — the fix for
+    /// `require_scoped_permission`'s existing bug (auth_routes.cpp, service
+    /// branch: an empty `agent_id` today skips the only comparison that
+    /// could deny and falls through to `return true`). Fail-closed 503 on a
+    /// null or degraded tag store, matching that same function's tag-store-
+    /// unavailable case.
+    [[nodiscard]] bool authorize_agent_target(const httplib::Request& req, httplib::Response& res,
+                                              const std::string& securable_type,
+                                              const std::string& operation,
+                                              const std::string& agent_id);
 
     /// Build a synthetic session from a validated API token. Two-branch on the
     /// token's persisted `principal_kind` (design doc §6):

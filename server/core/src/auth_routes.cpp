@@ -253,7 +253,10 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
     }
 
     if (api_token.principal_kind == "human") {
-        // ---- human branch — byte-identical to pre-#2021 behavior ----------
+        // ---- human branch ---------------------------------------------
+        // No longer byte-identical to pre-#2021 behavior: a service-scoped
+        // token's role is now floored below, rather than always resolved
+        // from the creator's live role (see the scope_service branch).
         auth::Session synth;
         synth.username = api_token.principal_id;
         // #1837: no separate display label is stored for a token; fall back to
@@ -267,11 +270,39 @@ std::optional<auth::Session> AuthRoutes::synthesize_token_session(const ApiToken
         synth.mcp_tier = api_token.mcp_tier;
         synth.principal_kind = "human";
 
-        // Resolve the creator's actual legacy role fresh (not unconditional admin).
-        // get_user_role() queries the current role on every call, so a creator who's
-        // been demoted since the token was issued will produce a user-role session.
-        auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
-        synth.role = legacy_role.value_or(auth::Role::user);
+        if (!api_token.scope_service.empty()) {
+            // A service-scoped token is capped at the user floor regardless of
+            // the minter's live role — ITServiceOwner (an RBAC grant, resolved
+            // elsewhere) is the sole authority ceiling for such a token, never
+            // the minter's legacy role. require_admin() already denies every
+            // service-scoped token outright on token_scope_service alone
+            // (below, pre-dating this cap) — the exposure this closes is the
+            // OTHER consumers of role/effective_role() that have no such
+            // independent guard: a service-scoped token minted by a
+            // currently-admin user inherited `role == admin` and satisfied
+            // the workflow/instruction step-approval gates' inline
+            // `effective_role(*session) == admin` check (workflow_routes.cpp,
+            // meant to require a human decision) and MCP bundle-ownership's
+            // raw `session->role == admin` check (mcp_server.cpp).
+            synth.role = auth::Role::user;
+            // Fires on every service-scoped session, not just when the cap
+            // changed the outcome — proving "changed the outcome" needs the
+            // creator's live role, i.e. the very get_user_role() lookup this
+            // branch deliberately skips (see the else branch's comment).
+            // This is a debuggability signal ("the cap is active for this
+            // token"), not an anomaly counter — there is no expected-vs-
+            // unexpected split to alert on here.
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_service_token_role_capped_total").increment();
+            }
+        } else {
+            // Resolve the creator's actual legacy role fresh (not unconditional
+            // admin). get_user_role() queries the current role on every call, so
+            // a creator who's been demoted since the token was issued will
+            // produce a user-role session.
+            auto legacy_role = auth_mgr_.get_user_role(api_token.principal_id);
+            synth.role = legacy_role.value_or(auth::Role::user);
+        }
 
         return synth;
     }
@@ -953,6 +984,135 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         return false;
     }
     return true;
+}
+
+ListReadGate AuthRoutes::require_list_read(const httplib::Request& req, httplib::Response& res,
+                                           const std::string& securable_type,
+                                           const std::string& operation) {
+    ListReadGate gate;
+    const std::string perm = securable_type + ":" + operation;
+
+    auto session = require_auth(req, res);
+    if (!session)
+        return gate;
+    gate.session = *session;
+
+    // Structurally Read-only: the MCP approval-ticket branch never applies to
+    // this gate (mcp::requires_approval only fires for Write/Delete/Execute,
+    // mcp_policy.hpp), and this prevents a future caller from accidentally
+    // routing a mutation through a primitive whose legacy-open branch can
+    // return an unfiltered admit.
+    if (operation != "Read") {
+        audit_log(req, "auth.permission_required", "denied", "", "",
+                  "list-read gate accepts Read operations only: " + perm);
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403, "list-read gate accepts Read operations only",
+                                          detail::A4ErrorOpts{.permission = perm}),
+                        "application/json");
+        return gate;
+    }
+
+    // JIT admin elevation: same semantics as require_permission — full admin
+    // for the elevation window, no underlying grant needed. Do NOT call
+    // authorize_list_read here: it has no elevation concept, so an elevated
+    // session with zero RBAC grants would otherwise be denied (the
+    // regression the first #3038 fix attempt shipped, closed here).
+    if (auth::is_elevated(*session)) {
+        gate.admitted = true;
+        return gate; // scope stays nullopt: unfiltered
+    }
+
+    // Engine principals have NO legacy or service-scoped authority — their
+    // only authority is an explicit RBAC assignment (design §4.2
+    // default-deny). authorize_list_read's own legacy-open branch would
+    // otherwise hand an engine credential fleet-wide read the moment RBAC is
+    // disabled; resolve engine sessions here, RBAC-only, or deny.
+    if (session->principal_kind == "engine") {
+        if (!rbac_store_ || !rbac_store_->is_open()) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "engine principal denied: RBAC store unavailable");
+            res.status = 503;
+            res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return gate;
+        }
+        if (!rbac_store_->is_rbac_enabled() ||
+            !rbac_store_->check_permission(session->username, securable_type, operation)) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "engine principal denied " + perm);
+            res.status = 403;
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return gate;
+        }
+        gate.admitted = true; // current engine grants are fleet-wide only
+        return gate;
+    }
+
+    // MCP-tier tokens: tier policy precedes RBAC (matches require_permission).
+    // Falls through on allow — an allowed MCP token continues below with its
+    // creator's role/authority.
+    if (!session->mcp_tier.empty() &&
+        !mcp::tier_allows(session->mcp_tier, securable_type, operation)) {
+        audit_log(req, "auth.permission_required", "denied", "", "",
+                  "MCP token tier '" + session->mcp_tier + "' does not allow " + perm);
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403, "MCP token tier does not allow " + perm,
+                                          detail::A4ErrorOpts{.permission = perm}),
+                        "application/json");
+        return gate;
+    }
+
+    // This fleet-wide list-read aggregate deliberately refuses service-scoped
+    // credentials outright — unlike require_permission's service-scoped
+    // branch (which checks the ITServiceOwner role and, for
+    // require_scoped_permission, the target agent's own service tag), a
+    // flat list-read gate has no single agent_id to scope the token's
+    // service against, so admitting it would hand a service-scoped token the
+    // WHOLE fleet's data.
+    if (!session->token_scope_service.empty()) {
+        audit_log(req, "auth.permission_required", "denied", "", "",
+                  "service-scoped token '" + session->token_scope_service +
+                      "' cannot read the fleet-wide list-read aggregate: " + perm);
+        res.status = 403;
+        res.set_content(
+            detail::a4_denial(res, 403,
+                              "service-scoped tokens cannot read the fleet-wide status rollup",
+                              detail::A4ErrorOpts{.permission = perm}),
+            "application/json");
+        return gate;
+    }
+
+    // Wholly unwired RBAC subsystem: exact current legacy semantics (mirrors
+    // require_permission's rbac_store_==nullptr short-circuit to legacy —
+    // authorize_list_read cannot be called on a null store).
+    if (!rbac_store_) {
+        gate.admitted = true;
+        return gate;
+    }
+
+    auto decision = rbac_store_->authorize_list_read(session->username, securable_type,
+                                                      operation, mgmt_group_store_);
+    switch (decision.decision) {
+    case ListReadDecision::DenyAll:
+        audit_log(req, "auth.permission_required", "denied", "", "",
+                  "RBAC denied list read " + perm);
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
+                                          detail::A4ErrorOpts{.permission = perm}),
+                        "application/json");
+        return gate;
+    case ListReadDecision::AdmitAll:
+        gate.admitted = true;
+        return gate; // scope stays nullopt: unfiltered (global grant, or legacy-open)
+    case ListReadDecision::AdmitScoped:
+        gate.admitted = true;
+        gate.scope = std::move(decision.visible_agents); // engaged even when empty (INV-2)
+        return gate;
+    }
+    return gate; // unreachable — fail-closed default (admitted stays false)
 }
 
 std::string AuthRoutes::session_cookie_attrs() const {
