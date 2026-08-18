@@ -203,11 +203,15 @@ ever delivered to the agent side. Checked and ruled out as causes: OS-target mis
 exact-match - fine) and scope-expression exclusion (`guardian_push_builder.cpp:119`:
 an EMPTY `scope_expr`, which every generated rule has, skips the `in_scope` check
 entirely - matches every agent by construction, not a targeting gap). Root cause not
-isolated within the time budget spent on it - most likely something specific to this
-throwaway single-box rig's setup (a fresh admin/agent pairing with no management-group
+isolated within the time budget spent on it - **UPDATE 2026-08-18 (re-run session):
+the original guess below ("something specific to this throwaway rig") was WRONG, not
+just incomplete - see forward action item 4 for the actual root causes found on
+re-investigation, one of which (a dispatch kill-switch defect) is a genuine product
+bug, not a rig artifact.** ~~most likely something specific to this throwaway
+single-box rig's setup (a fresh admin/agent pairing with no management-group
 assignment, or a push-dispatch precondition this run didn't satisfy) rather than a
 product defect, given the REST/storage layer and the deny-ACL mechanics both worked
-correctly in isolation. **This gap does not affect the Claims section above** - that
+correctly in isolation.~~ **This gap does not affect the Claims section above** - that
 section is entirely function of the committed Catch2 test, not this live run.
 Flagged as a forward action item (below), not silently dropped.
 
@@ -319,10 +323,86 @@ committed (adversarial-review workflow output, not repo content) - reproducible 
    is ever exercised (found live this run). Wording-only, no functional effect - a
    small fix, but worth landing before F14 ships this path for real, since it is
    exactly the log line an incident responder would trust post-flip.
-4. **Isolate why the live-window `full_sync` push never reached the agent's Guardian
-   reconcile** (this run's one open gap - see "Live DGRHP window" above for what was
-   ruled out). Worth a fresh, focused rig session before F14's real A/B, which depends
-   on push delivery actually working end-to-end.
+4. **RESOLVED IN PART, 2026-08-18 (re-run session) - the root cause is diagnosed, but
+   push delivery is STILL NOT confirmed working.** The suspected cause was `arm-errored`
+   never creating or deploying a Baseline for its 40 rules - `guardian_push_fn_`
+   (`server/core/src/server.cpp:~17601-17640`) filters every push through
+   `filter_deployed_members()`, so a rule outside any deployed Baseline is silently
+   dropped. Fixed in `generate_resgate_load.py` (commit `a086d9cca`, this branch):
+   `arm-errored` now creates + deploys a fixed-name Baseline covering all 40 rules;
+   `teardown-errored` deletes it first. **Verified correct, twice, against a real
+   server:** `POST /fragments/guardian/baselines` + `POST .../deploy` produced a
+   `deployed` Baseline with all 40 Guards (confirmed via `GET
+   /fragments/guardian/baselines`), matching the existing
+   `test_guardian_routes.cpp` "deploy_baseline marks deployed ... and pushes
+   fleet-wide" case (real Postgres, 29/29 assertions) which independently proves the
+   underlying mechanism. **This fix is real and necessary, but re-running the live
+   capture with it still did not deliver anything to the agent** - two SEPARATE,
+   previously-unknown issues were found blocking delivery independently of the
+   Baseline gate, neither of which is F11-scoped to fix:
+   - **A genuine, high-severity dispatch defect (found this session, needs its own
+     issue + urgent triage - NOT fixed here):** `finalize_classified_command`'s
+     kill-switch gate (`server/core/src/agent_registry.hpp:280-299`) calls
+     `PluginConfigStore::action_allowed(cap.plugin, cap.action)`, which calls
+     `plugin_config::parse_kill_switch_scope("__guard__", "push_rules")`
+     (`server/core/src/plugin_config_parsers.hpp:153-158`), which calls
+     `is_valid_identifier("__guard__")` (`plugin_config_parsers.hpp:44-55`) - and
+     that function requires the first character to be `a`-`z`. `__guard__` starts
+     with `_`, so the scope NEVER parses, and an unparseable scope is fail-closed to
+     "not allowed" (`plugin_config_store.cpp:478-479`) regardless of any row in the
+     `kill_switches` table (confirmed empty on this rig - the table was never the
+     issue). Net effect: **every** `__guard__:push_rules` dispatch - both call sites
+     (`server.cpp:4234`, `server.cpp:17711`) - is unconditionally treated as
+     kill-switched and silently dropped, with no error surfaced to the REST caller
+     (`POST /api/v1/guaranteed-state/push` returns `202 {"queued":true,"agents":0}`,
+     which reads as success). Confirmed live: `dispatch denied:
+     __guard__:push_rules reason=kill_switched caller=system` fired on every push
+     attempt this session, both before and after the Baseline fix. This is NOT
+     specific to this rig or to F11's errored-load profile - it is the SAME
+     `guardian_push_fn_` every real deployment's Baseline-deploy/enforcement-toggle
+     path uses, and the existing unit test that exercises `deploy_baseline` never
+     catches it because `TestRouteSink`'s harness stubs `push_fn_` directly, never
+     routing through the real `command_dispatch_fn`/kill-switch chokepoint (the same
+     class of test-vs-production gap the routed-concerns table already warns about
+     for `TestRouteSink`). Whether this is reachable in a real (non-throwaway)
+     deployment, or whether some other code path avoids `is_valid_identifier` for
+     `__guard__` specifically, was NOT further investigated here - that determination,
+     and the fix, belong to a dedicated issue, not this branch.
+   - **A separate, lower-severity Windows/loopback bug (also found this session, also
+     not fixed here):** connecting the test agent via `--server localhost:50051`
+     resolved to IPv6 `::1` on this box, and the gRPC peer string this build produced
+     was `ipv6:%5B::1%5D:PORT` - percent-encoded brackets, not literal `[`/`]`
+     (confirmed via the `session.peer_mismatch` audit rows' `raw_peer` field).
+     `extract_peer_ip` (`server/core/src/peer_ip.hpp:129-155`) requires a literal `[`
+     immediately after `ipv6:`, so it returned empty for both the Register and
+     Subscribe peer, which always fails the peer-binding check
+     (`agent_service_impl.cpp:894`) and rejects every Subscribe attempt
+     ("peer mismatch", `register_ip=`, `subscribe_ip=`, both empty). Switching the
+     agent to an explicit `--server 127.0.0.1:50051` (forcing IPv4) worked around it -
+     the Subscribe stream opened successfully after a few retries. Whether
+     `context->peer()` genuinely percent-encodes IPv6 brackets on this Windows
+     gRPC/vcpkg build (a real, if narrow, product bug affecting any direct
+     non-gateway Windows agent that resolves its server address to IPv6) or whether
+     something specific to this throwaway rig produced it was not further isolated.
+   - **With both worked around** (agent forced to IPv4; the kill-switch issue has no
+     workaround short of a code fix, so this was NOT resolved) **delivery still did
+     not happen**: a fresh `full_sync` push after the Subscribe stream opened
+     returned `{"agents":0}`, and the agent log shows zero `attach_rule`/reconcile/
+     `guard.unhealthy` lines across its entire run. The kill-switch defect is the
+     most likely full explanation - `agents:0` in the push response is consistent
+     with the dispatch being denied before ever counting a target.
+   - Rig left clean: `teardown-errored` run (all 40 rules + the Baseline deleted,
+     confirmed via subsequent 404s and "no baseline found"), deny-ACL files removed
+     (the HKLM key resisted removal via both `Remove-Item` and `reg delete /f` -
+     a pre-existing PowerShell/Windows registry-provider quirk unrelated to this
+     work, matching the runbook's own accepted "clean up by hand" posture - left as
+     a known leftover), rig-side patch reverted (`git diff` empty on `yuzu-pr3a`,
+     restored to `0023efc33`), agent + server processes stopped, the throwaway
+     `yuzu-f11-rerun-pg` Postgres container removed.
+   - **Forward: a fresh rig session cannot close this on its own anymore** - the
+     dispatch kill-switch defect needs an actual code fix (and review) before any
+     live Guardian push, F11-related or not, can be expected to deliver anywhere.
+     File it separately, fix it, THEN re-attempt this live capture.
 5. Re-verify the F5 config defaults cited here (`errored_refresh_ms`,
    `pending_demote_sweeps`, `pending_demote_ms`) have not changed before reusing these
    numbers in a later doc - they are cited by value, not by reference, in the "Claims"
