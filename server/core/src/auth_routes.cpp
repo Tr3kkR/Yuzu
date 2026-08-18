@@ -920,6 +920,28 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                             "application/json");
             return false;
         }
+        // Belt-and-braces (#2298 PR 3, mirrors require_permission's identical
+        // guard): engine-token mint already rejects a non-empty
+        // `scope_service` (`api_token_store.cpp::validate_engine_mint`), so
+        // this guards a corrupted/constraint-bypassed row only, not a live
+        // path — fjarvis (PR review) found this sibling function had the
+        // guard applied to only one of the two engine branches. A corrupted
+        // row must not use the engine branch as a side door around the
+        // seeded-empty allow-list.
+        if (!session->token_scope_service.empty() &&
+            !service_scope_admits(securable_type, operation)) {
+            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                      "engine principal denied: corrupted scope_service on engine session "
+                      "blocked by service-scope default-deny");
+            res.status = 403;
+            const std::string perm = securable_type + ":" + operation;
+            // No `.permission` field: holding `perm` alone would not admit
+            // this session (compile-time-empty allow-list — routed-concern
+            // "MUST NOT name a permission that wouldn't actually admit").
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm),
+                            "application/json");
+            return false;
+        }
         return true;
     }
 

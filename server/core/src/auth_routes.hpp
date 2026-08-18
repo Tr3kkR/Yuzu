@@ -568,6 +568,13 @@ public:
     /// exercise otherwise). `std::nullopt` reverts to the real, empty,
     /// production table. Test-only seam, same shape as
     /// `set_mfa_pending_cap_for_test` above.
+    ///
+    /// `PermPair` holds `string_view` fields, stored by value here — a
+    /// caller MUST construct entries from string literals or otherwise
+    /// program-lifetime storage (every current call site does). A
+    /// `std::string` temporary would dangle the moment the constructing
+    /// expression ends (PR review, fjarvis — checked no current call site
+    /// does this, but the risk is real for a future one).
     void set_service_scope_global_safe_override_for_test(
         std::optional<std::vector<authz::PermPair>> table) {
         service_scope_global_safe_override_for_test_ = std::move(table);

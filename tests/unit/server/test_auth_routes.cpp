@@ -16,6 +16,7 @@
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
+#include "test_tag_store_pg_helper.hpp" // TagStorePg — ADR-0050 PG port
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp" // PgConn/PgResult — the CH-4 saboteur's second connection
@@ -156,8 +157,10 @@ struct ServiceScopeFlipRig {
     pg::PgPool pool;
     RbacStore rbac;
     yuzu::test::ApiTokenStorePg api_tokens;
-    yuzu::test::TempDbFile tag_db{"yuzu_test_svcscopeflip_tags-"};
-    TagStore tags{tag_db.path};
+    // ADR-0050 (TagStore -> Postgres): declaration order load-bearing —
+    // tag_bundle must construct before the `tags` reference binds to it.
+    yuzu::test::TagStorePg tag_bundle;
+    TagStore& tags = *tag_bundle;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
     std::unique_ptr<AuthRoutes> ar;
