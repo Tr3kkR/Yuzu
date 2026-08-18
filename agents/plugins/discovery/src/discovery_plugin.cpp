@@ -64,6 +64,7 @@
 
 #include "icmp_probe.hpp" // yuzu::shared::IcmpSession — shared unprivileged ping sweep
 
+#include "bounded_wait.hpp"        // yuzu::discovery::bounded_call — uncancellable-call timeout
 #include "discovery_scan_plan.hpp" // pure sweep bounds + honest-degrade decisions
 
 // Portable (no platform guard of its own): parse_proc_net_arp for the Linux
@@ -304,9 +305,10 @@ ArpRead get_arp_table() {
 
 // ── Hostname resolution ───────────────────────────────────────────────────
 
-std::string resolve_hostname(const std::string& ip) {
+namespace detail {
+
+std::string resolve_hostname_blocking(const std::string& ip) {
 #ifdef _WIN32
-    // Use getnameinfo
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
     inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
@@ -316,7 +318,6 @@ std::string resolve_hostname(const std::string& ip) {
         return host;
     }
 #else
-    // Use getaddrinfo reverse lookup
     struct sockaddr_in sa{};
     sa.sin_family = AF_INET;
     inet_pton(AF_INET, ip.c_str(), &sa.sin_addr);
@@ -327,6 +328,25 @@ std::string resolve_hostname(const std::string& ip) {
     }
 #endif
     return {};
+}
+
+} // namespace detail
+
+// getnameinfo(..., NI_NAMEREQD) has no caller-supplied timeout, and a
+// black-holing (not refusing) reverse-DNS path can block it for the OS
+// resolver's own retry/nameserver/TCP-fallback envelope — potentially
+// minutes. Plugin execute() runs synchronously on the agent's bounded
+// ThreadPool with no per-task cancellation (governance Gate 4 unhappy-path
+// finding), so an unbounded call here can permanently pin a worker and,
+// under repeated/concurrent scans, exhaust the pool and stall every other
+// command dispatched to this agent. bounded_call() bounds the WAIT (the call
+// itself can't be cancelled) — see bounded_wait.hpp.
+constexpr std::chrono::milliseconds kHostnameLookupTimeout{5000};
+
+std::string resolve_hostname(const std::string& ip) {
+    auto result = yuzu::discovery::bounded_call(
+        kHostnameLookupTimeout, [ip] { return detail::resolve_hostname_blocking(ip); });
+    return result.value_or(std::string{}); // timed out => same as "no PTR record"
 }
 
 // ── Ping sweep ────────────────────────────────────────────────────────────
@@ -480,6 +500,16 @@ private:
         auto scan_start = std::chrono::steady_clock::now();
         bool timed_out = false;
 
+        // Every degrade condition below is a CANDIDATE, accumulated by
+        // severity rather than applied to the ABI4 result seam immediately:
+        // more than one can independently fire in a single scan (e.g. the
+        // ARP read fails AND the scan later hits its deadline), and
+        // yuzu_ctx_set_result_status is an unconditional overwrite — calling
+        // it once per condition would let only the LAST one survive
+        // (governance Gate 4 consistency-auditor finding). set_result_status
+        // is called exactly once, at the end, with the worst report seen.
+        yuzu::discovery::MaybeDegrade worst_degrade;
+
         // Step 1: Get current ARP table (fast, pre-populated entries)
         auto arp_read = get_arp_table();
         std::set<std::string> arp_ips;
@@ -490,14 +520,11 @@ private:
         }
 
         // An ARP half that did not run is a PARTIAL scan, not a quiet network.
-        // Reported before the sweep so the reason survives even if a later
-        // degrade also fires.
         if (const auto arp_degrade =
                 yuzu::discovery::degrade_for_arp(arp_read.ok, arp_read.complete);
             arp_degrade.has_report) {
             ctx.write_output(std::format("status|warning|{}", arp_degrade.report.message));
-            ctx.set_result_status(arp_degrade.report.status, arp_degrade.report.completeness,
-                                  arp_degrade.report.reason);
+            worst_degrade = yuzu::discovery::worst_of(worst_degrade, arp_degrade);
         }
 
         ctx.report_progress(10);
@@ -528,8 +555,7 @@ private:
             // (EMFILE/ENFILE/ENOMEM, or IcmpCreateFile failing on Windows)
             // carry distinct statuses and reason tags.
             ctx.write_output(std::format("status|warning|{}", degrade.report.message));
-            ctx.set_result_status(degrade.report.status, degrade.report.completeness,
-                                  degrade.report.reason);
+            worst_degrade = yuzu::discovery::worst_of(worst_degrade, degrade);
             // Confine the degrade fallback to the requested subnet — never
             // surface unrelated cached ARP neighbors (other subnets,
             // multicast/broadcast entries) as scan results.
@@ -582,25 +608,21 @@ private:
         }
 
         // A sweep that constructed a session but could not transmit through it
-        // is NOT an empty network. Checked before the timeout branch because a
-        // blocked sweep explains the missing hosts more precisely than the
-        // deadline does.
+        // is NOT an empty network.
         if (const auto blocked = yuzu::discovery::degrade_for_sweep(sweep_tally);
             blocked.has_report) {
             ctx.write_output(std::format("status|warning|{}", blocked.report.message));
-            ctx.set_result_status(blocked.report.status, blocked.report.completeness,
-                                  blocked.report.reason);
+            worst_degrade = yuzu::discovery::worst_of(worst_degrade, blocked);
         }
 
         // A sweep cut short by its own deadline is PARTIAL, not a clean scan.
-        // The warning line above says so to a human; this says so to the ABI4
-        // result seam, which is what a machine consumer reads — without it a
-        // scan that stopped at host 40 of 254 is indistinguishable from a
-        // complete one. Not set on the degrade path above, which has already
-        // reported its own (more specific) status.
+        // The warning line above (in the sweep loop) says so to a human; this
+        // accumulates it for the ABI4 result seam, which is what a machine
+        // consumer reads — without it a scan that stopped at host 40 of 254 is
+        // indistinguishable from a complete one.
         if (timed_out) {
-            const auto t = yuzu::discovery::timeout_degrade();
-            ctx.set_result_status(t.status, t.completeness, t.reason);
+            worst_degrade = yuzu::discovery::worst_of(
+                worst_degrade, {true, yuzu::discovery::timeout_degrade()});
         }
 
         // Step 3: Re-read ARP table after ping sweep to get MACs. A failure
@@ -643,12 +665,32 @@ private:
             ctx.write_output(std::format("host|{}|{}|{}|unknown", ip, mac, hostname));
             ++found;
         }
-        if (hostname_scan_timed_out && !timed_out) {
-            const auto t = yuzu::discovery::timeout_degrade();
-            ctx.set_result_status(t.status, t.completeness, t.reason);
-            ctx.write_output(std::format(
-                "status|warning|hostname resolution timed out after {}s, {} of {} alive hosts "
-                "resolved", kScanTimeoutSeconds, found, static_cast<int>(alive_ips.size())));
+        if (hostname_scan_timed_out) {
+            worst_degrade = yuzu::discovery::worst_of(
+                worst_degrade, {true, yuzu::discovery::timeout_degrade()});
+            // The probe loop already wrote its own "scan timed out" warning
+            // when `timed_out` is true, and the sweep already having consumed
+            // the whole budget means this loop trips on its very first
+            // iteration — a second, near-identical message here would be
+            // redundant and its "0 of N resolved" framing misleading (the
+            // hostname loop never got a real chance to run).
+            if (!timed_out) {
+                ctx.write_output(std::format(
+                    "status|warning|hostname resolution timed out after {}s, {} of {} alive "
+                    "hosts resolved",
+                    kScanTimeoutSeconds, found, static_cast<int>(alive_ips.size())));
+            }
+        }
+
+        // Every candidate degrade condition observed across the whole scan
+        // (ARP, ICMP session, sweep-blocked, probe-loop timeout, hostname-loop
+        // timeout) has been accumulated above by severity. Apply the worst one
+        // to the ABI4 result seam exactly once, here — never at the individual
+        // sites — so an earlier, more specific reason can't be silently
+        // overwritten by a later, less specific one.
+        if (worst_degrade.has_report) {
+            ctx.set_result_status(worst_degrade.report.status, worst_degrade.report.completeness,
+                                  worst_degrade.report.reason);
         }
 
         ctx.write_output(std::format("scan_complete|{}|{}", found, total));

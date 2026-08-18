@@ -292,3 +292,65 @@ TEST_CASE("degrade_for_arp: ARP reasons never collide with the ICMP ones",
         CHECK(arp_trunc != std::string_view{icmp});
     }
 }
+
+// ── worst_of (multi-degrade severity merge) ─────────────────────────────────
+
+TEST_CASE("worst_of: no report on either side stays no report",
+          "[agent][discovery_scan_plan]") {
+    CHECK_FALSE(worst_of(MaybeDegrade{}, MaybeDegrade{}).has_report);
+}
+
+TEST_CASE("worst_of: a report on one side alone survives regardless of order",
+          "[agent][discovery_scan_plan]") {
+    const auto report = degrade_for_arp(/*ok=*/false, /*complete=*/true);
+    REQUIRE(worst_of(MaybeDegrade{}, report).has_report);
+    CHECK(worst_of(MaybeDegrade{}, report).report.status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    REQUIRE(worst_of(report, MaybeDegrade{}).has_report);
+    CHECK(worst_of(report, MaybeDegrade{}).report.status == YUZU_RESULT_STATUS_UNAVAILABLE);
+}
+
+TEST_CASE("worst_of: UNAVAILABLE outranks CONSTRAINED regardless of arrival order",
+          "[agent][discovery_scan_plan]") {
+    // This is the exact scenario the governance Gate 4 consistency-auditor
+    // finding named: an ARP read failure (UNAVAILABLE) and a scan timeout
+    // (CONSTRAINED) firing in the same call. The more severe, more actionable
+    // reason must survive regardless of which condition is discovered first.
+    const auto arp_failed = degrade_for_arp(/*ok=*/false, /*complete=*/true);
+    const auto timeout = MaybeDegrade{true, timeout_degrade()};
+
+    const auto arp_then_timeout = worst_of(worst_of(MaybeDegrade{}, arp_failed), timeout);
+    REQUIRE(arp_then_timeout.has_report);
+    CHECK(arp_then_timeout.report.status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(std::string_view{arp_then_timeout.report.reason} == "arp:read_failed");
+
+    const auto timeout_then_arp = worst_of(worst_of(MaybeDegrade{}, timeout), arp_failed);
+    REQUIRE(timeout_then_arp.has_report);
+    CHECK(timeout_then_arp.report.status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    CHECK(std::string_view{timeout_then_arp.report.reason} == "arp:read_failed");
+}
+
+TEST_CASE("worst_of: a tie keeps the earlier (first-accumulated) report",
+          "[agent][discovery_scan_plan]") {
+    // Two equally-severe CONSTRAINED conditions (sweep-blocked, then timeout)
+    // must surface the more upstream cause, not whichever was merged last.
+    const auto blocked = degrade_for_sweep(SweepTally{2, 2, 0});
+    const auto timeout = MaybeDegrade{true, timeout_degrade()};
+    REQUIRE(blocked.has_report);
+    CHECK(degrade_severity(blocked.report.status) == degrade_severity(timeout.report.status));
+
+    const auto merged = worst_of(worst_of(MaybeDegrade{}, blocked), timeout);
+    REQUIRE(merged.has_report);
+    CHECK(std::string_view{merged.report.reason} == "icmp:transmit_blocked");
+}
+
+TEST_CASE("degrade_severity: exhaustive ranking, UNAVAILABLE worst, OK/UNDECLARED least",
+          "[agent][discovery_scan_plan]") {
+    CHECK(degrade_severity(YUZU_RESULT_STATUS_UNAVAILABLE) >
+          degrade_severity(YUZU_RESULT_STATUS_CONSTRAINED));
+    CHECK(degrade_severity(YUZU_RESULT_STATUS_CONSTRAINED) >
+          degrade_severity(YUZU_RESULT_STATUS_OK));
+    CHECK(degrade_severity(YUZU_RESULT_STATUS_PERMISSION_DENIED) ==
+          degrade_severity(YUZU_RESULT_STATUS_CONSTRAINED));
+    CHECK(degrade_severity(YUZU_RESULT_STATUS_OK) ==
+          degrade_severity(YUZU_RESULT_STATUS_UNDECLARED));
+}

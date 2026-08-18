@@ -176,6 +176,54 @@ inline DegradeReport timeout_degrade() {
             "scan deadline reached — reporting the hosts probed so far"};
 }
 
+// ── Merging multiple degrade reports ─────────────────────────────────────
+
+/**
+ * `scan_subnet` can independently hit more than one degrade condition in a
+ * single call (e.g. the ARP read fails AND the scan later hits its
+ * deadline). The ABI4 result seam holds only one {status, completeness,
+ * reason} triple, and `yuzu_ctx_set_result_status` is an unconditional
+ * overwrite — calling it once per condition as each fires means only the
+ * LAST one survives, silently discarding an earlier and sometimes more
+ * actionable reason (governance Gate 4 consistency-auditor finding). The
+ * caller accumulates every candidate through worst_of() and calls
+ * set_result_status exactly once, with the most severe report seen.
+ *
+ * Severity order, worst first: UNAVAILABLE (the read/session did not run at
+ * all) > CONSTRAINED/PERMISSION_DENIED (it ran but was bounded, blocked, or
+ * truncated) > no report (a clean scan). This plugin's own conditions never
+ * produce PERMISSION_DENIED today; it is ranked with CONSTRAINED so the
+ * function stays exhaustive if one ever does.
+ */
+inline int degrade_severity(YuzuResultStatus status) {
+    switch (status) {
+    case YUZU_RESULT_STATUS_UNAVAILABLE:
+        return 2;
+    case YUZU_RESULT_STATUS_PERMISSION_DENIED:
+    case YUZU_RESULT_STATUS_CONSTRAINED:
+        return 1;
+    case YUZU_RESULT_STATUS_OK:
+    case YUZU_RESULT_STATUS_UNDECLARED:
+        break;
+    }
+    return 0;
+}
+
+/**
+ * Keep `current` if it is at least as severe as `candidate`; otherwise adopt
+ * `candidate`. A tie keeps `current` — the earliest-reported reason — so two
+ * equally severe conditions still surface the more upstream cause.
+ */
+inline MaybeDegrade worst_of(MaybeDegrade current, const MaybeDegrade& candidate) {
+    if (!candidate.has_report)
+        return current;
+    if (!current.has_report)
+        return candidate;
+    if (degrade_severity(candidate.report.status) > degrade_severity(current.report.status))
+        return candidate;
+    return current;
+}
+
 // ── Sweep bounds ──────────────────────────────────────────────────────────
 
 /**
