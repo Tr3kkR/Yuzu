@@ -284,6 +284,7 @@ agent_test_exe = executable(
     'unit/test_users_posix_actions.cpp',      # Wave 2 WP-A remediation: real users.dylib/.so driven
                                                 # end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
+    'unit/test_certificates_x509.cpp',        # Wave 2 WP-B: pure libcrypto PEM/DER field extraction
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp

@@ -92,7 +92,7 @@ duplicates.
 | antivirus | ✅ | ✅ | ✅ | Defender/WMI · ClamAV+Falcon+Sophos · macOS real probes — XProtect bundle version + endpoint-security system-extension enumeration (`antivirus_plugin.cpp`, parsers `antivirus_parsers.hpp`), no longer a hardcoded assertion (posture depth: the **Antivirus posture** row) |
 | asset_tags | ✅ | ✅ | ✅ | portable — `std::filesystem` only |
 | bitlocker | ✅ | ✅ | ✅ | BitLocker `manage-bde` · LUKS `cryptsetup` · FileVault `fdesetup` + per-APFS-volume `diskutil apfs list` (encrypted/not_encrypted/unknown, parser `bitlocker_macos_apfs.hpp`) |
-| certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
+| certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); Linux now parses in-process via libcrypto (rung 1); macOS System/SystemRoot keychains read natively via SecItem (rung 1), login keychain stays on its registered Decision-7 governed-shell path; macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
 | chargen | ✅ | ✅ | ✅ | portable — RFC 864 generator |
 | content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS |
 | device_identity | ✅ | ✅ | ✅ | all three branches implemented |
@@ -214,13 +214,13 @@ implementation is.
 | bitlocker | state | linux | supported | 3 | lsblk+cryptsetup | - |
 | bitlocker | state | macos | supported | 3 | fdesetup+diskutil | - |
 | bitlocker | state | windows | supported | 3 | manage_bde | - |
-| certificates | list | linux | supported | 3 | openssl x509 via governed shell runner | - |
-| certificates | list | macos | supported | 3 | security find-certificate with login shell fallback | - |
+| certificates | list | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
+| certificates | list | macos | supported | 3 | SecItem (System/root, in-process) + security find-certificate via governed shell (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo ~user hop (Decision-7 governed-shell exception) |
 | certificates | list | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
-| certificates | details | linux | supported | 3 | openssl x509 via governed shell runner | - |
-| certificates | details | macos | supported | 3 | security find-certificate with login shell fallback | - |
+| certificates | details | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
+| certificates | details | macos | supported | 3 | SecItem (System/root, in-process) + security find-certificate via governed shell (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo ~user hop (Decision-7 governed-shell exception) |
 | certificates | details | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
-| certificates | delete | linux | supported | 3 | openssl lookup via governed shell + filesystem remove | - |
+| certificates | delete | linux | supported | 1 | libcrypto X509 lookup + filesystem remove | - |
 | certificates | delete | macos | constrained | 2 | security delete-certificate via subprocess runner | SystemRootCertificates.keychain is sealed under SIP and rejected outright; only System/MY store deletes are supported |
 | certificates | delete | windows | supported | 1 | CryptoAPI (CertDeleteCertificateFromStore) | - |
 | chargen | chargen_start | linux | supported | 1 | in-process | - |
