@@ -50,6 +50,7 @@
 #include <chrono>
 #include <spdlog/spdlog.h>
 #include <sudo_argv.hpp> // yuzu::shared::sudo_wrap (Decision-8 canonical privileged argv, ADR-3002)
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result-status seam, ADR-3002)
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (K-7/CDX-07, ADR-3002 rung 2)
 #endif
 
@@ -69,8 +70,8 @@ using yuzu::services::is_safe_service_name;
 
 #if defined(__linux__) || defined(__APPLE__)
 // Outcome of run_tool(): the captured output PLUS the raw runner result, so
-// a caller can inspect res.tool_ran/timed_out/exit_code itself (e.g.
-// run_command_exit below, which reduces it to a bare exit code).
+// a caller can inspect res.tool_ran/timed_out/exit_code/output_truncated
+// itself (e.g. do_list, via forward_list_degrade below).
 struct ToolOutcome {
     std::string output;
     yuzu::agent::SubprocessResult res;
@@ -102,6 +103,30 @@ ToolOutcome run_tool(std::vector<std::string> argv) {
     }
     std::string output = res.output;
     return ToolOutcome{std::move(output), std::move(res)};
+}
+
+// Forward a degraded run_tool() outcome through the ABI4 CC-07 result-status
+// seam. run_tool() already spdlog::warns on timed_out/!tool_ran/
+// output_truncated (a cut-short enumeration parses as "0 services" -- a
+// silent false-negative, sre-M1), but a log line alone never reaches the
+// operator: do_list must not report a degraded read as a clean success.
+// forward_runner_failure covers three of those four signals (spawn_error ->
+// UNAVAILABLE, deadline/cancelled/signaled -> CONSTRAINED); output_truncated
+// is a fourth degrade mode it doesn't classify (the child exited normally,
+// its captured output was just cut short by the byte cap), so it's handled
+// here as an explicit CONSTRAINED/PARTIAL fallback. Returns true iff a
+// status was set -- callers must not let a later call overwrite an earlier
+// degrade (matches network_actions_plugin.cpp's status_forwarded
+// discipline for its two-subprocess flush_dns macOS leg).
+bool forward_list_degrade(yuzu::CommandContext& ctx, const yuzu::agent::SubprocessResult& res) {
+    if (yuzu::agent::forward_runner_failure(ctx, res))
+        return true;
+    if (res.output_truncated) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "services:output_truncated");
+        return true;
+    }
+    return false;
 }
 #endif
 
@@ -220,7 +245,12 @@ std::vector<ServiceInfo> enumerate_services_win(bool running_only) {
 
 using ServiceInfo = yuzu::services::SystemdUnitEntry;
 
-std::vector<ServiceInfo> enumerate_services_linux(bool running_only) {
+// out_res (out) receives the raw runner result of the list-units call so the
+// caller (do_list) can detect a degraded enumeration (timed out, spawn
+// failed, or output truncated) and forward an honest non-success status
+// instead of reporting an empty/partial list as a clean success.
+std::vector<ServiceInfo> enumerate_services_linux(bool running_only,
+                                                   yuzu::agent::SubprocessResult& out_res) {
     // services/enumerate_services_linux#1 (docs/agent-spawn-sink-manifest.md)
     // Resolve the tool across the two absolute paths systemctl actually
     // lives at across distros (mirrors the installed sudoers grant, which
@@ -239,7 +269,9 @@ std::vector<ServiceInfo> enumerate_services_linux(bool running_only) {
     // `/bin/sh -c` hop, no shell-string interpolation -- systemctl is exec'd
     // directly with each flag its own argv element. Parsing is pure
     // (services_parsers.hpp), unit-testable independent of the runner.
-    return yuzu::services::parse_systemctl_list_units(run_tool(std::move(argv)).output);
+    auto outcome = run_tool(std::move(argv));
+    out_res = outcome.res;
+    return yuzu::services::parse_systemctl_list_units(outcome.output);
 }
 
 #elif defined(__APPLE__)
@@ -254,8 +286,13 @@ struct ServiceInfo {
 // total_seen (out) receives the number of services that passed all filters
 // (label allowlist + running_only) BEFORE the yuzu::services::kMaxServiceRows
 // cap, so the caller can emit an honest truncation sentinel when rows were
-// dropped.
-std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t& total_seen) {
+// dropped. list_res/disabled_res (out) receive the raw runner results of the
+// two `launchctl` calls below so the caller (do_list) can detect a degraded
+// enumeration and forward an honest non-success status instead of reporting
+// an empty/partial list as a clean success.
+std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t& total_seen,
+                                                  yuzu::agent::SubprocessResult& list_res,
+                                                  yuzu::agent::SubprocessResult& disabled_res) {
     total_seen = 0;
     std::vector<ServiceInfo> services;
 
@@ -273,9 +310,10 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t
     if (!launchctl_path.empty()) {
         list_argv = {launchctl_path, "list"};
     }
-    const std::string listing = run_tool(std::move(list_argv)).output;
+    auto list_outcome = run_tool(std::move(list_argv));
+    list_res = list_outcome.res;
 
-    auto parsed = yuzu::services::parse_launchctl_list(listing, running_only);
+    auto parsed = yuzu::services::parse_launchctl_list(list_outcome.output, running_only);
     total_seen = parsed.total_seen;
     services.reserve(parsed.services.size());
     for (auto& entry : parsed.services) {
@@ -295,8 +333,9 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t
     if (!launchctl_path.empty()) {
         disabled_argv = {launchctl_path, "print-disabled", "system"};
     }
-    auto disabled_map = yuzu::services_macos::parse_print_disabled(
-        run_tool(std::move(disabled_argv)).output);
+    auto disabled_outcome = run_tool(std::move(disabled_argv));
+    disabled_res = disabled_outcome.res;
+    auto disabled_map = yuzu::services_macos::parse_print_disabled(disabled_outcome.output);
     for (auto& si : services) {
         si.startup_type = yuzu::services_macos::startup_type_for(disabled_map, si.label);
     }
@@ -308,23 +347,25 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
-/// Run argv via the bounded, fork-lock-covered runner and return its exit
-/// code -- shell-free (ADR-3002 rung 2): argv[0] is exec'd directly, no
-/// `/bin/sh -c` hop. stdout is drained-and-discarded by the runner (the
-/// callers here only need the exit code). An empty/probe-miss argv is
-/// rejected the same way run_bounded_subprocess's own runtime-reject would
-/// (returns -1) without attempting an OS call. `!tool_ran` (spawn/exec
-/// failure) maps to the old `popen()==nullptr`/non-WIFEXITED path: a -1
-/// "unknown", never a fabricated success.
+/// Run argv via the bounded, fork-lock-covered runner and return its raw
+/// SubprocessResult -- shell-free (ADR-3002 rung 2): argv[0] is exec'd
+/// directly, no `/bin/sh -c` hop. stdout is drained-and-discarded by the
+/// runner (mutating callers here only need the exit code / termination
+/// reason). An empty/probe-miss argv is rejected the same way
+/// run_bounded_subprocess's own runtime-reject would (a default-constructed
+/// SubprocessResult: tool_ran=false, termination_reason=spawn_error, no OS
+/// call attempted). Returning the full result (not just a collapsed exit
+/// code) lets a mutating call site distinguish "the tool ran and exited
+/// nonzero" from "the runner itself never produced a real exit"
+/// (spawn_error/deadline/cancelled/signaled) and forward the latter through
+/// the ABI4 result-status seam via yuzu::agent::forward_runner_failure --
+/// exactly the pattern network_actions_plugin.cpp's mutating call sites use.
 #if defined(__linux__) || defined(__APPLE__)
-int run_command_exit(const std::vector<std::string>& argv) {
+yuzu::agent::SubprocessResult run_command(const std::vector<std::string>& argv) {
     if (argv.empty() || argv.front().empty())
-        return -1;
-    auto res = yuzu::agent::run_bounded_subprocess(
+        return yuzu::agent::SubprocessResult{};
+    return yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
-    if (!res.tool_ran || res.timed_out)
-        return -1;
-    return res.exit_code;
 }
 #endif
 
@@ -431,10 +472,10 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
         argv = yuzu::shared::sudo_wrap({systemctl_path, "enable", "--", std::string(name)});
     } else if (mode == "manual") {
         // If the service was previously masked, unmask it first so disable
-        // works. Best-effort, same as before: its exit code is intentionally
-        // not checked (a service that was never masked has nothing to
+        // works. Best-effort, same as before: its result is intentionally
+        // not inspected (a service that was never masked has nothing to
         // unmask, and the following disable is the actual mode change).
-        run_command_exit(
+        run_command(
             yuzu::shared::sudo_wrap({systemctl_path, "unmask", "--", std::string(name)}));
         argv = yuzu::shared::sudo_wrap({systemctl_path, "disable", "--", std::string(name)});
     } else if (mode == "disabled") {
@@ -445,10 +486,22 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
         return 1;
     }
 
-    int rc = run_command_exit(argv);
-    if (rc != 0) {
+    auto res = run_command(argv);
+    // A runner-level failure (spawn error / deadline / cancelled / signaled)
+    // must be reported through the ABI4 status seam as a distinguishable
+    // TIMEOUT/CONSTRAINED (or UNAVAILABLE) status -- never collapsed into
+    // the generic "exit=-1" error string below, which previously hid the
+    // difference between "systemctl ran and failed" and "the runner never
+    // got a real exit at all".
+    if (yuzu::agent::forward_runner_failure(ctx, res)) {
         ctx.write_output(
-            std::format("error|systemctl command failed for '{}' (exit={})", name, rc));
+            std::format("error|systemctl command failed for '{}' (runner did not complete)",
+                        name));
+        return 1;
+    }
+    if (!res.tool_ran || res.exit_code != 0) {
+        ctx.write_output(std::format("error|systemctl command failed for '{}' (exit={})", name,
+                                     res.tool_ran ? res.exit_code : -1));
         return 1;
     }
 
@@ -513,10 +566,19 @@ int do_set_start_mode_macos(yuzu::CommandContext& ctx, std::string_view name,
         return 1;
     }
 
-    int rc = run_command_exit(argv);
-    if (rc != 0) {
+    auto res = run_command(argv);
+    // Same distinguishable-status discipline as the Linux leg above: a
+    // deadline-killed/cancelled/spawn-failed launchctl invocation must
+    // report a real CONSTRAINED/UNAVAILABLE status, not a bare "exit=-1".
+    if (yuzu::agent::forward_runner_failure(ctx, res)) {
         ctx.write_output(
-            std::format("error|launchctl command failed for '{}' (exit={})", name, rc));
+            std::format("error|launchctl command failed for '{}' (runner did not complete)",
+                        name));
+        return 1;
+    }
+    if (!res.tool_ran || res.exit_code != 0) {
+        ctx.write_output(std::format("error|launchctl command failed for '{}' (exit={})", name,
+                                     res.tool_ran ? res.exit_code : -1));
         return 1;
     }
 
@@ -647,13 +709,27 @@ private:
                 std::format("svc|{}|{}|{}|{}", s.name, s.display_name, s.status, s.startup_type));
         }
 #elif defined(__linux__)
-        auto services = enumerate_services_linux(running_only);
+        yuzu::agent::SubprocessResult list_res;
+        auto services = enumerate_services_linux(running_only, list_res);
+        // A timed-out/spawn-failed/truncated systemctl run must not be
+        // reported as a clean empty/partial success -- forward the honest
+        // degrade status before writing whatever rows were parsed.
+        bool degraded = forward_list_degrade(ctx, list_res);
         for (const auto& s : services) {
             ctx.write_output(std::format("svc|{}|{}|{}", s.name, s.status, s.description));
         }
+        if (degraded)
+            return 1;
 #elif defined(__APPLE__)
         std::size_t total_seen = 0;
-        auto services = enumerate_services_macos(running_only, total_seen);
+        yuzu::agent::SubprocessResult list_res, disabled_res;
+        auto services = enumerate_services_macos(running_only, total_seen, list_res, disabled_res);
+        // Same honest-degrade discipline as Linux above, across BOTH
+        // launchctl calls (list + print-disabled) -- never let the second
+        // check overwrite an earlier degrade (status_forwarded discipline).
+        bool degraded = forward_list_degrade(ctx, list_res);
+        if (!degraded)
+            degraded = forward_list_degrade(ctx, disabled_res);
         for (const auto& s : services) {
             ctx.write_output(
                 std::format("svc|{}|{}|{}|{}", s.label, s.pid, s.status, s.startup_type));
@@ -665,6 +741,8 @@ private:
             // and total_seen rides in the status slot.
             ctx.write_output(std::format("svc|__truncated__|-|{}|-", total_seen));
         }
+        if (degraded)
+            return 1;
 #else
         ctx.write_output("error|unsupported platform");
         return 1;

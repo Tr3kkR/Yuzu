@@ -159,60 +159,115 @@ inline void set_port(Resolved& r, int port) {
 
 // ── TCP connect-time sample ──────────────────────────────────────────────────
 
+// A TCP connect attempt can end three genuinely different ways, and
+// collapsing them onto one std::optional<double> lost a distinction that
+// matters: `rtt_ms` set means a real connect succeeded; `refused` means the
+// destination's network stack actively answered with an RST (ECONNREFUSED /
+// WSAECONNREFUSED) -- POSITIVE evidence the host is up and reachable, just
+// with nothing listening on this port (common for a woken desktop with no
+// service on kFallbackTcpPort, especially when ICMP is also blocked);
+// neither set means a genuine timeout/no-response -- no evidence either way.
+// A caller that only checks `rtt_ms` (the old contract) still gets identical
+// behaviour for the connected case; `refused` is new information, not a
+// behaviour change for existing has_value()-style checks.
+struct TcpSampleResult {
+    std::optional<double> rtt_ms;
+    bool refused{false};
+};
+
 #ifdef _WIN32
-inline std::optional<double> tcp_sample(const Resolved& dst, int timeout_ms) {
+inline TcpSampleResult tcp_sample(const Resolved& dst, int timeout_ms) {
+    TcpSampleResult result;
     SocketGuard sock{::socket(dst.family, SOCK_STREAM, IPPROTO_TCP)};
     if (!sock.ok())
-        return std::nullopt;
+        return result;
     const SOCKET s = sock.s;
     u_long nonblock = 1;
     ::ioctlsocket(s, FIONBIO, &nonblock);
     const auto t0 = std::chrono::steady_clock::now();
     int rc = ::connect(s, reinterpret_cast<const sockaddr*>(&dst.addr), dst.addr_len);
-    std::optional<double> out;
     if (rc == 0) {
-        out = probe_elapsed_ms(t0);
-    } else if (::WSAGetLastError() == WSAEWOULDBLOCK) {
-        fd_set wfds, efds;
-        FD_ZERO(&wfds);
-        FD_ZERO(&efds);
-        FD_SET(s, &wfds);
-        FD_SET(s, &efds);
-        timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
-        if (::select(0, nullptr, &wfds, &efds, &tv) > 0 && FD_ISSET(s, &wfds)) {
-            int soerr = 0;
-            int len = sizeof(soerr);
-            if (::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &len) ==
-                    0 &&
-                soerr == 0)
-                out = probe_elapsed_ms(t0);
-        }
+        result.rtt_ms = probe_elapsed_ms(t0);
+        return result;
     }
-    return out;
+    const int err = ::WSAGetLastError();
+    if (err == WSAECONNREFUSED) {
+        // Rare but possible: a synchronous refusal (e.g. loopback) with no
+        // async wait needed at all.
+        result.refused = true;
+        return result;
+    }
+    if (err != WSAEWOULDBLOCK)
+        return result;
+    fd_set wfds, efds;
+    FD_ZERO(&wfds);
+    FD_ZERO(&efds);
+    FD_SET(s, &wfds);
+    FD_SET(s, &efds);
+    timeval tv{timeout_ms / 1000, (timeout_ms % 1000) * 1000};
+    if (::select(0, nullptr, &wfds, &efds, &tv) <= 0)
+        return result;
+    // Windows signals an async connect failure (e.g. RST/refused) via the
+    // EXCEPT set, not the WRITE set -- the write set alone (the old check)
+    // never observed a refusal at all, so it read identically to a timeout.
+    if (FD_ISSET(s, &wfds)) {
+        int soerr = 0;
+        int len = sizeof(soerr);
+        if (::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &len) == 0 &&
+            soerr == 0)
+            result.rtt_ms = probe_elapsed_ms(t0);
+        return result;
+    }
+    if (FD_ISSET(s, &efds)) {
+        int soerr = 0;
+        int len = sizeof(soerr);
+        if (::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soerr), &len) == 0 &&
+            soerr == WSAECONNREFUSED)
+            result.refused = true;
+    }
+    return result;
 }
 #else
-inline std::optional<double> tcp_sample(const Resolved& dst, int timeout_ms) {
+inline TcpSampleResult tcp_sample(const Resolved& dst, int timeout_ms) {
+    TcpSampleResult result;
     SocketGuard sock{::socket(dst.family, SOCK_STREAM, IPPROTO_TCP)};
     if (!sock.ok())
-        return std::nullopt;
+        return result;
     const int s = sock.s;
     ::fcntl(s, F_SETFL, ::fcntl(s, F_GETFL, 0) | O_NONBLOCK);
     const auto t0 = std::chrono::steady_clock::now();
     int rc = ::connect(s, reinterpret_cast<const sockaddr*>(&dst.addr),
                        static_cast<socklen_t>(dst.addr_len));
-    std::optional<double> out;
     if (rc == 0) {
-        out = probe_elapsed_ms(t0);
-    } else if (errno == EINPROGRESS) {
-        pollfd pfd{s, POLLOUT, 0};
-        if (::poll(&pfd, 1, timeout_ms) > 0 && (pfd.revents & POLLOUT)) {
-            int soerr = 0;
-            socklen_t len = sizeof(soerr);
-            if (::getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &len) == 0 && soerr == 0)
-                out = probe_elapsed_ms(t0);
-        }
+        result.rtt_ms = probe_elapsed_ms(t0);
+        return result;
     }
-    return out;
+    if (errno == ECONNREFUSED) {
+        // Rare but possible: a synchronous refusal (e.g. loopback) with no
+        // async wait needed at all.
+        result.refused = true;
+        return result;
+    }
+    if (errno != EINPROGRESS)
+        return result;
+    // Poll for the connect to settle -- do not gate on `revents & POLLOUT`:
+    // a failed async connect (e.g. RST/refused) is reported on some POSIX
+    // implementations via POLLERR/POLLHUP rather than POLLOUT, and the old
+    // POLLOUT-only gate silently treated that identically to a timeout
+    // (never reaching the getsockopt below at all). Any wakeup here means
+    // the connect settled one way or another; SO_ERROR tells us which.
+    pollfd pfd{s, POLLOUT, 0};
+    if (::poll(&pfd, 1, timeout_ms) <= 0)
+        return result;
+    int soerr = 0;
+    socklen_t len = sizeof(soerr);
+    if (::getsockopt(s, SOL_SOCKET, SO_ERROR, &soerr, &len) == 0) {
+        if (soerr == 0)
+            result.rtt_ms = probe_elapsed_ms(t0);
+        else if (soerr == ECONNREFUSED)
+            result.refused = true;
+    }
+    return result;
 }
 #endif
 

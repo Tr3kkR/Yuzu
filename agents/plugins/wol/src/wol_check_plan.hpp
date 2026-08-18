@@ -40,6 +40,11 @@ inline constexpr int kFallbackTcpPort = 443;
 enum class CheckMechanism {
     icmp,              // a real ICMP echo reply was observed
     tcp_fallback,      // ICMP unusable or no reply; TCP connect succeeded
+    tcp_refused,       // ICMP unusable or no reply; TCP connect was actively
+                        // refused (RST) — positive evidence the host's
+                        // network stack is up, just nothing listening on
+                        // the probed port (e.g. a woken desktop with ICMP
+                        // also blocked)
     checked_no_reply,  // both mechanisms were genuinely attempted; neither
                         // produced a positive result (an honest negative)
     unavailable,       // neither mechanism could even be attempted — NOT
@@ -57,9 +62,13 @@ struct ProbeOutcome {
     bool icmp_replied{false};
 
     // TCP fallback: a destination resolved is "TCP could be attempted";
-    // tcp_connected is the attempt's own result.
+    // tcp_connected is a successful connect; tcp_refused is an active RST
+    // (yuzu::shared::tcp_sample's TcpSampleResult::refused) — distinct from
+    // a genuine no-reply timeout, since a refusal is itself proof the host
+    // answered.
     bool tcp_resolved{false};
     bool tcp_connected{false};
+    bool tcp_refused{false};
 };
 
 struct CheckVerdict {
@@ -74,6 +83,12 @@ inline CheckVerdict classify_check(const ProbeOutcome& o) {
         return CheckVerdict{true, CheckMechanism::icmp};
     if (o.tcp_resolved && o.tcp_connected)
         return CheckVerdict{true, CheckMechanism::tcp_fallback};
+    // A refused TCP connect (RST) is positive evidence the destination's
+    // network stack is up -- reported reachable, distinct from a successful
+    // connect so an operator can tell "something is listening" from "the
+    // host answered but nothing is listening on this port".
+    if (o.tcp_resolved && o.tcp_refused)
+        return CheckVerdict{true, CheckMechanism::tcp_refused};
 
     // Neither mechanism produced a positive reply. "ICMP could be
     // attempted" requires BOTH a resolved destination and a usable
@@ -95,6 +110,8 @@ inline const char* check_mechanism_label(CheckMechanism m) {
         return "icmp";
     case CheckMechanism::tcp_fallback:
         return "tcp-fallback";
+    case CheckMechanism::tcp_refused:
+        return "tcp-refused";
     case CheckMechanism::checked_no_reply:
         return "icmp+tcp-fallback";
     case CheckMechanism::unavailable:

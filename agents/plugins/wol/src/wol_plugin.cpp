@@ -334,11 +334,14 @@ int do_check(yuzu::CommandContext& ctx, yuzu::Params params) {
         outcome.tcp_resolved = tcp_dst.has_value();
         if (tcp_dst) {
             yuzu::shared::set_port(*tcp_dst, yuzu::wol::kFallbackTcpPort);
-            for (int i = 0; i < count && !outcome.tcp_connected; ++i) {
+            for (int i = 0; i < count && !outcome.tcp_connected && !outcome.tcp_refused; ++i) {
                 if (i > 0)
                     std::this_thread::sleep_for(kInterSampleGap);
-                if (yuzu::shared::tcp_sample(*tcp_dst, timeout_ms))
+                auto sample = yuzu::shared::tcp_sample(*tcp_dst, timeout_ms);
+                if (sample.rtt_ms)
                     outcome.tcp_connected = true;
+                else if (sample.refused)
+                    outcome.tcp_refused = true;
             }
         }
     }
