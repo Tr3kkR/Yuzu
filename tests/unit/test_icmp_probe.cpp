@@ -10,6 +10,7 @@
 
 #include <icmp_probe.hpp>
 
+#include <cstdio>
 #include <cstring>
 
 using namespace yuzu::shared;
@@ -23,11 +24,21 @@ using namespace yuzu::shared;
 // any TEST_CASE below runs.
 namespace {
 struct WinsockInit {
+    bool ok{false};
     WinsockInit() {
         WSADATA wsa;
-        ::WSAStartup(MAKEWORD(2, 2), &wsa);
+        if (const int rc = ::WSAStartup(MAKEWORD(2, 2), &wsa); rc != 0) {
+            std::fprintf(stderr, "WinsockInit: WSAStartup failed (%d) -- resolve_first tests "
+                                 "below will fail WSANOTINITIALISED, not their own assertion\n",
+                         rc);
+        } else {
+            ok = true;
+        }
     }
-    ~WinsockInit() { ::WSACleanup(); }
+    ~WinsockInit() {
+        if (ok)
+            ::WSACleanup();
+    }
 };
 const WinsockInit kWinsockInit;
 } // namespace

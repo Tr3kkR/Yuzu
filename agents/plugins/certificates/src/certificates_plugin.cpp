@@ -192,6 +192,24 @@ void mark_result_partial(yuzu::CommandContext& ctx, std::string_view provenance)
     ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                           provenance);
 }
+
+/**
+ * Canonicalize a thumbprint to uppercase hex so every downstream comparison
+ * against a parsed value (certificates_x509::extract_thumbprint always emits
+ * uppercase) is a plain `==`. The `thumbprint` request parameter is
+ * documented as case-insensitive (content/definitions/certificates.yaml) but
+ * was compared as-is on both the macOS and Linux paths, so a lowercase
+ * caller-supplied value silently failed to match. `s` is assumed already
+ * hex-validated by is_valid_thumbprint(); this only changes case, never
+ * rejects input. Shared (not macOS-only) because details_cert_linux and
+ * delete_cert_linux need the identical fold.
+ */
+std::string canonical_thumbprint(std::string_view s) {
+    std::string out{s};
+    for (auto& c : out)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return out;
+}
 #endif
 
 // ── Expiry filtering helper ──────────────────────────────────────────────────
@@ -516,6 +534,20 @@ void details_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint) 
         return;
     }
 
+    // Case-insensitive per content/definitions/certificates.yaml -- see
+    // canonical_thumbprint's own comment (consistency-auditor Gate-4 finding:
+    // this compared as-is, unlike the macOS path fixed for the same gap
+    // earlier in this same PR).
+    auto needle = canonical_thumbprint(thumbprint);
+    // Tracks whether every candidate file in this directory was actually
+    // readable. A file read_linux_cert_record couldn't parse reports its
+    // degradation via mark_result_partial (the ABI4 result-status channel)
+    // but still leaves this LOCAL loop free to keep scanning -- so without
+    // this flag, an unreadable file that happened to be the real target
+    // would fall all the way through to "status|not_found" below, an
+    // incomplete scan silently presenting as a definitive negative
+    // (consistency-auditor Gate-4 BLOCKING finding).
+    bool scan_complete = true;
     for (const auto& entry : std::filesystem::directory_iterator(cert_dir, ec)) {
         if (!entry.is_regular_file(ec))
             continue;
@@ -524,12 +556,23 @@ void details_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint) 
             continue;
 
         auto rec = read_linux_cert_record(ctx, entry.path(), "/etc/ssl/certs");
-        if (rec.thumbprint == thumbprint) {
+        if (rec.thumbprint == "(skipped)") {
+            scan_complete = false;
+            continue;
+        }
+        if (canonical_thumbprint(rec.thumbprint) == needle) {
             ctx.write_output(rec.to_row());
             return;
         }
     }
-    ctx.write_output("status|not_found");
+    if (scan_complete) {
+        ctx.write_output("status|not_found");
+    } else {
+        // Mirrors details_cert_macos's "not_available|<store> scan
+        // incomplete" convention for the identical situation: a definitive
+        // negative was never established, so this must not say "not_found".
+        ctx.write_output("not_available|/etc/ssl/certs scan incomplete");
+    }
 }
 
 void delete_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint,
@@ -542,6 +585,12 @@ void delete_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint,
         return;
     }
 
+    auto needle = canonical_thumbprint(thumbprint);
+    // See details_cert_linux's identical flag -- a delete request must never
+    // report "not_found" (which idempotent "ensure-absent" remediation
+    // depends on being a definitive negative) when a candidate file couldn't
+    // actually be inspected.
+    bool scan_complete = true;
     for (const auto& entry : std::filesystem::directory_iterator(cert_dir, ec)) {
         if (!entry.is_regular_file(ec))
             continue;
@@ -552,7 +601,16 @@ void delete_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint,
         // parity: only the file's FIRST certificate is a delete target --
         // see first_cert_of_file's own comment.
         auto cert = first_cert_of_file(entry.path());
-        if (cert && cert->thumbprint == thumbprint) {
+        if (!cert) {
+            // Same degraded-read signal read_linux_cert_record gives list/
+            // details -- an unreadable file here means this scan cannot
+            // prove the target is absent (consistency-auditor Gate-4
+            // BLOCKING finding).
+            mark_result_partial(ctx, "libcrypto:unreadable-file");
+            scan_complete = false;
+            continue;
+        }
+        if (canonical_thumbprint(cert->thumbprint) == needle) {
             if (std::filesystem::remove(entry.path(), ec)) {
                 ctx.write_output("status|deleted");
             } else {
@@ -561,7 +619,13 @@ void delete_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint,
             return;
         }
     }
-    ctx.write_output("status|not_found");
+    if (scan_complete) {
+        ctx.write_output("status|not_found");
+    } else {
+        ctx.write_output(
+            "error|unreadable file(s) in /etc/ssl/certs prevented a complete scan; "
+            "cannot confirm the certificate is absent");
+    }
 }
 
 #endif // __linux__
@@ -1026,22 +1090,8 @@ std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
     return yuzu::macos::ConsoleUser{std::move(username), std::move(uid)};
 }
 
-/**
- * Canonicalize a thumbprint to uppercase hex so every downstream comparison
- * against a PEM-parsed value (parse_pem_block_macos always emits uppercase,
- * from openssl's `-fingerprint -sha1` output) is a plain `==`. The
- * `thumbprint` request parameter is documented as case-insensitive
- * (content/definitions/certificates.yaml) but was compared as-is, so a
- * lowercase caller-supplied value silently failed to match. `s` is assumed
- * already hex-validated by is_valid_thumbprint(); this only changes case,
- * never rejects input.
- */
-std::string canonical_thumbprint(std::string_view s) {
-    std::string out{s};
-    for (auto& c : out)
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    return out;
-}
+// canonical_thumbprint() moved to the shared __linux__/__APPLE__ block above
+// -- details_cert_linux/delete_cert_linux need the identical fold.
 
 // BlockIdentityOutcome / classify_block_identity moved to
 // certificates_macos_parsers.hpp (shared with the unit test).
