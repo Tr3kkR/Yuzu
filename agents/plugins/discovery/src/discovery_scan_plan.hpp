@@ -176,6 +176,21 @@ inline DegradeReport timeout_degrade() {
             "scan deadline reached — reporting the hosts probed so far"};
 }
 
+/**
+ * The degrade report for one or more reverse-DNS lookups that timed out or
+ * were throttled by bounded_call's outstanding-call ceiling (Gate 6 SRE
+ * finding). CONSTRAINED/PARTIAL for the same reason every other degrade here
+ * is: the host itself is a real finding, only its hostname is missing, and
+ * "no hostname" must not be silently indistinguishable from a genuine
+ * absent-PTR-record answer.
+ */
+inline DegradeReport hostname_lookup_degraded() {
+    return {YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+            "dns:hostname_lookup_degraded",
+            "one or more reverse-DNS lookups timed out or were throttled — affected hosts "
+            "report an unknown hostname"};
+}
+
 // ── Merging multiple degrade reports ─────────────────────────────────────
 
 /**

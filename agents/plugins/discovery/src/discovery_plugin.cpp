@@ -343,10 +343,17 @@ std::string resolve_hostname_blocking(const std::string& ip) {
 // itself can't be cancelled) — see bounded_wait.hpp.
 constexpr std::chrono::milliseconds kHostnameLookupTimeout{5000};
 
-std::string resolve_hostname(const std::string& ip) {
-    auto result = yuzu::discovery::bounded_call(
+// nullopt distinguishes "the lookup timed out or was throttled by
+// bounded_call's ceiling" from a present-but-empty string ("no PTR record" —
+// a genuine, non-degraded answer from getnameinfo). Gate 6 SRE finding: the
+// two were previously collapsed into the same empty string, so a lookup that
+// silently degraded looked identical to a host with no reverse-DNS entry —
+// the one place this plugin's otherwise-thorough honest-degrade reporting
+// didn't reach, because the degrade is per-item rather than per-scan. The
+// caller aggregates degrades across the whole hostname-resolution pass.
+std::optional<std::string> resolve_hostname(const std::string& ip) {
+    return yuzu::discovery::bounded_call(
         kHostnameLookupTimeout, [ip] { return detail::resolve_hostname_blocking(ip); });
-    return result.value_or(std::string{}); // timed out => same as "no PTR record"
 }
 
 // ── Ping sweep ────────────────────────────────────────────────────────────
@@ -637,6 +644,7 @@ private:
 
         // Step 4: Output results
         int found = 0;
+        int hostname_degraded = 0;
         bool hostname_scan_timed_out = false;
         for (const auto& ip : alive_ips) {
             std::string mac = ip_to_mac.count(ip) ? ip_to_mac[ip] : "unknown";
@@ -651,19 +659,42 @@ private:
                 hostname_scan_timed_out = true;
                 break;
             }
-            // hostname is a reverse-DNS PTR result -- attacker-influenceable
-            // (the responding host/DNS infra controls it), unlike `ip`/`mac`
-            // which come from inet_ntop/fixed-hex formatters. safe_output_field
-            // it so a crafted PTR record containing '|' or CR/LF can't inject
-            // an extra column or forge an extra output row (same class as the
-            // sibling users/certificates plugins' output-escaping fixes this
-            // session; governance Gate 2 finding).
-            std::string hostname = yuzu::util::safe_output_field(resolve_hostname(ip));
-            if (hostname.empty()) hostname = "unknown";
+            // resolve_hostname returns nullopt when the lookup timed out or
+            // was throttled by bounded_call's ceiling, distinct from a
+            // present-but-empty answer (a genuine "no PTR record"). Without
+            // this distinction the two looked identical — the one place this
+            // scan's otherwise-thorough honest-degrade reporting didn't
+            // reach, because the degrade is per-item rather than per-scan
+            // (governance Gate 6 SRE finding).
+            auto resolved = resolve_hostname(ip);
+            std::string hostname;
+            if (resolved) {
+                // hostname is a reverse-DNS PTR result -- attacker-
+                // influenceable (the responding host/DNS infra controls it),
+                // unlike `ip`/`mac` which come from inet_ntop/fixed-hex
+                // formatters. safe_output_field it so a crafted PTR record
+                // containing '|' or CR/LF can't inject an extra column or
+                // forge an extra output row (same class as the sibling
+                // users/certificates plugins' output-escaping fixes this
+                // session; governance Gate 2 finding).
+                hostname = yuzu::util::safe_output_field(*resolved);
+                if (hostname.empty()) hostname = "unknown";
+            } else {
+                ++hostname_degraded;
+                hostname = "unknown";
+            }
             // managed status is always "unknown" from the agent side —
             // the server will correlate with known agent IPs
             ctx.write_output(std::format("host|{}|{}|{}|unknown", ip, mac, hostname));
             ++found;
+        }
+        if (hostname_degraded > 0) {
+            ctx.write_output(std::format(
+                "status|warning|{} of {} hostname lookups timed out or were throttled; "
+                "reported as unknown",
+                hostname_degraded, found));
+            worst_degrade = yuzu::discovery::worst_of(
+                worst_degrade, {true, yuzu::discovery::hostname_lookup_degraded()});
         }
         if (hostname_scan_timed_out) {
             worst_degrade = yuzu::discovery::worst_of(

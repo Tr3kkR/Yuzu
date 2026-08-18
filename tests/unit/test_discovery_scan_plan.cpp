@@ -106,6 +106,21 @@ TEST_CASE("timeout_degrade: a deadline-truncated sweep is PARTIAL with its own r
           std::string_view{degrade_for(IcmpAvailability::Unavailable).report.reason});
 }
 
+TEST_CASE("hostname_lookup_degraded: CONSTRAINED/PARTIAL with its own distinct reason",
+          "[agent][discovery_scan_plan]") {
+    const auto h = hostname_lookup_degraded();
+    CHECK(h.status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(h.completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(std::string_view{h.reason} == "dns:hostname_lookup_degraded");
+    for (const auto& other : {timeout_degrade().reason,
+                              degrade_for(IcmpAvailability::Denied).report.reason,
+                              degrade_for(IcmpAvailability::Unavailable).report.reason,
+                              degrade_for_arp(false, true).report.reason,
+                              degrade_for_sweep(SweepTally{2, 2, 0}).report.reason}) {
+        CHECK(std::string_view{h.reason} != std::string_view{other});
+    }
+}
+
 // ── probe_budget_ms ───────────────────────────────────────────────────────
 
 TEST_CASE("probe_budget_ms: the per-host budget is capped so a /24 sweep stays finite",
