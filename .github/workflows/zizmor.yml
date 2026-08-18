@@ -59,7 +59,11 @@ jobs:
       # input on `actions/cache`. The cache maintainers documented it as
       # "does not work as intended" and recommend a split
       # `actions/cache/restore` + `actions/cache/save` (gated on
-      # `if: always() && cache-hit != 'true'`) instead. This step fails
+      # `if: always() && cache-hit != 'true'`) instead. That gate is right
+      # for an ADDITIVE cache (ccache); a coherent-artifact tree such as
+      # `vcpkg_installed` must ALSO gate on the producing step's outcome,
+      # or a cancelled run saves a partial tree under an immutable key —
+      # see `.claude/skills/ci-cache/SKILL.md`. This step fails
       # the workflow if `save-always` reappears in any workflow YAML so
       # the non-use becomes structural rather than convention.
       # Reference: https://github.com/actions/cache/tree/main/save#always-save-cache
