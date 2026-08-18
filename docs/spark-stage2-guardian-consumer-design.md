@@ -253,7 +253,7 @@ The read-failure path calls `unhealthy()` **unconditionally** on every `!read.kn
 *recovery* is edge-forced (`pack()`'s `recovered` bit). `build_entries` then pushes a
 **fresh-`event_id`** health entry on every `Unhealthy` (`guardian_spark_runtime.cpp:405-413`).
 An unhealthy rule stays in `pending_initial` (`:357`), which the priority lane re-sweeps
-every ~5 s (`ConvergenceScheduler::Config::priority_poll_ms`, default 5000 — the
+every ~5 s (`ConvergenceScheduler::Config::priority_poll_ms`, default 5000 - the
 `guardian_convergence_scheduler.hpp:60` line-ref this paragraph originally cited has
 since drifted; cite the symbol, not a line number, for exactly this reason). Net: one
 mundane unreadable target (ACL-denied file, missing hive path) emits **~17 k
@@ -265,9 +265,9 @@ without it): transition-edge health emission (emit on the false→true unknown e
 slow periodic refresh only) + evict never-Known rules from the 5 s priority lane to
 their normal lane cadence.
 
-**SUPERSEDED 2026-08-18 (F11, #2298) — the fix above has since shipped, in two parts,
+**SUPERSEDED 2026-08-18 (F11, #2298) - the fix above has since shipped, in two parts,
 and the ~17k/day figure is the PRE-fix number.** Transition-edge emission shipped first
-(`b30e93cfd`, 2026-07-20, "edge-guard into-unknown to stop unhealthy-event flood") —
+(`b30e93cfd`, 2026-07-20, "edge-guard into-unknown to stop unhealthy-event flood") -
 this alone removed the per-sweep flood this paragraph describes; every committed
 repeat-Unknown became silent (edge-only, `unhealthy_suppressed_`) rather than a
 fresh-`event_id` re-emission on every ~5s sweep. F5 (PR #3005, merged 2026-08-11) then
@@ -275,20 +275,20 @@ fresh-`event_id` re-emission on every ~5s sweep. F5 (PR #3005, merged 2026-08-11
 `errored_refresh_ms` (default 300s) re-emits a stale-but-still-errored rule so a
 lost/coalesced edge cannot leave the server's view stale forever, and
 `pending_demote_sweeps`/`pending_demote_ms` evict a never-Known rule off the 5s
-priority lane onto its normal type-lane cadence — exactly the mechanism this
-paragraph's "Fix" bullet called for. **F5 did not reduce the ~17k/day figure — edge
+priority lane onto its normal type-lane cadence - exactly the mechanism this
+paragraph's "Fix" bullet called for. **F5 did not reduce the ~17k/day figure - edge
 emission already had, to zero steady-state wire traffic; F5 set the new nonzero
 ceiling on top of that silence, by design (a lost-edge backstop, not free).** The
 measured ceiling (fake-clock Catch2 cases at production Config defaults,
-`tests/unit/test_guardian_spark_runtime.cpp`, "F11 flood: ..." — see
+`tests/unit/test_guardian_spark_runtime.cpp`, "F11 flood: ..." - see
 `docs/spark-rebuild-baselines/f11-flood-measurement-run.md` for the full derivation and
 a live-rig confirmation): **1 edge + 288 refreshes/day/rule/agent** on a 60s-cadence
-lane (service/registry — refresh recurs exactly every `errored_refresh_ms`, first
+lane (service/registry - refresh recurs exactly every `errored_refresh_ms`, first
 landing at t=300s post-edge), **1 edge + 180 refreshes/day/rule/agent** on the 600s
 file lane, accounting for the scheduler's default +/-20% jitter (every post-demotion
 sweep refreshes, since even the jitter-minimum 480s spacing already exceeds the 300s
 floor; 144/day is the exact-no-jitter figure, 180/day is the true production ceiling
-— corrected 2026-08-18 after an adversarial review caught the original doc's false
+- corrected 2026-08-18 after an adversarial review caught the original doc's false
 "jitter never shortens a sweep" claim). Both corrected figures are roughly 60-95x
 below the pre-fix ~17k/day this paragraph documents.
 

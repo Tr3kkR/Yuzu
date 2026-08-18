@@ -1,4 +1,4 @@
-// Spark rung-2 resource gate — external, PID-targeted sampler.
+// Spark rung-2 resource gate - external, PID-targeted sampler.
 //
 // Committed 2026-08-18 (F11, #2298; D1 ruling 2026-08-05: port-lite) - previously a
 // local-only spike on the DGRHP rig, same posture as tpwait_spike.cpp. Not meson-wired:
@@ -9,21 +9,21 @@
 // rung-2 resource gate: legacy vs spark, back-to-back on ONE Windows rig,
 // fixed armed load N=20 registry + 20 file + 20 service guards, sampling
 // thread count + handle/fd count + RSS + wakeups/sec + idle CPU%. No harness
-// existed for this — docs/spark-rebuild-baselines/stage0-resource-baseline.md
+// existed for this - docs/spark-rebuild-baselines/stage0-resource-baseline.md
 // scoped the metrics and gotchas but the tool was never built. This is that
 // tool.
 //
 // Deliberately generic: takes a target PID and samples it from the outside.
-// No link against any Yuzu source — works against a legacy agent, a spark
+// No link against any Yuzu source - works against a legacy agent, a spark
 // agent, or anything else, on any branch. The load itself (arming 20/20/20
 // guards) is a separate concern, driven through the real product surface
-// (a Guardian Baseline push) — see the runbook doc alongside this file.
+// (a Guardian Baseline push) - see the runbook doc alongside this file.
 //
 // Metric notes (methodology per stage0-resource-baseline.md):
 //   - thread count: CreateToolhelp32Snapshot/Thread32First/Next, same
 //     technique as tpwait_spike.cpp's current_process_thread_count(), just
 //     generalized to an arbitrary PID instead of GetCurrentProcessId().
-//   - handle count: GetProcessHandleCount(). REQUIRED, not optional — a
+//   - handle count: GetProcessHandleCount(). REQUIRED, not optional - a
 //     naive spark port could collapse threads while leaving one bus
 //     connection + eventfd/handle per unit, a partial win thread count alone
 //     would hide (this is exactly the systemd-guard risk flagged in the
@@ -36,7 +36,7 @@
 //     thread instance whose \Thread(*)\ID Process matches the target PID.
 //     Chosen over an internal TP-callback counter (spark_engine.cpp has one)
 //     because the legacy side has no equivalent internal counter to compare
-//     against — an OS-level count is the only thing measurable on BOTH
+//     against - an OS-level count is the only thing measurable on BOTH
 //     configurations without instrumenting legacy code. This is the direct
 //     Windows analogue of the Linux proxy the baseline doc names
 //     (voluntary_ctxt_switches + nonvoluntary_ctxt_switches delta).
@@ -44,7 +44,7 @@
 // Gotcha carried over from the baseline doc: a live agent's gRPC reconnect
 // backoff loop adds wakeup noise if it can't reach a server. Sample against
 // the SAME connectivity state (both reachable, or both consistently
-// unreachable) for legacy and spark runs — never one connected and the other
+// unreachable) for legacy and spark runs - never one connected and the other
 // not, or the delta is contaminated.
 //
 // Build (MSVC Developer environment, per docs/windows-build.md /
@@ -58,7 +58,7 @@
 //
 // Steady-state summary drops the first 2 samples (warm-up: process/query
 // startup transients, first PDH collect has no rate yet) and averages the
-// rest — paste straight into the 2b PR gate-evidence table.
+// rest - paste straight into the 2b PR gate-evidence table.
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -90,7 +90,7 @@ BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
 }
 
 // Best-effort: the target may run under a different account (the agent runs
-// as a service — docs/agent-privilege-model.md). SeDebugPrivilege lets an
+// as a service - docs/agent-privilege-model.md). SeDebugPrivilege lets an
 // elevated admin token open/query a process it doesn't own. If this fails,
 // OpenProcess below will too, with a clear error.
 void try_enable_debug_privilege() {
@@ -284,7 +284,7 @@ int wmain(int argc, wchar_t** argv) {
 
     HANDLE hproc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, target_pid);
     if (!hproc) {
-        fwprintf(stderr, L"[resource_sampler] OpenProcess(%lu) failed, gle=%lu — target may run as a "
+        fwprintf(stderr, L"[resource_sampler] OpenProcess(%lu) failed, gle=%lu - target may run as a "
                           L"different account; needs an elevated (Administrator) console even with "
                           L"SeDebugPrivilege, and the target must actually exist\n",
                   target_pid, GetLastError());
@@ -295,7 +295,7 @@ int wmain(int argc, wchar_t** argv) {
     CtxSwitchSampler ctxsw;
     bool have_pdh = ctxsw.init();
     if (!have_pdh) {
-        fwprintf(stderr, L"[resource_sampler] PDH init failed — continuing without wakeups/sec\n");
+        fwprintf(stderr, L"[resource_sampler] PDH init failed - continuing without wakeups/sec\n");
     }
 
     fwprintf(out, L"elapsed_s,threads,handles,rss_bytes,cpu_pct,ctxsw_per_sec\n");
@@ -317,7 +317,7 @@ int wmain(int argc, wchar_t** argv) {
         // Re-check liveness: a dead PID reuses cheap, keep it explicit.
         DWORD wait_rc = WaitForSingleObject(hproc, 0);
         if (wait_rc == WAIT_OBJECT_0) {
-            fwprintf(stderr, L"[resource_sampler] target pid %lu exited — stopping\n", target_pid);
+            fwprintf(stderr, L"[resource_sampler] target pid %lu exited - stopping\n", target_pid);
             break;
         }
 
