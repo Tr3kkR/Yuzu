@@ -1,10 +1,14 @@
 /**
- * test_antivirus_parsers.cpp — pure antivirus parse helpers
- * (antivirus_parsers.hpp, macOS parity 1.2).
+ * test_antivirus_parsers.cpp — pure antivirus parse/render helpers
+ * (antivirus_parsers.hpp).
  *
- * The popen shell-outs are the impure shell; the decision-shaped parsing of
- * PlistBuddy version output and `systemextensionsctl list` is header-pure and
- * pinned here on every host (the licensing_parsers.hpp pattern). Fixture
+ * The subprocess/WMI/registry acquisition is the impure shell; the
+ * decision-shaped parsing of PlistBuddy version output, `systemextensionsctl
+ * list`, the Windows Security Center productState bit layout, and the WMI
+ * row / registry value-name to output-line mapping are all header-pure and
+ * pinned here on every host (the licensing_parsers.hpp pattern) — including
+ * the Windows-only legs, since none of these functions touch WMI/COM/the
+ * registry directly; they take plain synthetic maps/vectors. Fixture
  * strings marked "real capture" were taken verbatim from a macOS 26 host;
  * older macOS releases are not yet fixture-verified — capture and add when
  * such hardware is available.
@@ -13,6 +17,10 @@
 #include "antivirus_parsers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <map>
+#include <string>
+#include <vector>
 
 using namespace yuzu::antivirus;
 
@@ -120,4 +128,142 @@ TEST_CASE("contains_insensitive: dedupe helper", "[antivirus]") {
     CHECK_FALSE(contains_insensitive("Sophos Scan Extension", "falcon"));
     CHECK(contains_insensitive("anything", ""));
     CHECK_FALSE(contains_insensitive("", "x"));
+}
+
+// ── decode_wsc_product_state ────────────────────────────────────────────────
+
+TEST_CASE("decode_wsc_product_state: enabled + current definitions", "[antivirus]") {
+    // mid byte 0x10 (on), low byte 0x00 (current).
+    const auto d = decode_wsc_product_state(0x001000);
+    CHECK(d.enabled);
+    CHECK_FALSE(d.snoozed);
+    CHECK(d.definitions_up_to_date);
+}
+
+TEST_CASE("decode_wsc_product_state: enabled + stale definitions", "[antivirus]") {
+    // mid byte 0x10 (on), low byte 0x01 (nonzero -> stale).
+    const auto d = decode_wsc_product_state(0x001001);
+    CHECK(d.enabled);
+    CHECK_FALSE(d.snoozed);
+    CHECK_FALSE(d.definitions_up_to_date);
+}
+
+TEST_CASE("decode_wsc_product_state: disabled", "[antivirus]") {
+    // mid byte 0x00 (off), low byte 0x00.
+    const auto d = decode_wsc_product_state(0x000000);
+    CHECK_FALSE(d.enabled);
+    CHECK_FALSE(d.snoozed);
+    CHECK(d.definitions_up_to_date);
+}
+
+TEST_CASE("decode_wsc_product_state: enabled but snoozed", "[antivirus]") {
+    // mid byte 0x11 (on, snoozed), low byte 0x00.
+    const auto d = decode_wsc_product_state(0x001100);
+    CHECK(d.enabled);
+    CHECK(d.snoozed);
+    CHECK(d.definitions_up_to_date);
+}
+
+TEST_CASE("decode_wsc_product_state: high byte (product-type code) is ignored", "[antivirus]") {
+    // Same mid/low bytes as the first case, arbitrary high byte -- must not
+    // change the decode.
+    const auto d = decode_wsc_product_state(0x391000);
+    CHECK(d.enabled);
+    CHECK(d.definitions_up_to_date);
+}
+
+// ── render_wsc_product_line / render_wsc_products ───────────────────────────
+
+TEST_CASE("render_wsc_product_line: enabled and current", "[antivirus]") {
+    std::map<std::string, std::string> row{{"displayName", "Windows Defender"},
+                                           {"productState", "397568"}}; // 0x061100
+    CHECK(render_wsc_product_line(row) == "av|Windows Defender|snoozed|current");
+}
+
+TEST_CASE("render_wsc_product_line: missing displayName renders unknown, not blank",
+          "[antivirus]") {
+    std::map<std::string, std::string> row{{"productState", "266240"}}; // 0x041000
+    CHECK(render_wsc_product_line(row) == "av|unknown|enabled|current");
+}
+
+TEST_CASE("render_wsc_product_line: missing productState is honest, not guessed", "[antivirus]") {
+    std::map<std::string, std::string> row{{"displayName", "Some AV"}};
+    CHECK(render_wsc_product_line(row) == "av|Some AV|unknown|unknown");
+}
+
+TEST_CASE("render_wsc_product_line: non-numeric productState is honest, not guessed",
+          "[antivirus]") {
+    std::map<std::string, std::string> row{{"displayName", "Some AV"},
+                                           {"productState", "not-a-number"}};
+    CHECK(render_wsc_product_line(row) == "av|Some AV|unknown|unknown");
+}
+
+TEST_CASE("render_wsc_product_line: name containing '|' is sanitized", "[antivirus]") {
+    std::map<std::string, std::string> row{{"displayName", "Evil|AV"}, {"productState", "0"}};
+    CHECK(render_wsc_product_line(row) == "av|Evil AV|disabled|current");
+}
+
+TEST_CASE("render_wsc_products: maps every row, empty input yields empty output",
+          "[antivirus]") {
+    CHECK(render_wsc_products({}).empty());
+
+    std::vector<std::map<std::string, std::string>> rows{
+        {{"displayName", "A"}, {"productState", "266240"}},  // 0x041000, enabled/current
+        {{"displayName", "B"}, {"productState", "262144"}}}; // 0x040000, disabled/current
+    auto lines = render_wsc_products(rows);
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0] == "av|A|enabled|current");
+    CHECK(lines[1] == "av|B|disabled|current");
+}
+
+// ── render_defender_status ──────────────────────────────────────────────────
+
+TEST_CASE("render_defender_status: full row maps every key", "[antivirus]") {
+    std::map<std::string, std::string> row{
+        {"RealTimeProtectionEnabled", "True"},
+        {"AntivirusSignatureVersion", "1.417.123.0"},
+        {"AntivirusSignatureLastUpdated", "20260817120000.000000+000"},
+        {"QuickScanEndTime", "20260816083000.000000+000"}};
+    auto lines = render_defender_status(row);
+    REQUIRE(lines.size() == 4);
+    CHECK(lines[0] == "realtime_protection|enabled");
+    CHECK(lines[1] == "definition_version|1.417.123.0");
+    CHECK(lines[2] == "last_update|20260817120000.000000+000");
+    CHECK(lines[3] == "last_quick_scan|20260816083000.000000+000");
+}
+
+TEST_CASE("render_defender_status: RealTimeProtectionEnabled false/0 both read disabled",
+          "[antivirus]") {
+    CHECK(render_defender_status({{"RealTimeProtectionEnabled", "False"}})[0] ==
+          "realtime_protection|disabled");
+    CHECK(render_defender_status({{"RealTimeProtectionEnabled", "0"}})[0] ==
+          "realtime_protection|disabled");
+    CHECK(render_defender_status({{"RealTimeProtectionEnabled", "1"}})[0] ==
+          "realtime_protection|enabled");
+}
+
+TEST_CASE("render_defender_status: missing keys are omitted, not fabricated", "[antivirus]") {
+    CHECK(render_defender_status({}).empty());
+    auto lines = render_defender_status({{"AntivirusSignatureVersion", "1.0"}});
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] == "definition_version|1.0");
+}
+
+// ── render_exclusion_lines ──────────────────────────────────────────────────
+
+TEST_CASE("render_exclusion_lines: maps every value name with its kind", "[antivirus]") {
+    auto lines = render_exclusion_lines({"C:\\Temp", "D:\\Data\\app.exe"}, "path");
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0] == "exclusion|path|C:\\Temp");
+    CHECK(lines[1] == "exclusion|path|D:\\Data\\app.exe");
+}
+
+TEST_CASE("render_exclusion_lines: empty input yields empty output", "[antivirus]") {
+    CHECK(render_exclusion_lines({}, "process").empty());
+}
+
+TEST_CASE("render_exclusion_lines: a value name containing '|' is sanitized", "[antivirus]") {
+    auto lines = render_exclusion_lines({"evil|name.exe"}, "process");
+    REQUIRE(lines.size() == 1);
+    CHECK(lines[0] == "exclusion|process|evil name.exe");
 }
