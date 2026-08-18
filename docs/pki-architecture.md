@@ -517,6 +517,15 @@ DACL via `SetNamedSecurityInfoW` is a tracked follow-up shared with
   full fleet re-enrollment. The issued-cert inventory + CRL history live in the server's Postgres
   substrate (`ca_store` schema) — back it up with the rest of the database (`docs/postgres-store-
   playbook.md`), not as a separate local file.
+- **Deliberate clean re-root** (wipe an established root, e.g. after root-key compromise):
+  `default_certs.cpp`'s B-2 guard refuses to regenerate while `ca_store.ca_root` already holds a
+  row, so there is no in-product "reset" action. The operator must clear the store directly —
+  `TRUNCATE ca_store.ca_root, ca_store.ca_issued, ca_store.ca_crl_versions` against the server's
+  Postgres substrate (`docs/postgres-store-playbook.md` for connecting) — and remove the on-disk
+  `<ca-dir>/default-*.{pem,key}` + `default-marker.json`, then restart. This orphans every
+  currently-enrolled agent (their leaves chain to the destroyed root); a full fleet re-enrollment
+  follows, same as a root-key loss. Prefer `POST /ca/import-chain` (Subordinate-CA, PR6) when the
+  goal is re-keying under a new authority without an enrollment outage.
 
 ## Roadmap
 

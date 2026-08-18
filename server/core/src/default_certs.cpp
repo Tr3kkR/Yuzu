@@ -532,14 +532,16 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
 
     // ── B-2 (#1238): never silently re-root a populated CA ─────────────────────
     // We only reach here because the fast path found the on-disk default certs
-    // missing / corrupt / mismatched. If ca.db STILL remembers a CA root,
+    // missing / corrupt / mismatched. If ca_store STILL remembers a CA root,
     // generating a fresh one would set_root-REPLACE it and purge the issued
     // inventory — orphaning every agent already enrolled under the old root (their
     // leaves now chain to a dead CA). That is the dangerous quadrant the
-    // corrupt-only self-heal above does NOT cover: a wiped cert dir on a
-    // persistent ca.db volume, or a botched restore. Refuse with an actionable
-    // message; the operator restores the certs from backup (matching the ca.db
-    // root) or removes ca.db too for a deliberate clean re-root. We refuse on ANY
+    // corrupt-only self-heal above does NOT cover: a wiped cert dir against a
+    // still-populated ca_store, or a botched restore. Refuse with an actionable
+    // message; the operator restores the certs from backup (matching the ca_store
+    // root) or performs a deliberate clean re-root (docs/pki-architecture.md
+    // "Operator runbook" — clears ca_store.ca_root/ca_issued/ca_crl_versions
+    // directly, ca.db has no bearing on this since ADR-0053). We refuse on ANY
     // existing root (not only a fingerprint mismatch): the regen path always mints
     // a brand-new CA, so proceeding would re-root regardless.
     if (ca_store && ca_store->is_open()) {
@@ -549,10 +551,10 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         // has one (the exact danger this guard exists to prevent).
         auto root_or_err = ca_store->get_root();
         if (!root_or_err) {
-            spdlog::error("default_certs: cannot determine whether ca.db already holds a CA root "
-                          "({}) — refusing to regenerate. A fresh CA would re-root the fleet if "
-                          "one already exists and this read simply failed to see it; resolve the "
-                          "database error and retry.",
+            spdlog::error("default_certs: cannot determine whether ca_store already holds a CA "
+                          "root ({}) — refusing to regenerate. A fresh CA would re-root the fleet "
+                          "if one already exists and this read simply failed to see it; resolve "
+                          "the database error and retry.",
                           root_or_err.error());
             return false;
         }
@@ -564,11 +566,11 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
                        pki::fingerprint_sha256(read_text_file(out.ca_cert)).value_or(std::string{"unreadable"}))
                     : std::string{"no on-disk CA cert"};
             spdlog::error(
-                "default_certs: ca.db already holds a CA root ({}) but the on-disk default "
+                "default_certs: ca_store already holds a CA root ({}) but the on-disk default "
                 "certs in {} are missing/corrupt ({}). Refusing to regenerate — a fresh CA "
                 "would re-root the fleet and orphan every enrolled agent. Restore "
-                "default-*.{{pem,key}} from backup (matching the ca.db root), or remove ca.db "
-                "for a deliberate clean re-root.",
+                "default-*.{{pem,key}} from backup (matching the ca_store root), or perform a "
+                "deliberate clean re-root per docs/pki-architecture.md \"Operator runbook\".",
                 root.fingerprint_sha256, dir.string(), on_disk);
             return false;
         }
@@ -589,10 +591,10 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         spdlog::error("default_certs: could not set 0700 on {}: {} (keys stay 0600 regardless)",
                       dir.string(), ec.message());
 
-    // On regeneration, purge any prior default-cert inventory rows so ca.db
+    // On regeneration, purge any prior default-cert inventory rows so ca_store
     // reflects only the live set (no orphan leaves referencing a replaced root;
     // set_root REPLACEs the single root row separately). After B-2 this path is
-    // only reached with an EMPTY ca.db (regen against a populated root is now
+    // only reached with an EMPTY ca_store (regen against a populated root is now
     // refused), so this normally deletes nothing — but a failed purge would leave
     // stale rows, so surface it (#1238 should-fix: don't silently ignore the rc).
     if (ca_store && !ca_store->delete_issued_by("system:default-certs"))
@@ -701,7 +703,7 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
             rec.issuer_fingerprint = *ca_fp;
             rec.issuer_key_id = ca_key_id;
             if (auto rec_result = ca_store->record_issued(rec); !rec_result) {
-                spdlog::error("default_certs: failed to record issued '{}' in ca.db — aborting "
+                spdlog::error("default_certs: failed to record issued '{}' in ca_store — aborting "
                               "(the inventory must be consistent for revocation / rotation): {}",
                               spec.purpose, rec_result.error());
                 ok = false;
@@ -739,7 +741,7 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
         // whichever root is now canonical.
         auto established = ca_store->try_insert_root(root);
         if (!established) {
-            spdlog::error("default_certs: failed to record CA root in ca.db — aborting: {}",
+            spdlog::error("default_certs: failed to record CA root in ca_store — aborting: {}",
                           established.error());
             return false; // before the marker — next boot regenerates
         }
@@ -750,7 +752,7 @@ bool ensure_default_certs(const fs::path& dir, const std::string& hostname, CaSt
             // authoritative, rather than silently operating under, or clobbering, a root nobody
             // else recognises.
             spdlog::error(
-                "default_certs: lost the first-boot CA-root race — ca.db already holds a "
+                "default_certs: lost the first-boot CA-root race — ca_store already holds a "
                 "DIFFERENT root (fingerprint {}) established by another instance. This "
                 "instance's freshly generated CA (fingerprint {}) is discarded; its default "
                 "certs are NOT written. If instances are meant to share one cert volume, restart "

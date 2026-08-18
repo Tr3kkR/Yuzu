@@ -2048,7 +2048,7 @@ public:
                           "#1118). Labelled event=security (SIEM-routing tag)",
                           "counter");
         // PKI PR3: an agent-initiated RPC rejected because the presented client
-        // leaf's serial is on the internal CA's revocation list (ca.db). A revoked
+        // leaf's serial is on the internal CA's revocation list (ca_store). A revoked
         // agent that keeps calling is a decommissioned/compromised-credential
         // signal. Labelled by rpc (subscribe|heartbeat|download_update) so an
         // operator can see a revoked agent trying every surface, not just the
@@ -2065,7 +2065,7 @@ public:
                           "enrollment (PKI PR3). Labelled purpose (agent)",
                           "counter");
         // PKI PR4 (gov sre/unhappy SHOULD): the CRL could not be (re)built/signed —
-        // the public CRL is stale relative to ca.db. Alert on >0 since a revocation,
+        // the public CRL is stale relative to ca_store. Alert on >0 since a revocation,
         // since server-side enforcement is live but external consumers are not
         // seeing the revocation. The audit row (ca.crl.published failure) is the
         // forensic pair; this counter is the real-time alert source.
@@ -5328,7 +5328,7 @@ public:
         const std::filesystem::path dir =
             cfg_.ca_dir.empty() ? auth::default_cert_dir() : cfg_.ca_dir;
         if (!ca_store_ || !ca_store_->is_open())
-            spdlog::warn("default_certs: ca.db is not open — cert-inventory recording will fail and "
+            spdlog::warn("default_certs: ca_store is not open — cert-inventory recording will fail and "
                          "generation will refuse (surfacing the DB-open failure)");
         if (!ensure_default_certs(dir, detect_hostname(), ca_store_.get(), default_cert_set_,
                                   cfg_.cert_sans, cfg_.cert_group)) {
@@ -5357,7 +5357,7 @@ public:
             // INVARIANT: using_default_agent_certs ⟹ using_default_certs (it is set
             // inside this `if (https_needs/agent_needs)` block, only after
             // using_default_certs is set above). The /healthz ca-store check keys on
-            // the broader using_default_certs (ca.db is needed whenever ANY default
+            // the broader using_default_certs (ca_store is needed whenever ANY default
             // surface is active); the listener relaxation keys on the agent-specific
             // flag. Keep them in sync if a future mixed-mode is introduced.
             cfg_.using_default_agent_certs = true;
@@ -5479,7 +5479,7 @@ public:
         agent_service_.set_require_client_identity(cfg_.tls_enabled && !cfg_.tls_ca_cert.empty());
         // Only an install with our OWN issuing CA (built-in defaults today,
         // subordinate in PR6) signs agent CSRs. When the operator brought their
-        // own certs there is no root in ca.db → no signer, and agents must carry
+        // own certs there is no root in ca_store → no signer, and agents must carry
         // operator-minted client certs (the pre-PKI contract). The revocation
         // checker is wired whenever a CA root exists so a revoked leaf is refused
         // even on an operator-supplied-cert install that still uses our CA.
@@ -7549,7 +7549,7 @@ private:
         }
         auto& root = *root_or_err;
         if (!root) {
-            spdlog::warn("PKI: agent CSR signing requested but ca.db has no root");
+            spdlog::warn("PKI: agent CSR signing requested but ca_store has no root");
             return std::nullopt;
         }
         // PR5d / Hermes LOW: bound the attacker-supplied CSR before any parse or
@@ -7624,10 +7624,10 @@ private:
         }
         // Hermes MEDIUM-4: per-agent issuance rate-limit. A holder of a valid
         // enrollment credential could otherwise spam Register-with-CSR, each call
-        // burning an ECDSA sign + a ca.db row. A legitimate agent issues once per
+        // burning an ECDSA sign + a ca_store row. A legitimate agent issues once per
         // provisioning (it then re-Registers WITHOUT a CSR) and again only at the
         // ~8-month renewal, so this floor never affects the happy path; it also
-        // bounds the ca.db rows a bounded agent retry (Hermes HIGH-2) can create.
+        // bounds the ca_store rows a bounded agent retry (Hermes HIGH-2) can create.
         {
             // gov UP-1: CHECK only here; the timestamp is recorded AFTER a
             // successful issuance (below), so a transient server-side failure
@@ -7683,7 +7683,7 @@ private:
         lp.usage = pki::LeafUsage{.client_auth = true};
         // Install-scoped URI SAN (defence in depth + forensic identity). The CA
         // fingerprint (colon-stripped → a valid URI authority) is the per-install
-        // id; fall back to the ca.db root fingerprint on an operator-supplied set.
+        // id; fall back to the ca_store root fingerprint on an operator-supplied set.
         std::string install = default_cert_set_.ca_fingerprint_sha256.empty()
                                   ? root->fingerprint_sha256
                                   : default_cert_set_.ca_fingerprint_sha256;
@@ -7697,7 +7697,7 @@ private:
             return std::nullopt;
         }
 
-        // Record the issued leaf so it can be revoked / inventoried (ca.db).
+        // Record the issued leaf so it can be revoked / inventoried (ca_store).
         IssuedCertRecord rec;
         rec.serial_hex = issued->serial_hex;
         rec.subject = agent_id;
@@ -7773,7 +7773,7 @@ private:
         }
         auto& root = *root_or_err;
         if (!root) {
-            spdlog::warn("PKI: CA CSR export requested but ca.db has no root");
+            spdlog::warn("PKI: CA CSR export requested but ca_store has no root");
             return std::nullopt;
         }
         const std::filesystem::path dir =
@@ -7896,7 +7896,7 @@ private:
     }
 
     /// True iff the presented client leaf is one of OURS and its serial is revoked
-    /// in ca.db. Issuer-scoped (is_yuzu_issued) so a foreign cert whose serial
+    /// in ca_store. Issuer-scoped (is_yuzu_issued) so a foreign cert whose serial
     /// happens to collide with a revoked Yuzu serial is not falsely rejected
     /// (Hermes LOW-5). Reads only the CA store (its own mutex) — safe off the
     /// agent-plane lock.
@@ -10318,11 +10318,11 @@ private:
             // /api/v1/offload-targets endpoint and every fire_event call
             // silently no-ops on a migration failure (HC-1 from Gate 6).
             bool offload_target_ok = offload_target_store_ && offload_target_store_->is_open();
-            // #1238 B-3: ca.db is load-bearing whenever default certs are active
+            // #1238 B-3: ca_store is load-bearing whenever default certs are active
             // (issuance / revocation / CRL). It was wired into /readyz but missing
-            // here, so /healthz could report "healthy" with a dead ca.db. Mirrors
+            // here, so /healthz could report "healthy" with a dead ca_store. Mirrors
             // the /readyz conjunction; trivially true when not on default certs
-            // (the operator brought their own, so ca.db isn't required).
+            // (the operator brought their own, so ca_store isn't required).
             bool ca_ok = !cfg_.using_default_certs || (ca_store_ && ca_store_->is_open());
             // Born-on-Postgres stores (ADR-0012). They were wired into /readyz but
             // not here, so /healthz could report "healthy" with a degraded store —
@@ -10652,7 +10652,7 @@ private:
                 // authoritative store on this ladder (all of which are wired in
                 // here) as belt-and-braces against a runtime is_open() flip.
                 {"deployment_store", deployment_store_ && deployment_store_->is_open()},
-                // PKI PR2: ca.db is load-bearing only when the install is on
+                // PKI PR2: ca_store is load-bearing only when the install is on
                 // built-in default certs (PR3+ make it load-bearing for mTLS
                 // issuance/revocation). When the operator brought their own certs
                 // it is not on the request path, so report ok.

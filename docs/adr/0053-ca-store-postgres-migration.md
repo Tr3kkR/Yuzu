@@ -266,6 +266,21 @@ the existing `/readyz` `ca_root` signal (`server.cpp`); `is_open()` already join
 store conjunction. No new wiring needed; the existing signal now correctly reflects a genuine
 Postgres read failure as "unhealthy" rather than the pre-migration file-open check.
 
+### Upgrade-test coverage — known gap, not unique to this store
+
+`scripts/test/test-upgrade-stack.sh` carries exactly one store-specific data-survival assertion
+(the original ADR-0009 generic-inventory pilot, `git log` shows no other touch to this file or
+`test-fixtures-verify.sh`). None of the sibling Wave 2/3 migrations that followed it — LicenseStore
+(ADR-0048), DeploymentStore, SoftwareDeploymentStore (ADR-0051) — added their own dedicated
+previous-release-SQLite → new-release-Postgres assertion either; each relies on the harness's
+generic `fixtures-verify` pass (asserts overall server health/migration success post-upgrade, not
+per-store content). This migration follows that same precedent rather than being the first to
+diverge from it: CA issued-cert + CRL history backfill is exercised by `test_ca_store.cpp`'s
+dedicated `migrate_from_sqlite` suite (real legacy-schema fixtures, fingerprint verification,
+idempotent-rerun) but not by the end-to-end upgrade harness. Closing this gap — for CaStore and
+its siblings alike — is tracked as a follow-up on `docs/postgres-migration-ladder.md`, not solved
+here.
+
 ## Considered and rejected
 
 - **Folding `has_root()` entirely into `get_root()` and updating all four call sites to the typed

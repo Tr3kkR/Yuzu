@@ -59,7 +59,7 @@ std::string fmt_epoch(int64_t epoch) {
     return std::string(buf);
 }
 
-/// Validate + normalise a serial to the canonical uppercase hex `ca.db` stores.
+/// Validate + normalise a serial to the canonical uppercase hex form `ca_store` stores.
 /// Returns empty if it is not 1–64 hex digits. Shared by the REST + dashboard
 /// revoke paths so both reject the same inputs and match the same stored serial.
 std::string normalize_serial(std::string s) {
@@ -191,7 +191,7 @@ std::string render_ca_fragment(CaStore* ca_store) {
                 // see web_utils.hpp), so the double-quoted value="" is safe for any
                 // serial (and a single-quoted hx-vals would have been too) — the
                 // form is just the clearer, codebase-standard pattern. The serial
-                // is hex-only in practice; this renders whatever ca.db holds safely.
+                // is hex-only in practice; this renders whatever ca_store holds safely.
                 html += "<form hx-post=\"/api/settings/ca/revoke\" hx-target=\"#ca-section\" "
                         "hx-swap=\"innerHTML\" style=\"display:inline-flex;gap:0.3rem\" "
                         "hx-confirm=\"Revoke certificate for &quot;" +
@@ -413,7 +413,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
 
     // ── POST /api/v1/ca/revoke ── Security:Delete: revoke a serial. ───────────
     // Body: {"serial_hex": "...", "reason": "..."}. Revocation takes effect
-    // server-side immediately (the mTLS accept gate consults ca.db, not the CRL);
+    // server-side immediately (the mTLS accept gate consults ca_store, not the CRL);
     // republishing the CRL propagates it to external consumers.
     sink.Post("/api/v1/ca/revoke", [perm_fn, ca_store, revoke_core](
                                       const httplib::Request& req, httplib::Response& res) {
@@ -467,7 +467,7 @@ void CaRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_
         // inject newlines into the audit detail (log-injection defence in depth).
         std::erase_if(reason, [](char c) { return c == '\n' || c == '\r'; });
         // Hermes M4: validate + normalise serial_hex (1..64 hex, uppercase) so a
-        // lowercase-input revoke still matches the canonical ca.db form.
+        // lowercase-input revoke still matches the canonical ca_store form.
         const std::string serial = normalize_serial(body.value("serial_hex", ""));
         if (serial.empty()) {
             res.status = 400;

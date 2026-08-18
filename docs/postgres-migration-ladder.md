@@ -105,3 +105,12 @@ Migrate last because they require `SecretCodec` (or a verify-only-hash schema) i
   in its per-store ADR.
 - When the last row clears, remove the `migration_runner.*` SQLite path from the server target and
   delete this file (its job is done).
+- **Open follow-up — upgrade-test coverage per store (noted 2026-08-18, ADR-0053).**
+  `scripts/test/test-upgrade-stack.sh` carries exactly one store-specific data-survival assertion
+  (the original ADR-0009 generic-inventory pilot). No migration since — `LicenseStore`,
+  `DeploymentStore`, `SoftwareDeploymentStore`, `CaStore` — added its own dedicated
+  previous-release-SQLite → new-release-Postgres assertion; each relies on the harness's generic
+  `fixtures-verify` pass instead. Each migrated store's own unit-test `migrate_from_sqlite` suite
+  covers the backfill logic with real legacy-schema fixtures, but not the end-to-end upgrade path.
+  Not solved here — flag for whoever next touches the upgrade harness or does a ladder-completeness
+  pass.

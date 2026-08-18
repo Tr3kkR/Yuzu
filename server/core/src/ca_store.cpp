@@ -1119,7 +1119,7 @@ std::expected<CaRoot, std::string> CaStore::try_insert_root(const CaRoot& root) 
                                "read back: " +
                                PQerrorMessage(lease.get()));
     const CaRoot winner = read_root_row(existing.get(), 0);
-    spdlog::warn("CaStore: try_insert_root LOST the first-boot race — ca.db already holds a "
+    spdlog::warn("CaStore: try_insert_root LOST the first-boot race — ca_store already holds a "
                 "DIFFERENT root (fingerprint {}) than the one just generated (fingerprint {}). "
                 "The caller's freshly-generated key material is unusable and must be discarded.",
                 winner.fingerprint_sha256, root.fingerprint_sha256);
