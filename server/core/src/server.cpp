@@ -1611,6 +1611,26 @@ public:
                           "Offload-target deliveries dropped because the delivery worker pool's "
                           "queue was full or the store was quiescing",
                           "counter");
+        // Pre-seed all six to 0 (adversarial-review round 2, Kimi+Codex
+        // both independently confirmed) - describe() alone only writes
+        // HELP/TYPE metadata (MetricsRegistry::describe()), it does not
+        // create a series; counter(name) with no labels does. Each of
+        // these six is a no-label counter, so it has exactly one known
+        // "label combination" - itself - and the same bounded-label
+        // pre-seed rule applies (docs/observability-conventions.md
+        // "Bounded-label counters are pre-seeded to 0 at startup"),
+        // matching the tag_store precedent a few hundred lines above.
+        // Without this, a fresh server has no series at all for any of
+        // these until the first delivery fires, so absent()-based
+        // alerting can't distinguish "not wired" from "no deliveries yet".
+        for (const char* name : {"yuzu_server_webhook_delivery_success_total",
+                                 "yuzu_server_webhook_delivery_failed_total",
+                                 "yuzu_server_webhook_delivery_dropped_total",
+                                 "yuzu_server_offload_delivery_success_total",
+                                 "yuzu_server_offload_delivery_failed_total",
+                                 "yuzu_server_offload_delivery_dropped_total"}) {
+            metrics_.counter(name);
+        }
         // ADR-0010 §Decision 3. Carried in the gauge family because the
         // authoritative cumulative count lives in SecretCodec and is exported
         // pull-model at scrape time, but it IS a monotonic counter — declared

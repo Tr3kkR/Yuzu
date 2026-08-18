@@ -120,10 +120,29 @@ public:
     /// drained within the bound, false on timeout (some task is still
     /// running past the deadline - the caller must not destroy the pool
     /// in that case; see the header comment on `~StoreWorkerPool`).
+    ///
+    /// Not `noexcept` in its signature, but every path out of it is
+    /// exception-safe (adversarial-review round 2, Kimi K2, independently
+    /// confirmed against source): every caller of this function is itself
+    /// noexcept - ServerImpl::stop() (`noexcept override`) and both
+    /// stores' implicitly-noexcept destructors. std::unique_lock's
+    /// locking constructor and condition_variable::wait_for are NOT
+    /// noexcept per the standard (both can throw std::system_error),
+    /// even though a correctly-used, non-recursive std::mutex essentially
+    /// never actually throws in practice - an uncaught throw here would
+    /// still call std::terminate() instead of reaching the documented
+    /// escalation path, exactly the hazard class this file's own
+    /// constructor try/catch and quiesce_and_join_unconditional() already
+    /// guard against elsewhere. Treat any throw the same as a timeout -
+    /// false is already a safe, handled outcome for every caller.
     bool quiesce(std::chrono::milliseconds timeout) {
-        std::unique_lock lock(mu_);
-        closed_ = true;
-        return idle_cv_.wait_for(lock, timeout, [this] { return pending_ == 0; });
+        try {
+            std::unique_lock lock(mu_);
+            closed_ = true;
+            return idle_cv_.wait_for(lock, timeout, [this] { return pending_ == 0; });
+        } catch (...) {
+            return false;
+        }
     }
 
 private:
