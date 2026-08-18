@@ -479,7 +479,6 @@ RUNNER_ALLOWLIST = {
 GRANDFATHERED = {
     "agents/plugins/antivirus/src/antivirus_plugin.cpp",
     "agents/plugins/bitlocker/src/bitlocker_plugin.cpp",
-    "agents/plugins/certificates/src/certificates_plugin.cpp",
     "agents/plugins/content_dist/src/content_dist_plugin.cpp",
     "agents/plugins/device_identity/src/device_identity_plugin.cpp",
     "agents/plugins/discovery/src/discovery_plugin.cpp",
@@ -503,7 +502,6 @@ GRANDFATHERED = {
     "agents/plugins/software_actions/src/software_actions_plugin.cpp",
     "agents/plugins/tar/src/tar_mapdrive_collector.cpp",
     "agents/plugins/tar/src/tar_service_collector.cpp",
-    "agents/plugins/users/src/users_plugin.cpp",
     "agents/plugins/vuln_scan/src/config_checks.hpp",
     "agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp",
     "agents/plugins/windows_updates/src/windows_updates_plugin.cpp",

@@ -20,15 +20,14 @@
 #ifndef _WIN32
 #include <chrono>
 #include <spdlog/spdlog.h>
-#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (K-7/CDX-07)
+#include <yuzu/agent/runner_status.hpp> // yuzu::agent::forward_runner_failure (ABI4 result seam)
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (K-7/CDX-07, ADR-3002 rung 2)
 #endif
 
 #if defined(__APPLE__)
 #include "users_macos_last.hpp" // pure `last -y` parsers (qe-M1)
 #endif
 
-#include <array>
-#include <cstdio>
 #include <format>
 #include <map>
 #include <sstream>
@@ -57,12 +56,18 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <iterator> // std::size (EvtNext batch array bound)
 #include <windows.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include <winevt.h>     // EvtQuery / EvtNext / EvtRender / EvtClose
 #include <lm.h>
 #include <wtsapi32.h>
+#include <user_profile_model.hpp> // yuzu::profiles::profile_name_from_path (PR1.7)
+#include <win_profiles.hpp>       // yuzu::win::enumerate_profile_records (PR1.7)
+#include "users_win_events.hpp"   // pure Security-channel XML parsers (Wave-2 WP-A)
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "netapi32.lib")
+#pragma comment(lib, "wevtapi.lib")
 #endif
 
 namespace {
@@ -91,53 +96,68 @@ bool is_safe_identifier(std::string_view s) {
     return true;
 }
 
-// ── subprocess helper (all platforms) ──────────────────────────────────────
+// ── subprocess helper (POSIX) ────────────────────────────────────────────
 
 #ifndef _WIN32
 // Per-call wall-clock bound for the local account tools (dscl/last/lastlog/
 // who/w). Generous enough never to fire in practice, short enough that a
-// wedged tool cannot pin the instruction worker indefinitely.
-constexpr std::chrono::seconds kUsersCmdDeadline{20};
-#endif
+// wedged tool cannot pin the instruction worker indefinitely. Read-only
+// tools stay within the plan's binding runner-idiom ceiling (5-10s).
+constexpr std::chrono::seconds kUsersCmdDeadline{10};
 
-std::string run_command(const char* cmd) {
-#ifdef _WIN32
-    std::string result;
-    std::array<char, 256> buf{};
-    FILE* pipe = _popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
+/// Outcome of run_tool(): the captured output PLUS the raw runner result, so
+/// a caller can forward the latter through the ABI4 result seam
+/// (yuzu::agent::forward_runner_failure) itself instead of this helper
+/// deciding that on the caller's behalf.
+struct ToolOutcome {
+    std::string output;
+    yuzu::agent::SubprocessResult res;
+};
+
+/// Direct-argv replacement for the old shell-string hop that ran every
+/// command through a shell interpreter (ADR-3002 rung 2): the same bounded,
+/// fork-lock-covered runner, but exec'd straight to argv[0] with no shell in
+/// between — no shell-quoting/injection surface, and a `2>/dev/null` suffix
+/// the old shell string carried is simply this call's default
+/// merge_stderr=false (child stderr -> /dev/null, the runner's documented
+/// equivalent). Strips trailing CR/LF from `output` exactly as the old
+/// helper did. `max_lines` (0 = unlimited) maps to what used to be a
+/// `| head -N` pipe — NOT a `| tail -N`, which a caller still needs to
+/// replicate in-process (max_lines caps the FIRST N lines).
+///
+/// Never touches ctx — every ACTION entry point forwards `res` itself via
+/// a local `status_forwarded` guard, so a per-user/per-call loop reports
+/// only the FIRST non-exit failure (later calls must not overwrite an
+/// earlier UNAVAILABLE with a later CONSTRAINED — sdk/include/yuzu/plugin.h:
+/// 287-288).
+ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0) {
+    if (argv.empty() || argv.front().empty()) {
+        // A probe_tool_path miss (empty argv[0]) or a programmer error
+        // (empty argv): report the same shape run_bounded_subprocess uses
+        // for its own runtime-reject (tool_ran=false, termination_reason=
+        // spawn_error — both already SubprocessResult's default member
+        // values) without ever attempting an OS call.
+        return ToolOutcome{std::string{}, yuzu::agent::SubprocessResult{}};
     }
-    _pclose(pipe);
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
-    }
-    return result;
-#else
-    // Route through the bounded, fork-lock-covered runner instead of a raw,
-    // deadline-less popen (K-7/CDX-07). `/bin/sh -c` preserves the shell
-    // semantics popen used (these commands use `2>/dev/null` redirects and a
-    // `| tail` pipe), so the returned stdout blob is byte-identical — now with
-    // a hard deadline, an output cap, and the global fork-lock.
+
     auto res = yuzu::agent::run_bounded_subprocess(
-        {"/bin/sh", "-c", cmd},
-        yuzu::agent::SubprocessOptions{.deadline = kUsersCmdDeadline});
+        argv, yuzu::agent::SubprocessOptions{.deadline = kUsersCmdDeadline,
+                                             .max_lines = max_lines,
+                                             .stop_after_max_lines = max_lines != 0});
     // A cut-short tool returns empty/partial output that parses as "no users /
     // unknown last-logon" — a silent false-negative. Warn so an operator can
     // distinguish a degraded scan from a genuinely empty result (sre-M1).
     if (res.timed_out || !res.tool_ran || res.output_truncated) {
-        spdlog::warn("users: degraded shell-out (timed_out={}, tool_ran={}, truncated={}): {}",
-                     res.timed_out, res.tool_ran, res.output_truncated, cmd);
+        spdlog::warn("users: degraded run (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, argv.front());
     }
-    std::string result = res.output;
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
+    std::string output = res.output;
+    while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
+        output.pop_back();
     }
-    return result;
-#endif
+    return ToolOutcome{std::move(output), std::move(res)};
 }
+#endif // !_WIN32
 
 #ifdef _WIN32
 // wide->UTF-8 conversion now via the shared win_str.hpp (#1681); from_wide is
@@ -156,7 +176,141 @@ std::string format_filetime(DWORD low, DWORD high) {
     return std::format("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", st.wYear, st.wMonth, st.wDay,
                        st.wHour, st.wMinute, st.wSecond);
 }
-#endif
+
+// ── Security-channel event log reader (wevtapi) ─────────────────────────
+
+// EVT_HANDLE must be closed with EvtClose, not CloseHandle — a local
+// single-owner guard, same shape as tar_netconn_win.cpp's EvtGuard.
+struct EvtGuard {
+    EVT_HANDLE h{nullptr};
+    explicit EvtGuard(EVT_HANDLE handle) : h{handle} {}
+    ~EvtGuard() {
+        if (h)
+            ::EvtClose(h);
+    }
+    EvtGuard(const EvtGuard&) = delete;
+    EvtGuard& operator=(const EvtGuard&) = delete;
+    explicit operator bool() const { return h != nullptr; }
+};
+
+// Render one event to UTF-8 XML (size-then-fill, same as tar_netconn_win.cpp).
+std::string render_event_xml(EVT_HANDLE event) {
+    DWORD used = 0, props = 0;
+    ::EvtRender(nullptr, event, EvtRenderEventXml, 0, nullptr, &used, &props);
+    if (used == 0)
+        return {};
+    std::wstring buf(used / sizeof(wchar_t) + 1, L'\0');
+    if (!::EvtRender(nullptr, event, EvtRenderEventXml, used, buf.data(), &used, &props))
+        return {};
+    return from_wide(buf.c_str());
+}
+
+// ADR-3002 rung-1 bounded-broker-call requirement: EvtNext is a daemon-
+// mediated call (the Event Log service) that offers a bounded wait mode, so
+// INFINITE is not an option here -- a wedged/heavily-contended service would
+// otherwise pin the instruction worker forever, with no runner deadline to
+// catch it (unlike the POSIX rung-2 argv sites, which run under
+// kUsersCmdDeadline). 10s matches that same ceiling.
+constexpr DWORD kEvtNextTimeoutMs = 10'000;
+
+// Distinguishes WHY a Security-channel query failed, so the caller can give
+// an operator an honest message and set the correct ABI4 result status
+// instead of a single hardcoded "requires elevated privileges" that also
+// fires for a missing/uninstalled channel or a mid-query timeout against a
+// wedged (not stopped) Event Log service — three different operational
+// facts that a governance chaos-injector pass found collapsed to one,
+// possibly-misleading, message (I4: guidance that conceals the real state).
+enum class EvtQueryOutcome { kOk, kAccessDenied, kChannelNotFound, kTimeout, kOtherError };
+
+struct EvtQueryFailureInfo {
+    const char* message;
+    YuzuResultStatus status;
+    YuzuResultCompleteness completeness;
+    const char* provenance;
+};
+
+inline EvtQueryFailureInfo describe_evt_query_failure(EvtQueryOutcome outcome) {
+    switch (outcome) {
+    case EvtQueryOutcome::kAccessDenied:
+        return {"Cannot access Security event log (requires elevated privileges)",
+               YUZU_RESULT_STATUS_PERMISSION_DENIED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+               "users_win_events:access_denied"};
+    case EvtQueryOutcome::kChannelNotFound:
+        return {"Security event log channel not found or unavailable",
+               YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+               "users_win_events:channel_not_found"};
+    case EvtQueryOutcome::kTimeout:
+        return {"Security event log query timed out (service may be degraded)",
+               YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+               "users_win_events:evt_next_timeout"};
+    case EvtQueryOutcome::kOk:
+    case EvtQueryOutcome::kOtherError:
+    default:
+        return {"Security event log query failed", YUZU_RESULT_STATUS_UNAVAILABLE,
+               YUZU_RESULT_COMPLETENESS_PARTIAL, "users_win_events:evt_query_failed"};
+    }
+}
+
+// Queries the Security channel with `xpath`, newest-first, rendering up to
+// `cap` events to XML and folding each through
+// yuzu::users_win::parse_logon_events into `out`. Returns a non-kOk outcome
+// when EvtQuery itself failed (missing/ACL-denied channel) OR when EvtNext
+// failed with anything other than ERROR_NO_MORE_ITEMS (a genuine I/O/access
+// error mid-query, including a timeout against a wedged service, must not be
+// reported as a clean, if partial, success) — either way the caller owns the
+// fallback/error path. A successful, fully-exhausted query still returns
+// kOk with `out` possibly empty (a real, distinct fact from "couldn't query
+// at all"). Every EVT_HANDLE — including EvtNext batch handles seen after
+// the cap is hit — is owned by an EvtGuard.
+EvtQueryOutcome query_logon_events(const wchar_t* xpath, std::size_t cap,
+                                   std::vector<yuzu::users_win::LogonEvent>& out) {
+    EvtGuard q{::EvtQuery(nullptr, L"Security", xpath,
+                          EvtQueryChannelPath | EvtQueryReverseDirection)};
+    if (!q) {
+        switch (::GetLastError()) {
+        case ERROR_ACCESS_DENIED:
+            return EvtQueryOutcome::kAccessDenied;
+        case ERROR_EVT_CHANNEL_NOT_FOUND:
+        case ERROR_FILE_NOT_FOUND:
+            return EvtQueryOutcome::kChannelNotFound;
+        default:
+            return EvtQueryOutcome::kOtherError;
+        }
+    }
+
+    std::size_t taken = 0;
+    while (taken < cap) {
+        EVT_HANDLE raw[64]{};
+        DWORD got = 0;
+        if (!::EvtNext(q.h, static_cast<DWORD>(std::size(raw)), raw, kEvtNextTimeoutMs, 0,
+                       &got)) {
+            const DWORD err = ::GetLastError();
+            if (err != ERROR_NO_MORE_ITEMS) {
+                // A genuine I/O/access error (incl. ERROR_TIMEOUT), not clean
+                // exhaustion -- distinguish a mid-query timeout from every
+                // other failure so it doesn't read as "access denied".
+                return err == ERROR_TIMEOUT ? EvtQueryOutcome::kTimeout
+                                            : EvtQueryOutcome::kOtherError;
+            }
+            break; // ERROR_NO_MORE_ITEMS — legitimately exhausted, done
+        }
+        for (DWORD i = 0; i < got; ++i) {
+            EvtGuard ev{raw[i]};
+            if (taken >= cap)
+                continue; // keep closing remaining handles in this batch
+            const std::string xml = render_event_xml(ev.h);
+            if (xml.empty())
+                continue;
+            for (auto& parsed : yuzu::users_win::parse_logon_events(xml)) {
+                out.push_back(std::move(parsed));
+                if (++taken >= cap)
+                    break;
+            }
+        }
+    }
+    return EvtQueryOutcome::kOk;
+}
+#endif // _WIN32
 
 // ── logged_on action ──────────────────────────────────────────────────────
 
@@ -182,7 +336,14 @@ int do_logged_on(yuzu::CommandContext& ctx) {
     endutent();
 
 #elif defined(__APPLE__)
-    auto who_out = run_command("who 2>/dev/null");
+    bool status_forwarded = false;
+    auto who_path = yuzu::agent::probe_tool_path({"/usr/bin/who", "/bin/who"});
+    // sink: users/do_logged_on#1 — `who` enumerates logged-on sessions; macOS
+    // exposes no native enumeration API for this (unlike Linux's utmp above).
+    auto who_res = run_tool({who_path});
+    if (!status_forwarded)
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, who_res.res);
+    auto& who_out = who_res.output;
     if (!who_out.empty()) {
         std::istringstream ss(who_out);
         std::string line;
@@ -257,8 +418,15 @@ int do_logged_on(yuzu::CommandContext& ctx) {
 
 int do_sessions(yuzu::CommandContext& ctx) {
 #ifdef __linux__
-    // Use 'w' command for session info with idle times
-    auto w_out = run_command("w -h 2>/dev/null");
+    bool status_forwarded = false;
+    auto w_path = yuzu::agent::probe_tool_path({"/usr/bin/w", "/bin/w"});
+    // sink: users/do_sessions#1 — `w` reports per-session idle/from-host
+    // info; no single syscall/proc read gives the same view (utmp alone
+    // lacks idle time).
+    auto w_res = run_tool({w_path, "-h"});
+    if (!status_forwarded)
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, w_res.res);
+    auto& w_out = w_res.output;
     if (!w_out.empty()) {
         std::istringstream ss(w_out);
         std::string line;
@@ -276,7 +444,14 @@ int do_sessions(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    auto w_out = run_command("w -h 2>/dev/null");
+    bool status_forwarded = false;
+    auto w_path = yuzu::agent::probe_tool_path({"/usr/bin/w", "/bin/w"});
+    // sink: users/do_sessions#2 — `w` reports per-session idle/from-host
+    // info; no equivalent native macOS API is wired in this plugin.
+    auto w_res = run_tool({w_path, "-h"});
+    if (!status_forwarded)
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, w_res.res);
+    auto& w_out = w_res.output;
     if (!w_out.empty()) {
         std::istringstream ss(w_out);
         std::string line;
@@ -376,6 +551,8 @@ int do_local_users(yuzu::CommandContext& ctx) {
         ctx.write_output("local_user|error|false|Never|Cannot read /etc/passwd");
         return 1;
     }
+    bool status_forwarded = false;
+    auto lastlog_path = yuzu::agent::probe_tool_path({"/usr/bin/lastlog", "/bin/lastlog"});
     std::string line;
     while (std::getline(passwd, line)) {
         // Format: username:x:uid:gid:description:home:shell
@@ -405,14 +582,26 @@ int do_local_users(yuzu::CommandContext& ctx) {
         }
 
         // Try to get last login from lastlog. `user` comes from /etc/passwd
-        // (local-trust), but guard the shell interpolation with the same
-        // allowlist the operator-facing paths use — a hostile local account
-        // name must not be able to inject into the lastlog command.
+        // (local-trust), but guard argv construction with the same allowlist
+        // the operator-facing paths use — a hostile local account name must
+        // not be able to reach the lastlog argv as an unexpected flag/token.
         std::string last_logon = "unknown";
         std::string lastlog_out;
         if (is_safe_identifier(user)) {
-            lastlog_out =
-                run_command(std::format("lastlog -u {} 2>/dev/null | tail -1", user).c_str());
+            // sink: users/do_local_users#1 — `lastlog` reports per-account
+            // last-login time; no /var/log/lastlog reader is wired in this
+            // plugin. `| tail -1` is replicated below, in-process: max_lines
+            // caps the FIRST N lines, which would invert `tail`'s "last
+            // line" selection.
+            auto res = run_tool({lastlog_path, "-u", user});
+            if (!status_forwarded)
+                status_forwarded = yuzu::agent::forward_runner_failure(ctx, res.res);
+            std::istringstream ll_ss(res.output);
+            std::string ll_line;
+            while (std::getline(ll_ss, ll_line)) {
+                if (!ll_line.empty())
+                    lastlog_out = ll_line;
+            }
         }
         if (!lastlog_out.empty() && lastlog_out.find("Never") != std::string::npos) {
             last_logon = "Never";
@@ -436,12 +625,20 @@ int do_local_users(yuzu::CommandContext& ctx) {
     // on a single line (or "Key:\n Value" for multi-line values like RealName).
     // Tested and verified on macOS 14 (Sonoma). If Apple changes the dscl
     // output format in a future macOS release, this parsing will need updating.
-    auto dscl_out = run_command("dscl . -list /Users UniqueID 2>/dev/null");
+    bool status_forwarded = false;
+    // sink: users/do_local_users#2 — `dscl . -list /Users UniqueID`
+    // enumerates local accounts; Directory Services exposes no lighter-weight
+    // C API this plugin already links against.
+    auto dscl_res = run_tool({"/usr/bin/dscl", ".", "-list", "/Users", "UniqueID"});
+    if (!status_forwarded)
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, dscl_res.res);
+    auto& dscl_out = dscl_res.output;
     // Queried once per call, not per user: the console/GUI-login user via the
     // shared helper (agents/shared/macos_console_user.hpp). nullopt (no
     // SystemConfiguration, or nobody at the console) means every row below
     // honestly reports is_console_user="unknown" rather than guessing false.
     auto console_login_user = yuzu::macos::console_user();
+    auto last_path = yuzu::agent::probe_tool_path({"/usr/bin/last", "/bin/last"});
     if (!dscl_out.empty()) {
         std::istringstream ss(dscl_out);
         std::string line;
@@ -459,13 +656,36 @@ int do_local_users(yuzu::CommandContext& ctx) {
             if (user.starts_with("_"))
                 continue;
 
-            // Validate username before using in shell commands
-            if (!is_safe_identifier(user))
+            // Validate username before using it in an argv element. A bare
+            // `continue` here would silently drop the account from output
+            // entirely -- an admin-privileged actor could rename an account
+            // to a name outside is_safe_identifier's charset specifically to
+            // blind this enumeration, with the tool reporting a clean,
+            // complete-looking result (governance chaos-injector finding,
+            // I3/HIGH). Emit a degraded row instead: the account stays
+            // visible, and no further dscl/last call ever reaches the
+            // unsafe name as an argv element. Matches the Linux branch
+            // above, which already degrades (last_logon stays "unknown")
+            // rather than dropping the row on the same condition.
+            if (!is_safe_identifier(user)) {
+                // `user` failed the argv-safety check precisely because it
+                // contains a character outside the allowed charset -- it is
+                // exactly the value most likely to carry a literal '|' or an
+                // embedded CR/LF, the same row/column-injection class the
+                // `desc` field below is already escaped against (K-11/CDX-10).
+                ctx.write_output(std::format("local_user|{}|unknown|unknown|-|unknown",
+                                             yuzu::util::safe_output_field(user)));
                 continue;
+            }
 
             // Check if account is enabled
-            auto shell = run_command(
-                std::format("dscl . -read /Users/{} UserShell 2>/dev/null", user).c_str());
+            // sink: users/do_local_users#3 — `dscl . -read UserShell` reads
+            // one account's login shell.
+            auto shell_res = run_tool(
+                {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "UserShell"});
+            if (!status_forwarded)
+                status_forwarded = yuzu::agent::forward_runner_failure(ctx, shell_res.res);
+            auto& shell = shell_res.output;
             // Extract second field (the shell path) without piping to awk
             bool enabled = true;
             {
@@ -479,8 +699,13 @@ int do_local_users(yuzu::CommandContext& ctx) {
                 }
             }
 
-            auto desc_raw = run_command(
-                std::format("dscl . -read /Users/{} RealName 2>/dev/null", user).c_str());
+            // sink: users/do_local_users#4 — `dscl . -read RealName` reads
+            // one account's display name.
+            auto desc_res = run_tool(
+                {"/usr/bin/dscl", ".", "-read", std::format("/Users/{}", user), "RealName"});
+            if (!status_forwarded)
+                status_forwarded = yuzu::agent::forward_runner_failure(ctx, desc_res.res);
+            auto& desc_raw = desc_res.output;
             // Extract real name: skip first line ("RealName:"), trim leading space
             std::string desc;
             {
@@ -514,8 +739,19 @@ int do_local_users(yuzu::CommandContext& ctx) {
             // actually ran and completed its (empty) search for this user.
             std::string last_logon = "unknown";
             {
-                auto last_out = run_command(
-                    std::format("LC_ALL=C last -y -1 {} 2>/dev/null", user).c_str());
+                // sink: users/do_local_users#5 — `last -y -1 <user>` reads
+                // one account's most recent login record. Spawned via
+                // `/usr/bin/env LC_ALL=C <last> ...` rather than a shell:
+                // SubprocessOptions has no env field, and LC_ALL=C is
+                // LOAD-BEARING (is_weekday/parse_last_timestamp above match
+                // only English day/month names) — /usr/bin/env is a plain
+                // exec wrapper, not an interpreter, so this stays rung 2
+                // with no shell involved.
+                auto last_res =
+                    run_tool({"/usr/bin/env", "LC_ALL=C", last_path, "-y", "-1", user});
+                if (!status_forwarded)
+                    status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
+                auto& last_out = last_res.output;
                 bool saw_record = false;
                 std::istringstream last_ss(last_out);
                 std::string last_line;
@@ -639,7 +875,14 @@ int do_local_admins(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    auto admin_out = run_command("dscl . -read /Groups/admin GroupMembership 2>/dev/null");
+    bool status_forwarded = false;
+    // sink: users/do_local_admins#1 — `dscl . -read /Groups/admin
+    // GroupMembership` reads the local admin group's membership.
+    auto admin_res =
+        run_tool({"/usr/bin/dscl", ".", "-read", "/Groups/admin", "GroupMembership"});
+    if (!status_forwarded)
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, admin_res.res);
+    auto& admin_out = admin_res.output;
     if (!admin_out.empty()) {
         // Format: GroupMembership: user1 user2 user3
         auto colon = admin_out.find(':');
@@ -651,6 +894,13 @@ int do_local_admins(yuzu::CommandContext& ctx) {
                 ctx.write_output(std::format("admin|{}|user|admin", member));
             }
         }
+    } else if (status_forwarded) {
+        // A runner failure (dscl timeout/spawn_error) must not read
+        // identically to "queried cleanly, zero admins" -- the caller's
+        // result_status already carries the failure (forward_runner_failure
+        // above), but the text output alone was previously indistinguishable
+        // from a genuinely admin-free host (Gate 4 unhappy-path finding).
+        ctx.write_output("admin|error|query failed");
     }
 
 #elif defined(_WIN32)
@@ -761,8 +1011,16 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    auto dscl_out = run_command(
-        std::format("dscl . -read /Groups/{} GroupMembership 2>/dev/null", group_name).c_str());
+    bool status_forwarded = false;
+    // sink: users/do_group_members#1 — `dscl . -read /Groups/<name>
+    // GroupMembership` reads an arbitrary local group's membership by name
+    // (group_name is validated by is_safe_identifier above, and is now a
+    // literal argv element, not a shell token).
+    auto dscl_res = run_tool(
+        {"/usr/bin/dscl", ".", "-read", std::format("/Groups/{}", group_name), "GroupMembership"});
+    if (!status_forwarded)
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, dscl_res.res);
+    auto& dscl_out = dscl_res.output;
     if (!dscl_out.empty()) {
         auto colon = dscl_out.find(':');
         if (colon != std::string::npos) {
@@ -773,6 +1031,14 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
                 ctx.write_output(std::format("group_member|{}|{}|user", member, group_name));
             }
         }
+    } else if (status_forwarded) {
+        // A runner failure (dscl timeout/spawn_error) is a different fact
+        // than "queried cleanly, group doesn't exist" -- the Windows branch
+        // below already distinguishes NERR_GroupNotFound from a generic
+        // query failure; this branch previously asserted "Group not found"
+        // regardless of cause (Gate 4 unhappy-path finding).
+        ctx.write_output(std::format("group_member|error|Query failed for group: {}", group_name));
+        return 1;
     } else {
         ctx.write_output(std::format("group_member|error|Group not found: {}", group_name));
         return 1;
@@ -840,8 +1106,15 @@ int do_group_members(yuzu::CommandContext& ctx, yuzu::Params params) {
 
 int do_primary_user(yuzu::CommandContext& ctx) {
 #ifdef __linux__
-    // Parse 'last' output to find most-frequent interactive login
-    auto last_out = run_command("last -F 2>/dev/null | head -200");
+    bool status_forwarded = false;
+    auto last_path = yuzu::agent::probe_tool_path({"/usr/bin/last", "/bin/last"});
+    // sink: users/do_primary_user#1 — `last -F` enumerates login history to
+    // derive the most-frequent interactive user; capped in-process via
+    // max_lines/stop_after_max_lines (was `| head -200`).
+    auto last_res = run_tool({last_path, "-F"}, 200);
+    if (!status_forwarded)
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
+    auto& last_out = last_res.output;
     if (!last_out.empty()) {
         std::map<std::string, int> login_counts;
         std::istringstream ss(last_out);
@@ -878,7 +1151,15 @@ int do_primary_user(yuzu::CommandContext& ctx) {
 
 #elif defined(__APPLE__)
     // macOS: use 'last' command similarly
-    auto last_out = run_command("last 2>/dev/null | head -200");
+    bool status_forwarded = false;
+    auto last_path = yuzu::agent::probe_tool_path({"/usr/bin/last", "/bin/last"});
+    // sink: users/do_primary_user#2 — `last` enumerates login history to
+    // derive the most-frequent interactive user; capped in-process via
+    // max_lines/stop_after_max_lines (was `| head -200`).
+    auto last_res = run_tool({last_path}, 200);
+    if (!status_forwarded)
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
+    auto& last_out = last_res.output;
     if (!last_out.empty()) {
         std::map<std::string, int> login_counts;
         std::istringstream ss(last_out);
@@ -914,78 +1195,50 @@ int do_primary_user(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(_WIN32)
-    // Windows: query Security Event Log for logon events (Event ID 4624)
-    // Use wevtutil to extract recent logon events
-    auto evt_out = run_command(
-        "wevtutil qe Security /q:\"*[System[EventID=4624]]\" /c:200 /f:text /rd:true 2>&1");
-    if (!evt_out.empty() && evt_out.find("Access is denied") == std::string::npos) {
-        std::map<std::string, int> login_counts;
-        std::istringstream ss(evt_out);
-        std::string line;
-        while (std::getline(ss, line)) {
-            // Look for "Account Name:" lines (skip the first one per event, which is machine$)
-            auto start = line.find_first_not_of(" \t");
-            if (start == std::string::npos)
-                continue;
-            auto trimmed = line.substr(start);
-            if (trimmed.starts_with("Account Name:")) {
-                auto name = trimmed.substr(13);
-                auto name_start = name.find_first_not_of(" \t");
-                if (name_start != std::string::npos) {
-                    name = name.substr(name_start);
-                    // Skip machine accounts (ending with $)
-                    if (!name.empty() && name.back() != '$' && name != "-" && name != "SYSTEM") {
-                        login_counts[name]++;
-                    }
-                }
-            }
-        }
-
-        std::string primary;
-        int max_count = 0;
-        for (const auto& [user, count] : login_counts) {
-            if (count > max_count) {
-                max_count = count;
-                primary = user;
-            }
-        }
-
+    // Windows: read the Security Event Log natively via wevtapi (EvtQuery/
+    // EvtRender), newest-first, capped at 200 events — no wevtutil shell-out.
+    std::vector<yuzu::users_win::LogonEvent> events;
+    const auto evt_outcome = query_logon_events(L"*[System[EventID=4624]]", 200, events);
+    if (evt_outcome == EvtQueryOutcome::kOk) {
+        auto [primary, max_count] = yuzu::users_win::primary_user_from_events(events);
         if (!primary.empty()) {
-            ctx.write_output(std::format("primary_user|{}|{}|event_log_4624", primary, max_count));
+            // primary originates from decoded Security-channel event XML --
+            // see session_history_rows' identical safe_output_field rationale.
+            ctx.write_output(std::format("primary_user|{}|{}|event_log_4624",
+                                         yuzu::util::safe_output_field(primary), max_count));
         } else {
             ctx.write_output("primary_user|unknown|0|no logon events found");
         }
     } else {
-        // Fallback: check user profiles in registry
-        auto reg_out = run_command("reg query \"HKLM\\SOFTWARE\\Microsoft\\Windows "
-                                   "NT\\CurrentVersion\\ProfileList\" /s 2>&1");
-        if (!reg_out.empty()) {
-            std::string last_user;
-            std::istringstream ss(reg_out);
-            std::string line;
-            while (std::getline(ss, line)) {
-                auto start = line.find_first_not_of(" \t");
-                if (start == std::string::npos)
-                    continue;
-                auto trimmed = line.substr(start);
-                if (trimmed.find("ProfileImagePath") != std::string::npos) {
-                    auto users_pos = trimmed.find("\\Users\\");
-                    if (users_pos != std::string::npos) {
-                        last_user = trimmed.substr(users_pos + 7);
-                        // Trim trailing whitespace
-                        while (!last_user.empty() &&
-                               (last_user.back() == '\r' || last_user.back() == ' '))
-                            last_user.pop_back();
-                    }
-                }
-            }
-            if (!last_user.empty()) {
-                ctx.write_output(std::format("primary_user|{}|0|profile_list", last_user));
-            } else {
-                ctx.write_output("primary_user|unknown|0|no profiles found");
-            }
+        // Fallback: enumerate ProfileList via the shared Win32 shell
+        // (agents/shared/win_profiles.hpp) — no registry shell-out. Same
+        // "last profile path under \Users\ wins" selection as before, just
+        // driven by RegEnumKeyExW/RegQueryValueExW instead of parsing
+        // `reg query /s` text.
+        bool ok = false;
+        auto records = yuzu::win::enumerate_profile_records(ok);
+        std::string last_user;
+        for (const auto& rec : records) {
+            if (rec.profile_image_path.find("\\Users\\") == std::string::npos)
+                continue;
+            auto name = yuzu::profiles::profile_name_from_path(rec.profile_image_path);
+            if (!name.empty())
+                last_user = name;
+        }
+        if (!ok) {
+            // Both the event-log path and the ProfileList fallback failed --
+            // surface the more specific event-log failure reason/status
+            // rather than a bare "cannot query" (the same message-conflation
+            // gap fixed for session_history below).
+            const auto info = describe_evt_query_failure(evt_outcome);
+            ctx.set_result_status(info.status, info.completeness, info.provenance);
+            ctx.write_output(std::format("primary_user|unknown|0|cannot query event log or "
+                                         "registry ({})",
+                                         info.message));
+        } else if (!last_user.empty()) {
+            ctx.write_output(std::format("primary_user|{}|0|profile_list", last_user));
         } else {
-            ctx.write_output("primary_user|unknown|0|cannot query event log or registry");
+            ctx.write_output("primary_user|unknown|0|no profiles found");
         }
     }
 #endif
@@ -1006,7 +1259,15 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #ifdef __linux__
-    auto last_out = run_command(std::format("last -F -n {} 2>/dev/null", count).c_str());
+    bool status_forwarded = false;
+    auto last_path = yuzu::agent::probe_tool_path({"/usr/bin/last", "/bin/last"});
+    // sink: users/do_session_history#1 — `last -F -n <count>` reads recent
+    // login/logout records; `-n <count>` already bounds the tool's own
+    // output, so no max_lines cap is needed here.
+    auto last_res = run_tool({last_path, "-F", "-n", std::to_string(count)});
+    if (!status_forwarded)
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
+    auto& last_out = last_res.output;
     if (!last_out.empty()) {
         std::istringstream ss(last_out);
         std::string line;
@@ -1048,7 +1309,15 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(__APPLE__)
-    auto last_out = run_command(std::format("last -n {} 2>/dev/null", count).c_str());
+    bool status_forwarded = false;
+    auto last_path = yuzu::agent::probe_tool_path({"/usr/bin/last", "/bin/last"});
+    // sink: users/do_session_history#2 — `last -n <count>` reads recent
+    // login/logout records; `-n <count>` already bounds the tool's own
+    // output, so no max_lines cap is needed here.
+    auto last_res = run_tool({last_path, "-n", std::to_string(count)});
+    if (!status_forwarded)
+        status_forwarded = yuzu::agent::forward_runner_failure(ctx, last_res.res);
+    auto& last_out = last_res.output;
     if (!last_out.empty()) {
         std::istringstream ss(last_out);
         std::string line;
@@ -1087,112 +1356,30 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
     }
 
 #elif defined(_WIN32)
-    // Query Windows Security Event Log for logon (4624) and logoff (4634) events
-    auto logon_out = run_command(
-        std::format("wevtutil qe Security /q:\"*[System[(EventID=4624 or EventID=4634)]]\" /c:{} "
-                    "/f:text /rd:true 2>&1",
-                    count)
-            .c_str());
-
-    if (!logon_out.empty() && logon_out.find("Access is denied") == std::string::npos) {
-        std::istringstream ss(logon_out);
-        std::string line;
-        std::string current_event_id;
-        std::string current_time;
-        std::string current_user;
-        std::string current_logon_type;
-        std::string current_source;
-        int account_name_count = 0; // Track which "Account Name" we're on
-
-        while (std::getline(ss, line)) {
-            auto start = line.find_first_not_of(" \t");
-            if (start == std::string::npos)
-                continue;
-            auto trimmed = line.substr(start);
-
-            if (trimmed.starts_with("Event[")) {
-                // New event — emit previous if we have data
-                if (!current_user.empty() && current_user != "-" && current_user != "SYSTEM" &&
-                    !current_user.empty() && current_user.back() != '$') {
-                    std::string event_type = (current_event_id == "4624") ? "logon" : "logoff";
-                    ctx.write_output(std::format(
-                        "session_history|{}|{}|{}|{}|{}|{}", current_user, event_type,
-                        current_logon_type, current_source.empty() ? "-" : current_source,
-                        current_time.empty() ? "-" : current_time, current_event_id));
-                }
-                current_event_id.clear();
-                current_time.clear();
-                current_user.clear();
-                current_logon_type.clear();
-                current_source.clear();
-                account_name_count = 0;
-            }
-
-            if (trimmed.starts_with("Date:")) {
-                current_time = trimmed.substr(5);
-                auto ts = current_time.find_first_not_of(" \t");
-                if (ts != std::string::npos)
-                    current_time = current_time.substr(ts);
-            } else if (trimmed.starts_with("Event ID:")) {
-                current_event_id = trimmed.substr(9);
-                auto ts = current_event_id.find_first_not_of(" \t");
-                if (ts != std::string::npos)
-                    current_event_id = current_event_id.substr(ts);
-            } else if (trimmed.starts_with("Account Name:")) {
-                account_name_count++;
-                // Second Account Name in 4624 events is the actual user
-                if (account_name_count == 2 || current_event_id == "4634") {
-                    current_user = trimmed.substr(13);
-                    auto ts = current_user.find_first_not_of(" \t");
-                    if (ts != std::string::npos)
-                        current_user = current_user.substr(ts);
-                }
-            } else if (trimmed.starts_with("Logon Type:")) {
-                auto val = trimmed.substr(11);
-                auto ts = val.find_first_not_of(" \t");
-                if (ts != std::string::npos)
-                    val = val.substr(ts);
-                // Map logon type numbers to names
-                if (val == "2")
-                    current_logon_type = "interactive";
-                else if (val == "3")
-                    current_logon_type = "network";
-                else if (val == "4")
-                    current_logon_type = "batch";
-                else if (val == "5")
-                    current_logon_type = "service";
-                else if (val == "7")
-                    current_logon_type = "unlock";
-                else if (val == "8")
-                    current_logon_type = "network_cleartext";
-                else if (val == "9")
-                    current_logon_type = "new_credentials";
-                else if (val == "10")
-                    current_logon_type = "remote_interactive";
-                else if (val == "11")
-                    current_logon_type = "cached_interactive";
-                else
-                    current_logon_type = val;
-            } else if (trimmed.starts_with("Source Network Address:")) {
-                current_source = trimmed.substr(23);
-                auto ts = current_source.find_first_not_of(" \t");
-                if (ts != std::string::npos)
-                    current_source = current_source.substr(ts);
-            }
-        }
-
-        // Emit last event
-        if (!current_user.empty() && current_user != "-" && current_user != "SYSTEM" &&
-            current_user.back() != '$') {
-            std::string event_type = (current_event_id == "4624") ? "logon" : "logoff";
-            ctx.write_output(
-                std::format("session_history|{}|{}|{}|{}|{}|{}", current_user, event_type,
-                            current_logon_type, current_source.empty() ? "-" : current_source,
-                            current_time.empty() ? "-" : current_time, current_event_id));
-        }
+    // Windows: read the Security Event Log natively via wevtapi for both
+    // logon (4624) and logoff (4634) events, newest-first, capped at the
+    // operator's `count` — no wevtutil shell-out. The field-by-field
+    // projection (logon-type name map, IpAddress-as-source, the '-'
+    // sentinels, ...) lives entirely in
+    // yuzu::users_win::session_history_rows, shared with the pure-parser
+    // unit tests.
+    std::vector<yuzu::users_win::LogonEvent> events;
+    const auto evt_outcome = query_logon_events(L"*[System[(EventID=4624 or EventID=4634)]]",
+                                                static_cast<std::size_t>(count), events);
+    if (evt_outcome == EvtQueryOutcome::kOk) {
+        for (const auto& row : yuzu::users_win::session_history_rows(events))
+            ctx.write_output(row);
     } else {
-        ctx.write_output("session_history|error|Cannot access Security event log (requires "
-                         "elevated privileges)");
+        // Access-denied / channel-missing / EvtNext-timeout are distinct
+        // operational facts (a chaos-injector governance pass found them
+        // collapsed into one hardcoded "requires elevated privileges"
+        // message, which misleads an operator when the real cause is a
+        // stopped/degraded service rather than a permissions gap) --
+        // describe_evt_query_failure() picks the honest message + ABI4
+        // status for whichever one actually occurred.
+        const auto info = describe_evt_query_failure(evt_outcome);
+        ctx.set_result_status(info.status, info.completeness, info.provenance);
+        ctx.write_output(std::format("session_history|error|{}", info.message));
     }
 #endif
     return 0;
@@ -1200,31 +1387,31 @@ int do_session_history(yuzu::CommandContext& ctx, yuzu::Params params) {
 
 // ABI4 capability declarations (#2204).
 //
-// Windows: every action reads a native Win32/WTS/NetAPI surface
-// (WTSEnumerateSessionsW, NetUserEnum, NetLocalGroupGetMembers) EXCEPT
-// "primary_user" and "session_history", which shell out via this plugin's
-// own `_popen`-based run_command() to `wevtutil`/`reg query` — a raw,
-// ungoverned shell exec (not routed through the shared runner at all on
-// this platform) — so those two are rung 3 on Windows despite the rest of
-// the plugin being native there.
+// Windows: every action reads a native Win32 surface — WTSEnumerateSessionsW/
+// NetUserEnum/NetLocalGroupGetMembers for the session/account actions, and
+// (as of this migration) EvtQuery/EvtRender against the Security channel for
+// "primary_user"/"session_history", with a native ProfileList registry
+// enumeration (agents/shared/win_profiles.hpp) as "primary_user"'s
+// no-login-count fallback when the Security channel is unreadable. No
+// action shells out on Windows; there is no `_popen`/`reg query`/`wevtutil`
+// left in this plugin.
 //
 // Linux/macOS: "local_admins" and "group_members" read native libc group/
 // passwd surfaces (getgrnam/getpwuid) on Linux only — rung 1. Every other
-// action, and both of those on macOS, goes through run_command(), which
-// (for non-Windows) IS routed through the shared, bounded, fork-lock-covered
-// agent-core runner as `{"/bin/sh", "-c", cmd}` (K-7/CDX-07) — this is
-// ADR-3002 rung 3's OWN definition to the letter ("a shell string ... but
-// executed through the runner"), i.e. the GOVERNED shell exception, not the
-// raw popen()/system() this ADR bans outright. "local_users" on Linux/macOS
-// mixes a native read (passwd/dscl enumeration) with a per-account runner
-// shell-out (lastlog/last) for the last-logon field, so the action as a
-// whole is rung 3 there too.
+// action, and both of those on macOS, goes through run_tool() —
+// yuzu::agent::run_bounded_subprocess() called on a fixed argv (an absolute,
+// possibly distro-probed tool path plus literal arguments) — never a shell.
+// This is ADR-3002 rung 2: no shell hop, no shell-quoting surface,
+// replacing the previous governed-shell (rung 3) exception. "local_users" on
+// Linux/macOS mixes a native read (passwd/dscl enumeration) with a
+// per-account run_tool() call for the last-logon field, so the action as a
+// whole is rung 2 there too.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "logged_on",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "utmp (setutent/getutent)", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'who'", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'who'", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "WTSEnumerateSessionsW + WTSQuerySessionInformationW",
          nullptr},
@@ -1232,9 +1419,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "sessions",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'w -h'", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'w -h'", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'w -h'", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'w -h'", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "WTSEnumerateSessionsW + WTSQuerySessionInformationW",
          nullptr},
@@ -1242,11 +1429,11 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "local_users",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3,
-         "/etc/passwd read + runner /bin/sh -c 'lastlog -u <user>' per account", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "/etc/passwd read + runner argv 'lastlog -u <user>' per account", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3,
-         "runner /bin/sh -c 'dscl . -list/-read UserShell/RealName' + 'last -y -1 <user>' per "
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "runner argv 'dscl . -list/-read UserShell/RealName' + 'last -y -1 <user>' per "
          "account",
          nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "NetUserEnum", nullptr},
@@ -1256,8 +1443,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam(sudo/wheel) + getpwuid(0)", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3,
-         "runner /bin/sh -c 'dscl . -read /Groups/admin GroupMembership'", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "runner argv 'dscl . -read /Groups/admin GroupMembership'", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "NetLocalGroupGetMembers", nullptr},
     },
@@ -1266,33 +1453,32 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "getgrnam + /etc/passwd primary-group scan", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3,
-         "runner /bin/sh -c 'dscl . -read /Groups/<name> GroupMembership'", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "runner argv 'dscl . -read /Groups/<name> GroupMembership'", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "NetLocalGroupGetMembers", nullptr},
     },
     {
         /* .action      = */ "primary_user",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'last -F, piped through head -200'",
-         nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'last -F' (max_lines=200 cap)", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'last, piped through head -200'", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'last' (max_lines=200 cap)", nullptr},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 3, "_popen(wevtutil qe Security EventID=4624)",
-         "falls back to an ungoverned _popen(reg query ProfileList) scan (no login-count) when "
-         "the Security event log is inaccessible"},
+        {YUZU_SUPPORT_SUPPORTED, 1, "wevtapi (EvtQuery/EvtRender, Security 4624)",
+         "falls back to a native ProfileList registry enumeration (no login count) when "
+         "the Security channel is inaccessible"},
     },
     {
         /* .action      = */ "session_history",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'last -F -n <count>'", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'last -F -n <count>'", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "runner /bin/sh -c 'last -n <count>'", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "runner argv 'last -n <count>'", nullptr},
         /* .windows_leg = */
-        {YUZU_SUPPORT_CONSTRAINED, 3, "_popen(wevtutil qe Security EventID=4624/4634)",
-         "requires an elevated/administrative token to read the Security event log; reports "
-         "an error otherwise"},
+        {YUZU_SUPPORT_CONSTRAINED, 1, "wevtapi (EvtQuery/EvtRender, Security 4624/4634)",
+         "requires an elevated token to read the Security channel; reports an error "
+         "otherwise"},
     },
 };
 
