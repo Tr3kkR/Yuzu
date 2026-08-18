@@ -365,4 +365,52 @@ TEST_CASE("parse_rt_flags_llinfo never crashes or loops on a malformed blob",
     }
 }
 
+TEST_CASE("parse_rt_flags_llinfo marks truncated when an inner sockaddr overruns the record, "
+         "rather than silently dropping that neighbour and continuing",
+         "[agent][route_sysctl_arp]") {
+    // Colleague-review should-fix: before this fix, both inner-chain overrun
+    // shapes just `break`-ed out of the sockaddr loop without setting
+    // `truncated` -- the outer walk then advanced to the next record via
+    // `off += hdr.rtm_msglen` as if nothing were wrong, so a malformed
+    // sockaddr silently dropped one neighbour while the parse still reported
+    // a complete-looking, secretly smaller table. Both overrun shapes from
+    // the header's own doc comment are exercised here.
+    rt_msghdr hdr{};
+    std::memcpy(&hdr, kRtFlagsLlinfo, sizeof(hdr));
+
+    SECTION("unrounded overrun: sa_len claims more than the record has left") {
+        // Real record 0's header (rtm_addrs includes RTAX_DST at bit 0) with
+        // only 4 bytes of sockaddr-chain payload following it, but a sa_len
+        // byte claiming 10 -- the record has nowhere near that much left.
+        constexpr std::size_t kRemaining = 4;
+        std::vector<unsigned char> blob(sizeof(hdr) + kRemaining, 0);
+        hdr.rtm_msglen = static_cast<u_short>(blob.size());
+        std::memcpy(blob.data(), &hdr, sizeof(hdr));
+        blob[sizeof(hdr) + 0] = 10; // sa_len -- overruns the 4 bytes left
+        blob[sizeof(hdr) + 1] = 0;  // sa_family -- irrelevant to this check
+
+        const auto parsed = parse_rt_flags_llinfo(std::span{blob});
+        CHECK(parsed.records.empty());
+        CHECK(parsed.truncated); // must not silently drop this record
+    }
+
+    SECTION("rounded-advance overrun: sa_len fits exactly, but its 4-byte-rounded advance "
+            "does not") {
+        // sa_len == the exact number of bytes left in the record (passes the
+        // unrounded `remaining < entry_len` check), but 5 is not a multiple
+        // of the routing-socket's 4-byte ROUNDUP unit, so the rounded advance
+        // (8) would push past the record end (5 bytes remaining).
+        constexpr std::size_t kEntryLen = 5;
+        std::vector<unsigned char> blob(sizeof(hdr) + kEntryLen, 0);
+        hdr.rtm_msglen = static_cast<u_short>(blob.size());
+        std::memcpy(blob.data(), &hdr, sizeof(hdr));
+        blob[sizeof(hdr) + 0] = static_cast<unsigned char>(kEntryLen); // sa_len == remaining
+        blob[sizeof(hdr) + 1] = 0;                                    // sa_family
+
+        const auto parsed = parse_rt_flags_llinfo(std::span{blob});
+        CHECK(parsed.records.empty());
+        CHECK(parsed.truncated); // must not silently drop this record
+    }
+}
+
 #endif // __APPLE__

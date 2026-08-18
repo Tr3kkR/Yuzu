@@ -75,12 +75,23 @@ struct ArpRecord {
  * whole records after that point are MISSING.
  *
  * It is deliberately NOT set when a single record's internal sockaddr chain
- * ends before RTAX_MAX: that is the normal shape of a routing message (the
- * chain simply runs out, and padding can leave a couple of trailing bytes), so
- * flagging it marked every healthy real-world capture as partial. Such a
- * record yields no ip/mac and is skipped like any unresolved entry. The
- * records already decoded are still returned, because an ARP table is a SET
- * and the entries that parsed are individually true.
+ * simply runs OUT before RTAX_MAX (fewer than 2 bytes left for the next
+ * sockaddr's length/family prefix): that is the normal shape of a routing
+ * message (padding can leave a couple of trailing bytes), so flagging it
+ * marked every healthy real-world capture as partial.
+ *
+ * It IS set when a sockaddr inside that chain OVERRUNS — its declared
+ * length claims more bytes than the record has left, or its word-rounded
+ * advance would push past the record end. That is not the chain ending
+ * normally; it is a malformed record silently dropping one neighbour while
+ * the outer walk carries on to the next record as if nothing were wrong.
+ * Reporting a smaller-but-complete-looking table in that case is exactly
+ * the "quietly returns a subset" failure this flag exists to prevent.
+ *
+ * Either way, a record that ends without a resolved ip/mac yields no entry
+ * and is skipped like any unresolved entry. The records already decoded are
+ * still returned, because an ARP table is a SET and the entries that parsed
+ * are individually true.
  *
  * NOTE the deliberate difference from net_quality_sampler.cpp's NET_RT_IFLIST2
  * walk, which discards the whole sample on any malformation. That one produces
@@ -219,8 +230,14 @@ inline ArpParse parse_rt_flags_llinfo(std::span<const unsigned char> blob) {
             // silently misalign any future field added after GATEWAY.
             constexpr std::size_t kRoutingSockaddrAlign = sizeof(std::uint32_t);
             const std::size_t entry_len = sa_len ? sa_len : kRoutingSockaddrAlign;
-            if (remaining < entry_len)
-                break; // this sockaddr claims more than the record has left
+            if (remaining < entry_len) {
+                // This sockaddr claims more than the record has left — an
+                // overrun, not a normal chain end. Mark the whole parse
+                // truncated so the caller degrades the scan rather than
+                // silently reporting a smaller, complete-looking table.
+                out.truncated = true;
+                break;
+            }
 
             if (i == RTAX_DST && sa_family == AF_INET &&
                 sa_len >= sizeof(struct sockaddr_inarp)) {
@@ -255,8 +272,14 @@ inline ArpParse parse_rt_flags_llinfo(std::span<const unsigned char> blob) {
             // must not push `p` past `rec_end`.
             std::size_t adv = entry_len;
             adv = (adv + kRoutingSockaddrAlign - 1) & ~(kRoutingSockaddrAlign - 1);
-            if (adv > remaining)
+            if (adv > remaining) {
+                // Same overrun as above, just discovered after rounding: the
+                // unrounded length fit but the rounded advance would push
+                // past the record end. Also an overrun, not a normal chain
+                // end — mark truncated for the same reason.
+                out.truncated = true;
                 break;
+            }
             p += adv;
         }
 

@@ -250,6 +250,29 @@ TEST_CASE("classify_transmit_errno: a policy refusal is distinguished from a tra
     CHECK(classify_transmit_errno(ENETUNREACH) != ProbeFailure::None);
 }
 
+TEST_CASE("classify_socket_open_errno: a ping_group_range policy denial is distinguished from "
+          "a kernel that lacks ICMP socket support (colleague-review should-fix)",
+          "[agent][icmp_probe]") {
+    // EACCES/EPERM: Linux's net.ipv4.ping_group_range refused this (E)UID an
+    // unprivileged ICMP socket — a policy denial, permitted=false, which the
+    // caller (discovery_scan_plan.hpp's classify_icmp_session) maps to
+    // CONSTRAINED/icmp:ping_group_range.
+    CHECK_FALSE(classify_socket_open_errno(EACCES));
+    CHECK_FALSE(classify_socket_open_errno(EPERM));
+
+    // EPROTONOSUPPORT: the kernel itself lacks SOCK_DGRAM/IPPROTO_ICMP
+    // support — no sysctl fixes that. Before this fix it was grouped with
+    // the policy denials above and misreported as CONSTRAINED/
+    // icmp:ping_group_range, misdirecting an operator toward tuning a
+    // sysctl that was never the cause. It must come back permitted=true (so
+    // IcmpSession::ok()==false) so the caller instead maps it to
+    // UNAVAILABLE/icmp:socket_error, distinct from EACCES/EPERM above.
+    CHECK(classify_socket_open_errno(EPROTONOSUPPORT));
+
+    // Any other transport-ish errno is likewise not a policy denial.
+    CHECK(classify_socket_open_errno(ENOBUFS));
+}
+
 TEST_CASE("IcmpSession: construction lands in a state the honest-degrade path handles",
           "[agent][icmp_probe]") {
     // DELIBERATELY NOT a live capability assertion. An earlier cut asserted

@@ -105,3 +105,58 @@ TEST_CASE("bounded_call: caps concurrently-outstanding detached threads, degradi
         std::this_thread::sleep_for(100ms);
     }
 }
+
+TEST_CASE("OutstandingCallGuard: releases the ceiling slot when an exception unwinds the stack "
+          "while the guard is still held (colleague-review blocker: construction-failure "
+          "exception safety)",
+          "[agent][bounded_wait]") {
+    // bounded_call() claims a slot via OutstandingCallGuard::try_acquire() BEFORE constructing
+    // std::make_shared<State> and the std::thread -- both of which can throw (std::bad_alloc,
+    // std::system_error from pthread_create under resource pressure). Before the RAII fix, the
+    // counter was a bare `++`/`--` whose only decrement site was inside the detached thread
+    // body, so a throw on either of those two lines permanently leaked a slot. This proves the
+    // guard's destructor runs during unwinding and releases the slot even when nothing ever
+    // reaches the point that used to do the decrementing.
+    using yuzu::discovery::detail::g_outstanding_bounded_calls;
+    using yuzu::discovery::detail::OutstandingCallGuard;
+
+    const int baseline = g_outstanding_bounded_calls.load();
+
+    bool threw = false;
+    try {
+        auto guard = OutstandingCallGuard::try_acquire();
+        REQUIRE(guard.has_value());
+        CHECK(g_outstanding_bounded_calls.load() == baseline + 1);
+        // Stand-in for make_shared<State>/std::thread's constructor throwing
+        // before the guard would normally be handed off to the detached thread.
+        throw std::bad_alloc();
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+
+    CHECK(threw);
+    CHECK(g_outstanding_bounded_calls.load() == baseline);
+}
+
+TEST_CASE("OutstandingCallGuard: move-construction transfers ownership so only the moved-to "
+          "guard releases the slot, never the moved-from one",
+          "[agent][bounded_wait]") {
+    // Mirrors bounded_call()'s real usage: the guard returned by try_acquire() is moved into
+    // the detached thread's lambda. If the move constructor failed to clear the source's
+    // "held" flag, both the moved-from local and the moved-to copy would decrement --
+    // double-releasing the slot and driving the counter negative for a later caller.
+    using yuzu::discovery::detail::g_outstanding_bounded_calls;
+    using yuzu::discovery::detail::OutstandingCallGuard;
+
+    const int baseline = g_outstanding_bounded_calls.load();
+
+    {
+        auto guard = OutstandingCallGuard::try_acquire();
+        REQUIRE(guard.has_value());
+        OutstandingCallGuard moved = std::move(*guard);
+        CHECK(g_outstanding_bounded_calls.load() == baseline + 1);
+        // `guard`'s contents are now moved-from; its destructor at end of scope must be a
+        // no-op. `moved` releases the slot when it goes out of scope just below.
+    }
+    CHECK(g_outstanding_bounded_calls.load() == baseline);
+}

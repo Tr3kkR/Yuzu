@@ -2,12 +2,17 @@
  * icmp_probe.hpp — shared unprivileged reachability probes
  * (ADR-3002, Decision 5: deepest-interpreter-invoked rung classification
  * applies to consumers; this header itself is rung 1, native, no interpreter).
- * Consumers: discovery's ping sweep, wol's check action.
+ * Consumer today: discovery's ping sweep. wol's `check` action still spawns
+ * the system `ping` binary via popen/run_command (rung 3, unmigrated as of
+ * this writing — see wol_plugin.cpp's own "last shell-out of this shape"
+ * comment, which tracks that migration as separate future work); do not
+ * re-list it here as a current consumer until it actually calls into this
+ * header.
  *
  * Hoisted VERBATIM from netprobe_plugin.cpp (behaviour identical; netprobe's
  * in-plugin copy is converged onto this header as a tracked follow-up) so
- * discovery's ping sweep and wol's `check` action can probe a host natively
- * (rung 1) instead of spawning `ping`:
+ * discovery's ping sweep can probe a host natively (rung 1) instead of
+ * spawning `ping`:
  *
  *   IcmpSession — ICMP echo RTT. Windows: IcmpSendEcho (iphlpapi,
  *       unprivileged; whole-millisecond granularity by API design). POSIX:
@@ -288,6 +293,27 @@ inline ProbeFailure classify_transmit_errno(int err) {
                                            : ProbeFailure::TransmitFailed;
 }
 
+/**
+ * Classify a failed `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` by its errno,
+ * returning the IcmpSession `permitted` value the caller should report. Pure,
+ * so the mapping is unit-tested even though the branch that consults it only
+ * runs on a POSIX host whose kernel actually refuses the socket (which no
+ * unit host can be made to do without a syscall seam).
+ *
+ * EACCES/EPERM mean a policy said no — Linux's net.ipv4.ping_group_range
+ * denied this (E)UID an unprivileged ICMP socket — so `permitted=false`,
+ * which the caller classifies CONSTRAINED/icmp:ping_group_range.
+ *
+ * EPROTONOSUPPORT is a DIFFERENT failure mode: the kernel itself lacks
+ * SOCK_DGRAM/IPPROTO_ICMP support, which no sysctl tuning fixes. It must NOT
+ * be grouped with the policy denials above (colleague review of this PR) —
+ * doing so reported it as CONSTRAINED/icmp:ping_group_range and would
+ * misdirect an operator toward tuning a sysctl that isn't the cause. Left
+ * `permitted=true` here (so IcmpSession::ok()==false), it classifies
+ * UNAVAILABLE/icmp:socket_error instead, same as any other transport error.
+ */
+inline bool classify_socket_open_errno(int err) { return !(err == EACCES || err == EPERM); }
+
 // ── Pure echo framing/matching (portable — compiled and tested on every leg) ──
 
 constexpr std::size_t kEchoPacketLen = 32;
@@ -391,7 +417,7 @@ struct IcmpSession {
     IcmpSession() {
         fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
         if (fd < 0)
-            permitted = !(errno == EACCES || errno == EPERM || errno == EPROTONOSUPPORT);
+            permitted = classify_socket_open_errno(errno);
         // Randomize the starting sequence: on macOS concurrent ICMP dgram
         // sockets can see each other's echo replies, and two sessions both
         // counting from 0 could cross-match a reply (and record a bogus RTT).
