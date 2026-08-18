@@ -310,6 +310,7 @@ agent_test_exe = executable(
                                                 # hardware.dylib/device_identity.dylib driven end to end
                                                 # via LocalDispatcher (macOS-only; a no-op TU elsewhere
                                                 # via the file's own #if defined(__APPLE__) guard)
+    'unit/test_windows_updates_parsers.cpp',  # Wave 3: pure installed/missing parse+format helpers
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -337,6 +338,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
     include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
     include_directories('../agents/plugins/device_identity/src'), # device_identity_macos.hpp (Wave 3 PR3.2 pure parser)
+    include_directories('../agents/plugins/windows_updates/src'), # windows_updates_parsers.hpp (Wave 3 pure parser)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly

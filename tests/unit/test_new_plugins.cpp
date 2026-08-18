@@ -337,6 +337,7 @@ DESCRIPTOR_TEST("rdp_control", "rdp_control", 2, "set_state", "status")
 DESCRIPTOR_TEST("disk_space", "disk_space", 1, "free")
 DESCRIPTOR_TEST("antivirus", "antivirus", 2, "products", "status")
 DESCRIPTOR_TEST("firewall", "firewall", 2, "state", "rules")
+DESCRIPTOR_TEST("windows_updates", "windows_updates", 4, "installed", "missing", "pending_reboot", "patch_connectivity")
 
 // ============================================================================
 // Section 2: URL validation (mirrors http_client anonymous namespace)

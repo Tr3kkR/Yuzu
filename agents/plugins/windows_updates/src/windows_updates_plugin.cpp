@@ -18,8 +18,11 @@
 
 #include <yuzu/plugin.hpp>
 
+#include "windows_updates_parsers.hpp" // pure installed/missing parse+format helpers
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
@@ -39,7 +42,13 @@
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include <objbase.h>       // CoInitializeEx/CoCreateInstance/IID_IUnknown -- WIN32_LEAN_AND_MEAN
+                           // drops these from windows.h's own includes (ole2.h), so pull them in
+                           // explicitly rather than relying on a transitive include elsewhere
+#include <win_com.hpp>     // shared yuzu::shared::win ComInit/ComPtr<T>/BStr
+#include <win_str.hpp>     // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include <wmi_bounded.hpp> // shared yuzu::shared::wmi::run_bounded_wmi_query (bounded, never WBEM_INFINITE)
+#include <wuapi.h>         // IUpdateSession/IUpdateSearcher/ISearchJob (Windows Update Agent COM API)
 #pragma comment(lib, "ws2_32.lib")
 #else
 #include <sys/types.h>
@@ -49,6 +58,10 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <arpa/inet.h>
+
+#include <spdlog/spdlog.h>
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result seam)
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (ADR-3002 rung 2)
 #endif
 
 namespace {
@@ -72,119 +85,197 @@ std::string run_command(const char* cmd) {
 }
 #endif
 
-std::vector<std::string> run_command_lines(const char* cmd) {
+// run_command_lines (the vector<string> popen wrapper) is gone: every call
+// site that used it has been migrated onto run_tool()/run_bounded_subprocess
+// (POSIX) or WMI/WUA COM (Windows) below. Only run_command (the
+// single-string variant, above) survives, still used by do_pending_reboot's
+// Linux branch (uname -r / ls -t /boot/vmlinuz-* / needs-restarting -r) --
+// those three sites are out of scope for this installed/missing-focused
+// migration and are intentionally left as-is (raw popen, no bound).
+
+#ifndef _WIN32
+// Per-call wall-clock bound for the installed/missing tool probes (rpm/apt/
+// yum/system_profiler/softwareupdate). Generous enough never to fire in
+// practice, short enough that a wedged tool cannot pin the instruction
+// worker indefinitely -- same ceiling as the users plugin's kUsersCmdDeadline.
+constexpr std::chrono::seconds kUpdatesCmdDeadline{10};
+
+/// Outcome of run_tool(): the captured lines PLUS the raw runner result, so
+/// a caller can forward the latter through the ABI4 result seam
+/// (yuzu::agent::forward_runner_failure) itself instead of this helper
+/// deciding that on the caller's behalf.
+struct ToolOutcome {
     std::vector<std::string> lines;
-    std::array<char, 512> buf{};
-#ifdef _WIN32
-    FILE* pipe = _popen(cmd, "r");
-#else
-    FILE* pipe = popen(cmd, "r");
-#endif
-    if (!pipe)
-        return lines;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        std::string line(buf.data());
-        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-            line.pop_back();
-        if (!line.empty())
-            lines.push_back(std::move(line));
+    yuzu::agent::SubprocessResult res;
+};
+
+/// Direct-argv replacement for the old shell-string popen hop (ADR-3002 rung
+/// 2): the same bounded, fork-lock-covered runner, but exec'd straight to
+/// argv[0] with no shell in between -- no shell-quoting/injection surface,
+/// and a `2>/dev/null` suffix an old shell string carried is simply this
+/// call's default merge_stderr=false. `max_lines` (0 = unlimited) maps to
+/// what used to be a `| head -N` pipe. Mirrors users_plugin.cpp's run_tool
+/// (users/src/users_plugin.cpp) exactly -- same calling convention, same
+/// degraded-run warning shape.
+ToolOutcome run_tool(std::vector<std::string> argv, std::size_t max_lines = 0) {
+    if (argv.empty() || argv.front().empty()) {
+        return ToolOutcome{{}, yuzu::agent::SubprocessResult{}};
     }
-#ifdef _WIN32
-    _pclose(pipe);
-#else
-    pclose(pipe);
-#endif
-    return lines;
+    auto res = yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = kUpdatesCmdDeadline,
+                                             .max_lines = max_lines,
+                                             .stop_after_max_lines = max_lines != 0});
+    if (res.timed_out || !res.tool_ran || res.output_truncated) {
+        spdlog::warn("windows_updates: degraded run (timed_out={}, tool_ran={}, truncated={}): {}",
+                     res.timed_out, res.tool_ran, res.output_truncated, argv.front());
+    }
+    auto lines = res.lines;
+    return ToolOutcome{std::move(lines), std::move(res)};
 }
+#endif // !_WIN32
+
+#ifdef _WIN32
+// Minimal ISearchCompletedCallback sink for IUpdateSearcher::BeginSearch.
+// BeginSearch requires a live callback object, but do_missing() polls
+// ISearchJob::IsCompleted itself under an explicit deadline rather than
+// waiting on Invoke to fire -- WUA invokes the callback on a background
+// thread of its own choosing, which would need its own cross-thread
+// hand-off to feed a bounded poll loop; polling the job directly is simpler
+// and no less correct here. Invoke() is therefore a no-op that just returns
+// S_OK. Self-refcounted starting at 1 (the caller's ComPtr holds that first
+// reference); QueryInterface/AddRef/Release follow standard COM idiom.
+class SearchCompletedSink final : public ISearchCompletedCallback {
+public:
+    SearchCompletedSink() = default;
+    SearchCompletedSink(const SearchCompletedSink&) = delete;
+    SearchCompletedSink& operator=(const SearchCompletedSink&) = delete;
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv)
+            return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(ISearchCompletedCallback)) {
+            *ppv = static_cast<ISearchCompletedCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override {
+        return ref_.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+    STDMETHODIMP_(ULONG) Release() override {
+        const ULONG n = ref_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (n == 0)
+            delete this;
+        return n;
+    }
+
+    STDMETHODIMP Invoke(ISearchJob* /*searchJob*/,
+                        ISearchCompletedCallbackArgs* /*callbackArgs*/) override {
+        return S_OK;
+    }
+
+private:
+    std::atomic<ULONG> ref_{1};
+};
+#endif // _WIN32
 
 // ── installed action ───────────────────────────────────────────────────────
 
 int do_installed(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
-    auto lines = run_command_lines(
-        "powershell -NoProfile -Command \""
-        "Get-HotFix | Select-Object HotFixID,Description,InstalledOn "
-        "| Sort-Object InstalledOn -Descending "
-        "| Select-Object -First 50 "
-        "| ForEach-Object { $_.HotFixID + '|' + $_.Description + '|' + $_.InstalledOn }"
-        "\"");
+    // In-process bounded WMI query (ADR-3002 rung 1: a daemon-mediated call
+    // through the WMI service, same status as the registry/wevtapi calls
+    // elsewhere in this Wave -- no child process spawned at all) replacing
+    // the old `powershell -Command Get-HotFix` interpreter shell-out.
+    //
+    // The old PowerShell pipeline sorted by InstalledOn descending and took
+    // the first 50. WQL SELECT gives no equivalent ordering guarantee for a
+    // data class query (ORDER BY is an event-query-only WQL feature), so
+    // that sort+cap is deliberately dropped here rather than faked: this
+    // returns every row WMI hands back, bounded only by
+    // BoundedQueryOptions::row_cap (default 512) -- a disclosed behaviour
+    // change, not an oversight.
+    auto res = yuzu::shared::wmi::run_bounded_wmi_query(
+        L"root\\cimv2", L"SELECT HotFixID, Description, InstalledOn FROM Win32_QuickFixEngineering");
+    if (res.error) {
+        const auto fail = yuzu::windows_updates::classify_wmi_error(*res.error);
+        ctx.set_result_status(fail.status, fail.completeness, fail.provenance);
+        ctx.write_output(std::format("update|none|WMI query failed: {}", *res.error));
+        return 0;
+    }
+
+    std::vector<yuzu::windows_updates::HotfixRow> hotfixes;
+    hotfixes.reserve(res.rows.size());
+    for (const auto& row : res.rows) {
+        yuzu::windows_updates::HotfixRow h;
+        if (auto it = row.find("HotFixID"); it != row.end())
+            h.hotfix_id = it->second;
+        if (auto it = row.find("Description"); it != row.end())
+            h.description = it->second;
+        if (auto it = row.find("InstalledOn"); it != row.end())
+            h.installed_on = it->second;
+        hotfixes.push_back(std::move(h));
+    }
+
+    if (res.truncated) {
+        // Not a failure -- an honest partial (the row cap was hit): OK,
+        // PARTIAL, same shape runner_status.hpp uses for line_limit.
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "wmi_bounded:row_cap_truncated");
+    }
+
+    auto lines = yuzu::windows_updates::format_hotfix_rows(hotfixes);
     if (lines.empty()) {
         ctx.write_output("update|none|No updates found|-");
         return 0;
     }
     for (const auto& line : lines) {
-        ctx.write_output(std::format("update|{}", line));
+        ctx.write_output(line);
     }
 
 #elif defined(__linux__)
-    // Try rpm first, then apt
-    auto lines = run_command_lines("rpm -qa --last 2>/dev/null | head -50");
-    if (!lines.empty()) {
-        for (const auto& line : lines) {
-            // Format: "package-name  date"
-            auto sep = line.find("  ");
-            if (sep != std::string::npos) {
-                ctx.write_output(
-                    std::format("package|{}|{}", line.substr(0, sep), line.substr(sep + 2)));
-            } else {
-                ctx.write_output(std::format("package|{}|-", line));
-            }
+    // Try rpm first, then apt -- direct argv via the bounded runner (ADR-3002
+    // rung 2), replacing the old `| head -50` shell pipeline (max_lines=50,
+    // stop_after_max_lines=true is the in-process equivalent).
+    auto rpm = run_tool({"/usr/bin/rpm", "-qa", "--last"}, 50);
+    if (!rpm.lines.empty()) {
+        for (const auto& line : yuzu::windows_updates::parse_rpm_last(rpm.lines)) {
+            ctx.write_output(line);
         }
     } else {
-        lines = run_command_lines("apt list --installed 2>/dev/null | head -50");
-        if (lines.empty()) {
+        auto apt = run_tool({"/usr/bin/apt", "list", "--installed"}, 50);
+        if (apt.lines.empty()) {
+            yuzu::agent::forward_runner_failure(ctx, apt.res);
             ctx.write_output("package|none|No packages found");
             return 0;
         }
-        for (const auto& line : lines) {
-            // Skip the "Listing..." header
-            if (line.starts_with("Listing"))
-                continue;
-            // Format: "name/repo version arch [status]"
-            auto slash = line.find('/');
-            auto space = line.find(' ');
-            if (slash != std::string::npos && space != std::string::npos) {
-                auto name = line.substr(0, slash);
-                auto version = line.substr(space + 1);
-                auto ver_end = version.find(' ');
-                if (ver_end != std::string::npos)
-                    version = version.substr(0, ver_end);
-                ctx.write_output(std::format("package|{}|{}", name, version));
-            } else {
-                ctx.write_output(std::format("package|{}|-", line));
-            }
+        for (const auto& line : yuzu::windows_updates::parse_apt_installed(apt.lines)) {
+            ctx.write_output(line);
         }
     }
 
 #elif defined(__APPLE__)
-    auto lines = run_command_lines("system_profiler SPInstallHistoryDataType 2>/dev/null "
-                                   "| grep -E '^ {4}\\w|Install Date:' | head -100");
+    // The old `| grep -E '^ {4}\w|Install Date:' | head -100` filtering
+    // stage moved into parse_install_history_macos (no shell to pipe
+    // through once this is direct argv) -- max_lines=2000 here is a
+    // generous RAW-output safety cap only; the real 100-MATCHED-line cap is
+    // enforced by the pure parser, matching the old pipeline's semantics
+    // (head -100 acted on the already-grepped stream, not the raw one).
+    auto sp = run_tool({"/usr/sbin/system_profiler", "SPInstallHistoryDataType"}, 2000);
+    if (sp.lines.empty()) {
+        yuzu::agent::forward_runner_failure(ctx, sp.res);
+        ctx.write_output("update|none|No update history found");
+        return 0;
+    }
+    auto lines = yuzu::windows_updates::parse_install_history_macos(sp.lines);
     if (lines.empty()) {
         ctx.write_output("update|none|No update history found");
         return 0;
     }
-    std::string current_name;
     for (const auto& line : lines) {
-        auto trimmed = line;
-        auto start = trimmed.find_first_not_of(" \t");
-        if (start != std::string::npos)
-            trimmed = trimmed.substr(start);
-
-        if (trimmed.starts_with("Install Date:")) {
-            auto date = trimmed.substr(14);
-            auto ds = date.find_first_not_of(" ");
-            if (ds != std::string::npos)
-                date = date.substr(ds);
-            if (!current_name.empty()) {
-                ctx.write_output(std::format("update|{}|{}", current_name, date));
-            }
-            current_name.clear();
-        } else if (!trimmed.empty() && trimmed.back() == ':') {
-            current_name = trimmed.substr(0, trimmed.size() - 1);
-        }
-    }
-    if (!current_name.empty()) {
-        ctx.write_output(std::format("update|{}|-", current_name));
+        ctx.write_output(line);
     }
 
 #else
@@ -197,69 +288,206 @@ int do_installed(yuzu::CommandContext& ctx) {
 
 int do_missing(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
-    auto lines = run_command_lines(
-        "powershell -NoProfile -Command \""
-        "$s = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher(); "
-        "$r = $s.Search('IsInstalled=0'); "
-        "foreach ($u in $r.Updates) { $u.Title + '|' + $u.MsrcSeverity }"
-        "\"");
+    // In-process WUA COM search replacing the old `powershell -Command
+    // New-Object -ComObject Microsoft.Update.Session` interpreter shell-out.
+    // Deliberately NOT IUpdateSearcher::Search() -- that is a synchronous,
+    // unbounded broker call forbidden by ADR-3002 (it can hang for minutes
+    // against an offline/broken WSUS with nothing to catch it). This uses
+    // the async BeginSearch()/ISearchJob API instead, polling
+    // ISearchJob::IsCompleted under an explicit deadline so a wedged search
+    // is aborted rather than hung on. This whole leg is the one part of this
+    // migration that could not be verified on this (non-Windows) host --
+    // written carefully from the documented WUA COM API surface, to be
+    // confirmed on a real Windows host.
+    using yuzu::shared::win::BStr;
+    using yuzu::shared::win::ComInit;
+    using yuzu::shared::win::ComPtr;
+
+    ComInit com_init;
+    if (!com_init.ok()) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows_updates:com_init_failed");
+        ctx.write_output("available|none|COM initialization failed");
+        return 0;
+    }
+
+    ComPtr<IUpdateSession> session;
+    HRESULT hr = CoCreateInstance(CLSID_UpdateSession, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_IUpdateSession, reinterpret_cast<void**>(session.put()));
+    if (FAILED(hr)) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows_updates:cocreate_updatesession_failed");
+        ctx.write_output(std::format("available|none|Failed to create update session ({:#010x})",
+                                     static_cast<unsigned long>(hr)));
+        return 0;
+    }
+
+    ComPtr<IUpdateSearcher> searcher;
+    hr = session->CreateUpdateSearcher(searcher.put());
+    if (FAILED(hr)) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows_updates:create_searcher_failed");
+        ctx.write_output(std::format("available|none|Failed to create update searcher ({:#010x})",
+                                     static_cast<unsigned long>(hr)));
+        return 0;
+    }
+
+    // BeginSearch requires a live, functioning callback object even though
+    // this call polls the job itself (see SearchCompletedSink above). put()
+    // takes ownership of the object's single starting refcount.
+    ComPtr<ISearchCompletedCallback> callback;
+    *callback.put() = new SearchCompletedSink();
+
+    BStr criteria(L"IsInstalled=0");
+    VARIANT state;
+    VariantInit(&state);
+
+    ComPtr<ISearchJob> job;
+    hr = searcher->BeginSearch(criteria.get(), callback.get(), state, job.put());
+    if (FAILED(hr)) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows_updates:begin_search_failed");
+        ctx.write_output(std::format("available|none|Failed to start update search ({:#010x})",
+                                     static_cast<unsigned long>(hr)));
+        return 0;
+    }
+
+    // ADR-3002: never block unbounded on a broker call. No caller-supplied
+    // timeout is plumbed into this plugin's actions today, so this is a
+    // hardcoded budget rather than a derived one -- 120s is generous for a
+    // normal search (typically seconds) while still bounding a wedged one.
+    constexpr auto kSearchDeadline = std::chrono::seconds(120);
+    constexpr auto kSearchPollInterval = std::chrono::milliseconds(500);
+    const auto search_deadline = std::chrono::steady_clock::now() + kSearchDeadline;
+
+    bool completed = false;
+    for (;;) {
+        VARIANT_BOOL is_completed = VARIANT_FALSE;
+        hr = job->get_IsCompleted(&is_completed);
+        if (FAILED(hr))
+            break;
+        if (is_completed == VARIANT_TRUE) {
+            completed = true;
+            break;
+        }
+        if (std::chrono::steady_clock::now() >= search_deadline)
+            break;
+        Sleep(static_cast<DWORD>(kSearchPollInterval.count()));
+    }
+
+    if (!completed) {
+        // Deliberate bounded stop, not a crash/hang: abort the job and clean
+        // up its resources before reporting an honest CONSTRAINED/PARTIAL.
+        job->RequestAbort();
+        job->CleanUp();
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows_updates:search_deadline_exceeded");
+        ctx.write_output("available|none|Update search did not complete within the time budget");
+        return 0;
+    }
+
+    ComPtr<ISearchResult> result;
+    hr = searcher->EndSearch(job.get(), result.put());
+    if (FAILED(hr)) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows_updates:end_search_failed");
+        ctx.write_output(std::format("available|none|Failed to retrieve search results ({:#010x})",
+                                     static_cast<unsigned long>(hr)));
+        return 0;
+    }
+
+    OperationResultCode result_code = orcNotStarted;
+    if (SUCCEEDED(result->get_ResultCode(&result_code)) &&
+        (result_code == orcFailed || result_code == orcAborted)) {
+        // Never report a failed/aborted search as "no updates" -- that would
+        // be false assurance, not an honest empty result.
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows_updates:search_result_failed");
+        ctx.write_output("available|none|Update search completed with a failure result");
+        return 0;
+    }
+
+    ComPtr<IUpdateCollection> updates;
+    hr = result->get_Updates(updates.put());
+    if (FAILED(hr) || !updates) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows_updates:get_updates_failed");
+        ctx.write_output("available|none|Failed to enumerate search results");
+        return 0;
+    }
+
+    LONG count = 0;
+    updates->get_Count(&count);
+
+    std::vector<yuzu::windows_updates::UpdateRow> rows;
+    rows.reserve(count > 0 ? static_cast<size_t>(count) : 0);
+    for (LONG i = 0; i < count; ++i) {
+        ComPtr<IUpdate> update;
+        if (FAILED(updates->get_Item(i, update.put())) || !update)
+            continue;
+
+        yuzu::windows_updates::UpdateRow row;
+        BSTR title_bstr = nullptr;
+        if (SUCCEEDED(update->get_Title(&title_bstr)) && title_bstr) {
+            row.title = from_wide(title_bstr);
+            SysFreeString(title_bstr);
+        }
+        BSTR severity_bstr = nullptr;
+        if (SUCCEEDED(update->get_MsrcSeverity(&severity_bstr)) && severity_bstr) {
+            row.msrc_severity = from_wide(severity_bstr);
+            SysFreeString(severity_bstr);
+        }
+        rows.push_back(std::move(row));
+    }
+
+    if (result_code == orcSucceededWithErrors) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows_updates:search_result_partial");
+    }
+
+    auto lines = yuzu::windows_updates::format_update_rows(rows);
     if (lines.empty()) {
         ctx.write_output("available|none|No pending updates");
         return 0;
     }
     for (const auto& line : lines) {
-        ctx.write_output(std::format("available|{}", line));
+        ctx.write_output(line);
     }
 
 #elif defined(__linux__)
-    auto lines = run_command_lines("apt list --upgradable 2>/dev/null");
-    bool found = false;
-    if (!lines.empty()) {
-        for (const auto& line : lines) {
-            if (line.starts_with("Listing"))
-                continue;
-            // Format: "name/repo version arch [upgradable from: old_ver]"
-            auto slash = line.find('/');
-            auto space = line.find(' ');
-            if (slash != std::string::npos && space != std::string::npos) {
-                auto name = line.substr(0, slash);
-                auto rest = line.substr(space + 1);
-                auto ver_end = rest.find(' ');
-                auto version = (ver_end != std::string::npos) ? rest.substr(0, ver_end) : rest;
-                ctx.write_output(std::format("available|{}|{}", name, version));
-                found = true;
+    auto apt = run_tool({"/usr/bin/apt", "list", "--upgradable"});
+    auto avail = yuzu::windows_updates::parse_apt_upgradable(apt.lines);
+    if (!avail.empty()) {
+        for (const auto& line : avail) {
+            ctx.write_output(line);
+        }
+    } else {
+        auto yum = run_tool({"/usr/bin/yum", "check-update"});
+        auto yum_lines = yuzu::windows_updates::parse_yum_checkupdate(yum.lines);
+        if (yum_lines.empty()) {
+            // A successful "nothing to update" exit is the common case here
+            // and forward_runner_failure is a no-op for it (classify_runner_
+            // failure returns nullopt for a normal `exited` termination) --
+            // this only actually reports a status for a genuine spawn/
+            // deadline/cancel/signal degradation.
+            yuzu::agent::forward_runner_failure(ctx, yum.res);
+            ctx.write_output("available|none|System is up to date");
+        } else {
+            for (const auto& line : yum_lines) {
+                ctx.write_output(line);
             }
         }
     }
-    if (!found) {
-        lines = run_command_lines("yum check-update 2>/dev/null | grep -v '^$'");
-        for (const auto& line : lines) {
-            if (line.starts_with("Loaded") || line.starts_with("Loading"))
-                continue;
-            ctx.write_output(std::format("available|{}", line));
-            found = true;
-        }
-    }
-    if (!found) {
-        ctx.write_output("available|none|System is up to date");
-    }
 
 #elif defined(__APPLE__)
-    auto lines = run_command_lines("softwareupdate -l 2>/dev/null");
-    if (lines.empty()) {
+    auto su = run_tool({"/usr/sbin/softwareupdate", "-l"});
+    if (su.lines.empty()) {
+        yuzu::agent::forward_runner_failure(ctx, su.res);
         ctx.write_output("available|none|No updates available");
         return 0;
     }
-    for (const auto& line : lines) {
-        auto trimmed = line;
-        auto start = trimmed.find_first_not_of(" \t*");
-        if (start != std::string::npos)
-            trimmed = trimmed.substr(start);
-        if (trimmed.empty() || trimmed.starts_with("Software Update"))
-            continue;
-        if (trimmed.starts_with("Finding") || trimmed.starts_with("No new"))
-            continue;
-        ctx.write_output(std::format("available|{}", trimmed));
+    for (const auto& line : yuzu::windows_updates::parse_softwareupdate_list(su.lines)) {
+        ctx.write_output(line);
     }
 
 #else
@@ -379,14 +607,22 @@ int do_pending_reboot(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    // Check: softwareupdate -l output containing "restart"
-    // NOTE: softwareupdate -l contacts Apple servers and may take 30-120s.
-    // run_command() uses popen() with no timeout — may block on headless/offline Macs.
-    // TODO: Consider timeout wrapper or checking /Library/Updates/ for cached state.
+    // Check: softwareupdate -l output containing "restart". softwareupdate
+    // -l contacts Apple servers and may take 30-120s; migrated off the old
+    // popen()-based run_command_lines() (no timeout at all -- could hang
+    // indefinitely on a headless/offline Mac) onto run_bounded_subprocess
+    // (ADR-3002 rung 2, direct argv, no shell). 60s is generous for the
+    // normal contacts-Apple-servers latency while still bounding a
+    // wedged/offline check instead of hanging forever.
     {
+        constexpr std::chrono::seconds kSoftwareUpdateDeadline{60};
+        auto res = yuzu::agent::run_bounded_subprocess(
+            {"/usr/sbin/softwareupdate", "-l"},
+            yuzu::agent::SubprocessOptions{.deadline = kSoftwareUpdateDeadline});
+        yuzu::agent::forward_runner_failure(ctx, res);
+
         bool found = false;
-        auto lines = run_command_lines("softwareupdate -l 2>/dev/null");
-        for (const auto& line : lines) {
+        for (const auto& line : res.lines) {
             // Case-insensitive search for "restart"
             std::string lower = line;
             for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -691,32 +927,40 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
-// installed/missing: shell out everywhere (powershell via _popen on Windows
-// = rung 3, interpreter payload; rpm/apt or apt/yum via popen on Linux =
-// rung 3; system_profiler/softwareupdate via popen on macOS = rung 3).
-// pending_reboot: Windows is pure Reg*A presence checks (rung 1); Linux
-// combines a filesystem::exists probe with uname/ls/needs-restarting shell
-// calls (rung 3, the worse of the two exercised); macOS shells out to
-// softwareupdate -l (rung 3) -- CONSTRAINED there per the file's own TODO:
-// "contacts Apple servers and may take 30-120s... may block on
-// headless/offline Macs" with no timeout wrapper yet.
+// installed/missing (this migration): Linux/macOS moved off popen shell
+// strings onto direct argv through yuzu::agent::run_bounded_subprocess (no
+// shell, ADR-3002 rung 2 -- rpm/apt on Linux, system_profiler/softwareupdate
+// on macOS). Windows moved off `powershell -Command` (an interpreter shell-
+// out, rung 3) onto in-process calls with no child process at all: a bounded
+// WMI query (installed) and the async WUA COM search API (missing) -- both
+// daemon-mediated broker calls, same rung-1 status as the registry/wevtapi
+// calls elsewhere in this Wave (see runner_status.hpp's EvtNext comment for
+// the precedent).
+// pending_reboot: Windows is pure Reg*A presence checks (rung 1, untouched).
+// Linux combines a filesystem::exists probe with uname/ls/needs-restarting
+// shell calls (rung 3, untouched -- out of scope for this migration, see the
+// run_command_lines removal note above). macOS's softwareupdate -l call
+// moved off unbounded popen (rung 3) onto run_bounded_subprocess with an
+// explicit 60s deadline (rung 2) -- still CONSTRAINED (a slow update check
+// is still slow), but bounded now instead of able to hang indefinitely.
 // patch_connectivity: pure BSD/Winsock sockets (getaddrinfo/connect/poll or
-// select) on all three OSes -- rung 1 everywhere.
+// select) on all three OSes -- rung 1 everywhere, untouched.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"installed",
-     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "rpm+apt", nullptr},
-     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "system_profiler", nullptr},
-     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_gethotfix", nullptr}},
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "rpm+apt", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "system_profiler", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "wmi_bounded_query", nullptr}},
     {"missing",
-     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "apt+yum", nullptr},
-     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 3, "softwareupdate", nullptr},
-     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_update_session", nullptr}},
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "apt+yum", nullptr},
+     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 2, "softwareupdate", nullptr},
+     /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "wua_com_async_search", nullptr}},
     {"pending_reboot",
      /* linux   = */
      {YUZU_SUPPORT_SUPPORTED, 3, "filesystem+uname+needs_restarting", nullptr},
      /* macos   = */
-     {YUZU_SUPPORT_CONSTRAINED, 3, "softwareupdate",
-      "unbounded network call -- may take 30-120s or hang on an offline/headless Mac"},
+     {YUZU_SUPPORT_CONSTRAINED, 2, "softwareupdate",
+      "bounded (60s deadline) since this migration, but still a slow network call -- "
+      "no longer able to hang indefinitely on an offline/headless Mac"},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "registry", nullptr}},
     {"patch_connectivity",
      /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 1, "raw_sockets", nullptr},
