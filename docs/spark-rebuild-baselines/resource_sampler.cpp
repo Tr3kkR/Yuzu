@@ -82,12 +82,13 @@ namespace {
 
 std::atomic<bool> g_stop{false};
 
-// RAII owner for the target-process HANDLE - CloseHandle on every exit path,
-// never leaving a future early return to remember it manually (governance
-// Gate 3 finding, 2026-08-18: manual cleanup here already leaked once before
-// this file was even committed, per the adversarial-review fix earlier the
-// same day - reordering acquire-after-fallible-open fixed that ONE path;
-// this closes the underlying pattern-fragility rather than the one instance).
+// RAII owner for a nullptr-sentinel owning HANDLE (target-process HANDLE,
+// privilege token) - CloseHandle on every exit path, never leaving a future
+// early return to remember it manually (governance Gate 3 finding,
+// 2026-08-18: manual cleanup here already leaked once before this file was
+// even committed, per the adversarial-review fix earlier the same day -
+// reordering acquire-after-fallible-open fixed that ONE path; this closes
+// the underlying pattern-fragility rather than the one instance).
 class UniqueProcessHandle {
 public:
     explicit UniqueProcessHandle(HANDLE h = nullptr) noexcept : h_(h) {}

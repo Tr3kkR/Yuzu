@@ -83,9 +83,9 @@ pinned.
   back, deliberately, as a lost/coalesced-edge backstop.
 - **Provenance - what's measured vs what's derived (corrected 2026-08-18, PR #3267
   review, fjarvis: the original wording here claimed the daily figures themselves were
-  "the runtime's own measured output," which a grep for `288`/`180` against this file's
-  `CHECK`/`REQUIRE` lines disproves - neither appears in an assertion, only in comments
-  and a test name):** the mechanism-level assertions - demotion completing in exactly
+  "the runtime's own measured output," which a grep for `288`/`180` against
+  `test_guardian_spark_runtime.cpp`'s `CHECK`/`REQUIRE` lines disproves - neither
+  appears in an assertion, only in comments and a test name):** the mechanism-level assertions - demotion completing in exactly
   12 committed sweeps, refresh recurring at exactly `errored_refresh_ms` after the last
   emission, the 480s jitter-floor sweep still refreshing - are the runtime's own
   measured output. The demotion-sweep-count assertion was verified red (a deliberately
