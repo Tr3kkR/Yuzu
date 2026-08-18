@@ -121,7 +121,7 @@ these rows are pointers, not evidence.
 **Raw `popen`/`system` helpers:** antivirus, bitlocker,
 device_identity, event_logs, hardware, installed_apps,
 ioc, license_scan, network_config,
-network_diag, os_info, processes, sccm,
+network_diag, os_info, processes,
 software_actions, tar, vuln_scan, wifi, windows_updates.
 (`vuln_scan` carries code slated for retirement per ADR-0028/ADR-0018 —
 sequence that cleanup against migrating it, tracked in #2380.)
@@ -191,7 +191,7 @@ Registered sites above). Both plugins now carry zero raw spawn tokens and
 are removed from `scripts/ci/check-plugin-spawn-lexical.sh`'s GRANDFATHERED
 allowlist.
 
-**Partially migrated (Wave 3):** `windows_updates` -- `installed`/`missing`
+**Partially migrated (Wave 3, PR33d):** `windows_updates` -- `installed`/`missing`
 fully migrated on every OS (Linux/macOS onto direct runner argv, Windows onto
 in-process bounded WMI/WUA COM calls with zero spawn sites; see Registered
 sites above) plus `pending_reboot`'s macOS leg (the file's own TODO —
@@ -205,6 +205,17 @@ for those three sites yet. Two of the three (`uname -r`, `ls -t
 right (a direct `uname(2)` syscall and a `std::filesystem` directory scan
 respectively need no subprocess at all) rather than a straight argv
 migration; tracked in #2380.
+
+**Migrated off raw spawn (Wave 3, PR33d):** `sccm` (0 spawn sites, was 3 —
+`client_version`'s `sc query ccmexec` text parse promoted to a native SCM
+query (`OpenSCManagerW`/`OpenServiceW`/`QueryServiceStatusEx`); `site`'s two
+PowerShell `Microsoft.SMS.Client` ComObject calls promoted to native
+in-process late-bound `IDispatch` (`CLSIDFromProgID`/`CoCreateInstance`/
+`GetIDsOfNames`/`Invoke`); `site`'s registry Authority-subkey fallback fixed
+alongside the migration — it previously matched a literal, never-substituted
+`SMS:{}` subkey name and so was permanently dead, now genuinely enumerates
+`HKLM\SOFTWARE\Microsoft\CCM\Authority\` via `RegEnumKeyExW`; no manifest
+rows since none survive, matching the discovery/PR2.1c precedent above).
 
 **Direct exec via private helpers:** script_exec, content_dist, filesystem
 (filesystem is fully migrated onto the runner on the #2321 branch).
