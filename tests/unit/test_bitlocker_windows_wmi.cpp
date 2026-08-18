@@ -112,6 +112,18 @@ TEST_CASE("parse_conversion_status degrades honestly when fields are absent",
     CHECK(state.percent_text == "unknown");
 }
 
+TEST_CASE("parse_conversion_status rejects a non-zero method ReturnValue",
+          "[agent][bitlocker_windows_wmi]") {
+    // The WMI method call transported successfully (COM layer OK) but
+    // BitLocker's own method failed — out params must not be trusted even
+    // though ConversionStatus/EncryptionPercentage are present and well-formed.
+    WmiRow row = {{"ReturnValue", "2150694912"}, {"ConversionStatus", "0"},
+                  {"EncryptionPercentage", "0"}};
+    auto state = parse_conversion_status(row);
+    CHECK(state.conversion_text == "Unknown");
+    CHECK(state.percent_text == "unknown");
+}
+
 TEST_CASE("format_volume_row assembles the frozen 5-field shape, method always unknown",
           "[agent][bitlocker_windows_wmi]") {
     EncryptableVolume vol;

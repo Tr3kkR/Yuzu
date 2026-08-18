@@ -141,11 +141,19 @@ struct ConversionState {
     std::string percent_text;    // e.g. "100%" or "unknown"
 };
 
-/// A method-call result missing ConversionStatus/EncryptionPercentage
-/// (e.g. the call itself failed, or ReturnValue was non-zero) is reported
-/// honestly — "Unknown" / "unknown" — never a fabricated "Fully Decrypted".
+/// A method-call result missing ConversionStatus/EncryptionPercentage, OR
+/// carrying a non-zero ReturnValue (the WMI method itself failed even
+/// though the COM call transported successfully), is reported honestly —
+/// "Unknown" / "unknown" — never a fabricated "Fully Decrypted". Absent
+/// ReturnValue is treated as failure too: a provider that omits it has not
+/// affirmatively told us the call succeeded.
 inline ConversionState parse_conversion_status(const WmiRow& row) {
     ConversionState state;
+    if (auto it = row.find("ReturnValue"); it == row.end() || it->second != "0") {
+        state.conversion_text = "Unknown";
+        state.percent_text = "unknown";
+        return state;
+    }
     if (auto it = row.find("ConversionStatus"); it != row.end())
         state.conversion_text = conversion_status_text(it->second);
     else

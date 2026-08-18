@@ -249,13 +249,40 @@ TEST_CASE("render_defender_status: missing keys are omitted, not fabricated", "[
     CHECK(lines[0] == "definition_version|1.0");
 }
 
-// ── render_exclusion_lines ──────────────────────────────────────────────────
+// ── merge_exclusion_sources / render_exclusion_lines ────────────────────────
 
-TEST_CASE("render_exclusion_lines: maps every value name with its kind", "[antivirus]") {
-    auto lines = render_exclusion_lines({"C:\\Temp", "D:\\Data\\app.exe"}, "path");
+TEST_CASE("merge_exclusion_sources: local-only names are tagged local", "[antivirus]") {
+    auto merged = merge_exclusion_sources({"C:\\Temp", "D:\\Data\\app.exe"}, {});
+    REQUIRE(merged.size() == 2);
+    CHECK(merged[0].source == "local");
+    CHECK(merged[1].source == "local");
+}
+
+TEST_CASE("merge_exclusion_sources: policy-only names are tagged policy", "[antivirus]") {
+    auto merged = merge_exclusion_sources({}, {"C:\\Program Files\\App"});
+    REQUIRE(merged.size() == 1);
+    CHECK(merged[0].value == "C:\\Program Files\\App");
+    CHECK(merged[0].source == "policy");
+}
+
+TEST_CASE("merge_exclusion_sources: a name in both hives is reported once, tagged both",
+          "[antivirus]") {
+    auto merged = merge_exclusion_sources({"C:\\Temp"}, {"C:\\Temp"});
+    REQUIRE(merged.size() == 1);
+    CHECK(merged[0].value == "C:\\Temp");
+    CHECK(merged[0].source == "both");
+}
+
+TEST_CASE("merge_exclusion_sources: empty inputs yield empty output", "[antivirus]") {
+    CHECK(merge_exclusion_sources({}, {}).empty());
+}
+
+TEST_CASE("render_exclusion_lines: maps every entry with its kind and source", "[antivirus]") {
+    auto lines = render_exclusion_lines(
+        {{"C:\\Temp", "local"}, {"D:\\Data\\app.exe", "policy"}}, "path");
     REQUIRE(lines.size() == 2);
-    CHECK(lines[0] == "exclusion|path|C:\\Temp");
-    CHECK(lines[1] == "exclusion|path|D:\\Data\\app.exe");
+    CHECK(lines[0] == "exclusion|path|local|C:\\Temp");
+    CHECK(lines[1] == "exclusion|path|policy|D:\\Data\\app.exe");
 }
 
 TEST_CASE("render_exclusion_lines: empty input yields empty output", "[antivirus]") {
@@ -263,7 +290,7 @@ TEST_CASE("render_exclusion_lines: empty input yields empty output", "[antivirus
 }
 
 TEST_CASE("render_exclusion_lines: a value name containing '|' is sanitized", "[antivirus]") {
-    auto lines = render_exclusion_lines({"evil|name.exe"}, "process");
+    auto lines = render_exclusion_lines({{"evil|name.exe", "local"}}, "process");
     REQUIRE(lines.size() == 1);
-    CHECK(lines[0] == "exclusion|process|evil name.exe");
+    CHECK(lines[0] == "exclusion|process|local|evil name.exe");
 }

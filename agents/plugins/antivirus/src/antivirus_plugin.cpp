@@ -5,7 +5,10 @@
  *   "products"      — List installed AV products.
  *   "status"        — Antivirus engine/definitions status.
  *   "av_exclusions" — Windows Defender exclusion lists (paths/processes/
- *                      extensions). Windows-only; a Windows-only concept.
+ *                      extensions), merged from both the local
+ *                      operator-editable hive and the GPO/MDM policy hive,
+ *                      each row tagged with its source. Windows-only; a
+ *                      Windows-only concept.
  *
  * Output is pipe-delimited via write_output().
  *
@@ -127,54 +130,82 @@ void defender_status_win(yuzu::CommandContext& ctx) {
         ctx.write_output(line);
 }
 
+// Attempts to open+enumerate one exclusion subkey (either the local
+// operator-editable hive or the GPO/MDM policy hive). Returns the value
+// names on success; ERROR_FILE_NOT_FOUND is folded into a genuinely-empty
+// result (the subkey never existing means no exclusion of this kind was
+// ever configured through this source), NOT a failure. Any other non-
+// success open outcome is reported via `write_output`/`set_result_status`
+// exactly once per call site (never silently swallowed into a fabricated
+// zero) and signalled back via the returned bool.
+bool read_exclusion_subkey(yuzu::CommandContext& ctx, const wchar_t* path, const char* kind,
+                           bool& status_forwarded, std::vector<std::string>& out_names) {
+    yuzu::win::RegKey key;
+    const LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_READ, key.put());
+    if (rc == ERROR_FILE_NOT_FOUND)
+        return true; // a real "zero" for this source, not a lie
+    if (rc == ERROR_ACCESS_DENIED) {
+        // Current Windows builds ACL this key against non-admin readers.
+        // Reported as its own typed status, never collapsed into a silent
+        // "no exclusions" -- that would be a false negative that looks
+        // like a clean posture.
+        ctx.write_output(std::format("permission_denied|exclusions {} access denied", kind));
+        if (!status_forwarded) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED,
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "antivirus:av_exclusions_access_denied");
+            status_forwarded = true;
+        }
+        return false;
+    }
+    if (rc != ERROR_SUCCESS) {
+        ctx.write_output(std::format("not_available|exclusions {} read failed", kind));
+        if (!status_forwarded) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "antivirus:av_exclusions_open_failed");
+            status_forwarded = true;
+        }
+        return false;
+    }
+    out_names = yuzu::win::enumerate_value_names(key.get());
+    return true;
+}
+
 void av_exclusions_win(yuzu::CommandContext& ctx) {
+    // Two configuration planes carry exclusions, and they are not
+    // interchangeable: the operator-editable local hive, and the
+    // GPO/MDM-managed policy hive (the dominant plane in an enterprise
+    // deployment -- reading only the local hive would report a clean
+    // posture on an endpoint whose exclusions are entirely policy-driven).
+    // Each kind is read from both and merged with provenance so an
+    // operator can tell which plane an exclusion came from.
     struct ExclusionSubkey {
-        const wchar_t* path;
+        const wchar_t* local_path;
+        const wchar_t* policy_path;
         const char* kind;
     };
     static constexpr ExclusionSubkey kSubkeys[] = {
-        {L"SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths", "path"},
-        {L"SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Processes", "process"},
-        {L"SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Extensions", "extension"},
+        {L"SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths",
+         L"SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Exclusions\\Paths", "path"},
+        {L"SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Processes",
+         L"SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Exclusions\\Processes", "process"},
+        {L"SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Extensions",
+         L"SOFTWARE\\Policies\\Microsoft\\Windows Defender\\Exclusions\\Extensions", "extension"},
     };
 
     bool status_forwarded = false;
     std::size_t total = 0;
     for (const auto& sk : kSubkeys) {
-        yuzu::win::RegKey key;
-        const LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, sk.path, 0, KEY_READ, key.put());
-        if (rc == ERROR_FILE_NOT_FOUND) {
-            // The subkey genuinely does not exist -- no exclusion of this
-            // kind has ever been configured. A real "zero", not a lie.
-            continue;
-        }
-        if (rc == ERROR_ACCESS_DENIED) {
-            // Current Windows builds ACL this key against non-admin
-            // readers. Reported as its own typed status, never collapsed
-            // into a silent "no exclusions" -- that would be a false
-            // negative that looks like a clean posture.
-            ctx.write_output(std::format("permission_denied|exclusions {} access denied", sk.kind));
-            if (!status_forwarded) {
-                ctx.set_result_status(YUZU_RESULT_STATUS_PERMISSION_DENIED,
-                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                      "antivirus:av_exclusions_access_denied");
-                status_forwarded = true;
-            }
-            continue;
-        }
-        if (rc != ERROR_SUCCESS) {
-            ctx.write_output(std::format("not_available|exclusions {} read failed", sk.kind));
-            if (!status_forwarded) {
-                ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
-                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                      "antivirus:av_exclusions_open_failed");
-                status_forwarded = true;
-            }
-            continue;
-        }
+        std::vector<std::string> local_names;
+        std::vector<std::string> policy_names;
+        // Both reads are attempted even if one fails -- an admin-blocked
+        // local hive must not hide a still-readable policy hive, and vice
+        // versa; each failure is reported once via status_forwarded.
+        read_exclusion_subkey(ctx, sk.local_path, sk.kind, status_forwarded, local_names);
+        read_exclusion_subkey(ctx, sk.policy_path, sk.kind, status_forwarded, policy_names);
 
-        auto names = yuzu::win::enumerate_value_names(key.get());
-        for (const auto& line : yuzu::antivirus::render_exclusion_lines(names, sk.kind)) {
+        auto merged = yuzu::antivirus::merge_exclusion_sources(local_names, policy_names);
+        for (const auto& line : yuzu::antivirus::render_exclusion_lines(merged, sk.kind)) {
             ctx.write_output(line);
             ++total;
         }

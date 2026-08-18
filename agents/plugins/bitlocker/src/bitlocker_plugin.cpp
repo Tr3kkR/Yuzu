@@ -29,6 +29,11 @@
 #include <string_view>
 #include <vector>
 
+#ifdef __linux__
+#include <cstdlib> // std::free — blkid_get_tag_value's returned string ownership
+#include <memory>  // std::unique_ptr
+#endif
+
 #ifdef _WIN32
 #include <win_str.hpp>   // yuzu::win::to_wide (#1681)
 #include <wmi_bounded.hpp> // yuzu::shared::wmi bounded WMI query/method call
@@ -173,14 +178,20 @@ std::vector<yuzu::bitlocker::linux_dm::LuksBlockDevice> enumerate_luks_devices()
             const char* devname = blkid_dev_devname(dev);
             if (!devname)
                 continue;
-            const char* uuid = blkid_get_tag_value(cache, "UUID", devname);
+            // blkid_get_tag_value returns a heap-allocated string the caller
+            // owns (util-linux convention — same as g_strdup) — adopt it
+            // into a unique_ptr immediately so every path (including the
+            // loop's next iteration) frees it; this is a long-lived agent
+            // daemon process, so a per-call leak here is cumulative.
+            std::unique_ptr<char, decltype(&std::free)> uuid{
+                blkid_get_tag_value(cache, "UUID", devname), &std::free};
             if (!uuid)
                 continue;
 
             std::string full{devname};
             auto slash = full.rfind('/');
             std::string base = (slash == std::string::npos) ? full : full.substr(slash + 1);
-            devices.push_back({std::move(base), std::string(uuid)});
+            devices.push_back({std::move(base), std::string(uuid.get())});
         }
         blkid_dev_iterate_end(iter);
     }

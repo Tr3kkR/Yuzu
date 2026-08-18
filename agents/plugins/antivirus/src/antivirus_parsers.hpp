@@ -305,12 +305,46 @@ struct WscProductState {
 /// "extension"; a value name is vendor/operator-controlled free text (a
 /// filesystem path can legally contain almost anything), so it is
 /// sanitized exactly like every other untrusted field this plugin emits.
+///
+/// One exclusion entry with a resolved provenance: "local" (the
+/// operator-editable `...\Windows Defender\Exclusions\*` hive only),
+/// "policy" (the GPO/MDM-managed `...\Policies\Microsoft\Windows
+/// Defender\Exclusions\*` hive only — the dominant enterprise
+/// configuration plane, and enforced regardless of the local hive), or
+/// "both" (present in both — reported once, not twice).
+struct ExclusionEntry {
+    std::string value;
+    std::string source;
+};
+
+/// Merge a kind's locally-configured and policy-managed value names into
+/// one deduplicated, provenance-tagged list. A name present in both
+/// sources is "both", never emitted as two separate rows — this is what
+/// keeps `av_exclusions`'s count honest when GPO and local configuration
+/// overlap.
+[[nodiscard]] inline std::vector<ExclusionEntry> merge_exclusion_sources(
+    const std::vector<std::string>& local_names, const std::vector<std::string>& policy_names) {
+    std::map<std::string, std::string> by_value; // value -> source
+    for (const auto& name : local_names)
+        by_value[name] = "local";
+    for (const auto& name : policy_names) {
+        auto it = by_value.find(name);
+        by_value[name] = (it != by_value.end()) ? "both" : "policy";
+    }
+    std::vector<ExclusionEntry> out;
+    out.reserve(by_value.size());
+    for (auto& [value, source] : by_value)
+        out.push_back(ExclusionEntry{value, source});
+    return out;
+}
+
 [[nodiscard]] inline std::vector<std::string> render_exclusion_lines(
-    const std::vector<std::string>& value_names, std::string_view kind) {
+    const std::vector<ExclusionEntry>& entries, std::string_view kind) {
     std::vector<std::string> lines;
-    lines.reserve(value_names.size());
-    for (const auto& name : value_names)
-        lines.push_back("exclusion|" + std::string(kind) + "|" + sanitize_field(name));
+    lines.reserve(entries.size());
+    for (const auto& entry : entries)
+        lines.push_back("exclusion|" + std::string(kind) + "|" + entry.source + "|" +
+                        sanitize_field(entry.value));
     return lines;
 }
 
