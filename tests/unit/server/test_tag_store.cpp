@@ -259,6 +259,68 @@ TEST_CASE("TagStore: agents_with_tag_checked distinguishes a degraded prepare fr
     CHECK(present->size() == 1);
 }
 
+TEST_CASE("TagStore: agents_with_tag_checked distinguishes a mid-scan failure (not just a "
+          "prepare-time one) from a genuine result",
+          "[tag_store][security]") {
+    // The prepare-time case above (deny_tag_read) forces sqlite3_prepare_v2
+    // itself to fail — it never proves the SEPARATE terminal-rc check added
+    // for a failure that occurs mid-scan, i.e. AFTER sqlite3_step has
+    // already returned SQLITE_ROW at least once (quality-engineer +
+    // unhappy-path, governance run 2026-08-17: the PG-tagged fault-injection
+    // test in test_authz_gates.cpp fires its interrupt before any row is
+    // scanned, so it exercises only the zero-rows-accumulated case). This
+    // case seeds enough rows, and calibrates the abort point from a clean
+    // run's own progress-handler tick count, to force the abort strictly
+    // after the scan has already returned real rows — proving the fix
+    // discards an in-progress partial result, not just an empty one, and
+    // runs everywhere (no [pg] tag, no Postgres needed).
+    TagStore store(":memory:");
+    constexpr int kRows = 20;
+    for (int i = 0; i < kRows; ++i)
+        store.set_tag("agent-" + std::to_string(i), "service", "printers");
+
+    sqlite3* db = TagStoreFaultHook::db(store);
+    REQUIRE(db != nullptr);
+
+    // Pass 1: count progress-handler ticks over an uninterrupted scan of all
+    // kRows rows (N=1 — fire on every VM instruction) to calibrate the abort
+    // point against this exact query/data/SQLite-build, rather than
+    // guessing a fixed tick count.
+    long tick_count = 0;
+    auto count_ticks = [](void* ctx) -> int {
+        ++*static_cast<long*>(ctx);
+        return 0; // never abort during calibration
+    };
+    sqlite3_progress_handler(db, 1, count_ticks, &tick_count);
+    auto baseline = store.agents_with_tag_checked("service", "printers");
+    REQUIRE(baseline.has_value());
+    REQUIRE(baseline->size() == kRows);
+    REQUIRE(tick_count > kRows); // sanity: more than one tick per row happened
+
+    // Pass 2: abort at roughly the midpoint of the calibrated tick count —
+    // by construction (kRows rows spread across tick_count ticks, kRows>1),
+    // the midpoint falls strictly after the first row has already been
+    // returned to the accumulating result vector.
+    struct AbortAtCounter {
+        long remaining;
+    } counter{tick_count / 2};
+    auto abort_at = [](void* ctx) -> int {
+        auto* c = static_cast<AbortAtCounter*>(ctx);
+        return --c->remaining <= 0 ? 1 : 0;
+    };
+    sqlite3_progress_handler(db, 1, abort_at, &counter);
+
+    auto mid_scan = store.agents_with_tag_checked("service", "printers");
+    CHECK_FALSE(mid_scan.has_value()); // nullopt == degraded, NOT a partial row set
+
+    sqlite3_progress_handler(db, 0, nullptr, nullptr);
+
+    // Lifting the fault restores the happy path with every row intact.
+    auto recovered = store.agents_with_tag_checked("service", "printers");
+    REQUIRE(recovered.has_value());
+    CHECK(recovered->size() == kRows);
+}
+
 TEST_CASE("TagStore: validate_key", "[tag_store]") {
     CHECK(TagStore::validate_key("env") == true);
     CHECK(TagStore::validate_key("os.version") == true);
