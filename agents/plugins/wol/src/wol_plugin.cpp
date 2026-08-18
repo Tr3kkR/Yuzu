@@ -302,7 +302,10 @@ int do_check(yuzu::CommandContext& ctx, yuzu::Params params) {
     //                         deadline is `-t <sec>`. Passing `-W 2` on Darwin
     //                         means "wait 2 ms", an instant timeout that reports
     //                         a live host as unreachable. Use `-t <sec>` instead.
-    // (Mirrors discovery_plugin.cpp's ping_host three-way branch.)
+    // (discovery_plugin.cpp used to carry the mirror of this branch; Wave-2
+    //  PR2.1c migrated it to the native yuzu::shared::IcmpSession, which takes
+    //  an explicit timeout_ms and so cannot hit the units trap at all. This is
+    //  now the last shell-out of this shape — see docs/darwin-compat.md.)
     std::string cmd;
 #ifdef _WIN32
     cmd = std::format("ping -n {} -w 2000 {} 2>&1", count, host);

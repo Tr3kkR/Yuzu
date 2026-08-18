@@ -276,7 +276,7 @@ Not implemented. Legacy reverse lookup on IP addresses.
 
 ### 4.10 ARP Scanning (Subnet Discovery) :white_check_mark: `T3`
 
-`discovery` plugin with `scan_subnet` action. ARP scan + ping sweep of a CIDR subnet to find hosts. Returns IP, MAC address, hostname, and managed/unmanaged status. Cross-platform: arp table parsing + ping sweep via subprocess. Input validation prevents command injection on CIDR parameter.
+`discovery` plugin with `scan_subnet` action. ARP scan + ping sweep of a CIDR subnet to find hosts. Returns IP, MAC address, hostname, and managed/unmanaged status. Cross-platform: native ARP-table acquisition (`GetIpNetTable2` on Windows, `/proc/net/arp` on Linux, the routing-socket `sysctl` on macOS) + an unprivileged ICMP ping sweep — no subprocess spawn on any platform (Wave 2, ADR-3002). Input validation prevents command injection on CIDR parameter.
 
 ### 4.11 Port Scanning :x: `T3`
 
@@ -473,7 +473,7 @@ collisions possible; vendor precision pending ADR-0018). See
 
 ### 9.8 Certificate Inventory (Get/Delete) :white_check_mark: `T2`
 
-`certificates` plugin with `list`, `details`, and `delete` actions. Enumerates certificates in system stores with thumbprint, subject, issuer, expiry, and key usage. Windows: CryptoAPI (CertOpenStore, CertEnumCertificatesInStore). Linux: PEM files in /etc/ssl/certs/. macOS: `security find-certificate` over System.keychain and SystemRootCertificates.keychain, plus the current console user's login keychain via a `launchctl asuser <uid> sudo -n -u <user> security` hop (selectable per query with the `store` param: `System`/`root`/`login`/`all`; the LaunchDaemon has no login keychain of its own). Delete on macOS verifies the certificate is actually absent from the target keychain afterward before reporting success (a tri-state safe delete — command failure, still-present, and an unreadable re-enumeration each block a false "deleted"); `store=root` is rejected as unsupported because SystemRootCertificates.keychain is sealed by System Integrity Protection and cannot be modified.
+`certificates` plugin with `list`, `details`, and `delete` actions. Enumerates certificates in system stores with thumbprint, subject, issuer, expiry, and key usage. Windows: CryptoAPI (CertOpenStore, CertEnumCertificatesInStore). Linux: PEM files in /etc/ssl/certs/, parsed in-process via libcrypto (no `openssl` shell-out). macOS: System.keychain and SystemRootCertificates.keychain are read natively via SecItem (`SecItemCopyMatching`, no shell-out); the current console user's login keychain still goes through the `launchctl asuser <uid> sudo -n -u <user> security` hop (selectable per query with the `store` param: `System`/`root`/`login`/`all`; the LaunchDaemon has no login keychain of its own). Delete on macOS verifies the certificate is actually absent from the target keychain afterward before reporting success (a tri-state safe delete — command failure, still-present, and an unreadable re-enumeration each block a false "deleted"); `store=root` is rejected as unsupported because SystemRootCertificates.keychain is sealed by System Integrity Protection and cannot be modified.
 
 ### 9.9 Quarantine Status Tracking :white_check_mark: `T2`
 
