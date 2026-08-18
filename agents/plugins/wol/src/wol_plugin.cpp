@@ -315,11 +315,11 @@ int do_check(yuzu::CommandContext& ctx, yuzu::Params params) {
                 std::this_thread::sleep_for(kInterSampleGap);
 #ifdef _WIN32
             const ULONG ipv4 = reinterpret_cast<sockaddr_in*>(&icmp_dst->addr)->sin_addr.s_addr;
-            if (session.sample(ipv4, timeout_ms))
+            if (session.sample(ipv4, timeout_ms).replied())
                 outcome.icmp_replied = true;
 #else
             const auto& sin = *reinterpret_cast<sockaddr_in*>(&icmp_dst->addr);
-            if (session.sample(sin, timeout_ms))
+            if (session.sample(sin, timeout_ms).replied())
                 outcome.icmp_replied = true;
 #endif
         }
