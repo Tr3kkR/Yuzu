@@ -984,12 +984,26 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
             std::string cmd = std::format(
                 "zenity --question --title='{}' --text='{}' 2>/dev/null",
                 safe_title, safe_prompt);
-            int rc = run_command_status(cmd);
-            if (rc == 5) { // zenity returns 5 for timeout/ESC, 1 for No
+            // Not classify_posix_capture: zenity's yesno leg has a genuine
+            // three-way exit-code contract (0=Yes, 1=No, 5=timeout/ESC) that
+            // classifier's two-way real_output/cancelled split would collapse
+            // (a real "No" click, rc=1, would misclassify as "cancelled").
+            // The runner-failure sentinel is still checked explicitly first
+            // -- without it, a genuine spawn/deadline failure (exit_code=-1)
+            // fell into the rc!=0 branch and reported a fabricated "no" (the
+            // same honest-status gap this PR closes on the sibling
+            // choice/text legs below).
+            auto result = run_command_capture(cmd);
+            if (result.exit_code == -1) {
+                yuzu::agent::forward_runner_failure(ctx, result.res);
+                ctx.write_output("status|unavailable|zenity dialog failed to complete");
+                return 1;
+            }
+            if (result.exit_code == 5) { // zenity returns 5 for timeout/ESC
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, rc == 0 ? "yes" : "no"));
+            ctx.write_output(std::format("answer_{}|{}", i, result.exit_code == 0 ? "yes" : "no"));
 
         } else if (q.type == "choice" && !q.choices.empty()) {
             std::string items;
