@@ -4,6 +4,7 @@
 // no pg — plugin_config_parsers.hpp has zero includes of any of those, and
 // these tests spawn nothing.
 
+#include "capability_decls/core_dispatch_capabilities.hpp"
 #include "plugin_config_parsers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -129,6 +130,23 @@ TEST_CASE("is_reserved_plugin_name accepts __<identifier>__, rejects malformed r
     CHECK_FALSE(is_reserved_plugin_name("guard"));
 }
 
+TEST_CASE("is_reserved_plugin_name: maximal length is 68 bytes (4 sentinel + "
+          "kMaxIdentifierBytes inner) — the exact bound the MCP tool schemas advertise "
+          "(#3265 governance Gate 3, quality-engineer)",
+          "[server][config]") {
+    const std::string max_inner(kMaxIdentifierBytes, 'a');
+    const std::string max_reserved = "__" + max_inner + "__";
+    REQUIRE(max_reserved.size() == 68);
+    CHECK(is_reserved_plugin_name(max_reserved));
+
+    // One byte over the inner cap: is_valid_identifier rejects the inner
+    // span, so the whole reserved name is rejected too — 69 bytes total is
+    // never a valid kill-switch plugin name.
+    const std::string over_inner(kMaxIdentifierBytes + 1, 'a');
+    const std::string over_reserved = "__" + over_inner + "__";
+    CHECK_FALSE(is_reserved_plugin_name(over_reserved));
+}
+
 TEST_CASE("parse_kill_switch_scope: #3265 — accepts a reserved-namespace plugin name so a "
           "system_reserved dispatch capability like __guard__.push_rules can be kill-switch "
           "addressed at all",
@@ -228,4 +246,28 @@ TEST_CASE("redact_secret_for_log never embeds a value — its signature has no v
     CHECK(line.find("email") != std::string::npos);
     CHECK(line.find("smtp.password") != std::string::npos);
     CHECK(line.find(std::string(kRedactedSecretPlaceholder)) != std::string::npos);
+}
+
+// ── #3265 governance Gate 3 (architect): permanent regression-prevention ──
+//
+// The bug this file's other #3265 tests pin (__guard__.push_rules
+// permanently kill-switched) was a silent, undetected mismatch between the
+// dispatch capability catalogue and the kill-switch scope grammar — nothing
+// asserted that every system_reserved row was even ADDRESSABLE by a kill
+// switch. A future capdecls row using a plugin name neither
+// is_valid_identifier nor is_reserved_plugin_name accepts would reproduce
+// the identical failure mode (permanently denied, 202 on the wire, no red
+// test) undetected by every OTHER test in this file, which only exercise
+// literal example names. This iterates the REAL catalogue so the sink is
+// closed once, not per-instance — mirrors the H2/G9 enum<->support-array
+// binding precedent for the same class of drift.
+
+TEST_CASE("#3265: every system_reserved dispatch capability's (plugin, action) is "
+          "kill-switch-addressable — a permanent guard against a future capdecls row "
+          "reproducing the __guard__ regression",
+          "[server][config]") {
+    for (const auto& cap : yuzu::server::capdecls::core_dispatch_capabilities()) {
+        INFO("plugin=" << cap.plugin << " action=" << cap.action);
+        CHECK(parse_kill_switch_scope(cap.plugin, cap.action).has_value());
+    }
 }
