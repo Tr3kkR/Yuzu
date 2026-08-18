@@ -523,6 +523,10 @@ TEST_CASE("A degraded/unopened store makes action_allowed return false, never tr
     // "allowed" — the whole point of action_allowed's collapse (ADR-0036).
     CHECK_FALSE(store.action_allowed("firewall", "block"));
     CHECK_FALSE(store.action_allowed("email", ""));
+    // #3265 governance Gate 5 (chaos-injector): the reserved-namespace path
+    // inherits the SAME fail-closed collapse under a degraded store — a
+    // transient PG stall during a Guardian push must never read as allowed.
+    CHECK_FALSE(store.action_allowed("__guard__", "push_rules"));
 
     // The display accessor surfaces the degradation as a typed error rather
     // than silently answering "enabled" — a caller that (incorrectly) tried
