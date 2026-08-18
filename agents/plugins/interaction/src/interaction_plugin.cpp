@@ -17,8 +17,9 @@
  *   macOS   — osascript (display notification, display dialog)
  *
  * Input validation: title/message/prompt fields are sanitized to prevent
- * command injection in popen calls. Only alphanumeric, spaces, and safe
- * punctuation are allowed.
+ * command injection into the osascript/zenity/PowerShell script text these
+ * fields are embedded in (run via the bounded argv runner, not a shell
+ * string). Only alphanumeric, spaces, and safe punctuation are allowed.
  */
 
 #include <yuzu/plugin.hpp>
@@ -72,7 +73,9 @@ bool is_safe_char(char c) {
     // Safe punctuation: space, period, comma, hyphen, underscore, colon,
     // question mark, exclamation, slash, at, hash, percent, plus, equals.
     // Note: single quote and double quote are intentionally excluded (M13)
-    // to prevent shell injection on macOS/Linux popen calls.
+    // to prevent shell injection into the osascript/zenity script text these
+    // values are embedded in on macOS/Linux (run via the bounded argv
+    // runner, not a shell string).
     switch (c) {
     case ' ':  case '.':  case ',':  case '-':  case '_':
     case ':':  case '?':  case '!':  case '/':  case '@':
