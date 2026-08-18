@@ -1619,7 +1619,11 @@ public:
         // "label combination" - itself - and the same bounded-label
         // pre-seed rule applies (docs/observability-conventions.md
         // "Bounded-label counters are pre-seeded to 0 at startup"),
-        // matching the tag_store precedent a few hundred lines above.
+        // matching the yuzu_server_principal_quota_exhausted_total
+        // precedent (~line 511) and the tag_store block a few thousand
+        // lines below (cpp-safety, final targeted check: an earlier
+        // version of this comment cited tag_store as "above," which is
+        // wrong - it is well below this line).
         // Without this, a fresh server has no series at all for any of
         // these until the first delivery fires, so absent()-based
         // alerting can't distinguish "not wired" from "no deliveries yet".

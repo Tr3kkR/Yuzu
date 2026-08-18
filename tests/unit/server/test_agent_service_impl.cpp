@@ -2423,3 +2423,34 @@ TEST_CASE("Register: notification fires once on first enrollment; webhook/offloa
         poll_deliveries([&] { return sinks.offloads->get_deliveries(off_id); }, /*min_count=*/2);
     CHECK(off_after_reauth.size() == 2);
 }
+
+// ── Metric: all 6 webhook/offload delivery counters pre-seeded to 0 ────────
+//
+// Mirrors server.cpp's ServerImpl constructor pre-seed block (the six
+// metrics_.counter(name) calls right after the six describe() calls,
+// server.cpp:~1614-1633) — same pattern as
+// test_principal_quota_chokepoint.cpp's preseed_quota_metric() helper.
+// Regression guard for the adversarial-review round-2 fix (bf5582461):
+// describe() alone only writes HELP/TYPE metadata, it does not materialize
+// a series, so before that fix a fresh server exposed none of these six
+// series until the first delivery incremented one - breaking absent()-based
+// alerting. This test does not construct a real ServerImpl (too heavyweight
+// for a unit test); it exercises the exact same describe()+counter() calls
+// against a bare MetricsRegistry.
+TEST_CASE("Webhook/offload delivery counters: all 6 pre-seeded to 0 at boot",
+          "[agent_service][issue3261][metrics]") {
+    yuzu::MetricsRegistry reg;
+    const char* names[] = {"yuzu_server_webhook_delivery_success_total",
+                           "yuzu_server_webhook_delivery_failed_total",
+                           "yuzu_server_webhook_delivery_dropped_total",
+                           "yuzu_server_offload_delivery_success_total",
+                           "yuzu_server_offload_delivery_failed_total",
+                           "yuzu_server_offload_delivery_dropped_total"};
+    for (const char* name : names) {
+        reg.describe(name, "test", "counter");
+        reg.counter(name);
+    }
+    for (const char* name : names) {
+        CHECK(reg.counter(name).value() == 0.0);
+    }
+}
