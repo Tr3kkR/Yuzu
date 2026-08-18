@@ -125,10 +125,21 @@ bool require_param(yuzu::CommandContext& ctx, std::string_view value,
 
 #if defined(_WIN32)
 // Same generous per-call wall-clock bound as kInteractionCmdDeadline below,
-// for the two PowerShell dialog sites (input/survey). These are interactive
-// (InputBox / WinForms) and can legitimately block on a user, so this is
-// deliberately long — it only fires on a genuinely wedged invocation.
+// for the single-field PowerShell InputBox site (input). Interactive and can
+// legitimately block on a user, so this is deliberately long — it only fires
+// on a genuinely wedged invocation.
 constexpr std::chrono::seconds kInteractionCmdDeadlineWin{120};
+
+// platform_survey builds ONE PowerShell script covering every question and
+// issues a single bounded call for the whole form (unlike the POSIX legs,
+// which loop and issue one osascript/zenity call PER question, so each
+// question implicitly gets its own fresh deadline). A multi-question form
+// can legitimately take a human several minutes combined to fill in, so this
+// gets its own, longer bound rather than reusing kInteractionCmdDeadlineWin
+// -- the pre-migration _popen call had no timeout at all here, so a bound
+// this tight would be a newly-introduced usability regression for a
+// legitimately slow-but-real multi-question response (Gate 4 finding F1).
+constexpr std::chrono::seconds kInteractionSurveyCmdDeadlineWin{600};
 
 // The stable, well-known location of Windows PowerShell 5.1 -- the only
 // candidate probed (ADR-3002 "tool path probing"): probe_tool_path()
@@ -797,7 +808,7 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
 
     auto res = yuzu::agent::run_bounded_subprocess(
         {ps_path, "-NoProfile", "-NonInteractive", "-Command", ps},
-        yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadlineWin});
+        yuzu::agent::SubprocessOptions{.deadline = kInteractionSurveyCmdDeadlineWin});
 
     // Consolidated runner-failure/exit-code decision (classify_windows_dialog_
     // capture, unit-tested): a killed-at-deadline dialog can still have
