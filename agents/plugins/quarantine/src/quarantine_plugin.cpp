@@ -571,7 +571,8 @@ struct WhitelistRead {
 // why this MUST stay ONE atomic `pfctl -f` call against the main
 // ruleset with `set skip on lo0` — never a named anchor.
 int macos_load_ruleset(yuzu::CommandContext& ctx, const std::vector<std::string>& whitelist_ips,
-                       int* rules_written_out, std::string* error_out) {
+                       int* rules_written_out, std::string* error_out,
+                       bool* pf_enable_failed_out = nullptr) {
     int rules_written = 0;
     std::string rules;
 
@@ -664,6 +665,14 @@ int macos_load_ruleset(yuzu::CommandContext& ctx, const std::vector<std::string>
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "quarantine:macos_load_ruleset pfctl -e failed to enable pf");
         }
+        // The ABI4 result seam above is the durable, server-persisted signal
+        // -- but it isn't the channel most customer-facing tooling parses
+        // (docs/user-manual/agent-plugins.md documents write_output's
+        // pipe-delimited fields as the contract). Surface it there too, via
+        // the out-param, so a caller that only reads stdout still learns
+        // the ruleset loaded but pf may not be enforcing it.
+        if (pf_enable_failed_out)
+            *pf_enable_failed_out = true;
     }
 
     *rules_written_out = rules_written;
@@ -676,11 +685,19 @@ int macos_quarantine(yuzu::CommandContext& ctx, const std::vector<std::string>& 
     // pfctl's load succeeds (see the rc check inside macos_load_ruleset).
     int rules_written = 0;
     std::string error;
-    if (macos_load_ruleset(ctx, whitelist_ips, &rules_written, &error) != 0) {
+    bool pf_enable_failed = false;
+    if (macos_load_ruleset(ctx, whitelist_ips, &rules_written, &error, &pf_enable_failed) != 0) {
         ctx.write_output(std::format("error|{}", error));
         return 1;
     }
-    ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_written));
+    if (pf_enable_failed) {
+        ctx.write_output(std::format(
+            "status|quarantined|rules_applied|{}|note|ruleset loaded but pf failed to enable "
+            "-- traffic may not actually be blocked, check agent logs",
+            rules_written));
+    } else {
+        ctx.write_output(std::format("status|quarantined|rules_applied|{}", rules_written));
+    }
     return 0;
 }
 
