@@ -333,8 +333,9 @@ against this branch before fixing:
   `test_guardian_spark_runtime.cpp` - only in comments and one test name) and via a
   stale cross-reference (this doc's own transcript block already showed the correct
   91 cases/1620 assertions while a prose line above it still said "90 cases / 1610").
-  Fixed: the Claims section intro, the red-then-green provenance paragraph, and the
-  ready-to-paste changelog sentence below now distinguish the empirically-pinned
+  Fixed: the Claims section intro, the "Provenance - what's measured vs what's
+  derived" paragraph, and the ready-to-paste changelog sentence below now distinguish
+  the empirically-pinned
   mechanism (sweep count, refresh timing, the jitter-floor case) from the arithmetic-
   derived daily totals - fjarvis's suggested framing, "derived bound, mechanism
   empirically pinned," adopted verbatim.
