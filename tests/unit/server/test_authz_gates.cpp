@@ -20,6 +20,7 @@
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "rbac_store.hpp"
 #include "tag_store.hpp"
 #include "test_api_token_pg_helper.hpp"  // ApiTokenStorePg
@@ -33,8 +34,6 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
-
-#include "pg/pg_raii.hpp"
 
 #include <libpq-fe.h>
 
