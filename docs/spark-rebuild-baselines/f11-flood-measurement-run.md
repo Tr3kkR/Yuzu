@@ -409,7 +409,11 @@ committed (adversarial-review workflow output, not repo content) - reproducible 
    - **Forward: a fresh rig session cannot close this on its own anymore** - the
      dispatch kill-switch defect needs an actual code fix (and review) before any
      live Guardian push, F11-related or not, can be expected to deliver anywhere.
-     File it separately, fix it, THEN re-attempt this live capture.
+     **Filed as #3265** (`bug`/`P0`/`reliability`/`ready-for-agent`) - fix it, THEN
+     re-attempt this live capture. Not shipped in any release (the regressing
+     commit is on `origin/dev` only, in no tag), so no released Yuzu build is
+     affected today - but any pilot/dev-rig on dev, or a future release cut before
+     #3265 lands, would be (governance Gate 6, enterprise-readiness, 2026-08-18).
 5. Re-verify the F5 config defaults cited here (`errored_refresh_ms`,
    `pending_demote_sweeps`, `pending_demote_ms`) have not changed before reusing these
    numbers in a later doc - they are cited by value, not by reference, in the "Claims"

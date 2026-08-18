@@ -197,12 +197,17 @@ clean up by hand (`Remove-Item -Recurse`, `Remove-Item -Path HKLM:\...\YuzuResGa
 
 ## Result table - original profile, paste into the flip PR as gate evidence
 
+**`cpu_pct` convention (restated here, not just in the .cpp header, since this table
+is where the raw CSV numbers actually get pasted, governance Gate 6/sre finding):**
+100% = one full core busy, unbounded above that (ps/top's per-process convention,
+NOT normalized by core count) - 250% means two and a half cores' worth of CPU time.
+
 | Metric | Legacy (`--spark-disable`) | Spark | Delta |
 |---|---|---|---|
 | Threads (steady-state) | | | |
 | Handles (steady-state) | | | |
 | RSS bytes (steady-state) | | | |
-| Idle CPU% (steady-state) | | | |
+| Idle CPU% (steady-state, ps/top convention - see above) | | | |
 | Wakeups/sec (steady-state) | | | |
 
 Report the Guardian-attributable delta separately from anything
