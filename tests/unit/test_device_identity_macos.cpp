@@ -99,3 +99,14 @@ TEST_CASE("parse_dsconfigad_show: label present but no '=' -> field not extracte
     CHECK(info.domain.empty());
     CHECK(info.ou.empty());
 }
+
+TEST_CASE("parse_dsconfigad_show: '=' present but value is blank -> NOT treated as bound "
+          "(CDX BR-009)",
+          "[device_identity][macos]") {
+    // A malformed/transient dsconfigad read (or a field present with an
+    // empty value) must not be read as proof of an AD bind -- an engaged-
+    // but-empty domain is not a real join.
+    auto info = parse_dsconfigad_show("Active Directory Domain =\nComputer Account = X\n");
+    CHECK_FALSE(info.ad_bound);
+    CHECK(info.domain.empty());
+}

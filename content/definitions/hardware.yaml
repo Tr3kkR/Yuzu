@@ -283,7 +283,7 @@ metadata:
   description: >
     Lists physical disk drives with model name, capacity in GB, media
     type (SSD/HDD/Removable), and interface type (SCSI, NVMe, SATA, USB).
-    Uses Win32_DiskDrive on Windows, lsblk on Linux, system_profiler on
+    Uses Win32_DiskDrive on Windows, native /sys/block on Linux, system_profiler on
     macOS.
   tags: [hardware, inventory, storage]
 

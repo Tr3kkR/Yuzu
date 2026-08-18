@@ -334,8 +334,13 @@ int do_bios(yuzu::CommandContext& ctx) {
     auto res = yuzu::agent::run_bounded_subprocess(
         {"/usr/sbin/system_profiler", "SPHardwareDataType"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(20)});
-    auto rom = res.tool_ran ? yuzu::hardware::macos::parse_boot_rom_version(res.output)
-                            : std::string{};
+    // A killed-at-deadline or capacity-truncated capture can still have
+    // tool_ran=true with partial/garbled text (SubprocessResult's own
+    // contract: "callers MUST check timed_out before trusting ... output").
+    // Treat either as no better than a failed run, same as tool_ran=false.
+    auto rom = (res.tool_ran && !res.timed_out && !res.output_truncated)
+                   ? yuzu::hardware::macos::parse_boot_rom_version(res.output)
+                   : std::string{};
     ctx.write_output("bios_vendor|Apple");
     ctx.write_output(std::format("bios_version|{}", rom.empty() ? "unknown" : rom));
     ctx.write_output("bios_date|N/A");
@@ -541,7 +546,11 @@ int do_memory(yuzu::CommandContext& ctx) {
         auto res = yuzu::agent::run_bounded_subprocess(
             {dmidecode_path, "-t", "memory"},
             yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10)});
-        if (res.tool_ran)
+        // A deadline/truncation partway through dmidecode's per-DIMM block
+        // stream can leave tool_ran=true over a partial device list -- treat
+        // that the same as a failed run (falls through to /proc/meminfo)
+        // rather than silently accepting a reduced RAM total.
+        if (res.tool_ran && !res.timed_out && !res.output_truncated)
             dimm_rows = yuzu::hardware::linuxutil::parse_dmidecode_memory(res.output);
     }
     if (!dimm_rows.empty()) {
@@ -663,7 +672,12 @@ int do_disks(yuzu::CommandContext& ctx) {
         {"/usr/sbin/system_profiler", "SPStorageDataType", "SPNVMeDataType",
          "SPSerialATADataType", "-json"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(20)});
-    auto sp_json = res.tool_ran ? res.output : std::string{};
+    // A killed-at-deadline or truncated capture would almost always fail
+    // JSON parsing anyway (macos_disk_rows_or_sentinel() already falls back
+    // to the sentinel on any parse error), but reject it explicitly here
+    // too rather than relying on that as the only safety net.
+    auto sp_json =
+        (res.tool_ran && !res.timed_out && !res.output_truncated) ? res.output : std::string{};
     for (const auto& row : yuzu::hardware::macos::macos_disk_rows_or_sentinel(sp_json)) {
         ctx.write_output(row);
     }

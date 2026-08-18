@@ -49,10 +49,29 @@ inline std::vector<std::string> parse_dmidecode_memory(const std::string& dmi) {
     auto emit_if_installed = [&]() {
         if (!in_device || size.empty() || size == "No Module Installed")
             return;
-        std::string size_mb = size;
+        // dmidecode's Size field is "<N> MB" / "<N> GB" / "<N> TB" -- the
+        // pre-Wave-3 code took the numeric prefix as-is and mislabeled GB/TB
+        // modules as MB (under-reporting by 1024x/1024^2x). Convert every
+        // unit to MB explicitly; an unrecognized/missing unit is skipped
+        // rather than silently mislabeled.
         auto sp = size.find(' ');
-        if (sp != std::string::npos)
-            size_mb = size.substr(0, sp);
+        if (sp == std::string::npos)
+            return;
+        std::string size_mb;
+        try {
+            unsigned long long value = std::stoull(size.substr(0, sp));
+            auto unit_start = size.find_first_not_of(' ', sp);
+            auto unit = unit_start == std::string::npos ? std::string{} : size.substr(unit_start);
+            if (unit == "GB")
+                value *= 1024ULL;
+            else if (unit == "TB")
+                value *= 1024ULL * 1024ULL;
+            else if (unit != "MB")
+                return;
+            size_mb = std::to_string(value);
+        } catch (...) {
+            return;
+        }
         std::string speed_mhz = speed;
         sp = speed.find(' ');
         if (sp != std::string::npos)
@@ -147,17 +166,24 @@ inline std::string rtrim(std::string s) {
 
 } // namespace detail
 
-// Builds "disk|idx|model|size_gb|disk|tran" rows from a caller-supplied list
-// of /sys/block entry names, using the injected accessors for every file
-// read. Size is now a byte-derived GiB integer (sectors x 512), normalizing
-// to the same unit the macOS (hardware_disks_macos.hpp) and Windows
-// (Win32_DiskDrive) legs already report -- lsblk's default SIZE column was a
-// human-readable string ("465.8G") with no equivalent from a raw sysfs read.
-// A device with no positive capacity is skipped, matching the macOS parser's
-// "no positive capacity -> skip this item" rule.
+// Builds "disk|idx|model|size_gb|media_type|tran" rows from a caller-supplied
+// list of /sys/block entry names, using the injected accessors for every
+// file read. Size is a sector-derived GiB integer (/sys/block/<n>/size is
+// always in 512-byte sectors regardless of the device's real block size,
+// per Documentation/ABI/stable/sysfs-block), normalizing to the same unit
+// the macOS (hardware_disks_macos.hpp) and Windows (Win32_DiskDrive) legs
+// already report -- lsblk's default SIZE column was a human-readable string
+// ("465.8G") with no equivalent from a raw sysfs read. Divides sectors
+// directly by sectors-per-GiB (rather than sectors*512 then /2^30) so a
+// device reporting nonsense-large sectors cannot wrap the intermediate
+// multiplication into a fabricated small capacity. A device with zero
+// sectors (no usable size read) is skipped; a genuinely sub-GiB device is
+// KEPT at size_gb=0 -- it is distinguishable from the do_disks() failure
+// sentinel ("disk|0|unknown|0|unknown|unknown") by a real model/name.
 inline std::vector<std::string> build_linux_disk_rows(
     const std::vector<std::string>& block_device_names, const ReadFileFn& read_file,
     const ReadLinkFn& read_link) {
+    constexpr unsigned long long kSectorsPerGiB = (1024ULL * 1024ULL * 1024ULL) / 512ULL;
     std::vector<std::string> rows;
     int idx = 0;
     for (const auto& name : block_device_names) {
@@ -173,16 +199,25 @@ inline std::vector<std::string> build_linux_disk_rows(
         }
         if (sectors == 0)
             continue;
-        const unsigned long long bytes = sectors * 512ULL;
-        const unsigned long long gb = bytes / (1024ULL * 1024ULL * 1024ULL);
-        if (gb == 0)
-            continue;
+        const unsigned long long gb = sectors / kSectorsPerGiB;
 
         auto model = detail::rtrim(read_file("/sys/block/" + name + "/device/model"));
         auto tran = detail::transport_from_symlink(read_link("/sys/block/" + name));
 
+        // Media type from the two dedicated sysfs attributes lsblk itself
+        // reads for TYPE/hotplug classification: `removable` (1 = hotpluggable
+        // media, e.g. USB) takes precedence over `rotational` (0 = SSD/flash,
+        // 1 = spinning HDD). Either file missing/unreadable (returns "") ->
+        // "unknown", never a guessed value.
+        auto removable = detail::rtrim(read_file("/sys/block/" + name + "/removable"));
+        auto rotational = detail::rtrim(read_file("/sys/block/" + name + "/queue/rotational"));
+        std::string media = removable == "1"   ? "Removable"
+                            : rotational == "0" ? "SSD"
+                            : rotational == "1" ? "HDD"
+                                                : "unknown";
+
         rows.push_back("disk|" + std::to_string(idx++) + "|" + (model.empty() ? name : model) +
-                        "|" + std::to_string(gb) + "|disk|" + tran);
+                        "|" + std::to_string(gb) + "|" + media + "|" + tran);
     }
     return rows;
 }

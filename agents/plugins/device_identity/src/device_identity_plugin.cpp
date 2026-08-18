@@ -35,6 +35,8 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+#include <icmp_probe.hpp> // yuzu::shared::AddrInfoGuard (move-only RAII owner for addrinfo*)
+
 #include "device_identity_macos.hpp"
 #endif
 
@@ -110,14 +112,21 @@ std::optional<std::vector<std::string>> sssd_list_domains_via_sdbus() {
     if (r < 0 || !reply)
         return std::nullopt;
 
-    if (sd_bus_message_enter_container(reply, SD_BUS_TYPE_ARRAY, "s") < 0)
+    // ListDomains returns an array of OBJECT PATHS ("ao"), one per configured
+    // domain (e.g. "/org/freedesktop/sssd/infopipe/Domains/example_2ecom") --
+    // NOT an array of domain-name strings ("as"). Reading "s" against an "ao"
+    // reply fails the container read on every conforming SSSD host, silently
+    // sending every real join through the sssd.conf fallback. This caller
+    // only needs "is the array non-empty" (the do_domain AD-join signal), so
+    // the path values themselves are never decoded into domain names.
+    if (sd_bus_message_enter_container(reply, SD_BUS_TYPE_ARRAY, "o") < 0)
         return std::nullopt;
     std::vector<std::string> domains;
-    const char* s = nullptr;
+    const char* path = nullptr;
     int rr;
-    while ((rr = sd_bus_message_read(reply, "s", &s)) > 0) {
-        if (s)
-            domains.emplace_back(s);
+    while ((rr = sd_bus_message_read(reply, "o", &path)) > 0) {
+        if (path)
+            domains.emplace_back(path);
     }
     sd_bus_message_exit_container(reply);
     if (rr < 0)
@@ -138,12 +147,14 @@ std::string local_fqdn() {
     struct addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_flags = AI_CANONNAME;
-    struct addrinfo* res = nullptr;
-    if (getaddrinfo(host, nullptr, &hints, &res) != 0 || res == nullptr)
+    struct addrinfo* raw_res = nullptr;
+    if (getaddrinfo(host, nullptr, &hints, &raw_res) != 0 || raw_res == nullptr)
         return {};
-    std::string fqdn = res->ai_canonname ? res->ai_canonname : host;
-    freeaddrinfo(res);
-    return fqdn;
+    // Adopt immediately -- a std::string allocation that throws between a
+    // successful getaddrinfo() and a manual freeaddrinfo() would otherwise
+    // leak the resolver's result list.
+    yuzu::shared::AddrInfoGuard res_guard(raw_res);
+    return res_guard.p->ai_canonname ? res_guard.p->ai_canonname : host;
 }
 #endif
 
@@ -254,7 +265,11 @@ int do_domain(yuzu::CommandContext& ctx) {
     auto res = yuzu::agent::run_bounded_subprocess(
         {"/usr/sbin/dsconfigad", "-show"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10)});
-    if (res.tool_ran) {
+    // A killed-at-deadline or truncated capture can leave tool_ran=true over
+    // partial/garbled text; treat that the same as a failed run (falls
+    // through to the hostname-suffix fallback below) rather than trusting a
+    // truncated dsconfigad parse.
+    if (res.tool_ran && !res.timed_out && !res.output_truncated) {
         auto info = yuzu::device_identity::macos::parse_dsconfigad_show(res.output);
         if (info.ad_bound) {
             ctx.write_output(std::format("domain|{}", info.domain));
@@ -313,7 +328,11 @@ int do_ou(yuzu::CommandContext& ctx) {
         auto res = yuzu::agent::run_bounded_subprocess(
             {realm_path, "list"},
             yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10)});
-        if (res.tool_ran)
+        // A killed-at-deadline or truncated capture can leave tool_ran=true
+        // over partial/garbled text; treat that the same as a failed run
+        // (falls through to the sssd.conf fallback below) rather than
+        // risking a truncated OU match.
+        if (res.tool_ran && !res.timed_out && !res.output_truncated)
             realm_out = res.output;
     }
     // Try realm list for OU
@@ -367,7 +386,8 @@ int do_ou(yuzu::CommandContext& ctx) {
     auto res = yuzu::agent::run_bounded_subprocess(
         {"/usr/sbin/dsconfigad", "-show"},
         yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10)});
-    if (res.tool_ran) {
+    // Same completeness gate as do_domain's dsconfigad call above.
+    if (res.tool_ran && !res.timed_out && !res.output_truncated) {
         auto info = yuzu::device_identity::macos::parse_dsconfigad_show(res.output);
         if (!info.ou.empty()) {
             ctx.write_output(std::format("ou|{}", info.ou));

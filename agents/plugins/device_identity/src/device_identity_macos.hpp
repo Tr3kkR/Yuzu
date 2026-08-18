@@ -58,7 +58,7 @@ inline std::optional<std::string> extract_field(std::string_view text, std::stri
 // binding carries no domain line surviving this parse.
 inline DsconfigadInfo parse_dsconfigad_show(std::string_view text) {
     DsconfigadInfo info;
-    if (auto d = detail::extract_field(text, "Active Directory Domain")) {
+    if (auto d = detail::extract_field(text, "Active Directory Domain"); d && !d->empty()) {
         info.domain = *d;
         info.ad_bound = true;
     }
