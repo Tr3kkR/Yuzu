@@ -594,10 +594,13 @@ Whichever PR flips `prefer_spark` MUST also:
    is meaningless). This also closes item 14 (see its note).
 7. **Run chaos scenario CH-5** (live-event latency under KvStore contention, UAT rig). It is
    the only scenario that measures the thing C0 was built to fix, so it is the flip's genuine
-   go/no-go rather than a formality. Run it at the journal's HARD ceiling (2000 batches /
-   64 MiB), not at the ~900 measured so far (Gate 6 sre): a full scan already exceeded one
-   second at 900, so the pass duration - not `kGuardianMinRefillInterval` - is what actually
-   paces chained forced pages during a large-backlog recovery.
+   go/no-go rather than a formality. Run it at ~~the journal's HARD ceiling (2000 batches /
+   64 MiB)~~ **the journal's SHIPPED caps (1000 batches / 32 MiB, `kMaxJournalBatches`/
+   `kMaxJournalBytes`) - ruled 2026-08-18 (Dave): the "2000/64 MiB" figure was stale text
+   predating the finalized caps, not a deliberate 2x stress margin; see item 9's resolved
+   open question below**, not at the ~900 measured so far (Gate 6 sre): a full scan already
+   exceeded one second at 900, so the pass duration - not `kGuardianMinRefillInterval` - is
+   what actually paces chained forced pages during a large-backlog recovery.
 8. ~~Persist pending lifecycle records BEFORE the drain-worker join~~ - **DONE (round 6,
    commit 882e2bf5)**,
    not deferred. Gate 6 compliance and Gate 8 security both declined the "or risk-accept"
@@ -659,13 +662,19 @@ Whichever PR flips `prefer_spark` MUST also:
      fail on. This is an agent-count check, not a batch-count equality - CH-11's
      scenario doesn't (and per the gauge's shape, can't) support asserting an exact
      per-batch count.
-   **Open question, flagged rather than resolved here:** item 7 above says to run
+   ~~**Open question, flagged rather than resolved here:** item 7 above says to run
    CH-5 at "the journal's HARD ceiling (2000 batches / 64 MiB)", double the shipped
    caps this threshold section derives from (1000 batches / 32 MiB,
    `kMaxJournalBatches`/`kMaxJournalBytes`). Unclear from the code alone whether
    2000/64 MiB is a deliberate 2x stress margin for the chaos run or stale text from
    before the caps were finalized - flagging for confirmation before CH-5 runs
-   rather than silently picking one reading.
+   rather than silently picking one reading.~~ - **RESOLVED 2026-08-18 (Dave, F11
+   #2298): confirmed stale text, not a deliberate margin. CH-5 runs at the shipped
+   caps (1000 batches / 32 MiB) - the thresholds above are internally consistent
+   with that reading and need no re-derivation. Item 7 updated to match.**
+
+   Thresholds themselves also **CONFIRMED 2026-08-18 (Dave)** as posted above
+   (including the 2026-08-10 per-agent-attribution correction) - stand as written.
    Posted for confirmation: issue #2364 and the #2340 chaos-campaign issue (CH-11).
 10. ~~**Make the replay pass lazy-parse** (Gate 3 performance, measured). `page_into_window` and
     `prune` both parse the ENTIRE journal before applying the 128-candidate cap: ~680 ms and
