@@ -276,7 +276,7 @@ Not implemented. Legacy reverse lookup on IP addresses.
 
 ### 4.10 ARP Scanning (Subnet Discovery) :white_check_mark: `T3`
 
-`discovery` plugin with `scan_subnet` action. ARP scan + ping sweep of a CIDR subnet to find hosts. Returns IP, MAC address, hostname, and managed/unmanaged status. Cross-platform: arp table parsing + ping sweep via subprocess. Input validation prevents command injection on CIDR parameter.
+`discovery` plugin with `scan_subnet` action. ARP scan + ping sweep of a CIDR subnet to find hosts. Returns IP, MAC address, hostname, and managed/unmanaged status. Cross-platform: native ARP-table acquisition (`GetIpNetTable2` on Windows, `/proc/net/arp` on Linux, the routing-socket `sysctl` on macOS) + an unprivileged ICMP ping sweep — no subprocess spawn on any platform (Wave 2, ADR-3002). Input validation prevents command injection on CIDR parameter.
 
 ### 4.11 Port Scanning :x: `T3`
 
