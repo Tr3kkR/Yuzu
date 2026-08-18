@@ -339,6 +339,12 @@ against this branch before fixing:
   derived daily totals - fjarvis's suggested framing, "derived bound, mechanism
   empirically pinned," adopted verbatim.
 
+`resource_sampler.cpp`'s fix compiled clean on DGRHP (MSVC 19.44.35227, `cl.exe /EHsc
+/std:c++20 /W4`, per `stage11-resource-gate-runbook.md` Step 1) - no warnings, no
+diagnostics for either changed function. Stated here rather than left implicit: this
+file is Windows-only and not meson-wired, so it is never CI-compiled - this was a
+one-off manual verification of this specific fix, not a standing check.
+
 ## Ready-to-paste F14 flip-changelog sentence
 
 > Guardian's `guard.unhealthy` wire traffic for a stuck-Unknown rule is bounded at
