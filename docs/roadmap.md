@@ -240,7 +240,7 @@ Server-side aggregation of response data. Support group-by columns with `count`,
 ### Issue 1.5: Device Tagging System :white_check_mark:
 **Capabilities:** 3.10, 3.6, 3.7 | **Scope:** Server + Agent | **Status:** Done
 
-`TagStore` with SQLite backend. `DeviceTag` struct: agent_id, key, value, source (agent/server/api), updated_at. Validation: key max 64 chars `[a-zA-Z0-9_.:-]`, value max 448 bytes. Agent tag sync from heartbeat. `agents_with_tag()` for scope queries. Device criticality (3.6) and location (3.7) implemented as special-purpose tags.
+`TagStore` on the PostgreSQL substrate (ADR-0050, schema `tag_store`). `DeviceTag` struct: agent_id, key, value, source (agent/server/api/mcp), updated_at. Validation: key max 64 chars `[a-zA-Z0-9_.:-]`, value max 448 bytes. Agent tag sync from heartbeat. `agents_with_tag()` for scope queries. Device criticality (3.6) and location (3.7) implemented as special-purpose tags.
 
 **Files:** `server/core/src/tag_store.hpp`, `server/core/src/tag_store.cpp`, `agents/plugins/tags/src/tags_plugin.cpp`
 

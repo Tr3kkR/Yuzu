@@ -1449,6 +1449,107 @@ bookkeeping's storage substrate changes. `POST /api/v1/quarantine` and
 `DELETE /api/v1/quarantine/{agent_id}`'s request/response shapes, and the MCP
 `quarantine_device` tool's ticket-then-recall approval flow, are unchanged.
 
+## Device tags migrate to Postgres (mandatory backfill, TagStore, ADR-0050)
+
+The `TagStore` — device tags behind `GET/PUT/DELETE /api/v1/tags`, the legacy
+`/api/tags*` routes, the MCP `get_tags`/`set_tag`/`delete_tag`/`search_agents_by_tag`
+tools, and every `tag:<key>` scope expression — moves from the SQLite `tags.db` file
+to the server's PostgreSQL substrate in this release (ADR-0006 Wave 2 batch 3),
+schema `tag_store`, on the existing shared pool. Tags are **dispatch-critical**:
+scope expressions decide which agents a command reaches, and service-scoped API
+tokens are confined by the `service` tag — which is why every failure mode below
+fails closed rather than degrading silently.
+
+**Before you upgrade**, sanity-check the legacy `tags.db` so a refusal surfaces in a
+planning window, not a maintenance one:
+
+```bash
+# Row count — sets the expectation for backfill duration (see below).
+sqlite3 /path/to/tags.db "SELECT count(*) FROM tags;"
+
+# updated_at must be INTEGER epoch seconds; TEXT/NULL values refuse the boot
+# (a structurally-wrong column would silently corrupt conflict ordering).
+sqlite3 /path/to/tags.db \
+  "SELECT agent_id, key, typeof(updated_at) FROM tags WHERE typeof(updated_at) != 'integer' LIMIT 5;"
+```
+
+- **What is preserved:** every tag row from every source — operator/dashboard
+  (`api`), MCP (`mcp`), server-internal (`server`), and agent-self-reported
+  (`agent`) — with its value, source, and `updated_at`. Agent-sourced tags would
+  also re-sync on each agent's next Register, but they are backfilled anyway so
+  `tag:`-scoped targeting has no gap between cutover and the fleet's next
+  Register cycle.
+- **Fail-closed boot, retried each start.** A backfill that cannot complete —
+  unreadable/corrupt `tags.db`, a non-INTEGER `updated_at` column, a Postgres
+  write error, a fingerprint mismatch, or a row-direction conflict (below) —
+  **refuses the boot** and retries on the next start. Under systemd this looks
+  like a restart loop ending in `failed` once `StartLimitBurst` is hit; the boot
+  log's `TagStore: migrate_from_sqlite:` lines carry the specific refusal, and
+  `docs/ops-runbooks/tag-store-backfill-recovery.md` maps each message to its
+  recovery.
+- **Backfill duration is unbounded and latency-driven — the orchestrator budget
+  is the real constraint.** The backfill inserts row-by-row (roughly two
+  database round trips per row) inside one transaction. No overall time limit
+  applies: the transaction's named 60 s bound covers only the wait to obtain a
+  pool connection, and the fixed 30 s per-statement limit is never approached
+  by single-row operations — so a large `tags.db` produces a LONG first boot,
+  not an automatic abort. Estimate: `row count × 2 × your server↔Postgres
+  round-trip latency` (10k rows ≈ seconds on a local/LAN database; at 1 ms
+  RTT, ~100k rows ≈ several minutes). **The actual oversized-file failure mode
+  is your orchestrator killing the server mid-backfill** (systemd start limits,
+  Kubernetes `startupProbe`, compose healthcheck `start_period`) — which is
+  safe (nothing commits; the next boot retries whole) but loops until the
+  budget is widened. So: check the row count pre-upgrade, widen the startup
+  budget to cover the estimate with margin, and test the upgrade against a
+  staging copy if the estimate is more than a couple of minutes.
+- **Fingerprint-verified, not marker-only** (the `DiscoveryStore`/`QuarantineStore`
+  shape — see those sections for the full multi-replica rationale): a later-booting
+  replica still holding its own `tags.db` verifies the file's content against the
+  recorded fingerprint before trusting an already-set completion marker, and a
+  `HOLDER-SIDE VERIFICATION FAILED` refusal means an operator decides which
+  replica's tags are authoritative — never force-boot around it.
+- **Direction-aware row conflicts (new in this store).** If Postgres already holds
+  a row for the same `(agent, key)` — a partial prior run, a concurrent replica,
+  or a rollback-then-roll-forward cycle — the backfill compares `updated_at`:
+  Postgres strictly ahead or identical is a benign skip; the LEGACY side strictly
+  ahead (or tied with different content) **refuses the boot**, because the legacy
+  file demonstrably holds a later write that silently keeping Postgres's value
+  would discard. **Treat this refusal as a data-integrity incident, not an
+  availability one** — the currently-served tag data may be the wrong side of an
+  operator-authored-data race; verify which side is authoritative (the log names
+  the exact row and both sides) before clearing anything.
+- **Legacy file moved aside after a verified backfill** (`tags.db.migrated-<epoch>`),
+  same one-release rollback window and re-verification semantics as the sibling
+  stores.
+
+**Operator-visible behaviour changes (fail-closed reads/writes).**
+
+- A degraded tag store now returns **503** (`retry_after_ms: 5000`) on the tag
+  REST surfaces and `-32603` on the MCP tools — never an empty tag list, a false
+  `deleted:false`, or a silent `200` over a failed write (the legacy
+  `POST /api/tags/set` previously reported `ok` even when nothing was written).
+  A caller whose error handling treats `400` as "don't retry" should treat these
+  `503`s as retryable.
+- A `tag:<key>`-scoped dispatch **fails the whole evaluation** on a degraded tag
+  read — the operation errors rather than reaching fewer or more devices than
+  the expression names. Watch `yuzu_server_tag_store_read_degrade_total{reason}`
+  (alert `YuzuTagStoreReadDegraded`): while it fires, the policy evaluator is
+  also silently skipping `tag:`-scoped checks (`last_check_at` stops advancing).
+- Agent tag syncs are bounded: an agent reporting more than 256 tags in one
+  Register has the sync refused whole (logged; the agent keeps its prior tag
+  set). Realistic agents report 5–20. If an agent legitimately exceeds the
+  cap, reduce what it self-reports (its `scopable_tags` come from the agent's
+  own configuration/plugins) — there is no server-side override knob; treat a
+  sustained refusal in the server log as an agent-configuration defect.
+
+**Verify:** after the server reports ready, `GET /api/v1/tags?agent_id=<id>` (or
+the device page) shows the same tags as before the upgrade, and
+`SELECT count(*) FROM tag_store.tags;` against Postgres matches
+`sqlite3 tags.db.migrated-<epoch> "SELECT count(*) FROM tags;"`.
+`yuzu_server_tag_store_backfill_total{result="success"}` confirms the backfill
+outcome (alert `YuzuTagStoreBackfillNotCompleted` keys on the ABSENCE of a
+success/fresh sample — a refused boot never serves `/metrics` at all).
+
 ## Upgrade Order
 
 Always upgrade in this order:

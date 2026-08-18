@@ -19,13 +19,24 @@
 
 namespace yuzu::server::mcp {
 
-// The (tool, securable, operation) dispatch rows from the internal kToolSecurity
-// map, so the annotation cross-check test can assert readOnlyHint/destructiveHint
-// against the dispatch class without duplicating the map.
+// Mirrors the internal `ServiceScopeClass` enum in mcp_server.cpp (#2298 PR 3
+// §3c) — same lockstep-via-exhaustive-switch shape as `ToolClassForTest`
+// below; the internal enum stays TU-private with the table it classifies.
+enum class ServiceScopeClassForTest {
+    kDenied,
+    kConfined,
+    kGlobalSafe,
+};
+
+// The (tool, securable, operation, service_scope) dispatch rows from the
+// internal kToolSecurity map, so the annotation cross-check test can assert
+// readOnlyHint/destructiveHint against the dispatch class without
+// duplicating the map.
 struct ToolSecurityRow {
     std::string_view name;
     std::string_view securable;
     std::string_view operation;
+    ServiceScopeClassForTest service_scope;
 };
 std::vector<ToolSecurityRow> tool_security_rows_for_test();
 
@@ -61,11 +72,16 @@ ToolClassForTest classify_tool_for_test(const std::string& tool_name,
                                         const std::vector<std::string>& known_tools,
                                         const std::vector<std::string>& registered_tools);
 
-// Owning-string (name, securable, operation) row for synthetic validator input.
+// Owning-string (name, securable, operation, service_scope) row for
+// synthetic validator input. `service_scope` defaults to `kDenied` so
+// existing/#2383-only test call sites that build this struct without
+// naming it keep working unchanged — matching production's `ToolSecurity`
+// default member initializer.
 struct ToolSecurityRowOwned {
     std::string name;
     std::string securable;
     std::string operation;
+    ServiceScopeClassForTest service_scope = ServiceScopeClassForTest::kDenied;
 };
 
 // Owning-string (name, input_schema_json) row for the validator's 4th raw

@@ -70,7 +70,7 @@ private helpers). Site-level transcription is #2380's first work item —
 these rows are pointers, not evidence.
 
 **Raw `popen`/`system` helpers:** antivirus, bitlocker,
-device_identity, discovery, event_logs, firewall, hardware, installed_apps,
+device_identity, event_logs, firewall, hardware, installed_apps,
 ioc, license_scan, network_actions, network_config,
 network_diag, os_info, processes, quarantine, sccm, services,
 software_actions, tar, vuln_scan, wifi, windows_updates, wol.
@@ -93,6 +93,10 @@ were already on the runner and are unchanged, except the Linux zenity
 nested-shell `__RC=$?` exit-code protocol is removed — the runner already
 returns a real exit code — all five interaction sites, Windows and POSIX,
 are transcribed under Registered sites above).
+
+**Migrated off raw spawn (Wave 2, PR2.1c):** `discovery` (0 spawn sites, was
+5 — GetIpNetTable2/`/proc/net/arp`/sysctl ARP + a shared `IcmpSession`
+sweep; no manifest rows since none survive).
 
 **Direct exec via private helpers:** script_exec, content_dist, filesystem
 (filesystem is fully migrated onto the runner on the #2321 branch).
