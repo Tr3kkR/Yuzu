@@ -14,6 +14,17 @@
 /// directly in auth_routes.hpp only to keep `ListAuthority`'s definition
 /// (and its `AuthRoutes`-only construction) out of that already-large header.
 ///
+/// Names carry the split deliberately: `require_fleet_read` is
+/// self-sufficient — it decides the management-group axis itself, a caller
+/// does not additionally gate on `require_permission` for the same
+/// `(securable_type, operation)` (see its own doc comment for why pairing
+/// them is the exact bug this gate exists to not repeat). `confine_agent_target`
+/// is confinement-axis ONLY — it does not decide RBAC at all, and a caller
+/// must pair it with `require_scoped_permission` to get a full authority
+/// decision. `authorize_*` was tried first and dropped (fjarvis/Kimi K2.7,
+/// PR #3216 follow-up review) because it reads as a complete authority
+/// verdict for both, which is only true of the first.
+///
 /// PHASE 0 (this PR): wired, tested, called by NO route. The default-deny
 /// flip that starts routing traffic through these lives in a later PR.
 namespace yuzu::server {
@@ -22,19 +33,26 @@ class AuthRoutes;
 
 namespace yuzu::server::authz {
 
-/// Why `authorize_fleet_read` did not produce a `ListAuthority`.
+/// Why `require_fleet_read` did not produce a `ListAuthority`. This is
+/// structural bookkeeping, not a caller dispatch surface — every failure
+/// path has already written `res` itself before returning one of these; a
+/// caller must not re-decode a `GateFailure` into a status code of its own.
 enum class GateFailure : std::uint8_t {
-    Forbidden, ///< 403 — the management-group axis returned DenyAll (a real
-               ///< deny OR a store/mgmt-store error; see rbac_store.hpp's
-               ///< `authorize_list_read` doc — the promise is deliberately
-               ///< weakened here rather than adding a discriminator).
-    Degraded,  ///< 503 — the service-scope axis's tag-store lookup failed
-               ///< (null `tag_store_`, or a degraded/failed query). Distinct
-               ///< from Forbidden because it is retryable.
+    Unauthenticated, ///< 401 — `require_auth` failed and already wrote the
+                     ///< response.
+    Forbidden,       ///< 403 — a real deny: the management-group axis
+                     ///< returned a genuine `ListReadDecision::DenyAll` (may
+                     ///< still mask an in-query store error —
+                     ///< `authorize_list_read`'s own documented weakening,
+                     ///< see rbac_store.hpp; unchanged here).
+    Degraded,        ///< 503 — infrastructure unavailable, retryable: a
+                     ///< null/not-open RBAC store, or the service-scope
+                     ///< axis's tag-store lookup failing (null `tag_store_`,
+                     ///< or a degraded/failed query).
 };
 
 /// Move-only witness over an already-composed `VisibleSet` — the product of
-/// `AuthRoutes::authorize_fleet_read`. `in_scope`/`filter` are the only
+/// `AuthRoutes::require_fleet_read`. `in_scope`/`filter` are the only
 /// operations exposed on the witness itself.
 ///
 /// Ergonomic, not structural: the stores this wraps still accept ordinary

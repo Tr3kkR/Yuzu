@@ -92,12 +92,12 @@ duplicates.
 | antivirus | ✅ | ✅ | ✅ | Defender/WMI · ClamAV+Falcon+Sophos · macOS real probes — XProtect bundle version + endpoint-security system-extension enumeration (`antivirus_plugin.cpp`, parsers `antivirus_parsers.hpp`), no longer a hardcoded assertion (posture depth: the **Antivirus posture** row) |
 | asset_tags | ✅ | ✅ | ✅ | portable — `std::filesystem` only |
 | bitlocker | ✅ | ✅ | ✅ | BitLocker `manage-bde` · LUKS `cryptsetup` · FileVault `fdesetup` + per-APFS-volume `diskutil apfs list` (encrypted/not_encrypted/unknown, parser `bitlocker_macos_apfs.hpp`) |
-| certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
+| certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); Linux now parses in-process via libcrypto (rung 1); macOS System/SystemRoot keychains read natively via SecItem (rung 1), login keychain stays on its registered Decision-7 governed-shell path; macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
 | chargen | ✅ | ✅ | ✅ | portable — RFC 864 generator |
 | content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS |
 | device_identity | ✅ | ✅ | ✅ | all three branches implemented |
 | diagnostics | ✅ | ✅ | ✅ | portable — `std::filesystem` checks |
-| discovery | ✅ | ✅ | ✅ | all three branches implemented |
+| discovery | ✅ | ✅ | ✅ | all three legs are native (`GetIpNetTable2` / `/proc/net/arp` / sysctl routing table), and the sweep uses a shared unprivileged ICMP socket, constrained on Linux by `net.ipv4.ping_group_range` |
 | disk_space | ✅ | ✅ | ✅ | linux/apple/win branches; `#else` unsupported only |
 | event_logs | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `log show` now runs under the bounded `SubprocessRunner` with a hard wall-clock deadline (no built-in timeout in the tool), classified by pure `event_logs_macos.hpp` (`decide_log_show_output`) — a timed-out/degraded run surfaces a sentinel row + non-zero rc, never a silent empty result |
 | example | ✅ | ✅ | ✅ | portable — sample plugin |
@@ -214,13 +214,13 @@ implementation is.
 | bitlocker | state | linux | supported | 3 | lsblk+cryptsetup | - |
 | bitlocker | state | macos | supported | 3 | fdesetup+diskutil | - |
 | bitlocker | state | windows | supported | 3 | manage_bde | - |
-| certificates | list | linux | supported | 3 | openssl x509 via governed shell runner | - |
-| certificates | list | macos | supported | 3 | security find-certificate with login shell fallback | - |
+| certificates | list | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
+| certificates | list | macos | supported | 3 | SecItem (System/root, in-process) + security find-certificate via governed shell (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo ~user hop (Decision-7 governed-shell exception) |
 | certificates | list | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
-| certificates | details | linux | supported | 3 | openssl x509 via governed shell runner | - |
-| certificates | details | macos | supported | 3 | security find-certificate with login shell fallback | - |
+| certificates | details | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
+| certificates | details | macos | supported | 3 | SecItem (System/root, in-process) + security find-certificate via governed shell (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo ~user hop (Decision-7 governed-shell exception) |
 | certificates | details | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
-| certificates | delete | linux | supported | 3 | openssl lookup via governed shell + filesystem remove | - |
+| certificates | delete | linux | supported | 1 | libcrypto X509 lookup + filesystem remove | - |
 | certificates | delete | macos | constrained | 2 | security delete-certificate via subprocess runner | SystemRootCertificates.keychain is sealed under SIP and rejected outright; only System/MY store deletes are supported |
 | certificates | delete | windows | supported | 1 | CryptoAPI (CertDeleteCertificateFromStore) | - |
 | chargen | chargen_start | linux | supported | 1 | in-process | - |
@@ -262,9 +262,9 @@ implementation is.
 | diagnostics | connection_info | linux | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
 | diagnostics | connection_info | macos | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
 | diagnostics | connection_info | windows | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
-| discovery | scan_subnet | linux | supported | 3 | arp table + ping sweep via popen/system() | - |
-| discovery | scan_subnet | macos | supported | 3 | arp table + ping sweep via popen/system() | - |
-| discovery | scan_subnet | windows | supported | 3 | GetIpNetTable + ping sweep via system() | - |
+| discovery | scan_subnet | linux | constrained | 1 | /proc/net/arp + unprivileged SOCK_DGRAM ICMP | the ICMP sweep needs net.ipv4.ping_group_range to admit the agent's gid; ARP-only results with a CONSTRAINED/PARTIAL status otherwise, or UNAVAILABLE/PARTIAL when the ICMP socket cannot be created at all. netlink RTM_GETNEIGH is a recorded future promotion over /proc/net/arp |
+| discovery | scan_subnet | macos | supported | 1 | sysctl NET_RT_FLAGS/RTF_LLINFO + SOCK_DGRAM ICMP | - |
+| discovery | scan_subnet | windows | supported | 1 | GetIpNetTable2 + IcmpSendEcho | - |
 | disk_space | free | linux | supported | 1 | statvfs(2) | - |
 | disk_space | free | macos | supported | 1 | statfs(2) | - |
 | disk_space | free | windows | supported | 1 | GetDiskFreeSpaceExW | - |
