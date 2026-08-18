@@ -155,13 +155,16 @@ for "did not start" warnings per-guard before trusting a sample).
 **Pre-register expected counts before sampling** (production defaults: `errored_refresh_ms`
 = 300 000 ms, `pending_demote_sweeps` = 12 @ 5 s priority-lane cadence = demotion at
 t=60 s, then registry's 60 s type-lane cadence): over a 30-minute (1800 s) window, each
-registry rule should show 1 edge + ~5 refreshes (refreshes recur every 300 s once past
-the errored_refresh_ms floor; first refresh lands at t=300 s from the edge, so 5 land by
-t=1800 s), `priority_demoted` should read 1 per rule once past t=60 s. File rules follow
-the same demotion timing (the priority lane is type-agnostic) but land on the 600 s file
-cadence afterward — expect 1 edge + ~2 refreshes in the same window (every post-demotion
-sweep refreshes on that lane, since 600 s > the 300 s floor; see the F11 run doc for the
-exact code-path derivation).
+registry rule should show 1 edge + 5 refreshes at t=300/600/900/1200/1500s, plus a 6th
+refresh if the sample captures the inclusive t=1800s boundary itself (refreshes recur
+every 300 s once past the errored_refresh_ms floor, first landing at t=300 s from the
+edge — don't treat a 6th refresh at the exact window edge as suspicious), `priority_demoted`
+should read 1 per rule once past t=60 s. File rules follow the same demotion timing (the
+priority lane is type-agnostic) but land on the 600 s file cadence afterward, subject to
+the scheduler's default +/-20% jitter (spacing anywhere from 480s-720s, never below
+300s so still refreshing on every sweep) — expect 1 edge + 2-3 refreshes in the same
+window (2 at exact 600s cadence, up to 3 under jitter; see the F11 run doc's corrected
+Claims section for the full-day worst-case derivation, 180/day not 144/day).
 
 ## Step 4 — sample
 

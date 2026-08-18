@@ -1,8 +1,10 @@
 # F11 — flood measurement + token-bucket disposition, recorded run
 
-Captured 2026-08-18, branch `feat/2298-f11-flood-measurement`, commit `fe69588ca` (the
-flood-measurement test commit; supersession/doc commits after it do not touch the
-measured code). Authority: D1 ruling 2026-08-05 (port-lite: commit the harness, record
+Captured 2026-08-18, branch `feat/2298-f11-flood-measurement`. Initial measurement at
+commit `fe69588ca`; **corrected after an adversarial review (Kimi + Codex, both
+independently) found the original file-lane figure ignored production scheduler
+jitter** — see "Adversarial review" below and the file-lane correction in Claims.
+Authority: D1 ruling 2026-08-05 (port-lite: commit the harness, record
 one worst-case run, replace the stale extrapolation) + `docs/adr/0021-spark-reflex-
 architecture.md`. Companion doc: `stage11-resource-gate-runbook.md` (build/run
 mechanics). Confirms/replaces the ~17k/day figure in
@@ -40,12 +42,30 @@ Measured, at production Config defaults, once a never-Known rule is past demotio
   exactly every `errored_refresh_ms` (measured: first refresh lands at t=300s post-edge,
   keyed off the LAST emission, not re-armed by demotion); 300s divides 86,400s evenly
   86,400 / 300 = 288 times/day.
-- **600s-cadence lane (file): 1 edge + 144 refreshes/rule/agent/day.** Same demotion
-  timing (the priority lane is type-agnostic). Once on the 600s file-lane cadence,
-  EVERY post-demotion sweep refreshes — the lane's own cadence (600s) already exceeds
-  the 300s refresh floor, so there is no suppression window at all on this lane; rate =
-  1/lane_period = 86,400 / 600 = 144/day.
-- Both figures are **roughly 60-120x below the pre-fix ~17k/day** extrapolation in
+- **600s-cadence lane (file): 1 edge + 144 refreshes/rule/agent/day AT EXACT
+  600s CADENCE (no scheduler jitter) — NOT the production ceiling; see the correction
+  below.** Same demotion timing (the priority lane is type-agnostic). Once on the
+  600s file-lane cadence, EVERY post-demotion sweep refreshes — the lane's own cadence
+  (600s) already exceeds the 300s refresh floor, so there is no suppression window at
+  all on this lane; rate = 1/lane_period = 86,400 / 600 = 144/day.
+- **CORRECTION (2026-08-18, adversarial review — Kimi + Codex both found this
+  independently): the true production file-lane ceiling is 1 edge + 180
+  refreshes/rule/agent/day, not 144.** `ConvergenceScheduler::Config` defaults
+  `jitter_pct=20` and `jittered()` draws a SYMMETRIC `base_ms + uniform(-span, +span)`
+  perturbation (`guardian_convergence_scheduler.cpp:59-69`) — an earlier version of
+  this doc claimed jitter "only ever pushes a sweep LATER, never earlier," which is
+  flatly false; the draw is symmetric and CAN shorten the interval. The minimum
+  possible file-lane sweep spacing is therefore `600s x (1-0.20) = 480s`; since 480s
+  still exceeds the 300s `errored_refresh_ms` floor, every such sweep still refreshes
+  (proven empirically, not just derived — see the fourth F11 Catch2 case, "file lane
+  at the scheduler-jitter floor (480s)"), giving a true worst-case rate of
+  `86,400 / 480 = 180/day`. The 60s-lane figure (288/day) is UNAFFECTED by this
+  correction: it is bounded by the 300s refresh floor itself, not by sweep cadence, so
+  shortening the already-sub-floor 60s lane's spacing changes nothing. **Use 180/day,
+  not 144/day, as the file-lane production ceiling in any downstream citation
+  (changelog, flip PR, fleet-ingest capacity planning).**
+- Both corrected figures (288/day, 180/day) are **roughly 60-95x below the pre-fix
+  ~17k/day** extrapolation in
   `docs/spark-stage2-guardian-consumer-design.md`'s "cutover-blocking finding (Fable
   M1)" section — see that doc's 2026-08-18 addendum for the corrected attribution:
   edge emission (`b30e93cfd`, 2026-07-20) already reduced the flood to zero
@@ -207,21 +227,58 @@ throwaway Postgres container removed. Nothing from this window was committed.
   errored/flood path this doc measures at all. The service lane shares the
   registry lane's 60s cadence, so no coverage is lost by this omission, but no
   service-specific number was captured (there is nothing to capture).
-- **No claim that jitter is accounted for.** `ConvergenceScheduler::Config::jitter_pct`
-  (default 20%) stretches real inter-sweep spacing; the figures above assume exact
-  cadence. Jitter only ever pushes a sweep LATER, never earlier, so 288/day and 144/day
-  are upper bounds (ceilings), not floors — the real fleet-observed rate will be at or
-  below these numbers, never above.
+- **Jitter IS now accounted for (corrected 2026-08-18, see the Claims section).** An
+  earlier version of this bullet claimed jitter only stretches inter-sweep spacing
+  later, never earlier — that was wrong: `jittered()`'s perturbation is symmetric
+  (`base_ms + uniform(-span, +span)`), so it can shorten spacing too. 288/day (60s
+  lanes) is unaffected — it is bounded by the 300s refresh floor regardless of sweep
+  cadence. 180/day (file lane, corrected from the no-jitter 144/day) IS the honest
+  ceiling once the symmetric jitter is accounted for, per the fourth Catch2 case.
 - **No claim about the pre-demotion (0-60s) window's read cost**, only its (zero) wire
   cost. 12 priority-lane reads at 5s cadence happen regardless of lane; this doc only
   characterizes what reaches the wire.
+
+## Adversarial review
+
+Kimi + Codex, two-phase independent review + cross-examination, run 2026-08-18 against
+this branch before push. Both converged on BLOCK. Verified findings, fixed in this
+branch:
+
+- **HIGH, found independently by both:** the file-lane "144/day" figure was presented
+  as a production ceiling, but the doc's own "jitter only pushes sweeps later, never
+  earlier" claim was false — `ConvergenceScheduler::jittered()` is symmetric. Fixed:
+  a fourth Catch2 case (`tests/unit/test_guardian_spark_runtime.cpp`) empirically
+  proves the jitter-floor (480s) case still refreshes every sweep, giving a true
+  worst-case of 180/day; every doc/changelog citation of "144/day" as a ceiling is
+  corrected to 180/day (144/day now stated only as the exact-no-jitter figure).
+- **HIGH (Codex) / MEDIUM (Kimi), confirmed by both:** `resource_sampler.cpp` leaked
+  the process `HANDLE` if `_wfopen_s` failed to open the output file (the acquire at
+  `OpenProcess` preceded the fallible file-open, with `CloseHandle` only at the very
+  end). Fixed: output-file open now happens before `OpenProcess`, so that failure
+  path never holds an unreleased handle.
+- **LOW, confirmed by both:** the runbook's 30-minute sanity-window table said "~5
+  refreshes" without noting the inclusive t=1800s boundary can land a 6th, and didn't
+  account for jitter on the file-lane count. Fixed: reworded.
+- **LOW (Kimi only, rejected by Codex on cross-exam, I agree with the rejection):**
+  `guardian-c0-thread-reloc-design.md`'s item 7/9 resolutions record an operator
+  ruling without a paired code change. Not a defect — there was no code to change
+  (the shipped caps already matched the derivation; only stale TEXT was wrong), and
+  the doc is honest about being a recorded ruling, not a code-verified measurement.
+- **Withdrawn by both (already tracked, out of this branch's scope):** the
+  `agent.cpp:1115` hardcoded log string — this branch doesn't touch `agent.cpp`;
+  stays forward action item 3 below.
+
+Full transcripts: Kimi/Codex phase1+phase2 reports and this synthesis are not
+committed (adversarial-review workflow output, not repo content) — reproducible via
+`/adversarial-review` against this branch if needed again.
 
 ## Ready-to-paste F14 flip-changelog sentence
 
 > Guardian's `guard.unhealthy` wire traffic for a stuck-Unknown rule is bounded at
 > 1 edge + 288 refreshes/rule/agent/day on 60s-cadence lanes (service/registry) and
-> 1 edge + 144/day on the 600s file lane (measured, `docs/spark-rebuild-baselines/
-> f11-flood-measurement-run.md`), roughly 60-120x below an earlier ~17k/day
+> 1 edge + 180/day on the 600s file lane, accounting for the scheduler's default
+> +/-20% jitter (measured, `docs/spark-rebuild-baselines/f11-flood-measurement-run.md`),
+> roughly 60-95x below an earlier ~17k/day
 > pre-mitigation estimate.
 
 ## Forward action items

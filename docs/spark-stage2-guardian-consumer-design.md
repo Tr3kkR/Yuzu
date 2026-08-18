@@ -284,9 +284,13 @@ measured ceiling (fake-clock Catch2 cases at production Config defaults,
 `docs/spark-rebuild-baselines/f11-flood-measurement-run.md` for the full derivation and
 a live-rig confirmation): **1 edge + 288 refreshes/day/rule/agent** on a 60s-cadence
 lane (service/registry — refresh recurs exactly every `errored_refresh_ms`, first
-landing at t=300s post-edge), **1 edge + 144 refreshes/day/rule/agent** on the 600s
-file lane (every post-demotion sweep refreshes, since 600s already exceeds the 300s
-floor). Both are roughly 60-120x below the pre-fix ~17k/day this paragraph documents.
+landing at t=300s post-edge), **1 edge + 180 refreshes/day/rule/agent** on the 600s
+file lane, accounting for the scheduler's default +/-20% jitter (every post-demotion
+sweep refreshes, since even the jitter-minimum 480s spacing already exceeds the 300s
+floor; 144/day is the exact-no-jitter figure, 180/day is the true production ceiling
+— corrected 2026-08-18 after an adversarial review caught the original doc's false
+"jitter never shortens a sweep" claim). Both corrected figures are roughly 60-95x
+below the pre-fix ~17k/day this paragraph documents.
 
 **Landed (PARTIAL) 2026-07-20, commit `b30e93cf`:** the **transition-edge emission** + a
 **counted, sparse-heartbeat suppression signal** (`yuzu.guardian_unhealthy_suppressed`) shipped.

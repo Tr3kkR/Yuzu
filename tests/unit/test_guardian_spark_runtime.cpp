@@ -1122,9 +1122,57 @@ TEST_CASE("F11 flood: post-demotion 600s-cadence lane (file) refreshes on EVERY 
     rt->evaluate_key(key, EvalReason::Convergence);
     CHECK(drain_all(*rt).size() == 1);
     CHECK(rt->unhealthy_refreshed() == 2);
-    // Steady-state projection: 144 refreshes/day + 1 edge = 145 total wire
-    // messages/rule/agent/day on this lane (86400s/600s = 144 sweeps/day, every one
-    // refreshes) - see the F11 run doc.
+    // At EXACT 600s cadence (no scheduler jitter): 144 refreshes/day + 1 edge = 145
+    // total wire messages/rule/agent/day on this lane (86400s/600s = 144 sweeps/day,
+    // every one refreshes). This is the NOMINAL figure, not the production ceiling -
+    // see the next case for the jittered worst-case, and the F11 run doc for both.
+}
+
+TEST_CASE("F11 flood: file lane at the scheduler-jitter floor (480s) still refreshes "
+          "every sweep - the TRUE production worst-case ceiling is 180/day, not the "
+          "144/day no-jitter figure (#2298, adversarial-review finding)",
+          "[spark][runtime]") {
+    // ConvergenceScheduler::Config defaults file_cadence_ms=600'000, jitter_pct=20
+    // (guardian_convergence_scheduler.hpp:69-73); jittered() draws base_ms +
+    // uniform(-span, +span) with span = base_ms*jitter_pct/100 = 120'000
+    // (guardian_convergence_scheduler.cpp:59-69) - a SYMMETRIC perturbation, not the
+    // later-only skew the run doc originally (incorrectly) claimed. The minimum
+    // possible single-draw interval is therefore 600'000-120'000=480'000ms: still
+    // above the 300s errored_refresh_ms floor, so every such sweep still refreshes,
+    // same as the exact-600s case - but at up to 86400/480=180 refreshes/day, not 144.
+    // This case proves that boundary empirically rather than asserting the arithmetic.
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt_with_clock(r, b, sc);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+
+    r->file = read_unknown<FileSnapshot>("io");
+    rt->evaluate_key(key, EvalReason::Initial); // edge @ t=0
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    while (rt->priority_demoted() == 0) { // demote at t=60s
+        sc.advance(5'000);
+        rt->evaluate_key(key, EvalReason::Convergence);
+        drain_all(*rt);
+    }
+    REQUIRE(rt->priority_demoted() == 1);
+    REQUIRE(rt->unhealthy_refreshed() == 0);
+
+    // Three consecutive sweeps at the jitter-floor 480s interval: every one refreshes
+    // (480s > 300s), proving jitter cannot suppress a file-lane refresh - it can only
+    // make them MORE frequent than the no-jitter 144/day figure, up to 180/day.
+    for (std::uint64_t i = 1; i <= 3; ++i) {
+        sc.advance(480'000);
+        rt->evaluate_key(key, EvalReason::Convergence);
+        CHECK(drain_all(*rt).size() == 1);
+        CHECK(rt->unhealthy_refreshed() == i);
+    }
+    CHECK(rt->unhealthy_suppressed() == 12); // unchanged - still never suppressed on this lane
+    // Ceiling: 86'400s / 480s = 180 refreshes/day + 1 edge = 181 total wire
+    // messages/rule/agent/day - the honest production worst-case, not 144. See the
+    // F11 run doc's corrected Claims section.
 }
 
 TEST_CASE("on_event after begin_stop commits nothing", "[spark][runtime]") {
