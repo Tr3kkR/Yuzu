@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <span>
 #include <string>
@@ -208,7 +209,16 @@ inline ArpParse parse_rt_flags_llinfo(std::span<const unsigned char> blob) {
             // to a typed sockaddr pointer and dereferencing through it.
             const unsigned char sa_len = p[0];
             const unsigned char sa_family = p[1];
-            const std::size_t entry_len = sa_len ? sa_len : sizeof(long);
+            // kRoutingSockaddrAlign: the BSD/XNU routing-socket ROUNDUP unit
+            // is a fixed 4 bytes (see XNU bsd/net/route.c and route.tproj,
+            // both use sizeof(uint32_t)) regardless of the platform's word
+            // size -- NOT sizeof(long) (8 on LP64 Darwin). Governance Gate 3
+            // finding: with only DST/GATEWAY extracted (both fixed-size,
+            // always the first two entries in rtm_addrs), the wrong unit
+            // never corrupted an extracted field in practice, but it would
+            // silently misalign any future field added after GATEWAY.
+            constexpr std::size_t kRoutingSockaddrAlign = sizeof(std::uint32_t);
+            const std::size_t entry_len = sa_len ? sa_len : kRoutingSockaddrAlign;
             if (remaining < entry_len)
                 break; // this sockaddr claims more than the record has left
 
@@ -244,7 +254,7 @@ inline ArpParse parse_rt_flags_llinfo(std::span<const unsigned char> blob) {
             // whose unrounded length fits but whose rounded length doesn't
             // must not push `p` past `rec_end`.
             std::size_t adv = entry_len;
-            adv = (adv + sizeof(long) - 1) & ~(sizeof(long) - 1);
+            adv = (adv + kRoutingSockaddrAlign - 1) & ~(kRoutingSockaddrAlign - 1);
             if (adv > remaining)
                 break;
             p += adv;
