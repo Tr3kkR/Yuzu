@@ -1140,7 +1140,7 @@ All authentication and authorization errors use the standard JSON envelope:
 {
   "error": {
     "code": 403,
-    "message": "service-scoped token does not grant Agent:Execute (ITServiceOwner permission required)"
+    "message": "service-scoped token does not grant Agent:Execute (requires ITServiceOwner AND an explicit service-scope allow-list entry)"
   },
   "meta": {
     "api_version": "v1"

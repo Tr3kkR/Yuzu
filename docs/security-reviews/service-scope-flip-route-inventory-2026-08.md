@@ -85,4 +85,10 @@ default-deny (§3c); `resources/read` bypasses C8 structurally but calls
 - Informational, no fix needed: `POST /api/v1/rbac/check` (routed to the
   topology-floor concern instead).
 
-No routes were left in an unresolved/undecided state.
+No routes were left in an unresolved/undecided state **within this sweep's
+scope** — `rest_api_v1.cpp`'s 74 `auth_fn` call sites and `mcp_server.cpp`'s
+3 (per the sweep note in the ADR). The nine other `*_routes.cpp` files
+(guardian, dex, deployment, preflight, schedule, device, network, inventory,
+tar_tree) were not re-swept here; they already carry `deny_service_scoped_*`/
+`token_scope_service` handling from prior PRs in this saga (found by
+compliance-officer, Gate 6) and are not re-verified by this document.

@@ -99,6 +99,43 @@ before #2376, treat the grant-population export as having been accessible to all
 authenticated principals unless RBAC was explicitly enabled on that deployment.** Full
 decision record: `docs/security-reviews/authz-topology-floor-2026-08-05.md`.
 
+**Addendum — service-scoped token fleet-wide confinement, durably closed
+(CC6.1/CC6.3, guardian-confinement-2298 PR 3 — "the flip", 2026-08-18).**
+`require_permission`'s service-scoped branch previously admitted any
+operation the `ITServiceOwner` role granted — since that role holds broad
+CRUD across most securables, a token bound to one IT service's agents
+could, in practice, reach fleet-wide data with no per-agent narrowing,
+across every route gated this way (not an enumerated list). This PR
+inverts the default: a `(securable, operation)` pair must now also clear a
+server-side allow-list that ships **empty**, so a route not yet migrated
+to real per-request confinement denies a service-scoped token outright
+rather than admitting it unfiltered — including routes not yet found.
+Mirrored at the MCP `tools/call` layer via `ServiceScopeClass`. This
+closes the confinement class the "Narrowed 2026-08-14" clause of "The
+machine-health audit exemption" bullet above (Workstream E) narrowed
+piecemeal, and is the durable fix that `docs/user-manual/server-admin.md`'s
+matching PR2 Upgrade Notes entry's own **"This note does not claim the
+underlying class is fully closed"** caveat anticipated. **For any
+assessment covering a period before this PR, treat a service-scoped token
+as having had the reach of its minting principal's `ITServiceOwner`
+grants, not the reach of its own service tag, on any route gated solely
+by `require_permission`/`require_scoped_permission` that lacked its own
+per-request confinement.** Three items this PR identifies but does not
+itself close, to be filed as follow-up issues at this PR's landing: (1)
+whoever can set an agent's `service` tag effectively moves that agent's
+scope membership — this PR does not harden that write path (ADR-1006
+Consequences); (2) a known remainder of the per-file `deny_service_scoped_*`
+family (`PreflightRoutes`, `schedule_routes.*`, and inline checks in
+device/network/inventory/TAR routes) still names a `.permission` that
+cannot admit a service-scoped caller — the same false-self-remediation
+defect this PR's own hardening round found and fixed in five sibling
+sites (`.claude/routed-concerns-access-control.md` clause 5); (3) the ~15 pre-existing per-file
+`deny_service_scoped_*` helpers and the 7 MCP double-deny sites this
+default-deny makes redundant are scheduled for Phase 2 consolidation, not
+retired here. Full design: `docs/adr/1006-service-scope-default-deny.md`;
+closed route inventory:
+`docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
+
 **Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
 principals (ADR-1005 class) are already least-privilege by construction —
 default-deny RBAC resolution, structurally barred from admin/built-in/
