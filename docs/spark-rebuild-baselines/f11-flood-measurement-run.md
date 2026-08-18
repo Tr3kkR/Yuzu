@@ -317,6 +317,10 @@ committed (adversarial-review workflow output, not repo content) - reproducible 
 2. **Server-side ingest cost** at the measured wire rate is unmeasured - worth a
    companion note (or its own doc) once a fleet-scale server test rig exists, if the
    #2298 checklist or an enterprise-readiness gate asks for it.
+2b. **Filed #3266** (governance Gate 6, enterprise-readiness): Guardian Baseline
+    create/deploy/delete has no JSON REST route - dashboard-fragment-only, which is
+    why `generate_resgate_load.py`'s Baseline helpers have to scrape HTML rather than
+    parse structured JSON. Out of F11's scope to fix; tracked separately.
 3. **Fix the stale `prefer_spark=false` / `detection backend = legacy IGuard` boot log
    text** at `agent.cpp:1115` - it hardcodes both facts as literals rather than reading
    `guardian_`'s actual state, and is now demonstrably wrong once `prefer_spark=true`
