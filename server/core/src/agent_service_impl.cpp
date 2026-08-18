@@ -530,13 +530,25 @@ enrolled:
         }
     }
 
-    // Sync agent-reported tags to persistent TagStore
+    // Sync agent-reported tags to persistent TagStore. A failed sync cannot
+    // fail the Register RPC (enrollment must not hinge on a tag write), but
+    // it is surfaced rather than swallowed — the sync rolled back
+    // atomically, so the agent keeps its PRIOR complete tag set and
+    // re-syncs on its next Register. Observability is this warn line ONLY:
+    // write-path failures have no counter (yuzu_server_tag_store_read_
+    // degrade_total is reads-only — governance sec-L1/sre-2; a wave-level
+    // write-degrade-metric decision is tracked as follow-up, deliberately
+    // not a one-store one-off here).
     if (tag_store_ && !info.scopable_tags().empty()) {
         std::unordered_map<std::string, std::string> tags;
         for (const auto& [k, v] : info.scopable_tags()) {
             tags[k] = v;
         }
-        tag_store_->sync_agent_tags(info.agent_id(), tags);
+        if (auto sync = tag_store_->sync_agent_tags(info.agent_id(), tags); !sync) {
+            spdlog::warn("Register({}): tag sync failed ({}) — prior tag set retained, agent "
+                         "re-syncs on next Register",
+                         info.agent_id(), sync.error());
+        }
     }
 
     auto session_id =
