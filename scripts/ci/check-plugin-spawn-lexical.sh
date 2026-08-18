@@ -495,7 +495,6 @@ GRANDFATHERED = {
     "agents/plugins/network_diag/src/network_diag_plugin.cpp",
     "agents/plugins/os_info/src/os_info_plugin.cpp",
     "agents/plugins/processes/src/processes_plugin.cpp",
-    "agents/plugins/quarantine/src/quarantine_plugin.cpp",
     "agents/plugins/sccm/src/sccm_plugin.cpp",
     "agents/plugins/script_exec/src/script_exec_plugin.cpp",
     "agents/plugins/services/src/services_plugin.cpp",

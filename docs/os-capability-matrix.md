@@ -481,18 +481,18 @@ implementation is.
 | procfetch | procfetch_fetch | linux | supported | 1 | /proc enumeration + OpenSSL EVP SHA-1 | - |
 | procfetch | procfetch_fetch | macos | supported | 1 | libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1 | - |
 | procfetch | procfetch_fetch | windows | supported | 1 | CreateToolhelp32Snapshot + BCrypt SHA-1 | - |
-| quarantine | quarantine | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | quarantine | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | quarantine | windows | supported | 3 | netsh via popen | - |
-| quarantine | unquarantine | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | unquarantine | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | unquarantine | windows | supported | 3 | netsh via popen | - |
-| quarantine | status | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | status | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | status | windows | supported | 3 | netsh via popen | - |
-| quarantine | whitelist | linux | supported | 3 | sudo iptables via popen | - |
-| quarantine | whitelist | macos | supported | 3 | sudo pfctl via popen | - |
-| quarantine | whitelist | windows | supported | 3 | netsh via popen | - |
+| quarantine | quarantine | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | quarantine | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | quarantine | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | unquarantine | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | unquarantine | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | unquarantine | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | status | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | status | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | status | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
+| quarantine | whitelist | linux | supported | 2 | sudo-governed iptables via bounded runner argv | - |
+| quarantine | whitelist | macos | supported | 2 | sudo-governed pfctl via bounded runner argv | - |
+| quarantine | whitelist | windows | supported | 2 | netsh via bounded runner argv (service-account privilege, no sudo) | - |
 | rdp_control | set_state | linux | unsupported | - | - | - |
 | rdp_control | set_state | macos | unsupported | - | - | - |
 | rdp_control | set_state | windows | supported | 1 | Win32 registry + INetFwPolicy2 COM + SCM | - |
