@@ -1051,11 +1051,18 @@ bool ManagementGroupStore::migrate_from_sqlite(const std::filesystem::path& lega
     // read_legacy_snapshot): without it, this connection's default autocommit
     // mode makes each probe/read its own independent transaction, so a legacy
     // file still being written by another process mid-backfill can interleave
-    // a write between them — producing a torn cross-table read that could
-    // pass whatever consistency the backfill logic checks and get permanently
-    // stamped complete. `BEGIN` (not `BEGIN IMMEDIATE`) is sufficient: this
-    // connection is SQLITE_OPEN_READONLY, so there is nothing for it to write
-    // that a reserved lock would need to protect. (#3210)
+    // a write between them, producing a torn cross-table read. For this
+    // store specifically, a torn read here would leave a member/role row
+    // referencing a group_id the groups-read never captured -- the
+    // non-deferrable Postgres FK on management_group_members.group_id /
+    // management_group_roles.group_id rejects that at INSERT time and aborts
+    // the whole backfill (fail-closed), never a silent completion. The
+    // defect this closes is that the refusal is NONDETERMINISTIC without the
+    // transaction: an operator hitting the race sees a spurious boot failure
+    // and must retry, hoping the legacy writer finishes first, rather than a
+    // deterministic success. `BEGIN` (not `BEGIN IMMEDIATE`) is sufficient:
+    // this connection is SQLITE_OPEN_READONLY, so there is nothing for it to
+    // write that a reserved lock would need to protect. (#3210)
     if (sqlite3_exec(legacy.get(), "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK) {
         spdlog::error("ManagementGroupStore: backfill: failed to start a snapshot transaction on "
                       "legacy {}: {}",
