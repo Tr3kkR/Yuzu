@@ -1035,6 +1035,14 @@ TEST_CASE("ManagementGroupStore::migrate_from_sqlite reads one consistent group/
 
     std::atomic<bool> migrate_done{false};
     std::atomic<bool> writer_open_failed{false};
+    // Set ONLY inside the txn's own success path (after a real COMMIT), so a
+    // run where the writer never lands its swap FAILS the REQUIRE below
+    // instead of silently passing with no race actually exercised -- a
+    // reviewer (fjarvis, PR #3241) found this test was vacuously green ~88%
+    // of the time: migrate_done is the ONLY cross-thread signal, so if
+    // migrate_from_sqlite finishes before the writer ever commits, every
+    // assertion still passes against both fixed and unfixed code.
+    std::atomic<bool> writer_swap_done{false};
     std::thread writer([&] {
         SqliteDb w;
         if (sqlite3_open(legacy.path.string().c_str(), w.addr()) != SQLITE_OK) {
@@ -1045,6 +1053,16 @@ TEST_CASE("ManagementGroupStore::migrate_from_sqlite reads one consistent group/
         while (!migrate_done.load(std::memory_order_acquire)) {
             if (sqlite3_exec(w.get(), "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
                 continue; // lock held by the reader's transaction -- retry
+            // SqliteTxn (not bare sqlite3_exec("ROLLBACK", ...)) -- same
+            // discipline pad_txn above already uses. Its constructor does
+            // NOT issue BEGIN (already done above), so this drops straight
+            // in; the destructor rolls back on any early failure, and
+            // .commit() is checked before this thread ever reports success
+            // (fjarvis, PR #3241: the removed test's writer had this exact
+            // non-RAII/string-concatenated-SQL pattern, ledger finding MG-3
+            // BLOCKING -- this retained test had the identical defect, just
+            // never independently re-checked for it).
+            SqliteTxn txn(w.get());
             bool ok = true;
             auto exec1 = [&](const std::string& sql) {
                 ok = ok && sqlite3_exec(w.get(), sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK;
@@ -1057,9 +1075,11 @@ TEST_CASE("ManagementGroupStore::migrate_from_sqlite reads one consistent group/
                   "' WHERE group_id='" + grp_old_id + "'");
             exec1("UPDATE management_group_roles SET group_id='" + grp_new_id +
                   "' WHERE group_id='" + grp_old_id + "'");
-            if (ok && sqlite3_exec(w.get(), "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK)
+            if (ok && txn.commit() == SQLITE_OK) {
+                writer_swap_done.store(true, std::memory_order_release);
                 return; // one successful swap is all this test needs
-            sqlite3_exec(w.get(), "ROLLBACK", nullptr, nullptr, nullptr);
+            }
+            // ok==false or commit failed: txn's destructor rolls back below.
         }
     });
     // Same ThreadJoiner-shaped guard as test_rbac_store.cpp / the
@@ -1079,6 +1099,7 @@ TEST_CASE("ManagementGroupStore::migrate_from_sqlite reads one consistent group/
     writer.join();
 
     REQUIRE_FALSE(writer_open_failed.load());
+    REQUIRE(writer_swap_done.load()); // else this run proved nothing -- see comment above
     REQUIRE(migrated);
 
     // Whichever group ended up referenced by the migrated member/role row, it
