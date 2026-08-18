@@ -30,16 +30,31 @@ Two independent load profiles, each with its own rule-id prefix so `arm`/`teardo
     API, not the filesystem/registry. Run the icacls/PowerShell one-liners in
     stage11-resource-gate-runbook.md FIRST, then arm-errored.
 
-    arm-errored also creates + deploys a Baseline containing all 40 errored rules
-    (and teardown-errored deletes it). This is not optional decoration: every push
-    -- including this script's own full_sync -- funnels through
-    guardian_push_fn_'s filter_deployed_members() gate (server.cpp:~17601-17640),
-    which keeps only rules that are members of a *deployed* Baseline
-    (docs/guardian-baseline-model.md). A rule that exists in the Guard store but
-    belongs to no deployed Baseline is silently dropped from every push, no error
-    either side -- the 2026-08-18 F11 live run hit exactly this (40 rules created
-    and confirmed stored via REST, zero ever reached the agent's reconcile; see
-    "Live DGRHP window" / forward action item 4 in f11-flood-measurement-run.md).
+    BOTH profiles create + deploy a Baseline containing their own rules (and
+    teardown deletes it). This is not optional decoration: every push -- including
+    this script's own full_sync -- funnels through guardian_push_fn_'s
+    filter_deployed_members() gate (server.cpp:~17601-17640), which keeps only
+    rules that are members of a *deployed* Baseline (docs/guardian-baseline-model.md).
+    A rule that exists in the Guard store but belongs to no deployed Baseline is
+    silently dropped from every push, no error either side -- the 2026-08-18 F11
+    live run hit exactly this for arm-errored (40 rules created and confirmed
+    stored via REST, zero ever reached the agent's reconcile; see "Live DGRHP
+    window" / forward action item 4 in f11-flood-measurement-run.md). The original
+    arm/teardown profile has the identical exposure (governance Gate 4,
+    consistency-auditor + happy-path, 2026-08-18) and gets the same treatment here.
+
+    A SECOND, separate, genuinely production-scope bug (NOT fixed by this harness
+    and NOT F11-scoped) shares the exact same dispatch chokepoint as this Baseline
+    fix: finalize_classified_command's kill-switch gate rejects any command whose
+    first classified segment isn't a lowercase-starting identifier, which "__guard__"
+    never is -- so every __guard__:push_rules dispatch (including this script's own
+    push_full_sync, AND any Baseline deploy's fleet-wide full_sync) is unconditionally
+    kill-switched and silently dropped on an affected rig, no error surfaced. Confirmed
+    from code (server.cpp's finalize_classified_command / is_valid_identifier), not
+    just from the live run's symptom -- see f11-flood-measurement-run.md's "Live
+    DGRHP window" section. Getting the Baseline-membership half right (this file)
+    was necessary but was proven, by the shared code path, to never have been
+    SUFFICIENT on its own for actual delivery until that separate bug is fixed.
 
 All guards in both profiles are enforcement_mode="audit" + remediation.type="alert-only"
 - Observe only, matching the .uat-seed/guardian/README-cis-observe.md convention
@@ -59,10 +74,10 @@ which reads as Known-absent, not Unknown; see guardian_state_reader.cpp). Errore
 profile file guards watch files under a deny-ACL directory.
 
 Usage:
-    python generate_resgate_load.py arm              # original: create 60 rules + full_sync
-    python generate_resgate_load.py teardown          # original: delete 60 rules + full_sync
-    python generate_resgate_load.py arm-errored       # errored: create 40 rules + full_sync
-    python generate_resgate_load.py teardown-errored  # errored: delete 40 rules + full_sync
+    python generate_resgate_load.py arm              # original: create+deploy 60 rules
+    python generate_resgate_load.py teardown          # original: delete Baseline + 60 rules
+    python generate_resgate_load.py arm-errored       # errored: create+deploy 40 rules
+    python generate_resgate_load.py teardown-errored  # errored: delete Baseline + 40 rules
 
 Config via env (matches seed-baselines.py):
     YUZU_BASE, YUZU_ADMIN_USER, YUZU_ADMIN_PASS
@@ -73,6 +88,7 @@ import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -84,10 +100,11 @@ RULE_PREFIX = "resgate-"
 ERR_RULE_PREFIX = "resgate-err-"
 N = 20
 
-# Fixed name so arm-errored/teardown-errored can find the SAME Baseline across
-# separate script invocations without persisting its id anywhere (BaselineStore
-# enforces unique names, so re-running arm-errored without a teardown in between
-# is detected as "already exists" and reused, not duplicated).
+# Fixed names so arm/arm-errored and teardown/teardown-errored can find the SAME
+# Baseline across separate script invocations without persisting its id anywhere
+# (BaselineStore enforces unique names, so re-running arm[-errored] without a
+# teardown in between is detected as "already exists" and reused, not duplicated).
+BASELINE_NAME = "resgate-baseline"
 ERR_BASELINE_NAME = "resgate-err-baseline"
 
 # Real, near-universally-present Windows services. Observe-only - never
@@ -222,13 +239,24 @@ def login(op):
 
 
 def post_rule(op, rule):
+    """Returns (ok, already_existed). A 409 (rest_api_v1.cpp's create_rule handler:
+    duplicate rule_id/name) means a prior arm[-errored] already created this exact
+    rule and this is an idempotent re-run - NOT a failure (governance Gate 4, UP-7:
+    re-running arm-errored on an already-armed rig previously reported "0/40
+    armed" because every 409 counted as FAIL)."""
     body = json.dumps(rule).encode("utf-8")
     req = urllib.request.Request(
         BASE + "/api/v1/guaranteed-state/rules",
         data=body,
         headers={"Content-Type": "application/json"},
     )
-    return op.open(req, timeout=15).read().decode("utf-8", "replace")
+    try:
+        op.open(req, timeout=15).read()
+        return True, False
+    except urllib.error.HTTPError as e:
+        if e.code == 409:
+            return True, True
+        raise
 
 
 def delete_rule(op, rule_id):
@@ -253,7 +281,7 @@ def push_full_sync(op):
     op.open(req, timeout=15)
 
 
-# -- Baseline plumbing (arm-errored/teardown-errored only) -------------------
+# -- Baseline plumbing (shared by both load profiles) ------------------------
 #
 # No JSON REST route exists for Baseline create/deploy/delete yet (dashboard
 # fragment-only, form-urlencoded HTML responses) - these helpers drive the same
@@ -262,7 +290,7 @@ def push_full_sync(op):
 
 
 def create_baseline_form(op, name, member_names):
-    fields = [("name", name), ("description", "F11 flood-measurement errored-load baseline")]
+    fields = [("name", name), ("description", "F11 resource-gate/flood-measurement harness baseline")]
     fields += [("guards", n) for n in member_names]
     body = urllib.parse.urlencode(fields, encoding="utf-8").encode("utf-8")
     req = urllib.request.Request(
@@ -288,13 +316,27 @@ def find_baseline_id(html_text, name):
     return m.group(1) if m else None
 
 
+def _raise_if_baseline_action_failed(resp, action):
+    """deploy_baseline and delete_baseline_action (guardian_routes.cpp) both render
+    a failure ("Deploy failed: ...", "Delete failed: ...", "Baseline not found.",
+    "Baseline store unavailable.") as a <div class="empty-state"> panel inside a
+    gs-modal-card; success re-renders the baselines/guards fragments instead and
+    never contains that marker. Governance Gate 4 (unhappy-path UP-5): this
+    response was previously fetched and discarded, so a real deploy/delete failure
+    printed as unconditional "success" - raise loudly instead."""
+    if 'class="empty-state"' in resp:
+        raise RuntimeError(f"baseline {action} failed: {resp[:300]}")
+
+
 def deploy_baseline_form(op, baseline_id):
     req = urllib.request.Request(
         BASE + f"/fragments/guardian/baseline/{baseline_id}/deploy",
         data=b"",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    return op.open(req, timeout=15).read().decode("utf-8", "replace")
+    resp = op.open(req, timeout=15).read().decode("utf-8", "replace")
+    _raise_if_baseline_action_failed(resp, "deploy")
+    return resp
 
 
 def delete_baseline_form(op, baseline_id):
@@ -303,39 +345,41 @@ def delete_baseline_form(op, baseline_id):
         data=b"",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    return op.open(req, timeout=15).read().decode("utf-8", "replace")
+    resp = op.open(req, timeout=15).read().decode("utf-8", "replace")
+    _raise_if_baseline_action_failed(resp, "delete")
+    return resp
 
 
-def ensure_deployed_baseline_errored(op):
-    """Creates (or reuses, if arm-errored ran before without a teardown) the fixed-
-    name Baseline covering every resgate-err- rule, and deploys it. Without this,
-    the 40 errored rules exist in the Guard store but reach no agent - see the
-    module docstring's guardian_push_fn_ note."""
-    member_names = [f"{ERR_RULE_PREFIX}reg-{i:02d}" for i in range(1, N + 1)]
-    member_names += [f"{ERR_RULE_PREFIX}file-{i:02d}" for i in range(1, N + 1)]
-    resp = create_baseline_form(op, ERR_BASELINE_NAME, member_names)
+def ensure_deployed_baseline(op, name, member_names):
+    """Creates (or reuses, if arm[-errored] ran before without a teardown) the
+    fixed-name Baseline covering the given rules, and deploys it. Without this,
+    the rules exist in the Guard store but reach no agent - see the module
+    docstring's guardian_push_fn_ note. Shared by both load profiles (governance
+    Gate 4, consistency-auditor + happy-path, 2026-08-18: the original arm/teardown
+    profile had the identical exposure the errored profile was fixed for)."""
+    resp = create_baseline_form(op, name, member_names)
     if "gs-error-banner" in resp and "already exists" not in resp.lower():
         raise RuntimeError(f"baseline create failed: {resp[:300]}")
-    baseline_id = find_baseline_id(resp, ERR_BASELINE_NAME)
+    baseline_id = find_baseline_id(resp, name)
     if not baseline_id:
-        baseline_id = find_baseline_id(list_baselines_html(op), ERR_BASELINE_NAME)
+        baseline_id = find_baseline_id(list_baselines_html(op), name)
     if not baseline_id:
-        raise RuntimeError(f"could not find baseline id for '{ERR_BASELINE_NAME}' after create")
+        raise RuntimeError(f"could not find baseline id for '{name}' after create")
     deploy_baseline_form(op, baseline_id)  # deploy itself fires a fleet-wide full_sync
     return baseline_id
 
 
-def teardown_deployed_baseline_errored(op):
-    """Deletes the errored-load Baseline if present. delete_baseline_action fires
-    its own fleet-wide full_sync when the deleted Baseline was deployed, so this
-    is the actual agent-side disarm step - do it BEFORE deleting the 40 rule
-    definitions themselves."""
-    baseline_id = find_baseline_id(list_baselines_html(op), ERR_BASELINE_NAME)
+def teardown_deployed_baseline(op, name):
+    """Deletes the named Baseline if present. delete_baseline_action fires its own
+    fleet-wide full_sync when the deleted Baseline was deployed, so this is the
+    actual agent-side disarm step - do it BEFORE deleting the rule definitions
+    themselves."""
+    baseline_id = find_baseline_id(list_baselines_html(op), name)
     if not baseline_id:
-        print(f"[resgate-load] no '{ERR_BASELINE_NAME}' baseline found, nothing to remove")
+        print(f"[resgate-load] no '{name}' baseline found, nothing to remove")
         return
     delete_baseline_form(op, baseline_id)
-    print(f"[resgate-load] deleted baseline '{ERR_BASELINE_NAME}' ({baseline_id}), fleet reconciled")
+    print(f"[resgate-load] deleted baseline '{name}' ({baseline_id}), fleet reconciled")
 
 
 def all_rules(scratch_dir):
@@ -351,6 +395,22 @@ def all_rules_errored(denied_dir, denied_hive_key):
     return rules
 
 
+def _post_all(op, rules):
+    """Posts every rule, tolerating a 409 (already armed by a prior run) as
+    success-not-failure. Returns (failed_count, reused_count)."""
+    failed = 0
+    reused = 0
+    for rule in rules:
+        try:
+            _, already_existed = post_rule(op, rule)
+            if already_existed:
+                reused += 1
+        except Exception as e:  # noqa: BLE001
+            print(f"[resgate-load] FAIL {rule['rule_id']}: {e}", file=sys.stderr)
+            failed += 1
+    return failed, reused
+
+
 def cmd_arm(op, scratch_dir):
     # Pre-create the scratch dir + the 20 watched files so the initial
     # assertion state is "present" (compliant) - quieter dashboard, and
@@ -359,19 +419,29 @@ def cmd_arm(op, scratch_dir):
     for i in range(1, N + 1):
         open(os.path.join(scratch_dir, f"watch-{i:02d}.txt"), "a", encoding="utf-8").close()
 
-    failed = 0
-    for rule in all_rules(scratch_dir):
-        try:
-            post_rule(op, rule)
-        except Exception as e:  # noqa: BLE001
-            print(f"[resgate-load] FAIL {rule['rule_id']}: {e}", file=sys.stderr)
-            failed += 1
+    rules = all_rules(scratch_dir)
+    failed, reused = _post_all(op, rules)
     push_full_sync(op)
-    print(f"[resgate-load] armed {3*N - failed}/{3*N} guards, pushed full_sync")
+    try:
+        baseline_id = ensure_deployed_baseline(op, BASELINE_NAME, [r["name"] for r in rules])
+    except Exception as e:  # noqa: BLE001
+        print(f"[resgate-load] armed {3*N - failed}/{3*N} guards ({reused} reused), pushed "
+              f"full_sync, but BASELINE DEPLOY FAILED: {e} - rules exist but reach NO agent "
+              f"until a Baseline covering them is deployed (see the module docstring)",
+              file=sys.stderr)
+        return 1
+    print(f"[resgate-load] armed {3*N - failed}/{3*N} guards ({reused} reused), deployed "
+          f"baseline '{BASELINE_NAME}' ({baseline_id}), pushed full_sync")
     return 1 if failed else 0
 
 
 def cmd_teardown(op):
+    try:
+        teardown_deployed_baseline(op, BASELINE_NAME)
+    except Exception as e:  # noqa: BLE001
+        print(f"[resgate-load] BASELINE TEARDOWN FAILED: {e} - the fleet-side disarm this "
+              f"performs did not happen; rule definitions below are still being deleted",
+              file=sys.stderr)
     failed = 0
     for rule in all_rules("C:\\YuzuResGate"):
         if not delete_rule(op, rule["rule_id"]):
@@ -388,22 +458,29 @@ def cmd_arm_errored(op, denied_dir, denied_hive_key):
     # Arming against targets the runbook hasn't yet prepared will just read Unknown
     # for the wrong reason (missing, not denied) - verify the deny-ACL setup is done
     # (a manual read as the agent's own account should fail) before arming.
-    failed = 0
-    for rule in all_rules_errored(denied_dir, denied_hive_key):
-        try:
-            post_rule(op, rule)
-        except Exception as e:  # noqa: BLE001
-            print(f"[resgate-load] FAIL {rule['rule_id']}: {e}", file=sys.stderr)
-            failed += 1
+    rules = all_rules_errored(denied_dir, denied_hive_key)
+    failed, reused = _post_all(op, rules)
     push_full_sync(op)
-    baseline_id = ensure_deployed_baseline_errored(op)
-    print(f"[resgate-load] armed-errored {2*N - failed}/{2*N} guards, deployed baseline "
-          f"'{ERR_BASELINE_NAME}' ({baseline_id}), pushed full_sync")
+    try:
+        baseline_id = ensure_deployed_baseline(op, ERR_BASELINE_NAME, [r["name"] for r in rules])
+    except Exception as e:  # noqa: BLE001
+        print(f"[resgate-load] armed-errored {2*N - failed}/{2*N} guards ({reused} reused), "
+              f"pushed full_sync, but BASELINE DEPLOY FAILED: {e} - rules exist but reach NO "
+              f"agent until a Baseline covering them is deployed (see the module docstring)",
+              file=sys.stderr)
+        return 1
+    print(f"[resgate-load] armed-errored {2*N - failed}/{2*N} guards ({reused} reused), "
+          f"deployed baseline '{ERR_BASELINE_NAME}' ({baseline_id}), pushed full_sync")
     return 1 if failed else 0
 
 
 def cmd_teardown_errored(op, denied_dir, denied_hive_key):
-    teardown_deployed_baseline_errored(op)
+    try:
+        teardown_deployed_baseline(op, ERR_BASELINE_NAME)
+    except Exception as e:  # noqa: BLE001
+        print(f"[resgate-load] BASELINE TEARDOWN FAILED: {e} - the fleet-side disarm this "
+              f"performs did not happen; rule definitions below are still being deleted",
+              file=sys.stderr)
     failed = 0
     for rule in all_rules_errored(denied_dir, denied_hive_key):
         if not delete_rule(op, rule["rule_id"]):

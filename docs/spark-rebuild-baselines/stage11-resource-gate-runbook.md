@@ -105,7 +105,11 @@ python docs/spark-rebuild-baselines/generate_resgate_load.py arm
 Creates `C:\YuzuResGate\watch-01.txt`..`watch-20.txt`, 20 `HKCU\SOFTWARE\YuzuResGate\Key01..20`
 registry guards, and 20 service-status watches against real, already-running
 Windows services (Spooler, Themes, BITS, ...) - read-only, nothing is
-started/stopped. Pushes `full_sync` so the agent actually arms them.
+started/stopped. Creates + deploys a `resgate-baseline` Baseline covering all 60
+rules and pushes `full_sync` (governance Gate 4, 2026-08-18: an earlier version of
+this script - and this line - assumed a bare `full_sync` was enough; it is not,
+since `guardian_push_fn_` only delivers rules that are members of a *deployed*
+Baseline, and this profile had the same gap `arm-errored` was found and fixed for).
 
 **Errored profile (F11) - deny-ACL setup FIRST, as Administrator, before `arm-errored`:**
 
