@@ -270,7 +270,7 @@ branch:
 - **LOW, confirmed by both:** the runbook's 30-minute sanity-window table said "~5
   refreshes" without noting the inclusive t=1800s boundary can land a 6th, and didn't
   account for jitter on the file-lane count. Fixed: reworded.
-- **LOW (Kimi only, rejected by Codex on cross-exam) — REOPENED AND CORRECTED
+- **LOW (Kimi only, rejected by Codex on cross-exam) - REOPENED AND CORRECTED
   post-adversarial-review, during full `/governance`:** `guardian-c0-thread-reloc-
   design.md`'s item 7/9 resolutions recorded an operator ruling ("2000/64 MiB is
   stale text") without a paired code change. Both Kimi and Codex, and my own
