@@ -4,6 +4,14 @@ if host_machine.system() == 'windows'
   hardware_deps += cxx.find_library('wbemuuid')
   hardware_deps += cxx.find_library('ole32')
   hardware_deps += cxx.find_library('oleaut32')
+elif host_machine.system() == 'darwin'
+  # Wave 3 (#2380/ADR-3002 promotion): the "system" action reads the IOKit
+  # IOPlatformExpertDevice registry entry natively (kIOPlatformSerialNumberKey
+  # / kIOPlatformUUIDKey) instead of shelling out to `ioreg`. Same dependency
+  # shape as tests/meson.build's agent_test_native_deps (PLAN-08) — agent-core
+  # itself links no IOKit/CoreFoundation on darwin, so this plugin pulls its
+  # own copy.
+  hardware_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'])
 endif
 
 shared_library(

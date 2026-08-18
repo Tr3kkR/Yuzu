@@ -17,24 +17,39 @@
 
 #include <yuzu/plugin.hpp>
 
-#include <array>
-#include <cstdio>
+#include <cstdint>
 #include <format>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #if defined(__linux__)
+#include <filesystem>
 #include <fstream>
+#include <iterator>
+
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess/probe_tool_path (Wave 3, ADR-3002)
+
+#include "hardware_linux_parsers.hpp"
 #endif
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
 
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+
 #include <nlohmann/json.hpp>
 
+#include <yuzu/agent/scoped_cfref.hpp>
+#include <yuzu/agent/scoped_ioobject.hpp>
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (Wave 3, ADR-3002)
+
 #include "hardware_disks_macos.hpp"
+#include "hardware_macos_bios.hpp"
 #endif
 
 #ifdef _WIN32
@@ -55,26 +70,6 @@
 
 namespace {
 
-// ── subprocess helper (Linux / macOS) ──────────────────────────────────────
-
-#if defined(__linux__) || defined(__APPLE__)
-std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
-    }
-    pclose(pipe);
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-        result.pop_back();
-    }
-    return result;
-}
-#endif
-
 // ── Linux: read a single-line sysfs/dmi file ──────────────────────────────
 
 #ifdef __linux__
@@ -90,9 +85,64 @@ std::string read_dmi_file(const char* path) {
 }
 #endif
 
+// ── macOS: native sysctlbyname / IOKit helpers ─────────────────────────────
+// Wave 3 (#2380/ADR-3002 promotion): every plain `sysctl -n <name>` popen()
+// call in this file becomes a direct sysctlbyname(3) (rung 1) — no shell,
+// no child process. Two-call size-probe idiom per sysctlbyname(3)'s own man
+// page (first call with a null buffer measures the required size).
+
+#ifdef __APPLE__
+std::string sysctl_string(const char* name) {
+    std::size_t len = 0;
+    if (sysctlbyname(name, nullptr, &len, nullptr, 0) != 0 || len == 0)
+        return {};
+    std::string buf(len, '\0');
+    if (sysctlbyname(name, buf.data(), &len, nullptr, 0) != 0)
+        return {};
+    // Trim the trailing NUL(s) sysctlbyname includes in `len` for a
+    // string-type sysctl.
+    while (!buf.empty() && buf.back() == '\0')
+        buf.pop_back();
+    return buf;
+}
+
+template <typename T> std::optional<T> sysctl_value(const char* name) {
+    T value{};
+    std::size_t len = sizeof(value);
+    if (sysctlbyname(name, &value, &len, nullptr, 0) != 0)
+        return std::nullopt;
+    return value;
+}
+
+// Reads a CFStringRef-typed IORegistry property off `entry` and converts it
+// to UTF-8, following the size-then-copy CFStringGetCString idiom used by
+// agents/shared/macos_console_user.hpp's console_user(). `prop` adopts
+// IORegistryEntryCreateCFProperty's +1 Create-Rule reference via ScopedCFRef
+// (scoped_cfref.hpp) so it is released on every return path, including the
+// type-mismatch/early-return ones.
+std::string io_registry_cf_string(io_object_t entry, CFStringRef key) {
+    yuzu::agent::ScopedCFRef<CFTypeRef> prop(
+        IORegistryEntryCreateCFProperty(entry, key, kCFAllocatorDefault, 0));
+    if (!prop || CFGetTypeID(prop.get()) != CFStringGetTypeID())
+        return {};
+    auto str = static_cast<CFStringRef>(prop.get());
+    CFIndex len = CFStringGetLength(str);
+    if (len <= 0)
+        return {};
+    CFIndex max_size = CFStringGetMaximumSizeForEncoding(len, kCFStringEncodingUTF8) + 1;
+    std::string buf(static_cast<std::size_t>(max_size), '\0');
+    if (!CFStringGetCString(str, buf.data(), max_size, kCFStringEncodingUTF8))
+        return {};
+    return std::string(buf.c_str());
+}
+#endif
+
 // ── Windows: WMI helper class ─────────────────────────────────────────────
 
 #ifdef _WIN32
+// TODO: bounded-WMI migration (shared agents/shared/wmi_bounded.hpp,
+// PR3.3-a, concurrent sibling) will swap this class's Next(WBEM_INFINITE,
+// ...) enumeration onto the bounded helper — no functional change here.
 class WmiQuery {
 public:
     WmiQuery() {
@@ -220,7 +270,7 @@ int do_manufacturer(yuzu::CommandContext& ctx) {
     ctx.write_output(std::format("manufacturer|{}", mfr.empty() ? "unknown" : mfr));
 
 #elif defined(__APPLE__)
-    auto mfr = run_command("sysctl -n hw.manufacturer 2>/dev/null");
+    auto mfr = sysctl_string("hw.manufacturer");
     // Apple hardware always says "Apple" but sysctl may not have this key
     ctx.write_output(std::format("manufacturer|{}", mfr.empty() ? "Apple Inc." : mfr));
 
@@ -247,7 +297,7 @@ int do_model(yuzu::CommandContext& ctx) {
     ctx.write_output(std::format("model|{}", model.empty() ? "unknown" : model));
 
 #elif defined(__APPLE__)
-    auto model = run_command("sysctl -n hw.model 2>/dev/null");
+    auto model = sysctl_string("hw.model");
     ctx.write_output(std::format("model|{}", model.empty() ? "unknown" : model));
 
 #elif defined(_WIN32)
@@ -277,9 +327,15 @@ int do_bios(yuzu::CommandContext& ctx) {
     ctx.write_output(std::format("bios_date|{}", date.empty() ? "unknown" : date));
 
 #elif defined(__APPLE__)
-    // macOS doesn't expose traditional BIOS; report boot ROM version
-    auto rom = run_command("system_profiler SPHardwareDataType 2>/dev/null | grep 'Boot ROM' | awk "
-                           "-F': ' '{print $2}'");
+    // macOS doesn't expose traditional BIOS; report boot ROM / system
+    // firmware version. hardware/do_bios#1 — read-only, no operator input;
+    // rung 2 (no public Boot-ROM/firmware-version API on macOS) via the
+    // bounded runner instead of a raw popen (docs/agent-spawn-sink-manifest.md).
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/usr/sbin/system_profiler", "SPHardwareDataType"},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(20)});
+    auto rom = res.tool_ran ? yuzu::hardware::macos::parse_boot_rom_version(res.output)
+                            : std::string{};
     ctx.write_output("bios_vendor|Apple");
     ctx.write_output(std::format("bios_version|{}", rom.empty() ? "unknown" : rom));
     ctx.write_output("bios_date|N/A");
@@ -340,10 +396,20 @@ int do_system(yuzu::CommandContext& ctx) {
     ctx.write_output(std::format("system_uuid|{}", uuid.empty() ? "unknown" : uuid));
 
 #elif defined(__APPLE__)
-    auto serial = run_command("ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | "
-                              "awk -F'\"' '/IOPlatformSerialNumber/{print $4}'");
-    auto uuid = run_command("ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null | "
-                            "awk -F'\"' '/IOPlatformUUID/{print $4}'");
+    // Native IOKit read of the IOPlatformExpertDevice registry entry (rung 1)
+    // instead of shelling out to `ioreg | awk`. ScopedIOObject/ScopedCFRef
+    // (agents/core/include/yuzu/agent/scoped_{ioobject,cfref}.hpp) own the
+    // Mach port / CF references so every return path releases them.
+    std::string serial;
+    std::string uuid;
+    {
+        yuzu::agent::ScopedIOObject expert(IOServiceGetMatchingService(
+            kIOMainPortDefault, IOServiceMatching("IOPlatformExpertDevice")));
+        if (expert) {
+            serial = io_registry_cf_string(expert.get(), CFSTR(kIOPlatformSerialNumberKey));
+            uuid = io_registry_cf_string(expert.get(), CFSTR(kIOPlatformUUIDKey));
+        }
+    }
     ctx.write_output(std::format("serial|{}", serial.empty() ? "unknown" : serial));
     ctx.write_output(std::format("system_uuid|{}", uuid.empty() ? "unknown" : uuid));
 
@@ -422,19 +488,16 @@ int do_processors(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    auto brand = run_command("sysctl -n machdep.cpu.brand_string 2>/dev/null");
-    auto cores = run_command("sysctl -n hw.physicalcpu 2>/dev/null");
-    auto threads = run_command("sysctl -n hw.logicalcpu 2>/dev/null");
-    auto freq = run_command("sysctl -n hw.cpufrequency 2>/dev/null");
-    double mhz = 0.0;
-    if (!freq.empty()) {
-        try {
-            mhz = std::stod(freq) / 1e6;
-        } catch (...) {}
-    }
-    ctx.write_output(std::format("cpu|0|{}|{}|{}|{:.0f}", brand.empty() ? "unknown" : brand,
-                                 cores.empty() ? "0" : cores, threads.empty() ? "0" : threads,
-                                 mhz));
+    auto brand = sysctl_string("machdep.cpu.brand_string");
+    auto cores = sysctl_value<int32_t>("hw.physicalcpu").value_or(0);
+    auto threads = sysctl_value<int32_t>("hw.logicalcpu").value_or(0);
+    // hw.cpufrequency is absent on Apple Silicon (sysctlbyname fails ==
+    // ENOENT), same as the prior `sysctl -n` invocation printing nothing --
+    // mhz stays 0.0 in that case, matching the pre-Wave-3 fallback exactly.
+    auto freq = sysctl_value<uint64_t>("hw.cpufrequency");
+    double mhz = freq ? static_cast<double>(*freq) / 1e6 : 0.0;
+    ctx.write_output(
+        std::format("cpu|0|{}|{}|{}|{:.0f}", brand.empty() ? "unknown" : brand, cores, threads, mhz));
 
 #elif defined(_WIN32)
     WmiQuery wmi;
@@ -464,66 +527,26 @@ int do_processors(yuzu::CommandContext& ctx) {
 
 int do_memory(yuzu::CommandContext& ctx) {
 #ifdef __linux__
-    // Try dmidecode first (needs root), fall back to /proc/meminfo
-    auto dmi = run_command("dmidecode -t memory 2>/dev/null");
-    if (!dmi.empty() && dmi.find("Size:") != std::string::npos) {
-        // Parse dmidecode output for each "Memory Device" block
-        std::istringstream ss(dmi);
-        std::string line;
-        std::string slot, size, type, speed;
-        bool in_device = false;
-        while (std::getline(ss, line)) {
-            // Trim leading whitespace
-            auto start = line.find_first_not_of(" \t");
-            if (start == std::string::npos)
-                continue;
-            line = line.substr(start);
-
-            if (line == "Memory Device") {
-                // Emit previous device if any
-                if (in_device && !size.empty() && size != "No Module Installed") {
-                    // Extract numeric size in MB
-                    std::string size_mb = size;
-                    auto sp = size.find(' ');
-                    if (sp != std::string::npos)
-                        size_mb = size.substr(0, sp);
-                    // Extract numeric speed
-                    std::string speed_mhz = speed;
-                    sp = speed.find(' ');
-                    if (sp != std::string::npos)
-                        speed_mhz = speed.substr(0, sp);
-                    ctx.write_output(
-                        std::format("dimm|{}|{}|{}|{}", slot, size_mb, type, speed_mhz));
-                }
-                slot.clear();
-                size.clear();
-                type.clear();
-                speed.clear();
-                in_device = true;
-            } else if (in_device) {
-                if (line.starts_with("Locator:")) {
-                    slot = line.substr(line.find(':') + 2);
-                } else if (line.starts_with("Size:")) {
-                    size = line.substr(line.find(':') + 2);
-                } else if (line.starts_with("Type:") && !line.starts_with("Type Detail")) {
-                    type = line.substr(line.find(':') + 2);
-                } else if (line.starts_with("Speed:")) {
-                    speed = line.substr(line.find(':') + 2);
-                }
-            }
-        }
-        // Emit last device
-        if (in_device && !size.empty() && size != "No Module Installed") {
-            std::string size_mb = size;
-            auto sp = size.find(' ');
-            if (sp != std::string::npos)
-                size_mb = size.substr(0, sp);
-            std::string speed_mhz = speed;
-            sp = speed.find(' ');
-            if (sp != std::string::npos)
-                speed_mhz = speed.substr(0, sp);
-            ctx.write_output(std::format("dimm|{}|{}|{}|{}", slot, size_mb, type, speed_mhz));
-        }
+    // Try dmidecode first (needs root), fall back to /proc/meminfo.
+    // hardware/do_memory#1 — dmidecode runs unprivileged here: it typically
+    // fails EPERM/empty (docs/agent-spawn-sink-manifest.md), and the
+    // existing EPERM->empty->/proc/meminfo fallback is preserved exactly
+    // below. Rung 2 via the bounded runner instead of a raw popen; the text
+    // parsing itself is now the pure, unit-tested
+    // hardware_linux_parsers.hpp::parse_dmidecode_memory.
+    auto dmidecode_path =
+        yuzu::agent::probe_tool_path({"/usr/sbin/dmidecode", "/sbin/dmidecode"});
+    std::vector<std::string> dimm_rows;
+    if (!dmidecode_path.empty()) {
+        auto res = yuzu::agent::run_bounded_subprocess(
+            {dmidecode_path, "-t", "memory"},
+            yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10)});
+        if (res.tool_ran)
+            dimm_rows = yuzu::hardware::linuxutil::parse_dmidecode_memory(res.output);
+    }
+    if (!dimm_rows.empty()) {
+        for (const auto& row : dimm_rows)
+            ctx.write_output(row);
     } else {
         // Fallback: just report total memory from /proc/meminfo
         std::ifstream meminfo("/proc/meminfo");
@@ -541,14 +564,9 @@ int do_memory(yuzu::CommandContext& ctx) {
     }
 
 #elif defined(__APPLE__)
-    auto mem = run_command("sysctl -n hw.memsize 2>/dev/null");
-    if (!mem.empty()) {
-        try {
-            auto bytes = std::stoull(mem);
-            ctx.write_output(std::format("dimm|total|{}|unknown|0", bytes / (1024 * 1024)));
-        } catch (...) {
-            ctx.write_output("dimm|total|unknown|unknown|0");
-        }
+    auto mem = sysctl_value<uint64_t>("hw.memsize");
+    if (mem) {
+        ctx.write_output(std::format("dimm|total|{}|unknown|0", *mem / (1024 * 1024)));
     } else {
         ctx.write_output("dimm|total|unknown|unknown|0");
     }
@@ -597,45 +615,55 @@ int do_memory(yuzu::CommandContext& ctx) {
 
 int do_disks(yuzu::CommandContext& ctx) {
 #ifdef __linux__
-    auto lsblk = run_command("lsblk -dno NAME,SIZE,TYPE,MODEL,TRAN 2>/dev/null");
-    if (!lsblk.empty()) {
-        std::istringstream ss(lsblk);
-        std::string line;
-        int idx = 0;
-        while (std::getline(ss, line)) {
-            // Fields are whitespace-separated; MODEL may contain spaces
-            // Use fixed-width parsing: NAME SIZE TYPE rest...
-            std::istringstream ls(line);
-            std::string name, size, type, model, tran;
-            ls >> name >> size >> type;
-            // Read remaining as model + transport
-            std::string rest;
-            std::getline(ls, rest);
-            // Trim leading space
-            auto start = rest.find_first_not_of(" \t");
-            if (start != std::string::npos)
-                rest = rest.substr(start);
-            // Last token might be transport (sata, nvme, usb, etc.)
-            auto last_space = rest.rfind(' ');
-            if (last_space != std::string::npos) {
-                tran = rest.substr(last_space + 1);
-                model = rest.substr(0, last_space);
-            } else {
-                model = rest;
-            }
-            if (type == "disk") {
-                ctx.write_output(std::format("disk|{}|{}|{}|{}|{}", idx++,
-                                             model.empty() ? name : model, size, type,
-                                             tran.empty() ? "unknown" : tran));
-            }
+    // Native /sys/block walk instead of `lsblk -dno NAME,SIZE,TYPE,MODEL,
+    // TRAN` (rung 1). The enumeration + every per-device file read below is
+    // injected into hardware_linux_parsers.hpp::build_linux_disk_rows so the
+    // row-building logic itself is unit-testable without a real sysfs tree.
+    std::vector<std::string> names;
+    try {
+        std::error_code ec;
+        for (const auto& entry :
+             std::filesystem::directory_iterator("/sys/block", ec)) {
+            if (ec)
+                break;
+            names.push_back(entry.path().filename().string());
         }
+    } catch (const std::filesystem::filesystem_error&) {
+        // A device disappeared mid-enumeration (rare sysfs TOCTOU) --
+        // fall through with whatever was collected so far; empty falls
+        // through to the sentinel row below.
+    }
+    auto read_file_fn = [](const std::string& path) -> std::string {
+        std::ifstream f(path, std::ios::binary);
+        if (!f)
+            return {};
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    };
+    auto read_link_fn = [](const std::string& path) -> std::string {
+        std::error_code ec;
+        auto target = std::filesystem::read_symlink(path, ec);
+        return ec ? std::string{} : target.string();
+    };
+    auto rows = yuzu::hardware::linuxutil::build_linux_disk_rows(names, read_file_fn, read_link_fn);
+    if (!rows.empty()) {
+        for (const auto& row : rows)
+            ctx.write_output(row);
     } else {
         ctx.write_output("disk|0|unknown|0|unknown|unknown");
     }
 
 #elif defined(__APPLE__)
-    auto sp_json = run_command(
-        "system_profiler SPStorageDataType SPNVMeDataType SPSerialATADataType -json 2>/dev/null");
+    // hardware/do_disks#1 — read-only, no operator input; rung 2 (no public
+    // per-disk enumeration API covers NVMe+SATA+size+model in one call) via
+    // the bounded runner instead of a raw popen
+    // (docs/agent-spawn-sink-manifest.md). The JSON parser itself
+    // (hardware_disks_macos.hpp) is UNCHANGED — only this acquisition call
+    // site moved.
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {"/usr/sbin/system_profiler", "SPStorageDataType", "SPNVMeDataType",
+         "SPSerialATADataType", "-json"},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(20)});
+    auto sp_json = res.tool_ran ? res.output : std::string{};
     for (const auto& row : yuzu::hardware::macos::macos_disk_rows_or_sentinel(sp_json)) {
         ctx.write_output(row);
     }
@@ -743,13 +771,15 @@ int do_drivers(yuzu::CommandContext& ctx) {
 // ABI4 capability declarations (#2204). Windows reads WMI throughout — the
 // ADR-3002 context section names this plugin's WMI usage as an existing
 // rung-1 example ("Windows plugins live here (hardware/bitlocker/
-// license_scan via WMI)"). Linux reads sysfs/dmi/proc files natively (rung
-// 1) except "disks", which shells out to `lsblk` (ungoverned rung 3 — no
-// stable /sys enumeration of disk model/transport exists). macOS shells out
-// via popen() for every action except "drivers" (unsupported — no public
-// per-driver/kext enumeration API is used here) — an ungoverned rung-3 shell
-// exec per ADR-3002's "27 of 49 plugins ... sit at an ungoverned rung 3".
-// "memory" is CONSTRAINED on Linux/macOS: both return a value, but only the
+// license_scan via WMI)"). Wave 3 (#2380/ADR-3002 promotion) moved Linux
+// "disks" onto a native /sys/block walk (rung 1, was ungoverned rung-3
+// `lsblk`) and "memory" onto the bounded runner (rung 2, was raw popen);
+// macOS "manufacturer"/"model"/"processors"/"system" are now direct
+// sysctlbyname(3)/IOKit calls (rung 1, were raw popen); macOS "bios"/"disks"
+// still shell out (no public API answers either question) but now via the
+// bounded runner (rung 2) instead of raw popen (rung 3). "drivers" remains
+// unsupported on macOS (no public per-driver/kext enumeration API). "memory"
+// stays CONSTRAINED on Linux/macOS: both return a value, but only the
 // aggregate total, not full per-DIMM detail, without additional privilege /
 // API surface.
 const YuzuActionDescriptor kActionDescriptors[] = {
@@ -758,7 +788,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "/sys/class/dmi/id/sys_vendor", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(sysctl -n hw.manufacturer)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sysctlbyname(hw.manufacturer)", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_ComputerSystem.Manufacturer", nullptr},
     },
@@ -767,7 +797,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "/sys/class/dmi/id/product_name", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(sysctl -n hw.model)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sysctlbyname(hw.model)", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_ComputerSystem.Model", nullptr},
     },
@@ -777,35 +807,39 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1,
          "/sys/class/dmi/id/bios_vendor + bios_version + bios_date", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3,
-         "popen(system_profiler SPHardwareDataType, grep 'Boot ROM', awk)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "run_bounded_subprocess(system_profiler SPHardwareDataType) + native parser "
+         "(hardware_macos_bios.hpp)",
+         nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_BIOS", nullptr},
     },
     {
         /* .action      = */ "processors",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/cpuinfo", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(sysctl machdep.cpu.*, hw.*cpu*)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "sysctlbyname(machdep.cpu.*, hw.*cpu*)", nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_Processor", nullptr},
     },
     {
         /* .action      = */ "memory",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 3, "popen(dmidecode -t memory)",
+        {YUZU_SUPPORT_CONSTRAINED, 2, "run_bounded_subprocess(dmidecode -t memory)",
          "falls back to the aggregate MemTotal from /proc/meminfo (no per-DIMM detail) when "
          "dmidecode is unavailable or unprivileged"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_CONSTRAINED, 3, "popen(sysctl -n hw.memsize)",
+        {YUZU_SUPPORT_CONSTRAINED, 1, "sysctlbyname(hw.memsize)",
          "aggregate total only, no per-DIMM breakdown (macOS has no public per-DIMM API)"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_PhysicalMemory", nullptr},
     },
     {
         /* .action      = */ "disks",
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "popen(lsblk)", nullptr},
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "/sys/block/*/{size,device/model} native walk", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3,
-         "popen(system_profiler SPStorageDataType SPNVMeDataType SPSerialATADataType -json)",
+        {YUZU_SUPPORT_SUPPORTED, 2,
+         "run_bounded_subprocess(system_profiler SPStorageDataType SPNVMeDataType "
+         "SPSerialATADataType -json) + native parser (hardware_disks_macos.hpp)",
          nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "WMI Win32_DiskDrive", nullptr},
     },
@@ -821,8 +855,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1,
          "/sys/class/dmi/id/product_serial + product_uuid", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 3,
-         "popen(ioreg -rd1 -c IOPlatformExpertDevice, awk)", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "IOServiceGetMatchingService(IOPlatformExpertDevice) + "
+         "IORegistryEntryCreateCFProperty(kIOPlatformSerialNumberKey/kIOPlatformUUIDKey)",
+         nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "WMI Win32_BIOS.SerialNumber + Win32_ComputerSystemProduct.UUID", nullptr},

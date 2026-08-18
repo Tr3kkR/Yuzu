@@ -303,6 +303,9 @@ agent_test_exe = executable(
                                                 # network_diag/ioc .dylib driven end to end via
                                                 # LocalDispatcher (Darwin-only, self-gated) -- same
                                                 # shape as test_users_posix_actions.cpp
+    'unit/test_hardware_macos_bios.cpp',      # Wave 3 PR3.2: pure Boot ROM / System Firmware Version parser
+    'unit/test_hardware_linux_parsers.cpp',   # Wave 3 PR3.2: pure dmidecode memory parser + injected /sys/block disk-row builder
+    'unit/test_device_identity_macos.cpp',    # Wave 3 PR3.2: pure dsconfigad -show parser (device_identity's first tests)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -329,6 +332,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/wol/src'),             # wol_check_plan.hpp (Wave 2 WP-E)
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
     include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
+    include_directories('../agents/plugins/device_identity/src'), # device_identity_macos.hpp (Wave 3 PR3.2 pure parser)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly
