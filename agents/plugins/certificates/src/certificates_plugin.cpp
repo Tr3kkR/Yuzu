@@ -955,9 +955,16 @@ bool caller_is_root() {
 }
 
 /**
- * Resolve the current console (GUI) user via subprocess -- the LaunchDaemon
- * has no framework access (SystemConfiguration) available, so this shells
- * out to `stat`/`id` rather than SCDynamicStoreCopyConsoleUser. Returns
+ * Resolve the current console (GUI) user via subprocess. SystemConfiguration
+ * IS linkable from this LaunchDaemon (see agents/shared/macos_console_user.hpp's
+ * SCDynamicStoreCopyConsoleUser, already used by the users plugin) -- this
+ * shells out to `stat`/`id` by deliberate choice, not because the framework is
+ * unavailable: `stat -f%Su /dev/console` reports the console DEVICE owner,
+ * while SCDynamicStoreCopyConsoleUser reports the Aqua SESSION owner, and the
+ * two diverge under fast user switching / screen sharing -- WHICH user's login
+ * keychain this plugin reads is an operator-visible behavioural contract that
+ * a rung-1 promotion would need to verify separately (tracked in #2380). See
+ * docs/agent-spawn-sink-manifest.md's `resolve_console_user#1` row. Returns
  * std::nullopt when there is no interactive console session (login window /
  * headless -- stat reports the "root" sentinel, see
  * yuzu::macos::is_no_console_user) OR when the resolved username/uid fails
@@ -977,8 +984,9 @@ std::optional<yuzu::macos::ConsoleUser> resolve_console_user(
     auto stat_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
     if (stat_deadline <= std::chrono::milliseconds::zero())
         return std::nullopt;
-    // sink: certificates/resolve_console_user#1 — rung-2 runner argv (no
-    // SystemConfiguration access from this LaunchDaemon), see manifest
+    // sink: certificates/resolve_console_user#1 — rung-2 runner argv;
+    // SystemConfiguration IS linkable here, deliberately not used (device-
+    // vs session-owner semantics), see manifest
     auto stat_result = run_bounded_checked({"/usr/bin/stat", "-f%Su", "/dev/console"},
                                            yuzu::agent::SubprocessOptions{
                                                .deadline = stat_deadline},
