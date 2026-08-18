@@ -958,7 +958,11 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // and that the ITServiceOwner role grants the required permission.
     if (!session->token_scope_service.empty()) {
         const std::string perm = securable_type + ":" + operation;
-        if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+        // #1717: gate on `rbac_enforcement_in_effect`, not raw
+        // `is_rbac_enabled()` — same standardization as `require_permission`'s
+        // service branch (#2298 PR 3), so a degraded/stale-cached store
+        // reads identically on both functions instead of diverging.
+        if (!rbac_store_ || !rbac_enforcement_in_effect(rbac_store_)) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
@@ -990,22 +994,39 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                             "application/json");
             return false;
         }
-        if (!agent_id.empty()) {
-            auto agent_service = tag_store_->get_tag(agent_id, "service");
-            if (agent_service != session->token_scope_service) {
-                audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
-                          "agent service '" + agent_service + "' does not match token scope '" +
-                              session->token_scope_service + "'");
-                res.status = 403;
-                // Was the third denial shape ({"error":"forbidden","detail":...});
-                // now the unified A4 envelope like every other gate (#1470).
-                res.set_content(detail::a4_denial(res, 403,
-                                                  "agent is not in service '" +
-                                                      session->token_scope_service + "'",
-                                                  detail::A4ErrorOpts{.permission = perm}),
-                                "application/json");
-                return false;
-            }
+        // #2298 PR 3 (§3b): an empty agent_id used to skip the ONLY
+        // comparison that could deny and fall through to an unconditional
+        // `return true` below — the exact "allow everything" degenerate
+        // `confine_agent_target` (authz_gates.cpp) was built to not repeat
+        // (#2437/#2500 omitted-vs-empty rule: an empty agent_id is a caller
+        // bug, never "no target to check"). Verified during planning: every
+        // one of this function's ~18 call sites already guards
+        // `agent_id.empty()` before reaching it, so this bug was latent, not
+        // live — this 400 closes the function's own degenerate shape without
+        // an admit->deny regression on any real caller.
+        if (agent_id.empty()) {
+            audit_log(req, "auth.scoped_permission_required", "denied", "", "",
+                      "service-scoped token blocked: empty agent_id");
+            res.status = 400;
+            res.set_content(detail::a4_denial(res, 400, "agent_id is required",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
+        }
+        auto agent_service = tag_store_->get_tag(agent_id, "service");
+        if (agent_service != session->token_scope_service) {
+            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                      "agent service '" + agent_service + "' does not match token scope '" +
+                          session->token_scope_service + "'");
+            res.status = 403;
+            // Was the third denial shape ({"error":"forbidden","detail":...});
+            // now the unified A4 envelope like every other gate (#1470).
+            res.set_content(detail::a4_denial(res, 403,
+                                              "agent is not in service '" +
+                                                  session->token_scope_service + "'",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
         }
         return true;
     }

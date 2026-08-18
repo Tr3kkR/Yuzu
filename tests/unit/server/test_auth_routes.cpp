@@ -21,7 +21,8 @@
 #include "pg/pg_raii.hpp" // PgConn/PgResult — the CH-4 saboteur's second connection
 #include "rbac_store.hpp"
 #include "service_scope_policy.hpp"
-#include "../test_helpers.hpp" // YUZU_REQUIRE_PG_DB_TPL / PgTestTemplate
+#include "tag_store.hpp"
+#include "../test_helpers.hpp" // YUZU_REQUIRE_PG_DB_TPL / PgTestTemplate / TempDbFile
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/server.hpp>
@@ -138,14 +139,16 @@ yuzu::test::PgTestTemplate service_scope_flip_rbac_tpl{
             throw std::runtime_error("rbac (svc scope flip) template: store failed to migrate/seed");
     }};
 
-/// Minimal real-RBAC rig for `AuthRoutes::require_permission`'s service-scoped
-/// branch (#2298 PR 3 — the flip). `require_permission` never touches
-/// `tag_store_`/`mgmt_group_store_` (only `require_scoped_permission`/
-/// `confine_agent_target` do), so both stay nullptr — `GatesRig`
-/// (test_authz_gates.cpp) is the fuller rig for those. Grants are set on
-/// synthetic securable names (e.g. "ZzzFlip...") rather than reusing real
-/// seeded ITServiceOwner grants, so a test's precondition is explicit and
-/// does not drift if the real seed data ever changes.
+/// Minimal real-RBAC rig for `AuthRoutes::require_permission`'s and
+/// `require_scoped_permission`'s service-scoped branches (#2298 PR 3 — the
+/// flip). `mgmt_group_store_` stays nullptr (neither function under test
+/// consults it directly; `confine_agent_target` does, and `GatesRig` in
+/// test_authz_gates.cpp is the fuller rig for that). Grants are set on real,
+/// catalogued (securable, operation) pairs (role_permissions FK-references
+/// securable_types/operations, so a synthetic name is rejected outright, not
+/// merely untested) — always set EXPLICITLY within each test so the
+/// precondition is that test's own, not incidental to ITServiceOwner's real
+/// default seed.
 struct ServiceScopeFlipRig {
     Config cfg{};
     yuzu::MetricsRegistry metrics; // wired so the default-deny counter fires
@@ -153,6 +156,8 @@ struct ServiceScopeFlipRig {
     pg::PgPool pool;
     RbacStore rbac;
     yuzu::test::ApiTokenStorePg api_tokens;
+    yuzu::test::TempDbFile tag_db{"yuzu_test_svcscopeflip_tags-"};
+    TagStore tags{tag_db.path};
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
     std::unique_ptr<AuthRoutes> ar;
@@ -166,8 +171,7 @@ struct ServiceScopeFlipRig {
         REQUIRE(auth_mgr.upsert_user("minter", "correct-horse-battery-staple", auth::Role::admin));
         ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(),
                                           /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr,
-                                          /*tag_store=*/nullptr, /*analytics_store=*/nullptr,
-                                          oidc_mu, oidc_provider);
+                                          &tags, /*analytics_store=*/nullptr, oidc_mu, oidc_provider);
     }
 
     /// Mint a token as "minter" — empty `scope_service` ⇒ a non-service token.
@@ -872,6 +876,89 @@ TEST_CASE("AuthRoutes::require_permission — the seeded-empty allow-list's admi
     bool ok2 = r.ar->require_permission(req, res2, "Response", "Read");
     CHECK_FALSE(ok2);
     CHECK(res2.status == 403);
+}
+
+// ---------------------------------------------------------------------------
+// require_scoped_permission — empty-agent_id hole (#2298 PR 3 §3b). An empty
+// agent_id used to skip the ONLY comparison that could deny the service
+// branch and fall through to an unconditional `return true` — an "allow
+// everything" degenerate for any service-scoped caller who omits the target.
+// Latent, not live, at every one of AuthRoutes's own callers — but real for
+// at least one *_routes.cpp `scoped_perm_fn_` consumer that derives its id
+// from an optional query param with no upstream empty-check
+// (device_routes.cpp's /fragments/device/page: `req.has_param("id") ? ... :
+// ""`) — swept and confirmed those route-level tests all inject a FAKE
+// scoped_perm_fn (test_device_routes.cpp:852 passes `{}`), so none exercise
+// this real function and none need updating for this fix.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_scoped_permission — service-scoped token with "
+          "empty agent_id now 400s instead of falling through to an "
+          "unconditional admit",
+          "[pg][auth_routes][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Tag", "Write", "allow"}).has_value());
+    auto token = r.mint("printers");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    bool ok = r.ar->require_scoped_permission(req, res, "Tag", "Write", /*agent_id=*/"");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 400);
+    CHECK(res.body.find("agent_id is required") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_scoped_permission — service-scoped token with a "
+          "matching non-empty agent_id still admits (regression: only the "
+          "empty-id degenerate path changed)",
+          "[pg][auth_routes][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Tag", "Write", "allow"}).has_value());
+    r.tags.set_tag("agent-1", "service", "printers");
+    auto token = r.mint("printers");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    bool ok = r.ar->require_scoped_permission(req, res, "Tag", "Write", "agent-1");
+    CHECK(ok);
+}
+
+TEST_CASE("AuthRoutes::require_scoped_permission — service-scoped token with a "
+          "non-matching agent_id still 403s (regression)",
+          "[pg][auth_routes][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Tag", "Write", "allow"}).has_value());
+    r.tags.set_tag("agent-2", "service", "other-service");
+    auto token = r.mint("printers");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    bool ok = r.ar->require_scoped_permission(req, res, "Tag", "Write", "agent-2");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("not in service") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_scoped_permission — service-scoped token hard-403s "
+          "when RBAC enforcement is not in effect (same standardized predicate "
+          "as require_permission, #2298 PR 3)",
+          "[pg][auth_routes][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Tag", "Write", "allow"}).has_value());
+    r.rbac.set_rbac_enabled(false);
+    r.tags.set_tag("agent-1", "service", "printers");
+    auto token = r.mint("printers");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    bool ok = r.ar->require_scoped_permission(req, res, "Tag", "Write", "agent-1");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("require RBAC to be enabled") != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
