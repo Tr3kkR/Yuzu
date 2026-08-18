@@ -330,12 +330,14 @@ TEST_CASE("POST /api/schedules: a service-scoped token is denied even holding "
 
     CHECK(res.status == 403);
     CHECK(h.schedule_engine.query_schedules().empty());
-    // Gate 8 (GC-7): create is gated on Schedule:Write in production, not the
-    // shared helper's Schedule:Read default — the A4 .permission hint must
-    // name the grant actually missing.
+    // Gate 8 (#2298 PR 3 hardening round, supersedes the prior GC-7 fix this
+    // test pinned): `.permission` is now omitted entirely, not renamed to
+    // the "correct" grant — `kServiceScopeGlobalSafe` is compile-time-empty,
+    // so no grant, correctly-named or not, actually admits a service-scoped
+    // caller here (routed-concern MUST clause 5).
     auto body = nlohmann::json::parse(res.body, nullptr, false);
     REQUIRE_FALSE(body.is_discarded());
-    CHECK(body["error"]["permission"] == "Schedule:Write");
+    CHECK_FALSE(body["error"].contains("permission"));
 }
 
 TEST_CASE("deny_service_scoped_schedule: denies a service-scoped session, writes 403, "

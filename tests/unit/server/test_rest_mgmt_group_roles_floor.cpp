@@ -60,14 +60,20 @@ struct GroupRolesHarness {
     /// intact — `grant everything` cannot express "route gate yes, second gate no".
     std::function<bool(const std::string&, const std::string&)> perm_override{};
 
+    /// guardian-confinement-2298 PR3 §3e sweep finding: empty ⇒ an ordinary
+    /// session; a test sets this to prove the ITServiceOwner-of-this-group
+    /// fallback is skipped for a service-scoped token.
+    std::string mock_token_scope_service;
+
     GroupRolesHarness() {
         REQUIRE(rbac.is_open());
 
-        auto auth_fn = [](const httplib::Request&,
-                          httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [this](const httplib::Request&,
+                              httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "tester";
             s.role = auth::Role::user;
+            s.token_scope_service = mock_token_scope_service;
             return s;
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -199,4 +205,146 @@ TEST_CASE("GET /management-groups/{id}/roles requires the floored UserManagement
         REQUIRE(res);
         CHECK(res->status == 403);
     }
+
+    SECTION("guardian-confinement-2298 §3e: ITServiceOwner OF THIS GROUP does NOT "
+             "save a service-scoped token") {
+        auto assigned = h.mgmt_bundle->assign_role(
+            GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
+        REQUIRE(assigned.has_value());
+
+        h.perm_override = [](const std::string& securable, const std::string& op) {
+            return !(securable == "UserManagement" && op == "Read");
+        };
+        h.mock_token_scope_service = "printers";
+        auto res = h.sink.Get("/api/v1/management-groups/" + gid + "/roles");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// guardian-confinement-2298 PR3 §3e sweep finding: POST/DELETE on this same
+// path had ZERO existing test coverage and used a direct
+// rbac_store->check_permission call bypassing require_permission (the §3a
+// flip) entirely. Fixed to route through perm_fn's probe-response form
+// (matching the GET handler above), with the ITServiceOwner-of-this-group
+// fallback skipped for a service-scoped token — same reasoning as GET's new
+// section above.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("POST /management-groups/{id}/roles: fleet-wide ManagementGroup:Write "
+          "grant is sufficient (regression)",
+          "[pg][rest][mgmt_group][authz][security_scope]") {
+    GroupRolesHarness h;
+    ManagementGroup g;
+    g.name = "floor-test-post";
+    g.membership_type = "static";
+    g.created_by = "tester";
+    auto grp = h.mgmt_bundle->create_group(g);
+    REQUIRE(grp.has_value());
+    const std::string gid = *grp;
+
+    auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                           R"({"principal_id":"someone","role_name":"Viewer"})");
+    REQUIRE(res);
+    CHECK(res->status == 201);
+}
+
+TEST_CASE("POST /management-groups/{id}/roles: ITServiceOwner OF THIS GROUP is "
+          "allowed without ManagementGroup:Write (regression)",
+          "[pg][rest][mgmt_group][authz][security_scope]") {
+    GroupRolesHarness h;
+    ManagementGroup g;
+    g.name = "floor-test-post2";
+    g.membership_type = "static";
+    g.created_by = "tester";
+    auto grp = h.mgmt_bundle->create_group(g);
+    REQUIRE(grp.has_value());
+    const std::string gid = *grp;
+    auto assigned = h.mgmt_bundle->assign_role(
+        GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
+    REQUIRE(assigned.has_value());
+
+    h.perm_override = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                           R"({"principal_id":"someone","role_name":"Viewer"})");
+    REQUIRE(res);
+    CHECK(res->status == 201);
+}
+
+TEST_CASE("POST /management-groups/{id}/roles: a service-scoped token is denied "
+          "even as ITServiceOwner of the group",
+          "[pg][rest][mgmt_group][authz][security_scope]") {
+    GroupRolesHarness h;
+    ManagementGroup g;
+    g.name = "floor-test-post3";
+    g.membership_type = "static";
+    g.created_by = "tester";
+    auto grp = h.mgmt_bundle->create_group(g);
+    REQUIRE(grp.has_value());
+    const std::string gid = *grp;
+    auto assigned = h.mgmt_bundle->assign_role(
+        GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
+    REQUIRE(assigned.has_value());
+
+    h.perm_override = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    h.mock_token_scope_service = "printers";
+    auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                           R"({"principal_id":"someone","role_name":"Viewer"})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("DELETE /management-groups/{id}/roles: fleet-wide ManagementGroup:Write "
+          "grant is sufficient (regression)",
+          "[pg][rest][mgmt_group][authz][security_scope]") {
+    GroupRolesHarness h;
+    ManagementGroup g;
+    g.name = "floor-test-del";
+    g.membership_type = "static";
+    g.created_by = "tester";
+    auto grp = h.mgmt_bundle->create_group(g);
+    REQUIRE(grp.has_value());
+    const std::string gid = *grp;
+    auto assigned = h.mgmt_bundle->assign_role(
+        GroupRoleAssignment{gid, "user", "someone", "Viewer"});
+    REQUIRE(assigned.has_value());
+
+    // TestRouteSink's Delete() convenience wrapper takes no body; the
+    // handler parses one, so dispatch() is called directly (mirrors Post/Put).
+    auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/roles",
+                               R"({"principal_id":"someone","role_name":"Viewer"})",
+                               "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+TEST_CASE("DELETE /management-groups/{id}/roles: a service-scoped token is denied "
+          "even as ITServiceOwner of the group",
+          "[pg][rest][mgmt_group][authz][security_scope]") {
+    GroupRolesHarness h;
+    ManagementGroup g;
+    g.name = "floor-test-del3";
+    g.membership_type = "static";
+    g.created_by = "tester";
+    auto grp = h.mgmt_bundle->create_group(g);
+    REQUIRE(grp.has_value());
+    const std::string gid = *grp;
+    auto assigned = h.mgmt_bundle->assign_role(
+        GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
+    REQUIRE(assigned.has_value());
+
+    h.perm_override = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    h.mock_token_scope_service = "printers";
+    auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/roles",
+                               R"({"principal_id":"tester","role_name":"ITServiceOwner"})",
+                               "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 403);
 }
