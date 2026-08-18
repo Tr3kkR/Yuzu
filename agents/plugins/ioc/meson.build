@@ -9,7 +9,8 @@ shared_library(
   'ioc',
   files('src/ioc_plugin.cpp'),
   name_prefix: '',
-  include_directories: include_directories('../../shared'),  # win_str.hpp (#1681, _WIN32-gated)
+  include_directories: include_directories('../../shared'),  # win_str.hpp (#1681, _WIN32-gated);
+                                                                # macos_socket_walk.hpp (Wave 3 PR3.1)
   dependencies: ioc_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',

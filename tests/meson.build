@@ -289,6 +289,8 @@ agent_test_exe = executable(
     'unit/test_discovery_scan_plan.cpp',      # Wave 2 WP-C: pure sweep bounds + honest-degrade decisions
     'unit/test_route_sysctl_arp.cpp',         # Wave 2 WP-C: pure sysctl NET_RT_FLAGS/RTF_LLINFO binary parser
     'unit/test_bounded_wait.cpp',             # Wave 2 WP-C remediation: uncancellable-call timeout wrapper
+    'unit/agent/test_socket_walk.cpp',        # Wave 3 PR3.1: macos_socket_walk.hpp libproc walk (Darwin-only, self-gated)
+    'unit/test_os_info_macos.cpp',            # Wave 3 PR3.1: os_info_macos.hpp SystemVersion.plist extractor (pure, every host)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -311,6 +313,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/users/src'),         # users_macos_last.hpp (qe-M1 pure parser)
     include_directories('../agents/plugins/content_dist/src'),  # content_dist_upload_parsers.hpp (PR1.6b pure helpers)
     include_directories('../agents/plugins/discovery/src'),      # discovery_parsers.hpp (Wave 2 WP-C pure parser)
+    include_directories('../agents/plugins/os_info/src'),        # os_info_macos.hpp (Wave 3 PR3.1 pure plist parser)
   ],
   # agent_platform_args carries -DYUZU_HAVE_LIBSYSTEMD (Linux + libsystemd found)
   # so Linux real-mechanism Service spark tests can compile-gate on it, exactly

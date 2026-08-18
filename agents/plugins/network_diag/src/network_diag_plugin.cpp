@@ -6,12 +6,15 @@
  *   "connections"  — List established TCP connections.
  *
  * Output is pipe-delimited via write_output().
+ *
+ * Platform support:
+ *   Linux   — /proc/net/tcp[6]
+ *   macOS   — libproc via agents/shared/macos_socket_walk.hpp (rung 1)
+ *   Windows — IP Helper API (GetExtendedTcpTable)
  */
 
 #include <yuzu/plugin.hpp>
 
-#include <array>
-#include <cstdio>
 #include <format>
 #include <sstream>
 #include <string>
@@ -21,6 +24,10 @@
 #include <cstdlib>
 #include <fstream>
 #include <vector>
+#endif
+
+#ifdef __APPLE__
+#include <macos_socket_walk.hpp>
 #endif
 
 #ifdef _WIN32
@@ -40,25 +47,6 @@
 #endif
 
 namespace {
-
-// ── subprocess helper ──────────────────────────────────────────────────────
-
-#if defined(__APPLE__)
-std::string run_command(const char* cmd) {
-    std::string result;
-    std::array<char, 256> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
-        return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
-        result += buf.data();
-    }
-    pclose(pipe);
-    while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
-        result.pop_back();
-    return result;
-}
-#endif
 
 #ifdef _WIN32
 
@@ -173,21 +161,21 @@ void parse_proc_tcp(yuzu::CommandContext& ctx, const char* path, const std::stri
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
-// Windows reads the IP Helper API natively (rung 1); Linux reads
-// /proc/net/tcp[6] directly (rung 1); macOS shells out to `lsof` via a raw
-// popen() (run_command above, `~:47-61` — not the bounded subprocess
-// runner), so both macOS legs are rung 3.
+// One action, native in-process on every platform: Windows reads the IP
+// Helper API natively, Linux reads /proc/net/tcp[6] directly, macOS walks
+// libproc via agents/shared/macos_socket_walk.hpp — zero subprocesses
+// anywhere (rung 1).
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "listening",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/tcp[6]", nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "lsof via popen", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "libproc", nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetExtendedTcpTable", nullptr},
     },
     {
         /* .action      = */ "connections",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/tcp[6]", nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 3, "lsof via popen", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "libproc", nullptr},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetExtendedTcpTable", nullptr},
     },
 };
@@ -227,22 +215,14 @@ public:
             parse_proc_tcp(ctx, "/proc/net/tcp", "0A", true);
             parse_proc_tcp(ctx, "/proc/net/tcp6", "0A", true);
 #elif defined(__APPLE__)
-            auto output = run_command("lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null");
-            std::istringstream iss(output);
-            std::string line;
-            std::getline(iss, line); // skip header
-            while (std::getline(iss, line)) {
-                // Parse lsof output: COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
-                std::istringstream ls(line);
-                std::string cmd, pid, user, fd, type, device, sizeoff, node, name;
-                ls >> cmd >> pid >> user >> fd >> type >> device >> sizeoff >> node >> name;
-                // name is like *:8080 or 127.0.0.1:443
-                auto colon = name.rfind(':');
-                if (colon != std::string::npos) {
-                    auto addr = name.substr(0, colon);
-                    auto port = name.substr(colon + 1);
-                    ctx.write_output(std::format("listen|tcp|{}|{}|{}", addr, port, pid));
-                }
+            for (const auto& s : yuzu::shared::walk_sockets(/*dedup=*/true)) {
+                if ((s.proto != "tcp" && s.proto != "tcp6") || s.state != "LISTEN")
+                    continue;
+                // lsof rendered an unbound wildcard address as "*" — preserve that
+                // for byte-identical output against the pre-migration format.
+                std::string addr =
+                    (s.local_addr == "0.0.0.0" || s.local_addr == "::") ? "*" : s.local_addr;
+                ctx.write_output(std::format("listen|tcp|{}|{}|{}", addr, s.local_port, s.pid));
             }
 #endif
             return 0;
@@ -255,27 +235,11 @@ public:
             parse_proc_tcp(ctx, "/proc/net/tcp", "01", false);
             parse_proc_tcp(ctx, "/proc/net/tcp6", "01", false);
 #elif defined(__APPLE__)
-            auto output = run_command("lsof -iTCP -sTCP:ESTABLISHED -P -n 2>/dev/null");
-            std::istringstream iss(output);
-            std::string line;
-            std::getline(iss, line); // skip header
-            while (std::getline(iss, line)) {
-                std::istringstream ls(line);
-                std::string cmd, pid, user, fd, type, device, sizeoff, node, name;
-                ls >> cmd >> pid >> user >> fd >> type >> device >> sizeoff >> node >> name;
-                // name is like 192.168.1.1:443->10.0.0.1:12345
-                auto arrow = name.find("->");
-                if (arrow != std::string::npos) {
-                    auto local = name.substr(0, arrow);
-                    auto remote = name.substr(arrow + 2);
-                    auto lc = local.rfind(':');
-                    auto rc = remote.rfind(':');
-                    if (lc != std::string::npos && rc != std::string::npos) {
-                        ctx.write_output(std::format("conn|tcp|{}|{}|{}|{}|{}", local.substr(0, lc),
-                                                     local.substr(lc + 1), remote.substr(0, rc),
-                                                     remote.substr(rc + 1), pid));
-                    }
-                }
+            for (const auto& s : yuzu::shared::walk_sockets(/*dedup=*/true)) {
+                if ((s.proto != "tcp" && s.proto != "tcp6") || s.state != "ESTABLISHED")
+                    continue;
+                ctx.write_output(std::format("conn|tcp|{}|{}|{}|{}|{}", s.local_addr, s.local_port,
+                                             s.remote_addr, s.remote_port, s.pid));
             }
 #endif
             return 0;
