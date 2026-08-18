@@ -198,7 +198,12 @@ public:
     //    with different return shapes. Not yet reconciled — a real question
     //    for later, not decided here. ------------------------------------
 
-    /// The two-axis list-read gate: management-group visibility (the
+    /// The two-axis list-read gate. Named `require_*`, not `authorize_*`
+    /// (renamed post-#3216, fjarvis/Kimi K2.7 follow-up review): it is a
+    /// self-sufficient authority gate that writes `res` on every failure
+    /// path itself, same contract as `require_permission`/
+    /// `require_scoped_permission` — a caller does not need, and must not
+    /// add, a second decision on top of it. Management-group visibility (the
     /// existing ADR-0017 `RbacStore::authorize_list_read` chokepoint, reused
     /// as the subordinate primitive here, never rewritten) intersected
     /// (`authz::meet`) with service-scope visibility (a service-scoped
@@ -238,14 +243,19 @@ public:
     /// tier-sensitive or service-scope-sensitive operation must add one, not
     /// assume `require_permission` supplies it.
     [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
-    authorize_fleet_read(const httplib::Request& req, httplib::Response& res,
-                         const std::string& securable_type, const std::string& operation);
+    require_fleet_read(const httplib::Request& req, httplib::Response& res,
+                       const std::string& securable_type, const std::string& operation);
 
     /// The single-agent confinement gate: does `agent_id` carry the
     /// `service` tag matching this session's `token_scope_service`?
     /// CONFINEMENT-AXIS ONLY — this is NOT a full authority decision and
     /// does not re-check the RBAC grant a caller must independently verify
-    /// for the same `(securable_type, operation)`. Pair with
+    /// for the same `(securable_type, operation)`. Named `confine_*`, not
+    /// `authorize_*` (renamed post-#3216, fjarvis/Kimi K2.7 follow-up
+    /// review) precisely because it is not self-sufficient the way
+    /// `require_fleet_read` is — the name itself now carries the "you still
+    /// need an RBAC check alongside this" constraint instead of relying on
+    /// a reader finding this paragraph. Pair with
     /// `require_scoped_permission`, NOT `require_permission` — this gate is
     /// single-agent-shaped, and `require_scoped_permission` (unlike
     /// `require_permission`) correctly passes `mgmt_group_store_` to
@@ -256,7 +266,7 @@ public:
     /// scoped caller cannot be) — so such a caller is not incorrectly
     /// rejected before ever reaching this gate's own check — the exact
     /// BLOCKING defect found in
-    /// `authorize_fleet_read`'s sibling comment (2026-08-17, reviewer
+    /// `require_fleet_read`'s sibling comment (2026-08-17, reviewer
     /// `fjarvis`, PR #3216) does not apply here, but corrected proactively
     /// since the wrong function name was named for the same reason. For a
     /// NON-service session the axis is TOP (unfiltered) by definition, so
@@ -270,10 +280,10 @@ public:
     /// could deny and falls through to `return true`). Fail-closed 503 on a
     /// null or degraded tag store, matching that same function's tag-store-
     /// unavailable case.
-    [[nodiscard]] bool authorize_agent_target(const httplib::Request& req, httplib::Response& res,
-                                              const std::string& securable_type,
-                                              const std::string& operation,
-                                              const std::string& agent_id);
+    [[nodiscard]] bool confine_agent_target(const httplib::Request& req, httplib::Response& res,
+                                            const std::string& securable_type,
+                                            const std::string& operation,
+                                            const std::string& agent_id);
 
     /// Build a synthetic session from a validated API token. Two-branch on the
     /// token's persisted `principal_kind` (design doc §6):
