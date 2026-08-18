@@ -188,7 +188,15 @@ CertRecord to_cert_record(const yuzu::certificates_x509::CertFields& fields, std
 /// currently-executing command, and every call here reports the same
 /// CONSTRAINED/PARTIAL pair, so a read that degrades in two places reports
 /// degraded once with the last-named provenance rather than escalating.
+///
+/// Also logs at WARN: the ABI4 seam alone is invisible to log/alert-based
+/// monitoring (governance Gate 6 sre finding) -- the sibling subprocess
+/// degradation sites in this file (run_bounded_checked/parse_pem_block_macos)
+/// already spdlog::warn on their own failures, and the SecItem/libcrypto
+/// in-process read paths this PR added had no equivalent, silently invisible
+/// to anything watching the agent log rather than result-status metadata.
 void mark_result_partial(yuzu::CommandContext& ctx, std::string_view provenance) {
+    spdlog::warn("certificates: degraded read ({})", provenance);
     ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                           provenance);
 }
