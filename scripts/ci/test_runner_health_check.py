@@ -138,6 +138,10 @@ class MainTests(unittest.TestCase):
                 "name": "windows-0",
                 "labels": ["self-hosted", "Windows", "X64", "yuzu-weetam-windows"],
             },
+            {
+                "name": "bigmags-0",
+                "labels": ["self-hosted", "macOS", "ARM64", "yuzu-bigmags-macos"],
+            },
         ]
         self.inventory.write_text(
             json.dumps({"strict_unknown_runners": True, "expected_runners": self.expected}),
@@ -174,6 +178,7 @@ class MainTests(unittest.TestCase):
             "runners": [
                 runner("linux-0", self.expected[0]["labels"], status="offline"),
                 runner("windows-0", self.expected[1]["labels"]),
+                runner("bigmags-0", self.expected[2]["labels"]),
             ]
         }
         result = runner_health.QueryResult(runner_health.QueryState.OK, payload=payload)
@@ -215,6 +220,7 @@ class MainTests(unittest.TestCase):
             "runners": [
                 runner("linux-0", self.expected[0]["labels"]),
                 runner("windows-0", self.expected[1]["labels"]),
+                runner("bigmags-0", self.expected[2]["labels"]),
             ]
         }
         result = runner_health.QueryResult(runner_health.QueryState.OK, payload=payload)
@@ -223,11 +229,13 @@ class MainTests(unittest.TestCase):
             "--mode", "preflight",
             "--require-pool", "bigtam",
             "--require-pool", "weetam",
+            "--require-pool", "bigmags",
         )
 
         self.assertEqual(code, 0)
         self.assertIn("bigtam_pool_healthy=true\n", output)
         self.assertIn("weetam_pool_healthy=true\n", output)
+        self.assertIn("bigmags_pool_healthy=true\n", output)
         self.assertIn("control_state=ok\n", output)
 
     def test_sentinel_drift_emits_issue_ready_report(self) -> None:
@@ -235,6 +243,7 @@ class MainTests(unittest.TestCase):
             "runners": [
                 runner("linux-0", self.expected[0]["labels"], status="offline"),
                 runner("windows-0", self.expected[1]["labels"]),
+                runner("bigmags-0", self.expected[2]["labels"]),
             ]
         }
         result = runner_health.QueryResult(runner_health.QueryState.OK, payload=payload)
@@ -327,6 +336,22 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertIn("--require-pool weetam", preflight)
                 self.assertIn("weetam_pool_healthy", preflight)
 
+    def test_bigmags_gate_matches_every_macos_consumer(self) -> None:
+        for workflow, job_name in (("ci.yml", "macos"),):
+            with self.subTest(workflow=workflow, job=job_name):
+                job = self.job(workflow, job_name)
+                self.assertRegex(
+                    job,
+                    r"(?m)^    runs-on: \[self-hosted, macOS, ARM64, yuzu-bigmags-macos\]$",
+                )
+                self.assertIn("needs.preflight.outputs.bigmags_pool_healthy == 'true'", job)
+
+        for workflow in ("ci.yml",):
+            with self.subTest(workflow=workflow):
+                preflight = self.job(workflow, "preflight")
+                self.assertIn("--require-pool bigmags", preflight)
+                self.assertIn("bigmags_pool_healthy", preflight)
+
     def test_preflight_context_names_are_unique(self) -> None:
         expected = {
             "ci.yml": 'name: "Preflight (runner health)"',
@@ -368,6 +393,9 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("TRUSTED_FORK_CI_GATE: ${{ secrets.TRUSTED_FORK_CI_GATE }}", wrapper)
         self.assertIn("RUNNER_INVENTORY_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN }}", wrapper)
 
+        # linux + windows carry the full boundary: conditional clean:false
+        # (safe only with their branch-switch wipe step + vcpkg sentinel) plus
+        # the trusted-fork cache-isolation trio.
         for job_name in ("linux", "windows"):
             with self.subTest(job=job_name):
                 job = self.job("ci.yml", job_name)
@@ -378,6 +406,24 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertIn("VCPKG_BINARY_SOURCES=clear", job)
                 self.assertIn("CCACHE_DIR=$cache_root/ccache", job)
                 self.assertIn("Purge trusted-fork workspace", job)
+
+        # macOS deliberately keeps actions/checkout's default clean:true (a
+        # fresh workspace every run is a *stronger* fork-isolation boundary; the
+        # conditional clean:false form is not adopted here because its
+        # branch-switch wipe step + vcpkg sentinel companions are not ported to
+        # macOS — cross-run incrementality is deferred). So macOS is asserted
+        # for the SAME cache-isolation trio but NOT the conditional clean
+        # expression — asserting that would force clean:false with no wipe
+        # companion, shipping cross-run staleness.
+        with self.subTest(job="macos"):
+            job = self.job("ci.yml", "macos")
+            self.assertNotIn(
+                "clean: ${{ needs.preflight.outputs.trusted_execution == 'true' }}",
+                job,
+            )
+            self.assertIn("VCPKG_BINARY_SOURCES=clear", job)
+            self.assertIn("CCACHE_DIR=$cache_root/ccache", job)
+            self.assertIn("Purge trusted-fork workspace", job)
 
     def test_nightly_alert_does_not_open_a_merge_block_after_cancellation(self) -> None:
         nightly = (ROOT / ".github" / "workflows" / "nightly.yml").read_text(encoding="utf-8")
