@@ -204,17 +204,25 @@ public:
     //    RELATED BUT DISTINCT from `require_list_read` above: both compose
     //    `RbacStore::authorize_list_read`, but for different purposes
     //    (general ADR-0017 confinement vs. service-scope confinement) and
-    //    with different return shapes. Not yet reconciled — tracked as #3218,
-    //    not decided here. The rename below (authorize_* -> require_*/confine_*,
-    //    fjarvis/Kimi K2.7 follow-up review) moves `require_fleet_read` into
-    //    the same `require_*` family as `require_list_read`, which sharpens
-    //    rather than resolves the confusability: unlike `require_list_read`,
-    //    `require_fleet_read` calls `authorize_list_read` directly with no
-    //    JIT-elevation or engine-principal special-casing — see its own doc
-    //    comment's "does NOT cover" paragraph. Whoever wires a route to
-    //    `require_fleet_read` for a caller class that can be elevated or an
-    //    engine principal must resolve #3218 first, not assume parity with
-    //    `require_list_read` from the shared name prefix. ------------------
+    //    with different return shapes. #3218 (this shared-name-prefix
+    //    confusability) is CLOSED as of #2298 PR 3, ADR-1006 "Decision 2 —
+    //    closes #3218": the two gates stay deliberately separate, not
+    //    merged — see `require_list_read`'s own doc comment above
+    //    ("Route-class distinction") and
+    //    `docs/adr/1006-service-scope-default-deny.md` for the resolution.
+    //    The rename below (authorize_* -> require_*/confine_*, fjarvis/Kimi
+    //    K2.7 follow-up review) moved `require_fleet_read` into the same
+    //    `require_*` family as `require_list_read` — a naming proximity
+    //    that is safe only because the closed #3218 discussion already
+    //    settled the two gates are not interchangeable: unlike
+    //    `require_list_read`, `require_fleet_read` calls
+    //    `authorize_list_read` directly with no JIT-elevation or
+    //    engine-principal special-casing — see its own doc comment's "does
+    //    NOT cover" paragraph. A route wiring `require_fleet_read` for a
+    //    caller class that can be elevated or an engine principal must still
+    //    account for that gap explicitly — #3218 closing means the TWO GATES
+    //    are settled as separate, not that this per-caller-class gap is
+    //    resolved. ------------------------------------------------------
 
     /// The two-axis list-read gate. Named `require_*`, not `authorize_*`
     /// (renamed post-#3216, fjarvis/Kimi K2.7 follow-up review): it is a
@@ -265,10 +273,13 @@ public:
     /// directly with no JIT-elevation branch (an elevated session gets no
     /// special unfiltered treatment here) and no engine-principal branch (an
     /// engine principal is not routed to RBAC-only resolution here the way
-    /// `require_list_read` routes it) — see #3218, the tracked reconciliation
-    /// question. A route reachable by either caller class must not assume
-    /// `require_fleet_read` alone reproduces `require_list_read`'s posture
-    /// for them.
+    /// `require_list_read` routes it). #3218 (the shared-name-prefix
+    /// confusability between these two gates) is CLOSED — see the "Phase 0
+    /// confinement primitives" comment above: the two gates stay
+    /// deliberately separate. Closing #3218 settled THAT question; it did
+    /// NOT resolve THIS per-caller-class gap — a route reachable by either
+    /// caller class must still not assume `require_fleet_read` alone
+    /// reproduces `require_list_read`'s posture for them.
     [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
     require_fleet_read(const httplib::Request& req, httplib::Response& res,
                        const std::string& securable_type, const std::string& operation);

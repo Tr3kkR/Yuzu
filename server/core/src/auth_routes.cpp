@@ -680,8 +680,10 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                       "blocked by service-scope default-deny");
             res.status = 403;
             const std::string perm = securable_type + ":" + operation;
-            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
-                                              detail::A4ErrorOpts{.permission = perm}),
+            // No `.permission` field: holding `perm` alone would not admit
+            // this session (compile-time-empty allow-list — routed-concern
+            // "MUST NOT name a permission that wouldn't actually admit").
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm),
                             "application/json");
             return false;
         }
@@ -761,9 +763,9 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
+            // No `.permission`: granting `perm` does not fix "RBAC disabled".
             res.set_content(detail::a4_denial(res, 403,
-                                              "service-scoped tokens require RBAC to be enabled",
-                                              detail::A4ErrorOpts{.permission = perm}),
+                                              "service-scoped tokens require RBAC to be enabled"),
                             "application/json");
             return false;
         }
@@ -771,10 +773,14 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
+            // Post-flip, an ITServiceOwner grant is necessary but no longer
+            // sufficient (the allow-list check below still applies) — the
+            // message says so and `.permission` is omitted rather than
+            // implying this single grant would admit the caller.
             std::string msg = "service-scoped token does not grant " + perm +
-                              " (ITServiceOwner permission required)";
-            res.set_content(detail::a4_denial(res, 403, msg, detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
+                              " (requires ITServiceOwner AND an explicit service-scope "
+                              "allow-list entry)";
+            res.set_content(detail::a4_denial(res, 403, msg), "application/json");
             return false;
         }
         if (!service_scope_admits(securable_type, operation)) {
@@ -789,12 +795,14 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
                     .increment();
             }
             res.status = 403;
+            // No `.permission`: the allow-list is compile-time-empty, so no
+            // RBAC grant admits this caller (routed-concern MUST — a blanket
+            // deny must not name a permission that wouldn't actually admit).
             std::string msg = "service-scoped token does not grant " + perm +
                               " (not on the service-scope global-safe allow-list; this route "
                               "needs an explicit confined path via require_fleet_read/"
                               "confine_agent_target)";
-            res.set_content(detail::a4_denial(res, 403, msg, detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
+            res.set_content(detail::a4_denial(res, 403, msg), "application/json");
             return false;
         }
         return true;
@@ -872,7 +880,15 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
 
     // JIT admin elevation grants full admin (across all management groups) for
     // its window — cookie-session-only, so unreachable by MCP/service tokens.
-    if (auth::is_elevated(*session))
+    //
+    // Defense-in-depth (#2298 PR 3, mirrors require_permission's identical
+    // guard above): the `token_scope_service.empty()` check is currently
+    // redundant with that same cookie-session-only invariant, not
+    // load-bearing — kept so this short-circuit can never be the thing that
+    // lets a service-scoped token bypass the default-deny flip below, if
+    // that invariant ever changes. Do NOT read its presence as evidence
+    // elevation is reachable for service tokens today; it is not.
+    if (auth::is_elevated(*session) && session->token_scope_service.empty())
         return true;
 
     // Engine principals have NO legacy or service-scoped authority — their only
@@ -966,9 +982,9 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
+            // No `.permission`: granting `perm` does not fix "RBAC disabled".
             res.set_content(detail::a4_denial(res, 403,
-                                              "service-scoped tokens require RBAC to be enabled",
-                                              detail::A4ErrorOpts{.permission = perm}),
+                                              "service-scoped tokens require RBAC to be enabled"),
                             "application/json");
             return false;
         }
@@ -977,10 +993,14 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
-            std::string msg =
-                "service-scoped token does not grant " + perm + " (ITServiceOwner permission required)";
-            res.set_content(detail::a4_denial(res, 403, msg, detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
+            // Post-flip, an ITServiceOwner grant is necessary but no longer
+            // sufficient (the target agent's service tag must still match
+            // below) — omit `.permission` rather than imply this single
+            // grant would admit the caller.
+            std::string msg = "service-scoped token does not grant " + perm +
+                              " (requires ITServiceOwner AND the target agent's service tag "
+                              "to match the token's scope)";
+            res.set_content(detail::a4_denial(res, 403, msg), "application/json");
             return false;
         }
         // Verify the target agent's service tag matches the token's scope
@@ -1340,8 +1360,20 @@ bool AuthRoutes::deny_service_scoped_session(const httplib::Request& req, httpli
     res.set_content(
         detail::a4_denial(res, 403, message, detail::A4ErrorOpts{.permission = permission}),
         "application/json");
-    audit_log(req, action, "denied", target_type, target_id,
-             message + " (path=" + req.path + ")");
+    // `audit_log` calls into a concrete `AuditStore*`, not an injected
+    // callback, so it cannot propagate a caller-supplied exception the way
+    // the per-file `deny_service_scoped_*` family's `audit_fn`/`audit_fn_`
+    // parameters could — but this try/catch matches their shape anyway
+    // (Gate 4/consistency-auditor: a family that looks identical everywhere
+    // is cheaper to reason about than one exception debated case-by-case).
+    try {
+        audit_log(req, action, "denied", target_type, target_id,
+                 message + " (path=" + req.path + ")");
+    } catch (const std::exception& e) {
+        spdlog::warn("deny_service_scoped_session: audit_log threw: {}", e.what());
+    } catch (...) {
+        spdlog::warn("deny_service_scoped_session: audit_log threw (non-std)");
+    }
     return true;
 }
 

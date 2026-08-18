@@ -175,9 +175,14 @@ struct ServiceScopeFlipRig {
     }
 
     /// Mint a token as "minter" — empty `scope_service` ⇒ a non-service token.
-    std::string mint(const std::string& scope_service = {}) {
+    /// `mcp_tier` defaults empty; pass it non-empty to mint a token carrying
+    /// BOTH attributes (UP-1: no mutual-exclusivity check exists at mint
+    /// time, so this combination is a real mintable input, not a
+    /// hypothetical).
+    std::string mint(const std::string& scope_service = {}, const std::string& mcp_tier = {}) {
         auto raw = api_tokens->create_token("svc-flip-test", "minter",
-                                            service_scope_flip_now_epoch() + 3600, scope_service);
+                                            service_scope_flip_now_epoch() + 3600, scope_service,
+                                            mcp_tier);
         REQUIRE(raw.has_value());
         return *raw;
     }
@@ -803,7 +808,11 @@ TEST_CASE("AuthRoutes::require_permission — service-scoped token: ITServiceOwn
     CHECK(res.status == 403);
     CHECK(res.body.find("global-safe allow-list") != std::string::npos);
     auto j = nlohmann::json::parse(res.body);
-    CHECK(j["error"]["permission"] == "Response:Read");
+    // No `.permission` field: the allow-list is compile-time-empty, so no
+    // RBAC grant would admit this caller — naming one would be a false
+    // self-remediation claim (routed-concern MUST, enterprise-readiness
+    // Finding A).
+    CHECK_FALSE(j["error"].contains("permission"));
 
     // The metric drives Phase 2 prioritization — path_class="default" since
     // this request never sets req.path (resolve_body_cap's catch-all row).
@@ -827,7 +836,12 @@ TEST_CASE("AuthRoutes::require_permission — service-scoped token lacking the "
     bool ok = r.ar->require_permission(req, res, "Response", "Read");
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
-    CHECK(res.body.find("ITServiceOwner permission required") != std::string::npos);
+    CHECK(res.body.find("requires ITServiceOwner AND an explicit service-scope "
+                        "allow-list entry") != std::string::npos);
+    auto j = nlohmann::json::parse(res.body);
+    // No `.permission` field: post-flip, ITServiceOwner alone is necessary
+    // but no longer sufficient (the allow-list check still applies below).
+    CHECK_FALSE(j["error"].contains("permission"));
     // Never reached the default-deny check for this pair.
     CHECK(r.counter("yuzu_auth_service_scope_default_denied_total",
                      {{"permission", "Response:Read"}, {"path_class", "default"}}) == 0);
@@ -849,6 +863,9 @@ TEST_CASE("AuthRoutes::require_permission — service-scoped token hard-403s whe
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
     CHECK(res.body.find("require RBAC to be enabled") != std::string::npos);
+    // No `.permission` field: granting `perm` does not fix "RBAC disabled".
+    auto j = nlohmann::json::parse(res.body);
+    CHECK_FALSE(j["error"].contains("permission"));
 }
 
 TEST_CASE("AuthRoutes::require_permission — the seeded-empty allow-list's admit "
@@ -959,6 +976,105 @@ TEST_CASE("AuthRoutes::require_scoped_permission — service-scoped token hard-4
     CHECK_FALSE(ok);
     CHECK(res.status == 403);
     CHECK(res.body.find("require RBAC to be enabled") != std::string::npos);
+    // No `.permission` field: granting `perm` does not fix "RBAC disabled".
+    auto j = nlohmann::json::parse(res.body);
+    CHECK_FALSE(j["error"].contains("permission"));
+}
+
+TEST_CASE("AuthRoutes::require_scoped_permission — service-scoped token lacking "
+          "the ITServiceOwner ceiling denies with the ceiling message, never "
+          "reaching the per-agent service-tag check",
+          "[pg][auth_routes][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Tag", "Write", "deny"}).has_value());
+    r.tags.set_tag("agent-1", "service", "printers");
+    auto token = r.mint("printers");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    bool ok = r.ar->require_scoped_permission(req, res, "Tag", "Write", "agent-1");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("requires ITServiceOwner AND the target agent's service tag "
+                        "to match the token's scope") != std::string::npos);
+    // No `.permission` field: post-flip, ITServiceOwner alone is necessary
+    // but no longer sufficient (the agent's service tag must still match).
+    auto j = nlohmann::json::parse(res.body);
+    CHECK_FALSE(j["error"].contains("permission"));
+}
+
+// ---------------------------------------------------------------------------
+// Dual-attribute tokens (UP-1, Gate 4/5 governance): a token can carry BOTH
+// `scope_service` and `mcp_tier` — `validate_human_mint` (api_token_store.cpp)
+// has no mutual-exclusivity check, so this is a real mintable input, not a
+// hypothetical. Every mcp_tier block in this file checks-and-continues on an
+// allowed tier, then unconditionally FALLS THROUGH into the service-scoped
+// branch below it — it never returns `true` itself. These tests pin that
+// fall-through property directly: a dual-attribute token, on a tier-allowed
+// operation, must still be default-denied by the service branch exactly like
+// a scope_service-only token. A single added `return true;` inside any
+// mcp_tier block would flip these green->red.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_permission — a dual-attribute token (scope_service "
+          "+ mcp_tier=readonly, tier-allowed op) still hits the service-scoped "
+          "default-deny, not an mcp_tier fall-through admit",
+          "[pg][auth_routes][service_scope][mcp]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Response", "Read", "allow"}).has_value());
+    auto token = r.mint("printers", "readonly"); // readonly tier allows Read
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    bool ok = r.ar->require_permission(req, res, "Response", "Read");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("global-safe allow-list") != std::string::npos);
+    // Reached the default-deny check (and its metric) — proof the mcp_tier
+    // block fell through rather than returning true on its own.
+    CHECK(r.counter("yuzu_auth_service_scope_default_denied_total",
+                     {{"permission", "Response:Read"}, {"path_class", "default"}}) == 1);
+}
+
+TEST_CASE("AuthRoutes::require_scoped_permission — a dual-attribute token "
+          "(scope_service + mcp_tier=readonly, tier-allowed op, matching agent) "
+          "still resolves via the service-scoped agent-tag check, not an "
+          "mcp_tier fall-through admit",
+          "[pg][auth_routes][service_scope][mcp]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    REQUIRE(r.rbac.set_permission({"ITServiceOwner", "Tag", "Read", "allow"}).has_value());
+    r.tags.set_tag("agent-2", "service", "other-service"); // deliberately non-matching
+    auto token = r.mint("printers", "readonly");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    bool ok = r.ar->require_scoped_permission(req, res, "Tag", "Read", "agent-2");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    // Reached the per-agent service-tag comparison (not an mcp_tier
+    // fall-through admit that would have skipped it).
+    CHECK(res.body.find("not in service") != std::string::npos);
+}
+
+TEST_CASE("AuthRoutes::require_list_read — a dual-attribute token "
+          "(scope_service + mcp_tier=readonly) is still refused outright: this "
+          "gate has no fall-through-to-admit path for service-scoped tokens to "
+          "begin with (unlike require_permission/require_scoped_permission), "
+          "so mcp_tier cannot open one",
+          "[pg][auth_routes][service_scope][mcp]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, service_scope_flip_rbac_tpl);
+    ServiceScopeFlipRig r{rbac_db_.dsn()};
+    auto token = r.mint("printers", "readonly");
+    auto req = request_with_header("Authorization", "Bearer " + token);
+    httplib::Response res;
+
+    auto gate = r.ar->require_list_read(req, res, "Response", "Read");
+    CHECK_FALSE(gate.admitted);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("cannot read the fleet-wide status rollup") != std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
