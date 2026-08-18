@@ -114,6 +114,35 @@ forbid, so the collapse happens explicitly rather than being left for each call 
 because its doc comment names it as a potential hot dispatch-gating path — a fail-closed posture
 makes giving up fast always safe here (a timeout only ever means "disabled").
 
+**Update (2026-08-18, #3265):** the kill-switch scope grammar
+(`plugin_config_parsers.hpp::parse_kill_switch_scope`) accepts a **reserved-namespace** plugin
+name of the form `__<identifier>__` (e.g. `__guard__`, matching the `__guard__`/`__observation__`
+convention used elsewhere in this codebase) in addition to an ordinary `is_valid_identifier`
+plugin name. This is scoped to the kill-switch grammar only — `is_valid_identifier` and
+`parse_plugin_key` (config/secret row addressing) are UNCHANGED and continue to reject a
+reserved-namespace plugin.
+
+Without this, every `system_reserved` dispatch capability whose catalogue `plugin` starts with
+`__` (`core_dispatch_capabilities.hpp`'s `__guard__.push_rules`) was kill-switch-**unreachable**:
+`is_valid_identifier`'s first-byte-must-be-`a`-`z` rule made `parse_kill_switch_scope` return
+`nullopt` unconditionally, which `action_allowed`'s own documented contract ("an unresolvable
+scope must never resolve to allowed") collapses to `false` — so `__guard__.push_rules` was
+**permanently kill-switched off**, with no kill-switch row ever having been set, on every
+Postgres-backed server (i.e. every server, ADR-0006/0007). This silently dropped every Guardian
+rule push (`/api/v1/guaranteed-state/push`, Baseline deploy, and the reconcile re-push) — the
+caller saw a normal `202 {"queued":true,"agents":0}` response and audit row — `agents=0` was technically
+present, but indistinguishable from any other ordinary zero-match case (no agents in scope, none online),
+so nothing identified a kill switch as the cause.
+`tar.fleet_snapshot` and `asset_tags.sync`, the other two `system_reserved` capabilities, were
+unaffected (neither plugin name starts with `_`).
+
+The fix restores `action_allowed`'s documented default: with no kill-switch row for
+`__guard__`/`__guard__.push_rules`, the dispatch is allowed. The scope remains fully
+kill-switchable like any ordinary plugin.action — an operator can still explicitly disable
+`__guard__.push_rules` (whole-plugin or action-level) via
+`PUT /api/v1/plugin-config/__guard__/kill-switch` (`?action=push_rules`) or the MCP twin
+`set_plugin_kill_switch`, and that switch is honored exactly as for any other capability.
+
 ### REST authorization — existing operations only
 
 Every route gates on `PluginConfig` or `PluginSecret` with an operation drawn **only** from
