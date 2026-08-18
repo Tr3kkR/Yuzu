@@ -1034,14 +1034,15 @@ TEST_CASE("ManagementGroupStore::migrate_from_sqlite reads one consistent group/
                              nullptr, nullptr, nullptr) == SQLITE_OK);
     }
 
-    // Built ONCE, before the loop -- keeps every per-iteration statement a
-    // prebuilt literal instead of a fresh concatenation inside the open
-    // SqliteTxn below (cpp-safety, Gate 3 review of this round: a
-    // std::bad_alloc mid-concatenation while txn is live is an
-    // uncaught-exception-in-a-thread terminate the RAII wrap cannot save
-    // regardless -- see the txn comment below -- so this removes the
-    // allocation from that window rather than only reacting to it landing
-    // there).
+    // Built ONCE, before the loop, on the MAIN thread -- before the writer
+    // thread even exists -- rather than freshly concatenated inside the open
+    // SqliteTxn below on every retry (cpp-safety, Gate 3 review of this
+    // round, finding RR-6). This is a stronger guarantee than just moving
+    // where the allocation happens: a std::bad_alloc here is on the main
+    // thread, before std::thread writer(...) is constructed, so Catch2 can
+    // still catch it as an ordinary test failure -- not the
+    // uncaught-exception-in-a-thread std::terminate() a bad_alloc during
+    // per-iteration concatenation on the writer thread would risk.
     const std::array<std::string, 4> swap_to_new = {
         "DELETE FROM management_groups WHERE id='" + grp_old_id + "'",
         "INSERT INTO management_groups (id, name, description, membership_type, "
