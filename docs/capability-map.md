@@ -374,7 +374,7 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 8.1 Installed Update Enumeration :white_check_mark: `T1`
 
-`windows_updates` plugin with `installed` action. Cross-platform: Windows (Get-HotFix), Linux (rpm/apt), macOS (system_profiler).
+`windows_updates` plugin with `installed` action. Cross-platform: Windows (bounded WMI `Win32_QuickFixEngineering` query), Linux (rpm/apt), macOS (system_profiler).
 
 ### 8.2 Pending Reboot Detection :white_check_mark: `T1`
 

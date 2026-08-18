@@ -528,10 +528,10 @@ implementation is.
 | registry | list_profiles | windows | supported | 1 | win32_registry | - |
 | sccm | client_version | linux | unsupported | - | - | - |
 | sccm | client_version | macos | unsupported | - | - | - |
-| sccm | client_version | windows | supported | 3 | registry+sc_query | - |
+| sccm | client_version | windows | supported | 1 | registry+scm | - |
 | sccm | site | linux | unsupported | - | - | - |
 | sccm | site | macos | unsupported | - | - | - |
-| sccm | site | windows | supported | 3 | registry+powershell_com | - |
+| sccm | site | windows | supported | 1 | registry+com_dispatch | - |
 | script_exec | exec | linux | supported | 2 | fork_execvp | - |
 | script_exec | exec | macos | supported | 2 | fork_execvp | - |
 | script_exec | exec | windows | supported | 2 | create_process | - |
@@ -703,14 +703,14 @@ implementation is.
 | wifi | connected | linux | constrained | 3 | nmcli via governed shell runner | falls back to a raw iwconfig text blob (ESSID/Signal only) when nmcli reports no SSID |
 | wifi | connected | macos | constrained | 1 | CoreWLAN | Location Services (macOS 14+) may withhold SSID/BSSID from a background daemon |
 | wifi | connected | windows | supported | 1 | WlanQueryInterface | - |
-| windows_updates | installed | linux | supported | 3 | rpm+apt | - |
-| windows_updates | installed | macos | supported | 3 | system_profiler | - |
-| windows_updates | installed | windows | supported | 3 | powershell_gethotfix | - |
-| windows_updates | missing | linux | supported | 3 | apt+yum | - |
-| windows_updates | missing | macos | supported | 3 | softwareupdate | - |
-| windows_updates | missing | windows | supported | 3 | powershell_update_session | - |
+| windows_updates | installed | linux | supported | 2 | rpm+apt | - |
+| windows_updates | installed | macos | supported | 2 | system_profiler | - |
+| windows_updates | installed | windows | supported | 1 | wmi_bounded_query | - |
+| windows_updates | missing | linux | supported | 2 | apt+yum | - |
+| windows_updates | missing | macos | supported | 2 | softwareupdate | - |
+| windows_updates | missing | windows | supported | 1 | wua_com_async_search | - |
 | windows_updates | pending_reboot | linux | supported | 3 | filesystem+uname+needs_restarting | - |
-| windows_updates | pending_reboot | macos | constrained | 3 | softwareupdate | unbounded network call -- may take 30-120s or hang on an offline/headless Mac |
+| windows_updates | pending_reboot | macos | constrained | 2 | softwareupdate | bounded (60s deadline) since this migration, but still a slow network call -- no longer able to hang indefinitely on an offline/headless Mac |
 | windows_updates | pending_reboot | windows | supported | 1 | registry | - |
 | windows_updates | patch_connectivity | linux | supported | 1 | raw_sockets | - |
 | windows_updates | patch_connectivity | macos | supported | 1 | raw_sockets | - |
@@ -731,6 +731,7 @@ implementation is.
 **Undeclared plugins** (ABI<4, or ABI4 with no capability declarations yet — RATCHET: this count must never grow):
 
 _none — every built plugin has adopted the ABI4 capability descriptor._
+<!-- END GENERATED -->
 <!-- END GENERATED -->
 
 ## Make this self-maintaining
