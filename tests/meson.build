@@ -79,6 +79,13 @@ invalid_name_fixture_plugin = shared_library(
 agent_test_native_deps = []
 if host_machine.system() == 'darwin'
   agent_test_native_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'])
+elif host_machine.system() == 'windows'
+  # test_icmp_probe.cpp (Wave 2 WP-0): ws2_32 for WSAStartup/getaddrinfo/
+  # htons, iphlpapi for IcmpCreateFile/IcmpCloseHandle -- icmp_probe.hpp's
+  # own consumers (discovery/wol) link these themselves; the test TU needs
+  # its own copy, same shape as tar_test_deps' Windows block below.
+  agent_test_native_deps += cxx.find_library('ws2_32')
+  agent_test_native_deps += cxx.find_library('iphlpapi')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -269,6 +276,14 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (Windows-only; a no-op
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
     'unit/test_content_dist_upload_parsers.cpp', # PR1.6b: pure upload-protocol planner/classifier (no I/O)
+    'unit/test_runner_status.cpp',             # Wave 2 WP-0: pure runner-outcome -> ABI4 result-seam table
+    'unit/test_host_arg.cpp',                 # Wave 2 WP-0: shared leading-'-' host-arg gate (Decision 6)
+    'unit/test_sudo_argv.cpp',                # Wave 2 WP-0: Decision-8 canonical sudo argv form (POSIX-only TU)
+    'unit/test_icmp_probe.cpp',               # Wave 2 WP-0: RFC-1071 checksum + numeric-literal resolve/set_port
+    'unit/test_users_win_events.cpp',         # Wave 2 WP-A: pure wevtapi event-XML -> LogonEvent parser
+    'unit/test_users_posix_actions.cpp',      # Wave 2 WP-A remediation: real users.dylib/.so driven
+                                                # end to end via LocalDispatcher (POSIX-only; a no-op
+                                                # TU on Windows via the file's own #ifndef _WIN32 guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -308,7 +323,12 @@ agent_test_exe = executable(
   # Ensure the fixture plugins are built before the test runs so the lookups
   # inside test_plugin_loader.cpp / test_capability_descriptor.cpp find them
   # under MESON_BUILD_ROOT/tests/.
-  link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin],
+  # users_plugin_lib (agents/plugins/users/meson.build): test_users_posix_actions.cpp
+  # loads the real users plugin by path -- without this, the plugin build isn't
+  # ordered ahead of the test binary, and a not-yet-built plugin makes those
+  # cases WARN-and-skip instead of failing (code-review re-verification finding).
+  link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
+                users_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it
