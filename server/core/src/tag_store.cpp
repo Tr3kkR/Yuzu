@@ -341,12 +341,20 @@ TagStore::agents_with_tag_checked(const std::string& key, const std::string& val
     }
 
     std::vector<std::string> result;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         auto t = sqlite3_column_text(stmt, 0);
         if (t)
             result.emplace_back(reinterpret_cast<const char*>(t));
     }
     sqlite3_finalize(stmt);
+    // A mid-scan failure (I/O error, corruption) surfaces here as anything
+    // other than SQLITE_DONE — degraded, per this function's own contract,
+    // not the partial rows already accumulated read as a genuine answer.
+    // Found by review while adding a fail-closed consumer (authz_gates.cpp)
+    // that depends on this distinction for its 503-vs-admit posture.
+    if (rc != SQLITE_DONE)
+        return std::nullopt;
     return result;
 }
 

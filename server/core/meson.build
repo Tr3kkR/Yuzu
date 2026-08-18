@@ -361,6 +361,7 @@ yuzu_server_core_lib = static_library(
     'src/auth.cpp',
     'src/auth_db.cpp',
     'src/auth_routes.cpp',
+    'src/authz_gates.cpp',
     'src/mfa_step_up.cpp',
     'src/mfa_qr.cpp',
     'src/totp.cpp',

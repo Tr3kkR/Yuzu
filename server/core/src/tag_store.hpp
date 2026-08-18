@@ -58,14 +58,13 @@ public:
 
     void delete_all_tags(const std::string& agent_id);
 
-    /// nullopt == the store was unavailable OR the query itself failed to
-    /// PREPARE (a degraded db_, not "no agents"); a step-time failure mid-scan
-    /// is not distinguished from "no more rows" (pre-existing — not changed
-    /// here). Existing callers use the value_or({})-collapsing
-    /// `agents_with_tag` below; a caller for whom the prepare-failure
-    /// distinction is security-relevant (B-2b — a degraded tag DB must not
-    /// silently read as "genuinely zero agents" on a fail-closed confinement
-    /// path) should use this instead.
+    /// nullopt == the store was unavailable, the query failed to PREPARE, or
+    /// a step-time failure occurred mid-scan (any terminal `sqlite3_step` rc
+    /// other than SQLITE_DONE) — none of these are "no agents". Existing
+    /// callers use the value_or({})-collapsing `agents_with_tag` below; a
+    /// caller for whom the degraded-vs-empty distinction is security-relevant
+    /// (B-2b — a degraded tag DB must not silently read as "genuinely zero
+    /// agents" on a fail-closed confinement path) should use this instead.
     std::optional<std::vector<std::string>>
     agents_with_tag_checked(const std::string& key, const std::string& value = {}) const;
 

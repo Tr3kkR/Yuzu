@@ -346,6 +346,36 @@ static int access_review_error_status(const std::string& err) {
     return err.starts_with("not_found:") ? 404 : 503;
 }
 
+// SoftwareDeploymentStore error classifier — mirrors discovery_routes.cpp's
+// is_deployment_db_error (DeploymentStore/ADR-0043): the majority of a
+// route's `unexpected` values here are caller-input validation or
+// not-found/wrong-state business errors (400 territory, matching how
+// DeploymentStore's own REST routes classify — see cancel_job's route,
+// which 400s "job not found" too, not 404; none of these store methods have
+// a REST get-by-id twin that would need the separate nullopt-vs-unexpected
+// 404 split). Keys off the SHARED constant (software_deployment_store.hpp),
+// never a local copy of the literal.
+static int sw_deploy_error_status(const std::string& err) {
+    return err.starts_with(kSwDeployDbErrorPrefix) ? 503 : 400;
+}
+
+// Never echoes a genuine DB/lease failure's raw text to the client — it can
+// embed PQerrorMessage() fragments (schema/constraint/DETAIL names, and on a
+// connection-phase failure occasionally a host:port) that are internal
+// implementation detail, not information the caller needs (gov Gate 2
+// security-guardian MEDIUM). Logs the real error server-side and returns a
+// generic constant instead, matching DeploymentStore's discovery_routes.cpp
+// precedent (`is_deployment_db_error` branch). A validation/business-rule
+// error (never carries the prefix) is safe to echo verbatim — it's
+// operator-authored request feedback, not database internals.
+static std::string sw_deploy_client_message(const char* op, const std::string& err) {
+    if (err.starts_with(kSwDeployDbErrorPrefix)) {
+        spdlog::error("{}: {}", op, err);
+        return "service unavailable";
+    }
+    return err;
+}
+
 // LicenseStore (docs/adr/0048-...md) error mapping — three-way, unlike
 // access_review_error_status's binary shape: LicenseStore's own methods still validate some
 // inputs internally (e.g. "license key already activated", "organization cannot be empty")
@@ -7931,8 +7961,16 @@ void RestApiV1::register_routes(
                      if (!perm_fn(req, res, "SoftwareDeployment", "Read"))
                          return;
                      auto pkgs = sw_deploy_store->list_packages();
+                     if (!pkgs) {
+                         res.status = sw_deploy_error_status(pkgs.error());
+                         res.set_content(
+                             detail::a4_error(res, sw_deploy_client_message(
+                                                       "GET /api/v1/software-packages", pkgs.error())),
+                             "application/json");
+                         return;
+                     }
                      JArr arr;
-                     for (const auto& p : pkgs) {
+                     for (const auto& p : *pkgs) {
                          arr.add(JObj()
                                      .add("id", p.id)
                                      .add("name", p.name)
@@ -7944,7 +7982,7 @@ void RestApiV1::register_routes(
                                      .add("created_at", p.created_at)
                                      .add("created_by", p.created_by));
                      }
-                     res.set_content(list_json(arr.str(), static_cast<int64_t>(pkgs.size())),
+                     res.set_content(list_json(arr.str(), static_cast<int64_t>(pkgs->size())),
                                      "application/json");
                  });
 
@@ -7972,10 +8010,16 @@ void RestApiV1::register_routes(
             // header if the audit_fn signals failure. Matches the W1.1 /
             // PR #883 pattern used by the session-revoke handlers — the
             // operator must learn from the response whether the security
-            // event was actually persisted.
+            // event was actually persisted. try_persist_audit (not a bare
+            // audit_fn call) for the same reason as the 5 success-path
+            // sites below: a throwing audit sink must not turn this denial
+            // into an uncaught-exception 500 (no exception_handler_ is
+            // installed) -- gov review (security-guardian + docs-writer,
+            // Gate 2, b77952416..HEAD review round).
             auto emit_denial = [&](const char* detail_msg) {
-                bool emitted = audit_fn(req, "software_package.create", "denied", "SoftwarePackage",
-                                        "", detail_msg);
+                bool emitted = detail::try_persist_audit(audit_fn, req, "software_package.create",
+                                                         "denied", "SoftwarePackage", "",
+                                                         detail_msg);
                 if (!emitted)
                     res.set_header("Sec-Audit-Failed", "true");
             };
@@ -8055,12 +8099,21 @@ void RestApiV1::register_routes(
 
             auto result = sw_deploy_store->create_package(pkg);
             if (!result) {
-                res.status = 400;
-                res.set_content(detail::a4_error(res, result.error()), "application/json");
+                res.status = sw_deploy_error_status(result.error());
+                res.set_content(detail::a4_error(res, sw_deploy_client_message(
+                                                          "POST /api/v1/software-packages",
+                                                          result.error())),
+                                "application/json");
                 return;
             }
-            audit_fn(req, "software_package.create", "success", "SoftwarePackage", *result,
-                     pkg.name);
+            // try_persist_audit (not a bare audit_fn call): a throwing audit
+            // sink must not turn this 201 into an uncaught-exception 500 (no
+            // exception_handler_ is installed) after the mutation already
+            // committed — same rationale as deny_fleet_wide_service_scoped
+            // above, unhappy-path Gate 4 (b77952416..HEAD review round).
+            if (!detail::try_persist_audit(audit_fn, req, "software_package.create", "success",
+                                           "SoftwarePackage", *result, pkg.name))
+                res.set_header("Sec-Audit-Failed", "true");
             res.status = 201;
             res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
         });
@@ -8072,8 +8125,16 @@ void RestApiV1::register_routes(
                 return;
             auto status = req.has_param("status") ? req.get_param_value("status") : std::string{};
             auto deps = sw_deploy_store->list_deployments(status);
+            if (!deps) {
+                res.status = sw_deploy_error_status(deps.error());
+                res.set_content(
+                    detail::a4_error(res, sw_deploy_client_message(
+                                              "GET /api/v1/software-deployments", deps.error())),
+                    "application/json");
+                return;
+            }
             JArr arr;
-            for (const auto& d : deps) {
+            for (const auto& d : *deps) {
                 arr.add(JObj()
                             .add("id", d.id)
                             .add("package_id", d.package_id)
@@ -8086,7 +8147,7 @@ void RestApiV1::register_routes(
                             .add("agents_success", static_cast<int64_t>(d.agents_success))
                             .add("agents_failure", static_cast<int64_t>(d.agents_failure)));
             }
-            res.set_content(list_json(arr.str(), static_cast<int64_t>(deps.size())),
+            res.set_content(list_json(arr.str(), static_cast<int64_t>(deps->size())),
                             "application/json");
         });
 
@@ -8110,12 +8171,18 @@ void RestApiV1::register_routes(
                       dep.created_by = session->username;
                       auto result = sw_deploy_store->create_deployment(dep);
                       if (!result) {
-                          res.status = 400;
-                          res.set_content(detail::a4_error(res, result.error()), "application/json");
+                          res.status = sw_deploy_error_status(result.error());
+                          res.set_content(detail::a4_error(res, sw_deploy_client_message(
+                                                                    "POST /api/v1/software-deployments",
+                                                                    result.error())),
+                                          "application/json");
                           return;
                       }
-                      audit_fn(req, "software_deployment.create", "success", "SoftwareDeployment",
-                               *result, "");
+                      // try_persist_audit — see software_package.create above.
+                      if (!detail::try_persist_audit(audit_fn, req, "software_deployment.create",
+                                                     "success", "SoftwareDeployment", *result,
+                                                     dep.package_id))
+                          res.set_header("Sec-Audit-Failed", "true");
                       res.status = 201;
                       res.set_content(ok_json(JObj().add("id", *result).str()), "application/json");
                   });
@@ -8135,13 +8202,20 @@ void RestApiV1::register_routes(
                     !step_up_fn(req, res, *session, "POST /api/v1/software-deployments/{id}/start"))
                     return;
                 auto id = req.matches[1].str();
-                if (sw_deploy_store->start_deployment(id)) {
-                    audit_fn(req, "software_deployment.start", "success", "SoftwareDeployment", id,
-                             "");
+                auto result = sw_deploy_store->start_deployment(id);
+                if (result) {
+                    // try_persist_audit — see software_package.create above.
+                    if (!detail::try_persist_audit(audit_fn, req, "software_deployment.start",
+                                                   "success", "SoftwareDeployment", id, ""))
+                        res.set_header("Sec-Audit-Failed", "true");
                     res.set_content(ok_json(JObj().add("started", true).str()), "application/json");
                 } else {
-                    res.status = 400;
-                    res.set_content(detail::a4_error(res, "cannot start deployment"), "application/json");
+                    res.status = sw_deploy_error_status(result.error());
+                    res.set_content(
+                        detail::a4_error(res, sw_deploy_client_message(
+                                                  "POST /api/v1/software-deployments/{id}/start",
+                                                  result.error())),
+                        "application/json");
                 }
             });
 
@@ -8154,15 +8228,23 @@ void RestApiV1::register_routes(
                       if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
                           return;
                       auto id = req.matches[1].str();
-                      if (sw_deploy_store->rollback_deployment(id)) {
-                          audit_fn(req, "software_deployment.rollback", "success",
-                                   "SoftwareDeployment", id, "");
+                      auto result = sw_deploy_store->rollback_deployment(id);
+                      if (result) {
+                          // try_persist_audit — see software_package.create above.
+                          if (!detail::try_persist_audit(audit_fn, req,
+                                                         "software_deployment.rollback", "success",
+                                                         "SoftwareDeployment", id, ""))
+                              res.set_header("Sec-Audit-Failed", "true");
                           res.set_content(ok_json(JObj().add("rolled_back", true).str()),
                                           "application/json");
                       } else {
-                          res.status = 400;
-                          res.set_content(detail::a4_error(res, "cannot rollback deployment"),
-                                          "application/json");
+                          res.status = sw_deploy_error_status(result.error());
+                          res.set_content(
+                              detail::a4_error(
+                                  res, sw_deploy_client_message(
+                                           "POST /api/v1/software-deployments/{id}/rollback",
+                                           result.error())),
+                              "application/json");
                       }
                   });
 
@@ -8175,15 +8257,23 @@ void RestApiV1::register_routes(
                       if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
                           return;
                       auto id = req.matches[1].str();
-                      if (sw_deploy_store->cancel_deployment(id)) {
-                          audit_fn(req, "software_deployment.cancel", "success",
-                                   "SoftwareDeployment", id, "");
+                      auto result = sw_deploy_store->cancel_deployment(id);
+                      if (result) {
+                          // try_persist_audit — see software_package.create above.
+                          if (!detail::try_persist_audit(audit_fn, req,
+                                                         "software_deployment.cancel", "success",
+                                                         "SoftwareDeployment", id, ""))
+                              res.set_header("Sec-Audit-Failed", "true");
                           res.set_content(ok_json(JObj().add("cancelled", true).str()),
                                           "application/json");
                       } else {
-                          res.status = 400;
-                          res.set_content(detail::a4_error(res, "cannot cancel deployment"),
-                                          "application/json");
+                          res.status = sw_deploy_error_status(result.error());
+                          res.set_content(
+                              detail::a4_error(
+                                  res, sw_deploy_client_message(
+                                           "POST /api/v1/software-deployments/{id}/cancel",
+                                           result.error())),
+                              "application/json");
                       }
                   });
     }
