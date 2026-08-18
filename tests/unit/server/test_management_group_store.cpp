@@ -25,6 +25,7 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <filesystem>
@@ -1033,15 +1034,49 @@ TEST_CASE("ManagementGroupStore::migrate_from_sqlite reads one consistent group/
                              nullptr, nullptr, nullptr) == SQLITE_OK);
     }
 
+    // Built ONCE, before the loop -- keeps every per-iteration statement a
+    // prebuilt literal instead of a fresh concatenation inside the open
+    // SqliteTxn below (cpp-safety, Gate 3 review of this round: a
+    // std::bad_alloc mid-concatenation while txn is live is an
+    // uncaught-exception-in-a-thread terminate the RAII wrap cannot save
+    // regardless -- see the txn comment below -- so this removes the
+    // allocation from that window rather than only reacting to it landing
+    // there).
+    const std::array<std::string, 4> swap_to_new = {
+        "DELETE FROM management_groups WHERE id='" + grp_old_id + "'",
+        "INSERT INTO management_groups (id, name, description, membership_type, "
+        "created_by, created_at, updated_at) VALUES ('" +
+            grp_new_id + "','Replacement','','static','admin',999999,999999)",
+        "UPDATE management_group_members SET group_id='" + grp_new_id + "' WHERE group_id='" +
+            grp_old_id + "'",
+        "UPDATE management_group_roles SET group_id='" + grp_new_id + "' WHERE group_id='" +
+            grp_old_id + "'",
+    };
+
     std::atomic<bool> migrate_done{false};
     std::atomic<bool> writer_open_failed{false};
     // Set ONLY inside the txn's own success path (after a real COMMIT), so a
     // run where the writer never lands its swap FAILS the REQUIRE below
-    // instead of silently passing with no race actually exercised -- a
-    // reviewer (fjarvis, PR #3241) found this test was vacuously green ~88%
-    // of the time: migrate_done is the ONLY cross-thread signal, so if
-    // migrate_from_sqlite finishes before the writer ever commits, every
-    // assertion still passes against both fixed and unfixed code.
+    // instead of silently passing with no race actually exercised. NECESSARY,
+    // not SUFFICIENT: it proves the writer wrote successfully, not that the
+    // write actually overlapped migrate_from_sqlite's own read window
+    // (quality-engineer, Gate 3 review of this round, caught the original
+    // wording here implying the REQUIRE proves the race was hit). fjarvis's
+    // PR #3241 review found this test was structurally vacuous before this
+    // guard existed -- migrate_done was the only cross-thread signal, so a
+    // run where migrate_from_sqlite finished before the writer's swap landed
+    // passed every assertion having exercised nothing; this branch's own
+    // MG-4 finding independently measured that catch rate at ~12%.
+    //
+    // A writer that keeps re-swapping until migrate_done (instead of
+    // returning after one commit) was tried as a way to raise that further --
+    // measured empirically rather than assumed, it did NOT: two 25-run
+    // batches against the unfixed production code (7/25, 4/25) landed in the
+    // same noise band as the single-swap design's own two batches (7/25,
+    // 5/25) that quality-engineer measured. Reverted to the simpler
+    // single-swap form; the underlying detectability is bounded by SQLite's
+    // own statement timing here, not by how many extra attempts this test
+    // makes.
     std::atomic<bool> writer_swap_done{false};
     std::thread writer([&] {
         SqliteDb w;
@@ -1064,17 +1099,8 @@ TEST_CASE("ManagementGroupStore::migrate_from_sqlite reads one consistent group/
             // never independently re-checked for it).
             SqliteTxn txn(w.get());
             bool ok = true;
-            auto exec1 = [&](const std::string& sql) {
+            for (const auto& sql : swap_to_new)
                 ok = ok && sqlite3_exec(w.get(), sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK;
-            };
-            exec1("DELETE FROM management_groups WHERE id='" + grp_old_id + "'");
-            exec1("INSERT INTO management_groups (id, name, description, membership_type, "
-                  "created_by, created_at, updated_at) VALUES ('" +
-                  grp_new_id + "','Replacement','','static','admin',999999,999999)");
-            exec1("UPDATE management_group_members SET group_id='" + grp_new_id +
-                  "' WHERE group_id='" + grp_old_id + "'");
-            exec1("UPDATE management_group_roles SET group_id='" + grp_new_id +
-                  "' WHERE group_id='" + grp_old_id + "'");
             if (ok && txn.commit() == SQLITE_OK) {
                 writer_swap_done.store(true, std::memory_order_release);
                 return; // one successful swap is all this test needs
