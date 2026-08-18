@@ -647,13 +647,24 @@ int macos_load_ruleset(yuzu::CommandContext& ctx, const std::vector<std::string>
 
     // Enable pf if not already enabled. Idempotent — the kernel returns a
     // harmless warning to stderr when called on an already-enabled pf.
-    // Best-effort/fire-and-forget by design (matches pre-migration
-    // behaviour, which never checked this call's return value) — run_tool
-    // still logs its own degrade warning if it genuinely fails to run.
+    // Best-effort in the sense that a failure here does not unwind the
+    // ruleset load that just succeeded above — but the failure is still
+    // forwarded through the ABI4 result-status seam (genuine runner
+    // failure via forward_runner_failure, or a clean nonzero exit via
+    // set_result_status) so a caller can never mistake "ruleset loaded"
+    // for "pf actually enabled". On stock macOS pf ships disabled, so a
+    // silently swallowed failure here would mean the quarantine reports
+    // success while blocking nothing.
     // sink: quarantine/macos_load_ruleset#2 — rung-2 sudo-governed runner
-    // argv, MUTATING (idempotent enable, failure ignored by design)
+    // argv, MUTATING (idempotent enable; failure forwarded, not ignored)
     auto enable_argv = yuzu::shared::sudo_wrap({kPfctl, "-e"});
-    run_tool(enable_argv, kQuarantineMutateDeadline, /*merge_stderr=*/false);
+    auto enable_out = run_tool(enable_argv, kQuarantineMutateDeadline, /*merge_stderr=*/false);
+    if (!(enable_out.res.tool_ran && enable_out.res.exit_code == 0)) {
+        if (!yuzu::agent::forward_runner_failure(ctx, enable_out.res)) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "quarantine:macos_load_ruleset pfctl -e failed to enable pf");
+        }
+    }
 
     *rules_written_out = rules_written;
     return 0;
@@ -1021,7 +1032,25 @@ private:
                 // current whitelist + new IPs". We get the current
                 // whitelist via macos_get_whitelist() and merge.
                 auto current = macos_get_whitelist();
-                report_runner_result(ctx, status_forwarded, current.res);
+                if (!report_runner_result(ctx, status_forwarded, current.res)) {
+                    // The prerequisite whitelist read failed — either a
+                    // genuine runner failure (already forwarded above) or a
+                    // clean nonzero exit (tool ran, refused). Either way
+                    // current.ips cannot be trusted as the whitelist
+                    // baseline: rebuilding the entire main pf ruleset from
+                    // an empty/wrong set would silently drop any real
+                    // whitelisted entries (including a possible
+                    // management-server IP) — the same impact class as the
+                    // 672896112 incident this migration exists to prevent.
+                    // Abort instead of rebuilding from an unproven read.
+                    if (!status_forwarded) {
+                        ctx.set_result_status(
+                            YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                            "quarantine:do_whitelist macOS whitelist read failed before add");
+                    }
+                    ctx.write_output("error|whitelist read failed, ruleset not rewritten");
+                    return 1;
+                }
                 for (const auto& ip : new_ips) {
                     bool dup = false;
                     for (const auto& existing : current.ips) {
@@ -1089,7 +1118,20 @@ private:
                 // (which the old anchor design tried to do via string
                 // matching, with the well-known false-match risk).
                 auto current = macos_get_whitelist();
-                report_runner_result(ctx, status_forwarded, current.res);
+                if (!report_runner_result(ctx, status_forwarded, current.res)) {
+                    // Same rationale as the "add" branch above: a failed
+                    // prerequisite read (runner failure OR clean nonzero
+                    // exit) must not be treated as an empty whitelist —
+                    // that would rebuild the ruleset with nothing
+                    // whitelisted at all. Abort rather than rebuild.
+                    if (!status_forwarded) {
+                        ctx.set_result_status(
+                            YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                            "quarantine:do_whitelist macOS whitelist read failed before remove");
+                    }
+                    ctx.write_output("error|whitelist read failed, ruleset not rewritten");
+                    return 1;
+                }
                 std::vector<std::string> filtered;
                 for (const auto& ip : current.ips) {
                     bool removed = false;
