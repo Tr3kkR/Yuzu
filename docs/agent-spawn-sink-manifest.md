@@ -75,7 +75,7 @@ private helpers). Site-level transcription is #2380's first work item —
 these rows are pointers, not evidence.
 
 **Raw `popen`/`system` helpers:** antivirus, bitlocker,
-device_identity, discovery, event_logs, firewall, hardware, installed_apps,
+device_identity, event_logs, firewall, hardware, installed_apps,
 interaction, ioc, license_scan, network_config,
 network_diag, os_info, processes, quarantine, sccm,
 software_actions, tar, vuln_scan, wifi, windows_updates.
@@ -97,6 +97,10 @@ to the shared `IcmpSession` + TCP-connect fallback, rung 1; 0 spawn sites,
 was 1 — no manifest rows since none survive); `services` (shell-string hop
 eliminated for all five surviving argv sites, and a live sudo grant/code
 mismatch fixed on the two mutating sites — see Registered sites above).
+
+**Migrated off raw spawn (Wave 2, PR2.1c):** `discovery` (0 spawn sites, was
+5 — GetIpNetTable2/`/proc/net/arp`/sysctl ARP + a shared `IcmpSession`
+sweep; no manifest rows since none survive).
 
 **Direct exec via private helpers:** script_exec, content_dist, filesystem
 (filesystem is fully migrated onto the runner on the #2321 branch).

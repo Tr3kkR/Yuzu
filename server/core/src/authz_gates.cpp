@@ -9,36 +9,63 @@
 namespace yuzu::server {
 
 std::expected<authz::ListAuthority, authz::GateFailure>
-AuthRoutes::authorize_fleet_read(const httplib::Request& req, httplib::Response& res,
-                                 const std::string& securable_type, const std::string& operation) {
+AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& res,
+                               const std::string& securable_type, const std::string& operation) {
     auto session = require_auth(req, res);
     if (!session)
         // require_auth already wrote the 401 response (unaudited — matches
         // require_admin/require_permission's existing convention: audit
         // trail begins at the first post-authentication decision, not at
-        // require_auth itself). Forbidden is the closest of the two
-        // GateFailure tags; callers must not re-decode it into a status
-        // code, res is already correct.
-        return std::unexpected(authz::GateFailure::Forbidden);
+        // require_auth itself).
+        return std::unexpected(authz::GateFailure::Unauthenticated);
 
     const std::string perm = securable_type + ":" + operation;
 
     // ── management-group axis: RbacStore::authorize_list_read (ADR-0017),
     // reused as the subordinate primitive — never rewritten. ──────────────
     if (!rbac_store_ || !rbac_store_->is_open()) {
-        // Mirrors every existing authorize_list_read call site's null-store
-        // guard (e.g. server.cpp's UploadGrant list_read_fn). Folds into the
-        // same Forbidden/403 as a real DenyAll per the decided weakening
-        // (implementation plan §2c) — no discriminator added here.
+        // Infrastructure unavailable, not a real authorization decision —
+        // Degraded/503, aligned with the three sibling
+        // "authorization store unavailable" sites in auth_routes.cpp (the
+        // engine-principal RBAC-store-unavailable branches; grep the quoted
+        // string): same wording, same status code. The 403/Forbidden this
+        // used to return was the outlier — a caller doing exponential
+        // backoff on 503 would never retry a transient RBAC-store hiccup
+        // that surfaced as a permanent-looking 403 (fjarvis/Kimi K2.7, PR
+        // #3216 follow-up review). retry_after_ms matches this function's
+        // own two Degraded branches below (tag-store unavailable/degraded),
+        // not the auth_routes.cpp siblings, which don't set it — this
+        // branch is Degraded now, so it carries the same retry signal as
+        // every other Degraded branch here. The deliberate DenyAll
+        // weakening (implementation plan §2c) now covers only the
+        // management-group axis's real-deny-vs-in-query-store-error
+        // ambiguity below, not this null-store case.
         audit_log(req, "auth.fleet_read_required", "denied", "", "",
                   "fleet read blocked: RBAC store unavailable");
+        res.status = 503;
+        res.set_content(detail::a4_denial(res, 503, "authorization store unavailable",
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000,
+                                                              .permission = perm}),
+                        "application/json");
+        return std::unexpected(authz::GateFailure::Degraded);
+    }
+
+    // Decision (#2298 PR 3, "the flip"): preserve `require_permission`'s
+    // service branch hard-403 when RBAC enforcement is not in effect. The
+    // service-tag axis below is RBAC-independent — without this check, a
+    // disabled-RBAC service-scoped session would get a NARROWED (non-empty,
+    // via the tag axis alone) result here, a capability that session never
+    // had through `require_permission`. Same predicate
+    // (`rbac_enforcement_in_effect`, not raw `is_rbac_enabled()`) as
+    // `require_permission`'s service branch, so the two gates can never
+    // disagree on a corrupt/degraded store. `rbac_store_` is known non-null
+    // and open here (the check above already returned Degraded otherwise).
+    if (!session->token_scope_service.empty() && !rbac_enforcement_in_effect(rbac_store_)) {
+        audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                  "fleet read blocked: service-scoped token requires RBAC to be enabled");
         res.status = 403;
-        // Distinct wording from the 503 "authorization store unavailable"
-        // used elsewhere for this same underlying condition (auth_routes.cpp)
-        // — same literal string at two different status codes would let a
-        // SIEM/grep rule keyed on the text misclassify retry semantics
-        // (consistency-auditor, governance run 2026-08-17).
-        res.set_content(detail::a4_denial(res, 403, "authorization unavailable",
+        res.set_content(detail::a4_denial(res, 403,
+                                          "service-scoped tokens require RBAC to be enabled",
                                           detail::A4ErrorOpts{.permission = perm}),
                         "application/json");
         return std::unexpected(authz::GateFailure::Forbidden);
@@ -83,12 +110,15 @@ AuthRoutes::authorize_fleet_read(const httplib::Request& req, httplib::Response&
                             "application/json");
             return std::unexpected(authz::GateFailure::Degraded);
         }
-        // agents_with_tag_checked (not the value_or({})-collapsing
-        // agents_with_tag) distinguishes "genuinely no agents tagged" from
-        // "the tag store failed to prepare the query" (B-2b) — the axis
-        // must fail closed to Degraded on the latter, never read as an
-        // empty-but-legitimate service.
-        auto tagged = tag_store_->agents_with_tag_checked("service", session->token_scope_service);
+        // agents_with_tag is the ADR-0050 typed read
+        // (std::expected<…, TagReadError>) — it distinguishes "genuinely no
+        // agents tagged" (engaged, possibly empty) from "the tag store
+        // degraded" (unexpected), superseding the pre-migration
+        // agents_with_tag_checked/B-2b split. The axis must fail closed to
+        // GateFailure::Degraded on the latter — never read a degraded store
+        // as an empty-but-legitimate service, and never collapse Degraded
+        // into Forbidden (the 503-vs-403 distinction this gate exists for).
+        auto tagged = tag_store_->agents_with_tag("service", session->token_scope_service);
         if (!tagged) {
             audit_log(req, "auth.fleet_read_required", "denied", "", "",
                       "fleet read blocked: tag store degraded resolving service scope");
@@ -104,9 +134,9 @@ AuthRoutes::authorize_fleet_read(const httplib::Request& req, httplib::Response&
     return authz::ListAuthority(authz::meet(mgmt_scope, service_scope));
 }
 
-bool AuthRoutes::authorize_agent_target(const httplib::Request& req, httplib::Response& res,
-                                        const std::string& securable_type,
-                                        const std::string& operation, const std::string& agent_id) {
+bool AuthRoutes::confine_agent_target(const httplib::Request& req, httplib::Response& res,
+                                      const std::string& securable_type,
+                                      const std::string& operation, const std::string& agent_id) {
     auto session = require_auth(req, res);
     if (!session)
         return false;
@@ -148,7 +178,9 @@ bool AuthRoutes::authorize_agent_target(const httplib::Request& req, httplib::Re
                         "application/json");
         return false;
     }
-    auto tagged = tag_store_->agents_with_tag_checked("service", session->token_scope_service);
+    // ADR-0050 typed read — degrade maps to the 503 branch below, never to
+    // the not-in-service Forbidden (same reasoning as require_fleet_read).
+    auto tagged = tag_store_->agents_with_tag("service", session->token_scope_service);
     if (!tagged) {
         audit_log(req, "auth.agent_target_required", "denied", "Agent", agent_id,
                   "agent target blocked: tag store degraded resolving service scope");

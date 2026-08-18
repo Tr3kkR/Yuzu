@@ -699,13 +699,35 @@ one file is one PG-instance event, not a test bug.
 
 ## Workflow-PR canary
 
-`ci.yml`'s `detect-ci-changes` + `canary` jobs run when a PR or main push
-touches `.github/workflows/`, `.github/actions/`, or `scripts/ci/`. The named
-`ci-infrastructure` class in `scripts/ci/detect-code-change.sh` owns both the
-path rules and `git diff` error handling. If the diff cannot be established,
-it returns changed=true so the canary runs fail-closed. Canary mirrors the
-linux build on a fresh-disk GHA-hosted `ubuntu-24.04` with `actions/cache` for
-vcpkg — catches workflow regressions before main.
+`ci.yml`'s `detect-ci-changes` + `canary` jobs run when a PR, or a push to
+`main` or `dev`, touches `.github/workflows/`, `.github/actions/`, or
+`scripts/ci/`. The named `ci-infrastructure` class in
+`scripts/ci/detect-code-change.sh` owns both the path rules and `git diff`
+error handling. If the diff cannot be established, it returns changed=true so
+the canary runs fail-closed. Canary mirrors the linux build on a fresh-disk
+GHA-hosted `ubuntu-24.04` with `actions/cache` for vcpkg + ccache — catches
+workflow regressions before main.
+
+**Diff semantics differ by event, deliberately.** A push asks "what did this
+push move", so it diffs two-dot against `github.event.before`. A pull request
+asks "what does this PR change", so it diffs from the merge base — its
+`base.sha` is a live branch tip, and two-dot there additionally reports every
+commit the base branch gained since the fork point, which misclassified any PR
+that had merely fallen behind a CI-touching `dev` (#3232). The merge-base diff
+must be given the **PR head**, never the checked-out `refs/pull/<N>/merge`
+commit: `base.sha` is always an ancestor of that merge commit, so the merge
+base *is* `base.sha` and three-dot silently collapses back to two-dot. That
+no-op is pinned by cases in `tests/shell/test_detect_code_change.sh`, which
+also assert the caller passes a resolved head.
+
+**Pushes to `dev` are what keep the cache warm.** GHA cache scope lets a PR job
+read its own ref, the default branch, and its base branch — never a sibling
+PR's. Every PR bases on `dev`, so a dev-scoped entry serves all of them; main-only
+warming left the scope empty for five weeks and each PR saved a private ~843 MB
+duplicate (#3233). Note the canary key hashes `vcpkg.json` /
+`vcpkg-configuration.json` / `triplets/x64-linux.cmake`, which the
+`ci-infrastructure` class does not match, so a manifest bump on `dev` does not
+itself re-warm the new key.
 
 ## Cache pruning + weekly maintenance
 
