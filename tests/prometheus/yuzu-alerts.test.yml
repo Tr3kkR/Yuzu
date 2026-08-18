@@ -1721,6 +1721,13 @@ tests:
       - series: 'yuzu_server_tag_store_read_degrade_total{job="yuzu",instance="s1",reason="query_error"}'
         values: "0+1x20"
     promql_expr_test:
+      # for: 5m pinned both sides (the file's bracketing convention): the
+      # rate is non-zero from t=1m, so firing begins ~t=6m -- still quiet
+      # at 5m, firing by 15m. A for: regression in either direction reds
+      # one of these two evals.
+      - expr: 'ALERTS{alertname="YuzuTagStoreReadDegraded", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples: []
       - expr: 'ALERTS{alertname="YuzuTagStoreReadDegraded", alertstate="firing"}'
         eval_time: 15m
         exp_samples:
@@ -1777,6 +1784,18 @@ tests:
       - series: 'yuzu_server_tag_store_backfill_total{job="yuzu",instance="s1",result="failed"}'
         values: "0+1x40"
     promql_expr_test:
+      # for: 5m pinned both sides: absence is true from the first evaluation
+      # (absent_over_time needs no window population), so pending starts at
+      # t=0 and firing begins at exactly t=5m -- quiet at 4m, firing at 5m
+      # and still at 25m.
+      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
+        eval_time: 4m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
+        eval_time: 5m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing", severity="critical"}'
+            value: 1
       - expr: 'ALERTS{alertname="YuzuTagStoreBackfillNotCompleted", alertstate="firing"}'
         eval_time: 25m
         exp_samples:
