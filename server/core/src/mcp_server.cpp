@@ -4496,11 +4496,22 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // Add tags
+                // Add tags. Degrade fails the whole tool call (ADR-0050) —
+                // an agentic caller acting on a silently-tagless agent
+                // record is the same mis-decision shape as a collapsed scope
+                // read; a null store (test/embedded config) still just omits
+                // tags.
                 if (tag_store) {
                     auto tags = tag_store->get_all_tags(agent_id);
+                    if (!tags) {
+                        mcp_audit("failure", agent_id);
+                        res.set_content(
+                            error_response(id, kInternalError, "Tag store unavailable"),
+                            "application/json");
+                        return;
+                    }
                     JArr tag_arr;
-                    for (const auto& t : tags)
+                    for (const auto& t : *tags)
                         tag_arr.add(
                             JObj().add("key", t.key).add("value", t.value).add("source", t.source));
                     agent_obj.raw("tags", tag_arr.str());
@@ -5418,8 +5429,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto agent_id = param_str(args, "agent_id");
                 auto tags = tag_store->get_all_tags(agent_id);
+                if (!tags) {
+                    // Degrade → tool error, never an empty tag list
+                    // (ADR-0050 / #3097 classification).
+                    mcp_audit("failure", agent_id);
+                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& t : tags) {
+                for (const auto& t : *tags) {
                     arr.add(JObj()
                                 .add("key", t.key)
                                 .add("value", t.value)
@@ -5454,8 +5473,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto key = param_str(args, "key");
                 auto value = param_str(args, "value");
                 auto agent_ids = tag_store->agents_with_tag(key, value);
+                if (!agent_ids) {
+                    // Degrade → tool error, never an empty agent list — the
+                    // result feeds the agentic caller's subsequent targeting
+                    // (ADR-0050 / #3097 classification).
+                    mcp_audit("failure", key);
+                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                                    "application/json");
+                    return;
+                }
                 JArr arr;
-                for (const auto& aid : agent_ids)
+                for (const auto& aid : *agent_ids)
                     arr.add(aid);
                 mcp_audit("success", key);
                 res.set_content(
@@ -5792,6 +5820,34 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Preload every tag:<key> the expression references in ONE
+                // bulk query before the agent loop (ADR-0050 — the
+                // pre-migration version called get_tag_map per agent, N
+                // network round-trips per preview against the Postgres
+                // substrate). Degrade fails the whole tool call: this tool
+                // PREVIEWS dispatch targeting, and a silently-tagless
+                // preview under/over-states the cohort exactly like a
+                // collapsed scope read (#2500 family).
+                std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
+                    preview_tags;
+                {
+                    std::vector<std::string> tag_keys;
+                    yuzu::scope::collect_attribute_suffixes(*parsed_expr, "tag:", tag_keys);
+                    if (!tag_keys.empty() && tag_store) {
+                        auto preload = tag_store->get_values_for_keys(tag_keys);
+                        if (!preload) {
+                            // Target = the expression being previewed — every
+                            // sibling failure audit here carries a target
+                            // (governance cons-F2).
+                            mcp_audit("failure", expression);
+                            res.set_content(
+                                error_response(id, kInternalError, "Tag store unavailable"),
+                                "application/json");
+                            return;
+                        }
+                        preview_tags = std::move(*preload);
+                    }
+                }
                 // Evaluate against all agents
                 const auto& agents = get_agents();
                 JArr matching;
@@ -5802,9 +5858,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     attrs["arch"] = a.value("arch", "");
                     attrs["hostname"] = a.value("hostname", "");
                     attrs["agent_version"] = a.value("agent_version", "");
-                    if (tag_store) {
-                        auto tag_map = tag_store->get_tag_map(agent_id);
-                        for (const auto& [k, v] : tag_map)
+                    if (auto it = preview_tags.find(agent_id); it != preview_tags.end()) {
+                        for (const auto& [k, v] : it->second)
                             attrs["tag:" + k] = v;
                     }
                     auto resolver = [&](std::string_view attr) -> std::string {
@@ -8150,8 +8205,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto set_res = tag_store->set_tag_checked(agent_id, key, value, "mcp");
                 if (!set_res) {
                     mcp_audit("failure", agent_id + ":" + key);
-                    res.set_content(error_response(id, kInvalidParams, set_res.error()),
-                                    "application/json");
+                    // #3097 classification: db_error prefix → internal
+                    // (degrade, retryable), else caller-input error.
+                    const bool db_error = set_res.error().starts_with(kTagDbErrorPrefix);
+                    res.set_content(
+                        error_response(id, db_error ? kInternalError : kInvalidParams,
+                                       db_error ? "Tag store unavailable" : set_res.error()),
+                        "application/json");
                     return;
                 }
                 // D4: fire the agent tag-push exactly like the REST path.
@@ -8201,10 +8261,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
                     return;
-                bool deleted = tag_store->delete_tag(agent_id, key);
+                auto deleted = tag_store->delete_tag(agent_id, key);
                 if (!deleted) {
+                    // Degrade → internal error (#3097) — the pre-migration
+                    // bool reported "tag not found" over a store failure.
+                    mcp_audit("failure", agent_id + ":" + key);
+                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                if (!*deleted) {
                     // 404-equivalent (mirror the REST 404 on a missing tag).
-                    mcp_audit("failure", "not found " + agent_id + ":" + key);
+                    // Outcome token matches the legacy + v1 twins' "not_found"
+                    // (governance cons-F2: one outcome vocabulary per event
+                    // across transports, and the target field carries the
+                    // target alone).
+                    mcp_audit("not_found", agent_id + ":" + key);
                     res.set_content(error_response(id, kInvalidParams, "tag not found"),
                                     "application/json");
                     return;

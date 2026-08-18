@@ -2,12 +2,17 @@
  * icmp_probe.hpp — shared unprivileged reachability probes
  * (ADR-3002, Decision 5: deepest-interpreter-invoked rung classification
  * applies to consumers; this header itself is rung 1, native, no interpreter).
- * Consumers: discovery's ping sweep, wol's check action.
+ * Consumer today: discovery's ping sweep. wol's `check` action still spawns
+ * the system `ping` binary via popen/run_command (rung 3, unmigrated as of
+ * this writing — see wol_plugin.cpp's own "last shell-out of this shape"
+ * comment, which tracks that migration as separate future work); do not
+ * re-list it here as a current consumer until it actually calls into this
+ * header.
  *
  * Hoisted VERBATIM from netprobe_plugin.cpp (behaviour identical; netprobe's
  * in-plugin copy is converged onto this header as a tracked follow-up) so
- * discovery's ping sweep and wol's `check` action can probe a host natively
- * (rung 1) instead of spawning `ping`:
+ * discovery's ping sweep can probe a host natively (rung 1) instead of
+ * spawning `ping`:
  *
  *   IcmpSession — ICMP echo RTT. Windows: IcmpSendEcho (iphlpapi,
  *       unprivileged; whole-millisecond granularity by API design). POSIX:
@@ -24,7 +29,10 @@
  */
 #pragma once
 
+#include <array>
+#include <cerrno>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>
@@ -44,6 +52,12 @@
 #include <iphlpapi.h>
 #include <icmpapi.h> // after iphlpapi.h
 // clang-format on
+// Normally from <ipexport.h> via iphlpapi.h; defined defensively so the
+// timeout-vs-send-failure split below cannot fail to compile on an SDK that
+// does not surface it.
+#ifndef IP_REQ_TIMED_OUT
+#define IP_REQ_TIMED_OUT 11010L
+#endif
 #else
 #include <arpa/inet.h>
 #include <cerrno>
@@ -216,6 +230,142 @@ inline std::optional<double> tcp_sample(const Resolved& dst, int timeout_ms) {
 }
 #endif
 
+// ── Pure checksum ────────────────────────────────────────────────────────────
+
+/**
+ * RFC 1071 internet checksum. Portable and pure — Windows' IcmpSendEcho
+ * computes its own checksum internally and never calls this, but keeping the
+ * function (and its tests) on every leg means the framing helper below can be
+ * portable too, and a checksum regression is caught wherever CI runs.
+ */
+inline std::uint16_t icmp_checksum(const unsigned char* data, std::size_t len) {
+    std::uint32_t sum = 0;
+    for (std::size_t i = 0; i + 1 < len; i += 2)
+        sum += static_cast<std::uint32_t>(data[i]) << 8 | data[i + 1];
+    if (len & 1)
+        sum += static_cast<std::uint32_t>(data[len - 1]) << 8;
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return static_cast<std::uint16_t>(~sum);
+}
+
+// ── Probe outcome: "no answer" is NOT the same as "could not ask" ───────────
+
+/**
+ * Why a probe produced no RTT. The distinction is the whole point: an
+ * untyped "nothing" makes a host that never received our packet
+ * indistinguishable from a host that chose not to answer, and a sweep that
+ * could not transmit at all then reports a confidently empty network.
+ */
+enum class ProbeFailure {
+    None,           // nothing went wrong — see ProbeOutcome::replied/silent
+    TransmitDenied, // send refused by policy (EACCES/EPERM, or a Windows send error)
+    TransmitFailed, // send failed for a non-policy reason (ENETUNREACH, ENOBUFS, ...)
+    ReceiveFailed,  // poll/recv errored — distinct from expiring the budget
+};
+
+struct ProbeOutcome {
+    std::optional<double> rtt_ms{}; // engaged iff the host actually replied
+    ProbeFailure failure{ProbeFailure::None};
+
+    bool replied() const { return rtt_ms.has_value(); }
+    // Transmitted fine, nothing came back within the budget — a genuinely
+    // silent (or absent) host. The ONLY case a caller may read as "down".
+    bool silent() const { return !rtt_ms.has_value() && failure == ProbeFailure::None; }
+    // We never got the question out; the target's state is unknown, not down.
+    bool transmit_blocked() const {
+        return failure == ProbeFailure::TransmitDenied || failure == ProbeFailure::TransmitFailed;
+    }
+};
+
+/**
+ * Classify a failed send by its errno. Pure, so the mapping is unit-tested
+ * even though the branch that consults it only runs when the kernel actually
+ * refuses a transmission (which no unit host can be made to do without a
+ * syscall seam — exercising the branch itself remains a tracked gap).
+ *
+ * EACCES/EPERM mean a policy said no; everything else is a transport problem.
+ * Both are "we could not ask", never "the host is down" — the distinction that
+ * keeps a blocked sweep from reporting a confidently empty network.
+ */
+inline ProbeFailure classify_transmit_errno(int err) {
+    return (err == EACCES || err == EPERM) ? ProbeFailure::TransmitDenied
+                                           : ProbeFailure::TransmitFailed;
+}
+
+/**
+ * Classify a failed `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` by its errno,
+ * returning the IcmpSession `permitted` value the caller should report. Pure,
+ * so the mapping is unit-tested even though the branch that consults it only
+ * runs on a POSIX host whose kernel actually refuses the socket (which no
+ * unit host can be made to do without a syscall seam).
+ *
+ * EACCES/EPERM mean a policy said no — Linux's net.ipv4.ping_group_range
+ * denied this (E)UID an unprivileged ICMP socket — so `permitted=false`,
+ * which the caller classifies CONSTRAINED/icmp:ping_group_range.
+ *
+ * EPROTONOSUPPORT is a DIFFERENT failure mode: the kernel itself lacks
+ * SOCK_DGRAM/IPPROTO_ICMP support, which no sysctl tuning fixes. It must NOT
+ * be grouped with the policy denials above (colleague review of this PR) —
+ * doing so reported it as CONSTRAINED/icmp:ping_group_range and would
+ * misdirect an operator toward tuning a sysctl that isn't the cause. Left
+ * `permitted=true` here (so IcmpSession::ok()==false), it classifies
+ * UNAVAILABLE/icmp:socket_error instead, same as any other transport error.
+ */
+inline bool classify_socket_open_errno(int err) { return !(err == EACCES || err == EPERM); }
+
+// ── Pure echo framing/matching (portable — compiled and tested on every leg) ──
+
+constexpr std::size_t kEchoPacketLen = 32;
+
+/**
+ * Build an ICMP echo request (type 8 / code 0) carrying `seq`, with the
+ * RFC-1071 checksum filled in. Pure: no socket, no platform header — so the
+ * framing that the live path depends on is unit-tested on every leg,
+ * including Windows where the send itself goes through IcmpSendEcho.
+ */
+inline std::array<unsigned char, kEchoPacketLen> build_echo_request(std::uint16_t seq) {
+    std::array<unsigned char, kEchoPacketLen> pkt{};
+    pkt[0] = 8; // echo request
+    pkt[1] = 0; // code
+    pkt[6] = static_cast<unsigned char>(seq >> 8);
+    pkt[7] = static_cast<unsigned char>(seq & 0xFF);
+    const char tag[] = "yuzu-net";
+    for (std::size_t i = 0; i + 1 < sizeof(tag); ++i)
+        pkt[8 + i] = static_cast<unsigned char>(tag[i]);
+    const std::uint16_t ck = icmp_checksum(pkt.data(), pkt.size());
+    pkt[2] = static_cast<unsigned char>(ck >> 8);
+    pkt[3] = static_cast<unsigned char>(ck & 0xFF);
+    return pkt;
+}
+
+/**
+ * Does `buf` hold OUR echo reply — i.e. an ICMP echo reply (type 0) whose
+ * sequence equals `expected_seq`?
+ *
+ * macOS delivers the IP header ahead of the ICMP message; Linux ping sockets
+ * deliver the ICMP message alone. The leading nibble check distinguishes them.
+ * Replies are matched on SEQUENCE only because Linux ping sockets rewrite the
+ * ICMP id; the caller separately checks the source address.
+ *
+ * Pure and bounds-checked: a short or truncated buffer is "not our reply",
+ * never an out-of-bounds read.
+ */
+inline bool match_echo_reply(const unsigned char* buf, std::size_t n, std::uint16_t expected_seq) {
+    if (!buf)
+        return false;
+    std::size_t off = 0;
+    if (n >= 20 && (buf[0] & 0xF0) == 0x40)
+        off = static_cast<std::size_t>(buf[0] & 0x0F) * 4;
+    if (n < off + 8)
+        return false;
+    if (buf[off] != 0) // 0 == echo reply; 8 would be someone else's request
+        return false;
+    const std::uint16_t got_seq =
+        static_cast<std::uint16_t>(buf[off + 6] << 8 | buf[off + 7]);
+    return got_seq == expected_seq;
+}
+
 // ── ICMP echo sample ─────────────────────────────────────────────────────────
 
 #ifdef _WIN32
@@ -233,33 +383,32 @@ struct IcmpSession {
     bool ok() const { return h != INVALID_HANDLE_VALUE; }
     bool permitted{true}; // Windows ICMP is unprivileged; parity with POSIX
 
-    std::optional<double> sample(ULONG ipv4, int timeout_ms) {
+    ProbeOutcome sample(ULONG ipv4, int timeout_ms) {
         static const char payload[24] = "yuzu-netprobe-e1-sample";
         std::vector<unsigned char> reply(sizeof(ICMP_ECHO_REPLY) + sizeof(payload) + 8);
         DWORD n = ::IcmpSendEcho(h, ipv4, const_cast<char*>(payload), sizeof(payload), nullptr,
                                  reply.data(), static_cast<DWORD>(reply.size()),
                                  static_cast<DWORD>(timeout_ms));
-        if (n == 0)
-            return std::nullopt;
+        if (n == 0) {
+            // A zero return covers BOTH "nobody answered in time" and "the
+            // request could not be issued". Only GetLastError separates them,
+            // and conflating them is what lets a blocked sweep report an empty
+            // network: IP_REQ_TIMED_OUT is a silent host, anything else means
+            // we never got the question out.
+            const DWORD err = ::GetLastError();
+            if (err == IP_REQ_TIMED_OUT)
+                return {};
+            return {std::nullopt, ProbeFailure::TransmitFailed};
+        }
         const auto* r = reinterpret_cast<const ICMP_ECHO_REPLY*>(reply.data());
         if (r->Status != IP_SUCCESS)
-            return std::nullopt;
-        return static_cast<double>(r->RoundTripTime);
+            return {}; // unreachable/TTL-expired etc. — a real network answer, host not up
+        ProbeOutcome out;
+        out.rtt_ms = static_cast<double>(r->RoundTripTime);
+        return out;
     }
 };
 #else
-// RFC 1071 internet checksum.
-inline std::uint16_t icmp_checksum(const unsigned char* data, std::size_t len) {
-    std::uint32_t sum = 0;
-    for (std::size_t i = 0; i + 1 < len; i += 2)
-        sum += static_cast<std::uint32_t>(data[i]) << 8 | data[i + 1];
-    if (len & 1)
-        sum += static_cast<std::uint32_t>(data[len - 1]) << 8;
-    while (sum >> 16)
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    return static_cast<std::uint16_t>(~sum);
-}
-
 struct IcmpSession {
     int fd{-1};
     bool permitted{true};
@@ -268,7 +417,7 @@ struct IcmpSession {
     IcmpSession() {
         fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
         if (fd < 0)
-            permitted = !(errno == EACCES || errno == EPERM || errno == EPROTONOSUPPORT);
+            permitted = classify_socket_open_errno(errno);
         // Randomize the starting sequence: on macOS concurrent ICMP dgram
         // sockets can see each other's echo replies, and two sessions both
         // counting from 0 could cross-match a reply (and record a bogus RTT).
@@ -283,48 +432,58 @@ struct IcmpSession {
     IcmpSession& operator=(const IcmpSession&) = delete;
     bool ok() const { return fd >= 0; }
 
-    std::optional<double> sample(const sockaddr_in& dst, int timeout_ms) {
-        // Echo request: type 8 / code 0 / checksum / id / seq + 24-byte
-        // payload. Linux ping sockets rewrite the id, so replies are matched
-        // on SEQUENCE only.
-        unsigned char pkt[32] = {8, 0, 0, 0, 0, 0, 0, 0, 'y', 'u', 'z', 'u', '-', 'n', 'e', 't'};
+    ProbeOutcome sample(const sockaddr_in& dst, int timeout_ms) {
         const std::uint16_t this_seq = ++seq;
-        pkt[6] = static_cast<unsigned char>(this_seq >> 8);
-        pkt[7] = static_cast<unsigned char>(this_seq & 0xFF);
-        const std::uint16_t ck = icmp_checksum(pkt, sizeof(pkt));
-        pkt[2] = static_cast<unsigned char>(ck >> 8);
-        pkt[3] = static_cast<unsigned char>(ck & 0xFF);
+        const auto pkt = build_echo_request(this_seq);
 
         const auto t0 = std::chrono::steady_clock::now();
-        if (::sendto(fd, pkt, sizeof(pkt), 0, reinterpret_cast<const sockaddr*>(&dst),
-                     sizeof(dst)) < 0)
-            return std::nullopt;
+        if (::sendto(fd, pkt.data(), pkt.size(), 0, reinterpret_cast<const sockaddr*>(&dst),
+                     sizeof(dst)) < 0) {
+            // A refused SEND is not a silent host. A policy that allows the
+            // socket but blocks transmission (seatbelt/SELinux/nftables) would
+            // otherwise mark every target dead and let the caller report a
+            // confidently empty network.
+            return {std::nullopt, classify_transmit_errno(errno)};
+        }
 
         // Drain until OUR echo reply (other ICMP traffic can share the
         // socket) or the timeout budget is spent.
         for (;;) {
             const int remaining = timeout_ms - static_cast<int>(probe_elapsed_ms(t0));
             if (remaining <= 0)
-                return std::nullopt;
+                return {}; // budget spent with the packet away — genuinely silent
             pollfd pfd{fd, POLLIN, 0};
-            if (::poll(&pfd, 1, remaining) <= 0)
-                return std::nullopt;
+            const int pr = ::poll(&pfd, 1, remaining);
+            if (pr == 0)
+                return {}; // timed out — silent
+            if (pr < 0) {
+                if (errno == EINTR)
+                    continue; // not an error, just interrupted — keep waiting
+                return {std::nullopt, ProbeFailure::ReceiveFailed};
+            }
             unsigned char buf[512];
-            const auto n = ::recv(fd, buf, sizeof(buf), 0);
-            if (n <= 0)
-                return std::nullopt;
-            // macOS delivers IP header + ICMP; Linux ping sockets deliver
-            // ICMP only. Skip the IP header when one is present.
-            std::size_t off = 0;
-            if (n >= 20 && (buf[0] & 0xF0) == 0x40)
-                off = static_cast<std::size_t>(buf[0] & 0x0F) * 4;
-            if (static_cast<std::size_t>(n) < off + 8)
+            sockaddr_in from{};
+            socklen_t from_len = sizeof(from);
+            const auto n = ::recvfrom(fd, buf, sizeof(buf), 0,
+                                      reinterpret_cast<sockaddr*>(&from), &from_len);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                return {std::nullopt, ProbeFailure::ReceiveFailed};
+            }
+            if (n == 0)
                 continue;
-            const bool is_reply = buf[off] == 0; // echo reply
-            const std::uint16_t got_seq =
-                static_cast<std::uint16_t>(buf[off + 6] << 8 | buf[off + 7]);
-            if (is_reply && got_seq == this_seq)
-                return probe_elapsed_ms(t0);
+            // recvfrom, not recv: matching on sequence alone would let any
+            // host on the segment answer for another address. Require the
+            // reply to come from the address we probed.
+            if (from.sin_family == AF_INET &&
+                from.sin_addr.s_addr != dst.sin_addr.s_addr)
+                continue; // someone else's traffic — keep draining
+            if (match_echo_reply(buf, static_cast<std::size_t>(n), this_seq)) {
+                ProbeOutcome out;
+                out.rtt_ms = probe_elapsed_ms(t0);
+                return out;
+            }
             // Someone else's reply / other ICMP — keep draining.
         }
     }

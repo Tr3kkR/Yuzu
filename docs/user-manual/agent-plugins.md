@@ -312,11 +312,11 @@ Plugins for network configuration, active connections, diagnostics, and administ
 |---|---|
 | **Version** | v1.0.0 |
 | **Platforms** | W L M |
-| **Description** | Network device discovery via ARP scan and ping sweep. Discovers hosts on a subnet and reports their IP, MAC address, hostname, and managed/unmanaged status. Input is validated to prevent command injection. |
+| **Description** | Network device discovery via ARP scan and ping sweep. Discovers hosts on a subnet and reports their IP, MAC address, hostname, and managed/unmanaged status. Native OS APIs on every platform — `GetIpNetTable2` + `IcmpSendEcho` on Windows, `/proc/net/arp` + an unprivileged ICMP socket on Linux, the kernel routing table + an unprivileged ICMP socket on macOS — no subprocess spawn (Wave 2, ADR-3002). |
 
 | Action | Description |
 |---|---|
-| `scan_subnet` | Scan a CIDR subnet for active hosts. Parameters: `subnet` (required, e.g., `192.168.1.0/24`). Returns IP address, MAC address, resolved hostname, and whether the device is managed by Yuzu. |
+| `scan_subnet` | Scan a CIDR subnet for active hosts. Parameters: `subnet` (required, e.g., `192.168.1.0/24`). Returns IP address, MAC address, resolved hostname, and whether the device is managed by Yuzu. **On Linux, the ping sweep requires `net.ipv4.ping_group_range` to include the agent's GID** (same constraint as the `icmp` action above) — without it the scan falls back to ARP-table-only results and reports a `CONSTRAINED`/`icmp:ping_group_range` partial status rather than failing silently. A scan that hits its own deadline, can't read the ARP table, or can't transmit ICMP probes similarly reports an honest partial result with a machine-readable reason instead of an empty network. |
 
 ---
 

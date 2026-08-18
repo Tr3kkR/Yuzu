@@ -4729,8 +4729,18 @@ void RestApiV1::register_routes(
                  }
 
                  auto gaps = tag_store->get_compliance_gaps();
+                 if (!gaps) {
+                     // Degrade → 503, never an empty (fully-compliant-looking)
+                     // report (#3097 classification); retryable (cons-F1).
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "tag store unavailable",
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                         "application/json");
+                     return;
+                 }
                  JArr arr;
-                 for (const auto& [agent_id, missing] : gaps) {
+                 for (const auto& [agent_id, missing] : *gaps) {
                      JArr m;
                      for (const auto& k : missing)
                          m.add(k);
@@ -4758,9 +4768,19 @@ void RestApiV1::register_routes(
                      return;
                  }
                  auto tags = tag_store->get_all_tags(agent_id);
+                 if (!tags) {
+                     // Degrade → 503, never an empty tag map (#3097);
+                     // retryable (cons-F1).
+                     res.status = 503;
+                     res.set_content(
+                         detail::a4_error(res, "tag store unavailable",
+                                          detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                         "application/json");
+                     return;
+                 }
                  JObj obj;
-                 for (size_t i = 0; i < tags.size(); ++i)
-                     obj.add(tags[i].key, tags[i].value);
+                 for (size_t i = 0; i < tags->size(); ++i)
+                     obj.add((*tags)[i].key, (*tags)[i].value);
                  res.set_content(ok_json(obj.str()), "application/json");
              });
 
@@ -4831,8 +4851,26 @@ void RestApiV1::register_routes(
 
         auto result = tag_store->set_tag_checked(agent_id, key, value, "api");
         if (!result) {
-            res.status = 400;
-            res.set_content(detail::a4_error(res, result.error()), "application/json");
+            // #3097 classification: db_error prefix → 503 (degrade,
+            // retryable — retry_after_ms per the rest-api.md contract and
+            // the quarantine-route precedent; governance cons-F1), anything
+            // else → 400 (caller/validation error) — never one catch-all.
+            // set_tag_checked now also propagates a FAILED WRITE (the
+            // pre-migration contract validated, then swallowed it and
+            // reported success over nothing written). Failed attempts leave
+            // an audit row (governance cmp-F1/cons-F2 — the MCP twin already
+            // audited its failure branches; an auditor querying tag.set must
+            // see the failed attempt on this transport too).
+            const bool db_error = result.error().starts_with(kTagDbErrorPrefix);
+            audit_fn(req, "tag.set", "failure", "Tag", agent_id + ":" + key, result.error());
+            res.status = db_error ? 503 : 400;
+            if (db_error) {
+                res.set_content(detail::a4_error(res, "tag store unavailable",
+                                                 detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                                "application/json");
+            } else {
+                res.set_content(detail::a4_error(res, result.error()), "application/json");
+            }
             return;
         }
         if (key == "service" && service_group_fn)
@@ -4874,8 +4912,23 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "Tag", "Delete", agent_id))
                 return;
-            bool deleted = tag_store->delete_tag(agent_id, key);
+            auto deleted = tag_store->delete_tag(agent_id, key);
             if (!deleted) {
+                // Degrade → 503 (#3097), retryable (cons-F1) — the
+                // pre-migration bool answered 404 for a store failure,
+                // telling the caller the tag was gone when nothing was
+                // checked. Audited (cmp-F1/cons-F2): a failed delete attempt
+                // must be visible to an auditor on this transport, as it
+                // already is on the legacy and MCP twins.
+                audit_fn(req, "tag.delete", "failure", "Tag", agent_id + ":" + key, "");
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "tag store unavailable",
+                                                 detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
+            if (!*deleted) {
+                audit_fn(req, "tag.delete", "not_found", "Tag", agent_id + ":" + key, "");
                 res.status = 404;
                 res.set_content(detail::a4_error(res, "tag not found"), "application/json");
                 return;
