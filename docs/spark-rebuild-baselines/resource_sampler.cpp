@@ -116,6 +116,24 @@ private:
     FILE* f_;
 };
 
+// RAII owner for a HANDLE whose failure sentinel is INVALID_HANDLE_VALUE, not
+// nullptr - CreateToolhelp32Snapshot's convention, distinct from
+// UniqueProcessHandle's OpenProcess/OpenProcessToken nullptr convention above
+// (PR #3267 review, fjarvis: the RAII floor landed on hproc/out but stopped
+// short of the token and snapshot handles below).
+class UniqueSnapshotHandle {
+public:
+    explicit UniqueSnapshotHandle(HANDLE h = INVALID_HANDLE_VALUE) noexcept : h_(h) {}
+    ~UniqueSnapshotHandle() { if (h_ != INVALID_HANDLE_VALUE) CloseHandle(h_); }
+    UniqueSnapshotHandle(const UniqueSnapshotHandle&) = delete;
+    UniqueSnapshotHandle& operator=(const UniqueSnapshotHandle&) = delete;
+    [[nodiscard]] HANDLE get() const noexcept { return h_; }
+    explicit operator bool() const noexcept { return h_ != INVALID_HANDLE_VALUE; }
+
+private:
+    HANDLE h_;
+};
+
 BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     if (ctrl_type == CTRL_C_EVENT || ctrl_type == CTRL_CLOSE_EVENT) {
         g_stop.store(true, std::memory_order_relaxed);
@@ -129,33 +147,32 @@ BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
 // elevated admin token open/query a process it doesn't own. If this fails,
 // OpenProcess below will too, with a clear error.
 void try_enable_debug_privilege() {
-    HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+    HANDLE token_raw = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token_raw)) {
         return;
     }
+    UniqueProcessHandle token(token_raw);
     LUID luid{};
     if (LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &luid)) {
         TOKEN_PRIVILEGES tp{};
         tp.PrivilegeCount = 1;
         tp.Privileges[0].Luid = luid;
         tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        AdjustTokenPrivileges(token.get(), FALSE, &tp, sizeof(tp), nullptr, nullptr);
     }
-    CloseHandle(token);
 }
 
 uint32_t thread_count_for_pid(DWORD pid) {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
+    UniqueSnapshotHandle snap(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+    if (!snap) return 0;
     THREADENTRY32 te{};
     te.dwSize = sizeof(te);
     uint32_t count = 0;
-    if (Thread32First(snap, &te)) {
+    if (Thread32First(snap.get(), &te)) {
         do {
             if (te.th32OwnerProcessID == pid) ++count;
-        } while (Thread32Next(snap, &te));
+        } while (Thread32Next(snap.get(), &te));
     }
-    CloseHandle(snap);
     return count;
 }
 

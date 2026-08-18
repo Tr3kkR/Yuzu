@@ -37,7 +37,13 @@ Two instruments, deliberately separated:
 
 ## Claims
 
-Measured, at production Config defaults, once a never-Known rule is past demotion:
+At production Config defaults, once a never-Known rule is past demotion. **Scope note
+(PR #3267 review, fjarvis):** the mechanism facts below (sweep count, refresh timing,
+the 480s jitter-floor still refreshing) are literal Catch2 assertions, empirically
+pinned. The daily-rate totals (288/day, 144/day, 180/day) are NOT themselves
+assertions - no test asserts a per-day count - they are arithmetic derived from the
+measured periods (`86,400s / period_s`): a derived bound, mechanism empirically
+pinned.
 
 - **60s-cadence lane (service/registry): 1 edge + 288 refreshes/rule/agent/day.**
   Demotion off the 5s priority lane completes in exactly 12 committed Convergence
@@ -75,11 +81,20 @@ Measured, at production Config defaults, once a never-Known rule is past demotio
   edge emission (`b30e93cfd`, 2026-07-20) already reduced the flood to zero
   steady-state before F5 shipped; F5 (PR #3005) then added the above nonzero ceiling
   back, deliberately, as a lost/coalesced-edge backstop.
-- **Red-then-green provenance:** each numeric assertion was verified to actually fail
-  under a deliberately wrong pinned value before being set to the value the code
-  produces (recorded below), then a full `[spark][runtime]` tag run (90 cases / 1610
-  assertions) passed clean - this is not an extrapolation from the mechanism's
-  documented behavior, it is the runtime's own measured output.
+- **Provenance - what's measured vs what's derived (corrected 2026-08-18, PR #3267
+  review, fjarvis: the original wording here claimed the daily figures themselves were
+  "the runtime's own measured output," which a grep for `288`/`180` against this file's
+  `CHECK`/`REQUIRE` lines disproves - neither appears in an assertion, only in comments
+  and a test name):** the mechanism-level assertions - demotion completing in exactly
+  12 committed sweeps, refresh recurring at exactly `errored_refresh_ms` after the last
+  emission, the 480s jitter-floor sweep still refreshing - are the runtime's own
+  measured output. The demotion-sweep-count assertion was verified red (a deliberately
+  wrong pinned value, recorded below) before being set to the value the code actually
+  produces. The daily-rate figures (288/day, 144/day, 180/day) are not themselves
+  assertions - they are arithmetic derived from those measured periods
+  (`86,400s / period_s`): a derived bound, mechanism empirically pinned, not an
+  independently-measured daily count. A full `[spark][runtime]` tag run (91 cases /
+  1620 assertions) passed clean on this branch's HEAD.
 
 ```
 $ tests-build-agent-linux_x64/yuzu_agent_tests "F11*" --success
@@ -299,12 +314,38 @@ Full transcripts: Kimi/Codex phase1+phase2 reports and this synthesis are not
 committed (adversarial-review workflow output, not repo content) - reproducible via
 `/adversarial-review` against this branch if needed again.
 
+## PR review (fjarvis, #3267)
+
+External review, CHANGES_REQUESTED, two BLOCKING findings - both verified accurate
+against this branch before fixing:
+
+- **RAII policy floor applied incompletely to `resource_sampler.cpp`.** The
+  governance-driven RAII pass (Gate 3, 2026-08-18) wrapped `hproc`/`out` but left
+  `try_enable_debug_privilege()`'s `token` and `thread_count_for_pid()`'s `snap` on
+  manual `CloseHandle`. Confirmed via grep before fixing. Fixed: `token` now uses the
+  existing `UniqueProcessHandle` (its `nullptr` failure-sentinel convention matches
+  `OpenProcessToken`); `snap` needed a distinct wrapper (`UniqueSnapshotHandle`) since
+  `CreateToolhelp32Snapshot` fails with `INVALID_HANDLE_VALUE`, not `nullptr` -
+  reusing `UniqueProcessHandle` there would have called `CloseHandle` on the sentinel
+  itself on the failure path.
+- **Overclaiming: the daily-rate figures were presented as measured, not derived.**
+  Confirmed via grep (`288`/`180` never appear on a `CHECK`/`REQUIRE` line in
+  `test_guardian_spark_runtime.cpp` - only in comments and one test name) and via a
+  stale cross-reference (this doc's own transcript block already showed the correct
+  91 cases/1620 assertions while a prose line above it still said "90 cases / 1610").
+  Fixed: the Claims section intro, the red-then-green provenance paragraph, and the
+  ready-to-paste changelog sentence below now distinguish the empirically-pinned
+  mechanism (sweep count, refresh timing, the jitter-floor case) from the arithmetic-
+  derived daily totals - fjarvis's suggested framing, "derived bound, mechanism
+  empirically pinned," adopted verbatim.
+
 ## Ready-to-paste F14 flip-changelog sentence
 
 > Guardian's `guard.unhealthy` wire traffic for a stuck-Unknown rule is bounded at
 > 1 edge + 288 refreshes/rule/agent/day on 60s-cadence lanes (service/registry) and
 > 1 edge + 180/day on the 600s file lane, accounting for the scheduler's default
-> +/-20% jitter (measured, `docs/spark-rebuild-baselines/f11-flood-measurement-run.md`),
+> +/-20% jitter (mechanism empirically pinned, daily rate derived from it -
+> `docs/spark-rebuild-baselines/f11-flood-measurement-run.md`),
 > roughly 60-95x below an earlier ~17k/day
 > pre-mitigation estimate.
 
