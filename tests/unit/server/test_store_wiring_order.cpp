@@ -59,6 +59,36 @@
  * Nothing here needs updating when a setter or construction call is added
  * in the correct order; a failure means an ordering regression was
  * introduced, not that this file is stale.
+ *
+ * WHAT THIS SCAN DOES NOT CATCH (governance Gate 3 architect + quality-
+ * engineer, both SHOULD, recorded here per docs-writer-owns-wording /
+ * domain-agent-owns-truth so a reader trusts the guarantee this test
+ * actually gives, not a stronger one):
+ *   - A setter wired to the WRONG member, e.g. `set_webhook_store(
+ *     offload_target_store_.get())`. The scan ties correctness to whichever
+ *     member name literally appears in the call; it has no notion of which
+ *     member a given setter is SUPPOSED to receive.
+ *   - A setter or construction inside a branch that is never taken at
+ *     runtime (dead code, an always-false `if`). This is pure text-position
+ *     scanning with no control-flow awareness -- a setter genuinely gated on
+ *     a runtime condition (e.g. NotificationStore's PG-fail-closed branch)
+ *     is indistinguishable, from the regex's point of view, from one that
+ *     can never execute at all.
+ *   - PRESENCE. The order check only fires for setters that exist; deleting
+ *     a setter (and its member's construction) outright does not fail this
+ *     test as long as >= 25 setters remain (see the sanity floor below) --
+ *     see the second TEST_CASE in this file, which pins presence of the
+ *     three specific #3261 setters explicitly, for exactly this reason.
+ *   - Only single-line `//`-style comments are stripped before scanning --
+ *     C-style block comments are NOT stripped. Empirically harmless today
+ *     (no setter or construction call is presently written inside one), and
+ *     deliberately left unstripped rather than "fixed" with a naive
+ *     block-comment-matching regex -- an early attempt at exactly that
+ *     swallowed real code by opening a phantom block comment inside a
+ *     string literal elsewhere in server.cpp that happens to contain a
+ *     slash-star-shaped substring, losing ~2000 real lines including 5 live
+ *     setters from the scan. A correct fix needs a string-literal-aware
+ *     stripper, which this file does not attempt.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -168,4 +198,27 @@ TEST_CASE("server.cpp: every agent_service_/gateway_service_ store setter runs a
         INFO("earliest construction of " << s.member << " at server.cpp:" << earliest_construction);
         CHECK(earliest_construction < s.line);
     }
+}
+
+TEST_CASE("server.cpp: the three #3261 setters specifically are still present "
+          "(#3261 presence pin)",
+          "[wiring_order]") {
+    // Companion to the ordering test above (quality-engineer SHOULD, Gate
+    // 3): that test only asserts ORDER for whatever setters happen to
+    // exist, gated by a >= 25 sanity floor. Deleting all three of
+    // #3261's setters outright (28 - 3 = 25) would still clear that
+    // floor and pass silently -- exactly the literal symptom #3261 was.
+    // Pin presence of these three explicitly so that regression can never
+    // hide behind the floor.
+    const std::string text = strip_line_comments(read_server_cpp());
+    const auto setters = extract_setter_calls(text);
+
+    auto has = [&](const char* receiver, const char* setter, const char* member) {
+        return std::any_of(setters.begin(), setters.end(), [&](const SetterCall& s) {
+            return s.receiver == receiver && s.setter == setter && s.member == member;
+        });
+    };
+    CHECK(has("agent_service_", "notification_store", "notification_store_"));
+    CHECK(has("agent_service_", "webhook_store", "webhook_store_"));
+    CHECK(has("agent_service_", "offload_target_store", "offload_target_store_"));
 }

@@ -4,13 +4,13 @@
 #include <httplib.h>
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
+#include <yuzu/metrics.hpp>
 
 #include <chrono>
 #include <iomanip>
 #include <semaphore>
 #include <shared_mutex>
 #include <sstream>
-#include <thread>
 
 #ifdef _WIN32
 // clang-format off
@@ -117,6 +117,19 @@ WebhookStore::WebhookStore(const std::filesystem::path& db_path) {
 }
 
 WebhookStore::~WebhookStore() {
+    // #3261 governance hardening. A destructor's BODY runs BEFORE its
+    // members' destructors, so declaring `pool_` last in the class does
+    // NOT by itself stop this body from closing `db_` while a worker is
+    // still touching it - the member-destruction-order trick only helps
+    // once this body returns. Drain explicitly, first. In the intended
+    // production flow (ServerImpl::stop() -> quiesce(15s) -> success ->
+    // .reset()) this is always instant: the pool is already empty by the
+    // time this destructor runs. It only actually waits for a store
+    // destroyed without going through that dance first (tests, or a
+    // standalone WebhookStore) - bounded generously rather than
+    // literally forever, so a std::chrono::milliseconds::max() overflow
+    // in the wait's internal deadline arithmetic isn't a risk.
+    pool_.quiesce(std::chrono::hours(24));
     if (db_)
         sqlite3_close(db_);
 }
@@ -124,6 +137,10 @@ WebhookStore::~WebhookStore() {
 bool WebhookStore::is_open() const {
     return db_ != nullptr;
 }
+
+void WebhookStore::set_metrics(yuzu::MetricsRegistry* metrics) { metrics_ = metrics; }
+
+bool WebhookStore::quiesce(std::chrono::milliseconds timeout) { return pool_.quiesce(timeout); }
 
 void WebhookStore::create_tables() {
     static const std::vector<Migration> kMigrations = {
@@ -385,6 +402,13 @@ void WebhookStore::deliver_single(const Webhook& wh, const std::string& event_ty
         spdlog::warn("WebhookStore: delivery to {} failed: {}", wh.url, error);
     }
 
+    const bool ok = error.empty() && status_code >= 200 && status_code < 300;
+    if (metrics_) {
+        metrics_->counter(ok ? "yuzu_server_webhook_delivery_success_total"
+                              : "yuzu_server_webhook_delivery_failed_total")
+            .increment();
+    }
+
     // Record delivery under unique lock
     {
         std::unique_lock lock(mtx_);
@@ -432,12 +456,23 @@ void WebhookStore::fire_event(const std::string& event_type, const std::string& 
         sqlite3_finalize(stmt);
     }
 
-    // Deliver to each matching webhook asynchronously on detached threads.
-    // The counting semaphore limits concurrent deliveries to 10.
-    for ([[maybe_unused]] const auto& wh : matching) {
-        std::thread([this, wh, event_type, payload_json]() {
-            deliver_single(wh, event_type, payload_json);
-        }).detach();
+    // Deliver to each matching webhook on the bounded pool (#3261 governance
+    // hardening - was a raw detached std::thread per event; see
+    // store_worker_pool.hpp for why). The counting semaphore inside
+    // deliver_single further limits concurrent HTTP work to 10; the pool
+    // itself bounds concurrent THREAD creation to 4, and a full queue
+    // drops the delivery (logged + counted) rather than spawning unbounded
+    // threads.
+    for (const auto& wh : matching) {
+        const bool queued = pool_.submit(
+            [this, wh, event_type, payload_json]() { deliver_single(wh, event_type, payload_json); });
+        if (!queued) {
+            spdlog::warn("WebhookStore: dropped delivery to {} - worker pool queue full or "
+                         "server shutting down",
+                         wh.url);
+            if (metrics_)
+                metrics_->counter("yuzu_server_webhook_delivery_dropped_total").increment();
+        }
     }
 }
 

@@ -1,0 +1,172 @@
+#pragma once
+
+/// @file store_worker_pool.hpp
+/// #3261 governance hardening - bounded delivery worker pool shared by
+/// WebhookStore and OffloadTargetStore. Replaces the prior per-event
+/// `std::thread(...).detach()` dispatch, which had two independent defects:
+///
+///  1. UNBOUNDED THREAD CREATION (governance Gate 4 UP-2): the 10-slot
+///     counting semaphore in each store capped concurrent HTTP work, but it
+///     was acquired INSIDE the spawned thread, after the thread already
+///     existed - a burst of events (e.g. a mass agent-reconnect after a
+///     gateway bounce, #1197) could still spawn hundreds of OS threads that
+///     all pile up blocked on `acquire()`.
+///  2. USE-AFTER-FREE AT SHUTDOWN (governance Gate 2/3, security-guardian +
+///     cpp-safety + sre independently convergent): a detached thread
+///     captures `this` and, on completion, calls `record_delivery()`, whose
+///     first statement locks a member mutex. Nothing joined these threads,
+///     so a delivery still in flight when the owning store was destroyed
+///     dereferenced freed memory.
+///
+/// A bounded pool with a FIXED worker count and a BOUNDED queue closes (1):
+/// `submit()` never spawns a thread on the caller's stack, and a full queue
+/// is a `false` return the caller logs and drops rather than an unbounded
+/// spawn. It closes (2) two ways: `quiesce(timeout)` gives the owning store
+/// an explicit, BOUNDED wait-for-drain to call before it destroys itself
+/// (matching the `web_thread_done_cv_` 15s-grace-then-escalate pattern
+/// already established in `ServerImpl::stop()`, `server.cpp`), and as
+/// defense in depth the destructor still joins every worker unconditionally
+/// - so even a caller that skips `quiesce()` cannot free the pool (and by
+/// construction, cannot free a store that OWNS the pool as its last-declared
+/// member) while a worker is still touching store state.
+///
+/// This is deliberately NOT a general-purpose thread pool - no work
+/// stealing, no futures, no priority. `agents/core/src/thread_pool.hpp` is
+/// the agent-side sibling this borrows its exception-firewall idiom from;
+/// they are not shared because the two build targets (agent, server) do not
+/// share a common internal library for something this small.
+
+#include <spdlog/spdlog.h>
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <functional>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
+
+namespace yuzu::server {
+
+class StoreWorkerPool {
+public:
+    /// `num_threads`: fixed worker count, clamped to [1, 16]. `max_queue`:
+    /// backpressure ceiling - `submit()` returns false once the queue is
+    /// this full, rather than growing without bound.
+    StoreWorkerPool(std::size_t num_threads, std::size_t max_queue)
+        : max_queue_(max_queue) {
+        num_threads = std::max<std::size_t>(num_threads, 1);
+        num_threads = std::min<std::size_t>(num_threads, 16);
+        workers_.reserve(num_threads);
+        for (std::size_t i = 0; i < num_threads; ++i) {
+            workers_.emplace_back([this] { worker_loop(); });
+        }
+    }
+
+    ~StoreWorkerPool() {
+        // Defense in depth: a caller that skips quiesce() (or whose
+        // quiesce() timed out and chose to keep the pool anyway, which no
+        // caller in this codebase does today) still cannot destroy this
+        // pool while a worker is mid-task - join() blocks until every
+        // worker returns, exactly like agents/core/src/thread_pool.hpp's
+        // destructor. This is why the pool must be the LAST-declared
+        // member of any store that owns one: member destruction order is
+        // reverse-declaration, so this join runs BEFORE that store's
+        // db_/mtx_ are torn down.
+        {
+            std::lock_guard lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) {
+            if (w.joinable())
+                w.join();
+        }
+    }
+
+    StoreWorkerPool(const StoreWorkerPool&) = delete;
+    StoreWorkerPool& operator=(const StoreWorkerPool&) = delete;
+
+    /// Enqueue a task. Returns false (task NOT queued) if the pool has
+    /// already been quiesced, or if the bounded queue is full - the caller
+    /// must log and drop rather than fall back to an unbounded spawn.
+    bool submit(std::function<void()> task) {
+        {
+            std::lock_guard lock(mu_);
+            if (closed_ || stop_)
+                return false;
+            if (tasks_.size() >= max_queue_)
+                return false;
+            tasks_.push(std::move(task));
+            ++pending_;
+        }
+        cv_.notify_one();
+        return true;
+    }
+
+    /// Stop accepting new work and wait up to `timeout` for the queue to
+    /// drain AND every in-flight task to finish. Returns true if fully
+    /// drained within the bound, false on timeout (some task is still
+    /// running past the deadline - the caller must not destroy the pool
+    /// in that case; see the header comment on `~StoreWorkerPool`).
+    bool quiesce(std::chrono::milliseconds timeout) {
+        {
+            std::lock_guard lock(mu_);
+            closed_ = true;
+        }
+        std::unique_lock lock(mu_);
+        return idle_cv_.wait_for(lock, timeout, [this] { return pending_ == 0; });
+    }
+
+private:
+    void worker_loop() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock lock(mu_);
+                cv_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+                if (stop_ && tasks_.empty())
+                    return;
+                task = std::move(tasks_.front());
+                tasks_.pop();
+            }
+            // Exception firewall, same rationale as
+            // agents/core/src/thread_pool.hpp: a task must never let an
+            // exception escape this callable, or the server terminates.
+            // deliver_single() already wraps its own body in try/catch, so
+            // this is a last-resort net, not the primary handler.
+            try {
+                task();
+            } catch (const std::exception& e) {
+                try {
+                    spdlog::error("StoreWorkerPool: task threw std::exception (contained): {}",
+                                  e.what());
+                } catch (...) {}
+            } catch (...) {
+                try {
+                    spdlog::error("StoreWorkerPool: task threw a non-std exception (contained)");
+                } catch (...) {}
+            }
+            {
+                std::lock_guard lock(mu_);
+                --pending_;
+                if (pending_ == 0)
+                    idle_cv_.notify_all();
+            }
+        }
+    }
+
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mu_;
+    std::condition_variable cv_;      // producer -> worker: new task / stop
+    std::condition_variable idle_cv_; // worker -> quiesce(): pending_ reached 0
+    std::size_t max_queue_;
+    std::size_t pending_{0}; // queued + currently-executing tasks
+    bool stop_{false};       // destructor-path: stop workers unconditionally
+    bool closed_{false};     // quiesce()-path: reject new submissions
+};
+
+} // namespace yuzu::server

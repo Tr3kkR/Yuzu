@@ -2180,13 +2180,14 @@ struct BareServiceHarness {
 
 /// MEMBER ORDER LOAD-BEARING, same contract as TrackerScope above: the dtor
 /// must null both borrowed-pointer setters before the stores it borrowed
-/// from destruct. Both stores are SQLite in-memory, so unlike production
-/// (server.cpp's stop(), which deliberately never resets these two because
-/// fire_event()/flush_all() spawn detached delivery threads still in
-/// flight) resetting here is safe: every test using this scope polls
-/// get_deliveries() until the fired event's delivery row lands before the
-/// scope goes out of it, so no detached thread is still writing when the
-/// stores are reset.
+/// from destruct. #3261 governance hardening: WebhookStore/OffloadTargetStore
+/// now dispatch deliveries through a bounded StoreWorkerPool instead of a
+/// raw detached std::thread (store_worker_pool.hpp), so this scope's dtor
+/// calls quiesce() before reset() below — a real, bounded guarantee that no
+/// delivery thread is still touching the store, not merely an inference
+/// from every test polling get_deliveries() to completion first (which was
+/// the whole story before the pool existed, and left a narrow gap if a
+/// REQUIRE failed mid-poll and unwound straight into this destructor).
 struct EventSinkScope {
     std::unique_ptr<WebhookStore> webhooks;
     std::unique_ptr<OffloadTargetStore> offloads;
@@ -2205,6 +2206,20 @@ struct EventSinkScope {
             svc->set_webhook_store(nullptr);
             svc->set_offload_target_store(nullptr);
         }
+        // #3261 governance hardening (cpp-expert SHOULD, Gate 3): the old
+        // version of this comment argued destruction was safe because
+        // every test using this scope polls get_deliveries() to
+        // completion first — true on the success path, but a REQUIRE
+        // failure mid-poll unwinds straight into this destructor with a
+        // detached delivery thread potentially still in flight. quiesce()
+        // makes that argument unconditional instead of relying on test
+        // discipline: it blocks (bounded) until every queued/in-flight
+        // delivery on the pool has actually finished, so reset() below is
+        // always safe regardless of how this scope exits.
+        if (webhooks)
+            webhooks->quiesce(std::chrono::seconds(5));
+        if (offloads)
+            offloads->quiesce(std::chrono::seconds(5));
         offloads.reset();
         webhooks.reset();
     }
@@ -2213,18 +2228,22 @@ struct EventSinkScope {
     EventSinkScope& operator=(const EventSinkScope&) = delete;
 };
 
-/// Poll `get` (a `get_deliveries`-shaped callable) up to 5s for a non-empty
-/// result — matches the deterministic-without-a-fixed-sleep idiom already
-/// established for detached delivery threads in
-/// test_offload_target_store.cpp's batch_size test.
+/// Poll `get` (a `get_deliveries`-shaped callable) up to 5s for at least
+/// `min_count` results — matches the deterministic-without-a-fixed-sleep
+/// idiom already established for detached delivery threads in
+/// test_offload_target_store.cpp's batch_size test. Default `min_count=1`
+/// preserves the original "wait for non-empty" behavior for existing
+/// callers; a caller re-polling after a second delivery (e.g. a reconnect
+/// firing a second `agent.registered`) passes 2 so it does not observe a
+/// stale still-size-1 result and stop waiting too early.
 template <typename Get>
-auto poll_deliveries(Get get) {
+auto poll_deliveries(Get get, std::size_t min_count = 1) {
     constexpr auto kPollDeadline = std::chrono::seconds(5);
     auto start = std::chrono::steady_clock::now();
     decltype(get()) rows;
     while (std::chrono::steady_clock::now() - start < kPollDeadline) {
         rows = get();
-        if (!rows.empty())
+        if (rows.size() >= min_count)
             break;
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
@@ -2332,4 +2351,75 @@ TEST_CASE("process_gateway_response: wired notification store receives an "
     CHECK(rows[0].message.find("cmd-fail-1") != std::string::npos);
     CHECK(rows[0].message.find("agent-9") != std::string::npos);
     CHECK(rows[0].message.find("boom") != std::string::npos);
+}
+
+// ── #3261 governance hardening (Gate 3 quality-engineer SHOULD) ────────────
+//
+// The two TEST_CASEs above exercise process_gateway_response's wiring but
+// never Register/Subscribe's own notification/webhook/offload logic — which,
+// being downstream of the SAME construction-order bug, had never executed
+// in any test or production boot until #3261's fix. This closes that gap,
+// and doubles as the regression test for the reauth-suppression fix
+// (agent_service_impl.cpp Register handler): "Agent Enrolled" must fire
+// once, on first enrollment only; `agent.registered` webhook/offload must
+// fire on EVERY Register, including a reconnect, per the documented
+// contract (docs/user-manual/rest-api.md's webhook/offload sections).
+
+TEST_CASE("Register: notification fires once on first enrollment; webhook/offload "
+          "fire again on a reconnect (#3261)",
+          "[pg][agent_service][issue3261]") {
+    YUZU_REQUIRE_PG_DB_TPL(ndb, notif_tpl);
+    PgPool npool{{.conninfo = ndb.dsn(), .size = 4}};
+
+    BareServiceHarness h;
+    h.auto_approve.add_rule({yuzu::server::auth::AutoApproveRuleType::hostname_glob, "*",
+                             "match-all (test)", /*enabled=*/true});
+    EventSinkScope sinks(h.svc);
+    NotificationScope nscope(h.svc, npool);
+
+    auto wh_id =
+        sinks.webhooks->create_webhook("http://127.0.0.1:1/hook", "agent.registered", "");
+    REQUIRE(wh_id > 0);
+    auto off_id = sinks.offloads->create_target("t1", "http://127.0.0.1:1/off",
+                                                OffloadAuthType::None, "", "agent.registered",
+                                                /*batch_size=*/1);
+    REQUIRE(off_id > 0);
+
+    auto req = make_register("reauth-test-agent");
+
+    // First Register: genuinely new agent.
+    apb::RegisterResponse resp1;
+    REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &resp1).ok());
+    REQUIRE(resp1.accepted());
+
+    auto notifs = nscope.store->list_all();
+    REQUIRE(notifs.size() == 1);
+    CHECK(notifs[0].title == "Agent Enrolled");
+    CHECK(notifs[0].message.find("reauth-test-agent") != std::string::npos);
+
+    auto wh_after_first = poll_deliveries([&] { return sinks.webhooks->get_deliveries(wh_id); });
+    REQUIRE(wh_after_first.size() == 1);
+    auto off_after_first =
+        poll_deliveries([&] { return sinks.offloads->get_deliveries(off_id); });
+    REQUIRE(off_after_first.size() == 1);
+
+    // Second Register with the SAME agent_id: a reconnect.
+    // auth_mgr_.get_pending_status() now returns approved, so is_reauth
+    // becomes true inside Register.
+    apb::RegisterResponse resp2;
+    REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &resp2).ok());
+
+    // Notification: unchanged. A regression here (the pre-#3261-fix shape,
+    // just newly visible) would flood the unreaper'd notification feed on
+    // every fleet-wide restart (Gate 4 happy-path/unhappy-path UP-3).
+    auto notifs_after_reauth = nscope.store->list_all();
+    CHECK(notifs_after_reauth.size() == 1);
+
+    // Webhook/offload: DO fire again, matching the documented contract.
+    auto wh_after_reauth =
+        poll_deliveries([&] { return sinks.webhooks->get_deliveries(wh_id); }, /*min_count=*/2);
+    CHECK(wh_after_reauth.size() == 2);
+    auto off_after_reauth =
+        poll_deliveries([&] { return sinks.offloads->get_deliveries(off_id); }, /*min_count=*/2);
+    CHECK(off_after_reauth.size() == 2);
 }

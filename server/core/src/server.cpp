@@ -5023,11 +5023,13 @@ public:
         {
             auto webhook_db = cfg_.db_dir() / "webhooks.db";
             webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
+            webhook_store_->set_metrics(&metrics_);
             agent_service_.set_webhook_store(webhook_store_.get());
         }
         {
             auto offload_db = cfg_.db_dir() / "offload_targets.db";
             offload_target_store_ = std::make_unique<OffloadTargetStore>(offload_db);
+            offload_target_store_->set_metrics(&metrics_);
             agent_service_.set_offload_target_store(offload_target_store_.get());
         }
 
@@ -7047,16 +7049,6 @@ public:
             }
         }
 
-        // Phase 8.3 #255 — drain offload batch buffers BEFORE the store is
-        // reset further down. Detached delivery threads continue past
-        // process exit's perspective but get a fair chance to finish
-        // before the SQLite handle goes away. flush_all() spawns a final
-        // round of detached deliveries; we don't join them, but the
-        // buffer state is consistent (RESTART-1 from Gate 6 SRE).
-        if (offload_target_store_) {
-            offload_target_store_->flush_all();
-        }
-
         // Shutdown gRPC with a deadline FIRST so in-flight Subscribe and
         // ManagementService streams drain before we drop the stores they
         // reference. Without a deadline, Shutdown() waits indefinitely for
@@ -7359,23 +7351,53 @@ public:
         // declaration order alone.
         agent_service_.set_notification_store(nullptr);
         notification_store_.reset();
-        // WebhookStore / OffloadTargetStore (#3261) borrow no pool - each owns
-        // its own SQLite handle, so unlike the PG-backed stores above there is
-        // no pool-ordering requirement. Unwire the borrowed pointers anyway,
-        // matching the drain -> null -> reset discipline the gRPC shutdown
-        // above already established, so agent_service_ never dereferences a
-        // store past this point. Deliberately NO .reset() here: fire_event()
-        // and flush_all() (called just above, Phase 8.3 #255) both spawn
-        // detached std::thread deliveries that capture `this` and are never
-        // joined - resetting the store while one is still in flight is a
-        // use-after-free. This unwire only stops NEW deliveries from being
-        // queued; it does not prove already-in-flight ones have finished
-        // (pre-existing gap, not introduced or fixed here - the store has no
-        // join/quiescence primitive). Deferring destruction to normal member
-        // teardown narrows the risk window (bounded by the gRPC drain +
-        // flush_all above) but does not close it.
+        // WebhookStore / OffloadTargetStore (#3261 governance hardening).
+        // flush_all() runs HERE, after the gRPC drain above, not before it -
+        // an earlier version ran it before Shutdown(deadline), which missed
+        // any delivery fired by a Register/process_gateway_response call
+        // still in flight during the up-to-5s drain window (Gate 4
+        // unhappy-path UP-1). Both stores now dispatch deliveries onto a
+        // bounded StoreWorkerPool (store_worker_pool.hpp) instead of a raw
+        // detached std::thread, so quiesce(15s) below gives a real, bounded
+        // guarantee that no delivery thread is still touching the store
+        // before it is reset - closing the use-after-free that motivated
+        // this whole block (security-guardian/cpp-safety/sre, Gate 2/3) and
+        // the unbounded-thread-creation risk on a mass-reconnect burst
+        // (Gate 4 unhappy-path UP-2/UP-8), since the pool caps concurrent
+        // thread creation, not just concurrent HTTP work.
+        if (offload_target_store_)
+            offload_target_store_->flush_all();
+        const bool webhook_drained =
+            !webhook_store_ || webhook_store_->quiesce(std::chrono::seconds(15));
+        const bool offload_drained =
+            !offload_target_store_ || offload_target_store_->quiesce(std::chrono::seconds(15));
         agent_service_.set_webhook_store(nullptr);
         agent_service_.set_offload_target_store(nullptr);
+        if (webhook_drained) {
+            webhook_store_.reset();
+        } else {
+            // Mirrors the nvd_sync leak-and-continue precedent elsewhere in
+            // this function: a delivery is still in flight past the bound
+            // (a slow/unreachable operator-configured endpoint). Destroying
+            // the store now would be the exact use-after-free this pool
+            // exists to prevent; hanging stop() indefinitely is not
+            // acceptable either (it runs synchronously on the SIGTERM
+            // handler thread). Deliberately leak: release() so ~WebhookStore
+            // never runs, and the still-running worker keeps touching
+            // valid, merely-unreferenced memory instead of freed memory.
+            spdlog::critical("ServerImpl::stop: WebhookStore did not quiesce within 15s - "
+                              "leaking the store rather than risking a use-after-free "
+                              "against an in-flight delivery");
+            [[maybe_unused]] auto* leaked = webhook_store_.release();
+        }
+        if (offload_drained) {
+            offload_target_store_.reset();
+        } else {
+            spdlog::critical("ServerImpl::stop: OffloadTargetStore did not quiesce within 15s - "
+                              "leaking the store rather than risking a use-after-free "
+                              "against an in-flight delivery");
+            [[maybe_unused]] auto* leaked = offload_target_store_.release();
+        }
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
         // pointer from agent_service_ (the Register sync_agent_tags ingest —
         // Register-only, heartbeats do not sync tags; governance perf-F8),
@@ -10339,6 +10361,10 @@ private:
             // /api/v1/offload-targets endpoint and every fire_event call
             // silently no-ops on a migration failure (HC-1 from Gate 6).
             bool offload_target_ok = offload_target_store_ && offload_target_store_->is_open();
+            // #3261 governance hardening (Gate 6 SRE) - same HC-1 gap class
+            // as offload_target above; webhook_store was missing from this
+            // probe even though its sibling was already covered.
+            bool webhook_ok = webhook_store_ && webhook_store_->is_open();
             // #1238 B-3: ca.db is load-bearing whenever default certs are active
             // (issuance / revocation / CRL). It was wired into /readyz but missing
             // here, so /healthz could report "healthy" with a dead ca.db. Mirrors
@@ -10437,6 +10463,7 @@ private:
                   {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
                   {"baselines", baseline_ok ? "ok" : "error"},
                   {"offload_target", offload_target_ok ? "ok" : "error"},
+                  {"webhook_store", webhook_ok ? "ok" : "error"},
                   {"ca", ca_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
@@ -10580,6 +10607,13 @@ private:
                 // would silently no-op all offload deliveries while the
                 // probe reported "ready" (HC-1 gap from Gate 6 SRE).
                 {"offload_target_store", offload_target_store_ && offload_target_store_->is_open()},
+                // #3261 governance hardening (Gate 6 SRE) - WebhookStore is
+                // load-bearing for /api/webhooks and the same AgentService
+                // fan-out path as offload_target_store above, but was
+                // missing from this probe (its two siblings,
+                // offload_target_store and notification_store below, were
+                // already covered) - same HC-1 gap class.
+                {"webhook_store", webhook_store_ && webhook_store_->is_open()},
                 // Governance UAT 2026-05-06 SRE-1: ExecutionTracker became
                 // load-bearing in this batch — AgentServiceImpl's
                 // notify_exec_tracker calls update_agent_status on every

@@ -1,13 +1,20 @@
 #pragma once
 
+#include "store_worker_pool.hpp"
+
 #include <sqlite3.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <shared_mutex>
 #include <string>
 #include <vector>
+
+namespace yuzu {
+class MetricsRegistry;
+}
 
 namespace yuzu::server {
 
@@ -40,6 +47,17 @@ public:
 
     bool is_open() const;
 
+    /// Wire a metrics sink for delivery outcome counters. Set-before-traffic
+    /// contract, same as DexAlertRouter::set_metrics - call once, before
+    /// the store is wired into agent_service_.
+    void set_metrics(yuzu::MetricsRegistry* metrics);
+
+    /// Stop accepting new deliveries and wait up to `timeout` for every
+    /// queued/in-flight delivery to finish. Returns true if fully drained.
+    /// The caller (ServerImpl::stop()) MUST NOT destroy this store if this
+    /// returns false - see store_worker_pool.hpp's header comment.
+    bool quiesce(std::chrono::milliseconds timeout);
+
     /// Create a new webhook. Returns the assigned id.
     int64_t create_webhook(const std::string& url, const std::string& event_types,
                            const std::string& secret, bool enabled = true);
@@ -64,12 +82,21 @@ public:
 private:
     sqlite3* db_{nullptr};
     mutable std::shared_mutex mtx_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
 
     void create_tables();
     void deliver_single(const Webhook& wh, const std::string& event_type,
                         const std::string& payload_json);
     void record_delivery(int64_t webhook_id, const std::string& event_type,
                          const std::string& payload, int status_code, const std::string& error);
+
+    // LAST-DECLARED MEMBER, LOAD-BEARING (#3261 governance hardening).
+    // Member destruction is reverse-declaration-order, so this pool is
+    // destroyed FIRST when a WebhookStore is torn down - its destructor
+    // joins every worker before db_/mtx_ above are touched, which is what
+    // makes the use-after-free this pool replaces structurally impossible
+    // rather than merely unlikely. See store_worker_pool.hpp.
+    StoreWorkerPool pool_{/*num_threads=*/4, /*max_queue=*/256};
 };
 
 } // namespace yuzu::server

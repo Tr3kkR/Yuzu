@@ -124,6 +124,34 @@ An MCP approval-ticket recall that hits a store fault has always returned `-3260
 
 **What to do:** if you have automation that blindly retries on `-32603` without checking `retry_after_ms`, it now stops retrying sooner in this specific case — which is the correct behavior (the old retries were futile). If your automation already honors `retry_after_ms` per [invariant A5](../agentic-first-principle.md), no change is needed. See [`mcp.md`](mcp.md) "`-32603`: Approval store unavailable" for the full response-body reference.
 
+## Behaviour change: webhook and offload-target deliveries, and enrollment/execution-failure notifications, now actually fire (#3261)
+
+A boot-ordering bug wired `NotificationStore`/`WebhookStore`/`OffloadTargetStore` into
+the agent-service RPC path (`Register`, `Subscribe`, `process_gateway_response`) before
+those three stores were constructed, so the wiring silently never took effect. Dashboard
+notifications for agent enrollment and execution failures, and configured webhook/offload
+deliveries for `agent.registered` and `execution.completed` events, have been dead for
+the life of the process **since the stores were introduced — every tagged release from
+v0.10.0 through v0.13.0 (roughly four months)**. Every use site double-guards
+`ptr && ptr->is_open()` with a silent skip, so nothing logged or alerted; the bug produced
+zero signal. They now fire on every boot.
+
+**What to do:** if you configured a webhook (`POST /api/webhooks`) or an offload target
+(`POST /api/v1/offload-targets`) at any point since v0.10.0 expecting live traffic and saw
+none, that integration has been silently non-functional the entire time, not merely quiet
+— there is no queued backlog to replay, because the events were never generated in the
+first place. If you use one of these integrations as part of your own monitoring or
+compliance evidence chain (a SIEM feed, an alerting pipeline), treat the gap as a
+documented monitoring-coverage lapse for that period, not just a product bug, when
+recording it in your own change or incident log. After upgrading, confirm your receiving
+endpoint still exists and can handle real traffic before you rely on it — deliveries
+start immediately, with no flag or opt-in involved. If your webhook fires to Slack or a
+similar noisy channel for enrollment alerts, note that `agent.registered` fires on every
+gRPC reconnect, not only first enrollment (this is unchanged, documented behaviour — see
+"Webhooks" / "Response Offloading" in [`rest-api.md`](rest-api.md) — but was invisible
+until now); the "Agent Enrolled" **dashboard notification** specifically does not repeat
+on reconnect, so a server restart with N connected agents does not flood that feed.
+
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 
 Audit rows for the MCP progress bridge (`mcp.bridge.done_reap`, `session_dead`, `arming_reaped`, `pin_acked`, `forced_expire`) were previously stamped `result=success` unconditionally, regardless of what actually happened. They now report the real outcome: `result=failure` when a background teardown could not release one of the resources it owns, or when the terminal-frame publish ladder poisoned the session, threw, or was never reached. The `detail` field names which, and no longer asserts a delivery or a poisoning that did not occur.
