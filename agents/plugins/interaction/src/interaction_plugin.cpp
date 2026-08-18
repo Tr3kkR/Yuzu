@@ -18,8 +18,14 @@
  *
  * Input validation: title/message/prompt fields are sanitized to prevent
  * command injection into the osascript/zenity/PowerShell script text these
- * fields are embedded in (run via the bounded argv runner, not a shell
- * string). Only alphanumeric, spaces, and safe punctuation are allowed.
+ * fields are embedded in. Every spawn goes through the bounded argv runner
+ * (yuzu::agent::run_bounded_subprocess); on Windows that runner call is
+ * clean argv end to end (PowerShell is the only interpreter involved), while
+ * on macOS/Linux the runner's own argv is `/bin/sh -c <script>` (a governed
+ * shell exception, ADR-3002 Decision 7 — AppleScript/zenity/notify-send have
+ * no non-shell invocation form) with the sanitized text embedded inside that
+ * single script-string element. Only alphanumeric, spaces, and safe
+ * punctuation are allowed.
  */
 
 #include <yuzu/plugin.hpp>
@@ -148,7 +154,7 @@ std::string run_command(const std::string& cmd) {
     auto res = yuzu::agent::run_bounded_subprocess(
         {"/bin/sh", "-c", cmd},
         yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadline});
-    std::string output = res.output;
+    std::string output = std::move(res.output);
     while (!output.empty() && (output.back() == '\n' || output.back() == '\r')) {
         output.pop_back();
     }
@@ -183,10 +189,10 @@ struct CommandResult {
 };
 
 /**
- * Run a command via popen, capturing both its output and its exit status
- * in one invocation (unlike calling run_command() + run_command_status()
- * separately, which would run an interactive command — e.g. an osascript
- * dialog — twice).
+ * Run a command via the bounded runner, capturing both its output and its
+ * exit status in one invocation (unlike calling run_command() + run_command_
+ * status() separately, which would run an interactive command — e.g. an
+ * osascript dialog — twice).
  *
  * Used on macOS to tell "osascript ran and produced this text" apart from
  * "osascript failed" (non-zero exit, e.g. no reachable GUI session for the
@@ -391,11 +397,11 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
     // keeps a genuine user-cancel (-128) distinct from an undeliverable
     // session.
     //
-    // Documented shell exception (docs/cpp-conventions.md, shell/process
-    // boundaries): this osascript invocation is built via the plugin's
-    // existing popen-based run_command helper rather than argv-style
-    // execution because AppleScript has no non-shell invocation form and
-    // Yuzu has no cross-platform subprocess helper today. safe_msg/
+    // Documented shell exception (ADR-3002 Decision 7): this osascript
+    // invocation goes through the plugin's run_command helper, which spawns
+    // `/bin/sh -c <script>` via the bounded argv runner, rather than
+    // argv-style execution, because AppleScript has no non-shell invocation
+    // form. safe_msg/
     // safe_title are already sanitize()d (unsafe chars replaced with '_',
     // so no shell/AppleScript metacharacter reaches the string); btn_spec
     // and every sentinel/-e fragment are fixed compile-time literals — no
@@ -523,7 +529,7 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
         return decision.rc;
     }
 
-    std::string output = res.output;
+    std::string output = std::move(res.output);
     // Trim trailing whitespace
     while (!output.empty() && (output.back() == '\n' || output.back() == '\r' ||
                                 output.back() == ' ')) {
@@ -812,7 +818,7 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
         return decision.rc;
     }
 
-    std::string output = res.output;
+    std::string output = std::move(res.output);
     // Trim trailing whitespace
     while (!output.empty() && (output.back() == '\n' || output.back() == '\r' ||
                                 output.back() == ' ')) {

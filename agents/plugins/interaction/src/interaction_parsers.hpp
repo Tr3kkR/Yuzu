@@ -1,15 +1,18 @@
 #pragma once
 
 /**
- * interaction_parsers.hpp — pure parse helpers for the interaction plugin's
- * macOS message_box leg: decoding the sentinel-wrapped `osascript` output of a
- * try/on-error `display dialog` into a structured dialog outcome.
+ * interaction_parsers.hpp — pure parse helpers for the interaction plugin:
+ * decoding the sentinel-wrapped `osascript` output of a try/on-error
+ * `display dialog` (macOS message_box) into a structured dialog outcome,
+ * plus the POSIX zenity and Windows PowerShell dialog-capture exit-code/
+ * runner-state classification used by the input/survey legs on every OS.
  *
  * Header-only and OS-free so the parsing is unit-tested on every host
  * (test_interaction_parsers.cpp — the licensing_parsers.hpp pattern); the
- * popen shell-out in interaction_plugin.cpp is the impure shell, and the
- * operator-supplied title/message it interpolates are already run through
- * sanitize() there, so nothing attacker-controlled reaches this parser.
+ * runner-backed shell-out in interaction_plugin.cpp is the impure shell, and
+ * the operator-supplied title/message it interpolates are already run
+ * through sanitize() there, so nothing attacker-controlled reaches this
+ * parser.
  *
  * Honest-status invariant: an `osascript` that could not display the dialog
  * (no Aqua/GUI session on the root LaunchDaemon, a TCC denial, a missing
