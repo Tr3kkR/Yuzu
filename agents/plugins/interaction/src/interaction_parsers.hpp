@@ -110,4 +110,48 @@ inline CaptureDecision classify_input_capture(int exit_code, std::string_view ou
     return {std::format("response|{}", output), 0};
 }
 
+/// Outcome of a POSIX run_command_capture() exit-code classification for the
+/// Linux zenity `--entry`/`--list` captures (input text, survey text/choice).
+/// Unlike macOS's osascript (any nonzero exit is a delivery failure), zenity's
+/// own contract makes a nonzero exit code a REAL domain signal (Cancel/
+/// dismiss = 1, ESC/timeout = 5) -- but run_command_capture's documented -1
+/// sentinel means the tool never produced a real exit status at all (spawn
+/// error, deadline, or signal death; see subprocess_runner.hpp), which must
+/// never be misread as the user clicking Cancel.
+enum class PosixCaptureOutcome { runner_failure, cancelled, real_output };
+
+[[nodiscard]] inline PosixCaptureOutcome classify_posix_capture(int exit_code) {
+    if (exit_code == -1) return PosixCaptureOutcome::runner_failure;
+    if (exit_code != 0) return PosixCaptureOutcome::cancelled;
+    return PosixCaptureOutcome::real_output;
+}
+
+/// The (output line, return code, is_failure) decision for the Windows
+/// input/survey PowerShell dialog legs, extracted here so it is
+/// unit-testable without a subprocess (the classify_input_capture pattern).
+/// Consolidates the three checks these sites must run, in order, before ever
+/// parsing PowerShell's stdout as a real dialog outcome: did the process
+/// launch at all (tool_ran), did it hit the deadline (timed_out), and --
+/// the gap this closes -- did it exit non-zero (a ShowDialog()/InputBox()
+/// exception under a non-interactive session, whose error text never
+/// reaches output since merge_stderr defaults false). Any of the three is a
+/// genuine runner/tool failure, never a fabricated cancel or an
+/// empty-but-"successful" response.
+struct WindowsDialogDecision {
+    std::string output_line;
+    int rc = 0;
+    bool is_failure = false;
+};
+
+[[nodiscard]] inline WindowsDialogDecision classify_windows_dialog_capture(
+    bool tool_ran, bool timed_out, int exit_code) {
+    if (!tool_ran)
+        return {"status|error|failed to launch PowerShell", 1, true};
+    if (timed_out)
+        return {"status|unavailable|PowerShell dialog timed out", 1, true};
+    if (exit_code != 0)
+        return {"status|unavailable|PowerShell dialog exited with an error", 1, true};
+    return {{}, 0, false};
+}
+
 } // namespace yuzu::interaction

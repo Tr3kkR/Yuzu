@@ -118,3 +118,70 @@ TEST_CASE("interaction input/survey capture: exit-code/output decision (qe-L2)",
         CHECK(d2.rc == 0);
     }
 }
+
+TEST_CASE("classify_posix_capture: -1 is a genuine runner failure, "
+          "never a fabricated zenity Cancel",
+          "[interaction][runner_status]") {
+    using yuzu::interaction::classify_posix_capture;
+    using yuzu::interaction::PosixCaptureOutcome;
+
+    // run_command_capture's documented sentinel for spawn error / deadline /
+    // signal death -- the runner never produced a real zenity exit status.
+    CHECK(classify_posix_capture(-1) == PosixCaptureOutcome::runner_failure);
+
+    // zenity's own contract: 1 = Cancel/dismiss, 5 = ESC/timeout -- both are
+    // real user outcomes, not runner failures.
+    CHECK(classify_posix_capture(1) == PosixCaptureOutcome::cancelled);
+    CHECK(classify_posix_capture(5) == PosixCaptureOutcome::cancelled);
+
+    // A clean exit is genuine output the caller should parse.
+    CHECK(classify_posix_capture(0) == PosixCaptureOutcome::real_output);
+}
+
+TEST_CASE("classify_windows_dialog_capture: every runner-failure branch is "
+          "honest, never a fabricated cancel or completed survey",
+          "[interaction][runner_status]") {
+    using yuzu::interaction::classify_windows_dialog_capture;
+
+    SECTION("the process never launched") {
+        auto d = classify_windows_dialog_capture(/*tool_ran=*/false,
+                                                  /*timed_out=*/false,
+                                                  /*exit_code=*/0);
+        CHECK(d.is_failure);
+        CHECK(d.output_line == "status|error|failed to launch PowerShell");
+        CHECK(d.rc == 1);
+    }
+
+    SECTION("a killed-at-deadline dialog is never a fabricated cancel") {
+        auto d = classify_windows_dialog_capture(/*tool_ran=*/true,
+                                                  /*timed_out=*/true,
+                                                  /*exit_code=*/0);
+        CHECK(d.is_failure);
+        CHECK(d.output_line == "status|unavailable|PowerShell dialog timed out");
+        CHECK(d.rc == 1);
+        // timed_out is checked even when the killed process happens to report
+        // a nonzero exit code -- it must never fall through to the exit_code
+        // branch's different message.
+        auto d2 = classify_windows_dialog_capture(true, true, 1);
+        CHECK(d2.output_line == "status|unavailable|PowerShell dialog timed out");
+    }
+
+    SECTION("a ran-but-nonzero-exit dialog (e.g. ShowDialog() threw) is "
+            "never a fabricated cancel or empty-but-successful response") {
+        auto d = classify_windows_dialog_capture(/*tool_ran=*/true,
+                                                  /*timed_out=*/false,
+                                                  /*exit_code=*/1);
+        CHECK(d.is_failure);
+        CHECK(d.output_line == "status|unavailable|PowerShell dialog exited with an error");
+        CHECK(d.rc == 1);
+    }
+
+    SECTION("a real, clean-exit dialog is not a failure -- caller parses output") {
+        auto d = classify_windows_dialog_capture(/*tool_ran=*/true,
+                                                  /*timed_out=*/false,
+                                                  /*exit_code=*/0);
+        CHECK_FALSE(d.is_failure);
+        CHECK(d.output_line.empty());
+        CHECK(d.rc == 0);
+    }
+}

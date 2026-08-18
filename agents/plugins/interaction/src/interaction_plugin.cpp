@@ -46,8 +46,10 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result seam)
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002)
 #else
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure (ABI4 result seam)
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (arch-L1)
 #endif
 
@@ -172,6 +174,12 @@ int run_command_status(const std::string& cmd) {
 struct CommandResult {
     std::string output;
     int exit_code = -1;
+    // Full runner result, kept alongside output/exit_code so a caller can
+    // forward a genuine runner-level failure (spawn error/deadline/cancel/
+    // signal death) through the ABI4 result seam (runner_status.hpp) before
+    // ever trusting exit_code/output as a real dialog outcome -- see
+    // classify_posix_capture in interaction_parsers.hpp.
+    yuzu::agent::SubprocessResult res;
 };
 
 /**
@@ -200,6 +208,7 @@ CommandResult run_command_capture(const std::string& cmd) {
            (result.output.back() == '\n' || result.output.back() == '\r')) {
         result.output.pop_back();
     }
+    result.res = std::move(res);
     return result;
 }
 #endif // !_WIN32
@@ -493,19 +502,25 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
     auto res = yuzu::agent::run_bounded_subprocess(
         {ps_path, "-NoProfile", "-NonInteractive", "-Command", ps_script},
         yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadlineWin});
-    if (!res.tool_ran) {
-        ctx.write_output("status|error|failed to launch PowerShell");
-        return 1;
-    }
-    // A killed-at-deadline dialog can still have tool_ran=true with empty or
-    // partial output (subprocess_runner.hpp's documented contract) -- without
-    // this check, empty output falls through to the "cancelled" branch below
-    // and silently misreports a timeout as a user cancel. Report it honestly
-    // instead, matching classify_input_capture's macOS/Linux contract (a
-    // delivery failure is never silently reinterpreted as a real outcome).
-    if (res.timed_out) {
-        ctx.write_output("status|unavailable|PowerShell dialog timed out");
-        return 1;
+
+    // Consolidated runner-failure/exit-code decision (classify_windows_dialog_
+    // capture, unit-tested): a killed-at-deadline dialog can still have
+    // tool_ran=true with empty or partial output (subprocess_runner.hpp's
+    // documented contract) -- without the timed_out check, empty output falls
+    // through to the "cancelled" branch below and silently misreports a
+    // timeout as a user cancel. The exit_code check closes the remaining gap:
+    // a ShowDialog()/InputBox() exception under a non-interactive session
+    // exits nonzero with empty output (its error text never reaches `output`
+    // -- merge_stderr defaults false), which previously fell through to
+    // "cancelled|true" as a fabricated user outcome. None of these three
+    // cases may be reinterpreted as a real dialog response, matching
+    // classify_input_capture's macOS/Linux contract.
+    auto decision = yuzu::interaction::classify_windows_dialog_capture(
+        res.tool_ran, res.timed_out, res.exit_code);
+    if (decision.is_failure) {
+        yuzu::agent::forward_runner_failure(ctx, res);
+        ctx.write_output(decision.output_line);
+        return decision.rc;
     }
 
     std::string output = res.output;
@@ -573,10 +588,21 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
 
     auto result = run_command_capture(cmd);
 
-    if (result.exit_code != 0) {
+    switch (yuzu::interaction::classify_posix_capture(result.exit_code)) {
+    case yuzu::interaction::PosixCaptureOutcome::runner_failure:
+        // exit_code == -1: the runner itself never produced a real zenity
+        // exit status (spawn error, deadline, or signal death) -- report it
+        // honestly instead of misreading it as the user clicking Cancel.
+        yuzu::agent::forward_runner_failure(ctx, result.res);
+        ctx.write_output("status|unavailable|zenity dialog failed to complete");
+        return 1;
+    case yuzu::interaction::PosixCaptureOutcome::cancelled:
+        // zenity's own contract: a real nonzero exit here is Cancel/dismiss.
         ctx.write_output("cancelled|true");
-    } else {
+        break;
+    case yuzu::interaction::PosixCaptureOutcome::real_output:
         ctx.write_output(std::format("response|{}", result.output));
+        break;
     }
     return 0;
 }
@@ -766,19 +792,24 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
     auto res = yuzu::agent::run_bounded_subprocess(
         {ps_path, "-NoProfile", "-NonInteractive", "-Command", ps},
         yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadlineWin});
-    if (!res.tool_ran) {
-        ctx.write_output("status|error|failed to launch PowerShell");
-        return 1;
-    }
-    // A killed-at-deadline dialog can still have tool_ran=true with empty or
-    // partial output (subprocess_runner.hpp's documented contract). Without
-    // this check, empty output falls through to the answer-parse loop below
-    // and reports "cancelled|false" + "question_count|N" with zero answer_
-    // lines -- reading to a caller as "survey completed, nothing answered"
-    // rather than the honest truth: the dialog never delivered a result.
-    if (res.timed_out) {
-        ctx.write_output("status|unavailable|PowerShell dialog timed out");
-        return 1;
+
+    // Consolidated runner-failure/exit-code decision (classify_windows_dialog_
+    // capture, unit-tested): a killed-at-deadline dialog can still have
+    // tool_ran=true with empty or partial output (subprocess_runner.hpp's
+    // documented contract). Without the timed_out check, empty output falls
+    // through to the answer-parse loop below and reports "cancelled|false" +
+    // "question_count|N" with zero answer_ lines -- reading to a caller as
+    // "survey completed, nothing answered" rather than the honest truth that
+    // the dialog never delivered a result. The exit_code check closes the
+    // remaining gap: a WinForms exception under a non-interactive session
+    // (tool_ran=true, not timed out, nonzero exit, empty output) previously
+    // hit that same fabricated-completion branch.
+    auto decision = yuzu::interaction::classify_windows_dialog_capture(
+        res.tool_ran, res.timed_out, res.exit_code);
+    if (decision.is_failure) {
+        yuzu::agent::forward_runner_failure(ctx, res);
+        ctx.write_output(decision.output_line);
+        return decision.rc;
     }
 
     std::string output = res.output;
@@ -968,11 +999,18 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                 safe_title, safe_prompt, items);
             auto result = run_command_capture(cmd);
 
-            if (result.exit_code != 0) {
+            switch (yuzu::interaction::classify_posix_capture(result.exit_code)) {
+            case yuzu::interaction::PosixCaptureOutcome::runner_failure:
+                yuzu::agent::forward_runner_failure(ctx, result.res);
+                ctx.write_output("status|unavailable|zenity dialog failed to complete");
+                return 1;
+            case yuzu::interaction::PosixCaptureOutcome::cancelled:
                 ctx.write_output("cancelled|true");
                 return 0;
+            case yuzu::interaction::PosixCaptureOutcome::real_output:
+                ctx.write_output(std::format("answer_{}|{}", i, result.output));
+                break;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, result.output));
 
         } else {
             // text entry
@@ -985,11 +1023,18 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                 safe_title, safe_prompt);
             auto result = run_command_capture(cmd);
 
-            if (result.exit_code != 0) {
+            switch (yuzu::interaction::classify_posix_capture(result.exit_code)) {
+            case yuzu::interaction::PosixCaptureOutcome::runner_failure:
+                yuzu::agent::forward_runner_failure(ctx, result.res);
+                ctx.write_output("status|unavailable|zenity dialog failed to complete");
+                return 1;
+            case yuzu::interaction::PosixCaptureOutcome::cancelled:
                 ctx.write_output("cancelled|true");
                 return 0;
+            case yuzu::interaction::PosixCaptureOutcome::real_output:
+                ctx.write_output(std::format("answer_{}|{}", i, result.output));
+                break;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, result.output));
         }
     }
     ctx.write_output(std::format("question_count|{}", questions.size()));
