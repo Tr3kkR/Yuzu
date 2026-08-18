@@ -25,6 +25,7 @@
  */
 
 #include <yuzu/plugin.hpp>
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field (governance Gate 2)
 
 #include <algorithm>
 #include <array>
@@ -614,14 +615,40 @@ private:
 
         // Step 4: Output results
         int found = 0;
+        bool hostname_scan_timed_out = false;
         for (const auto& ip : alive_ips) {
             std::string mac = ip_to_mac.count(ip) ? ip_to_mac[ip] : "unknown";
-            std::string hostname = resolve_hostname(ip);
+            // The same kScanTimeoutSeconds budget that bounds the probe loop
+            // above must also bound this loop: reverse-DNS has no per-call
+            // timeout of its own, and up to |alive_ips| lookups against a
+            // slow/unreachable resolver could otherwise run far past the
+            // action's documented 300s bound (governance Gate 2 finding).
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - scan_start).count();
+            if (elapsed >= kScanTimeoutSeconds) {
+                hostname_scan_timed_out = true;
+                break;
+            }
+            // hostname is a reverse-DNS PTR result -- attacker-influenceable
+            // (the responding host/DNS infra controls it), unlike `ip`/`mac`
+            // which come from inet_ntop/fixed-hex formatters. safe_output_field
+            // it so a crafted PTR record containing '|' or CR/LF can't inject
+            // an extra column or forge an extra output row (same class as the
+            // sibling users/certificates plugins' output-escaping fixes this
+            // session; governance Gate 2 finding).
+            std::string hostname = yuzu::util::safe_output_field(resolve_hostname(ip));
             if (hostname.empty()) hostname = "unknown";
             // managed status is always "unknown" from the agent side —
             // the server will correlate with known agent IPs
             ctx.write_output(std::format("host|{}|{}|{}|unknown", ip, mac, hostname));
             ++found;
+        }
+        if (hostname_scan_timed_out && !timed_out) {
+            const auto t = yuzu::discovery::timeout_degrade();
+            ctx.set_result_status(t.status, t.completeness, t.reason);
+            ctx.write_output(std::format(
+                "status|warning|hostname resolution timed out after {}s, {} of {} alive hosts "
+                "resolved", kScanTimeoutSeconds, found, static_cast<int>(alive_ips.size())));
         }
 
         ctx.write_output(std::format("scan_complete|{}|{}", found, total));
