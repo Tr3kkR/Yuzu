@@ -30,6 +30,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #ifdef _WIN32
@@ -241,13 +242,16 @@ int do_installed(yuzu::CommandContext& ctx) {
     // stop_after_max_lines=true is the in-process equivalent).
     auto rpm = run_tool({"/usr/bin/rpm", "-qa", "--last"}, 50);
     if (!rpm.lines.empty()) {
+        // Forward rpm's own outcome (e.g. the 50-line cap truncating a
+        // longer install history) even though it returned data.
+        yuzu::agent::forward_runner_failure(ctx, rpm.res);
         for (const auto& line : yuzu::windows_updates::parse_rpm_last(rpm.lines)) {
             ctx.write_output(line);
         }
     } else {
         auto apt = run_tool({"/usr/bin/apt", "list", "--installed"}, 50);
+        yuzu::agent::forward_runner_failure(ctx, apt.res);
         if (apt.lines.empty()) {
-            yuzu::agent::forward_runner_failure(ctx, apt.res);
             ctx.write_output("package|none|No packages found");
             return 0;
         }
@@ -264,8 +268,10 @@ int do_installed(yuzu::CommandContext& ctx) {
     // enforced by the pure parser, matching the old pipeline's semantics
     // (head -100 acted on the already-grepped stream, not the raw one).
     auto sp = run_tool({"/usr/sbin/system_profiler", "SPInstallHistoryDataType"}, 2000);
+    // Forward sp's outcome before branching on its output -- a deadline-cut
+    // run can still have produced some (incomplete) rows.
+    yuzu::agent::forward_runner_failure(ctx, sp.res);
     if (sp.lines.empty()) {
-        yuzu::agent::forward_runner_failure(ctx, sp.res);
         ctx.write_output("update|none|No update history found");
         return 0;
     }
@@ -376,10 +382,25 @@ int do_missing(yuzu::CommandContext& ctx) {
     }
 
     if (!completed) {
-        // Deliberate bounded stop, not a crash/hang: abort the job and clean
-        // up its resources before reporting an honest CONSTRAINED/PARTIAL.
+        // Deliberate bounded stop, not a crash/hang -- but ISearchJob::
+        // CleanUp() is documented to block until the async operation has
+        // actually finished, so calling it inline here would just move the
+        // unbounded wait from Search() to CleanUp(), defeating the point of
+        // this whole bounded-poll design. Request the abort, then hand the
+        // job off (via an extra COM ref, not a move -- ComPtr is neither
+        // copyable nor movable) to a detached thread that blocks in
+        // CleanUp() on its own time; this call returns the honest
+        // CONSTRAINED result immediately either way. Known limitation: this
+        // thread isn't tracked or joined at plugin shutdown -- acceptable
+        // for a short-lived best-effort cleanup after an already-120s-late
+        // abort, not a resource anyone waits on.
         job->RequestAbort();
-        job->CleanUp();
+        ISearchJob* raw_job = job.get();
+        raw_job->AddRef();
+        std::thread([raw_job]() {
+            raw_job->CleanUp();
+            raw_job->Release();
+        }).detach();
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "windows_updates:search_deadline_exceeded");
         ctx.write_output("available|none|Update search did not complete within the time budget");
@@ -397,8 +418,17 @@ int do_missing(yuzu::CommandContext& ctx) {
     }
 
     OperationResultCode result_code = orcNotStarted;
-    if (SUCCEEDED(result->get_ResultCode(&result_code)) &&
-        (result_code == orcFailed || result_code == orcAborted)) {
+    hr = result->get_ResultCode(&result_code);
+    if (FAILED(hr)) {
+        // An accessor failure here is not "no result" -- it means we don't
+        // actually know whether the search succeeded. Fail closed rather
+        // than falling through to the success path below.
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows_updates:get_result_code_failed");
+        ctx.write_output("available|none|Failed to read update-search status");
+        return 0;
+    }
+    if (result_code == orcFailed || result_code == orcAborted) {
         // Never report a failed/aborted search as "no updates" -- that would
         // be false assurance, not an honest empty result.
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
@@ -417,30 +447,42 @@ int do_missing(yuzu::CommandContext& ctx) {
     }
 
     LONG count = 0;
-    updates->get_Count(&count);
+    if (FAILED(updates->get_Count(&count))) {
+        // Same reasoning as get_ResultCode above -- an unreadable count is
+        // not zero updates, it's an unknown count.
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "windows_updates:get_update_count_failed");
+        ctx.write_output("available|none|Failed to count search results");
+        return 0;
+    }
 
     std::vector<yuzu::windows_updates::UpdateRow> rows;
     rows.reserve(count > 0 ? static_cast<size_t>(count) : 0);
+    bool item_read_failed = false;
     for (LONG i = 0; i < count; ++i) {
         ComPtr<IUpdate> update;
-        if (FAILED(updates->get_Item(i, update.put())) || !update)
+        if (FAILED(updates->get_Item(i, update.put())) || !update) {
+            // Don't silently drop it -- a skipped item means the collection
+            // we're about to report is incomplete, not exhaustive.
+            item_read_failed = true;
             continue;
+        }
 
         yuzu::windows_updates::UpdateRow row;
         BSTR title_bstr = nullptr;
         if (SUCCEEDED(update->get_Title(&title_bstr)) && title_bstr) {
-            row.title = from_wide(title_bstr);
+            row.title = yuzu::win::from_wide(title_bstr);
             SysFreeString(title_bstr);
         }
         BSTR severity_bstr = nullptr;
         if (SUCCEEDED(update->get_MsrcSeverity(&severity_bstr)) && severity_bstr) {
-            row.msrc_severity = from_wide(severity_bstr);
+            row.msrc_severity = yuzu::win::from_wide(severity_bstr);
             SysFreeString(severity_bstr);
         }
         rows.push_back(std::move(row));
     }
 
-    if (result_code == orcSucceededWithErrors) {
+    if (result_code == orcSucceededWithErrors || item_read_failed) {
         ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "windows_updates:search_result_partial");
     }
@@ -457,10 +499,23 @@ int do_missing(yuzu::CommandContext& ctx) {
 #elif defined(__linux__)
     auto apt = run_tool({"/usr/bin/apt", "list", "--upgradable"});
     auto avail = yuzu::windows_updates::parse_apt_upgradable(apt.lines);
+    // apt genuinely finding nothing to upgrade (a clean exit, not a spawn/
+    // deadline/timeout degradation) is real "up to date" data, not evidence
+    // that apt is unavailable -- don't fall through to yum on it, and don't
+    // let a subsequent yum spawn failure overwrite that honest result.
+    const bool apt_complete = apt.res.tool_ran &&
+                              apt.res.termination_reason == yuzu::agent::TerminationReason::exited &&
+                              apt.res.exit_code == 0;
     if (!avail.empty()) {
+        // Forward apt's own outcome (e.g. a line_limit truncation) even
+        // though it returned data -- non-empty output does not mean the
+        // acquisition was complete.
+        yuzu::agent::forward_runner_failure(ctx, apt.res);
         for (const auto& line : avail) {
             ctx.write_output(line);
         }
+    } else if (apt_complete) {
+        ctx.write_output("available|none|System is up to date");
     } else {
         auto yum = run_tool({"/usr/bin/yum", "check-update"});
         auto yum_lines = yuzu::windows_updates::parse_yum_checkupdate(yum.lines);
@@ -473,6 +528,7 @@ int do_missing(yuzu::CommandContext& ctx) {
             yuzu::agent::forward_runner_failure(ctx, yum.res);
             ctx.write_output("available|none|System is up to date");
         } else {
+            yuzu::agent::forward_runner_failure(ctx, yum.res);
             for (const auto& line : yum_lines) {
                 ctx.write_output(line);
             }
@@ -481,8 +537,10 @@ int do_missing(yuzu::CommandContext& ctx) {
 
 #elif defined(__APPLE__)
     auto su = run_tool({"/usr/sbin/softwareupdate", "-l"});
+    // Forward su's outcome before branching on its output -- a truncated or
+    // deadline-cut run can still have produced some lines.
+    yuzu::agent::forward_runner_failure(ctx, su.res);
     if (su.lines.empty()) {
-        yuzu::agent::forward_runner_failure(ctx, su.res);
         ctx.write_output("available|none|No updates available");
         return 0;
     }

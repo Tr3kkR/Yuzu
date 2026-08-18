@@ -377,7 +377,12 @@ int do_site(yuzu::CommandContext& ctx) {
         // `(New-Object -ComObject Microsoft.SMS.Client).GetAssignedSite()`.
         auto r = sms_client_call(L"GetAssignedSite");
         if (r.outcome == SmsInvokeOutcome::ok) {
-            ctx.write_output(std::format("site_code|{}", r.value));
+            // Store it, not just print it -- the authority-subkey selection
+            // below needs the real site code, not the still-empty registry
+            // lookup's value (was silently discarded, so selection always
+            // fell back to whichever SMS:* subkey enumerated first).
+            site_code = std::move(r.value);
+            ctx.write_output(std::format("site_code|{}", site_code));
         } else {
             ctx.write_output("site_code|not_configured");
         }
