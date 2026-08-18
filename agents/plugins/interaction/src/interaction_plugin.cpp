@@ -26,10 +26,8 @@
 #include "interaction_parsers.hpp"
 
 #include <algorithm>
-#include <array>
 #include <charconv>
 #include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <format>
 #include <sstream>
@@ -47,6 +45,7 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path (ADR-3002)
 #else
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (arch-L1)
 #endif
@@ -112,6 +111,21 @@ bool require_param(yuzu::CommandContext& ctx, std::string_view value,
     }
     return true;
 }
+
+#if defined(_WIN32)
+// Same generous per-call wall-clock bound as kInteractionCmdDeadline below,
+// for the two PowerShell dialog sites (input/survey). These are interactive
+// (InputBox / WinForms) and can legitimately block on a user, so this is
+// deliberately long — it only fires on a genuinely wedged invocation.
+constexpr std::chrono::seconds kInteractionCmdDeadlineWin{120};
+
+// The stable, well-known location of Windows PowerShell 5.1 -- the only
+// candidate probed (ADR-3002 "tool path probing"): probe_tool_path()
+// verifies it exists and is executable at call time rather than assuming a
+// hardcoded path is safe to exec unchecked.
+constexpr const char* kPowerShellPath =
+    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe";
+#endif
 
 #if !defined(_WIN32)
 // A generous per-call wall-clock bound for the interaction shell-outs. osascript
@@ -462,21 +476,26 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
         "else {{ Write-Output $result }}",
         safe_prompt, safe_title, safe_default);
 
-    std::string cmd = "powershell.exe -NoProfile -NonInteractive -Command \"" + ps_script + "\"";
-
-    std::string output;
-    FILE* pipe = _popen(cmd.c_str(), "r");
-    if (!pipe) {
+    // interaction/input_windows#1 -- clean argv via the bounded runner instead
+    // of a raw _popen shell string; the script text itself remains a single
+    // argv element PowerShell interprets (ADR-3002 Decision 5: the outer
+    // invocation is now argv-clean, but the deepest interpreter intentionally
+    // invoked -- PowerShell -- still sets the rung, rung 3, same as before).
+    auto ps_path = yuzu::agent::probe_tool_path({kPowerShellPath});
+    if (ps_path.empty()) {
         ctx.write_output("status|error|failed to launch PowerShell");
         return 1;
     }
 
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
-        output += buf.data();
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {ps_path, "-NoProfile", "-NonInteractive", "-Command", ps_script},
+        yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadlineWin});
+    if (!res.tool_ran) {
+        ctx.write_output("status|error|failed to launch PowerShell");
+        return 1;
     }
-    _pclose(pipe);
 
+    std::string output = res.output;
     // Trim trailing whitespace
     while (!output.empty() && (output.back() == '\n' || output.back() == '\r' ||
                                 output.back() == ' ')) {
@@ -531,35 +550,20 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
     std::string safe_prompt = sanitize(prompt);
     std::string safe_default = sanitize(default_value);
 
-    // Capture output and exit code in a single invocation using a
-    // shell wrapper that appends the exit status on a separate line.
+    // run_command_capture already returns the real exit code from the same
+    // round trip (SubprocessResult::exit_code) -- no need for the vestigial
+    // nested-shell `; echo __RC=$?` trick this used to smuggle it through
+    // captured stdout.
     std::string cmd = std::format(
-        "sh -c 'OUT=$(zenity --entry --title='\"'\"'{}'\"'\"' "
-        "--text='\"'\"'{}'\"'\"' --entry-text='\"'\"'{}'\"'\"' 2>/dev/null); "
-        "RC=$?; echo \"$OUT\"; echo \"__RC=$RC\"'",
+        "zenity --entry --title='{}' --text='{}' --entry-text='{}' 2>/dev/null",
         safe_title, safe_prompt, safe_default);
 
-    std::string output = run_command(cmd);
+    auto result = run_command_capture(cmd);
 
-    // Parse the exit code from the last line
-    int rc = 1;
-    std::string user_text;
-    auto rc_pos = output.rfind("__RC=");
-    if (rc_pos != std::string::npos) {
-        auto rc_str = output.substr(rc_pos + 5);
-        std::from_chars(rc_str.data(), rc_str.data() + rc_str.size(), rc);
-        user_text = output.substr(0, rc_pos);
-        // Trim trailing newline from user text
-        while (!user_text.empty() &&
-               (user_text.back() == '\n' || user_text.back() == '\r')) {
-            user_text.pop_back();
-        }
-    }
-
-    if (rc != 0) {
+    if (result.exit_code != 0) {
         ctx.write_output("cancelled|true");
     } else {
-        ctx.write_output(std::format("response|{}", user_text));
+        ctx.write_output(std::format("response|{}", result.output));
     }
     return 0;
 }
@@ -734,21 +738,27 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
     ps += "  } else { Write-Output $c.Text } ";
     ps += "} ";
 
-    std::string cmd = "powershell.exe -NoProfile -NonInteractive -Command \"" + ps + "\"";
-
-    std::string output;
-    FILE* pipe = _popen(cmd.c_str(), "r");
-    if (!pipe) {
+    // interaction/survey_windows#1 -- clean argv via the bounded runner
+    // instead of a raw _popen shell string; the script text itself remains a
+    // single argv element PowerShell interprets (ADR-3002 Decision 5: the
+    // outer invocation is now argv-clean, but the deepest interpreter
+    // intentionally invoked -- PowerShell -- still sets the rung, rung 3,
+    // same as before).
+    auto ps_path = yuzu::agent::probe_tool_path({kPowerShellPath});
+    if (ps_path.empty()) {
         ctx.write_output("status|error|failed to launch PowerShell");
         return 1;
     }
 
-    std::array<char, 256> buf{};
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe) != nullptr) {
-        output += buf.data();
+    auto res = yuzu::agent::run_bounded_subprocess(
+        {ps_path, "-NoProfile", "-NonInteractive", "-Command", ps},
+        yuzu::agent::SubprocessOptions{.deadline = kInteractionCmdDeadlineWin});
+    if (!res.tool_ran) {
+        ctx.write_output("status|error|failed to launch PowerShell");
+        return 1;
     }
-    _pclose(pipe);
 
+    std::string output = res.output;
     // Trim trailing whitespace
     while (!output.empty() && (output.back() == '\n' || output.back() == '\r' ||
                                 output.back() == ' ')) {
@@ -926,54 +936,37 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
             for (const auto& ch : q.choices) {
                 items += " '" + sanitize(ch) + "'";
             }
+            // run_command_capture already returns the real exit code from
+            // the same round trip -- no need for the vestigial nested-shell
+            // `; echo __RC=$?` trick this used to smuggle it through
+            // captured stdout.
             std::string cmd = std::format(
-                "sh -c 'OUT=$(zenity --list --title='\"'\"'{}'\"'\"' "
-                "--text='\"'\"'{}'\"'\"' --column=Option{} 2>/dev/null); "
-                "RC=$?; echo \"$OUT\"; echo \"__RC=$RC\"'",
+                "zenity --list --title='{}' --text='{}' --column=Option{} 2>/dev/null",
                 safe_title, safe_prompt, items);
-            std::string output = run_command(cmd);
+            auto result = run_command_capture(cmd);
 
-            int rc = 1;
-            std::string chosen;
-            auto rc_pos = output.rfind("__RC=");
-            if (rc_pos != std::string::npos) {
-                auto rc_str = output.substr(rc_pos + 5);
-                std::from_chars(rc_str.data(), rc_str.data() + rc_str.size(), rc);
-                chosen = output.substr(0, rc_pos);
-                while (!chosen.empty() && (chosen.back() == '\n' || chosen.back() == '\r'))
-                    chosen.pop_back();
-            }
-            if (rc != 0) {
+            if (result.exit_code != 0) {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, chosen));
+            ctx.write_output(std::format("answer_{}|{}", i, result.output));
 
         } else {
             // text entry
+            // run_command_capture already returns the real exit code from
+            // the same round trip -- no need for the vestigial nested-shell
+            // `; echo __RC=$?` trick this used to smuggle it through
+            // captured stdout.
             std::string cmd = std::format(
-                "sh -c 'OUT=$(zenity --entry --title='\"'\"'{}'\"'\"' "
-                "--text='\"'\"'{}'\"'\"' 2>/dev/null); "
-                "RC=$?; echo \"$OUT\"; echo \"__RC=$RC\"'",
+                "zenity --entry --title='{}' --text='{}' 2>/dev/null",
                 safe_title, safe_prompt);
-            std::string output = run_command(cmd);
+            auto result = run_command_capture(cmd);
 
-            int rc = 1;
-            std::string user_text;
-            auto rc_pos = output.rfind("__RC=");
-            if (rc_pos != std::string::npos) {
-                auto rc_str = output.substr(rc_pos + 5);
-                std::from_chars(rc_str.data(), rc_str.data() + rc_str.size(), rc);
-                user_text = output.substr(0, rc_pos);
-                while (!user_text.empty() &&
-                       (user_text.back() == '\n' || user_text.back() == '\r'))
-                    user_text.pop_back();
-            }
-            if (rc != 0) {
+            if (result.exit_code != 0) {
                 ctx.write_output("cancelled|true");
                 return 0;
             }
-            ctx.write_output(std::format("answer_{}|{}", i, user_text));
+            ctx.write_output(std::format("answer_{}|{}", i, result.output));
         }
     }
     ctx.write_output(std::format("question_count|{}", questions.size()));
@@ -1000,8 +993,12 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& /*title*/,
 // code explicitly detects and reports that ("no reachable GUI session" /
 // "not_reachable"), so those 4 legs are CONSTRAINED rather than SUPPORTED.
 // windows: notify/message_box are native Win32 (Shell_NotifyIconW /
-// MessageBoxW, rung 1); input/survey spawn powershell.exe via _popen
-// (rung 3 -- an interpreter payload, same principle as osascript).
+// MessageBoxW, rung 1); input/survey spawn powershell.exe via
+// run_bounded_subprocess with clean argv (rung 3 -- an interpreter payload,
+// same principle as osascript; ADR-3002 Decision 5 -- the outer invocation
+// is argv-clean, but PowerShell interpreting its own -Command script is
+// still the deepest interpreter intentionally invoked, so the rung is
+// unchanged from the prior popen-based mechanism).
 // set_dnd is a pure in-process KV-store write on every OS (rung 1).
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"notify",
