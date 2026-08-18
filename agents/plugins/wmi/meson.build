@@ -5,9 +5,9 @@ endif
 
 shared_library(
   'wmi',
-  files('src/wmi_plugin.cpp'),
+  files('src/wmi_plugin.cpp', '../../shared/wmi_bounded.cpp'),
   name_prefix: '',
-  include_directories: include_directories('../../shared'),  # win_str.hpp (#1681)
+  include_directories: include_directories('../../shared'),  # win_str.hpp (#1681) + wmi_bounded.hpp / win_com.hpp
   dependencies: wmi_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',
