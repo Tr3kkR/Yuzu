@@ -23,7 +23,7 @@
 /// type (`rbac_store.cpp:292-339`), `operation` reuses only a
 /// `seed_defaults()`-seeded op (`rbac_store.cpp:380`), and every
 /// `risk_tier >= min_risk_tier_for(operation)` (`authz_model.hpp`).
-/// `system_reserved` is `false` on every row below — none of these 41 rows
+/// `system_reserved` is `false` on every row below — none of these 42 rows
 /// is a server-self-issued dispatch.
 ///
 /// FOUR of the six plugins the originating spec called out as carrying
@@ -50,7 +50,7 @@ using yuzu::server::DispatchClass;
 using yuzu::server::Mutability;
 namespace authz = yuzu::server::authz;
 
-inline constexpr std::array<CommandCapability, 41> kPluginActionCatalogueD{{
+inline constexpr std::array<CommandCapability, 42> kPluginActionCatalogueD{{
     // ── tags (agents/plugins/tags/src/tags_plugin.cpp) ──────────────────────
     // Local <data_dir>/tags.json store; no server round-trip. All 7 actions
     // from the plugin's actions() table, in order.
@@ -437,6 +437,19 @@ inline constexpr std::array<CommandCapability, 41> kPluginActionCatalogueD{{
         .securable = "Security",
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
+    },
+    // av_exclusions: Windows-only, reads Defender's exclusion registry keys
+    // (paths/processes/extensions an operator has told Defender to skip).
+    // Above the products/status floor: this list is itself a map of where
+    // AV coverage has gaps, which is more sensitive than "is AV present".
+    {
+        .plugin = "antivirus",
+        .action = "av_exclusions",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Security",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Medium,
     },
 
     // ── bitlocker (agents/plugins/bitlocker/src/bitlocker_plugin.cpp) ──────
