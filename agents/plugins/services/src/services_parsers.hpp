@@ -20,8 +20,12 @@
  */
 #pragma once
 
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::classify_runner_failure
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::SubprocessResult
+
 #include <cctype>
 #include <cstddef>
+#include <format>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -215,6 +219,54 @@ inline LaunchdListResult parse_launchctl_list(std::string_view output, bool runn
     }
 
     return result;
+}
+
+// ── set_start_mode call-site decision ────────────────────────────────────
+
+/// Outcome of a `set_start_mode` mutation call (systemctl enable/disable/
+/// mask on Linux, launchctl enable/disable on macOS), decided from the raw
+/// SubprocessResult -- the exact logic do_set_start_mode_linux/_macos apply
+/// after run_command() returns, extracted here so it is fixture-testable
+/// without a live systemctl/launchctl/sudo dependency (services_plugin.cpp
+/// keeps the actual run_bounded_subprocess call; only this decision moves).
+struct SetStartModeOutcome {
+    bool ok{false};
+    // True iff the runner itself never produced a real exit (spawn error /
+    // deadline / cancelled / signaled) -- the caller must forward this
+    // through the ABI4 result-status seam (yuzu::agent::forward_runner_
+    // failure) BEFORE emitting `message` below, so the operator sees a
+    // distinguishable CONSTRAINED/UNAVAILABLE status rather than a bare
+    // "exit=-1".
+    bool runner_failed{false};
+    // Populated only when !ok -- ready to hand straight to write_output().
+    // Empty when ok (the caller emits its own status|ok/service|/mode|
+    // rows).
+    std::string message;
+};
+
+/// tool_label names the failing tool in the emitted error string
+/// ("systemctl" or "launchctl"). `res.output` (captured via merge_stderr,
+/// see run_command in services_plugin.cpp) is threaded into the message so
+/// a sudo denial ("sudo: a password is required") is diagnosable instead of
+/// discarded.
+inline SetStartModeOutcome decide_set_start_mode_outcome(
+    std::string_view tool_label, std::string_view name,
+    const yuzu::agent::SubprocessResult& res) {
+    if (yuzu::agent::classify_runner_failure(res).has_value()) {
+        return SetStartModeOutcome{
+            /*ok=*/false, /*runner_failed=*/true,
+            std::format("error|{} command failed for '{}' (runner did not complete)", tool_label,
+                        name)};
+    }
+    if (!res.tool_ran || res.exit_code != 0) {
+        const std::string detail = res.output.empty() ? std::string{}
+                                                       : std::format(": {}", res.output);
+        return SetStartModeOutcome{
+            /*ok=*/false, /*runner_failed=*/false,
+            std::format("error|{} command failed for '{}' (exit={}){}", tool_label, name,
+                        res.tool_ran ? res.exit_code : -1, detail)};
+    }
+    return SetStartModeOutcome{/*ok=*/true, /*runner_failed=*/false, {}};
 }
 
 } // namespace yuzu::services

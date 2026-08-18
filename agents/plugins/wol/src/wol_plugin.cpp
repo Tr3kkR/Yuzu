@@ -24,11 +24,6 @@
 
 #include <yuzu/plugin.hpp>
 
-#include "wol_check_plan.hpp"
-
-#include <host_arg.hpp>
-#include <icmp_probe.hpp>
-
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -37,6 +32,11 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#include <host_arg.hpp>
+#include <icmp_probe.hpp>
+
+#include "wol_check_plan.hpp"
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN

@@ -17,7 +17,7 @@
 using namespace yuzu::wol;
 
 TEST_CASE("classify_check: an ICMP echo reply is reachable via icmp",
-          "[agent][wol][wol_check_plan]") {
+          "[wol][wol_check_plan]") {
     ProbeOutcome o;
     o.icmp_resolved = true;
     o.icmp_session_ok = true;
@@ -31,7 +31,7 @@ TEST_CASE("classify_check: an ICMP echo reply is reachable via icmp",
 
 TEST_CASE("classify_check: ICMP session unusable (denied/unavailable), TCP fallback connects "
           "-> reachable via tcp_fallback",
-          "[agent][wol][wol_check_plan]") {
+          "[wol][wol_check_plan]") {
     ProbeOutcome o;
     o.icmp_resolved = true;
     o.icmp_session_ok = false; // e.g. Linux net.ipv4.ping_group_range denied it
@@ -45,7 +45,7 @@ TEST_CASE("classify_check: ICMP session unusable (denied/unavailable), TCP fallb
 
 TEST_CASE("classify_check: ICMP usable but no reply, TCP fallback connects -> reachable via "
           "tcp_fallback",
-          "[agent][wol][wol_check_plan]") {
+          "[wol][wol_check_plan]") {
     ProbeOutcome o;
     o.icmp_resolved = true;
     o.icmp_session_ok = true;
@@ -59,7 +59,7 @@ TEST_CASE("classify_check: ICMP usable but no reply, TCP fallback connects -> re
 
 TEST_CASE("classify_check: ICMP unusable, TCP connect refused (RST) -> reachable via "
           "tcp_refused, distinct from a successful connect",
-          "[agent][wol][wol_check_plan]") {
+          "[wol][wol_check_plan]") {
     ProbeOutcome o;
     o.icmp_resolved = true;
     o.icmp_session_ok = false; // e.g. Linux net.ipv4.ping_group_range denied it
@@ -74,7 +74,7 @@ TEST_CASE("classify_check: ICMP unusable, TCP connect refused (RST) -> reachable
 
 TEST_CASE("classify_check: TCP refused takes precedence over a plain no-reply (refused is "
           "stronger evidence than 'no signal at all')",
-          "[agent][wol][wol_check_plan]") {
+          "[wol][wol_check_plan]") {
     ProbeOutcome o;
     o.icmp_resolved = true;
     o.icmp_session_ok = true;
@@ -89,7 +89,7 @@ TEST_CASE("classify_check: TCP refused takes precedence over a plain no-reply (r
 
 TEST_CASE("classify_check: both mechanisms genuinely attempted, neither succeeds -> an honest "
           "negative (checked_no_reply), not unavailable",
-          "[agent][wol][wol_check_plan]") {
+          "[wol][wol_check_plan]") {
     ProbeOutcome o;
     o.icmp_resolved = true;
     o.icmp_session_ok = true;
@@ -103,7 +103,7 @@ TEST_CASE("classify_check: both mechanisms genuinely attempted, neither succeeds
 
 TEST_CASE("classify_check: ICMP unusable AND no TCP destination resolvable -> unavailable, "
           "never a fabricated unreachable",
-          "[agent][wol][wol_check_plan]") {
+          "[wol][wol_check_plan]") {
     ProbeOutcome o;
     o.icmp_resolved = false;
     o.icmp_session_ok = false;
@@ -117,7 +117,7 @@ TEST_CASE("classify_check: ICMP unusable AND no TCP destination resolvable -> un
 
 TEST_CASE("classify_check: ICMP session usable but the destination didn't resolve, no TCP "
           "destination either -> still unavailable (icmp_attemptable requires BOTH facts)",
-          "[agent][wol][wol_check_plan]") {
+          "[wol][wol_check_plan]") {
     ProbeOutcome o;
     o.icmp_resolved = false; // no AF_INET address for this host
     o.icmp_session_ok = true; // the session itself constructed fine
@@ -131,7 +131,7 @@ TEST_CASE("classify_check: ICMP session usable but the destination didn't resolv
 
 TEST_CASE("classify_check: ICMP unusable but a destination resolved (e.g. IPv6-only host, ICMP "
           "is IPv4-only) and TCP was genuinely attempted -> checked_no_reply, not unavailable",
-          "[agent][wol][wol_check_plan]") {
+          "[wol][wol_check_plan]") {
     ProbeOutcome o;
     o.icmp_resolved = false; // no AF_INET result for an IPv6-only host
     o.icmp_session_ok = true;
@@ -144,7 +144,7 @@ TEST_CASE("classify_check: ICMP unusable but a destination resolved (e.g. IPv6-o
 }
 
 TEST_CASE("check_mechanism_label: every enumerator renders a distinct, stable token",
-          "[agent][wol][wol_check_plan]") {
+          "[wol][wol_check_plan]") {
     CHECK(std::string_view{check_mechanism_label(CheckMechanism::icmp)} == "icmp");
     CHECK(std::string_view{check_mechanism_label(CheckMechanism::tcp_fallback)} ==
           "tcp-fallback");

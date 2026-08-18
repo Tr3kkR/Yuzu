@@ -364,8 +364,16 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t
 yuzu::agent::SubprocessResult run_command(const std::vector<std::string>& argv) {
     if (argv.empty() || argv.front().empty())
         return yuzu::agent::SubprocessResult{};
+    // merge_stderr=true (matching network_actions_plugin.cpp's Linux
+    // flush_dns): without it, a `sudo -n` denial ("a password is required")
+    // is discarded to /dev/null and indistinguishable from a genuine
+    // systemctl/launchctl failure -- a realistic gap during a pilot
+    // enrollment before the sudoers grant lands. The captured output is
+    // threaded into the caller's error message via decide_set_start_mode_
+    // outcome (services_parsers.hpp).
     return yuzu::agent::run_bounded_subprocess(
-        argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+        argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20},
+                                             .merge_stderr = true});
 }
 #endif
 
@@ -492,16 +500,16 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     // TIMEOUT/CONSTRAINED (or UNAVAILABLE) status -- never collapsed into
     // the generic "exit=-1" error string below, which previously hid the
     // difference between "systemctl ran and failed" and "the runner never
-    // got a real exit at all".
-    if (yuzu::agent::forward_runner_failure(ctx, res)) {
-        ctx.write_output(
-            std::format("error|systemctl command failed for '{}' (runner did not complete)",
-                        name));
-        return 1;
+    // got a real exit at all". The decision itself is the pure
+    // yuzu::services::decide_set_start_mode_outcome (services_parsers.hpp,
+    // fixture-tested in tests/unit/test_services_parsers.cpp); only the
+    // ctx.set_result_status forwarding stays here.
+    auto outcome = yuzu::services::decide_set_start_mode_outcome("systemctl", name, res);
+    if (outcome.runner_failed) {
+        yuzu::agent::forward_runner_failure(ctx, res);
     }
-    if (!res.tool_ran || res.exit_code != 0) {
-        ctx.write_output(std::format("error|systemctl command failed for '{}' (exit={})", name,
-                                     res.tool_ran ? res.exit_code : -1));
+    if (!outcome.ok) {
+        ctx.write_output(outcome.message);
         return 1;
     }
 
@@ -570,15 +578,12 @@ int do_set_start_mode_macos(yuzu::CommandContext& ctx, std::string_view name,
     // Same distinguishable-status discipline as the Linux leg above: a
     // deadline-killed/cancelled/spawn-failed launchctl invocation must
     // report a real CONSTRAINED/UNAVAILABLE status, not a bare "exit=-1".
-    if (yuzu::agent::forward_runner_failure(ctx, res)) {
-        ctx.write_output(
-            std::format("error|launchctl command failed for '{}' (runner did not complete)",
-                        name));
-        return 1;
+    auto outcome = yuzu::services::decide_set_start_mode_outcome("launchctl", name, res);
+    if (outcome.runner_failed) {
+        yuzu::agent::forward_runner_failure(ctx, res);
     }
-    if (!res.tool_ran || res.exit_code != 0) {
-        ctx.write_output(std::format("error|launchctl command failed for '{}' (exit={})", name,
-                                     res.tool_ran ? res.exit_code : -1));
+    if (!outcome.ok) {
+        ctx.write_output(outcome.message);
         return 1;
     }
 

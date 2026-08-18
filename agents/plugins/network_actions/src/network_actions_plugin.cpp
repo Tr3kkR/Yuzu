@@ -19,14 +19,6 @@
 
 #include <yuzu/plugin.hpp>
 
-#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure / classify_runner_failure
-#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path
-
-#include <host_arg.hpp>  // yuzu::shared::is_safe_host_arg
-#include <sudo_argv.hpp> // yuzu::shared::sudo_wrap
-
-#include "network_actions_parsers.hpp" // yuzu::network_actions::resolver_flush_flag
-
 #include <cctype>
 #include <chrono>
 #include <format>
@@ -34,17 +26,27 @@
 #include <string_view>
 #include <vector>
 
+#include <yuzu/agent/runner_status.hpp>     // yuzu::agent::forward_runner_failure / classify_runner_failure
+#include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess / probe_tool_path
+
+#include <host_arg.hpp>  // yuzu::shared::is_safe_host_arg
+#include <sudo_argv.hpp> // yuzu::shared::sudo_wrap
+
+#include "network_actions_parsers.hpp" // yuzu::network_actions::resolver_flush_flag / decide_dns_flush
+
 namespace {
 
 // Per-call wall-clock bound for these actions: flush_dns and ping are both
-// quick, single-shot commands (a cache flush or a handful of ICMP probes),
-// so a short ceiling is enough — generous enough never to fire on a healthy
-// endpoint, short enough that a wedged tool (or an operator-supplied ping
-// `count` large enough to run past it) cannot pin the instruction worker
-// indefinitely. Matches the read-only-tool ceiling used elsewhere
-// (users_plugin.cpp's kUsersCmdDeadline). A ping cut short by this deadline
-// is reported honestly via forward_runner_failure (CONSTRAINED/PARTIAL),
-// never as a silent success.
+// quick, single-shot commands (a cache flush -- including its privileged
+// `sudo -n` hop -- or a handful of ICMP probes), so a short ceiling is
+// enough — generous enough never to fire on a healthy endpoint, short
+// enough that a wedged tool (or an operator-supplied ping `count` large
+// enough to run past it) cannot pin the instruction worker indefinitely.
+// This is justified on its own terms, not by analogy to a read-only-tool
+// ceiling elsewhere: flush_dns is a mutating, privileged action, but still
+// a fast local operation with no reason to ever legitimately run long. A
+// ping cut short by this deadline is reported honestly via
+// forward_runner_failure (CONSTRAINED/PARTIAL), never as a silent success.
 constexpr std::chrono::milliseconds kNetworkActionsCmdDeadline{10'000};
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
@@ -142,33 +144,39 @@ public:
             // the NOPASSWD grants install-agent-user.sh installs; the real
             // exit code of the last attempt is reported -- never a blind
             // status|ok the way `|| true` used to guarantee.
+            //
+            // The retry/candidate-selection DECISION (which candidate wins,
+            // does the loop stop early, what's the final status) is the
+            // pure yuzu::network_actions::decide_dns_flush -- fixture-
+            // tested in test_network_actions_parsers.cpp without a live
+            // resolvectl/systemd-resolve/sudo dependency. Only the probe +
+            // subprocess I/O stays here.
+            std::vector<yuzu::network_actions::DnsFlushAttemptOutcome> attempts;
             yuzu::agent::SubprocessResult res;
-            bool attempted = false;
-            bool ok = false;
             for (const char* candidate : {"/usr/bin/resolvectl", "/usr/bin/systemd-resolve"}) {
                 auto tool = yuzu::agent::probe_tool_path({candidate});
-                if (tool.empty())
+                if (tool.empty()) {
+                    attempts.push_back({/*found=*/false, /*succeeded=*/false});
                     continue;
+                }
                 auto argv = yuzu::shared::sudo_wrap(
                     {tool, std::string(yuzu::network_actions::resolver_flush_flag(tool))});
                 res = yuzu::agent::run_bounded_subprocess(
                     argv, yuzu::agent::SubprocessOptions{.deadline = kNetworkActionsCmdDeadline,
                                                          .merge_stderr = true});
-                attempted = true;
-                if (res.tool_ran && res.exit_code == 0) {
-                    ok = true;
+                const bool succeeded = res.tool_ran && res.exit_code == 0;
+                attempts.push_back({/*found=*/true, succeeded});
+                if (succeeded)
                     break; // success -- do not try the next candidate
-                }
-                // this attempt failed (spawn error or nonzero exit); fall
-                // through to the next candidate, matching the old `||` chain
             }
-            if (!attempted) {
+            const auto decision = yuzu::network_actions::decide_dns_flush(attempts);
+            if (!decision.attempted) {
                 ctx.write_output("status|error");
                 ctx.write_output("output|neither resolvectl nor systemd-resolve found");
                 return 1;
             }
             bool status_forwarded = yuzu::agent::forward_runner_failure(ctx, res);
-            ok = ok && !status_forwarded;
+            bool ok = decision.ok && !status_forwarded;
             ctx.write_output(std::format("status|{}", ok ? "ok" : "error"));
             ctx.write_output(std::format("output|{}", res.output));
             return ok ? 0 : 1;

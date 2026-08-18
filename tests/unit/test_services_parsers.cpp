@@ -13,10 +13,15 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <yuzu/agent/subprocess_runner.hpp>
+
 #include <cstddef>
 #include <format>
 #include <string>
 
+using yuzu::agent::SubprocessResult;
+using yuzu::agent::TerminationReason;
+using yuzu::services::decide_set_start_mode_outcome;
 using yuzu::services::is_safe_service_name;
 using yuzu::services::kMaxServiceRows;
 using yuzu::services::LaunchdListResult;
@@ -195,4 +200,96 @@ TEST_CASE("services: is_safe_service_name permits a leading hyphen (argv callers
     // construction is responsible for the "--" separator that keeps a name
     // like this from being parsed as a systemctl/launchctl flag.
     CHECK(is_safe_service_name("-foo"));
+}
+
+// ── decide_set_start_mode_outcome ────────────────────────────────────────
+//
+// Pins the CALL-SITE WIRING in do_set_start_mode_linux/_macos -- given a
+// SubprocessResult, is a runner-level failure (spawn error / deadline /
+// cancelled / signaled) correctly distinguished from an ordinary tool
+// failure (ran, nonzero exit), and from success. classify_runner_failure
+// itself already has generic coverage in test_runner_status.cpp; this pins
+// that services_plugin.cpp actually WIRES the distinction through rather
+// than collapsing every non-success into the same generic error string.
+
+TEST_CASE("decide_set_start_mode_outcome: a clean zero-exit run is ok, no message",
+         "[services]") {
+    SubprocessResult res;
+    res.termination_reason = TerminationReason::exited;
+    res.tool_ran = true;
+    res.exit_code = 0;
+
+    auto outcome = decide_set_start_mode_outcome("systemctl", "sshd", res);
+    CHECK(outcome.ok);
+    CHECK_FALSE(outcome.runner_failed);
+    CHECK(outcome.message.empty());
+}
+
+TEST_CASE("decide_set_start_mode_outcome: tool_ran=false (spawn error) sets runner_failed, "
+         "not the generic exit-code message",
+         "[services]") {
+    SubprocessResult res;
+    res.termination_reason = TerminationReason::spawn_error;
+    res.tool_ran = false;
+
+    auto outcome = decide_set_start_mode_outcome("systemctl", "sshd", res);
+    CHECK_FALSE(outcome.ok);
+    CHECK(outcome.runner_failed);
+    CHECK(outcome.message == "error|systemctl command failed for 'sshd' (runner did not complete)");
+}
+
+TEST_CASE("decide_set_start_mode_outcome: timed_out/deadline sets runner_failed, distinguishable "
+         "from an ordinary nonzero exit",
+         "[services]") {
+    SubprocessResult res;
+    res.termination_reason = TerminationReason::deadline;
+    res.tool_ran = true; // the child had started but was killed before a real exit
+    res.timed_out = true;
+
+    auto outcome = decide_set_start_mode_outcome("launchctl", "com.example.svc", res);
+    CHECK_FALSE(outcome.ok);
+    CHECK(outcome.runner_failed);
+    CHECK(outcome.message ==
+         "error|launchctl command failed for 'com.example.svc' (runner did not complete)");
+}
+
+TEST_CASE("decide_set_start_mode_outcome: signaled (e.g. a crash) sets runner_failed",
+         "[services]") {
+    SubprocessResult res;
+    res.termination_reason = TerminationReason::signaled;
+    res.tool_ran = true;
+
+    auto outcome = decide_set_start_mode_outcome("systemctl", "sshd", res);
+    CHECK_FALSE(outcome.ok);
+    CHECK(outcome.runner_failed);
+}
+
+TEST_CASE("decide_set_start_mode_outcome: the tool ran and exited nonzero -- an ORDINARY "
+         "failure, never reported as runner_failed",
+         "[services]") {
+    SubprocessResult res;
+    res.termination_reason = TerminationReason::exited;
+    res.tool_ran = true;
+    res.exit_code = 1;
+
+    auto outcome = decide_set_start_mode_outcome("systemctl", "sshd", res);
+    CHECK_FALSE(outcome.ok);
+    CHECK_FALSE(outcome.runner_failed);
+    CHECK(outcome.message == "error|systemctl command failed for 'sshd' (exit=1)");
+}
+
+TEST_CASE("decide_set_start_mode_outcome: a nonzero exit's captured output (e.g. a sudo denial) "
+         "is threaded into the message, not discarded",
+         "[services]") {
+    SubprocessResult res;
+    res.termination_reason = TerminationReason::exited;
+    res.tool_ran = true;
+    res.exit_code = 1;
+    res.output = "sudo: a password is required";
+
+    auto outcome = decide_set_start_mode_outcome("systemctl", "sshd", res);
+    CHECK_FALSE(outcome.ok);
+    CHECK_FALSE(outcome.runner_failed);
+    CHECK(outcome.message ==
+         "error|systemctl command failed for 'sshd' (exit=1): sudo: a password is required");
 }
