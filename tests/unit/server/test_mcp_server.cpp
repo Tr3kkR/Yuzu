@@ -7789,6 +7789,46 @@ TEST_CASE("MCP operator surface: set_plugin_kill_switch actually flips PluginCon
     CHECK(ts.audit_log[6] == "mcp.set_plugin_kill_switch|success");
 }
 
+// #3265 adversarial-review K1/C2-K1: the store/dispatch-chokepoint tests in
+// test_plugin_config_store_pg.cpp prove __guard__.push_rules is
+// kill-switch-addressable, but nothing exercised this SPECIFIC operator
+// surface (the MCP tool, documented in guaranteed-state.md as an equivalent
+// way to flip the switch) with a reserved-namespace plugin name — a future
+// MCP-only regression (e.g. reverting this handler to plain
+// is_valid_identifier validation) would silently break emergency-stop access
+// to Guardian rule delivery via MCP while every other test here stayed green.
+TEST_CASE("MCP operator surface: set_plugin_kill_switch reaches the real dispatch chokepoint "
+          "for the reserved-namespace __guard__.push_rules capability, not just an ordinary "
+          "plugin.action",
+          "[pg][mcp][integration][operator_surface]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, operator_surface_plugincfg_tpl);
+    PluginConfigPgWired w{db.dsn()};
+    McpTestServer ts;
+    ts.plugin_config_store_for_test = &w.store;
+    ts.start();
+
+    // Baseline: no row yet — the #3265 regression shape exactly (this must
+    // read allowed, not fail-closed-to-denied).
+    CHECK(w.store.action_allowed("__guard__", "push_rules"));
+
+    auto off_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"set_plugin_kill_switch",)"
+        R"("arguments":{"plugin":"__guard__","action":"push_rules","enabled":false,"reason":"incident"}}})");
+    REQUIRE(off_res);
+    auto off_payload = operator_surface_payload(off_res);
+    CHECK(off_payload["enabled"] == false);
+
+    // Proven against the real chokepoint, same as the ordinary-plugin case
+    // above — not by trusting the tool's own echoed response.
+    CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
+
+    auto on_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"set_plugin_kill_switch",)"
+        R"("arguments":{"plugin":"__guard__","action":"push_rules","enabled":true,"reason":"resolved"}}})");
+    REQUIRE(on_res);
+    CHECK(w.store.action_allowed("__guard__", "push_rules"));
+}
+
 TEST_CASE("MCP operator surface: mint_upload_grant writes a real UploadGrantStore row — proven "
           "by a DIRECT list_for_agent read, never a re-call of the tool",
           "[pg][mcp][integration][operator_surface]") {
