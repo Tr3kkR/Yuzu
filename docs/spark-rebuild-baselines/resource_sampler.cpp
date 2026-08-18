@@ -268,6 +268,18 @@ int wmain(int argc, wchar_t** argv) {
     int interval_sec = argc >= 4 ? _wtoi(argv[3]) : 5;
     const wchar_t* out_path = argc >= 5 ? argv[4] : nullptr;
 
+    // Output file opened BEFORE OpenProcess (adversarial review finding, 2026-08-18):
+    // no HANDLE is acquired yet on this failure path, so there is nothing to leak -
+    // the alternative (a scope-guard/RAII HANDLE wrapper) would work too, but this
+    // file is deliberately zero-Yuzu-dependency and this reorder needs no new type.
+    FILE* out = stdout;
+    if (out_path) {
+        if (_wfopen_s(&out, out_path, L"w") != 0 || !out) {
+            fwprintf(stderr, L"[resource_sampler] failed to open %s for write\n", out_path);
+            return 1;
+        }
+    }
+
     try_enable_debug_privilege();
 
     HANDLE hproc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE, FALSE, target_pid);
@@ -276,6 +288,7 @@ int wmain(int argc, wchar_t** argv) {
                           L"different account; needs an elevated (Administrator) console even with "
                           L"SeDebugPrivilege, and the target must actually exist\n",
                   target_pid, GetLastError());
+        if (out != stdout) fclose(out);
         return 1;
     }
 
@@ -283,14 +296,6 @@ int wmain(int argc, wchar_t** argv) {
     bool have_pdh = ctxsw.init();
     if (!have_pdh) {
         fwprintf(stderr, L"[resource_sampler] PDH init failed — continuing without wakeups/sec\n");
-    }
-
-    FILE* out = stdout;
-    if (out_path) {
-        if (_wfopen_s(&out, out_path, L"w") != 0 || !out) {
-            fwprintf(stderr, L"[resource_sampler] failed to open %s for write\n", out_path);
-            return 1;
-        }
     }
 
     fwprintf(out, L"elapsed_s,threads,handles,rss_bytes,cpu_pct,ctxsw_per_sec\n");
