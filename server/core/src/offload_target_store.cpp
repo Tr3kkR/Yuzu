@@ -186,16 +186,28 @@ OffloadTargetStore::~OffloadTargetStore() {
     // is supposed to cover. httplib's read/write timeouts reset PER CALL,
     // not per connection (see the codebase's own httplib-write-timeout
     // note), so a slow-dribbling remote endpoint can hold a delivery open
-    // well past 15s in practice - this is not a purely theoretical path.
-    // spdlog is safe here (an ordinary destructor call stack, not the
-    // signal-handler context ServerImpl::stop() runs in).
+    // well past ServerImpl::stop()'s own 60s quiesce bound in practice -
+    // this is not a purely theoretical path (see server.cpp's stop()
+    // comment on that bound for the full derivation).
+    //
+    // spdlog is safe from an ASYNC-SIGNAL-SAFETY standpoint here (an
+    // ordinary destructor call stack, not the signal-handler context
+    // ServerImpl::stop() runs in), but this destructor is implicitly
+    // noexcept, and spdlog's own SPDLOG_LOGGER_CATCH rethrows a non-
+    // std::exception from a custom sink/formatter (gov Gate 8 round-2,
+    // cpp-safety) - this codebase has none today, so the risk is
+    // theoretical, but wrap it anyway rather than leave a noexcept
+    // function one custom-sink-throw away from std::terminate().
     if (pool_.quiesce(std::chrono::hours(24))) {
         if (db_)
             sqlite3_close(db_);
     } else {
-        spdlog::critical("OffloadTargetStore::~OffloadTargetStore: pool did not quiesce "
-                          "within 24h - leaking the SQLite handle rather than risking a "
-                          "use-after-free against an in-flight delivery");
+        try {
+            spdlog::critical("OffloadTargetStore::~OffloadTargetStore: pool did not quiesce "
+                              "within 24h - leaking the SQLite handle rather than risking a "
+                              "use-after-free against an in-flight delivery");
+        } catch (...) {
+        }
     }
 }
 

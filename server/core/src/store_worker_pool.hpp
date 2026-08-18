@@ -129,11 +129,7 @@ public:
 private:
     /// Signal every started worker to stop and join it. Safe to call on a
     /// partially constructed pool (the ctor's failure path, where some
-    /// workers never started) and from the destructor. `noexcept` matches
-    /// agents/core/src/thread_pool.hpp's identical helper: a join that
-    /// throws here would terminate() us anyway (joining an already-joined
-    /// or not-joinable thread doesn't throw the way we call it, but the
-    /// noexcept documents the intent).
+    /// workers never started) and from the destructor.
     void quiesce_and_join_unconditional() noexcept {
         {
             std::lock_guard lock(mu_);
@@ -141,8 +137,20 @@ private:
         }
         cv_.notify_all();
         for (auto& w : workers_) {
-            if (w.joinable())
-                w.join();
+            if (w.joinable()) {
+                try {
+                    w.join();
+                } catch (...) {
+                    // gov Gate 8 round-2 (cpp-safety): this function is
+                    // noexcept, so an uncaught throw here would terminate()
+                    // us anyway - but WRAPPED, it stays a swallow-and-
+                    // continue instead, matching
+                    // agents/core/src/thread_pool.hpp's quiesce_and_join()
+                    // exactly (an earlier version of this comment claimed
+                    // parity with that function while actually leaving the
+                    // join unwrapped, which was false).
+                }
+            }
         }
     }
 

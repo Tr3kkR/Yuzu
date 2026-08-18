@@ -136,15 +136,24 @@ WebhookStore::~WebhookStore() {
     // this store WITHOUT going through stop()'s escalate-on-timeout
     // first) this defensive call is supposed to cover. If still not
     // drained after 24h, leak the SQLite handle rather than close it -
-    // spdlog is safe here (an ordinary destructor call stack, not the
-    // signal-handler context ServerImpl::stop() runs in).
+    // spdlog is safe from an ASYNC-SIGNAL-SAFETY standpoint here (an
+    // ordinary destructor call stack, not the signal-handler context
+    // ServerImpl::stop() runs in), but this destructor is implicitly
+    // noexcept, and spdlog's own SPDLOG_LOGGER_CATCH rethrows a non-
+    // std::exception from a custom sink/formatter (gov Gate 8 round-2,
+    // cpp-safety) - this codebase has none today, so the risk is
+    // theoretical, but wrap it anyway rather than leave a noexcept
+    // function one custom-sink-throw away from std::terminate().
     if (pool_.quiesce(std::chrono::hours(24))) {
         if (db_)
             sqlite3_close(db_);
     } else {
-        spdlog::critical("WebhookStore::~WebhookStore: pool did not quiesce within 24h - "
-                          "leaking the SQLite handle rather than risking a use-after-free "
-                          "against an in-flight delivery");
+        try {
+            spdlog::critical("WebhookStore::~WebhookStore: pool did not quiesce within 24h - "
+                              "leaking the SQLite handle rather than risking a use-after-free "
+                              "against an in-flight delivery");
+        } catch (...) {
+        }
     }
 }
 

@@ -7430,37 +7430,94 @@ public:
         // again; that does not hold here, exactly as the web_thread_
         // comment above already warns.
         //
-        // BOUND, derived from THIS workload, not copied from web_thread_'s
-        // 15s (advisor review post-Gate-8): deliver_single's httplib::Client
-        // allows connect(5s) + write(10s) + read(10s) = 25s for ONE
-        // legitimate, healthy, slow-endpoint delivery (webhook_store.cpp /
-        // offload_target_store.cpp set_*_timeout calls). web_thread_'s 15s
-        // is calibrated to ITS OWN workload (one post-close-signal
-        // keep-alive tick) and does not transfer - copying it here would
-        // let an ORDINARY slow-but-healthy delivery in flight at SIGTERM
-        // trip force-exit and skip all remaining teardown, on a path that
-        // is not even a bug. 30s gives >5s margin over the 25s legitimate
-        // worst case so escalation fires on a genuinely wedged delivery,
-        // not a slow one.
+        // BOUND (Gate 8 round-2 targeted re-review, cpp-safety AND
+        // unhappy-path independently): this is NOT a per-delivery
+        // HTTP-timeout bound, and an earlier version of this comment was
+        // wrong to derive one that way. Two things disprove that framing,
+        // both verified against source: (1) quiesce() waits for pending_ to
+        // reach ZERO - the WHOLE queue (capacity 256 across 4 workers), not
+        // one delivery, so a burst of pending deliveries (the exact "mass
+        // agent-reconnect" scenario store_worker_pool.hpp's own header
+        // names as its motivating case) already exceeds any single-
+        // delivery estimate; (2) httplib's connect/read/write timeouts
+        // (deliver_single's set_*_timeout calls) reset PER CALL, not per
+        // connection (offload_target_store.cpp's destructor comment, #3017)
+        // - a slow-dribbling-but-legitimate endpoint can hold ONE delivery
+        // open indefinitely, so no finite per-delivery ceiling is even
+        // derivable from those three setters. There is no mathematically
+        // provable bound here, so this is a heuristic sized against this
+        // DEPLOYMENT's actual shutdown budget instead:
+        // docs/user-manual/upgrading.md documents the pre-existing stacked
+        // shutdown bound at ~55s (executions + NVD-sync + web_thread_ +
+        // gRPC drain), and the shipped compose/systemd grace period is 210s
+        // (deploy/docker/docker-compose*.yml stop_grace_period,
+        // deploy/systemd/yuzu-server.service TimeoutStopSec). 60s here,
+        // run CONCURRENTLY for both stores below (not sequentially, which
+        // would double the worst case), brings the documented stacked total
+        // to ~115s - comfortably inside 210s, with real headroom over the
+        // "a handful of pending deliveries" case above. Update
+        // upgrading.md's stacked-bound section if this constant changes.
+        // This bound is exactly as heuristic, and exactly as unproven, as
+        // the pre-existing web_thread_ 15s bound a few hundred lines up -
+        // an established pattern in this codebase, not a new risk class.
         if (offload_target_store_)
             offload_target_store_->flush_all();
-        const bool webhook_drained =
-            !webhook_store_ || webhook_store_->quiesce(std::chrono::seconds(30));
-        const bool offload_drained =
-            !offload_target_store_ || offload_target_store_->quiesce(std::chrono::seconds(30));
+        static constexpr auto kStoreQuiesceBound = std::chrono::seconds(60);
+        bool webhook_drained = true;
+        bool offload_drained = true;
+        // Run both waits concurrently (Gate 8 round-2 targeted re-review,
+        // cpp-safety SHOULD) - sequential quiesce(60s) then quiesce(60s)
+        // would double the worst-case stall to 120s for no benefit; the two
+        // stores are otherwise fully independent.
+        std::thread offload_wait;
+        if (offload_target_store_) {
+            offload_wait = std::thread([this, &offload_drained] {
+                offload_drained = offload_target_store_->quiesce(kStoreQuiesceBound);
+            });
+        }
+        if (webhook_store_)
+            webhook_drained = webhook_store_->quiesce(kStoreQuiesceBound);
+        if (offload_wait.joinable())
+            offload_wait.join();
         if (!webhook_drained || !offload_drained) {
             // Async-signal-safe only (see the web_thread_ comment above for
             // why spdlog is not used here): a raw write() of a fixed
             // message, then _Exit. Skips the remaining teardown below,
             // exactly as a supervisor SIGKILL would - strictly no worse.
-            const char msg[] =
-                "ServerImpl::stop: WebhookStore/OffloadTargetStore did not quiesce within "
-                "30s (#3261 governance hardening) - force-exiting.\n";
+            // Three fixed literals rather than one shared string (Gate 8
+            // round-2, unhappy-path SHOULD: name which store, so an
+            // operator with only stderr in hand knows which configured
+            // endpoint to investigate) - still async-signal-safe, since
+            // selecting among fixed literals is a branch, not a format/
+            // allocation.
+            if (!webhook_drained && !offload_drained) {
+                const char msg[] =
+                    "ServerImpl::stop: WebhookStore AND OffloadTargetStore did not quiesce "
+                    "within 60s (#3261 governance hardening) - force-exiting.\n";
 #ifdef _WIN32
-            _write(2, msg, sizeof(msg) - 1);
+                _write(2, msg, sizeof(msg) - 1);
 #else
-            (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
 #endif
+            } else if (!webhook_drained) {
+                const char msg[] =
+                    "ServerImpl::stop: WebhookStore did not quiesce within 60s "
+                    "(#3261 governance hardening) - force-exiting.\n";
+#ifdef _WIN32
+                _write(2, msg, sizeof(msg) - 1);
+#else
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            } else {
+                const char msg[] =
+                    "ServerImpl::stop: OffloadTargetStore did not quiesce within 60s "
+                    "(#3261 governance hardening) - force-exiting.\n";
+#ifdef _WIN32
+                _write(2, msg, sizeof(msg) - 1);
+#else
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            }
             std::_Exit(1);
         }
         agent_service_.set_webhook_store(nullptr);
