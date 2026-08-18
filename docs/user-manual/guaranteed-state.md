@@ -189,12 +189,12 @@ The push is dispatched to in-scope agents; the `agents=<count>` field records ho
 curl -H "Authorization: Bearer $YUZU_TOKEN" \
   "https://yuzu.example.com/api/v1/guaranteed-state/events?severity=high&limit=50"
 
-# Fleet rollup (placeholder in PR 2 — fleet aggregation lands in PR 4)
+# Fleet rollup (errored_rules is real, #2298 item 6d; compliant/drifted are still placeholder 0)
 curl -H "Authorization: Bearer $YUZU_TOKEN" \
   https://yuzu.example.com/api/v1/guaranteed-state/status
 ```
 
-Both require `GuaranteedState:Read`. `/status` response keys (`total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`) match the agent-side proto `GuaranteedStateStatus`. **The agent status is fail-closed:** until the guard self-test lands, an armed guard reports `errored` / `guard_healthy=false`, never `compliant`. Treat the **events stream** (`drift.remediated` / `remediation.failed`), not `/status`, as the source of truth for whether enforcement is working.
+Both require `GuaranteedState:Read`. The four count fields (`total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`) match the agent-side proto `GuaranteedStateStatus`; the REST response also carries `note` (human-readable caveats) and, on the per-agent route, `agent_id` — neither of those two has a proto counterpart. `errored_rules` is derived from the `guardian_agent_rule_status` census (the count of distinct rules with at least one agent currently reporting `errored`); `compliant_rules`/`drifted_rules` stay `0` until full status ingest lands in a later rung. **The agent status is fail-closed:** until the guard self-test lands, an armed guard reports `errored` / `guard_healthy=false`, never `compliant`. Treat the **events stream** (`drift.remediated` / `remediation.failed`), not `/status`'s still-placeholder `compliant_rules`/`drifted_rules`, as the source of truth for whether enforcement is working.
 
 ### 6. Enable/disable a Guard from the dashboard
 
@@ -264,7 +264,7 @@ The Guard and Baseline detail pages — which **replaced the old detail modal** 
 
 Compliance derives from **one** liveness-folded rollup: an agent that is currently offline folds to **unknown** (its last state is not reported as live truth). The Fleet census, the per-Guard/Baseline **cards**, and the detail **pages** all read that single rollup, so they cannot disagree.
 
-> **The REST `/api/v1/guaranteed-state/status` endpoint still returns placeholder zeros** — the live census is dashboard-only at present. A SIEM/automation integration must not read `/status` for compliance; corroborate against the `/events` stream until the status endpoint is wired to the census (tracked follow-up).
+> **The REST `/api/v1/guaranteed-state/status` endpoint's `errored_rules` is now real** (#2298 item 6d), derived from the same `guardian_agent_rule_status` census as the dashboard and intersected against the live rule catalogue (a census row for a since-deleted rule is excluded — the deletion path's own status cleanup is best-effort, so an unintersected count could otherwise include a deleted rule indefinitely). It is still **not** the dashboard's liveness-folded rollup: it does not fold an offline agent's last state to unknown, so a rule reported errored only by a currently-offline agent still counts. `compliant_rules`/`drifted_rules` still return placeholder `0` until full status ingest lands in a later rung, and the fleet endpoint denies a service-scoped API token outright (it aggregates across every agent's census; a token scoped to one service must not read the fleet-wide count). The fleet route is also **management-group-confined** (ADR-0017): a global grant sees the fleet-wide count, a group-confined grant sees `errored_rules` scoped to that operator's visible agents, and `total_rules` is never confined (it is the global rule-catalogue size, with no agent dimension). A SIEM/automation integration reading `errored_rules` should treat it as a raw census-derived count, not the dashboard's folded compliance posture; corroborate against the `/events` stream for compliant/drifted state until the status endpoint's remaining fields are wired.
 
 ## Resilience policy (enforce-retry behaviour)
 

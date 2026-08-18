@@ -270,7 +270,7 @@ so the push hits BuildKit's own solver cache and rebuilds nothing.
 |---|---|---|
 | `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) — 4 L3/CCD-pinned runners (`0-7,32-39`; `8-15,40-47`; `16-23,48-55`; `24-31,56-63`), Ninja capped at `-j16` | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. Provisioned from [`deploy/linux/`](../deploy/linux/README.md). |
 | `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
-| `macos-15` | GitHub-hosted | macos matrix |
+| `yuzu-bigmags-macos-{0,1}` | BigMags Mac Mini (Apple M4 Pro, 24 GiB, macOS 26) — 2 runners as headless LaunchDaemons, shared label `yuzu-bigmags-macos` | **self-hosted macOS**: ci.yml `macos` matrix. `release.yml` build-macos + pre-release install-macos deliberately stay GitHub-hosted (`macos-15`/`macos-14`) until on-box signing. Provisioned from [`deploy/macos/`](../deploy/macos/README.md). |
 
 **Retired 2026-06-21:** `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
 `yuzu-shulgi`) and `yuzu-local-windows` (Shulgi native Windows) — superseded by
@@ -396,8 +396,12 @@ bash scripts/test/test-db-query.sh ci-suite-stats --since 30d
 bash scripts/test/test-db-query.sh ci-flakes --since 30d
 ```
 
-GitHub-hosted macOS agents are ephemeral and cannot meet this runner-local
-persistence contract; their test logs remain retained Actions artifacts.
+macOS now runs on the self-hosted **BigMags** pool ([`deploy/macos/`](../deploy/macos/README.md)):
+ccache persists in the runner user's HOME and the vcpkg binary cache in
+`runner.tool_cache`, like Big Tam/Wee Tam. Per-agent `test-runs.db` telemetry is
+NOT yet wired into the `macos` job (Phase 4 to-do), so the DB queries above have
+no macOS data yet. The `release.yml`/`pre-release.yml` macOS legs stay on
+GitHub-hosted `macos-15`/`macos-14`, which are ephemeral.
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected
@@ -607,9 +611,9 @@ short-circuit to "already installed" and then fail post-install
 pkgconfig validation; this was #741.) Never touches `$WS/vcpkg/` (the
 sibling vcpkg tool root, owned by lukka/run-vcpkg), never
 `runner.tool_cache`, never ccache. Persistence: self-hosted in
-`${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows}`
-(per-triplet, outside workspace). macOS uses `actions/cache@v5` keyed on
-the same invariant.
+`${runner.tool_cache}/yuzu-vcpkg-binary-cache-{linux,asan,windows,macos}`
+(per-triplet, outside workspace). macOS joined this model with the BigMags
+cutover; its former `actions/cache@v5` round-trip was removed.
 
 The script must run cleanly under MSYS2 bash on Windows. **Do NOT use
 `set -e` + `[[ test ]] && cmd` short-circuits** — they silently exit under

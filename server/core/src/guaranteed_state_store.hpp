@@ -33,8 +33,9 @@
 ///    three-state `std::expected<std::optional<Row>, GuaranteedStateReadError>`
 ///    (found / genuinely-absent / degraded — mirrors
 ///    `DeviceInventoryStore::CiReadError`). `agent_rule_statuses` /
-///    `agent_rule_statuses_for_agent` (enforce-gate/census input) are the same
-///    `std::expected<std::vector<T>, std::string>` shape. A degraded read
+///    `agent_rule_statuses_for_agent` / `errored_rule_count` (enforce-gate/
+///    census/ADR-0017 list-read input) are the same
+///    `std::expected<..., std::string>` shape. A degraded read
 ///    collapsing to silent empty would push an EMPTY rule set to the fleet —
 ///    a Guardian-wide disarm — so every push/reconcile consumer MUST abort
 ///    (503 / no-op push) on `!result`, never fan out an empty container it
@@ -475,6 +476,19 @@ public:
     /// rule_ids. Empty input -> empty map (success, not degrade).
     std::expected<std::unordered_map<std::string, std::string>, std::string>
     rule_names_for(const std::vector<std::string>& rule_ids) const;
+
+    /// COUNT(DISTINCT rule_id) of rules currently in `errored` state on at
+    /// least one agent, joined against the live rule catalogue (ADR-0017
+    /// INV-3: confinement applied in SQL, before the aggregate — never a
+    /// C++ post-filter over the whole census). `agent_scope`: nullopt = the
+    /// whole fleet; engaged (including empty, INV-2) = only those agents,
+    /// via `agent_id = ANY($1::text[])` — an engaged-empty scope returns 0
+    /// WITHOUT issuing a query (mirrors `rule_names_for`'s empty-input
+    /// posture: success, not degrade). AUTHORITATIVE like its
+    /// catastrophic-read siblings above: `std::unexpected`, never a silent
+    /// 0, on any store/query failure.
+    std::expected<std::size_t, std::string>
+    errored_rule_count(const std::optional<std::vector<std::string>>& agent_scope) const;
 
     std::size_t rule_count() const;
     std::size_t event_count() const;

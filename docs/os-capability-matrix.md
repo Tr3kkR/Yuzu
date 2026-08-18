@@ -120,7 +120,7 @@ duplicates.
 | procfetch | ✅ | ✅ | ✅ | linux/apple/win branches |
 | quarantine | ✅ | ✅ | ✅ | full per-OS blocks |
 | rdp_control | ✅ | ⛔ | ⛔ | Windows-only. Off-Windows returns an honest `rdp_control\|unsupported` sentinel (macOS names Screen Sharing); state-changing `set_state` reports terminal FAILURE, read-only `status` rc=0 — `rdp_control_plugin.cpp` `#ifndef _WIN32` branch |
-| registry | ✅ | ⛔ | ⛔ | Windows-only (advapi32). Off-Windows returns an honest `registry\|unsupported` sentinel (reads rc=0; mutating `set_value`/`delete_*` report terminal FAILURE — no false success) — `registry_plugin.cpp` `#ifndef _WIN32` branch. `list_profiles` (PR1.7) enumerates local profiles via ProfileList/HKEY_USERS. `get_user_value` resolves the target profile via ProfileList and reads the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `RegLoadKey` mount (SeBackup/SeRestore privileges, required only for that fallback) when not |
+| registry | ✅ | ⛔ | ⛔ | Windows-only (advapi32). Off-Windows returns an honest `registry\|unsupported` sentinel (reads rc=0; mutating `set_value`/`delete_*` report terminal FAILURE — no false success) — `registry_plugin.cpp` `#ifndef _WIN32` branch. `list_profiles` (PR1.7) enumerates local profiles via ProfileList/HKEY_USERS. `get_user_value` resolves the target profile via ProfileList and reads the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `RegLoadKey` mount (SeBackup/SeRestore privileges, required only for that fallback) when not. The ladder lives in `agents/shared/win_profiles.hpp` and is shared with `installed_apps.list_per_user`, `license_scan`'s per-user surfaces and `tar`'s mapdrive history (#2771) |
 | sccm | ✅ | ⛔ | ⛔ | Windows-only. macOS returns an honest `sccm\|unsupported` (points at Jamf/MDM); Linux `installed\|false` + "platform not supported" — `sccm_plugin.cpp` `__APPLE__` branch |
 | script_exec | ✅ | ✅ | ✅ | win/apple/linux. Different action sets per OS (`bash` POSIX-only; powershell/cmd on Windows) |
 | services | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `list`/`running` now emit `startup_type` (automatic/disabled/unknown) from a bulk `launchctl print-disabled` join (parser `services_macos_launchd.hpp`); `set_start_mode` rejects `manual` (launchd is binary enable/disable) |
@@ -130,7 +130,7 @@ duplicates.
 | storage | ✅ | ✅ | ✅ | portable — persistent KV store |
 | tags | ✅ | ✅ | ✅ | portable — `std::filesystem` |
 | **tar** | ✅ | 🟡 | 🟡 | Uneven by design — richest on Windows (ETW/dnsapi/registry), `/proc`-based on Linux, ES + scattered branches on macOS. Per-source depth is the **TAR warehouse capture sources** section above (`tar_schema_registry.cpp`) |
-| users | ✅ | ✅ | ✅ | linux/apple/win branches. macOS `local_users` now adds real `last_logon` (`last -y`) and a tri-state `console_state` GUI-login flag (`SCDynamicStoreCopyConsoleUser`, shared `macos_console_user.hpp`) |
+| users | ✅ | ✅ | ✅ | linux/apple/win branches. macOS `local_users` now adds real `last_logon` (`last -y`) and a tri-state `console_state` GUI-login flag (`SCDynamicStoreCopyConsoleUser`, shared `macos_console_user.hpp`); Windows `primary_user`/`session_history` now read the Security channel natively via wevtapi, and the POSIX account tools run as bounded argv invocations instead of a shell |
 | vuln_scan | ✅ | ✅ | ✅ | linux/apple/win branches |
 | wifi | ✅ | ✅ | ✅ | win/linux/apple all implemented; macOS `connected` via CoreWLAN (`wifi_corewlan.mm`), `list_networks` legacy `airport -s`/`system_profiler` (connection depth: the **Live — Wi-Fi current connection** row) |
 | windows_updates | ✅ | ✅ | ✅ | update history / rpm+apt / `system_profiler` install history (Linux/mac report installed-package history) |
@@ -662,26 +662,26 @@ implementation is.
 | tar | purge_source | macos | supported | 1 | sqlite | - |
 | tar | purge_source | windows | supported | 1 | sqlite | - |
 | users | logged_on | linux | supported | 1 | utmp (setutent/getutent) | - |
-| users | logged_on | macos | supported | 3 | runner /bin/sh -c 'who' | - |
+| users | logged_on | macos | supported | 2 | runner argv 'who' | - |
 | users | logged_on | windows | supported | 1 | WTSEnumerateSessionsW + WTSQuerySessionInformationW | - |
-| users | sessions | linux | supported | 3 | runner /bin/sh -c 'w -h' | - |
-| users | sessions | macos | supported | 3 | runner /bin/sh -c 'w -h' | - |
+| users | sessions | linux | supported | 2 | runner argv 'w -h' | - |
+| users | sessions | macos | supported | 2 | runner argv 'w -h' | - |
 | users | sessions | windows | supported | 1 | WTSEnumerateSessionsW + WTSQuerySessionInformationW | - |
-| users | local_users | linux | supported | 3 | /etc/passwd read + runner /bin/sh -c 'lastlog -u <user>' per account | - |
-| users | local_users | macos | supported | 3 | runner /bin/sh -c 'dscl . -list/-read UserShell/RealName' + 'last -y -1 <user>' per account | - |
+| users | local_users | linux | supported | 2 | /etc/passwd read + runner argv 'lastlog -u <user>' per account | - |
+| users | local_users | macos | supported | 2 | runner argv 'dscl . -list/-read UserShell/RealName' + 'last -y -1 <user>' per account | - |
 | users | local_users | windows | supported | 1 | NetUserEnum | - |
 | users | local_admins | linux | supported | 1 | getgrnam(sudo/wheel) + getpwuid(0) | - |
-| users | local_admins | macos | supported | 3 | runner /bin/sh -c 'dscl . -read /Groups/admin GroupMembership' | - |
+| users | local_admins | macos | supported | 2 | runner argv 'dscl . -read /Groups/admin GroupMembership' | - |
 | users | local_admins | windows | supported | 1 | NetLocalGroupGetMembers | - |
 | users | group_members | linux | supported | 1 | getgrnam + /etc/passwd primary-group scan | - |
-| users | group_members | macos | supported | 3 | runner /bin/sh -c 'dscl . -read /Groups/<name> GroupMembership' | - |
+| users | group_members | macos | supported | 2 | runner argv 'dscl . -read /Groups/<name> GroupMembership' | - |
 | users | group_members | windows | supported | 1 | NetLocalGroupGetMembers | - |
-| users | primary_user | linux | supported | 3 | runner /bin/sh -c 'last -F, piped through head -200' | - |
-| users | primary_user | macos | supported | 3 | runner /bin/sh -c 'last, piped through head -200' | - |
-| users | primary_user | windows | constrained | 3 | _popen(wevtutil qe Security EventID=4624) | falls back to an ungoverned _popen(reg query ProfileList) scan (no login-count) when the Security event log is inaccessible |
-| users | session_history | linux | supported | 3 | runner /bin/sh -c 'last -F -n <count>' | - |
-| users | session_history | macos | supported | 3 | runner /bin/sh -c 'last -n <count>' | - |
-| users | session_history | windows | constrained | 3 | _popen(wevtutil qe Security EventID=4624/4634) | requires an elevated/administrative token to read the Security event log; reports an error otherwise |
+| users | primary_user | linux | supported | 2 | runner argv 'last -F' (max_lines=200 cap) | - |
+| users | primary_user | macos | supported | 2 | runner argv 'last' (max_lines=200 cap) | - |
+| users | primary_user | windows | supported | 1 | wevtapi (EvtQuery/EvtRender, Security 4624) | falls back to a native ProfileList registry enumeration (no login count) when the Security channel is inaccessible |
+| users | session_history | linux | supported | 2 | runner argv 'last -F -n <count>' | - |
+| users | session_history | macos | supported | 2 | runner argv 'last -n <count>' | - |
+| users | session_history | windows | constrained | 1 | wevtapi (EvtQuery/EvtRender, Security 4624/4634) | requires an elevated token to read the Security channel; reports an error otherwise |
 | vuln_scan | scan | linux | supported | 3 | popen(pkg-manager+iptables/nft/ufw) | - |
 | vuln_scan | scan | macos | supported | 3 | popen(system_profiler/brew+security-checks) | - |
 | vuln_scan | scan | windows | supported | 1 | win32_registry | - |

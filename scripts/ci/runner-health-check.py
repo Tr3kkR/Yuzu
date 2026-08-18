@@ -83,6 +83,17 @@ WEETAM_POOL_LABELS = frozenset(
     {"self-hosted", "Windows", "X64", "yuzu-weetam-windows"}
 )
 
+# The BigMags macOS pool. ci.yml's `macos` job pins
+# runs-on: [self-hosted, macOS, ARM64, yuzu-bigmags-macos] because its
+# Apple-Silicon toolchain exists only on the BigMags Mac Minis; no
+# GitHub-hosted or Shulgi fallback can satisfy it. preflight emits
+# `bigmags_pool_healthy=true` iff >=1 such runner is online, so the pinned
+# job skips fast (fail-closed) instead of queueing forever against an
+# offline pool.
+BIGMAGS_POOL_LABELS = frozenset(
+    {"self-hosted", "macOS", "ARM64", "yuzu-bigmags-macos"}
+)
+
 
 class QueryState(str, Enum):
     """Trust state of the runner-control interface."""
@@ -123,6 +134,14 @@ def weetam_pool_members(expected: dict[str, Any]) -> list[str]:
     return [
         name for name, exp in expected.items()
         if WEETAM_POOL_LABELS.issubset(set(exp["labels"]))
+    ]
+
+
+def bigmags_pool_members(expected: dict[str, Any]) -> list[str]:
+    """Declared runners eligible for the BigMags macOS job pool."""
+    return [
+        name for name, exp in expected.items()
+        if BIGMAGS_POOL_LABELS.issubset(set(exp["labels"]))
     ]
 
 
@@ -301,7 +320,7 @@ def write_control_failure(expected: dict[str, Any], result: QueryResult) -> None
     """Emit a complete, typed unhealthy result for every consumer."""
     for name in expected:
         write_output(f"{slug(name)}_healthy", "false")
-    for pool in ("linux", "bigtam", "weetam"):
+    for pool in ("linux", "bigtam", "weetam", "bigmags"):
         write_output(f"{pool}_pool_healthy", "false")
     write_output("all_healthy", "false")
     write_output("control_state", result.state.value)
@@ -322,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--require-pool",
         action="append",
-        choices=("linux", "bigtam", "weetam"),
+        choices=("linux", "bigtam", "weetam", "bigmags"),
         default=[],
         help="In preflight mode, fail when this pool has no healthy member. Repeatable.",
     )
@@ -434,6 +453,7 @@ def main(argv: list[str] | None = None) -> int:
             "linux": linux_pool_members(expected),
             "bigtam": bigtam_pool_members(expected),
             "weetam": weetam_pool_members(expected),
+            "bigmags": bigmags_pool_members(expected),
         }
         pool_health = {
             pool_name: any(healthy_map.get(name, False) for name in members)
@@ -443,6 +463,8 @@ def main(argv: list[str] | None = None) -> int:
         # Big Tam sub-pool gate for the gcc-15/clang-21 compile job (26.04-only).
         write_output("bigtam_pool_healthy", "true" if pool_health["bigtam"] else "false")
         write_output("weetam_pool_healthy", "true" if pool_health["weetam"] else "false")
+        # BigMags macOS pool gate for the Apple-Silicon macos job.
+        write_output("bigmags_pool_healthy", "true" if pool_health["bigmags"] else "false")
         write_output("all_healthy", "true" if all_healthy else "false")
         write_output("control_state", QueryState.OK.value)
         if drift:

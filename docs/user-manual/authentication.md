@@ -642,7 +642,12 @@ curl -s -H "X-Yuzu-Token: yuzu_Ab3xK9m2..." \
   http://localhost:8080/api/v1/me
 ```
 
-API tokens are always granted full admin-level access. RBAC scoping for API tokens is planned for a future release.
+A plain, untiered, unscoped API token carries the creating user's own RBAC role and grants — it is
+not automatically admin unless its creator is. Two mechanisms narrow a token below that: an
+`mcp_tier` bounds what it can do through the MCP endpoint (see [MCP Token
+Restrictions](#mcp-token-restrictions) below), and a `scope_service` floors its session role to
+`user` regardless of the creator's role, so an `ITServiceOwner` RBAC grant becomes its sole
+authority ceiling (see [Service-Scoped Tokens](#service-scoped-tokens) below).
 
 ### Listing Tokens
 
@@ -709,6 +714,9 @@ Service-scoped tokens:
 - Require RBAC to be enabled; rejected if RBAC is disabled (403 Forbidden)
 - Must have `ITServiceOwner` role permission for the target operation
 - Are scoped to agents tagged with the matching `service` tag
+- Carry a session role floored to the base `user` level regardless of the
+  minting principal's own role — an `ITServiceOwner` RBAC grant is the sole
+  authority ceiling for a service-scoped token, never the minter's role
 
 ### Revoking a Token
 
