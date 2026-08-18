@@ -26,9 +26,9 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     if (!rbac_store_ || !rbac_store_->is_open()) {
         // Infrastructure unavailable, not a real authorization decision —
         // Degraded/503, aligned with the three sibling
-        // "authorization store unavailable" sites in auth_routes.cpp
-        // (630/811/1035, the engine-principal RBAC-store-unavailable
-        // branches): same wording, same status code. The 403/Forbidden this
+        // "authorization store unavailable" sites in auth_routes.cpp (the
+        // engine-principal RBAC-store-unavailable branches; grep the quoted
+        // string): same wording, same status code. The 403/Forbidden this
         // used to return was the outlier — a caller doing exponential
         // backoff on 503 would never retry a transient RBAC-store hiccup
         // that surfaced as a permanent-looking 403 (fjarvis/Kimi K2.7, PR

@@ -444,8 +444,9 @@ TEST_CASE("require_fleet_read: null rbac store ⇒ Degraded (not a crash)",
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == authz::GateFailure::Degraded);
     CHECK(res.status == 503);
-    // Pins the sibling-convention claim (auth_routes.cpp:630/811/1035): same
-    // text, same status, plus the retry_after_ms this specific branch adds.
+    // Pins the sibling-convention claim (the three "authorization store
+    // unavailable" sites in auth_routes.cpp): same text, same status, plus
+    // the retry_after_ms this specific branch adds.
     auto j = nlohmann::json::parse(res.body);
     CHECK(j["error"]["message"].get<std::string>() == "authorization store unavailable");
     CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == 5000);
