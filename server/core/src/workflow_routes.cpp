@@ -1008,9 +1008,48 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // -- Scope estimate API ----------------------------------------------------
 
+    // guardian-confinement-2298 PR3 §3e: /api/scope/estimate is auth_fn-only
+    // (no perm_fn at all) and probes an arbitrary caller-supplied scope
+    // expression against `scope_fn(expression, session->username)` — the
+    // minter's OWN visible fleet, which for a service-scoped token is still
+    // ITServiceOwner's full-CRUD-visible set (the route never consults
+    // token_scope_service). No per-target parameter to scope against, same
+    // gap class as deny_service_scoped_schedule_list above.
+    auto deny_service_scoped_scope_estimate = [auth_fn, audit_fn](const httplib::Request& req,
+                                                                   httplib::Response& res) -> bool {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return true; // auth_fn already wrote 401/redirect; caller returns.
+        if (session->token_scope_service.empty())
+            return false;
+        const auto cid = detail::make_correlation_id();
+        res.status = 403;
+        // No `.permission` label: this route has no perm_fn gate at all — a
+        // blanket deny with no grant that would admit a service-scoped
+        // token, so naming one would be a false self-remediation claim.
+        res.set_content(
+            detail::error_json_a4(
+                403, "service-scoped tokens may not estimate scope expressions against the fleet",
+                cid),
+            "application/json");
+        if (audit_fn) {
+            try {
+                audit_fn(req, "scope.estimate.access_denied", "denied", "scope_expression", "",
+                         "fleet-wide scope estimate denied to a service-scoped token");
+            } catch (const std::exception& e) {
+                spdlog::warn("scope.estimate.access_denied: audit_fn threw: {}", e.what());
+            } catch (...) {
+                spdlog::warn("scope.estimate.access_denied: audit_fn threw (non-std)");
+            }
+        }
+        return true;
+    };
+
     // POST /api/scope/estimate -- scope expression target count
-    sink.Post("/api/scope/estimate", [auth_fn, scope_fn](const httplib::Request& req,
-                                                         httplib::Response& res) {
+    sink.Post("/api/scope/estimate", [auth_fn, scope_fn, deny_service_scoped_scope_estimate](
+                                          const httplib::Request& req, httplib::Response& res) {
+        if (deny_service_scoped_scope_estimate(req, res))
+            return;
         auto session = auth_fn(req, res);
         if (!session)
             return;

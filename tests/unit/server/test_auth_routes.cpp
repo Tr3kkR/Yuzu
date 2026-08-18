@@ -962,6 +962,96 @@ TEST_CASE("AuthRoutes::require_scoped_permission — service-scoped token hard-4
 }
 
 // ---------------------------------------------------------------------------
+// AuthRoutes::deny_service_scoped_session (#2298 PR 3 §3e) — the shared gate
+// server.cpp's require_auth-only fragment/stream routes call directly, since
+// they never reach require_permission/require_scoped_permission at all (so
+// §3a/§3b's flip never runs for them). Needs no RBAC store — the fixture
+// leaves it nullptr, matching the function's own dependency (require_auth +
+// audit_log only).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::deny_service_scoped_session — a service-scoped token is denied",
+          "[pg][auth_routes][service_scope]") {
+    AuthRoutesFixture fix;
+    auto now = service_scope_flip_now_epoch();
+    auto raw = fix.api_tokens->create_token("scoped", "test_user", now + 3600, "printers", "");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_session(
+        req, res, "health.fragment.access_denied",
+        "service-scoped tokens may not read the fleet-wide health summary", "Health", "svc-1",
+        "Inventory:Read");
+    CHECK(must_return);
+    CHECK(res.status == 403);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["code"].get<int>() == 403);
+    CHECK(j["error"]["message"].get<std::string>().find("service-scoped tokens may not read") !=
+          std::string::npos);
+    CHECK(j["error"]["permission"].get<std::string>() == "Inventory:Read");
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res.get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
+}
+
+TEST_CASE("AuthRoutes::deny_service_scoped_session — default call (no explicit "
+          "permission) omits the A4 permission field",
+          "[pg][auth_routes][service_scope]") {
+    // Matches production's actual call shape — every server.cpp site calls
+    // this with 4 args, relying on the default. `permission` defaults empty
+    // (not a securable pair): every route this gate covers is a blanket
+    // deny with no grant that would admit a service-scoped token, so naming
+    // one would be a false self-remediation claim in the A4 body.
+    AuthRoutesFixture fix;
+    auto now = service_scope_flip_now_epoch();
+    auto raw = fix.api_tokens->create_token("scoped", "test_user", now + 3600, "printers", "");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_session(
+        req, res, "health.fragment.access_denied",
+        "service-scoped tokens may not read the fleet-wide health summary");
+    CHECK(must_return);
+    CHECK(res.status == 403);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK_FALSE(j["error"].contains("permission"));
+}
+
+TEST_CASE("AuthRoutes::deny_service_scoped_session — an ordinary (non-scoped) "
+          "session is unaffected (regression)",
+          "[pg][auth_routes][service_scope]") {
+    AuthRoutesFixture fix;
+    auto raw = fix.mint_token(); // no scope_service
+    auto req = request_with_header("Authorization", "Bearer " + raw);
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_session(
+        req, res, "health.fragment.access_denied",
+        "service-scoped tokens may not read the fleet-wide health summary");
+    CHECK_FALSE(must_return);
+    // res is untouched — httplib::Response defaults status to -1.
+    CHECK(res.status == -1);
+    CHECK(res.body.empty());
+}
+
+TEST_CASE("AuthRoutes::deny_service_scoped_session — no session at all defers to "
+          "require_auth's own 401 (defence-in-depth, unreachable behind the "
+          "pre-routing chokepoint today)",
+          "[pg][auth_routes][service_scope]") {
+    AuthRoutesFixture fix;
+    httplib::Request req; // no credential of any kind
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_session(
+        req, res, "health.fragment.access_denied",
+        "service-scoped tokens may not read the fleet-wide health summary");
+    CHECK(must_return);
+    CHECK(res.status == 401);
+}
+
+// ---------------------------------------------------------------------------
 // Bearer token length guard tests (#630 — Claude review F4/F6)
 // ---------------------------------------------------------------------------
 

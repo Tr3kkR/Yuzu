@@ -1322,6 +1322,29 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
     return ok;
 }
 
+bool AuthRoutes::deny_service_scoped_session(const httplib::Request& req, httplib::Response& res,
+                                             const std::string& action,
+                                             const std::string& message,
+                                             const std::string& target_type,
+                                             const std::string& target_id,
+                                             const std::string& permission) {
+    auto session = require_auth(req, res);
+    if (!session)
+        return true; // require_auth already wrote 401/redirect; caller returns.
+    if (session->token_scope_service.empty())
+        return false;
+    // Write the 403 FIRST, audit after: a throwing audit sink must not be
+    // able to suppress the 403 (mirrors the per-file deny_service_scoped_*
+    // family's ordering — see this method's declaration comment).
+    res.status = 403;
+    res.set_content(
+        detail::a4_denial(res, 403, message, detail::A4ErrorOpts{.permission = permission}),
+        "application/json");
+    audit_log(req, action, "denied", target_type, target_id,
+             message + " (path=" + req.path + ")");
+    return true;
+}
+
 void AuthRoutes::emit_event(const std::string& event_type, const httplib::Request& req,
                             const nlohmann::json& attrs, const nlohmann::json& payload_data,
                             Severity sev) {

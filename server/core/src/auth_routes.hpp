@@ -377,6 +377,41 @@ public:
                                  const std::string& detail = {},
                                  const std::string& principal_class_override = {});
 
+    /// guardian-confinement-2298 PR3 §3e — server.cpp's shared deny gate for
+    /// routes that reach agent/fleet/execution data via `require_auth`
+    /// alone, with no `require_permission`/`require_scoped_permission` call
+    /// at all (so the §3a flip never runs for them). Same
+    /// resolve-then-check-`token_scope_service`-then-403+audit shape and
+    /// throw-safety ordering (403 written before the audit call) as the
+    /// per-file `deny_service_scoped_*` family in guardian_routes.cpp /
+    /// dex_routes.cpp / deployment_routes.cpp / preflight_routes.cpp / etc.
+    /// — server.cpp gets its own copy here (rather than a free function)
+    /// because it already holds `auth_routes_` and delegates every other
+    /// auth primitive through it. Returns true iff the caller must return
+    /// immediately (either a written 401/redirect from `require_auth`, or
+    /// the 403 deny itself); false means the session is present and is not
+    /// service-scoped, so the caller proceeds. Deliberately does NOT touch
+    /// the §3a `yuzu_auth_service_scope_default_denied_total` metric — that
+    /// metric counts `require_permission`'s own default-deny branch, and
+    /// these routes never call it; counting them there would misrepresent
+    /// what "default denied at the flip" means.
+    ///
+    /// `permission` defaults EMPTY, not a securable pair — every route this
+    /// gate covers is a blanket deny with no RBAC grant that would admit a
+    /// service-scoped token (that's the whole point of §3e). A4's
+    /// `permission` field names "the missing grant" for a caller to
+    /// self-remediate; naming one that doesn't exist would be a false claim
+    /// (the A4 builder omits the field entirely when this is empty — see
+    /// `A4ErrorOpts::permission`'s doc comment). Pass a real securable pair
+    /// explicitly only if a future caller of this gate genuinely has one.
+    [[nodiscard]] bool deny_service_scoped_session(const httplib::Request& req,
+                                                   httplib::Response& res,
+                                                   const std::string& action,
+                                                   const std::string& message,
+                                                   const std::string& target_type = {},
+                                                   const std::string& target_id = {},
+                                                   const std::string& permission = {});
+
     /// Emit an analytics event with HTTP request context.
     void emit_event(const std::string& event_type, const httplib::Request& req,
                     const nlohmann::json& attrs = {}, const nlohmann::json& payload_data = {},

@@ -10649,8 +10649,15 @@ private:
         });
 
         // -- Health summary dashboard fragment (7.2) ----------------------------
+        // guardian-confinement-2298 PR3 §3e: require_auth-only, no
+        // per-target parameter — reports agent count, in-flight execution
+        // count, and store health fleet-wide.
         web_server_->Get("/fragments/health/summary", [this](const httplib::Request& req,
                                                              httplib::Response& res) {
+            if (auth_routes_->deny_service_scoped_session(
+                    req, res, "health.fragment.access_denied",
+                    "service-scoped tokens may not read the fleet-wide health summary"))
+                return;
             auto session = require_auth(req, res);
             if (!session)
                 return;
@@ -11405,6 +11412,19 @@ private:
             // route is the missing per-connection queue cap (`/api/v1/events` opts into
             // `kPerConnectionQueueCapDefault`; this one does not), which the lease does
             // NOT address — see ADR-0034 Decision 1.
+            // guardian-confinement-2298 PR3 §3e: this legacy stream has NO
+            // in-handler auth at all beyond the pre-routing 401 (see the
+            // block comment above) — `event_bus_.subscribe` below fans out
+            // raw agent ids, pending-agent ids, live command result rows,
+            // and command status/timing with no per-agent scoping. Deny a
+            // service-scoped session BEFORE the admission-control lease and
+            // BEFORE subscribe, so a denied caller never pins a worker or a
+            // bus subscription slot.
+            if (auth_routes_->deny_service_scoped_session(
+                    req, res, "events.stream.access_denied",
+                    "service-scoped tokens may not open the fleet-wide legacy event stream"))
+                return;
+
             std::string principal = "anonymous";
             std::size_t per_principal = detail::kPerPrincipalAnonymous;
             if (auth_routes_) {
@@ -12900,9 +12920,23 @@ private:
                          });
 
         // Owner-scoped sidebar list.
+        //
+        // guardian-confinement-2298 PR3 §3e: every result-set fragment below
+        // is require_auth-only, keyed on `session->username` — but that
+        // username is the MINTING principal's, not the individual token's
+        // own service scope. A service-scoped token therefore reaches every
+        // result set the minter (or any OTHER service token that same
+        // minter holds) has created/pinned — cross-service reach beyond
+        // this token's own intended cohort. Denied all six (one read here,
+        // detail below, plus pin/unpin/delete/create).
         web_server_->Get(
             "/fragments/result-sets/sidebar",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.sidebar.access_denied",
+                        "service-scoped tokens may not read the result-set sidebar",
+                        "ResultSet"))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session)
                     return;
@@ -12939,6 +12973,11 @@ private:
         web_server_->Get(
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/detail)",
             [this, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.detail.access_denied",
+                        "service-scoped tokens may not read result-set detail", "ResultSet",
+                        req.matches[1].str()))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session)
                     return;
@@ -12972,6 +13011,11 @@ private:
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/pin)",
             [this, rs_detail_after, rs_get_owned](const httplib::Request& req,
                                                   httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.pin.access_denied",
+                        "service-scoped tokens may not pin result sets", "ResultSet",
+                        req.matches[1].str()))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session || !result_set_store_)
                     return;
@@ -13007,6 +13051,11 @@ private:
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)",
             [this, rs_detail_after, rs_get_owned](const httplib::Request& req,
                                                   httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.unpin.access_denied",
+                        "service-scoped tokens may not unpin result sets", "ResultSet",
+                        req.matches[1].str()))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session || !result_set_store_)
                     return;
@@ -13037,6 +13086,11 @@ private:
         web_server_->Post(
             R"(/fragments/result-sets/(rs_[0-9a-f]+)/delete)",
             [this, rs_get_owned](const httplib::Request& req, httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.delete.access_denied",
+                        "service-scoped tokens may not delete result sets", "ResultSet",
+                        req.matches[1].str()))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session || !result_set_store_)
                     return;
@@ -13064,6 +13118,10 @@ private:
         web_server_->Post(
             "/fragments/result-sets/create",
             [this](const httplib::Request& req, httplib::Response& res) {
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "result_set.create.access_denied",
+                        "service-scoped tokens may not create result sets", "ResultSet"))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session || !result_set_store_)
                     return;
@@ -14249,6 +14307,14 @@ private:
 
         web_server_->Get(
             "/fragments/instructions", [this](const httplib::Request& req, httplib::Response& res) {
+                // guardian-confinement-2298 PR3 §3e: require_auth-only; the
+                // role check below (`can_author`) gates only the New/Edit
+                // buttons, not the definitions list itself.
+                if (auth_routes_->deny_service_scoped_session(
+                        req, res, "instructions.fragment.access_denied",
+                        "service-scoped tokens may not read the fleet-wide instruction "
+                        "definitions list"))
+                    return;
                 auto session = require_auth(req, res);
                 if (!session)
                     return;
