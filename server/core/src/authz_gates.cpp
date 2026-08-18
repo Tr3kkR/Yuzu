@@ -10,7 +10,7 @@ namespace yuzu::server {
 
 std::expected<authz::ListAuthority, authz::GateFailure>
 AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& res,
-                              const std::string& securable_type, const std::string& operation) {
+                               const std::string& securable_type, const std::string& operation) {
     auto session = require_auth(req, res);
     if (!session)
         // require_auth already wrote the 401 response (unaudited — matches
