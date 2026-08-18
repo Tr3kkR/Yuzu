@@ -86,6 +86,12 @@ elif host_machine.system() == 'windows'
   # its own copy, same shape as tar_test_deps' Windows block below.
   agent_test_native_deps += cxx.find_library('ws2_32')
   agent_test_native_deps += cxx.find_library('iphlpapi')
+  # test_wmi_bounded.cpp compiles agents/shared/wmi_bounded.cpp directly into
+  # this exe (same shape as tar_test_deps' Windows block) — bounded WMI needs
+  # WbemLocator (wbemuuid) + COM init/BSTR (ole32/oleaut32).
+  agent_test_native_deps += cxx.find_library('wbemuuid')
+  agent_test_native_deps += cxx.find_library('ole32')
+  agent_test_native_deps += cxx.find_library('oleaut32')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -253,6 +259,8 @@ agent_test_exe = executable(
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
+    'unit/test_wmi_bounded.cpp',        # shared bounded WMI helper (roadmap C-8 extraction)
+    '../agents/shared/wmi_bounded.cpp', # implementation under test; #ifdef _WIN32-gated, empty TU elsewhere
     'unit/test_installed_apps_registry_utf8.cpp',
     'unit/test_service_binpath.cpp',
     'unit/test_installed_apps_inventory.cpp',
