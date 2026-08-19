@@ -1,8 +1,8 @@
 #pragma once
 
 /// @file shutdown_watcher.hpp
-/// The agent's POSIX shutdown self-pipe: a signal handler writes ONE byte; a dedicated
-/// watcher thread wakes and runs the real teardown.
+/// POSIX shutdown self-pipe shared by the agent and server binaries (#3007): a signal
+/// handler writes ONE byte; a dedicated watcher thread wakes and runs the real teardown.
 ///
 /// WHY IT IS IN A HEADER, not buried in main.cpp. An earlier version of this lived in
 /// main.cpp, so the unit test could only RE-IMPLEMENT the pipe ("build it the same way the
@@ -80,7 +80,7 @@
 
 #include <spdlog/spdlog.h>
 
-namespace yuzu::agent {
+namespace yuzu {
 
 class ShutdownWatcher {
 public:
@@ -390,6 +390,6 @@ private:
     std::shared_ptr<WatcherState> state_;
 };
 
-} // namespace yuzu::agent
+} // namespace yuzu
 
 #endif // !_WIN32

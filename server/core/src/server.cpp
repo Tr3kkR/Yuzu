@@ -5388,8 +5388,9 @@ public:
 
     // Destruction must guarantee every background thread is joined before its
     // captured members are torn down. stop() does that join and is idempotent
-    // (guarded by the stop_entered_ CAS), so calling it here is safe even when
-    // the normal shutdown path already ran. Without this, a destruction that
+    // (guarded by the lifecycle_mu_/teardown_complete_ completion barrier — #3007),
+    // so calling it here is safe even when the normal shutdown path already ran.
+    // Without this, a destruction that
     // skips stop() — run() early-returning on a TLS/bind failure after the
     // policy-eval / health threads were spawned, or an exception during late
     // construction — would destroy a still-joinable std::thread and call
@@ -5805,9 +5806,10 @@ public:
         // halts the process instead of serving on the gRPC ports with a
         // broken web/SCIM surface. stop() is safe to call this early — every
         // thread/store it joins or resets is joinable()/nullptr-guarded, and
-        // it also runs from ~ServerImpl (guarded against double-entry by
-        // stop_entered_), so calling it here and letting the destructor run
-        // again afterward is a deliberate no-op the second time.
+        // it also runs from ~ServerImpl (guarded against double-entry by the
+        // lifecycle_mu_/teardown_complete_ completion barrier — #3007), so calling
+        // it here and letting the destructor run again afterward is a deliberate
+        // no-op the second time (same thread, sequential — not a wait).
         if (startup_failed_) {
             spdlog::error("run(): refusing to serve — startup failed in start_web_server() "
                          "(SCIM boot failure); stopping the already-started agent/management "
@@ -6903,14 +6905,34 @@ public:
     }
 
     void stop() noexcept override {
-        // Guard against re-entrant calls from repeated signals.
-        // The signal handler calls stop() directly, so a second Ctrl+C
-        // re-enters stop() on a different thread while the first is still
-        // joining threads — causing "Resource deadlock avoided".
-        bool expected = false;
-        if (!stop_entered_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            return; // Another thread is already running stop()
-        }
+        // COMPLETION BARRIER, not a bare re-entry flag (#3007; precedent:
+        // SparkEngine::stop(), agents/core/src/spark_engine.cpp). The old stop_entered_
+        // CAS let a losing caller (typically ~ServerImpl, on main) return IMMEDIATELY
+        // while another thread was still mid-teardown — main would then destroy
+        // pg_pool_/agent_service_/every store below while that thread was still using
+        // them, including through up to ~120s of the #3261 quiesce waits (UAF/
+        // double-free class). A second caller now BLOCKS here until the in-flight
+        // teardown has actually finished, then sees teardown_complete_ and returns
+        // having genuinely waited.
+        //
+        // Legal ONLY because stop() is no longer reachable from a real OS signal
+        // context: main.cpp's on_signal writes a self-pipe byte and a dedicated
+        // watcher thread calls stop() from ordinary thread context (mirroring
+        // agents/core/src/main.cpp), and a second SIGTERM/SIGINT hard-exits BEFORE
+        // taking any lock. Adding this barrier without that change first would
+        // recreate the double-Ctrl-C self-deadlock commit dea5bb8b5 fixed (two
+        // threads racing a blocking wait on the same non-recursive primitive).
+        //
+        // Self-join is unreachable: the only callers are the POSIX watcher thread, the
+        // Windows console-handler thread, and run()/~ServerImpl on the thread that
+        // constructed this object — never a thread this function itself joins. A
+        // same-thread re-entry (run()'s startup_failed_ early-return, later followed
+        // by ~ServerImpl) is sequential, not concurrent, so a non-recursive mutex is
+        // correct: the first call completes and sets teardown_complete_ before the
+        // second is ever reached.
+        std::lock_guard<std::mutex> life(lifecycle_mu_);
+        if (teardown_complete_)
+            return; // another call already ran stop() to completion
 
         spdlog::info("Shutting down server...");
         draining_.store(true, std::memory_order_release);
@@ -7105,14 +7127,12 @@ public:
             if (finished) {
                 web_thread_.join();
             } else {
-                // `stop()` is called synchronously and directly from the SIGTERM/SIGINT
-                // OS signal handler (`on_signal()`, main.cpp) — NOT deferred to a normal
-                // thread context. spdlog::critical()/flush() allocate and take internal
-                // locks, which is undefined behaviour inside a signal handler (the same
-                // class #73 fixed for the single log line at the top of on_signal(), but
-                // never eliminated from the rest of the synchronously-invoked stop() call
-                // graph — tracked as a systemic follow-up). Use only the async-signal-safe
-                // primitive already established there: a raw write() of a fixed message.
+                // #3007: stop() now runs on an ordinary thread (main.cpp's shutdown
+                // watcher / a Windows console-handler thread), never inside a real OS
+                // signal handler, so spdlog would be legal here. The raw write() stays
+                // anyway: std::_Exit() below skips atexit handling and any buffered
+                // spdlog sink flush, so a log call here could be silently lost — this
+                // write() is guaranteed to reach stderr before the process ends.
                 const char msg[] =
                     "ServerImpl::stop: web thread did not finish within the 15s shutdown "
                     "grace bound (#2703 Gate 7 item 2) - force-exiting.\n";
@@ -7559,16 +7579,14 @@ public:
         if (offload_wait.joinable())
             offload_wait.join();
         if (!webhook_drained || !offload_drained) {
-            // Async-signal-safe only (see the web_thread_ comment above for
-            // why spdlog is not used here): a raw write() of a fixed
-            // message, then _Exit. Skips the remaining teardown below,
-            // exactly as a supervisor SIGKILL would - strictly no worse.
-            // Three fixed literals rather than one shared string (Gate 8
-            // round-2, unhappy-path SHOULD: name which store, so an
-            // operator with only stderr in hand knows which configured
-            // endpoint to investigate) - still async-signal-safe, since
-            // selecting among fixed literals is a branch, not a format/
-            // allocation.
+            // #3007: stop() runs on an ordinary thread now (see the web_thread_ comment
+            // above), so spdlog would be legal — the raw write() stays because _Exit()
+            // below skips any buffered sink flush. A raw write() of a fixed message,
+            // then _Exit. Skips the remaining teardown below, exactly as a supervisor
+            // SIGKILL would - strictly no worse. Three fixed literals rather than one
+            // shared string (Gate 8 round-2, unhappy-path SHOULD: name which store, so
+            // an operator with only stderr in hand knows which configured endpoint to
+            // investigate).
             if (!webhook_drained && !offload_drained) {
                 const char msg[] =
                     "ServerImpl::stop: WebhookStore AND OffloadTargetStore did not quiesce "
@@ -7611,6 +7629,12 @@ public:
         agent_service_.set_tag_store(nullptr);
         tag_store_.reset();
         pg_pool_.reset();
+
+        // ONLY on full completion — a path above that escalates via std::_Exit(1)
+        // never reaches here and never marks the barrier complete (SparkEngine::stop()
+        // lesson: a flag set before a throwing/escaping teardown finishes would let a
+        // later caller wrongly believe teardown ran).
+        teardown_complete_ = true;
     }
 
 private:
@@ -19249,7 +19273,11 @@ private:
     std::thread engine_rotation_sweep_thread_;
 
     std::atomic<bool> stop_requested_{false};
-    std::atomic<bool> stop_entered_{false};
+    // Completion barrier for stop() (#3007) — see stop()'s own comment for why this
+    // replaced a bare stop_entered_ CAS and why the mutex is safe to hold across the
+    // whole ~700-line teardown body.
+    std::mutex lifecycle_mu_;
+    bool teardown_complete_ = false; // guarded by lifecycle_mu_
     std::atomic<bool> draining_{false};
 
     // Rate limiting
