@@ -24,8 +24,8 @@ bool deny_service_scoped_schedule(AuthRoutes& auth_routes, const httplib::Reques
     // (this call site used to set it unconditionally via `res.set_header`,
     // which `emplace`s into httplib's header multimap rather than replacing
     // in place — an upstream-minted cid wasn't overwritten so much as joined
-    // by a second entry, leaving which value the caller actually saw
-    // dependent on header-serialization order. Now reused instead — #3167).
+    // by a second entry, both of which reached the wire. Now reused
+    // instead — #3167).
     res.status = 403;
     res.set_content(
         detail::a4_denial(

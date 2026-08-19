@@ -370,10 +370,10 @@ TEST_CASE("deny_service_scoped_schedule: denies a service-scoped session, writes
         // Pre-#3167, this call site set X-Correlation-Id unconditionally via
         // res.set_header, which emplaces into httplib's header multimap
         // rather than replacing in place — an earlier gate's minted id would
-        // have gained a second entry rather than being overwritten, leaving
-        // which value the caller saw dependent on serialization order
-        // (unlike every sibling deny_service_scoped_* helper, which reuses
-        // via ensure_correlation_id). Pin the fixed behavior directly:
+        // have gained a second entry rather than being overwritten, both of
+        // which reach the wire (unlike every sibling deny_service_scoped_*
+        // helper, which reuses via ensure_correlation_id). Pin the fixed
+        // behavior directly:
         // empirically, this SECTION fails against the pre-#3167 code
         // (get_header_value returns the freshly-minted id, not the upstream
         // one), confirming it's a genuine, non-vacuous regression test.
