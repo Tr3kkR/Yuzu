@@ -175,6 +175,7 @@
 #include "scope_engine.hpp"
 #include "instruction_db_pool.hpp"
 #include "tag_store.hpp"
+#include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
 #include "webhook_store.hpp"
 #include "offload_target_store.hpp"
@@ -721,6 +722,13 @@ public:
                           "Oldest-progress frames dropped from a record's bounded arming mailbox "
                           "(terminals are never dropped)",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_progress_suppressed_total",
+                          "notifications/progress candidates dropped by the H1 monotonic-progress "
+                          "rule (#2438) - a duplicate or momentarily-decreasing snapshot from the "
+                          "bus, never forwarded to the client. Correct, expected movement under "
+                          "normal load; watch for a sustained high rate relative to "
+                          "yuzu_mcp_bridge_projector_cycles_total as a sign of upstream event churn",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_terminal_publish_failures_total",
                           "Terminal-frame publish failures seen by the bridge's "
                           "publish_final → fallback → poison ladder (Decision 15(f))",
@@ -818,14 +826,28 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
                           "Progress-bridge teardown steps that could not complete on the "
-                          "maintenance thread, by reason. DEFENCE IN DEPTH, not the live "
-                          "out-of-memory signal: all three steps allocate nothing, so only a "
-                          "mutex failure can reach them today - use "
+                          "maintenance thread on a given ATTEMPT, by reason - fires once per "
+                          "failed step per attempt, so a record retried 3 times moves this "
+                          "counter 3 times even though it is one strand, not three. DEFENCE IN "
+                          "DEPTH, not the live out-of-memory signal: all three steps allocate "
+                          "nothing, so only a mutex failure can reach them today - use "
                           "yuzu_mcp_stream_terminal_publish_failures_total for allocation "
-                          "pressure. The claim is one-way, so a record that fails here is never "
-                          "retried and what it still owns is held until the process restarts; a "
-                          "retained record also pins that session's whole stream state, its "
-                          "replay ring and any pinned finals. Alert on > 0",
+                          "pressure. A record whose teardown fails IS RETRIED by a later sweep "
+                          "(#2513), up to Config::teardown_retry_max times, before what it still "
+                          "owns is held until the process restarts; a retained record also pins "
+                          "that session's whole stream state, its replay ring and any pinned "
+                          "finals. This counter ALONE is not yet an incident - check "
+                          "yuzu_mcp_bridge_teardown_retry_total{outcome} next, which is the one "
+                          "to alert on",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_teardown_retry_total",
+                          "#2513: the final disposition of a retry pass's re-entry into a "
+                          "previously-incomplete teardown, by outcome (recovered|exhausted). "
+                          "exhausted means the record failed every attempt up to "
+                          "Config::teardown_retry_max and is now retained exactly like the "
+                          "pre-#2513 posture: until the process restarts. THIS is the metric to "
+                          "alert on, not teardown_incomplete alone, which moves on every attempt "
+                          "including ones that go on to recover",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_forced_expire_total",
                           "Parked progress-bridge records force-expired by the ring-only "
@@ -924,6 +946,7 @@ public:
         metrics_.gauge("yuzu_mcp_bridge_records_active").set(0);
         metrics_.counter("yuzu_mcp_bridge_listener_failures_total");
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
+        metrics_.counter("yuzu_mcp_bridge_progress_suppressed_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_bridge_projection_degraded_total");
         metrics_.counter("yuzu_mcp_stream_attach_audit_failures_total");
@@ -957,6 +980,11 @@ public:
         // fourth owned resource cannot be added without this loop following.
         for (auto stage : mcp::McpStreamBridge::kTeardownStageNames) {
             metrics_.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", stage}});
+        }
+        // #2513: CLOSED set, derived the same way, so a third retry outcome
+        // cannot ship without this seed following it.
+        for (auto outcome : mcp::McpStreamBridge::kTeardownRetryOutcomeNames) {
+            metrics_.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", outcome}});
         }
         // sre-N1 (#2489): CLOSED set, derived from TeardownFinal the same way, so a
         // fourth disposition cannot ship without this seed following it. Seeding
@@ -8512,8 +8540,8 @@ private:
                 // token), so the DISPATCH outcome is unchanged; the
                 // distinction is what makes a degraded read observable
                 // instead of silently indistinguishable from "no agents".
-                if (auto svc = tag_store_->agents_with_tag("service",
-                                                           sess.token_scope_service)) {
+                if (auto svc = tag_store_->agents_with_tag(
+                        std::string(authz::kServiceTagKey), sess.token_scope_service)) {
                     facts.service_tagged = std::unordered_set<std::string>(svc->begin(), svc->end());
                 } else {
                     spdlog::error("derive_exec_visible: tag store degraded resolving service "
@@ -13121,6 +13149,41 @@ private:
                 return;
             }
 
+            // #3289 hardening-round follow-up: normalize category keys to
+            // lowercase BEFORE anything downstream compares against them —
+            // mirrors the REST v1 twin (rest_api_v1.cpp), which already did
+            // this. Without it, a caller writing `key="Service"` (capital)
+            // stored the tag under the wrong case and silently skipped the
+            // `ensure_service_management_group` side effect below (a
+            // case-sensitive literal comparison), even though it isn't a
+            // security issue — the #3289 guard's own key check is already
+            // case-insensitive regardless of this normalization. Uses
+            // `kCategoryKeys` (the same constant the tag-push block 40 lines
+            // below already reads) rather than a second hardcoded literal
+            // list.
+            {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == lower_key) {
+                        key = lower_key;
+                        break;
+                    }
+                }
+            }
+
+            // #3289: a service-scoped token authorizing this write via
+            // require_scoped_permission below reads the PRE-WRITE `service`
+            // tag to decide admission — so without this guard it could
+            // authorize the very write that changes that tag out from under
+            // its own confinement. Value-blind, checked before the scoped
+            // gate. See deny_service_scoped_service_tag_mutation's doc
+            // comment (auth_routes.hpp).
+            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.set",
+                                                                       agent_id, key))
+                return;
+
             // K-04/CDX-R4-08: per-TARGET authorization -- NOT a global Tag:Write
             // gate. The old require_permission("Tag","Write") admitted a
             // service-scoped token on its ITServiceOwner grant with no target
@@ -13193,6 +13256,31 @@ private:
                     "application/json");
                 return;
             }
+
+            // Gate 4/#3289 hardening round: normalize category keys to
+            // lowercase, matching the /api/tags/set twin above — without
+            // this, deleting a key by the same case a caller just set it
+            // with (e.g. "Service") silently no-ops (TagStore::delete_tag
+            // finds no row stored under that exact case) instead of removing
+            // the tag, since /api/tags/set now stores the normalized form.
+            {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == lower_key) {
+                        key = lower_key;
+                        break;
+                    }
+                }
+            }
+
+            // #3289: same TOCTOU guard as /api/tags/set — a service-scoped
+            // token must not delete its own confinement key. See
+            // deny_service_scoped_service_tag_mutation's doc comment.
+            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.delete",
+                                                                       agent_id, key))
+                return;
 
             // K-04/CDX-R4-08: per-TARGET authorization (see /api/tags/set) --
             // a service-scoped token must not delete a tag on an out-of-scope

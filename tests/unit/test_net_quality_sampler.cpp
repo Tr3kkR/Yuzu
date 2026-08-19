@@ -3,10 +3,12 @@
  * (median, throughput delta, and the 4b.3 interval-retransmit-rate window),
  * plus the macOS syscall entry points (`read_net_counters()` /
  * `sample_net_quality()`, both YUZU_EXPORT), which are live-tested below since
- * the macOS suite runs on real macOS runners. The Linux netlink INET_DIAG path
- * is verified EMPIRICALLY on the Linux rig (rtt_p50 matches `ss -ti`; the
- * interval rate separates 0%/4%/12% netem loss) and the Windows GetIfTable2 /
- * GetTcpStatisticsEx path is exercised on its own live rig — neither here.
+ * the macOS suite runs on real macOS runners, and a Linux smoke test of the
+ * `/proc/net/dev` counter read (`read_net_counters()`). The Linux netlink
+ * INET_DIAG path is verified EMPIRICALLY on the Linux rig (rtt_p50 matches
+ * `ss -ti`; the interval rate separates 0%/4%/12% netem loss) and the Windows
+ * GetIfTable2 / GetTcpStatisticsEx path is exercised on its own live rig —
+ * neither here.
  */
 #include "net_quality_sampler.hpp"
 
@@ -133,6 +135,23 @@ TEST_CASE("RetransWindow: counter decrease (DWORD wrap) clamps, never negative",
 // that netem validation was run on Linux only and is tracked for Windows in
 // issue #1465. The cross-platform, deterministic helpers above (median /
 // throughput_bps / RetransWindow) are unit-tested everywhere.
+
+#ifdef __linux__
+// Linux smoke test: read_net_counters() is the /proc/net/dev read path — this
+// exercises the fgets + strtoull field walk (which replaced sscanf; glibc 2.38
+// __isoc23_* compatibility) end-to-end on the live procfs, mirroring the macOS
+// smoke test below.
+TEST_CASE("Linux: read_net_counters parses /proc/net/dev and finds live traffic",
+          "[netq][linux]") {
+    const NetCounters c = read_net_counters();
+    // A successful walk always sets valid=true (headers skipped, lines walked).
+    REQUIRE(c.valid);
+    // Every real Linux CI host has at least one non-loopback interface with
+    // since-boot traffic, so this forces the field walk to have actually
+    // converted the rx/tx byte counters — it fails if the parse always misses.
+    CHECK(c.rx_bytes + c.tx_bytes > 0);
+}
+#endif
 
 #ifdef __APPLE__
 // macOS smoke test: read_net_counters() is the NET_RT_IFLIST2 syscall path, so

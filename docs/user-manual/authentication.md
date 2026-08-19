@@ -733,13 +733,27 @@ by design. Widening what a service-scoped token can reach is a
 security-reviewed change to the server, not a per-token configuration
 option.
 
+**A service-scoped token may never write or delete the `service` tag
+itself (#3289)**, on any target device — in or out of its own scope. The
+`service` tag is the confinement boundary the token is checked against, so
+without this restriction a token could rewrite or delete its own cohort's
+`service` tag and move a device out of (or a different device into) its
+own confinement. Writing or deleting any OTHER tag key on an in-scope
+device is unaffected — only the `service` key is restricted, and the
+restriction applies regardless of the value being written (even
+re-asserting the token's own current value is denied). This does not
+affect a plain, non-service-scoped session's `Tag:Write`/`Tag:Delete`
+grant, which remains sufficient to set or move any device's `service` tag.
+
 **Bootstrap note.** A brand-new service token, on a brand-new install, has
 no other credential to fall back on — it cannot use itself to discover or
-claim a `service` tag for its own agents, or to widen its own reach. Stand
-up a new service's automation using an interactive session (or a plain,
-unscoped API token) for the one-time setup, and mint the service-scoped
-token only once the agents it should reach already carry the matching
-`service` tag.
+claim a `service` tag for its own agents, or to widen its own reach. As of
+#3289, an agent cannot self-claim a `service` tag on its own behalf either
+(its gRPC `Register` sync silently drops any `service` value it reports).
+Stand up a new service's automation using an interactive session (or a
+plain, unscoped API token) for the one-time setup, and mint the
+service-scoped token only once the agents it should reach already carry
+the matching, operator-or-API-assigned `service` tag.
 
 ### Revoking a Token
 
