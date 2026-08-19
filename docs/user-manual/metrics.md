@@ -933,7 +933,7 @@ every mechanism- and consumer-health counter below is **0** in production today 
 `_reporting`, `_disabled`, `_failed` and `_mechanisms` are the four that carry live
 signal, and none of them depends on a consumer being armed; the rest go live when
 rung 2 arms real rules. A `(metric, os[, mechanism])` nobody reported is **absent**,
-never a fabricated 0 (all eleven families are cleared and re-emitted every sweep, the
+never a fabricated 0 (all twelve families are cleared and re-emitted every sweep, the
 same idiom as `yuzu_fleet_net_*`). An agent started with `--spark-disable` reports
 `spark_running=0` + `spark_disabled=1`: it is absent from `_reporting` and counted in
 `_disabled`. An agent whose engine was enabled but **threw at boot** reports
@@ -943,11 +943,14 @@ split is what makes a fleet-wide spark boot failure visible at all.
 **All series carry an `os` label** — `file` and `registry` mechanisms are
 Windows-only, `service` is Windows + Linux, macOS has none — so **query and alert
 per OS, never `sum without(os)`** (a cross-OS aggregate is meaningless for a
-single-platform mechanism). The four mechanism counters additionally carry a
-`mechanism` label (`file` / `registry` / `service`). The mechanism counters are
-fleet **sums of monotonic per-agent counters**, so a bare `> 0` alert **latches**
+single-platform mechanism). Four families additionally carry a `mechanism` label
+(`file` / `registry` / `service`): `_watch_rejected`, `_quarantined` and `_slow_op`
+are fleet **sums of monotonic per-agent counters**, so a bare `> 0` alert **latches**
 until the reporting agent restarts — the shipped **counter** alert templates
-(disabled until rung 2) use `increase(...[15m]) > 0` instead. One rule ships
+(disabled until rung 2) use `increase(...[15m]) > 0` instead. `_unsupported` (F7,
+#2298 rung 2) is the exception: a **live current gauge**, not a counter - it can
+legally decrease, so it must never be alerted on with `increase()`/latching logic;
+see its own row below. One rule ships
 **active** today: `YuzuSparkBootFailed` on `_failed` (a per-sweep state gauge,
 latch-free) — warning severity, 30m hold (see `docs/prometheus/yuzu-alerts.yml`,
 group `yuzu-fleet-spark-rung1`).
