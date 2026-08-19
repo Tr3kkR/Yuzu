@@ -365,7 +365,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"}},"required":["agent_id","hostname","os","arch","agent_version"]}}},"required":["agents"]})j"},
 
     {"get_agent_details", "Get detailed info for a single agent including tags and inventory.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"arch":{"type":"string"},"agent_version":{"type":"string"},"tags":{"type":"array","items":{"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"source":{"type":"string"}},"required":["key","value","source"]}}},"required":["agent_id","hostname","os","arch","agent_version"]})j"},
 
     {"query_audit_log",
@@ -419,7 +419,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"tables":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"agent_count":{"type":"integer"},"last_collected":{"type":"integer"}},"required":["plugin","agent_count","last_collected"]}}},"required":["tables"]})j"},
 
     {"get_agent_inventory", "Get all inventory data for a specific agent.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Agent ID"}},"required":["agent_id"]})",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"description":"Agent ID"}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"records":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"data":{"type":"string"},"collected_at":{"type":"integer"}},"required":["plugin","data","collected_at"]}},"result_truncated_by_cap":{"type":"boolean"}},"required":["records","result_truncated_by_cap"]})j"},
 
     {"query_installed_software",
@@ -479,14 +479,14 @@ static const ToolDef kTools[] = {
 
     {"validate_scope",
      "Validate a scope expression without executing it. Returns parse errors if invalid.",
-     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression to validate"}},"required":["expression"]})",
+     R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression to validate"}},"required":["expression"]})",
      R"j({"oneOf":[)j"
      R"j({"type":"object","properties":{"valid":{"const":true},"expression":{"type":"string","description":"The input expression, echoed back verbatim (not canonicalized)"}},"required":["valid","expression"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"valid":{"const":false},"error":{"type":"string","description":"Parse error message"}},"required":["valid","error"],"additionalProperties":false})j"
      R"j(]})j"},
 
     {"preview_scope_targets", "Show which agents match a scope expression.",
-     R"({"type":"object","properties":{"expression":{"type":"string","description":"Scope expression"}},"required":["expression"]})",
+     R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
     {"list_pending_approvals", "List pending approval requests.",
@@ -822,7 +822,7 @@ static const ToolDef kTools[] = {
      "(cut N round-trips to 1). Each step is {plugin, action, params?}; 1-32 steps, distinct "
      "(plugin,action). Mirrors POST /api/v1/bundles. Requires Execution:Execute.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"The single target device — a bundle targets one device"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"description":"The single target device — a bundle targets one device"},)j"
      R"j("steps":{"type":"array","minItems":1,"maxItems":32,"description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
      R"j("plugin":{"type":"string"},"action":{"type":"string"},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string"}})j"
@@ -838,7 +838,7 @@ static const ToolDef kTools[] = {
      "succeeded=0); check succeeded==expected for success. Mirrors GET /api/v1/bundles/{id}. "
      "Requires Response:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("bundle_id":{"type":"string","description":"The bundle id (bundle-…) returned by execute_bundle"})j"
+     R"j("bundle_id":{"type":"string","minLength":1,"description":"The bundle id (bundle-…) returned by execute_bundle"})j"
      R"j(},"required":["bundle_id"]})j",
      R"j({"type":"object","properties":{)j"
      R"j("complete":{"type":"boolean","description":"True once every step is terminal - NOT a success signal, check succeeded==expected"},)j"
@@ -864,7 +864,11 @@ static const ToolDef kTools[] = {
      "POST /api/v1/ca/revoke. Destructive — requires Security:Delete (supervised MCP tier; "
      "approval-gated like every other destructive MCP op).",
      R"j({"type":"object","properties":{)j"
-     R"j("serial_hex":{"type":"string","description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
+     // #2444 item 1: mirrors the handler's own serial_ok check (serial.size()<=64
+     // + hex charset) exactly, so a malformed serial_hex is refused by schema
+     // (no ticket ever minted/consumed, #2441) instead of burning an
+     // already-approved ticket at the handler below.
+     R"j("serial_hex":{"type":"string","pattern":"^[0-9A-Fa-f]{1,64}$","maxLength":64,"description":"Cert serial (1-64 hex) from list_issued_certs"},)j"
      R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"})j"
      R"j(},"required":["serial_hex"]})j",
      R"j({"type":"object","properties":{"revoked":{"const":true},"serial_hex":{"type":"string"},"crl_republished":{"type":"boolean"},)j"
@@ -896,10 +900,16 @@ static const ToolDef kTools[] = {
      "MCP tier; maker-checker approval like every other privileged MCP op). Additive: creates a "
      "new identity, overwrites nothing.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Reserved namespace id, e.g. engine:vuln (must start with \"engine:\" + a non-empty lowercase/digit/./_/- slug)"},)j"
-     R"j("display_name":{"type":"string","description":"UI/audit label"},)j"
-     R"j("owner_username":{"type":"string","description":"Named responsible human; must reference an existing user"},)j"
-     R"j("justification":{"type":"string","description":"Grant justification captured at creation (feeds access reviews)"},)j"
+     // #2444 item 1: engine tools' principal_id shape (engine:<slug>, slug in
+     // [a-z0-9._-]+) is currently enforced ONLY in EnginePrincipalStore::create
+     // (store-side) — a malformed id passes schema, mints/consumes an approval
+     // ticket, then is rejected by the store. The pattern mirrors that store
+     // charset check exactly (never stricter — no invented length cap: neither
+     // the store nor the DB CHECK constraint bounds slug length).
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"Reserved namespace id, e.g. engine:vuln (must start with \"engine:\" + a non-empty lowercase/digit/./_/- slug)"},)j"
+     R"j("display_name":{"type":"string","minLength":1,"description":"UI/audit label"},)j"
+     R"j("owner_username":{"type":"string","minLength":1,"description":"Named responsible human; must reference an existing user"},)j"
+     R"j("justification":{"type":"string","minLength":1,"description":"Grant justification captured at creation (feeds access reviews)"},)j"
      R"j("classification":{"type":"string","enum":["internal","external"],"description":"Required at creation, no default"})j"
      R"j(},"required":["principal_id","display_name","owner_username","justification","classification"]})j",
      R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"created_at":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j"},
@@ -916,7 +926,7 @@ static const ToolDef kTools[] = {
      "Get one engine principal's identity row plus its active-credential count. Mirrors GET "
      "/api/v1/engine-principals/{id}. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"})j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"})j"
      R"j(},"required":["principal_id"]})j",
      R"j({"type":"object","properties":{"principal_id":{"type":"string"},"display_name":{"type":"string"},"owner_username":{"type":"string"},"justification":{"type":"string"},"classification":{"type":"string"},"lifecycle_state":{"type":"string"},"superseded_by":{"type":"string"},"created_at":{"type":"integer"},"revoked_at":{"type":"integer"},"created_by":{"type":"string"},"active_credentials":{"type":"integer"}},"required":["principal_id","lifecycle_state"]})j"},
 
@@ -929,7 +939,7 @@ static const ToolDef kTools[] = {
      "Mirrors DELETE /api/v1/engine-principals/{id}. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("reason":{"type":"string","description":"Optional revocation reason (audited)"},)j"
      R"j("superseded_by":{"type":"string","description":"Optional successor engine principal id, recorded on this row for audit trail continuity"})j"
      R"j(},"required":["principal_id"]})j",
@@ -946,7 +956,7 @@ static const ToolDef kTools[] = {
      "credential issuance; supervised MCP tier; maker-checker approval). Additive: issues the "
      "first credential, overwrites nothing.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("name":{"type":"string","description":"Human-readable credential label"},)j"
      R"j("ttl_days":{"type":"integer","default":90,"minimum":1,"maximum":90,"description":"Credential lifetime in days (90-day ceiling, design doc §7)"})j"
      R"j(},"required":["principal_id"]})j",
@@ -964,7 +974,7 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/credentials/rotate. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
      R"j(},"required":["principal_id"]})j",
      R"j({"type":"object","properties":{"token_id":{"type":"string"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"principal_id":{"type":"string"},"overlap_expires_at":{"type":"integer"}},"required":["token_id","raw_token","principal_id"]})j"},
@@ -996,8 +1006,14 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/credentials/confirm. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
-     R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"})j"
+     // #2444 item 1: token_id is minted as sha256_hex(raw).substr(0,24) —
+     // ApiTokenStore::mint/rotate (api_token_store.cpp) — always exactly 24
+     // lowercase hex chars. maxLength alone (the pre-#2444 schema) let a
+     // schema-valid-but-wrong-shape token_id mint/consume a ticket only to be
+     // rejected by confirm_rotation's own lookup; the pattern now bounds the
+     // exact shape so that rejection happens before a ticket is ever touched.
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
+     R"j("token_id":{"type":"string","pattern":"^[0-9a-f]{24}$","maxLength":24,"description":"Successor token_id returned by rotate_engine_credential (24 lowercase hex) - pins the exact rotation being confirmed"})j"
      R"j(},"required":["principal_id","token_id"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"principal_id":{"type":"string"}},"required":["confirmed","principal_id"]})j"},
 
@@ -1021,7 +1037,7 @@ static const ToolDef kTools[] = {
      "PREDECESSOR's own stamp (the successor row never carries one). Mirrors POST "
      "/api/v1/tokens/{id}/rotate. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
-     R"j("token_id":{"type":"string","maxLength":64,"description":"The token_id of the predecessor token being rotated — must be owned by the calling principal"},)j"
+     R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"The token_id of the predecessor token being rotated — must be owned by the calling principal"},)j"
      R"j("overlap_days":{"type":"integer","default":7,"minimum":1,"maximum":3650,"description":"Overlap window before the predecessor auto-revokes; rejected outright (never truncated) if it would fall below the 24h floor"})j"
      R"j(},"required":["token_id"]})j",
      R"j({"type":"object","properties":{"token_id":{"type":"string","description":"The successor's token_id, scoped exactly to the predecessor rotated"},"raw_token":{"type":"string","description":"One-time (or bounded-replay) reveal — capture now"},"expires_at":{"type":"integer","description":"The successor's expiry — inherited from the predecessor verbatim"},"overlap_expires_at":{"type":"integer","description":"The PREDECESSOR's own overlap-expiry stamp"}},"required":["token_id","raw_token","expires_at","overlap_expires_at"]})j"},
@@ -1044,7 +1060,7 @@ static const ToolDef kTools[] = {
      "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Mirrors "
      "POST /api/v1/tokens/{id}/confirm. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
-     R"j("token_id":{"type":"string","maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"})j"
+     R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"})j"
      R"j(},"required":["token_id"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"token_id":{"type":"string"}},"required":["confirmed","token_id"]})j"},
 
@@ -1056,8 +1072,8 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/transfer-owner. Destructive — requires Security:Write "
      "(supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"e.g. engine:vuln"},)j"
-     R"j("new_owner":{"type":"string","description":"Username of the new responsible human; must reference an existing user"})j"
+     R"j("principal_id":{"type":"string","pattern":"^engine:[a-z0-9._-]+$","description":"e.g. engine:vuln"},)j"
+     R"j("new_owner":{"type":"string","minLength":1,"description":"Username of the new responsible human; must reference an existing user"})j"
      R"j(},"required":["principal_id","new_owner"]})j",
      R"j({"type":"object","properties":{"transferred":{"type":"boolean"},"principal_id":{"type":"string"},"new_owner":{"type":"string"}},"required":["transferred","principal_id","new_owner"]})j"},
 
@@ -1094,8 +1110,8 @@ static const ToolDef kTools[] = {
      "Requires the operator or supervised MCP tier (Tag:Write). Fires the agent tag-push on "
      "a structured-category change, exactly like the REST path.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
-     R"j("key":{"type":"string","description":"Tag key (category keys role/environment/location/service are case-normalised)"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"description":"Target agent id"},)j"
+     R"j("key":{"type":"string","minLength":1,"description":"Tag key (category keys role/environment/location/service are case-normalised)"},)j"
      R"j("value":{"type":"string","description":"Tag value; category keys validate against their allowed set"})j"
      R"j(},"required":["agent_id","key","value"]})j",
      R"j({"type":"object","properties":{"set":{"const":true},"agent_id":{"type":"string"},"key":{"type":"string"},)j"
@@ -1110,8 +1126,8 @@ static const ToolDef kTools[] = {
      "call returns an approval ticket (kApprovalRequired), re-call with the returned approval_id "
      "after an admin approves.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
-     R"j("key":{"type":"string","description":"Tag key to delete"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"description":"Target agent id"},)j"
+     R"j("key":{"type":"string","minLength":1,"description":"Tag key to delete"},)j"
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
      R"j(},"required":["agent_id","key"]})j",
      R"j({"type":"object","properties":{"deleted":{"const":true},"agent_id":{"type":"string"},"key":{"type":"string"},)j"
@@ -1126,7 +1142,7 @@ static const ToolDef kTools[] = {
      "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
      "reviewer cannot be the submitter.",
      R"j({"type":"object","properties":{)j"
-     R"j("approval_id":{"type":"string","description":"Id of the pending approval to approve"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to approve"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
      R"j(},"required":["approval_id"]})j",
      R"j({"type":"object","properties":{"approved":{"const":true},"approval_id":{"type":"string"},)j"
@@ -1141,7 +1157,7 @@ static const ToolDef kTools[] = {
      "interchangeable response shapes). Requires Approval:Approve, supervised MCP tier. The "
      "reviewer cannot be the submitter.",
      R"j({"type":"object","properties":{)j"
-     R"j("approval_id":{"type":"string","description":"Id of the pending approval to reject"},)j"
+     R"j("approval_id":{"type":"string","minLength":1,"description":"Id of the pending approval to reject"},)j"
      R"j("comment":{"type":"string","description":"Optional reviewer comment (audited)"})j"
      R"j(},"required":["approval_id"]})j",
      R"j({"type":"object","properties":{"rejected":{"const":true},"approval_id":{"type":"string"},)j"
@@ -1155,9 +1171,18 @@ static const ToolDef kTools[] = {
      "approval-gated on the supervised tier — the first call returns an approval ticket, re-call "
      "with the returned approval_id after an admin approves.",
      R"j({"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string","description":"Target agent id"},)j"
-     R"j("reason":{"type":"string","description":"Optional quarantine reason (audited)"},)j"
-     R"j("whitelist":{"type":"string","description":"Comma-separated extra IPs to allow through the isolation firewall"},)j"
+     // #2444 item 1: mirror the handler's own limits so an oversized/off-charset
+     // reason or whitelist is refused by schema instead of burning an
+     // already-approved ticket. reason's bound is length-only (free text,
+     // audited verbatim); whitelist's pattern is a CHARSET superset of the
+     // handler's per-token safe_ip check (hex digits, '.', ':', separated by
+     // ',' and optional spaces) — deliberately not a byte-for-byte replica of
+     // the token-splitting/45-char-per-token logic (that stays handler-side,
+     // #2444: risk of a schema/handler mismatch false-rejecting a legal
+     // whitelist outweighs closing the last sliver of this burn class).
+     R"j("agent_id":{"type":"string","minLength":1,"description":"Target agent id"},)j"
+     R"j("reason":{"type":"string","maxLength":1024,"description":"Optional quarantine reason (audited)"},)j"
+     R"j("whitelist":{"type":"string","maxLength":512,"pattern":"^[0-9A-Fa-f.:, ]*$","description":"Comma-separated extra IPs to allow through the isolation firewall"},)j"
      R"j("approval_id":{"type":"string","description":"Approval ticket id from a prior kApprovalRequired response; supply after admin approval to execute"})j"
      R"j(},"required":["agent_id"]})j",
      R"j({"type":"object","properties":{)j"
@@ -1184,8 +1209,11 @@ static const ToolDef kTools[] = {
      "/api/v1/engine-principals/{id}/roles. Requires Security:Write (supervised MCP tier; "
      "approval-gated like every other Security:Write operation).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
-     R"j("role":{"type":"string","description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
+     // #2444 item 1: the bare-slug charset check (A1, [a-z0-9._-]+) runs
+     // AFTER the ticket is minted/consumed today — same handler-side pattern
+     // as the engine:<slug> form above, just without the prefix.
+     R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix (e.g. vuln-viewer)"},)j"
+     R"j("role":{"type":"string","minLength":1,"description":"An existing RBAC role name (see discover_permissions for the catalog); admin/Administrator/any built-in system role is rejected"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"assigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
@@ -1198,8 +1226,8 @@ static const ToolDef kTools[] = {
      "module may be actively relying on; verify the module doesn't need this role before "
      "calling. Requires Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
-     R"j("role":{"type":"string","description":"The role name to revoke"})j"
+     R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix"},)j"
+     R"j("role":{"type":"string","minLength":1,"description":"The role name to revoke"})j"
      R"j(},"required":["principal_id","role"]})j",
      R"j({"type":"object","properties":{"unassigned":{"type":"boolean"},"principal_id":{"type":"string"},"role":{"type":"string"},)j"
      R"j("audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"})j"
@@ -1211,7 +1239,7 @@ static const ToolDef kTools[] = {
      "to audit what an autonomous module can actually do right now. Mirrors GET "
      "/api/v1/engine-principals/{id}/roles. Requires EnginePrincipal:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("principal_id":{"type":"string","description":"Engine principal slug WITHOUT the engine: prefix"})j"
+     R"j("principal_id":{"type":"string","pattern":"^[a-z0-9._-]+$","description":"Engine principal slug WITHOUT the engine: prefix"})j"
      R"j(},"required":["principal_id"]})j",
      R"j({"type":"object","properties":{"principal_id":{"type":"string"},"count":{"type":"integer"},)j"
      R"j("roles":{"type":"array","items":{"type":"object","properties":{"principal_id":{"type":"string"},"role":{"type":"string"}},"required":["principal_id","role"]}})j"
@@ -1230,7 +1258,7 @@ static const ToolDef kTools[] = {
      "requires_external_connector, unsafe_without_approval, or outside_yuzu_scope. Use this "
      "before planning incident work, especially for OpenShift, KVM, database, and SaaS asks. "
      "Advisory classification only, not a security gate.",
-     R"({"type":"object","properties":{"question":{"type":"string","maxLength":2048}},"required":["question"]})",
+     R"({"type":"object","properties":{"question":{"type":"string","minLength":1,"maxLength":2048}},"required":["question"]})",
      kObjectOutputSchema},
     {"get_incident_playbook",
      "Return the recommended Yuzu investigation workflow for a named incident scenario, including "
@@ -1282,7 +1310,7 @@ static const ToolDef kTools[] = {
      "confidence. MACHINE-SCOPE FACTS ONLY: the per-user user_ref personal data (Decision "
      "11) is NOT returned here — it is served only by the audited, management-group-scoped "
      "REST drill. Requires SoftwareLicensing:Read.",
-     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","maxLength":256}},"required":["agent_id"]})",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","minLength":1,"maxLength":256}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"licenses":{"type":"array","items":{"type":"object","properties":{"product":{"type":"string"},"vendor":{"type":"string"},"version":{"type":"string"},"license_type":{"type":"string"},"state":{"type":"string"},"expiry_at":{"type":"integer"},"channel":{"type":"string"},"key_hint":{"type":"string"},"detector":{"type":"string"},"confidence":{"type":"string"},"exe_hints":{"type":"string"}}}}},"required":["agent_id","count","licenses"]})j"},
 
     // ── Periodic Access Reviews (SOC 2 CC6.2) — MCP twins of
@@ -1312,7 +1340,7 @@ static const ToolDef kTools[] = {
      "evidence and does not itself change any access grant — destructiveHint:false. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("title":{"type":"string","description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
+     R"j("title":{"type":"string","minLength":1,"description":"Human-readable campaign name, e.g. 'Q3 2026 Access Review'"})j"
      R"j(},"required":["title"]})j",
      R"j({"type":"object","properties":{"campaign_id":{"type":"string"},"grant_count":{"type":"integer"}},"required":["campaign_id","grant_count"]})j"},
 
@@ -1329,10 +1357,10 @@ static const ToolDef kTools[] = {
      "POST /api/v1/access-reviews/{id}/attestations. Self-audited as access_review.attested "
      "or access_review.flagged (by decision). Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string"},)j"
+     R"j("campaign_id":{"type":"string","minLength":1},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"]},)j"
-     R"j("principal_id":{"type":"string"},)j"
-     R"j("role_name":{"type":"string"},)j"
+     R"j("principal_id":{"type":"string","minLength":1},)j"
+     R"j("role_name":{"type":"string","minLength":1},)j"
      R"j("decision":{"type":"string","enum":["attested","flagged_revoke"]},)j"
      R"j("justification":{"type":"string"})j"
      R"j(},"required":["campaign_id","principal_type","principal_id","role_name","decision"]})j",
@@ -1344,7 +1372,7 @@ static const ToolDef kTools[] = {
      "/api/v1/access-reviews/{id}. Self-audited as access_review.get. Requires "
      "AccessReview:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string"})j"
+     R"j("campaign_id":{"type":"string","minLength":1})j"
      R"j(},"required":["campaign_id"]})j",
      R"j({"type":"object","properties":{"campaign":{"type":"object"},"attestations":{"type":"array"},"pending_count":{"type":"integer"}},"required":["campaign","attestations","pending_count"]})j"},
 
@@ -1366,7 +1394,7 @@ static const ToolDef kTools[] = {
      "untouched), but the campaign's own open->closed state is irreversibly transitioned. "
      "Requires AccessReview:Attest.",
      R"j({"type":"object","properties":{)j"
-     R"j("campaign_id":{"type":"string"})j"
+     R"j("campaign_id":{"type":"string","minLength":1})j"
      R"j(},"required":["campaign_id"]})j",
      R"j({"type":"object","properties":{"closed":{"type":"boolean"}},"required":["closed"]})j"},
 

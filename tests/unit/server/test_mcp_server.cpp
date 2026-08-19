@@ -11022,8 +11022,12 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
          nlohmann::json::parse(R"({"principal_id":"engine:v","new_owner":"o2"})")},
         {"mint_engine_credential", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
         {"rotate_engine_credential", nlohmann::json::parse(R"({"principal_id":"engine:v"})")},
+        // #2444 item 1: token_id must satisfy the schema's ^[0-9a-f]{24}$
+        // pattern (24 lowercase hex, mirroring ApiTokenStore's
+        // sha256_hex(...).substr(0,24) token_id shape).
         {"confirm_engine_rotation",
-         nlohmann::json::parse(R"({"principal_id":"engine:v","token_id":"t1"})")},
+         nlohmann::json::parse(
+             R"({"principal_id":"engine:v","token_id":"aaaaaaaaaaaaaaaaaaaaaaaa"})")},
         {"assign_engine_role",
          nlohmann::json::parse(R"({"principal_id":"vuln-viewer","role":"Operator"})")},
         {"unassign_engine_role",
@@ -11075,6 +11079,101 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
     }
 }
 
+TEST_CASE("MCP 2444: item 1 schema tightenings reject at compile-validate on the REAL served "
+          "schemas",
+          "[mcp][2g][schema]") {
+    // Real kTools[] schemas, not synthetic ones — proves the served strings
+    // (not just the compiler's keyword logic) carry the tightened bounds.
+    using yuzu::server::mcp::compile_input_schema;
+    std::map<std::string, std::string> schemas;
+    for (const auto& row : input_schemas_for_test())
+        schemas.emplace(row.name, row.schema_json);
+
+    // revoke_certificate.serial_hex: pattern ^[0-9A-Fa-f]{1,64}$ + maxLength 64
+    // mirrors the handler's serial_ok check exactly (mcp_server.cpp).
+    {
+        auto c = compile_input_schema(schemas.at("revoke_certificate"));
+        REQUIRE(c);
+        CHECK_FALSE(c->validate(nlohmann::json::parse(R"({"serial_hex":"AB12"})")));
+        auto bad_char = c->validate(nlohmann::json::parse(R"({"serial_hex":"ZZ12"})"));
+        REQUIRE(bad_char);
+        CHECK(bad_char->path == "/serial_hex");
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"serial_hex":")" + std::string(65, 'a') + R"("})")));
+        CHECK(c->validate(nlohmann::json::parse(R"({"serial_hex":""})")));
+    }
+    // engine tools' principal_id: engine:<slug> shape, slug in [a-z0-9._-]+ —
+    // mirrors EnginePrincipalStore::create's store-side charset check. Every
+    // OTHER required field is filled in with a valid value so the "missing
+    // required property" check (which runs before per-property validation)
+    // cannot mask the principal_id pattern violation being tested here.
+    const std::map<std::string, std::string> other_required_fields = {
+        {"create_engine_principal",
+         R"("display_name":"d","owner_username":"o","justification":"j","classification":"internal")"},
+        {"get_engine_principal", ""},
+        {"revoke_engine_principal", ""},
+        {"mint_engine_credential", ""},
+        {"rotate_engine_credential", ""},
+        {"transfer_engine_principal_owner", R"("new_owner":"o2")"},
+    };
+    for (const auto& [tool, extra] : other_required_fields) {
+        INFO("tool: " << tool);
+        auto c = compile_input_schema(schemas.at(tool));
+        REQUIRE(c);
+        auto with_pid = [&](const std::string& pid) {
+            std::string body = R"({"principal_id":")" + pid + R"(")";
+            if (!extra.empty())
+                body += "," + extra;
+            body += "}";
+            return nlohmann::json::parse(body);
+        };
+        auto v = c->validate(with_pid("vuln"));
+        REQUIRE(v); // missing "engine:" prefix
+        CHECK(v->path == "/principal_id");
+        CHECK(c->validate(with_pid("engine:"))); // empty slug
+        CHECK(c->validate(with_pid("engine:Has-Upper"))); // uppercase not allowed
+        CHECK_FALSE(c->validate(with_pid("engine:vuln"))); // the valid shape passes
+    }
+    // assign_engine_role/unassign_engine_role/list_engine_roles: bare slug
+    // form (no "engine:" prefix) — same charset, different shape.
+    for (const char* tool : {"assign_engine_role", "unassign_engine_role", "list_engine_roles"}) {
+        INFO("tool: " << tool);
+        auto c = compile_input_schema(schemas.at(tool));
+        REQUIRE(c);
+        CHECK(c->validate(nlohmann::json::parse(R"({"principal_id":"engine:vuln"})")));
+        CHECK(c->validate(nlohmann::json::parse(R"({"principal_id":""})")));
+    }
+    // confirm_engine_rotation.token_id: exactly 24 lowercase hex (ApiTokenStore's
+    // sha256_hex(...).substr(0,24) shape).
+    {
+        auto c = compile_input_schema(schemas.at("confirm_engine_rotation"));
+        REQUIRE(c);
+        CHECK_FALSE(c->validate(nlohmann::json::parse(
+            R"({"principal_id":"engine:v","token_id":"aaaaaaaaaaaaaaaaaaaaaaaa"})")));
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"principal_id":"engine:v","token_id":"AAAAAAAAAAAAAAAAAAAAAAAA"})"))); // uppercase
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"principal_id":"engine:v","token_id":"aaaa"})"))); // too short
+    }
+    // quarantine_device.reason (<=1024) / whitelist (<=512, charset).
+    {
+        auto c = compile_input_schema(schemas.at("quarantine_device"));
+        REQUIRE(c);
+        CHECK_FALSE(c->validate(nlohmann::json::parse(R"({"agent_id":"a"})")));
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"agent_id":"a","reason":")" + std::string(1025, 'x') + R"("})")));
+        CHECK(c->validate(nlohmann::json::parse(
+            R"({"agent_id":"a","whitelist":")" + std::string(513, '1') + R"("})")));
+        // Charset: hex digits, '.', ':', ',', ' ' only — mirrors the handler's
+        // safe_ip per-token check (a superset, per the code comment: the
+        // token-splitting/45-char-per-token structure stays handler-side).
+        CHECK(c->validate(
+            nlohmann::json::parse(R"({"agent_id":"a","whitelist":"10.0.0.1;rm -rf /"})")));
+        CHECK_FALSE(c->validate(
+            nlohmann::json::parse(R"({"agent_id":"a","whitelist":"10.0.0.1, ::1"})")));
+    }
+}
+
 TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at the gate",
           "[mcp][integration][approval][schema]") {
     // The pure-compiler test proves the keyword LOGIC on synthetic schemas;
@@ -11115,7 +11214,8 @@ TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at th
         deny(
             R"({"jsonrpc":"2.0","method":"tools/call","id":321,"params":{"name":"mint_engine_credential","arguments":{"principal_id":"engine:v","ttl_days":91}}})",
             "'/ttl_days'");
-        // maxLength: confirm_engine_rotation.token_id <= 64 bytes.
+        // maxLength (#2444 item 1 tightened this to 24, alongside the new
+        // ^[0-9a-f]{24}$ pattern — a 65-char value still exceeds both).
         deny((std::string(
                   R"({"jsonrpc":"2.0","method":"tools/call","id":322,"params":{"name":"confirm_engine_rotation","arguments":{"principal_id":"engine:v","token_id":")") +
               std::string(65, 'a') + R"("}}})")
