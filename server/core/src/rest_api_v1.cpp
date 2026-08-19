@@ -25,6 +25,7 @@
 #include "rest_a4_envelope.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
+#include "service_scope_policy.hpp" // authz::service_scope_may_mutate_tag_key — #3289
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric
 #include "web_utils.hpp"  // audit_token (H1 — neutralise k=v audit-field forgery)
@@ -4788,7 +4789,8 @@ void RestApiV1::register_routes(
                               tag_push_fn](const httplib::Request& req, httplib::Response& res) {
         // CDX-R4-02: authenticate BEFORE any store/body work (401 first, never a
         // 503/400 to an unauthenticated caller).
-        if (!auth_fn(req, res))
+        auto session = auth_fn(req, res);
+        if (!session)
             return;
         // CDX-R2-003/CDX-03: authorization is the per-target scoped gate ALONE
         // (below, once agent_id is parsed) — no global Tag:Write pre-gate. The
@@ -4828,6 +4830,24 @@ void RestApiV1::register_routes(
         if (agent_id.empty() || key.empty()) {
             res.status = 400;
             res.set_content(detail::a4_error(res, "agent_id and key required"), "application/json");
+            return;
+        }
+
+        // #3289: a service-scoped token authorizing this write via
+        // scoped_perm_fn below reads the PRE-WRITE `service` tag to decide
+        // admission — without this guard it could authorize the very write
+        // that changes that tag out from under its own confinement.
+        // Value-blind, checked before the scoped gate. No `.permission` — no
+        // grant admits a service-scoped session past this rule.
+        if (!authz::service_scope_may_mutate_tag_key(session->token_scope_service, key)) {
+            audit_fn(req, "tag.set", "denied", "Tag", agent_id + ":" + key,
+                    "service-scoped token blocked: cannot mutate the service tag");
+            res.status = 403;
+            res.set_content(
+                detail::a4_error(res, "a service-scoped token may not modify the 'service' "
+                                      "tag (it defines the token's own confinement); ask an "
+                                      "operator to re-assign the agent's service"),
+                "application/json");
             return;
         }
 
@@ -4886,7 +4906,8 @@ void RestApiV1::register_routes(
         [auth_fn, scoped_perm_fn, audit_fn, tag_store](const httplib::Request& req,
                                                        httplib::Response& res) {
             // CDX-R4-02: authenticate BEFORE any store/body work (401 first).
-            if (!auth_fn(req, res))
+            auto session = auth_fn(req, res);
+            if (!session)
                 return;
             // CDX-R2-003/CDX-03: scoped gate ALONE (no global Tag:Delete
             // pre-gate that would 403 a management-group-scoped operator before
@@ -4899,6 +4920,20 @@ void RestApiV1::register_routes(
 
             auto agent_id = req.matches[1].str();
             auto key = req.matches[2].str();
+            // #3289: same TOCTOU guard as PUT above — a service-scoped
+            // token must not delete its own confinement key.
+            if (!authz::service_scope_may_mutate_tag_key(session->token_scope_service, key)) {
+                audit_fn(req, "tag.delete", "denied", "Tag", agent_id + ":" + key,
+                        "service-scoped token blocked: cannot mutate the service tag");
+                res.status = 403;
+                res.set_content(
+                    detail::a4_error(res, "a service-scoped token may not modify the "
+                                          "'service' tag (it defines the token's own "
+                                          "confinement); ask an operator to re-assign the "
+                                          "agent's service"),
+                    "application/json");
+                return;
+            }
             // H1 / CDX-P2-003 / K-01: the SOLE per-target authorization — same
             // tag-boundary confinement as the PUT twin above. A service-scoped
             // token must not delete a tag (e.g. `service`) on an agent outside

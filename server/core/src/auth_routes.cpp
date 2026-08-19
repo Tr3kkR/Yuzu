@@ -1417,6 +1417,37 @@ bool AuthRoutes::deny_service_scoped_session(const httplib::Request& req, httpli
     return true;
 }
 
+bool AuthRoutes::deny_service_scoped_service_tag_mutation(const httplib::Request& req,
+                                                            httplib::Response& res,
+                                                            const std::string& action,
+                                                            const std::string& agent_id,
+                                                            const std::string& key) {
+    auto session = require_auth(req, res);
+    if (!session)
+        return true; // require_auth already wrote 401/redirect; caller returns.
+    if (authz::service_scope_may_mutate_tag_key(session->token_scope_service, key))
+        return false;
+    // Write the 403 FIRST, audit after — same throw-safety ordering as
+    // deny_service_scoped_session immediately above.
+    res.status = 403;
+    res.set_content(
+        detail::a4_denial(res, 403,
+                          "a service-scoped token may not modify the 'service' tag (it "
+                          "defines the token's own confinement); ask an operator to "
+                          "re-assign the agent's service"),
+        "application/json");
+    try {
+        audit_log(req, action, "denied", "Agent", agent_id + ":" + key,
+                 "service-scoped token blocked: cannot mutate the service tag (path=" +
+                     req.path + ")");
+    } catch (const std::exception& e) {
+        spdlog::warn("deny_service_scoped_service_tag_mutation: audit_log threw: {}", e.what());
+    } catch (...) {
+        spdlog::warn("deny_service_scoped_service_tag_mutation: audit_log threw (non-std)");
+    }
+    return true;
+}
+
 void AuthRoutes::emit_event(const std::string& event_type, const httplib::Request& req,
                             const nlohmann::json& attrs, const nlohmann::json& payload_data,
                             Severity sev) {

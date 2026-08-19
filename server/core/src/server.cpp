@@ -12878,6 +12878,17 @@ private:
                 return;
             }
 
+            // #3289: a service-scoped token authorizing this write via
+            // require_scoped_permission below reads the PRE-WRITE `service`
+            // tag to decide admission — so without this guard it could
+            // authorize the very write that changes that tag out from under
+            // its own confinement. Value-blind, checked before the scoped
+            // gate. See deny_service_scoped_service_tag_mutation's doc
+            // comment (auth_routes.hpp).
+            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.set",
+                                                                       agent_id, key))
+                return;
+
             // K-04/CDX-R4-08: per-TARGET authorization -- NOT a global Tag:Write
             // gate. The old require_permission("Tag","Write") admitted a
             // service-scoped token on its ITServiceOwner grant with no target
@@ -12950,6 +12961,13 @@ private:
                     "application/json");
                 return;
             }
+
+            // #3289: same TOCTOU guard as /api/tags/set — a service-scoped
+            // token must not delete its own confinement key. See
+            // deny_service_scoped_service_tag_mutation's doc comment.
+            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.delete",
+                                                                       agent_id, key))
+                return;
 
             // K-04/CDX-R4-08: per-TARGET authorization (see /api/tags/set) --
             // a service-scoped token must not delete a tag on an out-of-scope
