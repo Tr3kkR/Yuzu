@@ -4518,9 +4518,9 @@ TEST_CASE("MCP Integration: tools/call unknown tool returns error", "[mcp][integ
           std::string::npos);
     CHECK(!body.contains("result"));
 
-    // #2445: client-caused (unknown tool name), audited "denied" like every
-    // other rejection on this surface — not "failure", which is reserved for
-    // server-side faults.
+    // #2445: client-caused (unknown tool name), audited "denied" like most
+    // other rejections on this surface — several other client-caused
+    // rejections on this surface still audit "failure" (tracked in #3176).
     REQUIRE(ts.audit_log.size() == 1);
     CHECK(ts.audit_log[0] == "mcp.nonexistent_tool|denied");
     CHECK(ts.audit_details[0] == "unknown tool");

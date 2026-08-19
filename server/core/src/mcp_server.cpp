@@ -12003,7 +12003,14 @@ McpServer::HandlerFn McpServer::build_handler(
 
             // ── Unknown tool ──────────────────────────────────────────────
             // "denied" not "failure" (#2445) — see the pre-gate kUnknown
-            // branch above for the taxonomy rationale.
+            // branch above for the taxonomy rationale. NOTE (adversarial
+            // review, unfixed, tracked in #3176): the pre-gate already exits
+            // for every name the caller can actually cause to reach here, so
+            // this backstop can only fire for a SERVED, security-registered
+            // tool with no matching dispatch branch — a registration defect,
+            // not a client action. No boot-time validator proves dispatch
+            // coverage today, so this stays "denied" (matching the pre-gate)
+            // rather than "failure" until that gap is closed.
             mcp_audit("denied", "unknown tool");
             res.set_content(error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
                             "application/json");
