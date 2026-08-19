@@ -28,6 +28,22 @@
 
 namespace yuzu::server {
 
+// Mirrors rest_api_v1.cpp's license_error_status/sw_deploy_error_status shape: ProductPackStore
+// widened list()/get() to std::expected and uninstall() now returns a machine-checkable
+// "not_found: " prefix (product_pack_store.hpp) as part of its PG migration — this classifier
+// keeps the REST surface's status codes correct instead of collapsing every failure to the
+// pre-migration 400/503-by-is_open()-only split. `kProductPackDbErrorPrefix` (a genuine DB/lease
+// failure) -> 503; `"not_found:"` -> 404 (a REST contract change for DELETE — the pre-migration
+// route always returned 400 for a missing id); anything else (signature rejection, validation,
+// business-rule error) -> 400.
+static int product_pack_error_status(const std::string& err) {
+    if (err.starts_with("not_found:"))
+        return 404;
+    if (err.starts_with(yuzu::server::kProductPackDbErrorPrefix))
+        return 503;
+    return 400;
+}
+
 // Production overload — wraps the Server in an HttplibRouteSink and forwards
 // to the sink-based body. Defined first so callers see a familiar signature.
 void WorkflowRoutes::register_routes(httplib::Server& svr, Deps deps) {
@@ -1859,7 +1875,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        auto packs = product_pack_store->list(q);
+        auto packs_result = product_pack_store->list(q);
+        if (!packs_result) {
+            res.status = product_pack_error_status(packs_result.error());
+            res.set_content(nlohmann::json({{"error", packs_result.error()}}).dump(),
+                            "application/json");
+            return;
+        }
+        auto& packs = *packs_result;
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& p : packs) {
             nlohmann::json items_arr = nlohmann::json::array();
@@ -1981,7 +2004,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             // attacker-influenced audit key); the pack name is recoverable
             // from the request body if forensics need it.
             audit_fn(req, "product_pack.install", "denied", "ProductPack", "", result.error());
-            res.status = 400;
+            res.status = product_pack_error_status(result.error());
             res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
             return;
         }
@@ -2014,14 +2037,21 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
-        auto pack = product_pack_store->get(id);
-        if (!pack) {
+        auto pack_result = product_pack_store->get(id);
+        if (!pack_result) {
+            res.status = product_pack_error_status(pack_result.error());
+            res.set_content(nlohmann::json({{"error", pack_result.error()}}).dump(),
+                            "application/json");
+            return;
+        }
+        if (!*pack_result) {
             res.status = 404;
             res.set_content(
                 R"({"error":{"code":404,"message":"product pack not found"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
+        auto& pack = *pack_result;
 
         nlohmann::json items_arr = nlohmann::json::array();
         for (const auto& item : pack->items) {
@@ -2077,7 +2107,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         auto result = product_pack_store->uninstall(id, uninstall_fn);
         if (!result) {
-            res.status = 400;
+            res.status = product_pack_error_status(result.error());
             res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
             return;
         }
