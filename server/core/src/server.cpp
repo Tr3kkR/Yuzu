@@ -12886,13 +12886,16 @@ private:
             // `ensure_service_management_group` side effect below (a
             // case-sensitive literal comparison), even though it isn't a
             // security issue — the #3289 guard's own key check is already
-            // case-insensitive regardless of this normalization.
+            // case-insensitive regardless of this normalization. Uses
+            // `kCategoryKeys` (the same constant the tag-push block 40 lines
+            // below already reads) rather than a second hardcoded literal
+            // list.
             {
                 std::string lower_key = key;
                 std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
                                [](unsigned char c) { return std::tolower(c); });
-                for (auto cat : {"role", "environment", "location", "service"}) {
-                    if (lower_key == cat) {
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == lower_key) {
                         key = lower_key;
                         break;
                     }
@@ -12981,6 +12984,24 @@ private:
                     R"({"error":{"code":400,"message":"agent_id and key required"},"meta":{"api_version":"v1"}})",
                     "application/json");
                 return;
+            }
+
+            // Gate 4/#3289 hardening round: normalize category keys to
+            // lowercase, matching the /api/tags/set twin above — without
+            // this, deleting a key by the same case a caller just set it
+            // with (e.g. "Service") silently no-ops (TagStore::delete_tag
+            // finds no row stored under that exact case) instead of removing
+            // the tag, since /api/tags/set now stores the normalized form.
+            {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == lower_key) {
+                        key = lower_key;
+                        break;
+                    }
+                }
             }
 
             // #3289: same TOCTOU guard as /api/tags/set — a service-scoped

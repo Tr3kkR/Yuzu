@@ -1432,12 +1432,14 @@ bool AuthRoutes::deny_service_scoped_service_tag_mutation(const httplib::Request
     res.status = 403;
     res.set_content(
         detail::a4_denial(res, 403,
-                          "a service-scoped token may not modify the 'service' tag (it "
-                          "defines the token's own confinement); ask an operator to "
-                          "re-assign the agent's service"),
+                          std::string(authz::kServiceTagMutationDeniedMessage)),
         "application/json");
     try {
-        audit_log(req, action, "denied", "Agent", agent_id + ":" + key,
+        // Gate 4/#3289 hardening round: target_type="Tag" matches the REST
+        // v1 twin's convention for this identical logical event (a denied
+        // tag mutation) — not "Agent", which mismatched both REST's and this
+        // file's own pre-existing tag.set/tag.delete audit rows.
+        audit_log(req, action, "denied", "Tag", agent_id + ":" + key,
                  "service-scoped token blocked: cannot mutate the service tag (path=" +
                      req.path + ")");
     } catch (const std::exception& e) {

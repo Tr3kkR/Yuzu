@@ -53,6 +53,12 @@ struct TagRouteHarness {
     // action/result/target triples, in emission order (governance cmp-F1:
     // the v1 failure branches must leave audit rows).
     std::vector<std::string> audit_events;
+    // target_type in the same emission order as audit_events, kept as a
+    // parallel vector rather than folded into the string above so existing
+    // has_audit()-style assertions don't need to change shape. Added for
+    // the #3289 Gate 4/6 hardening round's target_type pin (was "Agent",
+    // now "Tag" to match this file's own pre-existing convention).
+    std::vector<std::string> audit_target_types;
 
     explicit TagRouteHarness(bool wire_scope = true) {
         REQUIRE(tag_store.is_open());
@@ -75,9 +81,10 @@ struct TagRouteHarness {
         auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
                           const std::string&) -> bool { return true; };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& result, const std::string&,
+                               const std::string& result, const std::string& target_type,
                                const std::string& target, const std::string&) -> bool {
             audit_events.push_back(action + "/" + result + "/" + target);
+            audit_target_types.push_back(target_type);
             return true;
         };
 
@@ -229,6 +236,11 @@ TEST_CASE("REST PUT /api/v1/tags denies a service-scoped token writing the "
     CHECK_FALSE(h.scope_fn_called); // ordering pin: the TOCTOU guard runs first
     CHECK(tag_value(h.tag_store, "agent-B", "service").empty());
     CHECK(has_audit(h.audit_events, "tag.set/denied/agent-B:service"));
+    // Gate 4/6 hardening round: pin target_type="Tag" — REST's own
+    // convention for this event, which auth_routes.cpp's and mcp_server.cpp's
+    // #3289 denials were fixed to match (they previously used "Agent").
+    REQUIRE_FALSE(h.audit_target_types.empty());
+    CHECK(h.audit_target_types.back() == "Tag");
 }
 
 TEST_CASE("REST PUT /api/v1/tags service-tag guard is case-insensitive ('Service')",
@@ -309,10 +321,29 @@ TEST_CASE("REST DELETE /api/v1/tags admits a service-scoped token deleting a "
     CHECK(tag_value(h.tag_store, "agent-B", "location").empty());
 }
 
-TEST_CASE("REST PUT /api/v1/tags — a non-service-scoped session writing the "
-          "service tag is unaffected (#3289 regression) and fires the "
-          "service-group callback",
+TEST_CASE("REST DELETE /api/v1/tags — a non-service-scoped session deleting "
+          "the service tag is unaffected (#3289 regression)",
           "[pg][rest][tag][service_scope]") {
+    // Gate 4 happy-path coverage note: the PUT-side sibling below already
+    // covered this for writes; DELETE had no equivalent test.
+    TagRouteHarness h;
+    REQUIRE(h.tag_store.set_tag("agent-B", "service", "ServiceA", "seed").has_value());
+    h.scope_allow = true;
+    auto res = h.del("agent-B", "service");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.scope_fn_called);
+    CHECK(tag_value(h.tag_store, "agent-B", "service").empty());
+}
+
+TEST_CASE("REST PUT /api/v1/tags — a non-service-scoped session writing the "
+          "service tag is unaffected (#3289 regression)",
+          "[pg][rest][tag][service_scope]") {
+    // NOTE: the harness registers an empty service_group_fn, so this does
+    // NOT exercise ensure_service_management_group's own firing — only that
+    // the #3289 guard doesn't block a non-service-scoped write. The
+    // management-group side effect has its own coverage in
+    // test_rest_api_v1.cpp / the legacy-dashboard tests, not here.
     TagRouteHarness h; // token_scope_service left empty
     h.scope_allow = true;
     auto res = h.put(kBody);

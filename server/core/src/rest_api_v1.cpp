@@ -4844,9 +4844,7 @@ void RestApiV1::register_routes(
                     "service-scoped token blocked: cannot mutate the service tag");
             res.status = 403;
             res.set_content(
-                detail::a4_error(res, "a service-scoped token may not modify the 'service' "
-                                      "tag (it defines the token's own confinement); ask an "
-                                      "operator to re-assign the agent's service"),
+                detail::a4_error(res, std::string(authz::kServiceTagMutationDeniedMessage)),
                 "application/json");
             return;
         }
@@ -4927,10 +4925,7 @@ void RestApiV1::register_routes(
                         "service-scoped token blocked: cannot mutate the service tag");
                 res.status = 403;
                 res.set_content(
-                    detail::a4_error(res, "a service-scoped token may not modify the "
-                                          "'service' tag (it defines the token's own "
-                                          "confinement); ask an operator to re-assign the "
-                                          "agent's service"),
+                    detail::a4_error(res, std::string(authz::kServiceTagMutationDeniedMessage)),
                     "application/json");
                 return;
             }

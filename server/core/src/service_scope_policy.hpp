@@ -5,10 +5,13 @@
 #include <string_view>
 
 /// @file service_scope_policy.hpp
-/// The service-scope global-safe allow-list: `(securable_type, operation)`
-/// pairs a service-scoped token may exercise UNCONFINED — i.e. without the
-/// per-agent/`service`-tag narrowing `AuthRoutes::require_fleet_read` /
-/// `confine_agent_target` (authz_gates.hpp) otherwise apply.
+/// Two service-scope policy surfaces live here. (1) The global-safe
+/// allow-list: `(securable_type, operation)` pairs a service-scoped token may
+/// exercise UNCONFINED — i.e. without the per-agent/`service`-tag narrowing
+/// `AuthRoutes::require_fleet_read` / `confine_agent_target` (authz_gates.hpp)
+/// otherwise apply. (2) The `service`-tag mutation guard (#3289): the pure
+/// predicate deciding whether a service-scoped token may write/delete the tag
+/// key that defines its own confinement boundary.
 ///
 /// Seeded EMPTY. This is deliberate, not a placeholder to fill in "later":
 /// the whole point of the default-deny flip (`require_permission`'s
@@ -47,11 +50,23 @@ inline constexpr std::array<PermPair, 0> kServiceScopeGlobalSafe{};
 
 /// #3289: the tag key that IS a service-scoped token's own confinement
 /// boundary (`AuthRoutes::require_scoped_permission`'s service branch reads
-/// this key via `TagStore::get_tag` to decide admission). Every confinement
-/// reader and every tag-mutation guard key on this single definition — a
-/// second copy is the drift this seam exists to remove for `kPermPair`-shaped
-/// policy above.
+/// this key via `TagStore::get_tag` to decide admission). Every TOKEN-SCOPE
+/// confinement reader (`auth_routes.cpp`, `authz_gates.cpp`,
+/// `derive_exec_visible`) and every tag-mutation guard key on this single
+/// definition — a second copy on THIS axis is the drift this seam exists to
+/// remove. Deliberately NOT extended to the separate RBAC/management-group
+/// confinement axis (`ensure_service_management_group` and its
+/// `key == "service"` triggers in server.cpp/rest_api_v1.cpp) — that axis is
+/// unrelated to token-scope confinement and reads the `service` tag for a
+/// different purpose (dynamic group membership, not admission).
 inline constexpr std::string_view kServiceTagKey = "service";
+
+/// #3289: the denial message every tag-mutation guard emits, hoisted so the
+/// wording can only drift by editing this one definition. A test/doc
+/// asserting on this string should reference the constant, not retype it.
+inline constexpr std::string_view kServiceTagMutationDeniedMessage =
+    "a service-scoped token may not modify the 'service' tag (it defines the "
+    "token's own confinement); ask an operator to re-assign the agent's service";
 
 /// ASCII case-insensitive match against `kServiceTagKey`. Tag keys are
 /// user-supplied strings (REST/MCP/legacy dashboard callers, and the agent's

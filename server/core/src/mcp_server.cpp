@@ -3650,14 +3650,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     const std::string& key) -> bool {
                 if (authz::service_scope_may_mutate_tag_key(session->token_scope_service, key))
                     return false;
+                // Gate 4/#3289 hardening round: target_type="Tag" matches
+                // REST v1's convention for this identical logical event —
+                // not "Agent", which mismatched every pre-existing tag audit
+                // row on any surface.
                 (void)yuzu::server::detail::try_persist_audit(
-                    audit_fn, req, action, "denied", "Agent", agent_id + ":" + key,
+                    audit_fn, req, action, "denied", "Tag", agent_id + ":" + key,
                     "service-scoped token blocked: cannot mutate the service tag");
                 res.set_content(
                     a4_error(kPermissionDenied,
-                            "a service-scoped token may not modify the 'service' tag (it "
-                            "defines the token's own confinement); ask an operator to "
-                            "re-assign the agent's service"),
+                            std::string(authz::kServiceTagMutationDeniedMessage)),
                     "application/json");
                 return true;
             };

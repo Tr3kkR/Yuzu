@@ -381,6 +381,13 @@ TagStore::sync_agent_tags(const std::string& agent_id,
             spdlog::info("TagStore::sync_agent_tags: dropped agent-reported 'service' tag for "
                         "{} (#3289) — the service tag is operator/API-assigned only",
                         agent_id);
+            // Gate 5/6 hardening round: the only prior signal was this log
+            // line — no counter, no audit row. A counter is the proportionate
+            // in-PR addition (an audit row needs its own audit-sink design,
+            // tracked as a follow-up); this at least makes "how often is this
+            // firing fleet-wide" answerable without grepping logs.
+            if (metrics_)
+                metrics_->counter("yuzu_tag_store_agent_service_purge_total").increment();
             continue;
         }
         keys.push_back(key);
