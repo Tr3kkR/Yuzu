@@ -74,6 +74,25 @@ coherent artifact it hands out a tree that reads as complete. Only the second is
 a correctness problem, which is why only the second is gated here — but do not
 read "additive" as "immune".
 
+Two consequences follow, and they are different questions:
+
+**Correctness** — only coherent artifacts need it. Gate the save on the **producing
+step's** outcome, not the job's.
+
+**Key occupancy** — both classes need thought. A thin entry written under an exact
+key is hit by every later run with the same inputs, which then skips its own save,
+and the key is immutable. For an additive cache that costs a permanently colder
+cache rather than a wrong answer, so the gate is looser: save when the producing
+step RAN (pass *or* fail — a failed build's objects are still worth keeping), skip
+only when it was cancelled or never started. `ci.yml`'s canary ccache save is the
+worked example.
+
+**Key inputs must be stable.** `hashFiles` globs the whole workspace and does not
+honour `.gitignore`, so a bare `**/*.cpp`-style glob also hashes anything an
+earlier restore step materialised — dependency trees included. The key then differs
+between a cold and a warm run and the namespace splits. Scope the glob to the
+source roots you actually compile (#3270).
+
 For coherent artifacts, additionally gate on the **producing step's** outcome, not the job's:
 
 ```yaml

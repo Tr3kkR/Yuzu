@@ -1081,6 +1081,44 @@ TEST_CASE("AuthRoutes::require_list_read — a dual-attribute token "
 }
 
 // ---------------------------------------------------------------------------
+// authz::is_service_tag_key / authz::service_scope_may_mutate_tag_key (#3289)
+// — pure predicates in service_scope_policy.hpp. No fixture, no store.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("authz::is_service_tag_key — matches the canonical key and common case "
+          "variants, rejects everything else",
+          "[auth_routes][service_scope][tag_write]") {
+    using yuzu::server::authz::is_service_tag_key;
+    CHECK(is_service_tag_key("service"));
+    CHECK(is_service_tag_key("Service"));
+    CHECK(is_service_tag_key("SERVICE"));
+    CHECK(is_service_tag_key("SeRviCe"));
+    CHECK_FALSE(is_service_tag_key("environment"));
+    CHECK_FALSE(is_service_tag_key("service2"));
+    CHECK_FALSE(is_service_tag_key("servic"));
+    CHECK_FALSE(is_service_tag_key(""));
+}
+
+TEST_CASE("authz::service_scope_may_mutate_tag_key — denies a service-scoped "
+          "session mutating the service key, value-blind; admits every other "
+          "combination (#3289)",
+          "[auth_routes][service_scope][tag_write]") {
+    using yuzu::server::authz::service_scope_may_mutate_tag_key;
+    // Service-scoped session, service key: DENY. Value-blind — the function
+    // does not take a value parameter at all, so a would-be no-op rewrite of
+    // the token's own current value is denied identically to any other.
+    CHECK_FALSE(service_scope_may_mutate_tag_key("printers", "service"));
+    CHECK_FALSE(service_scope_may_mutate_tag_key("printers", "Service"));
+    // Service-scoped session, non-service key: ADMIT.
+    CHECK(service_scope_may_mutate_tag_key("printers", "environment"));
+    CHECK(service_scope_may_mutate_tag_key("printers", "owner"));
+    // Non-scoped session (empty token_scope_service): ADMIT regardless of key —
+    // this predicate only confines service-scoped sessions.
+    CHECK(service_scope_may_mutate_tag_key("", "service"));
+    CHECK(service_scope_may_mutate_tag_key("", "environment"));
+}
+
+// ---------------------------------------------------------------------------
 // AuthRoutes::deny_service_scoped_session (#2298 PR 3 §3e) — the shared gate
 // server.cpp's require_auth-only fragment/stream routes call directly, since
 // they never reach require_permission/require_scoped_permission at all (so
@@ -1166,6 +1204,98 @@ TEST_CASE("AuthRoutes::deny_service_scoped_session — no session at all defers 
     bool must_return = fix.ar->deny_service_scoped_session(
         req, res, "health.fragment.access_denied",
         "service-scoped tokens may not read the fleet-wide health summary");
+    CHECK(must_return);
+    CHECK(res.status == 401);
+}
+
+// ---------------------------------------------------------------------------
+// AuthRoutes::deny_service_scoped_service_tag_mutation (#3289) — the legacy
+// dashboard's tag-mutation guard, tested directly against the helper the
+// same way deny_service_scoped_session is above (no httplib route harness
+// exists for server.cpp's /api/tags/set|delete, matching every sibling
+// server.cpp handler; the shared predicate + this direct call together
+// cover the decision logic the route wiring only forwards to).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::deny_service_scoped_service_tag_mutation — a "
+          "service-scoped session mutating the service key is denied (#3289)",
+          "[pg][auth_routes][service_scope][tag_write]") {
+    AuthRoutesFixture fix;
+    auto now = service_scope_flip_now_epoch();
+    auto raw = fix.api_tokens->create_token("scoped", "test_user", now + 3600, "printers", "");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_service_tag_mutation(
+        req, res, "tag.set", "agent-1", "service");
+    CHECK(must_return);
+    CHECK(res.status == 403);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["message"].get<std::string>().find("service-scoped token may not modify") !=
+          std::string::npos);
+    CHECK_FALSE(j["error"].contains("permission"));
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res.get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
+}
+
+TEST_CASE("AuthRoutes::deny_service_scoped_service_tag_mutation — case-insensitive "
+          "('Service') (#3289)",
+          "[pg][auth_routes][service_scope][tag_write]") {
+    AuthRoutesFixture fix;
+    auto now = service_scope_flip_now_epoch();
+    auto raw = fix.api_tokens->create_token("scoped", "test_user", now + 3600, "printers", "");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_service_tag_mutation(
+        req, res, "tag.delete", "agent-1", "Service");
+    CHECK(must_return);
+    CHECK(res.status == 403);
+}
+
+TEST_CASE("AuthRoutes::deny_service_scoped_service_tag_mutation — a "
+          "service-scoped session mutating a NON-service key is admitted "
+          "(#3289 regression)",
+          "[pg][auth_routes][service_scope][tag_write]") {
+    AuthRoutesFixture fix;
+    auto now = service_scope_flip_now_epoch();
+    auto raw = fix.api_tokens->create_token("scoped", "test_user", now + 3600, "printers", "");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_service_tag_mutation(
+        req, res, "tag.set", "agent-1", "environment");
+    CHECK_FALSE(must_return);
+    CHECK(res.status == -1); // untouched
+}
+
+TEST_CASE("AuthRoutes::deny_service_scoped_service_tag_mutation — an "
+          "ordinary (non-scoped) session is unaffected (#3289 regression)",
+          "[pg][auth_routes][service_scope][tag_write]") {
+    AuthRoutesFixture fix;
+    auto raw = fix.mint_token(); // no scope_service
+    auto req = request_with_header("Authorization", "Bearer " + raw);
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_service_tag_mutation(
+        req, res, "tag.set", "agent-1", "service");
+    CHECK_FALSE(must_return);
+    CHECK(res.status == -1);
+}
+
+TEST_CASE("AuthRoutes::deny_service_scoped_service_tag_mutation — no session "
+          "at all defers to require_auth's own 401 (#3289)",
+          "[pg][auth_routes][service_scope][tag_write]") {
+    AuthRoutesFixture fix;
+    httplib::Request req; // no credential of any kind
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_service_tag_mutation(
+        req, res, "tag.set", "agent-1", "service");
     CHECK(must_return);
     CHECK(res.status == 401);
 }

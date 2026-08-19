@@ -1062,7 +1062,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         // pre-migration read collapsed both to "", which happened to
         // deny (fail-closed) but audited the outage as a scope MISMATCH,
         // hiding the real cause from the operator.
-        auto service_tag = tag_store_->get_tag(agent_id, "service");
+        auto service_tag = tag_store_->get_tag(agent_id, std::string(authz::kServiceTagKey));
         if (!service_tag) {
             audit_log(req, "auth.scoped_permission_required", "denied", agent_id, "",
                       "service-scoped token blocked: tag store degraded");
@@ -1413,6 +1413,44 @@ bool AuthRoutes::deny_service_scoped_session(const httplib::Request& req, httpli
         spdlog::warn("deny_service_scoped_session: audit_log threw: {}", e.what());
     } catch (...) {
         spdlog::warn("deny_service_scoped_session: audit_log threw (non-std)");
+    }
+    return true;
+}
+
+bool AuthRoutes::deny_service_scoped_service_tag_mutation(const httplib::Request& req,
+                                                            httplib::Response& res,
+                                                            const std::string& action,
+                                                            const std::string& agent_id,
+                                                            const std::string& key) {
+    auto session = require_auth(req, res);
+    if (!session)
+        return true; // require_auth already wrote 401/redirect; caller returns.
+    if (authz::service_scope_may_mutate_tag_key(session->token_scope_service, key))
+        return false;
+    // Write the 403 FIRST, audit after — same throw-safety ordering as
+    // deny_service_scoped_session immediately above.
+    res.status = 403;
+    res.set_content(
+        detail::a4_denial(res, 403,
+                          authz::kServiceTagMutationDeniedMessage),
+        "application/json");
+    try {
+        // Gate 4/#3289 hardening round: target_type="Tag" matches REST v1's
+        // convention for this identical logical event (a denied tag
+        // mutation) — not "Agent", which matched neither REST's nor any
+        // other surface's convention. This does NOT resolve the separate,
+        // pre-existing mismatch against server.cpp's own tag.set/tag.delete
+        // success/failure rows, which use lowercase "tag" — this caller
+        // (server.cpp, via the legacy dashboard routes) is a DIFFERENT file
+        // from where this comment lives; see the routed-concern row for the
+        // tracked residual.
+        audit_log(req, action, "denied", "Tag", agent_id + ":" + key,
+                 "service-scoped token blocked: cannot mutate the service tag (path=" +
+                     req.path + ")");
+    } catch (const std::exception& e) {
+        spdlog::warn("deny_service_scoped_service_tag_mutation: audit_log threw: {}", e.what());
+    } catch (...) {
+        spdlog::warn("deny_service_scoped_service_tag_mutation: audit_log threw (non-std)");
     }
     return true;
 }

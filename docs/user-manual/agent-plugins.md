@@ -615,6 +615,12 @@ Plugins for running arbitrary commands, managing device tags, and structured ass
 | `clear` | Remove all tags. |
 | `count` | Return the total number of tags. |
 
+> **The `service` key is not synced from `tags.json` (#3289).** `service` is the confinement
+> boundary a service-scoped API token is checked against, so the server silently drops it from
+> an agent's self-reported tags rather than accepting it — set-locally-only, never propagated. A
+> device's `service` tag must always be assigned by an operator (dashboard/REST) or an API
+> integration, never by a `tags.json` entry shipped with the agent.
+
 ### asset_tags
 
 | | |
