@@ -580,6 +580,102 @@ TEST_CASE("bridge listener fault - contained, counted, one-shot", "[mcp][bridge]
         [&] { return fx.reg.counter("yuzu_mcp_bridge_listener_failures_total").value() == 1.0; }));
 }
 
+TEST_CASE("bridge #2411 - a wake dirty-marks only ITS OWN record, not every record",
+          "[mcp][bridge][2f][2411]") {
+    // Direct proof the projector visits O(dirty), not O(records_): a wake on
+    // record A must not re-poke record B's bound sink, even though B's own
+    // work is still pending (has_pending_work_locked(B) stays true forever
+    // here - nothing ever drains it via take_post_batch). Under the
+    // pre-#2411 full-table-scan projector, EVERY wake re-visits EVERY
+    // record, so A's wake would re-poke B every time - that asymmetry is the
+    // whole assertion, and it is RED on the unfixed tree.
+    Fx fx;
+    auto a = fx.make_session("alice");
+    REQUIRE(fx.bridge->reserve(a.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->subscribe(a.id, json(1), "exec-2411-a"));
+    REQUIRE(fx.bridge->arm(a.id, json(1), Bridge::ArmMode::kGetOnly) ==
+            Bridge::ArmOutcome::kArmed);
+
+    auto b = fx.make_session("bob");
+    REQUIRE(fx.bridge->reserve(b.id, "bob", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(b.id, json(1), "exec-2411-b"));
+    REQUIRE(fx.bridge->arm(b.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    auto sink = std::make_shared<mcp::sse_bus::SseSinkState>();
+    REQUIRE(fx.bridge->bind_post_sink(b.id, json(1), sink).has_value());
+
+    // B's own event: latches, marks B dirty, the projector visits B and
+    // pokes the bound sink (has_pending_work_locked is true - nothing ever
+    // drains it via take_post_batch in this test, so it stays true for the
+    // rest of B's life).
+    fx.bus.publish("exec-2411-b", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] { return sink->poked.load(std::memory_order_acquire); }));
+    {
+        // Reset under sink->mu, the same lock poke_post_sink takes - the
+        // established isolation pattern (see CH-16 above) for separating a
+        // LATER poke from this setup one.
+        std::lock_guard<std::mutex> lk(sink->mu);
+        sink->poked.store(false, std::memory_order_release);
+    }
+
+    // A's event: marks only A dirty. A's frame reaching the wire proves A's
+    // own wake WAS processed - the test isn't vacuous.
+    fx.bus.publish("exec-2411-a", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        return count_method(ring_frames(*a.stream, "alice"), "notifications/progress") == 1;
+    }));
+
+    // B was NOT re-visited as a side effect of A's wake.
+    CHECK_FALSE(poll_until([&] { return sink->poked.load(std::memory_order_acquire); },
+                           std::chrono::milliseconds(100)));
+}
+
+TEST_CASE("bridge #2411 - a listener fault on one record still flushes via that record's "
+          "own dirty mark",
+          "[mcp][bridge][2f][2411]") {
+    // The dirty-set drain only visits a record whose OWN key is in
+    // core_->dirty - so the listener's catch path needs its OWN mark_dirty
+    // call (the one call site #2411 ADDS over the pre-existing wake()), or a
+    // fault-eaten event's listener_failure_delta strands forever on a record
+    // nothing else ever touches again. The existing "listener fault"
+    // test above cannot catch a regression here - its second publish is on
+    // the SAME record, so that record's own ordinary activity would flush
+    // the delta regardless of whether the catch path marks it dirty.
+    Fx fx;
+    auto a = fx.make_session("alice");
+    REQUIRE(fx.bridge->reserve(a.id, "alice", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->subscribe(a.id, json(1), "exec-2411-flush-a"));
+    REQUIRE(fx.bridge->arm(a.id, json(1), Bridge::ArmMode::kGetOnly) ==
+            Bridge::ArmOutcome::kArmed);
+
+    // A harmless first event, drained to the wire before the fault: proves A
+    // is fully out of the dirty set (including its arm()-time handoff mark)
+    // before the fault-eaten event below, so the ONLY thing that can put A
+    // back into the dirty set afterward is the catch path under test - not a
+    // stale mark left over from setup.
+    fx.bus.publish("exec-2411-flush-a", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until([&] {
+        return count_method(ring_frames(*a.stream, "alice"), "notifications/progress") == 1;
+    }));
+
+    auto b = fx.make_session("bob");
+    REQUIRE(fx.bridge->reserve(b.id, "bob", json(1), json("t"), false).ok);
+    REQUIRE(fx.bridge->subscribe(b.id, json(1), "exec-2411-flush-b"));
+    REQUIRE(fx.bridge->arm(b.id, json(1), Bridge::ArmMode::kGetOnly) ==
+            Bridge::ArmOutcome::kArmed);
+
+    fx.bridge->inject_listener_fault_for_test();  // one-shot, shared WakeCore
+    fx.bus.publish("exec-2411-flush-a", "execution-progress", prog(2, 3));  // eaten
+
+    // B only, never A again. The pre-#2411 full-table-scan projector would
+    // have flushed A's delta as a side effect of visiting every record on
+    // B's wake; a dirty-set without the catch-path mark_dirty call strands
+    // it, because nothing ever puts A's key back into core_->dirty.
+    fx.bus.publish("exec-2411-flush-b", "execution-progress", prog(1, 3));
+    REQUIRE(poll_until(
+        [&] { return fx.reg.counter("yuzu_mcp_bridge_listener_failures_total").value() == 1.0; }));
+}
+
 TEST_CASE("bridge immediate terminal via replay - subscribe after completion",
           "[mcp][bridge][2f]") {
     Fx fx;

@@ -215,6 +215,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu {
@@ -846,6 +847,25 @@ private:
         std::atomic<std::uint64_t> pending_listener_failures{0};
         std::atomic<std::uint64_t> pending_projection_degraded{0};
         std::atomic<std::uint64_t> pending_progress_suppressed{0};
+        /// #2411: keys with possibly-unprojected work, pushed by mark_dirty and
+        /// swapped out whole by the projector each cycle (bucket storage reused
+        /// across cycles - see run_projector). Bounded by live-record-count-ish
+        /// churn between drains, never larger, because insertion dedupes.
+        ///
+        /// INVARIANT (the lost-wakeup proof mark_dirty's comment states in
+        /// full): `!dirty.empty() || scan_all ⇒ work_pending`. Both the insert
+        /// and the `work_pending = true` store happen in the SAME `mu` critical
+        /// section, and `work_pending` is cleared only in the SAME critical
+        /// section that swaps `dirty` out empty - so the invariant can never be
+        /// observed false by a projector that just re-acquired `mu`.
+        std::unordered_set<std::string> dirty;
+        /// Degrade valve: a dirty-key insert hit an allocation failure, or a
+        /// prior cycle's body threw after already swapping its keys out (see
+        /// run_projector's outer catch) - either way, the swapped-away keys are
+        /// not trustworthy as the FULL set of records with pending work, so the
+        /// next cycle falls back to the pre-#2411 full-table scan instead of
+        /// trusting a possibly-incomplete dirty set.
+        bool scan_all = false;
     };
 
     /// Which rung of the publish ladder actually committed. The committed id alone
@@ -1083,7 +1103,11 @@ private:
     /// Free-standing listener factory (C7/D5): captures record + wake core only.
     static ExecutionEventBus::Listener make_listener(std::shared_ptr<BridgeRecord> rec,
                                                      std::shared_ptr<WakeCore> core);
-    static void wake(WakeCore& core) noexcept;
+    /// #2411: replaces the old bare `wake(core)` - every caller now names WHICH
+    /// record has possibly-unprojected work, so the projector can visit O(dirty)
+    /// records per cycle instead of the whole table. See the .cpp definition for
+    /// the lost-wakeup proof.
+    static void mark_dirty(WakeCore& core, const std::string& key) noexcept;
 
     std::shared_ptr<BridgeRecord> find_locked(const std::string& key) const;  // holds bridge_mu_
 

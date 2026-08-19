@@ -262,16 +262,55 @@ McpStreamBridge::find_locked(const std::string& key) const {
 
 // ── Wake path ──────────────────────────────────────────────────────────────
 
-void McpStreamBridge::wake(WakeCore& core) noexcept {
+void McpStreamBridge::mark_dirty(WakeCore& core, const std::string& key) noexcept {
+    // #2411: replaces the old bare wake(core). The projector used to rescan
+    // EVERY live record on every wake, regardless of which one had new work;
+    // it now scans only the keys pushed here.
+    //
+    // LOST-WAKEUP PROOF (do not weaken this without re-deriving it - it is
+    // what a TSan run and an adversarial review are meant to catch). The
+    // insert and `work_pending = true` happen in ONE `core.mu` critical
+    // section here; the projector clears `work_pending` and swaps `dirty` out
+    // empty in ONE `core.mu` section of its own (run_projector). Three cases:
+    //   - This insert lands BEFORE the projector's swap: `key` is in the set
+    //     the swap takes, so this cycle visits it.
+    //   - This insert lands AFTER the swap: `dirty` was empty at the swap, so
+    //     insert() returns true here, notify_one() fires, and `work_pending`
+    //     is set true in the SAME critical section as the insert - even if
+    //     the notify races the projector's re-entry into cv.wait, the
+    //     predicate (`stop || work_pending`) is already satisfied by the time
+    //     it re-checks.
+    //   - insert() returns FALSE: `key` was already in the CURRENT `dirty`
+    //     set, so the set was non-empty when this insert ran, so (by the
+    //     invariant stated on WakeCore::dirty) `work_pending` was already
+    //     true - a cycle that will visit `key` is already owed, and skipping
+    //     the redundant notify is correct, not a lost wakeup.
+    // This IS "wake only on a real edge" (the issue's phrasing), expressed at
+    // drain granularity (per dirty-set-empty→non-empty transition) rather
+    // than per mailbox-empty→non-empty transition - provable here, and
+    // equivalent for the projector's purposes, since the projector only ever
+    // cares whether a cycle is owed, not how many events landed.
     try {
+        bool signal = false;
         {
             // The flag flips under the SAME mutex the projector's wait predicate
             // reads - a notify can never slot between predicate-check and sleep
             // (the lost-wakeup killer). WakeCore::mu is a strict leaf.
             std::lock_guard<std::mutex> lk(core.mu);
-            core.work_pending = true;
+            try {
+                signal = core.dirty.insert(key).second;
+            } catch (...) {
+                // Allocation failure growing the set: degrade to a full scan
+                // next cycle rather than lose track of which records have
+                // pending work - see WakeCore::scan_all.
+                core.scan_all = true;
+                signal = true;
+            }
+            core.work_pending = true;  // UNCONDITIONAL - see the invariant above
         }
-        core.cv.notify_one();
+        if (signal) {
+            core.cv.notify_one();
+        }
     } catch (...) {  // NOLINT(bugprone-empty-catch) - a wake must never escape a listener
     }
 }
@@ -331,10 +370,15 @@ ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<Bridg
                     rec->progress_pending = true;
                 }
             }
-            wake(*core);
+            mark_dirty(*core, rec->key);
         } catch (...) {
             // Counted record-locally; the projector flushes it to the registry.
+            // #2411: mark dirty too - without this, a dirty-set drain that
+            // never otherwise visits this record (its OWN wake is what just
+            // failed) would strand this delta until some other event on the
+            // same record eventually marks it.
             rec->listener_failure_delta.fetch_add(1, std::memory_order_relaxed);
+            mark_dirty(*core, rec->key);
         }
     };
 }
@@ -922,7 +966,7 @@ McpStreamBridge::ArmOutcome McpStreamBridge::arm(const std::string& session_id,
             (mode == ArmMode::kStreaming && !degraded) ? Phase::kStreaming : Phase::kArmedGetOnly;
         rec->phase.store(target, std::memory_order_release);
         outcome = degraded ? ArmOutcome::kDegradedGetOnly : ArmOutcome::kArmed;
-        wake(*core_);  // the handoff - same hold
+        mark_dirty(*core_, rec->key);  // the handoff - same hold
     }
     if (degraded) {
         // #2529: the degraded record follows the GET-only lifecycle and can never
@@ -1153,7 +1197,7 @@ bool McpStreamBridge::park_after_dispatch_failure(const std::string& session_id,
     }
     // The mailbox and any latched terminal survived the transition, so hand the
     // record to the projector now rather than waiting for the next bus event.
-    wake(*core_);
+    mark_dirty(*core_, rec->key);
     audit_contained("mcp.bridge.dispatch_failure", exec_id,
                     "parked after a post-dispatch failure: the execution continues and its "
                     "result stays fetchable by execution_id",
@@ -1216,7 +1260,7 @@ bool McpStreamBridge::on_post_closed_keyed(const std::string& key) {
     }
     // A1: a terminal latched while the pump was dying must not wait for the next
     // bus event or sweep - hand the record to the projector now.
-    wake(*core_);
+    mark_dirty(*core_, rec->key);
     return true;
 }
 
@@ -1333,7 +1377,7 @@ McpStreamBridge::PostBatch McpStreamBridge::take_post_batch(const std::string& k
     // Re-waking here closes that window. A spurious wake costs one projector pass
     // over a record with no work; a missed one costs a stalled result.
     if (rec->phase.load(std::memory_order_acquire) != Phase::kStreaming) {
-        wake(*core_);
+        mark_dirty(*core_, rec->key);
     }
     // COMMIT THE ENDING HERE, at the DECISION, not later at the close. Once the
     // bridge has handed back a final or settled the cap, this response IS ending -
@@ -1422,7 +1466,13 @@ void McpStreamBridge::poke_post_sink(
 // ── Projector ──────────────────────────────────────────────────────────────
 
 void McpStreamBridge::run_projector() {
+    // #2411: keys with possibly-unprojected work, swapped out of core_->dirty
+    // each cycle. Declared OUTSIDE the loop and `clear()`ed (not
+    // reconstructed) per cycle so its bucket storage is reused across the
+    // projector's whole lifetime rather than reallocated on every wake.
+    std::unordered_set<std::string> keys;
     for (;;) {
+        bool full_scan = false;
         {
             std::unique_lock<std::mutex> lk(core_->mu);
             core_->cv.wait(lk, [&] { return core_->stop || core_->work_pending; });
@@ -1432,6 +1482,10 @@ void McpStreamBridge::run_projector() {
                          // obligation (terminals are durable-fetchable)
             }
             core_->work_pending = false;
+            keys.swap(core_->dirty);  // `keys` is empty here (cleared last cycle
+                                      // below) so this ALSO empties core_->dirty
+            full_scan = core_->scan_all;
+            core_->scan_all = false;
         }
         // BARE-THREAD BOUNDARY: run_projector is a std::thread entry with no
         // caller try/catch, so ANY escaped exception is std::terminate (#2037
@@ -1444,11 +1498,46 @@ void McpStreamBridge::run_projector() {
             std::vector<std::shared_ptr<BridgeRecord>> snap;
             {
                 std::lock_guard<std::mutex> lk(bridge_mu_);
-                snap.reserve(records_.size());
-                for (const auto& [key, rec] : records_) {
-                    snap.push_back(rec);
+                if (full_scan) {
+                    // Degraded-cycle fallback (WakeCore::scan_all): a dirty-key
+                    // insert hit an allocation failure in mark_dirty, or a
+                    // PRIOR cycle's body threw after its keys were already
+                    // swapped out (see the outer catch below) - either way
+                    // `keys` cannot be trusted as the full set of records with
+                    // pending work, so fall back to the pre-#2411 full-table
+                    // scan for this one cycle.
+                    snap.reserve(records_.size());
+                    for (const auto& [key, rec] : records_) {
+                        snap.push_back(rec);
+                    }
+                } else {
+                    // #2411: O(dirty) per cycle, not O(records_). A key that no
+                    // longer resolves (erased since it was marked) is simply
+                    // skipped, and a key that resolves to a DIFFERENT, freshly
+                    // reserved record at the same key (keys are reused after
+                    // erase - see BridgeRecord::key's contract) is visited
+                    // anyway: a spurious project_record visit on a fresh
+                    // same-key record is benign, because every action inside
+                    // it self-gates under rec->mu (the phase check, the
+                    // projection_in_flight claim, the want_progress/
+                    // want_terminal gates) - unlike the CLAIM paths (Pass R
+                    // and its siblings), which compare map-slot IDENTITY
+                    // because acting on the wrong record there would corrupt
+                    // exactly-once teardown arbitration. Projection has no
+                    // such hazard, so a plain key lookup is sufficient here.
+                    snap.reserve(keys.size());
+                    for (const auto& key : keys) {
+                        auto it = records_.find(key);
+                        if (it != records_.end()) {
+                            snap.push_back(it->second);
+                        }
+                    }
                 }
             }
+            keys.clear();  // MUST happen before the next cycle's swap (above) -
+                           // an unclear `keys` would hand last cycle's already-
+                           // processed keys back into core_->dirty instead of
+                           // draining it.
             for (const auto& rec : snap) {
                 try {
                     project_record(rec);
@@ -1467,6 +1556,18 @@ void McpStreamBridge::run_projector() {
                 obs_guard([&] { metrics_->counter(kMetricProjectorCycles).increment(); });
             }
         } catch (...) {  // NOLINT(bugprone-empty-catch) - see the boundary note above
+            // #2411: this cycle's dirty keys were already swapped out of
+            // core_->dirty above and its snapshot never got visited, so the
+            // pre-#2411 guarantee ("the next wake retries") would otherwise
+            // silently narrow to only whichever records happen to get freshly
+            // marked afterward. Re-arm a full scan instead, restoring it.
+            try {
+                std::lock_guard<std::mutex> lk(core_->mu);
+                core_->scan_all = true;
+                core_->work_pending = true;
+            } catch (...) {  // NOLINT(bugprone-empty-catch)
+            }
+            core_->cv.notify_one();
         }
     }
 }
@@ -2134,8 +2235,6 @@ void McpStreamBridge::sweep() {
     // GET-only bridge. Fixed by scanning ONCE to build a parked_seq-sorted
     // candidate list, then iterating it with per-visit re-validation instead of
     // per-visit re-scanning.
-    bool wake_projector = false;  // a defer left a secured terminal to settle
-
     // ONE scan: ring_only count, mark count, and the full candidate list, sorted
     // oldest-first. Every kRingOnly record is a candidate - no floor to apply,
     // since each is visited at most once by construction below.
@@ -2397,10 +2496,12 @@ void McpStreamBridge::sweep() {
         // rather than ending the pass (UP-5, #2489): iterating the pre-sorted list
         // once, never revisiting an entry, is what now carries FA-4's
         // no-tight-re-visit property, so a defer costs this victim its turn this
-        // sweep instead of costing every newer victim theirs. The projector is
-        // woken ONCE at the exit - a defer means work was left for it (a secured
-        // terminal to settle), and one wake covers every deferral.
-        wake_projector = true;
+        // sweep instead of costing every newer victim theirs. #2411: mark THIS
+        // victim dirty - a defer means work was left for it (a secured terminal
+        // to settle), and mark_dirty's own dedupe (see its lost-wakeup proof)
+        // means marking every deferral costs nothing extra over the old single
+        // end-of-pass wake.
+        mark_dirty(*core_, oldest->key);
     }
 
     // FRESH final scan (Doomgoose + Fable plan review): both the mark-clearing
@@ -2440,10 +2541,20 @@ void McpStreamBridge::sweep() {
                 if (rec->phase.load(std::memory_order_acquire) != Phase::kRingOnly) {
                     continue;
                 }
-                std::lock_guard<std::mutex> rlk(rec->mu);
-                rec->pressure_requested = false;
+                bool was_marked = false;
+                {
+                    std::lock_guard<std::mutex> rlk(rec->mu);
+                    was_marked = rec->pressure_requested;
+                    rec->pressure_requested = false;
+                }
+                if (was_marked) {
+                    // #2411: only a record that WAS quiesced needs re-waking -
+                    // progress may have been frozen mid-execution on it, and
+                    // that freeze just lifted. An already-unmarked record has
+                    // nothing new for this walk to have unfrozen.
+                    mark_dirty(*core_, key);
+                }
             }
-            wake_projector = true;  // progress may have been frozen mid-execution
         }
         if (still_parked > cfg_.ring_only_pressure_cap) {
             // NOT a silent cap: the hatch disengaged with the cap still exceeded
@@ -2453,9 +2564,6 @@ void McpStreamBridge::sweep() {
             // are parking at least as fast as they are being expired.
             count_pressure_budget_exhausted();
         }
-    }
-    if (wake_projector) {
-        wake(*core_);
     }
 }
 
