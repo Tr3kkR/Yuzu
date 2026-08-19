@@ -163,8 +163,6 @@ struct KillSwitchScope {
 /// dispatch must be kill-switch-ADDRESSABLE, never kill-switch-UNREACHABLE).
 [[nodiscard]] inline bool is_reserved_plugin_name(std::string_view s) {
     constexpr std::string_view kSentinel = "__";
-    if (s.size() < kSentinel.size() * 2 + 1)
-        return false;
     if (!s.starts_with(kSentinel) || !s.ends_with(kSentinel))
         return false;
     return is_valid_identifier(s.substr(kSentinel.size(), s.size() - kSentinel.size() * 2));
