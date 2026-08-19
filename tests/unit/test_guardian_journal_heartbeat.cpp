@@ -187,9 +187,11 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     // emit_guardian_unsupported_heartbeat_tags is deliberately NOT unioned here (Gate
     // 8 finding, F7/#2298): its wire keys are yuzu.spark_<mechanism>_unsupported, not
     // yuzu.guardian_* - this regex can never match anything it produces, so unioning
-    // it would be dead code asserting a coverage claim this test cannot make. Its own
-    // doc/emitter agreement is proven separately (yuzu.spark_* is a sibling family
-    // this file's tag_re does not scrape).
+    // it would be dead code asserting a coverage claim this test cannot make. Its
+    // emitter<->reader agreement is proven separately (test_spark_fleet_tags.cpp's
+    // writer<->reader bind + test_guardian_unsupported_heartbeat.cpp's key pins); no
+    // doc-scrape exists for yuzu.spark_* since metrics.md names no individual spark
+    // wire keys to check.
     emit_guardian_health_heartbeat_tags(
         emitted, GuardianHealthStats{
                      .unhealthy_suppressed = 1, .unhealthy_refreshed = 1, .priority_demoted = 1});
