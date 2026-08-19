@@ -58,7 +58,8 @@
 #include <netfw.h>
 #include <oleauto.h> // SysAllocString / SysFreeString / VARIANT
 
-#include "../../shared/win_com.hpp" // ComInit / ComPtr<T> / BStr (PR3.3-a shared header)
+#include <win_com.hpp> // ComInit / ComPtr<T> / BStr (PR3.3-a shared header)
+#include <win_str.hpp> // yuzu::win::from_wide
 #endif
 
 #if defined(__linux__) && defined(YUZU_HAVE_LIBSYSTEMD)
@@ -128,20 +129,6 @@ const char* profile_name(NET_FW_PROFILE_TYPE2 p) {
     default:
         return "Unknown";
     }
-}
-
-/// Narrow, best-effort UTF-8 conversion for a firewall rule's display name.
-std::string narrow(const std::wstring& w) {
-    if (w.empty())
-        return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), nullptr, 0,
-                                  nullptr, nullptr);
-    if (len <= 0)
-        return {};
-    std::string out(static_cast<std::size_t>(len), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()), out.data(), len,
-                        nullptr, nullptr);
-    return out;
 }
 
 void do_state_windows(yuzu::CommandContext& ctx) {
@@ -271,7 +258,7 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
         long profiles_mask = 0;
         rule->get_Profiles(&profiles_mask);
 
-        std::string name = sanitize_field(narrow(name_w));
+        std::string name = sanitize_field(yuzu::win::from_wide(name_w.c_str()));
 
         ctx.write_output(std::format("rule|{}|{}|{}|{}|{}", name,
                                      enabled != VARIANT_FALSE ? "enabled" : "disabled", dir_s,

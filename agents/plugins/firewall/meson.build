@@ -31,7 +31,7 @@ shared_library(
   'firewall',
   files('src/firewall_plugin.cpp'),
   name_prefix: '',
-  include_directories: include_directories('../../shared'),  # win_com.hpp (Windows)
+  include_directories: include_directories('../../shared'),  # win_com.hpp, win_str.hpp (Windows)
   cpp_args: firewall_cpp_args,
   dependencies: firewall_deps,
   install: true,
