@@ -216,7 +216,7 @@ NetCounters read_net_counters() {
         // 8 rx fields then tx bytes is field 9 overall. strtoull walk instead of
         // sscanf "%llu"x9 (glibc 2.38's __isoc23_sscanf redirect breaks older-glibc
         // hosts); like %llu, strtoull skips leading whitespace, and all 9 fields
-        // must convert — matching the old ==9 conversion-count gate.
+        // must convert — matching the old `>= 9` (i.e. all-nine) conversion-count gate.
         const char* p = colon + 1;
         unsigned long long fields[9]{};
         bool ok = true;

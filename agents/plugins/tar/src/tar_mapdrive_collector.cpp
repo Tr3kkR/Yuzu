@@ -130,11 +130,11 @@ int64_t ymd_hms_to_epoch(int y, int mo, int d, int h, int mi, int s) {
 // prefix of the next `width` characters (sign included, as scanf counts it).
 // Advances `p` past the consumed characters; nullopt = no conversion.
 std::optional<int> scan_int(const char*& p, int width) {
-    while (std::isspace(static_cast<unsigned char>(*p)))
-        ++p;
     char buf[8]{};
     if (width <= 0 || width > 7) // callers pass 2 or 4; guard the buffer bound
-        return std::nullopt;
+        return std::nullopt;     // (before any side effect on the cursor)
+    while (std::isspace(static_cast<unsigned char>(*p)))
+        ++p;
     for (int i = 0; i < width && p[i]; ++i)
         buf[i] = p[i];
     char* end{};

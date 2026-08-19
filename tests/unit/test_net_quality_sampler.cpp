@@ -139,8 +139,8 @@ TEST_CASE("RetransWindow: counter decrease (DWORD wrap) clamps, never negative",
 #ifdef __linux__
 // Linux smoke test: read_net_counters() is the /proc/net/dev read path — this
 // exercises the fgets + strtoull field walk (which replaced sscanf; glibc 2.38
-// __isoc23_* removal) end-to-end on the live procfs, mirroring the macOS smoke
-// test below.
+// __isoc23_* compatibility) end-to-end on the live procfs, mirroring the macOS
+// smoke test below.
 TEST_CASE("Linux: read_net_counters parses /proc/net/dev and finds live traffic",
           "[netq][linux]") {
     const NetCounters c = read_net_counters();

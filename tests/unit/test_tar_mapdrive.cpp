@@ -138,9 +138,9 @@ TEST_CASE("mapdrive parse_win_security_logons: 4624 type-3 kept, others filtered
 }
 
 // The flexible-timestamp parser replaced sscanf ("%4d-%2d-%2dT%2d:%2d:%2d" and
-// siblings) for glibc __isoc23_* compatibility; these cases pin the scanf quirks
-// the rewrite must preserve (width caps, sign-in-width, zero-or-more format
-// whitespace, unparseable-field filtering).
+// siblings) for glibc 2.38 __isoc23_* compatibility; these cases pin the scanf
+// quirks the rewrite must preserve (width caps, sign-in-width, zero-or-more
+// format whitespace, unparseable-field filtering, CRLF tolerance).
 TEST_CASE("mapdrive timestamp/field parsing: scanf quirk pins", "[tar][mapdrive][parse]") {
     const std::string text =
         "Event[0]:\n"
@@ -163,11 +163,20 @@ TEST_CASE("mapdrive timestamp/field parsing: scanf quirk pins", "[tar][mapdrive]
         "Logon Type:\t\tbad\n" // unparseable logon type keeps -1 → filtered
         "New Logon:\n"
         "\tAccount Name:\t\tcarol\n"
-        "\tSource Network Address:\t192.168.1.52\n";
+        "\tSource Network Address:\t192.168.1.52\n"
+        "Event[3]:\r\n" // CRLF line endings (Windows-collected text): '\r' is
+        "  Date: 2026-07-01T10:20:30\r\n" // whitespace to the tokenizer + parsers
+        "  Event ID: 4624\r\n"
+        "Logon Type:\t\t3\r\n"
+        "New Logon:\r\n"
+        "\tAccount Name:\t\terin\r\n"
+        "\tSource Network Address:\t192.168.1.53\r\n";
     auto out = parse_win_security_logons(text);
-    REQUIRE(out.size() == 2);
+    REQUIRE(out.size() == 3);
     CHECK(out[0].ts == 1782901230); // width-capped seconds (2026-07-01T10:20:30 UTC)
     CHECK(out[1].ts == 1782901230); // signed month
+    CHECK(out[2].entry.username == "erin");
+    CHECK(out[2].ts == 1782901230); // CRLF text parses identically
     const std::string samba =
         "[2026/07/01   10:20:30,  3] hdr\n" // multiple format-space whitespace
         "  s1 (ipv4:10.0.0.1:445) connect to service s1 initially as user u1\n"
