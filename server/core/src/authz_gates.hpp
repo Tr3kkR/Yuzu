@@ -25,8 +25,16 @@
 /// PR #3216 follow-up review) because it reads as a complete authority
 /// verdict for both, which is only true of the first.
 ///
-/// PHASE 0 (this PR): wired, tested, called by NO route. The default-deny
-/// flip that starts routing traffic through these lives in a later PR.
+/// PHASE 0 (PR #3216): wired, tested, called by NO route at that point. The
+/// default-deny flip (#2298 PR 3, `require_permission`'s service branch)
+/// landed separately and does not call these either — it is the OTHER gate
+/// this file's `require_fleet_read` was deliberately left uninvolved in (see
+/// its own doc comment's "SELF-SUFFICIENT" / "does NOT cover" paragraphs and
+/// #3218). Migrating a route onto `require_fleet_read`/`confine_agent_target`
+/// so it actually serves confined service-scoped tokens instead of the
+/// flip's blanket deny is Phase 2, metric-prioritized, still not done as of
+/// this comment — `grep -rl "require_fleet_read\|confine_agent_target"` to
+/// check the current caller count before trusting "still zero" here.
 namespace yuzu::server {
 class AuthRoutes;
 }

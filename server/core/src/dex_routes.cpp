@@ -2,7 +2,8 @@
 
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
-#include "rest_a4_envelope.hpp" // detail::error_json_a4, make_correlation_id (deny_service_scoped_)
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
+                                     // X-Correlation-Id so header and body always agree
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 
 #include <algorithm>
@@ -2604,14 +2605,17 @@ bool DexRoutes::deny_service_scoped_(const httplib::Request& req, httplib::Respo
         return true; // auth_fn_ already wrote the response (401/etc).
     if (session->token_scope_service.empty())
         return false;
-    const auto cid = detail::make_correlation_id();
     // Write the 403 FIRST, audit after (mirrors GuardianRoutes::deny_service_scoped_):
     // a throwing audit_fn_ must not be able to suppress the 403.
     res.status = 403;
+    // No `.permission`: `kServiceScopeGlobalSafe` is compile-time-empty, so
+    // no grant admits a service-scoped caller here (gov-fix, Gate 8, #2298
+    // PR 3 hardening round — routed-concern MUST clause). `a4_denial` also
+    // fixes a second bug found in the same pass: the hand-built cid never
+    // reached the X-Correlation-Id header.
     res.set_content(
-        detail::error_json_a4(
-            403, "service-scoped tokens may not read this fleet-wide DEX view", cid,
-            detail::A4ErrorOpts{.permission = "GuaranteedState:Read"}),
+        detail::a4_denial(res, 403,
+                          "service-scoped tokens may not read this fleet-wide DEX view"),
         "application/json");
     (void)detail::try_persist_audit(audit_fn_, req, action, "denied", target_type, "",
                                     audit_detail);

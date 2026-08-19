@@ -129,8 +129,18 @@ private:
                                             const std::string& audit_detail,
                                             const std::string& target_type =
                                                 "SoftwareDeployment",
-                                            const std::string& permission =
-                                                "SoftwareDeployment:Read") const;
+                                            // `permission` defaults EMPTY
+                                            // (gov-fix, Gate 8, #2298 PR 3
+                                            // hardening round):
+                                            // kServiceScopeGlobalSafe is
+                                            // compile-time-empty, so no grant
+                                            // admits a service-scoped caller
+                                            // on this surface — a non-empty
+                                            // default was the same false
+                                            // self-remediation claim the
+                                            // routed-concern MUST clause
+                                            // forbids. Do not reintroduce one.
+                                            const std::string& permission = "") const;
 
     AuthFn auth_fn_;
     PermFn perm_fn_;

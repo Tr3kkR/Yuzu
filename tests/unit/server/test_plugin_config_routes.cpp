@@ -403,6 +403,40 @@ TEST_CASE("plugin_config_routes: kill-switch PUT flips the switch and is audited
     CHECK(body(get->body)["data"]["enabled"] == false);
 }
 
+// #3265 governance Gate 3 (quality-engineer): the MCP kill-switch surface got
+// a dedicated reserved-namespace regression test during an earlier fix round
+// (test_mcp_server.cpp) — this REST route shares the identical
+// parse_kill_switch_scope pre-validation but had no equivalent case, the same
+// coverage gap in a different transport.
+TEST_CASE("plugin_config_routes: kill-switch PUT reaches the real dispatch chokepoint for "
+          "the reserved-namespace __guard__.push_rules capability, not just an ordinary "
+          "plugin.action",
+          "[pg][server][routes][config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, route_tpl);
+    PgWired w{db.dsn()};
+    Harness h;
+    h.store = &w.store;
+    h.wire();
+
+    // Baseline: no row yet — the #3265 regression shape exactly.
+    CHECK(w.store.action_allowed("__guard__", "push_rules"));
+
+    auto put = h.sink.Put("/api/v1/plugin-config/__guard__/kill-switch?action=push_rules",
+                          json{{"enabled", false}, {"reason", "incident"}}.dump());
+    REQUIRE(put);
+    CHECK(put->status == 200);
+    CHECK(body(put->body)["data"]["enabled"] == false);
+
+    // Proven against the real chokepoint, not the echoed response.
+    CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
+
+    auto put_on = h.sink.Put("/api/v1/plugin-config/__guard__/kill-switch?action=push_rules",
+                             json{{"enabled", true}, {"reason", "resolved"}}.dump());
+    REQUIRE(put_on);
+    CHECK(put_on->status == 200);
+    CHECK(w.store.action_allowed("__guard__", "push_rules"));
+}
+
 TEST_CASE("plugin_config_routes: a dropped audit row fails the write closed (503) AND the "
           "mutation never happens — audit is checked BEFORE the store is touched",
           "[pg][server][routes][config]") {

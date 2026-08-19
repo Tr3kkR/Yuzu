@@ -1265,23 +1265,16 @@ static void collect_result_set_ids(const yuzu::scope::Expression& expr,
     }
 }
 
-// Collect every props.<key> reference in a scope expression, mirroring
-// collect_result_set_ids above — same reason: the resolver preloads all
-// referenced property keys ONCE, before the agent loop, rather than a
-// per-agent CustomPropertiesStore query while holding mu_ (same shape
-// review finding F fixed for from_result_set:).
-static void collect_props_keys(const yuzu::scope::Expression& expr,
-                               std::vector<std::string>& out) {
-    if (const auto* cond = std::get_if<yuzu::scope::Condition>(&expr)) {
-        if (cond->attribute.starts_with("props."))
-            out.push_back(cond->attribute.substr(6));
-    } else if (const auto* comb =
-                   std::get_if<std::unique_ptr<yuzu::scope::Combinator>>(&expr)) {
-        if (*comb)
-            for (const auto& child : (*comb)->children)
-                collect_props_keys(child, out);
-    }
-}
+// props.<key> and tag:<key> collection both use the shared
+// yuzu::scope::collect_attribute_suffixes (scope_engine.hpp) — added with
+// ADR-0050 for exactly this preload pattern. Folding props onto it (Gate 7,
+// governance DSL-3/arch-F1) also FIXED a pre-existing defect: the local
+// collector this replaced matched the raw attribute, so `LEN(props.x)` /
+// `STARTSWITH(props.x, …)` (synthetic `__len:`/`__startswith:` encodings)
+// never contributed `x` to the preload and those atoms resolved against
+// nothing. collect_result_set_ids above stays local — it is shape-different
+// (id extraction, not a prefix-suffix walk) and from_result_set: has no
+// synthetic interplay worth encoding.
 
 std::optional<std::vector<std::string>>
 AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStore* tag_store,
@@ -1368,7 +1361,7 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
     std::unordered_map<std::string, std::unordered_map<std::string, std::string>> props_values;
     {
         std::vector<std::string> prop_keys;
-        collect_props_keys(expr, prop_keys);
+        yuzu::scope::collect_attribute_suffixes(expr, "props.", prop_keys);
         if (!prop_keys.empty()) {
             if (props_store == nullptr) {
                 spdlog::error("AgentRegistry::evaluate_scope: scope references props.<key> but no "
@@ -1383,6 +1376,38 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
                 return std::nullopt;
             }
             props_values = std::move(*preload);
+        }
+    }
+
+    // Preload every tag:<key> value the expression references, ONE bulk query
+    // across all agents — mirrors the props.<key> preload directly above
+    // (ADR-0050; the pre-migration resolver queried TagStore per agent inside
+    // the loop below, and its degraded read collapsed to "" — the silent
+    // under/over-target of the #2500 family this migration closes). Same
+    // ADR-0036 fail-closed contract: a store/pool/query error ABORTS the
+    // whole evaluation (nullopt), never resolves tag:<key> to "no match"
+    // (which a NOT combinator inverts to "matches every agent").
+    //
+    // DELIBERATE ASYMMETRY vs the props preload: a NULL tag_store with a
+    // tag: atom does NOT abort. Tags have a first-class in-memory source —
+    // session->scopable_tags, checked FIRST in the resolver below — that
+    // legitimately answers tag: atoms without any store; props have no such
+    // source, so a props.<key> atom without a store is unresolvable and must
+    // abort. In production the store cannot be null post-migration (a failed
+    // TagStore open is a fatal startup error); a null store here is a
+    // test/embedded configuration running on in-memory tags alone.
+    std::unordered_map<std::string, std::unordered_map<std::string, std::string>> tag_values;
+    {
+        std::vector<std::string> tag_keys;
+        yuzu::scope::collect_attribute_suffixes(expr, "tag:", tag_keys);
+        if (!tag_keys.empty() && tag_store != nullptr) {
+            auto preload = tag_store->get_values_for_keys(tag_keys);
+            if (!preload) {
+                spdlog::error("AgentRegistry::evaluate_scope: tag preload degraded — aborting "
+                              "scope evaluation");
+                return std::nullopt;
+            }
+            tag_values = std::move(*preload);
         }
     }
 
@@ -1410,16 +1435,24 @@ AgentRegistry::evaluate_scope(const yuzu::scope::Expression& expr, const TagStor
                 return session->arch;
             if (key == "agent_version")
                 return session->agent_version;
-            // tag:X lookups
+            // tag:X lookups — in-memory scopable_tags first (a live agent's
+            // self-report shadows the store during evaluation — pre-existing
+            // precedence, deliberately preserved across the ADR-0050
+            // migration), then the bulk preload above (never a per-agent
+            // store query here; see the preload block's fail-closed
+            // contract).
             if (key.starts_with("tag:")) {
                 auto tag_key = key.substr(4);
-                // First check in-memory scopable_tags
                 auto it = session->scopable_tags.find(tag_key);
                 if (it != session->scopable_tags.end())
                     return it->second;
-                // Then check persistent TagStore
-                if (tag_store)
-                    return tag_store->get_tag(id, tag_key);
+                auto agent_it = tag_values.find(id);
+                if (agent_it != tag_values.end()) {
+                    auto tag_it = agent_it->second.find(tag_key);
+                    if (tag_it != agent_it->second.end())
+                        return tag_it->second;
+                }
+                return {};
             }
             // props.X lookups (custom properties, Phase 7.6) — served from the
             // bulk preload above, never a per-agent store query (see the
@@ -1579,6 +1612,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.clear_gauge_family("yuzu_fleet_spark_watch_rejected");
     metrics.clear_gauge_family("yuzu_fleet_spark_quarantined");
     metrics.clear_gauge_family("yuzu_fleet_spark_slow_op");
+    metrics.clear_gauge_family("yuzu_fleet_spark_unsupported"); // F7, #2298 rung 2
     // Guardian durable lifecycle-journal telemetry (#2298 gate 3). Same rule, and it
     // bites hardest here: the writer is sparse (a 0 counter ships no tag), so on a
     // healthy or inert fleet NOBODY reports and every family must be ABSENT. A
@@ -1650,9 +1684,9 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::unordered_map<std::string, double> spark_armed_faulted_os, spark_watch_faults_os,
         spark_queued_dropped_os, spark_consumer_errors_os;
     std::unordered_map<std::string, std::unordered_map<std::string, double>> spark_watch_rejected_om,
-        spark_quarantined_om, spark_slow_op_om;
+        spark_quarantined_om, spark_slow_op_om, spark_unsupported_om;
     // Per-{mechanism,metric} spark tag keys are loop-invariant across agents AND
-    // cycles — build the 3×3 once, not per agent per 15s sweep (gov perf-S1). Indexed
+    // cycles — build the 3×4 once, not per agent per 15s sweep (gov perf-S1). Indexed
     // [mechanism][metric] in kSparkMechTokens / kSparkMetricTokens order. Function-
     // static: recompute_metrics is single-threaded, and static-local init is
     // thread-safe regardless.
@@ -1924,17 +1958,35 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                 spark_queued_dropped_os[net_os] += *v;
             if (auto v = parse_spark_count(get_view(kKeySparkConsumerErrors)))
                 spark_consumer_errors_os[net_os] += *v;
-            // Per-mechanism-type health counters (the three that back the alerts).
-            // Keys are the precomputed loop-invariants (perf-S1); index 0/1/2 =
-            // watch_rejected / quarantined / slow_op (kSparkMetricTokens order).
+            // Per-mechanism-type health counters. Keys are the precomputed
+            // loop-invariants (perf-S1), read by the NAMED indices in
+            // spark_fleet_tags.hpp (kSparkMetricIdx*), each pinned to its
+            // kSparkMetricTokens slot by a static_assert there - a future reorder
+            // or insertion fails to compile here rather than silently misattributing
+            // one health signal's fleet sum into another gauge family (governance
+            // finding, F7/#2298: consistency-auditor C1 / architect). The first
+            // three back the fleet alerts and are agent-side CUMULATIVE counters
+            // (only grow until agent restart), so their fleet sum can only grow
+            // too. unsupported (F7, #2298 rung 2) is a CURRENT gauge instead -
+            // GuardianEngine reports a live snapshot each heartbeat, not a running
+            // total, so its fleet sum can genuinely decrease. set_mech_gauge below
+            // (.set(), never delta-accumulated across sweeps) is identical for all
+            // four either way; the distinction is purely in what the agent-reported
+            // VALUE means, not in how the server publishes it.
             for (std::size_t mi = 0; mi < kNMech; ++mi) {
                 const char* mech = kSparkMechTokens[mi];
-                if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][0])))
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxWatchRejected])))
                     spark_watch_rejected_om[net_os][mech] += *v;
-                if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][1])))
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxQuarantined])))
                     spark_quarantined_om[net_os][mech] += *v;
-                if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][2])))
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxSlowOp])))
                     spark_slow_op_om[net_os][mech] += *v;
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxUnsupported])))
+                    spark_unsupported_om[net_os][mech] += *v;
             }
         } else if (spark_state == SparkRunState::NotRunning) {
             // running == "0" — the agent IS rung-1+ and is NOT running spark. Split the
@@ -2148,6 +2200,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     set_mech_gauge("yuzu_fleet_spark_watch_rejected", spark_watch_rejected_om);
     set_mech_gauge("yuzu_fleet_spark_quarantined", spark_quarantined_om);
     set_mech_gauge("yuzu_fleet_spark_slow_op", spark_slow_op_om);
+    set_mech_gauge("yuzu_fleet_spark_unsupported", spark_unsupported_om); // F7, #2298 rung 2
 
     // Guardian journal rollup (#2298 gate 3). Families were cleared at the top, so a
     // signal NOBODY reported this cycle stays ABSENT - never a fabricated 0. On a

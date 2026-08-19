@@ -3,6 +3,7 @@
 #include "auth_routes.hpp"
 #include "authz_model.hpp"
 #include "rest_a4_envelope_http.hpp"
+#include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 
 #include <unordered_set>
 
@@ -26,9 +27,9 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
     if (!rbac_store_ || !rbac_store_->is_open()) {
         // Infrastructure unavailable, not a real authorization decision —
         // Degraded/503, aligned with the three sibling
-        // "authorization store unavailable" sites in auth_routes.cpp
-        // (630/811/1035, the engine-principal RBAC-store-unavailable
-        // branches): same wording, same status code. The 403/Forbidden this
+        // "authorization store unavailable" sites in auth_routes.cpp (the
+        // engine-principal RBAC-store-unavailable branches; grep the quoted
+        // string): same wording, same status code. The 403/Forbidden this
         // used to return was the outlier — a caller doing exponential
         // backoff on 503 would never retry a transient RBAC-store hiccup
         // that surfaced as a permanent-looking 403 (fjarvis/Kimi K2.7, PR
@@ -48,6 +49,27 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
                                                               .permission = perm}),
                         "application/json");
         return std::unexpected(authz::GateFailure::Degraded);
+    }
+
+    // Decision (#2298 PR 3, "the flip"): preserve `require_permission`'s
+    // service branch hard-403 when RBAC enforcement is not in effect. The
+    // service-tag axis below is RBAC-independent — without this check, a
+    // disabled-RBAC service-scoped session would get a NARROWED (non-empty,
+    // via the tag axis alone) result here, a capability that session never
+    // had through `require_permission`. Same predicate
+    // (`rbac_enforcement_in_effect`, not raw `is_rbac_enabled()`) as
+    // `require_permission`'s service branch, so the two gates can never
+    // disagree on a corrupt/degraded store. `rbac_store_` is known non-null
+    // and open here (the check above already returned Degraded otherwise).
+    if (!session->token_scope_service.empty() && !rbac_enforcement_in_effect(rbac_store_)) {
+        audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                  "fleet read blocked: service-scoped token requires RBAC to be enabled");
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403,
+                                          "service-scoped tokens require RBAC to be enabled",
+                                          detail::A4ErrorOpts{.permission = perm}),
+                        "application/json");
+        return std::unexpected(authz::GateFailure::Forbidden);
     }
 
     // Spelled via deny_all() rather than relying on the switch below to
@@ -89,12 +111,16 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
                             "application/json");
             return std::unexpected(authz::GateFailure::Degraded);
         }
-        // agents_with_tag_checked (not the value_or({})-collapsing
-        // agents_with_tag) distinguishes "genuinely no agents tagged" from
-        // "the tag store failed to prepare the query" (B-2b) — the axis
-        // must fail closed to Degraded on the latter, never read as an
-        // empty-but-legitimate service.
-        auto tagged = tag_store_->agents_with_tag_checked("service", session->token_scope_service);
+        // agents_with_tag is the ADR-0050 typed read
+        // (std::expected<…, TagReadError>) — it distinguishes "genuinely no
+        // agents tagged" (engaged, possibly empty) from "the tag store
+        // degraded" (unexpected), superseding the pre-migration
+        // agents_with_tag_checked/B-2b split. The axis must fail closed to
+        // GateFailure::Degraded on the latter — never read a degraded store
+        // as an empty-but-legitimate service, and never collapse Degraded
+        // into Forbidden (the 503-vs-403 distinction this gate exists for).
+        auto tagged = tag_store_->agents_with_tag(std::string(authz::kServiceTagKey),
+                                                  session->token_scope_service);
         if (!tagged) {
             audit_log(req, "auth.fleet_read_required", "denied", "", "",
                       "fleet read blocked: tag store degraded resolving service scope");
@@ -154,7 +180,10 @@ bool AuthRoutes::confine_agent_target(const httplib::Request& req, httplib::Resp
                         "application/json");
         return false;
     }
-    auto tagged = tag_store_->agents_with_tag_checked("service", session->token_scope_service);
+    // ADR-0050 typed read — degrade maps to the 503 branch below, never to
+    // the not-in-service Forbidden (same reasoning as require_fleet_read).
+    auto tagged = tag_store_->agents_with_tag(std::string(authz::kServiceTagKey),
+                                              session->token_scope_service);
     if (!tagged) {
         audit_log(req, "auth.agent_target_required", "denied", "Agent", agent_id,
                   "agent target blocked: tag store degraded resolving service scope");

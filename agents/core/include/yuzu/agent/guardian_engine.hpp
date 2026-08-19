@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -254,6 +255,14 @@ public:
     /// mutual-exclusion test seam.
     std::size_t spark_armed_rule_count() const;
 
+    /// Per-SparkType count of rules CURRENTLY classified RulePlacement::Unsupported -
+    /// enforced by neither armed_guard_count() nor spark_armed_rule_count() (F7,
+    /// #2298 rung 2). A CURRENT gauge, not a cumulative counter: aggregates the live
+    /// unsupported_rules_ map fresh on every call, so it can legally decrease (e.g. a
+    /// mechanism becoming available, or the rule being disabled/removed). Backs the
+    /// mech_unsupported_total heartbeat tag.
+    [[nodiscard]] std::map<SparkType, std::uint64_t> unsupported_counts_by_type() const;
+
     /// Current policy generation — monotonically increasing; bumped on
     /// every successful apply_rules call. Persisted across restarts.
     std::uint64_t policy_generation() const;
@@ -298,6 +307,14 @@ public:
 
     /// The current, immutable-after-set outcome of wire_spark_engine().
     [[nodiscard]] SparkAvailability spark_availability() const;
+
+    /// Constructor-time spark preference (F7). No lock needed: prefer_spark_ is const,
+    /// set once in the ctor initializer list before this object is ever shared across
+    /// threads - unlike spark_availability_, which IS written later by
+    /// wire_spark_engine() and needs mtx_ for the cross-thread happens-before edge.
+    /// Exposed for yuzu.guardian_backend (guardian_backend_from_state()): Available
+    /// alone does not mean the backend IS spark, since prefer_spark_ defaults false.
+    [[nodiscard]] bool prefer_spark() const noexcept { return prefer_spark_; }
 
     /// TEST-ONLY: the durable-journal component, for fault injection (see
     /// GuardianLifecycleJournal::inject_write_failures_for_test). Null until
@@ -479,6 +496,19 @@ private:
     /// production wiring turns it on, so every test's cadence stays deterministic.
     bool maintenance_jitter_{false};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
+
+    /// rule_id -> SparkType for every rule CURRENTLY classified RulePlacement::Unsupported
+    /// (F7, #2298 rung 2): a known spark type with no mechanism registered on this host,
+    /// enforced by NEITHER backend. Maintained by reconcile_rule_locked (mtx_ held): every
+    /// outcome that is NOT Unsupported explicitly erases its own rule_id there; only the
+    /// Unsupported branch inserts/updates. Deliberately not an erase-at-function-entry +
+    /// reinsert pattern - that shape loses data if reconcile_rule_locked throws between the
+    /// erase and the (much later) reinsert point (apply_rules's per-rule try/catch means it
+    /// really can throw), and independently makes every retained-unsupported rule look
+    /// newly-unsupported on a full_sync pass, spamming the edge-triggered log. Backs
+    /// unsupported_counts_by_type(). Cleared (by rule_id sweep, not blanket) at the end of a
+    /// full_sync apply_rules pass, and blanket-cleared in stop().
+    std::unordered_map<std::string, SparkType> unsupported_rules_;
 
     // --- Spark detection path (rung 7) - all guarded by mtx_ except where noted ---
     const bool prefer_spark_; ///< IMMUTABLE for object lifetime; set only at construction

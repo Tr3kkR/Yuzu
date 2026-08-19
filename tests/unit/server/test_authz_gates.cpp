@@ -20,6 +20,7 @@
 #include "management_group_store.hpp"
 #include "oidc_provider.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "rbac_store.hpp"
 #include "tag_store.hpp"
 #include "test_api_token_pg_helper.hpp"  // ApiTokenStorePg
@@ -33,8 +34,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <httplib.h>
+
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
-#include <sqlite3.h>
 
 #include <algorithm>
 #include <chrono>
@@ -48,15 +50,6 @@
 using namespace yuzu::server;
 namespace pg = yuzu::server::pg;
 using pg::PgPool;
-
-namespace yuzu::server {
-// Test-only access to TagStore's connection (declared `friend` in
-// tag_store.hpp) so a test can install a sqlite3 authorizer for
-// deterministic fault injection — mirrors test_tag_store.cpp exactly.
-struct TagStoreFaultHook {
-    static sqlite3* db(TagStore& s) { return s.db_; }
-};
-} // namespace yuzu::server
 
 namespace {
 
@@ -76,20 +69,19 @@ int64_t now_epoch() {
         .count();
 }
 
-// Deny reads of the `tags` table so a prepare fails deterministically —
-// same technique as test_tag_store.cpp's degraded-prepare case (B-2b).
-int deny_tag_read(void*, int action, const char* arg1, const char*, const char*, const char*) {
-    if (action == SQLITE_READ && arg1 != nullptr && std::string(arg1) == "tags")
-        return SQLITE_DENY;
-    return SQLITE_OK;
-}
-
-// Unconditionally interrupts the VM — used to force sqlite3_step to return
-// SQLITE_INTERRUPT rather than SQLITE_ROW/SQLITE_DONE, exercising the
-// mid-scan (not prepare-time) failure path agents_with_tag_checked's fix
-// distinguishes from a genuine end-of-results.
-int force_interrupt(void*) {
-    return 1;
+// Drop the tags table out from under a live TagStore so its next read fails
+// deterministically — same degrade injection as test_rest_tag_routes.cpp /
+// test_tag_store.cpp (ADR-0050). On PG this replaces BOTH of the SQLite
+// mechanisms this file used pre-migration (authorizer prepare-deny and
+// progress-handler mid-scan interrupt): libpq returns one status-checked
+// PGresult per query, so prepare-time vs mid-scan failure is not a
+// distinction the store can observe — any query failure is the single
+// degraded case, TagReadError::kDegraded.
+void drop_tags_table(const std::string& dsn) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(conn.get(), "DROP TABLE tag_store.tags CASCADE")};
+    REQUIRE(r.ok());
 }
 
 // Distinct template name from every other file's "rbacstore*" registrations
@@ -101,11 +93,15 @@ yuzu::test::PgTestTemplate rbac_gates_tpl{
         RbacStore store{pool};
         if (!store.is_open())
             throw std::runtime_error("rbac (authz_gates) template: store failed to migrate/seed");
+        TagStore tags{pool};
+        if (!tags.is_open())
+            throw std::runtime_error("rbac (authz_gates) template: tag store failed to migrate");
     }};
 
 /// Full-stack rig: real RbacStorePg + real ManagementGroupStorePg + real
-/// ApiTokenStorePg + a SQLite TagStore, wired into a real AuthRoutes exactly
-/// as ServerImpl wires it (auth_routes.hpp:73-78).
+/// ApiTokenStorePg + a PG TagStore (ADR-0050, sharing the rbac clone's
+/// database — its own `tag_store` schema, no conflict), wired into a real
+/// AuthRoutes exactly as ServerImpl wires it (auth_routes.hpp:73-78).
 ///
 /// Management-group tree (mirrors test_list_read_confinement.cpp's Rig):
 ///   P ─┬─ C1        S   (P and S are roots; C1,C2 are children of P)
@@ -121,8 +117,7 @@ struct GatesRig {
     yuzu::test::ManagementGroupStorePg mgmt_bundle;
     ManagementGroupStore& mgmt = *mgmt_bundle;
     yuzu::test::ApiTokenStorePg api_tokens;
-    yuzu::test::TempDbFile tag_db{"yuzu_test_authzgates_tags-"};
-    TagStore tags{tag_db.path};
+    TagStore tags;
     // Shares the rbac database via a second pool (its own `audit_store`
     // schema, no conflict) — same pattern as test_rest_api_tokens.cpp's
     // CSPRNG-failure audit test. Real AuditStore, not nullptr, so denial
@@ -137,10 +132,11 @@ struct GatesRig {
     std::string gP, gC1, gC2, gS;
 
     explicit GatesRig(const std::string& dsn)
-        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool}, audit_pool{{.conninfo = dsn, .size = 2}},
-          audit_store{audit_pool} {
+        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool}, tags{pool},
+          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool} {
         REQUIRE(pool.valid());
         REQUIRE(rbac.is_open());
+        REQUIRE(tags.is_open());
         REQUIRE(audit_store.is_open());
         rbac.set_rbac_enabled(true); // enforcement in effect, not legacy-open
 
@@ -159,9 +155,9 @@ struct GatesRig {
         REQUIRE(mgmt.add_member(gC2, "a_c2").has_value());
         REQUIRE(mgmt.add_member(gS, "a_s").has_value());
 
-        tags.set_tag("a_p", "service", "printers");
-        tags.set_tag("a_c1", "service", "printers");
-        tags.set_tag("a_s", "service", "printers");
+        REQUIRE(tags.set_tag("a_p", "service", "printers").has_value());
+        REQUIRE(tags.set_tag("a_c1", "service", "printers").has_value());
+        REQUIRE(tags.set_tag("a_s", "service", "printers").has_value());
         // a_c2 deliberately untagged: inside mgmt scope, outside service scope.
 
         REQUIRE(auth_mgr.upsert_user("minter", "correct-horse-battery-staple", auth::Role::admin));
@@ -386,8 +382,14 @@ TEST_CASE("require_fleet_read: null tag store on a service token ⇒ Degraded",
     CHECK(res.status == 503);
 }
 
-TEST_CASE("require_fleet_read: degraded tag-store prepare on a service token ⇒ Degraded",
+TEST_CASE("require_fleet_read: degraded tag-store read on a service token ⇒ Degraded, "
+          "never a partial admit",
           "[pg][auth_routes][authz_gates][service_scope]") {
+    // Pre-ADR-0050 this was TWO tests, exercising SQLite's prepare-deny and
+    // mid-scan-interrupt failure paths separately. The PG TagStore has no
+    // such split to test — agents_with_tag issues one query and checks one
+    // PGresult status, so a partial row set is structurally unobservable and
+    // every read failure is the single kDegraded case this test injects.
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
     REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
@@ -395,48 +397,12 @@ TEST_CASE("require_fleet_read: degraded tag-store prepare on a service token ⇒
     auto req = bearer_request(token);
     httplib::Response res;
 
-    sqlite3* db = TagStoreFaultHook::db(r.tags);
-    REQUIRE(db != nullptr);
-    sqlite3_set_authorizer(db, deny_tag_read, nullptr);
+    drop_tags_table(rbac_db_.dsn());
 
     auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == authz::GateFailure::Degraded);
     CHECK(res.status == 503);
-
-    sqlite3_set_authorizer(db, nullptr, nullptr);
-}
-
-TEST_CASE("require_fleet_read: tag-store step() terminates with rc != SQLITE_DONE on a "
-          "service token ⇒ Degraded, never a partial admit",
-          "[pg][auth_routes][authz_gates][service_scope]") {
-    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
-    GatesRig r{rbac_db_.dsn()};
-    REQUIRE(r.rbac.assign_role({"user", "minter", "RespReader"}).has_value());
-    auto token = r.mint("printers");
-    auto req = bearer_request(token);
-    httplib::Response res;
-
-    sqlite3* db = TagStoreFaultHook::db(r.tags);
-    REQUIRE(db != nullptr);
-    // Fires during the VM run, after prepare succeeds — unlike deny_tag_read
-    // above, this exercises agents_with_tag_checked's terminal-rc check (any
-    // sqlite3_step rc other than SQLITE_DONE), not its prepare guard. NOTE:
-    // N=1 fires the interrupt on the VM's very first progress check, which in
-    // practice lands before any row is accumulated (a zero-rows case) — this
-    // proves the terminal-rc check itself is correct, but NOT that it holds
-    // after real rows were already scanned. That genuine after-real-rows
-    // mid-scan case is covered separately and calibrated for it in
-    // test_tag_store.cpp (counts ticks in a clean pass, then aborts at
-    // tick_count/2 to guarantee real rows were scanned first).
-    sqlite3_progress_handler(db, 1, force_interrupt, nullptr);
-
-    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
-    REQUIRE_FALSE(result.has_value());
-    CHECK(result.error() == authz::GateFailure::Degraded);
-    CHECK(res.status == 503);
-
-    sqlite3_progress_handler(db, 0, nullptr, nullptr);
 }
 
 TEST_CASE("require_fleet_read: genuinely empty service set ⇒ admitted-empty witness, "
@@ -478,11 +444,47 @@ TEST_CASE("require_fleet_read: null rbac store ⇒ Degraded (not a crash)",
     REQUIRE_FALSE(result.has_value());
     CHECK(result.error() == authz::GateFailure::Degraded);
     CHECK(res.status == 503);
-    // Pins the sibling-convention claim (auth_routes.cpp:630/811/1035): same
-    // text, same status, plus the retry_after_ms this specific branch adds.
+    // Pins the sibling-convention claim (the three "authorization store
+    // unavailable" sites in auth_routes.cpp): same text, same status, plus
+    // the retry_after_ms this specific branch adds.
     auto j = nlohmann::json::parse(res.body);
     CHECK(j["error"]["message"].get<std::string>() == "authorization store unavailable");
     CHECK(j["error"]["retry_after_ms"].get<std::int64_t>() == 5000);
+}
+
+TEST_CASE("require_fleet_read: service-scoped token, RBAC genuinely disabled "
+          "⇒ Forbidden (#2298 PR 3 decision 1 — preserve require_permission's "
+          "hard-403, do not let the tag axis alone admit a narrowed result)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    r.rbac.set_rbac_enabled(false); // genuinely, freshly disabled — denied before the mgmt
+                                    // axis is even consulted, so no grant is needed here.
+    auto token = r.mint("printers");
+    auto req = bearer_request(token);
+    httplib::Response res;
+
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("require RBAC to be enabled") != std::string::npos);
+}
+
+TEST_CASE("require_fleet_read: non-service token, RBAC genuinely disabled ⇒ "
+          "unfiltered (regression — the new RBAC-off check is service-scoped "
+          "only, legacy-open AdmitAll is untouched for an ordinary caller)",
+          "[pg][auth_routes][authz_gates][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
+    GatesRig r{rbac_db_.dsn()};
+    r.rbac.set_rbac_enabled(false);
+    auto token = r.mint(); // non-service
+    auto req = bearer_request(token);
+    httplib::Response res;
+
+    auto result = r.ar->require_fleet_read(req, res, "Response", "Read");
+    REQUIRE(result.has_value());
+    CHECK(result->unfiltered());
 }
 
 TEST_CASE("require_fleet_read: no bearer token ⇒ Unauthenticated",
@@ -613,7 +615,7 @@ TEST_CASE("confine_agent_target: null tag store on a service token ⇒ 503",
     CHECK(res.status == 503);
 }
 
-TEST_CASE("confine_agent_target: degraded tag-store prepare on a service token ⇒ 503",
+TEST_CASE("confine_agent_target: degraded tag-store read on a service token ⇒ 503",
           "[pg][auth_routes][authz_gates][service_scope]") {
     YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_gates_tpl);
     GatesRig r{rbac_db_.dsn()};
@@ -621,15 +623,11 @@ TEST_CASE("confine_agent_target: degraded tag-store prepare on a service token �
     auto req = bearer_request(token);
     httplib::Response res;
 
-    sqlite3* db = TagStoreFaultHook::db(r.tags);
-    REQUIRE(db != nullptr);
-    sqlite3_set_authorizer(db, deny_tag_read, nullptr);
+    drop_tags_table(rbac_db_.dsn());
 
     bool ok = r.ar->confine_agent_target(req, res, "Response", "Read", "a_p");
     CHECK_FALSE(ok);
     CHECK(res.status == 503);
-
-    sqlite3_set_authorizer(db, nullptr, nullptr);
 }
 
 // ── service_scope_policy.hpp — compile coverage ─────────────────────────────

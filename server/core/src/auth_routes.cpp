@@ -13,6 +13,7 @@
 #include <string_view>
 
 #include "authz_topology_floor.hpp"
+#include "body_cap_policy.hpp" // resolve_body_cap — path_class label for the service-scope deny metric (#2298 PR 3)
 #include "deprovision_deny_split.hpp" // record_deprovision_deny_split — ADR-2001 #3069 shared split
 #include "engine_principal_store.hpp"
 #include "http_route_sink.hpp"
@@ -25,6 +26,7 @@
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — the unified A4 denial wrapper (#1470)
 #include "saml_principal.hpp"  // saml_principal_id / is_valid_saml_component — ADR-2001 PR4a
 #include "saml_scim_link.hpp"  // link_saml_login_to_scim — ADR-2001 PR4a login-site orchestration
+#include "service_scope_policy.hpp" // authz::service_scope_global_safe — #2298 PR 3 default-deny table
 
 #include <ctime>
 
@@ -599,6 +601,18 @@ bool AuthRoutes::require_admin(const httplib::Request& req, httplib::Response& r
     return true;
 }
 
+bool AuthRoutes::service_scope_admits(std::string_view securable_type,
+                                      std::string_view operation) const {
+    if (service_scope_global_safe_override_for_test_) {
+        for (const auto& pair : *service_scope_global_safe_override_for_test_) {
+            if (pair.securable_type == securable_type && pair.operation == operation)
+                return true;
+        }
+        return false;
+    }
+    return authz::service_scope_global_safe(securable_type, operation);
+}
+
 bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Response& res,
                                     const std::string& securable_type,
                                     const std::string& operation) {
@@ -611,9 +625,16 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
     // effective_role). Only interactive cookie sessions can be elevated —
     // elevate_session never runs for MCP/service-scoped tokens (which are
     // synthesized per-request and carry no elevated_until), so this short-circuit
-    // cannot be reached by them. Auditing is on the elevation lifecycle
+    // cannot be reached by them today. Auditing is on the elevation lifecycle
     // (role.elevation.granted/expired), not per privileged action.
-    if (auth::is_elevated(*session))
+    //
+    // Defense-in-depth (#2298 PR 3): the `token_scope_service.empty()` guard
+    // is currently redundant with the invariant above, not load-bearing — kept
+    // so this short-circuit can never be the thing that lets a service-scoped
+    // token bypass the default-deny flip below, if that invariant ever
+    // changes. Do NOT read its presence as evidence elevation is reachable
+    // for service tokens today; it is not.
+    if (auth::is_elevated(*session) && session->token_scope_service.empty())
         return true;
 
     // Engine principals have NO legacy or service-scoped authority — their only
@@ -641,6 +662,28 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             const std::string perm = securable_type + ":" + operation;
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
+        }
+        // Belt-and-braces (#2298 PR 3): engine-token mint already rejects a
+        // non-empty `scope_service` (`api_token_store.cpp::validate_engine_mint`),
+        // so this guards a corrupted/constraint-bypassed row only, not a live
+        // path. An engine session's own direct RBAC grant is a DIFFERENT
+        // authority than ITServiceOwner and is not exempt from the same
+        // default-deny consult the service branch applies below — a
+        // corrupted row must not use the engine branch as a side door around
+        // the seeded-empty allow-list.
+        if (!session->token_scope_service.empty() &&
+            !service_scope_admits(securable_type, operation)) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "engine principal denied: corrupted scope_service on engine session "
+                      "blocked by service-scope default-deny");
+            res.status = 403;
+            const std::string perm = securable_type + ":" + operation;
+            // No `.permission` field: holding `perm` alone would not admit
+            // this session (compile-time-empty allow-list — routed-concern
+            // "MUST NOT name a permission that wouldn't actually admit").
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm),
                             "application/json");
             return false;
         }
@@ -695,17 +738,34 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
         }
     }
 
-    // Service-scoped tokens: check if the ITServiceOwner role grants this permission.
-    // Scoped tokens cannot be used when RBAC is disabled.
+    // Service-scoped tokens (PR 3 — the flip, #2298 durable fix): ITServiceOwner
+    // remains the AUTHORITY CEILING (a service token can never exceed what that
+    // role grants), but no longer the sole gate. A pair also has to clear the
+    // seeded-EMPTY `kServiceScopeGlobalSafe` allow-list to be exercised
+    // fleet-wide/unconfined — everything else 403s by default now, inverting
+    // the old "ITServiceOwner holds it -> admit" shape. This closes the ~100
+    // instances where that admit reached fleet-wide data with no per-agent
+    // narrowing at all (`docs/adr/1006-service-scope-default-deny.md`). A
+    // route that legitimately needs to serve service tokens migrates onto
+    // `require_fleet_read`/`confine_agent_target` (Phase 2, metric-prioritized
+    // below) instead of growing this allow-list.
     if (!session->token_scope_service.empty()) {
         const std::string perm = securable_type + ":" + operation;
-        if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+        // #1717: gate on `rbac_enforcement_in_effect`, not raw
+        // `is_rbac_enabled()` (same standardization as the legacy branch
+        // below and `require_scoped_permission`'s service branch). A null
+        // store or a genuinely-disabled one still denies here; a degraded
+        // view (open, but a stale cached "disabled" that never observed a
+        // real toggle) is treated as still-enforced and falls through to
+        // fail closed via `check_role_has_permission` on that same handle
+        // instead — deny-on-degrade either way, just a more accurate reason.
+        if (!rbac_store_ || !rbac_enforcement_in_effect(rbac_store_)) {
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
+            // No `.permission`: granting `perm` does not fix "RBAC disabled".
             res.set_content(detail::a4_denial(res, 403,
-                                              "service-scoped tokens require RBAC to be enabled",
-                                              detail::A4ErrorOpts{.permission = perm}),
+                                              "service-scoped tokens require RBAC to be enabled"),
                             "application/json");
             return false;
         }
@@ -713,10 +773,36 @@ bool AuthRoutes::require_permission(const httplib::Request& req, httplib::Respon
             audit_log(req, "auth.permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
+            // Post-flip, an ITServiceOwner grant is necessary but no longer
+            // sufficient (the allow-list check below still applies) — the
+            // message says so and `.permission` is omitted rather than
+            // implying this single grant would admit the caller.
             std::string msg = "service-scoped token does not grant " + perm +
-                              " (ITServiceOwner permission required)";
-            res.set_content(detail::a4_denial(res, 403, msg, detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
+                              " (requires ITServiceOwner AND an explicit service-scope "
+                              "allow-list entry)";
+            res.set_content(detail::a4_denial(res, 403, msg), "application/json");
+            return false;
+        }
+        if (!service_scope_admits(securable_type, operation)) {
+            audit_log(req, "auth.permission_required", "denied", "", "",
+                      "service-scoped token blocked: default-deny (" + perm +
+                          " not on the service-scope global-safe allow-list)");
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                m->counter("yuzu_auth_service_scope_default_denied_total",
+                           {{"permission", perm},
+                            {"path_class", std::string(resolve_body_cap(req.method, req.path)
+                                                            .path_class)}})
+                    .increment();
+            }
+            res.status = 403;
+            // No `.permission`: the allow-list is compile-time-empty, so no
+            // RBAC grant admits this caller (routed-concern MUST — a blanket
+            // deny must not name a permission that wouldn't actually admit).
+            std::string msg = "service-scoped token does not grant " + perm +
+                              " (not on the service-scope global-safe allow-list; this route "
+                              "needs an explicit confined path via require_fleet_read/"
+                              "confine_agent_target)";
+            res.set_content(detail::a4_denial(res, 403, msg), "application/json");
             return false;
         }
         return true;
@@ -794,7 +880,15 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
 
     // JIT admin elevation grants full admin (across all management groups) for
     // its window — cookie-session-only, so unreachable by MCP/service tokens.
-    if (auth::is_elevated(*session))
+    //
+    // Defense-in-depth (#2298 PR 3, mirrors require_permission's identical
+    // guard above): the `token_scope_service.empty()` check is currently
+    // redundant with that same cookie-session-only invariant, not
+    // load-bearing — kept so this short-circuit can never be the thing that
+    // lets a service-scoped token bypass the default-deny flip below, if
+    // that invariant ever changes. Do NOT read its presence as evidence
+    // elevation is reachable for service tokens today; it is not.
+    if (auth::is_elevated(*session) && session->token_scope_service.empty())
         return true;
 
     // Engine principals have NO legacy or service-scoped authority — their only
@@ -823,6 +917,28 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             const std::string perm = securable_type + ":" + operation;
             res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm,
                                               detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
+        }
+        // Belt-and-braces (#2298 PR 3, mirrors require_permission's identical
+        // guard): engine-token mint already rejects a non-empty
+        // `scope_service` (`api_token_store.cpp::validate_engine_mint`), so
+        // this guards a corrupted/constraint-bypassed row only, not a live
+        // path — fjarvis (PR review) found this sibling function had the
+        // guard applied to only one of the two engine branches. A corrupted
+        // row must not use the engine branch as a side door around the
+        // seeded-empty allow-list.
+        if (!session->token_scope_service.empty() &&
+            !service_scope_admits(securable_type, operation)) {
+            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                      "engine principal denied: corrupted scope_service on engine session "
+                      "blocked by service-scope default-deny");
+            res.status = 403;
+            const std::string perm = securable_type + ":" + operation;
+            // No `.permission` field: holding `perm` alone would not admit
+            // this session (compile-time-empty allow-list — routed-concern
+            // "MUST NOT name a permission that wouldn't actually admit").
+            res.set_content(detail::a4_denial(res, 403, "permission denied: " + perm),
                             "application/json");
             return false;
         }
@@ -880,13 +996,17 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // and that the ITServiceOwner role grants the required permission.
     if (!session->token_scope_service.empty()) {
         const std::string perm = securable_type + ":" + operation;
-        if (!rbac_store_ || !rbac_store_->is_rbac_enabled()) {
+        // #1717: gate on `rbac_enforcement_in_effect`, not raw
+        // `is_rbac_enabled()` — same standardization as `require_permission`'s
+        // service branch (#2298 PR 3), so a degraded/stale-cached store
+        // reads identically on both functions instead of diverging.
+        if (!rbac_store_ || !rbac_enforcement_in_effect(rbac_store_)) {
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: RBAC not enabled");
             res.status = 403;
+            // No `.permission`: granting `perm` does not fix "RBAC disabled".
             res.set_content(detail::a4_denial(res, 403,
-                                              "service-scoped tokens require RBAC to be enabled",
-                                              detail::A4ErrorOpts{.permission = perm}),
+                                              "service-scoped tokens require RBAC to be enabled"),
                             "application/json");
             return false;
         }
@@ -895,10 +1015,14 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
             audit_log(req, "auth.scoped_permission_required", "denied", "", "",
                       "service-scoped token blocked: lacks ITServiceOwner permission");
             res.status = 403;
-            std::string msg =
-                "service-scoped token does not grant " + perm + " (ITServiceOwner permission required)";
-            res.set_content(detail::a4_denial(res, 403, msg, detail::A4ErrorOpts{.permission = perm}),
-                            "application/json");
+            // Post-flip, an ITServiceOwner grant is necessary but no longer
+            // sufficient (the target agent's service tag must still match
+            // below) — omit `.permission` rather than imply this single
+            // grant would admit the caller.
+            std::string msg = "service-scoped token does not grant " + perm +
+                              " (requires ITServiceOwner AND the target agent's service tag "
+                              "to match the token's scope)";
+            res.set_content(detail::a4_denial(res, 403, msg), "application/json");
             return false;
         }
         // Verify the target agent's service tag matches the token's scope
@@ -912,22 +1036,57 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
                             "application/json");
             return false;
         }
-        if (!agent_id.empty()) {
-            auto agent_service = tag_store_->get_tag(agent_id, "service");
-            if (agent_service != session->token_scope_service) {
-                audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
-                          "agent service '" + agent_service + "' does not match token scope '" +
-                              session->token_scope_service + "'");
-                res.status = 403;
-                // Was the third denial shape ({"error":"forbidden","detail":...});
-                // now the unified A4 envelope like every other gate (#1470).
-                res.set_content(detail::a4_denial(res, 403,
-                                                  "agent is not in service '" +
-                                                      session->token_scope_service + "'",
-                                                  detail::A4ErrorOpts{.permission = perm}),
-                                "application/json");
-                return false;
-            }
+        // #2298 PR 3 (§3b): an empty agent_id used to skip the ONLY
+        // comparison that could deny and fall through to an unconditional
+        // `return true` below — the exact "allow everything" degenerate
+        // `confine_agent_target` (authz_gates.cpp) was built to not repeat
+        // (#2437/#2500 omitted-vs-empty rule: an empty agent_id is a caller
+        // bug, never "no target to check"). Verified during planning: every
+        // one of this function's ~18 call sites already guards
+        // `agent_id.empty()` before reaching it, so this bug was latent, not
+        // live — this 400 closes the function's own degenerate shape without
+        // an admit->deny regression on any real caller. Checked FIRST, before
+        // any tag-store access, so a caller bug never reaches the (unrelated)
+        // degraded-store handling below.
+        if (agent_id.empty()) {
+            audit_log(req, "auth.scoped_permission_required", "denied", "", "",
+                      "service-scoped token blocked: empty agent_id");
+            res.status = 400;
+            res.set_content(detail::a4_denial(res, 400, "agent_id is required",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
+        }
+        // ADR-0050 typed read: a degraded store is a 503 (retryable),
+        // never conflated with "agent has no service tag" — the
+        // pre-migration read collapsed both to "", which happened to
+        // deny (fail-closed) but audited the outage as a scope MISMATCH,
+        // hiding the real cause from the operator.
+        auto service_tag = tag_store_->get_tag(agent_id, std::string(authz::kServiceTagKey));
+        if (!service_tag) {
+            audit_log(req, "auth.scoped_permission_required", "denied", agent_id, "",
+                      "service-scoped token blocked: tag store degraded");
+            res.status = 503;
+            res.set_content(detail::a4_denial(res, 503,
+                                              "tag store unavailable, cannot verify scope",
+                                              detail::A4ErrorOpts{.retry_after_ms = 5000}),
+                            "application/json");
+            return false;
+        }
+        const std::string agent_service = service_tag->value_or(std::string{});
+        if (agent_service != session->token_scope_service) {
+            audit_log(req, "auth.scoped_permission_required", "denied", agent_id,
+                      "agent service '" + agent_service + "' does not match token scope '" +
+                          session->token_scope_service + "'");
+            res.status = 403;
+            // Was the third denial shape ({"error":"forbidden","detail":...});
+            // now the unified A4 envelope like every other gate (#1470).
+            res.set_content(detail::a4_denial(res, 403,
+                                              "agent is not in service '" +
+                                                  session->token_scope_service + "'",
+                                              detail::A4ErrorOpts{.permission = perm}),
+                            "application/json");
+            return false;
         }
         return true;
     }
@@ -1221,6 +1380,79 @@ bool AuthRoutes::audit_log_for_principal(const httplib::Request& req, const std:
                      action, principal, target_id);
     }
     return ok;
+}
+
+bool AuthRoutes::deny_service_scoped_session(const httplib::Request& req, httplib::Response& res,
+                                             const std::string& action,
+                                             const std::string& message,
+                                             const std::string& target_type,
+                                             const std::string& target_id,
+                                             const std::string& permission) {
+    auto session = require_auth(req, res);
+    if (!session)
+        return true; // require_auth already wrote 401/redirect; caller returns.
+    if (session->token_scope_service.empty())
+        return false;
+    // Write the 403 FIRST, audit after: a throwing audit sink must not be
+    // able to suppress the 403 (mirrors the per-file deny_service_scoped_*
+    // family's ordering — see this method's declaration comment).
+    res.status = 403;
+    res.set_content(
+        detail::a4_denial(res, 403, message, detail::A4ErrorOpts{.permission = permission}),
+        "application/json");
+    // `audit_log` calls into a concrete `AuditStore*`, not an injected
+    // callback, so it cannot propagate a caller-supplied exception the way
+    // the per-file `deny_service_scoped_*` family's `audit_fn`/`audit_fn_`
+    // parameters could — but this try/catch matches their shape anyway
+    // (Gate 4/consistency-auditor: a family that looks identical everywhere
+    // is cheaper to reason about than one exception debated case-by-case).
+    try {
+        audit_log(req, action, "denied", target_type, target_id,
+                 message + " (path=" + req.path + ")");
+    } catch (const std::exception& e) {
+        spdlog::warn("deny_service_scoped_session: audit_log threw: {}", e.what());
+    } catch (...) {
+        spdlog::warn("deny_service_scoped_session: audit_log threw (non-std)");
+    }
+    return true;
+}
+
+bool AuthRoutes::deny_service_scoped_service_tag_mutation(const httplib::Request& req,
+                                                            httplib::Response& res,
+                                                            const std::string& action,
+                                                            const std::string& agent_id,
+                                                            const std::string& key) {
+    auto session = require_auth(req, res);
+    if (!session)
+        return true; // require_auth already wrote 401/redirect; caller returns.
+    if (authz::service_scope_may_mutate_tag_key(session->token_scope_service, key))
+        return false;
+    // Write the 403 FIRST, audit after — same throw-safety ordering as
+    // deny_service_scoped_session immediately above.
+    res.status = 403;
+    res.set_content(
+        detail::a4_denial(res, 403,
+                          authz::kServiceTagMutationDeniedMessage),
+        "application/json");
+    try {
+        // Gate 4/#3289 hardening round: target_type="Tag" matches REST v1's
+        // convention for this identical logical event (a denied tag
+        // mutation) — not "Agent", which matched neither REST's nor any
+        // other surface's convention. This does NOT resolve the separate,
+        // pre-existing mismatch against server.cpp's own tag.set/tag.delete
+        // success/failure rows, which use lowercase "tag" — this caller
+        // (server.cpp, via the legacy dashboard routes) is a DIFFERENT file
+        // from where this comment lives; see the routed-concern row for the
+        // tracked residual.
+        audit_log(req, action, "denied", "Tag", agent_id + ":" + key,
+                 "service-scoped token blocked: cannot mutate the service tag (path=" +
+                     req.path + ")");
+    } catch (const std::exception& e) {
+        spdlog::warn("deny_service_scoped_service_tag_mutation: audit_log threw: {}", e.what());
+    } catch (...) {
+        spdlog::warn("deny_service_scoped_service_tag_mutation: audit_log threw (non-std)");
+    }
+    return true;
 }
 
 void AuthRoutes::emit_event(const std::string& event_type, const httplib::Request& req,

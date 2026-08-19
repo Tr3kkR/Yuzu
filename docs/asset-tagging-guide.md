@@ -28,14 +28,23 @@ Structured categories are enforced at the API layer:
 
 ## Setting Tags
 
-> **Tag source precedence.** Every tag carries a `source` field — `"server"` for operator/API
-> writes (REST `PUT /api/v1/tags`, MCP `set_tag`) and `"agent"` for tags an agent self-reports
-> via its heartbeat `scopable_tags`. An agent-reported tag is written only when the stored row
-> is itself `"agent"`-sourced or absent; an operator/API-set tag for the same `(agent_id, key)`
-> is **authoritative and cannot be overwritten by the agent**. This prevents a rogue or
-> misconfigured agent from self-assigning into an operator-declared benchmark cohort. To force a
-> value regardless of the current source, write it via the REST API or MCP `set_tag` (source
-> `"server"`).
+> **Tag source precedence.** Every tag carries a `source` field — `"api"` for REST/dashboard
+> writes (`PUT /api/v1/tags`), `"mcp"` for MCP `set_tag`, `"server"` for server-internal
+> writes, and `"agent"` for tags an agent self-reports via its heartbeat `scopable_tags`. An
+> agent-reported tag is written only when the stored row is itself `"agent"`-sourced or absent;
+> any non-`"agent"`-sourced tag for the same `(agent_id, key)` is **authoritative and cannot be
+> overwritten by the agent**. This prevents a rogue or misconfigured agent from self-assigning
+> into an operator-declared benchmark cohort. To force a value regardless of the current
+> source, write it via the REST API or MCP `set_tag`.
+>
+> **The `service` key is a special case (#3289).** It is never accepted from an agent's
+> self-report at all — an agent-supplied `service` value is silently dropped during sync,
+> regardless of whether a stored row exists. `service` is the confinement boundary a
+> service-scoped API token is checked against, so it must always be operator/API-assigned,
+> never agent-claimed. A pre-existing agent-authored `service` row (from before this
+> restriction existed) is purged on the agent's next sync. A service-scoped token is also
+> denied writing or deleting its OWN `service` tag on any target, regardless of source — see
+> "Service-Scoped Tokens" under `docs/user-manual/authentication.md`.
 
 ### Via the REST API
 
@@ -345,6 +354,17 @@ These groups use `dynamic` membership — the scope engine can refresh which dev
 
 This means an ITServiceOwner assigned to "Service: payments" automatically has scoped access to every device tagged with `service=payments`.
 
+**Two distinct confinement axes.** The ITServiceOwner *role* documented above confines a
+management-group-scoped user via RBAC — that is unaffected by, and independent of, a
+*service-scoped API token*'s confinement (ADR-1006, "the flip"), which restricts what a
+minted token bound to a specific service value may reach. Holding ITServiceOwner (or
+Administrator, or Operator) with a plain `Tag:Write`/`Tag:Delete` grant remains sufficient
+to set or move any device's `service` tag — those are fleet-scoped RBAC roles, not
+service-scoped tokens, so moving a `service` tag through them is not a confinement bypass.
+The restriction in the callout above applies only to a session whose own API token carries
+a `token_scope_service` — such a token may never write or delete the `service` key on any
+target, in or out of its own scope (#3289).
+
 ### Setting up an IT Service Owner
 
 **Step 1: Tag devices with a service.**
@@ -495,6 +515,12 @@ NOT tag:environment == "Dev"
 This allows you to target instructions, policies, and reports at specific device subsets based on their tags.
 
 For **presence** (a tag key exists on the device, regardless of value) use `EXISTS tag:<name>` rather than an equality. The YAML `spec.scope.selector.tags` block-form authoring surface lowers each listed tag to `EXISTS tag:<name>` — a presence check — so a `selector.tags: [production]` entry matches any device carrying a `production` tag with a non-empty value. For value-equality matching, use the explicit `tag:<key> == "<value>"` form shown above.
+
+**Failure behavior (ADR-0050):** a scope evaluation whose `tag:<key>` values cannot be read
+from the tag store (a degraded database) **fails the whole evaluation** — the operation
+reports an error rather than resolving to fewer or more devices than the expression names. A
+`NOT tag:...` expression in particular can never silently expand to the whole fleet because a
+tag read failed.
 
 ---
 

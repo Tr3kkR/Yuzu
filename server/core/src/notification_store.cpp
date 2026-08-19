@@ -533,6 +533,13 @@ bool NotificationStore::migrate_from_sqlite_impl(const std::filesystem::path& le
     // 3b. Read every legacy row ONCE — the single source both the real
     // migration (below) and this stamp's own trust-anchor fingerprint
     // derive from (no second file read anywhere in this function).
+    //
+    // #3210: investigated for the multi-table torn-read hazard PR #3174 fixed
+    // in software_deployment_store.cpp (and #3210 later fixed in
+    // management_group_store.cpp) — confirmed NOT applicable here.
+    // read_legacy_snapshot reads exactly one table (`notifications`) via one
+    // statement; there is no second table read that could observe a
+    // different point in time, so no enclosing transaction is needed.
     const auto snap_opt = read_legacy_snapshot(legacy.get());
     if (!snap_opt) {
         spdlog::error("NotificationStore: migrate_from_sqlite: legacy read failed: {}",
