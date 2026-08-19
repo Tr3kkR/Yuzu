@@ -203,6 +203,60 @@ struct BoundUdpSocket {
     BoundUdpSocket& operator=(const BoundUdpSocket&) = delete;
 };
 
+// A real ESTABLISHED TCP pair (client + accepted server side), both ends on
+// 127.0.0.1 -- the only way to prove network_diag's "connections" action
+// (migrated in this PR alongside "listening", but previously untested: gate-3
+// /governance quality-engineer finding). Same ScopedFd-on-acquisition
+// reasoning as the other fixtures above; three sockets (listener, accepted,
+// client), each its own ScopedFd.
+struct ConnectedTcpPair {
+    yuzu::agent::ScopedFd listener;
+    yuzu::agent::ScopedFd server_side;
+    yuzu::agent::ScopedFd client_side;
+    uint16_t listen_port{0};
+    uint16_t client_port{0};
+
+    ConnectedTcpPair() {
+        listener = yuzu::agent::ScopedFd(::socket(AF_INET, SOCK_STREAM, 0));
+        REQUIRE(listener.valid());
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = 0;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        REQUIRE(::bind(listener.get(), reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) ==
+               0);
+        REQUIRE(::listen(listener.get(), 1) == 0);
+        struct sockaddr_in bound{};
+        socklen_t len = sizeof(bound);
+        REQUIRE(::getsockname(listener.get(), reinterpret_cast<struct sockaddr*>(&bound), &len) ==
+               0);
+        listen_port = ntohs(bound.sin_port);
+        REQUIRE(listen_port != 0);
+
+        client_side = yuzu::agent::ScopedFd(::socket(AF_INET, SOCK_STREAM, 0));
+        REQUIRE(client_side.valid());
+        struct sockaddr_in connect_addr{};
+        connect_addr.sin_family = AF_INET;
+        connect_addr.sin_port = htons(listen_port);
+        connect_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        REQUIRE(::connect(client_side.get(), reinterpret_cast<struct sockaddr*>(&connect_addr),
+                          sizeof(connect_addr)) == 0);
+
+        server_side = yuzu::agent::ScopedFd(::accept(listener.get(), nullptr, nullptr));
+        REQUIRE(server_side.valid());
+
+        struct sockaddr_in client_bound{};
+        socklen_t client_len = sizeof(client_bound);
+        REQUIRE(::getsockname(client_side.get(),
+                              reinterpret_cast<struct sockaddr*>(&client_bound),
+                              &client_len) == 0);
+        client_port = ntohs(client_bound.sin_port);
+        REQUIRE(client_port != 0);
+    }
+    ConnectedTcpPair(const ConnectedTcpPair&) = delete;
+    ConnectedTcpPair& operator=(const ConnectedTcpPair&) = delete;
+};
+
 } // namespace
 
 TEST_CASE("os_info plugin: os_name/os_version/os_build read the real host plist/sysctl chain",
@@ -293,6 +347,27 @@ TEST_CASE("network_diag plugin: listening finds this process's own real TCP list
     // filter(LISTEN) -> output chain.
     const std::string expect =
         std::format("listen|tcp|127.0.0.1|{}|{}", listener.port, self);
+    CHECK(result.captured.find(expect) != std::string::npos);
+}
+
+TEST_CASE("network_diag plugin: connections finds this process's own real ESTABLISHED TCP pair",
+          "[agent][network_diag][wave3_pr31]") {
+    auto plugin = load_plugin("network_diag");
+
+    ConnectedTcpPair conn;
+    const pid_t self = getpid();
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin.descriptor, "connections");
+    CHECK(result.rc == 0);
+
+    // Reverting the lsof->walk_sockets migration for "connections", or
+    // wiring it to the wrong filter/output, either drops this row or
+    // misreports local/remote addr:port/pid -- this only matches the real
+    // dispatch -> walk_sockets -> filter(ESTABLISHED) -> output chain, from
+    // the accepted server-side socket's point of view.
+    const std::string expect = std::format("conn|tcp|127.0.0.1|{}|127.0.0.1|{}|{}",
+                                           conn.listen_port, conn.client_port, self);
     CHECK(result.captured.find(expect) != std::string::npos);
 }
 

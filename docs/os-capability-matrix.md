@@ -395,7 +395,7 @@ implementation is.
 | interaction | set_dnd | macos | supported | 1 | local_kv_store | - |
 | interaction | set_dnd | windows | supported | 1 | local_kv_store | - |
 | ioc | check | linux | supported | 1 | procfs | - |
-| ioc | check | macos | supported | 1 | libproc | - |
+| ioc | check | macos | supported | 1 | libproc | UDP rows carry an empty state (no fabricated "LISTEN") — a real UDP listener still matches a port check, but its detail text differs from a TCP match |
 | ioc | check | windows | supported | 1 | iphlpapi_dnsapi | - |
 | license_scan | list | linux | supported | 3 | popen(rpm/dpkg-query/openssl) | - |
 | license_scan | list | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
@@ -446,10 +446,10 @@ implementation is.
 | network_config | arp | macos | unsupported | - | - | - |
 | network_config | arp | windows | supported | 1 | GetIpNetTable2 | - |
 | network_diag | listening | linux | supported | 1 | /proc/net/tcp[6] | - |
-| network_diag | listening | macos | supported | 1 | libproc | - |
+| network_diag | listening | macos | supported | 1 | libproc | a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner |
 | network_diag | listening | windows | supported | 1 | GetExtendedTcpTable | - |
 | network_diag | connections | linux | supported | 1 | /proc/net/tcp[6] | - |
-| network_diag | connections | macos | supported | 1 | libproc | - |
+| network_diag | connections | macos | supported | 1 | libproc | a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one arbitrarily-chosen owning PID, not one row per owner |
 | network_diag | connections | windows | supported | 1 | GetExtendedTcpTable | - |
 | os_info | os_name | linux | supported | 1 | /etc/os-release | - |
 | os_info | os_name | macos | supported | 1 | SystemVersion.plist + sysctlbyname | - |
