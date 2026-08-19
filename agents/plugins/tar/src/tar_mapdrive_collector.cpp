@@ -32,6 +32,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib> // std::strtol — timestamp/event-field parsing (no scanf family)
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -122,16 +123,57 @@ int64_t ymd_hms_to_epoch(int y, int mo, int d, int h, int mi, int s) {
            h * 3600 + mi * 60 + s;
 }
 
+// Faithful stand-in for sscanf's "%Nd" (glibc 2.38's __isoc23_sscanf redirect
+// breaks older-glibc hosts, so no scanf family): skip leading whitespace (as %d
+// does, uncounted against the width), then let strtol consume the longest valid
+// prefix of the next `width` characters (sign included, as scanf counts it).
+// Advances `p` past the consumed characters and returns true on success.
+bool scan_int(const char*& p, int width, int& out) {
+    while (std::isspace(static_cast<unsigned char>(*p)))
+        ++p;
+    char buf[8]{}; // widths here are 2 or 4
+    for (int i = 0; i < width && p[i]; ++i)
+        buf[i] = p[i];
+    char* end{};
+    const long v = std::strtol(buf, &end, 10);
+    if (end == buf)
+        return false;
+    p += end - buf;
+    out = static_cast<int>(v); // width <= 4 → |v| <= 9999, cast exact
+    return true;
+}
+
 // Parse a flexible timestamp starting at `pos`: "YYYY-MM-DD[T| ]HH:MM:SS" or the
 // Samba "YYYY/MM/DD HH:MM:SS" form. Returns epoch seconds or 0 if not matched.
+// Same shapes the former sscanf triple matched:
+//   "%4d-%2d-%2dT%2d:%2d:%2d" | "%4d-%2d-%2d %2d:%2d:%2d" | "%4d/%2d/%2d %2d:%2d:%2d"
+// Preserved quirks: a format ' ' matches ZERO or more whitespace (each %d also
+// skips leading whitespace), and 'T' only follows a '-' date.
 int64_t parse_flexible_ts(const std::string& s, std::size_t pos = 0) {
     int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
-    // Accept '-' or '/' date separators and 'T' or ' ' between date and time.
-    if (std::sscanf(s.c_str() + pos, "%4d-%2d-%2dT%2d:%2d:%2d", &y, &mo, &d, &h, &mi, &se) == 6 ||
-        std::sscanf(s.c_str() + pos, "%4d-%2d-%2d %2d:%2d:%2d", &y, &mo, &d, &h, &mi, &se) == 6 ||
-        std::sscanf(s.c_str() + pos, "%4d/%2d/%2d %2d:%2d:%2d", &y, &mo, &d, &h, &mi, &se) == 6)
-        return ymd_hms_to_epoch(y, mo, d, h, mi, se);
-    return 0;
+    const char* p = s.c_str() + pos;
+    if (!scan_int(p, 4, y))
+        return 0;
+    const char sep = *p;
+    if (sep != '-' && sep != '/')
+        return 0;
+    ++p;
+    if (!scan_int(p, 2, mo) || *p != sep)
+        return 0;
+    ++p;
+    if (!scan_int(p, 2, d))
+        return 0;
+    if (sep == '-' && *p == 'T')
+        ++p;
+    if (!scan_int(p, 2, h) || *p != ':')
+        return 0;
+    ++p;
+    if (!scan_int(p, 2, mi) || *p != ':')
+        return 0;
+    ++p;
+    if (!scan_int(p, 2, se))
+        return 0;
+    return ymd_hms_to_epoch(y, mo, d, h, mi, se);
 }
 
 // Decode the kernel's octal escapes in /proc/mounts and /etc/fstab fields
@@ -439,8 +481,13 @@ std::vector<MapDriveHistoryRow> parse_win_security_logons(const std::string& tex
         int event_id = 0;
         {
             auto p = block.find("Event ID:");
-            if (p != std::string::npos)
-                std::sscanf(block.c_str() + p + 9, "%d", &event_id);
+            if (p != std::string::npos) {
+                const char* q = block.c_str() + p + 9;
+                char* end{};
+                const long v = std::strtol(q, &end, 10);
+                if (end != q) // parse failure keeps the 0 initializer (≠ 4624 → skipped)
+                    event_id = static_cast<int>(v);
+            }
         }
         if (event_id != 4624)
             continue;
@@ -449,8 +496,13 @@ std::vector<MapDriveHistoryRow> parse_win_security_logons(const std::string& tex
         int logon_type = -1;
         {
             auto p = block.find("Logon Type:");
-            if (p != std::string::npos)
-                std::sscanf(block.c_str() + p + 11, "%d", &logon_type);
+            if (p != std::string::npos) {
+                const char* q = block.c_str() + p + 11;
+                char* end{};
+                const long v = std::strtol(q, &end, 10);
+                if (end != q) // parse failure keeps the -1 initializer (≠ 3 → skipped)
+                    logon_type = static_cast<int>(v);
+            }
         }
         if (logon_type != 3)
             continue;

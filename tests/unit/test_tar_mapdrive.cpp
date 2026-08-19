@@ -110,13 +110,31 @@ TEST_CASE("mapdrive parse_win_security_logons: 4624 type-3 kept, others filtered
         "Logon Type:\t\t2\n" // interactive — must be filtered out
         "New Logon:\n"
         "\tAccount Name:\t\tbob\n"
-        "\tSource Network Address:\t-\n";
+        "\tSource Network Address:\t-\n"
+        "Event[2]:\n"
+        "  Date: 2026-07-01T11:30:00.000\n"
+        "  Event ID: notanumber\n" // unparseable id keeps the 0 initializer → filtered
+        "Logon Type:\t\t3\n"
+        "New Logon:\n"
+        "\tAccount Name:\t\tmallory\n"
+        "\tSource Network Address:\t192.168.1.66\n"
+        "Event[3]:\n"
+        "  Date: 2026-07/01 10:20:30\n" // mixed date separators → ts unparseable, row kept
+        "  Event ID: 4624\n"
+        "Logon Type:\t\t3\n"
+        "New Logon:\n"
+        "\tAccount Name:\t\tdave\n"
+        "\tSource Network Address:\t192.168.1.77\n";
     auto out = parse_win_security_logons(text);
-    REQUIRE(out.size() == 1); // only the type-3 network logon survives
+    REQUIRE(out.size() == 2); // only the type-3 network logons survive
     CHECK(out[0].entry.direction == "inbound");
     CHECK(out[0].entry.username == "alice"); // the 2nd Account Name, not HOST$
     CHECK(out[0].entry.remote_host == "192.168.1.50");
-    CHECK(out[0].ts > 0);
+    // Exact epoch pins the 'T' form incl. width-capped seconds + fraction tolerance
+    // (2026-07-01T10:20:30 UTC).
+    CHECK(out[0].ts == 1782901230);
+    CHECK(out[1].entry.username == "dave");
+    CHECK(out[1].ts == 0); // separator-consistency rejection, without dropping the row
 }
 
 // ── Samba logs / journalctl (Linux inbound historic) ──────────────────────────
@@ -127,19 +145,27 @@ TEST_CASE("mapdrive parse_samba_logs: connect events from both log shapes",
         "[2026/07/01 10:20:30.123456,  3] ../../source3/smbd/service.c:1055(make_connection_snum)\n"
         "  public (ipv4:192.168.1.50:445) connect to service public initially as user alice "
         "(uid=1000, gid=1000)\n"
+        "[2026/07/01T10:25:00,  3] ../../source3/smbd/service.c:1055(make_connection_snum)\n" //
+        // slash-date + 'T' is unparseable — the next row falls back to the previous header's ts
+        "  private (ipv4:10.0.0.7:445) connect to service private initially as user dave "
+        "(uid=1001, gid=1001)\n"
         "2026-07-02T08:15:00+0000 host smbd[1234]: srv (ipv4:10.0.0.9:445) connect to service srv "
         "initially as user carol\n";
     auto out = parse_samba_logs(text);
-    REQUIRE(out.size() == 2);
+    REQUIRE(out.size() == 3);
     CHECK(out[0].entry.direction == "inbound");
     CHECK(out[0].entry.local_mount == "public");
     CHECK(out[0].entry.remote_host == "192.168.1.50");
     CHECK(out[0].entry.username == "alice");
-    CHECK(out[0].ts > 0); // from the [ ... ] header timestamp
-    CHECK(out[1].entry.local_mount == "srv");
-    CHECK(out[1].entry.remote_host == "10.0.0.9");
-    CHECK(out[1].entry.username == "carol");
-    CHECK(out[1].ts > 0); // from the inline ISO timestamp
+    // Exact epoch pins the bracket form "[YYYY/MM/DD HH:MM:SS.us, 3]" at pos=1
+    // (2026-07-01 10:20:30 UTC), incl. width-capped seconds + fraction tolerance.
+    CHECK(out[0].ts == 1782901230);
+    CHECK(out[1].entry.username == "dave");
+    CHECK(out[1].ts == 1782901230); // unparseable header → previous header's ts
+    CHECK(out[2].entry.local_mount == "srv");
+    CHECK(out[2].entry.remote_host == "10.0.0.9");
+    CHECK(out[2].entry.username == "carol");
+    CHECK(out[2].ts == 1782980100); // inline ISO timestamp (2026-07-02T08:15:00 UTC)
 }
 
 // ── insert round-trip: historical (incl. ts=0) + live rows ────────────────────

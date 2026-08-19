@@ -32,6 +32,7 @@
 #include <cstddef> // offsetof
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib> // std::strtoull — /proc/net/dev field walk
 #include <cstring>
 #include <type_traits>
 #include <vector>
@@ -212,12 +213,25 @@ NetCounters read_net_counters() {
         if (std::strcmp(name, "lo") == 0)
             continue;
         // rx: bytes packets errs drop fifo frame compressed multicast | tx: bytes ...
-        unsigned long long rxb = 0, txb = 0, junk = 0;
-        // 8 rx fields then tx bytes is field 9 overall.
-        if (std::sscanf(colon + 1, "%llu %llu %llu %llu %llu %llu %llu %llu %llu", &rxb, &junk,
-                        &junk, &junk, &junk, &junk, &junk, &junk, &txb) >= 9) {
-            rx_total += rxb;
-            tx_total += txb;
+        // 8 rx fields then tx bytes is field 9 overall. strtoull walk instead of
+        // sscanf "%llu"x9 (glibc 2.38's __isoc23_sscanf redirect breaks older-glibc
+        // hosts); like %llu, strtoull skips leading whitespace, and all 9 fields
+        // must convert — matching the old ==9 conversion-count gate.
+        const char* p = colon + 1;
+        unsigned long long fields[9]{};
+        bool ok = true;
+        for (auto& fv : fields) {
+            char* end{};
+            fv = std::strtoull(p, &end, 10);
+            if (end == p) {
+                ok = false;
+                break;
+            }
+            p = end;
+        }
+        if (ok) {
+            rx_total += fields[0]; // rx bytes
+            tx_total += fields[8]; // tx bytes
         }
     }
     c.valid = true;
