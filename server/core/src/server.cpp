@@ -721,6 +721,13 @@ public:
                           "Oldest-progress frames dropped from a record's bounded arming mailbox "
                           "(terminals are never dropped)",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_progress_suppressed_total",
+                          "notifications/progress candidates dropped by the H1 monotonic-progress "
+                          "rule (#2438) - a duplicate or momentarily-decreasing snapshot from the "
+                          "bus, never forwarded to the client. Correct, expected movement under "
+                          "normal load; watch for a sustained high rate relative to "
+                          "yuzu_mcp_bridge_projector_cycles_total as a sign of upstream event churn",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_terminal_publish_failures_total",
                           "Terminal-frame publish failures seen by the bridge's "
                           "publish_final → fallback → poison ladder (Decision 15(f))",
@@ -818,14 +825,28 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
                           "Progress-bridge teardown steps that could not complete on the "
-                          "maintenance thread, by reason. DEFENCE IN DEPTH, not the live "
-                          "out-of-memory signal: all three steps allocate nothing, so only a "
-                          "mutex failure can reach them today - use "
+                          "maintenance thread on a given ATTEMPT, by reason - fires once per "
+                          "failed step per attempt, so a record retried 3 times moves this "
+                          "counter 3 times even though it is one strand, not three. DEFENCE IN "
+                          "DEPTH, not the live out-of-memory signal: all three steps allocate "
+                          "nothing, so only a mutex failure can reach them today - use "
                           "yuzu_mcp_stream_terminal_publish_failures_total for allocation "
-                          "pressure. The claim is one-way, so a record that fails here is never "
-                          "retried and what it still owns is held until the process restarts; a "
-                          "retained record also pins that session's whole stream state, its "
-                          "replay ring and any pinned finals. Alert on > 0",
+                          "pressure. A record whose teardown fails IS RETRIED by a later sweep "
+                          "(#2513), up to Config::teardown_retry_max times, before what it still "
+                          "owns is held until the process restarts; a retained record also pins "
+                          "that session's whole stream state, its replay ring and any pinned "
+                          "finals. This counter ALONE is not yet an incident - check "
+                          "yuzu_mcp_bridge_teardown_retry_total{outcome} next, which is the one "
+                          "to alert on",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_teardown_retry_total",
+                          "#2513: the final disposition of a retry pass's re-entry into a "
+                          "previously-incomplete teardown, by outcome (recovered|exhausted). "
+                          "exhausted means the record failed every attempt up to "
+                          "Config::teardown_retry_max and is now retained exactly like the "
+                          "pre-#2513 posture: until the process restarts. THIS is the metric to "
+                          "alert on, not teardown_incomplete alone, which moves on every attempt "
+                          "including ones that go on to recover",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_forced_expire_total",
                           "Parked progress-bridge records force-expired by the ring-only "
@@ -924,6 +945,7 @@ public:
         metrics_.gauge("yuzu_mcp_bridge_records_active").set(0);
         metrics_.counter("yuzu_mcp_bridge_listener_failures_total");
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
+        metrics_.counter("yuzu_mcp_bridge_progress_suppressed_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_bridge_projection_degraded_total");
         metrics_.counter("yuzu_mcp_stream_attach_audit_failures_total");
