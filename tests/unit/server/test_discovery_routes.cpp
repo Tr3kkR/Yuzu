@@ -404,9 +404,11 @@ TEST_CASE("discover.instructions: enabled-only subset with parsed parameter_sche
             // InstructionStore::create_definition defaults an empty
             // parameter_schema to the literal "{}" (instruction_store.cpp),
             // so a definition authored with none round-trips as an empty
-            // OBJECT, not null. null is reserved for a stored value that
-            // fails to parse as JSON at all (defensive branch, not
-            // reachable through the normal create_definition path).
+            // OBJECT, not null. null covers a stored value that fails to
+            // parse as JSON at all, OR one that parses but isn't an object
+            // (array/string/number/bool) — the latter IS reachable via
+            // create/update/import (no object-shape validation on write),
+            // see the "non-object parameter_schema nulls out" test below.
             CHECK(d["parameter_schema"].is_object());
             CHECK(d["parameter_schema"].empty());
         }

@@ -1305,10 +1305,12 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{}})",
      // #2986: build_instructions_catalog's envelope is fixed; each entry's
      // parameter_schema is itself an arbitrary nested JSON Schema document
-     // (or null when the stored value doesn't parse) — genuinely variable
-     // BY DESIGN, so it is typed generically rather than pretending to know
+     // (or null when the stored value doesn't parse, OR parses to something
+     // other than an object — array/string/number/bool are nulled out too,
+     // discover_routes.cpp's is_object() guard) — genuinely variable BY
+     // DESIGN, so it is typed generically rather than pretending to know
      // its shape, same idiom as get_access_review's "campaign":{"type":"object"}.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Nested JSON Schema when the stored value parses as JSON, else null"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"count":{"type":"integer"},"truncated":{"type":"boolean"},"instructions":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"plugin":{"type":"string"},"action":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":["object","null"],"description":"Nested JSON Schema when the stored value parses as JSON AND is itself an object, else null"},"platforms":{"type":"string","description":"Comma-separated OS list, e.g. windows,linux,darwin"},"approval_mode":{"type":"string"}},"required":["id","name","plugin","action","description","parameter_schema","platforms","approval_mode"]}}},"required":["version","description","count","truncated","instructions"]})j"},
     {"discover_routes",
      "REST route catalog — subset of the same OpenAPI document GET /api/v1/openapi.json "
      "serves. Hand-maintained source, so it can under-report an undocumented route "
@@ -9154,7 +9156,19 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "summarize_working_set") {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                const std::string kind = param_str(args, "kind", "fleet");
+                // Gate 4 unhappy-path (2026-08-19): this tool is ReadOnly, not
+                // approval-gated, so the input schema's `kind` enum is
+                // advertised only — never enforced server-side (this
+                // codebase's established "ungated tool schema constraints
+                // aren't enforced unless the handler re-checks" pattern). An
+                // out-of-enum caller value was echoed verbatim below,
+                // violating the #2986 output schema's own `kind` enum on a
+                // strict validating client. Normalize to the schema's stated
+                // default before it's ever read or echoed.
+                std::string kind = param_str(args, "kind", "fleet");
+                if (kind != "fleet" && kind != "agent" && kind != "execution" &&
+                    kind != "result_set")
+                    kind = "fleet";
                 const std::string target_id = param_str(args, "id");
                 const int limit = std::clamp(param_int32(args, "limit", 25), 1, 100);
                 JArr links;
