@@ -627,7 +627,11 @@ the published `inputSchema`) answers `-32602` immediately — it never creates a
 request, and a re-call carrying an `approval_id` with schema-invalid arguments
 never consumes the ticket. (Semantic checks the schema cannot express — an
 unknown plugin name, a nonexistent agent — still happen in the handler and are
-not pre-empted by this gate. When one of those DOES fire on a recall that
+not pre-empted by this gate. Also not pre-empted: a whitespace-only value
+(e.g. `" "`) satisfies `minLength:1` and still mints/consumes a ticket before
+a handler-side existence check (e.g. `owner_username`) rejects it — a known,
+self-observing residual of the same semantic-burn class, not yet closed by a
+schema-expressible charset bound. When one of those DOES fire on a recall that
 already consumed a ticket — #2444 item 3 — it is alertable via the
 `yuzu_mcp_approval_burned_total{tool,reason}` counter, usually paired with an
 audit row for forensic detail — the generic `mcp.<tool>|failure` row, or, for

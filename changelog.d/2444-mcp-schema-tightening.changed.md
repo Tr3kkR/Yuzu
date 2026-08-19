@@ -1,9 +1,13 @@
-- **Tightened approval-gated MCP tool schemas to close the remaining semantic-burn class (#2444).**
-  `revoke_certificate.serial_hex`, engine-principal tools' `principal_id` (both the `engine:<slug>`
-  and bare-slug forms), `confirm_engine_rotation.token_id`, and `quarantine_device.reason`/
-  `whitelist` now carry `pattern`/`maxLength` bounds that mirror their handlers' existing checks, so
-  a malformed argument is refused by schema — before an approval ticket is ever minted or
-  consumed — instead of burning an already-approved, one-time ticket at the handler. Roughly two
+- **Tightened MCP tool schemas to close the remaining semantic-burn class (#2444).**
+  `revoke_certificate.serial_hex`, `confirm_engine_rotation.token_id`, `quarantine_device.reason`/
+  `whitelist`, and the eight *approval-gated* engine-principal tools' `principal_id` (both the
+  `engine:<slug>` and bare-slug forms) now carry `pattern`/`maxLength` bounds that mirror their
+  handlers' existing checks, so a malformed argument is refused by schema — before an approval
+  ticket is ever minted or consumed — instead of burning an already-approved, one-time ticket at
+  the handler. `get_engine_principal` and `list_engine_roles` gained the same `principal_id`
+  pattern too, but being Read-tier and never approval-gated, it's advertised `tools/list` metadata
+  only — this codebase enforces input schemas solely on the approval-gated path, so a malformed
+  value there still reaches the handler exactly as before. Roughly two
   dozen other required-string MCP tool arguments (`agent_id`, `expression`, `approval_id`,
   `campaign_id`, etc.) gained `minLength: 1`. For the approval-gated tools among them, an empty
   string is now refused the same pre-ticket way as the pattern tightenings above; for the rest
