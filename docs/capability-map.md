@@ -264,7 +264,7 @@ Not implemented. Enumerate connected printers for asset tracking.
 
 ### 4.7 Wake-on-LAN :white_check_mark: `T2`
 
-`wol` plugin (cross-platform). `wake` sends magic packet (UDP broadcast, 6×0xFF + 16×MAC) to a target MAC address. `check` pings the host to verify wake. Windows: Winsock2, Linux/macOS: POSIX sockets.
+`wol` plugin (cross-platform). `wake` sends magic packet (UDP broadcast, 6×0xFF + 16×MAC) to a target MAC address. `check` verifies reachability natively — unprivileged ICMP echo (`IcmpSendEcho` on Windows, an unprivileged ICMP socket on Linux/macOS) with a TCP-connect fallback on port 443 for hosts/kernels that drop or deny ICMP (Wave 2, ADR-3002) — no subprocess spawn on any platform.
 
 ### 4.8 Network Diagnostics :white_check_mark: `T1`
 

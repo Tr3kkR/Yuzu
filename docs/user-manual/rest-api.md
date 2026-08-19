@@ -3769,6 +3769,8 @@ Create a new webhook subscription.
 | `dex.blast_radius` | N distinct devices report the same DEX signal `(obs_type, subject)` within the window — thresholds are operator-tunable under Settings → DEX alerts (defaults 5 devices / 15 min; see [DEX fleet incident alerts](dex.md#fleet-incident-alerts-blast-radius)) | `obs_type`, `subject`, `device_count`, `window_seconds` |
 | `dex.signal` | A device reports a DEX signal type the operator routed to alerts (Settings → DEX alerts; once per device per hour — see [Routing signals to alerts](dex.md#routing-signals-to-alerts)) | `obs_type`, `subject`, `agent_id` |
 
+`agent.registered` fires on *every* gRPC reconnect, not only first enrollment — a server restart, a network blip, or a gateway bounce that strands and reconnects a fleet produces one delivery per reconnecting agent, not one per genuinely new device. A target wired to a low-tolerance channel (e.g. a Slack alert intended for "new device joined the fleet") should filter or debounce on the receiving end if reconnect noise matters; the dashboard's own "Agent Enrolled" notification does not have this problem (it fires once, on first enrollment only).
+
 If a `secret` is provided, each delivery includes an `X-Yuzu-Signature` header containing the HMAC-SHA256 hex digest of the request body.
 
 #### `DELETE /api/webhooks/{id}`
@@ -3790,9 +3792,11 @@ List recent delivery attempts for a webhook. Includes HTTP status code, response
 
 ### Offload Targets
 
-Response-offload control plane (issue #255, Phase 8.3). Targets are named external HTTP endpoints that receive a copy of `agent.registered` and `execution.completed` events as they fire — heavier-duty than webhooks: typed auth (none / bearer / basic / hmac) and server-side batching for SIEM / data-warehouse ingestion that prefers fewer, larger requests.
+Response-offload control plane (issue #255, Phase 8.3). Targets are named external HTTP endpoints that receive a copy of the same events webhooks do (see the event-types table in the Webhooks section above) as they fire — heavier-duty than webhooks: typed auth (none / bearer / basic / hmac) and server-side batching for SIEM / data-warehouse ingestion that prefers fewer, larger requests.
 
 A target is identified by a unique `name` so a definition can reference it via `spec.offload.targets` in YAML (see [yaml-dsl-spec.md](../yaml-dsl-spec.md#specoffload)).
+
+`agent.registered` fires on *every* gRPC reconnect, not only first enrollment — same caveat as the Webhooks section above, and the same event-type table, since both sinks fire off the identical set of events. A target wired to a low-tolerance channel should filter or debounce on the receiving end if reconnect noise matters.
 
 All five endpoints require the `Infrastructure` securable type — `Read` for `GET`, `Write` for `POST`/`DELETE`. The `auth_credential` is **never** returned in any response (redacted from `list()` and from `get()`); only the auth_type and shape leak. Audit events: `offload_target.create` (success or denied) and `offload_target.delete`.
 
