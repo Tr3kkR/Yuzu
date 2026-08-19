@@ -1,15 +1,23 @@
 #include "baseline_store.hpp"
 
-#include "migration_runner.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_migration_runner.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "sqlite_raii.hpp"
 #include "store_errors.hpp"
 
-#include <nlohmann/json.hpp>
+#include <libpq-fe.h>
+#include <openssl/evp.h>
 #include <spdlog/spdlog.h>
+#include <sqlite3.h>
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <chrono>
-#include <mutex>
+#include <cstdlib>
+#include <format>
 #include <random>
 #include <unordered_map>
 #include <unordered_set>
@@ -18,9 +26,19 @@ namespace yuzu::server {
 
 namespace {
 
-const char* safe(const char* p) {
-    return p ? p : "";
-}
+constexpr const char* kStoreName = "baseline_store";
+
+// Bounded acquires (ADR-0012 §2(a)). Reads back the push fan-out / heartbeat
+// reconcile catastrophic-read path and the Guardian dashboard; writes come
+// from the operator dashboard/REST only (no gRPC hot path touches this
+// store). Mirrors GuaranteedStateStore's rule/meta budget (its closest
+// Guardian-domain sibling, ADR-0038) rather than its tighter ingest budget —
+// this store has no ingest path.
+constexpr std::chrono::milliseconds kReadTimeout{2000};
+constexpr std::chrono::milliseconds kWriteTimeout{4000};
+constexpr std::chrono::milliseconds kBackfillTxnTimeout{60000};
+
+constexpr const char* kSourcelessFingerprint = "sourceless";
 
 int64_t now_epoch() {
     return std::chrono::duration_cast<std::chrono::seconds>(
@@ -28,84 +46,67 @@ int64_t now_epoch() {
         .count();
 }
 
-// Canonical kConflictPrefix-tagged error (mirrors guaranteed_state_store).
+std::string text_col(PGresult* res, int row, int col) {
+    if (PQgetisnull(res, row, col))
+        return {};
+    return std::string(PQgetvalue(res, row, col),
+                       static_cast<std::size_t>(PQgetlength(res, row, col)));
+}
+
+std::int64_t to_i64(const char* s) {
+    if (s == nullptr || s[0] == '\0')
+        return 0;
+    return static_cast<std::int64_t>(std::strtoll(s, nullptr, 10));
+}
+
 std::string format_conflict(std::string_view detail) {
     return std::string(kConflictPrefix) + " " + std::string(detail);
 }
 
-// A UNIQUE / PRIMARY KEY violation is a duplicate-resource conflict (HTTP 409).
-bool is_uniqueness_violation(int extended) {
-    return extended == SQLITE_CONSTRAINT_UNIQUE ||
-           extended == SQLITE_CONSTRAINT_PRIMARYKEY;
-}
-
-// Read every column of a Baseline row off a stepped statement. Column order is
-// fixed by kBaselineColumns; every SELECT below uses that exact list.
-constexpr const char* kBaselineColumns =
-    "baseline_id, name, description, lifecycle, deployed_snapshot, "
-    "created_by, updated_by, deployed_by, created_at, updated_at, deployed_at";
-
-Baseline read_baseline_row(sqlite3_stmt* s) {
-    Baseline b;
-    b.baseline_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-    b.name = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
-    b.description = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 2)));
-    b.lifecycle = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 3)));
-    b.deployed_snapshot = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 4)));
-    b.created_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 5)));
-    b.updated_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 6)));
-    b.deployed_by = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 7)));
-    b.created_at = sqlite3_column_int64(s, 8);
-    b.updated_at = sqlite3_column_int64(s, 9);
-    b.deployed_at = sqlite3_column_int64(s, 10);
-    return b;
-}
-
-} // namespace
-
-// ── Construction / teardown ──────────────────────────────────────────────────
-
-BaselineStore::BaselineStore(const std::filesystem::path& db_path) {
-    int rc = sqlite3_open_v2(db_path.string().c_str(), &db_,
-                             SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-                             nullptr);
-    if (rc != SQLITE_OK) {
-        spdlog::error("BaselineStore: failed to open {}: {}", db_path.string(),
-                      sqlite3_errmsg(db_));
-        if (db_) {
-            sqlite3_close(db_);
-            db_ = nullptr;
-        }
-        return;
+std::optional<std::string> sha256_hex(std::string_view in) {
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int len = 0;
+    if (EVP_Digest(in.data(), in.size(), md, &len, EVP_sha256(), nullptr) != 1)
+        return std::nullopt;
+    static const char* kHex = "0123456789abcdef";
+    std::string out;
+    out.reserve(len * 2);
+    for (unsigned int i = 0; i < len; ++i) {
+        out.push_back(kHex[md[i] >> 4]);
+        out.push_back(kHex[md[i] & 0x0F]);
     }
-    sqlite3_exec(db_, "PRAGMA journal_mode=WAL;", nullptr, nullptr, nullptr);
-    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
-    // Load-bearing: the join tables' ON DELETE CASCADE only fires when foreign
-    // keys are enabled, and the FK is also what rejects an INSERT into a join
-    // table for a non-existent baseline_id. SQLite defaults foreign_keys OFF.
-    sqlite3_exec(db_, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
-    create_tables();
-    if (db_)
-        spdlog::info("BaselineStore: opened {}", db_path.string());
+    return out;
 }
 
-BaselineStore::~BaselineStore() {
-    // close_v2 (not close): if a statement ever outlived its RAII owner, close_v2
-    // schedules a deferred close instead of returning BUSY and leaking the handle.
-    if (db_)
-        sqlite3_close_v2(db_);
+std::string legacy_text(sqlite3_stmt* s, int col) {
+    const auto* v = sqlite3_column_text(s, col);
+    return v ? std::string(reinterpret_cast<const char*>(v),
+                           static_cast<std::size_t>(sqlite3_column_bytes(s, col)))
+             : std::string{};
 }
 
-bool BaselineStore::is_open() const {
-    return db_ != nullptr;
+std::optional<bool> legacy_has_table(sqlite3* db, const char* table) {
+    SqliteStmt s;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", -1,
+                           s.addr(), nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_bind_text(s.get(), 1, table, -1, SQLITE_STATIC);
+    const int rc = sqlite3_step(s.get());
+    if (rc == SQLITE_ROW)
+        return true;
+    if (rc == SQLITE_DONE)
+        return false;
+    return std::nullopt;
 }
 
-// ── DDL ──────────────────────────────────────────────────────────────────────
-
-void BaselineStore::create_tables() {
-    static const std::vector<Migration> kMigrations = {
+// ── Postgres schema (ADR-0055): the FINAL column set of the legacy SQLite
+// store's single migration, collapsed into one v1. Unqualified DDL — the
+// migration runner sets search_path to `baseline_store` for the migration
+// transaction. Runtime statements below schema-qualify explicitly.
+const std::vector<pg::PgMigration>& migrations() {
+    static const std::vector<pg::PgMigration> kMigrations = {
         {1, R"(
-            CREATE TABLE IF NOT EXISTS guaranteed_state_baselines (
+            CREATE TABLE baselines (
                 baseline_id       TEXT PRIMARY KEY,
                 name              TEXT NOT NULL UNIQUE,
                 description       TEXT NOT NULL DEFAULT '',
@@ -118,30 +119,29 @@ void BaselineStore::create_tables() {
                 created_by        TEXT NOT NULL DEFAULT '',
                 updated_by        TEXT NOT NULL DEFAULT '',
                 deployed_by       TEXT NOT NULL DEFAULT '',
-                created_at        INTEGER NOT NULL DEFAULT 0,
-                updated_at        INTEGER NOT NULL DEFAULT 0,
-                deployed_at       INTEGER NOT NULL DEFAULT 0
+                created_at        BIGINT NOT NULL DEFAULT 0,
+                updated_at        BIGINT NOT NULL DEFAULT 0,
+                deployed_at       BIGINT NOT NULL DEFAULT 0
             );
 
             -- Member Guards (M:N). rule_id references a Guard in a DIFFERENT
-            -- database (guaranteed-state.db) so there is no FK on it; a dangling
-            -- member is harmless at deploy (the push builder skips it). The FK to
-            -- guaranteed_state_baselines (same file) gives delete_baseline its
-            -- cascade and rejects a member row for a non-existent baseline.
-            CREATE TABLE IF NOT EXISTS guaranteed_state_baseline_rules (
-                baseline_id TEXT NOT NULL
-                    REFERENCES guaranteed_state_baselines(baseline_id) ON DELETE CASCADE,
+            -- schema (guaranteed_state_store) so there is no FK on it; a
+            -- dangling member is harmless at deploy (the push builder skips
+            -- it). The FK to baselines (same schema) gives delete_baseline
+            -- its cascade and rejects a member row for a non-existent
+            -- baseline.
+            CREATE TABLE baseline_rules (
+                baseline_id TEXT NOT NULL REFERENCES baselines(baseline_id) ON DELETE CASCADE,
                 rule_id     TEXT NOT NULL,
                 PRIMARY KEY (baseline_id, rule_id)
             );
 
             -- Assignment: included − excluded management groups. group_id also
-            -- references a different database (the management group store), so no
+            -- references a different schema (management_group_store), so no
             -- FK on it. PK on (baseline_id, group_id) makes a group's disposition
             -- unambiguous — it cannot be both included and excluded.
-            CREATE TABLE IF NOT EXISTS guaranteed_state_baseline_groups (
-                baseline_id TEXT NOT NULL
-                    REFERENCES guaranteed_state_baselines(baseline_id) ON DELETE CASCADE,
+            CREATE TABLE baseline_groups (
+                baseline_id TEXT NOT NULL REFERENCES baselines(baseline_id) ON DELETE CASCADE,
                 group_id    TEXT NOT NULL,
                 disposition TEXT NOT NULL,   -- 'include' | 'exclude'
                 PRIMARY KEY (baseline_id, group_id)
@@ -149,19 +149,277 @@ void BaselineStore::create_tables() {
 
             -- Reverse-lookup indexes: which baselines reference a given guard /
             -- group (deploy slice's affected-set recompute + cross-store cleanup).
-            -- No index on lifecycle (cardinality 2): SQLite would skip it and the
-            -- baselines table is bounded operator config anyway.
-            CREATE INDEX IF NOT EXISTS idx_gsbr_rule
-                ON guaranteed_state_baseline_rules(rule_id);
-            CREATE INDEX IF NOT EXISTS idx_gsbg_group
-                ON guaranteed_state_baseline_groups(group_id);
+            CREATE INDEX idx_baseline_rules_rule ON baseline_rules(rule_id);
+            CREATE INDEX idx_baseline_groups_group ON baseline_groups(group_id);
+
+            -- Backfill idempotency marker (ADR-0009/0055 — RbacStore/TagStore
+            -- post-#2703 fingerprint shape). A dedicated k/v row pair — NEVER
+            -- inferred from any table being empty.
+            CREATE TABLE baseline_store_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
         )"},
     };
-    if (!MigrationRunner::run(db_, "baseline_store", kMigrations)) {
-        spdlog::error("BaselineStore: schema migration failed, closing database");
-        sqlite3_close(db_);
-        db_ = nullptr;
+    return kMigrations;
+}
+
+constexpr const char* kBaselineCols =
+    "baseline_id, name, description, lifecycle, deployed_snapshot, created_by, updated_by, "
+    "deployed_by, created_at, updated_at, deployed_at";
+
+Baseline read_baseline_row(PGresult* res, int i) {
+    Baseline b;
+    int c = 0;
+    b.baseline_id = text_col(res, i, c++);
+    b.name = text_col(res, i, c++);
+    b.description = text_col(res, i, c++);
+    b.lifecycle = text_col(res, i, c++);
+    b.deployed_snapshot = text_col(res, i, c++);
+    b.created_by = text_col(res, i, c++);
+    b.updated_by = text_col(res, i, c++);
+    b.deployed_by = text_col(res, i, c++);
+    b.created_at = to_i64(PQgetvalue(res, i, c++));
+    b.updated_at = to_i64(PQgetvalue(res, i, c++));
+    b.deployed_at = to_i64(PQgetvalue(res, i, c++));
+    return b;
+}
+
+// ── Backfill (ADR-0009/0055) ─────────────────────────────────────────────────
+// Mirrors TagStore/RbacStore's post-#2703 fingerprint-verified marker shape
+// (docs/postgres-store-playbook.md "Local source absence never creates
+// terminal migration state on its own"), scaled to THREE tables with FKs:
+// parent rows (`baselines`) are migrated per-row, direction-aware on
+// `updated_at` (the DeploymentStore/TagStore shape); a baseline's member +
+// assignment children are copied ONLY when its parent row was freshly
+// inserted from legacy THIS pass — see the header doc comment for why a
+// baseline that already existed live does not need its children re-merged.
+
+struct LegacyBaselineRow {
+    std::string baseline_id, name, description, lifecycle, deployed_snapshot, created_by,
+        updated_by, deployed_by;
+    std::int64_t created_at{0}, updated_at{0}, deployed_at{0};
+};
+struct LegacyMemberRow {
+    std::string baseline_id, rule_id;
+};
+struct LegacyGroupRow {
+    std::string baseline_id, group_id, disposition;
+};
+struct LegacySnapshot {
+    std::vector<LegacyBaselineRow> baselines;
+    std::vector<LegacyMemberRow> members;
+    std::vector<LegacyGroupRow> groups;
+};
+
+void append_field(std::string& out, std::string_view v) {
+    out += std::to_string(v.size());
+    out += ':';
+    out += v;
+}
+void append_field(std::string& out, std::int64_t v) { append_field(out, std::to_string(v)); }
+
+// Deterministic canonical serialization for the content fingerprint — field
+// order and delimiter matter (mirrors TagStore's canonicalize_legacy_snapshot).
+// Fingerprints RAW legacy bytes, pre-any-transform: the fingerprint answers
+// "is this the same FILE content", not "would it insert the same rows".
+std::string canonicalize_legacy_snapshot(const LegacySnapshot& snap) {
+    std::vector<std::string> brows;
+    brows.reserve(snap.baselines.size());
+    for (const auto& b : snap.baselines) {
+        std::string r;
+        append_field(r, "baseline");
+        append_field(r, b.baseline_id);
+        append_field(r, b.name);
+        append_field(r, b.description);
+        append_field(r, b.lifecycle);
+        append_field(r, b.deployed_snapshot);
+        append_field(r, b.created_by);
+        append_field(r, b.updated_by);
+        append_field(r, b.deployed_by);
+        append_field(r, b.created_at);
+        append_field(r, b.updated_at);
+        append_field(r, b.deployed_at);
+        brows.push_back(std::move(r));
     }
+    std::sort(brows.begin(), brows.end());
+
+    std::vector<std::string> mrows;
+    mrows.reserve(snap.members.size());
+    for (const auto& m : snap.members) {
+        std::string r;
+        append_field(r, "member");
+        append_field(r, m.baseline_id);
+        append_field(r, m.rule_id);
+        mrows.push_back(std::move(r));
+    }
+    std::sort(mrows.begin(), mrows.end());
+
+    std::vector<std::string> grows;
+    grows.reserve(snap.groups.size());
+    for (const auto& g : snap.groups) {
+        std::string r;
+        append_field(r, "group");
+        append_field(r, g.baseline_id);
+        append_field(r, g.group_id);
+        append_field(r, g.disposition);
+        grows.push_back(std::move(r));
+    }
+    std::sort(grows.begin(), grows.end());
+
+    std::string canon = "baseline-store-legacy-fingerprint-v1\n";
+    for (const auto& r : brows)
+        canon += r;
+    for (const auto& r : mrows)
+        canon += r;
+    for (const auto& r : grows)
+        canon += r;
+    return canon;
+}
+
+std::optional<std::string> fingerprint_legacy_snapshot(const LegacySnapshot& snap) {
+    const auto hash = sha256_hex(canonicalize_legacy_snapshot(snap));
+    if (!hash)
+        return std::nullopt;
+    return "v1:" + *hash;
+}
+
+// nullopt == a genuine read error (fail-closed); an empty snapshot with no
+// error is a legitimate zero-row legacy database. All three legacy tables are
+// read inside ONE deferred transaction (RAII-guarded SqliteTxn) so a legacy
+// file still being written by a stale pre-migration binary yields one
+// consistent cross-table snapshot — load-bearing here (unlike TagStore's
+// single-table case) because a torn read across `guaranteed_state_baselines`
+// and its two child tables could fingerprint/migrate a parent whose children
+// were captured from a different instant.
+std::optional<LegacySnapshot> read_legacy_snapshot(sqlite3* db) {
+    if (sqlite3_exec(db, "BEGIN", nullptr, nullptr, nullptr) != SQLITE_OK)
+        return std::nullopt;
+    SqliteTxn txn(db);
+    LegacySnapshot snap;
+    bool ok = true;
+    {
+        SqliteStmt s;
+        const char* sql =
+            "SELECT baseline_id, name, description, lifecycle, deployed_snapshot, created_by, "
+            "updated_by, deployed_by, created_at, updated_at, deployed_at FROM "
+            "guaranteed_state_baselines";
+        if (sqlite3_prepare_v2(db, sql, -1, s.addr(), nullptr) != SQLITE_OK) {
+            ok = false;
+        } else {
+            int rc;
+            while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+                LegacyBaselineRow b;
+                b.baseline_id = legacy_text(s.get(), 0);
+                b.name = legacy_text(s.get(), 1);
+                b.description = legacy_text(s.get(), 2);
+                b.lifecycle = legacy_text(s.get(), 3);
+                b.deployed_snapshot = legacy_text(s.get(), 4);
+                b.created_by = legacy_text(s.get(), 5);
+                b.updated_by = legacy_text(s.get(), 6);
+                b.deployed_by = legacy_text(s.get(), 7);
+                b.created_at = sqlite3_column_int64(s.get(), 8);
+                b.updated_at = sqlite3_column_int64(s.get(), 9);
+                b.deployed_at = sqlite3_column_int64(s.get(), 10);
+                snap.baselines.push_back(std::move(b));
+            }
+            if (rc != SQLITE_DONE)
+                ok = false;
+        }
+    }
+    if (ok) {
+        SqliteStmt s;
+        const char* sql = "SELECT baseline_id, rule_id FROM guaranteed_state_baseline_rules";
+        if (sqlite3_prepare_v2(db, sql, -1, s.addr(), nullptr) != SQLITE_OK) {
+            ok = false;
+        } else {
+            int rc;
+            while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+                LegacyMemberRow m;
+                m.baseline_id = legacy_text(s.get(), 0);
+                m.rule_id = legacy_text(s.get(), 1);
+                snap.members.push_back(std::move(m));
+            }
+            if (rc != SQLITE_DONE)
+                ok = false;
+        }
+    }
+    if (ok) {
+        SqliteStmt s;
+        const char* sql =
+            "SELECT baseline_id, group_id, disposition FROM guaranteed_state_baseline_groups";
+        if (sqlite3_prepare_v2(db, sql, -1, s.addr(), nullptr) != SQLITE_OK) {
+            ok = false;
+        } else {
+            int rc;
+            while ((rc = sqlite3_step(s.get())) == SQLITE_ROW) {
+                LegacyGroupRow g;
+                g.baseline_id = legacy_text(s.get(), 0);
+                g.group_id = legacy_text(s.get(), 1);
+                g.disposition = legacy_text(s.get(), 2);
+                snap.groups.push_back(std::move(g));
+            }
+            if (rc != SQLITE_DONE)
+                ok = false;
+        }
+    }
+    if (ok && txn.commit() != SQLITE_OK)
+        spdlog::warn("BaselineStore: read_legacy_snapshot: COMMIT failed: {}", sqlite3_errmsg(db));
+    if (!ok)
+        return std::nullopt;
+    return snap;
+}
+
+// Path-based convenience for the holder-side verification call site: opens
+// read-only, probes for corruption, and either returns the sourceless
+// sentinel (no `guaranteed_state_baselines` table — same "nothing to
+// protect" class as no local file at all) or fingerprints a full snapshot.
+// Returns nullopt ONLY on a corrupt/unreadable file or a snapshot read
+// failure — the caller MUST fail closed on that, never treat it as
+// sourceless-equivalent.
+std::optional<std::string> legacy_fingerprint(const std::filesystem::path& legacy_db_path) {
+    SqliteDb legacy;
+    if (sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(), SQLITE_OPEN_READONLY,
+                        nullptr) != SQLITE_OK)
+        return std::nullopt;
+    sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+    {
+        SqliteStmt probe;
+        if (sqlite3_prepare_v2(legacy.get(), "SELECT count(*) FROM sqlite_master", -1, probe.addr(),
+                               nullptr) != SQLITE_OK ||
+            sqlite3_step(probe.get()) != SQLITE_ROW)
+            return std::nullopt;
+    }
+    const auto has_table = legacy_has_table(legacy.get(), "guaranteed_state_baselines");
+    if (!has_table)
+        return std::nullopt; // genuine read error, NOT "no table"
+    if (!*has_table)
+        return std::string(kSourcelessFingerprint);
+    const auto snap = read_legacy_snapshot(legacy.get());
+    if (!snap)
+        return std::nullopt;
+    return fingerprint_legacy_snapshot(*snap);
+}
+
+} // namespace
+
+// ── Construction ─────────────────────────────────────────────────────────────
+
+BaselineStore::BaselineStore(pg::PgPool& pool) : pool_(pool) {
+    auto lease = pool_.acquire();
+    if (!lease) {
+        spdlog::error("BaselineStore: no database connection at construction ({}) — Guardian "
+                      "Baseline persistence disabled",
+                      pool_.last_error());
+        return;
+    }
+    if (!pg::PgMigrationRunner::run(lease.get(), kStoreName, migrations())) {
+        spdlog::error("BaselineStore: schema migration failed — Guardian Baseline persistence "
+                      "disabled");
+        return;
+    }
+    open_ = true;
+    spdlog::info("BaselineStore initialized (schema {})", kStoreName);
 }
 
 std::string BaselineStore::generate_id() const {
@@ -175,218 +433,567 @@ std::string BaselineStore::generate_id() const {
     return id;
 }
 
+// ── Backfill ─────────────────────────────────────────────────────────────────
+
+bool BaselineStore::migrate_from_sqlite(const std::filesystem::path& legacy_db_path) {
+    if (!open_)
+        return false;
+
+    // The marker and its source fingerprint are ALWAYS stamped together, in
+    // the SAME transaction. The fingerprint write is a MONOTONIC PROMOTION
+    // (never a plain ON CONFLICT DO NOTHING), ported unmodified from
+    // RbacStore/TagStore: "sourceless" carries no evidence worth protecting,
+    // so a real fingerprint may promote a stored "sourceless" value; a stored
+    // REAL value is never overwritten; a writer whose value already equals
+    // what's stored counts as success. RETURNING + PQntuples() is the correct
+    // read of "did MY value end up stored" — 0 rows means a DIFFERENT real
+    // value already won.
+    const auto stamp_complete = [this](std::string_view source_fingerprint) -> bool {
+        return pool_.with_txn_for(kBackfillTxnTimeout, [source_fingerprint](PGconn* c) -> bool {
+            pg::PgResult mk = pg::exec_params(
+                c,
+                "INSERT INTO baseline_store.baseline_store_meta (key, value) VALUES "
+                "('backfill_complete', $1) ON CONFLICT (key) DO NOTHING",
+                std::vector<std::string>{std::to_string(now_epoch())});
+            if (mk.status() != PGRES_COMMAND_OK) {
+                spdlog::error("BaselineStore: migrate_from_sqlite: marker stamp failed: {}",
+                              PQerrorMessage(c));
+                return false;
+            }
+            pg::PgResult fp = pg::exec_params(
+                c,
+                "INSERT INTO baseline_store.baseline_store_meta (key, value) VALUES "
+                "('backfill_source_fingerprint', $1) ON CONFLICT (key) DO UPDATE SET "
+                "value = EXCLUDED.value WHERE "
+                "baseline_store.baseline_store_meta.value = 'sourceless' OR "
+                "baseline_store.baseline_store_meta.value = EXCLUDED.value RETURNING value",
+                std::vector<std::string>{std::string(source_fingerprint)});
+            if (fp.status() != PGRES_TUPLES_OK) {
+                spdlog::error(
+                    "BaselineStore: migrate_from_sqlite: source-fingerprint stamp failed: {}",
+                    PQerrorMessage(c));
+                return false;
+            }
+            if (PQntuples(fp.get()) == 0 && source_fingerprint != kSourcelessFingerprint) {
+                spdlog::error(
+                    "BaselineStore: migrate_from_sqlite: lost the race to record this backfill's "
+                    "own source fingerprint — a DIFFERENT real fingerprint already stamped "
+                    "backfill_source_fingerprint between this pass's marker-absent check and "
+                    "this commit. Manual reconciliation required (see "
+                    "docs/postgres-store-playbook.md).");
+                return false;
+            }
+            // A sourceless stamp losing this same race is NOT an error:
+            // whichever writer's "sourceless" value won is the same value
+            // this call would have written.
+            return true;
+        });
+    };
+
+    const auto move_legacy_aside = [](const std::filesystem::path& path) {
+        std::filesystem::path aside;
+        for (int suffix = 0;; ++suffix) {
+            aside = path;
+            aside += ".migrated-" + std::to_string(now_epoch());
+            if (suffix > 0)
+                aside += "-" + std::to_string(suffix);
+            std::error_code exists_ec;
+            if (!std::filesystem::exists(aside, exists_ec))
+                break;
+        }
+        std::error_code mv_ec;
+        std::filesystem::rename(path, aside, mv_ec);
+        if (mv_ec)
+            spdlog::warn("BaselineStore: migrate_from_sqlite: could not move legacy {} aside "
+                         "({}); it is safe to archive/remove manually",
+                         path.string(), mv_ec.message());
+        else
+            spdlog::info("BaselineStore: migrate_from_sqlite: moved legacy db to {}",
+                         aside.string());
+    };
+
+    std::error_code ec;
+    const bool legacy_exists = std::filesystem::exists(legacy_db_path, ec);
+    if (ec) {
+        spdlog::error("BaselineStore: migrate_from_sqlite: cannot stat legacy path {}: {}",
+                      legacy_db_path.string(), ec.message());
+        return false;
+    }
+
+    bool marker_present = false;
+    std::optional<std::string> stored_fingerprint;
+    {
+        auto lease = pool_.acquire(); // one-shot pre-serve boot step (ADR-0012 §2(a))
+        if (!lease) {
+            spdlog::error("BaselineStore: migrate_from_sqlite: no database connection ({})",
+                          pool_.last_error());
+            return false;
+        }
+        pg::PgResult mk = pg::exec_params(
+            lease.get(),
+            "SELECT key, value FROM baseline_store.baseline_store_meta WHERE key IN "
+            "('backfill_complete', 'backfill_source_fingerprint')",
+            std::vector<std::string>{});
+        if (mk.status() != PGRES_TUPLES_OK) {
+            spdlog::error("BaselineStore: migrate_from_sqlite: marker lookup failed: {}",
+                          PQerrorMessage(lease.get()));
+            return false;
+        }
+        for (int i = 0; i < PQntuples(mk.get()); ++i) {
+            const std::string key = text_col(mk.get(), i, 0);
+            if (key == "backfill_complete")
+                marker_present = true;
+            else if (key == "backfill_source_fingerprint")
+                stored_fingerprint = text_col(mk.get(), i, 1);
+        }
+    }
+
+    if (marker_present) {
+        if (!legacy_exists) {
+            spdlog::debug("BaselineStore: migrate_from_sqlite already completed, skipping");
+            return true;
+        }
+        // This replica still holds a local legacy file even though the
+        // marker is already set — verify it was actually the file that got
+        // migrated before trusting the marker (holder-side verification).
+        const auto verify_fp = legacy_fingerprint(legacy_db_path);
+        if (!verify_fp) {
+            spdlog::error("BaselineStore: migrate_from_sqlite: backfill_complete is already set, "
+                          "and this replica's own legacy db {} exists but is unreadable/corrupt "
+                          "while being fingerprint-verified — refusing (fail-closed; never "
+                          "silently trust a marker over an unverifiable local file)",
+                          legacy_db_path.string());
+            return false;
+        }
+        if (*verify_fp == kSourcelessFingerprint) {
+            spdlog::debug("BaselineStore: migrate_from_sqlite already completed; this replica's "
+                          "own legacy db has no guaranteed_state_baselines table (nothing to "
+                          "lose), skipping");
+            return true;
+        }
+        if (!stored_fingerprint || *stored_fingerprint != *verify_fp) {
+            spdlog::error(
+                "BaselineStore: migrate_from_sqlite: HOLDER-SIDE VERIFICATION FAILED — "
+                "backfill_complete is already set with fingerprint '{}' but this replica's own "
+                "legacy db {} fingerprints as '{}' — some other replica's legacy data was "
+                "migrated, not this one's (docs/postgres-store-playbook.md anti-pattern 'Local "
+                "source absence never creates terminal migration state on its own'). Refusing to "
+                "silently accept a completion this replica's Baselines were never part of.",
+                stored_fingerprint.value_or("<none recorded>"), legacy_db_path.string(),
+                *verify_fp);
+            return false;
+        }
+        spdlog::debug("BaselineStore: migrate_from_sqlite already completed (fingerprint "
+                      "verified), skipping");
+        move_legacy_aside(legacy_db_path);
+        return true;
+    }
+
+    if (!legacy_exists) {
+        if (!stamp_complete(kSourcelessFingerprint))
+            return false;
+        spdlog::info("BaselineStore: migrate_from_sqlite: no legacy db at {}; marking backfill "
+                     "complete (fresh install)",
+                     legacy_db_path.string());
+        return true;
+    }
+
+    SqliteDb legacy;
+    if (sqlite3_open_v2(legacy_db_path.string().c_str(), legacy.addr(), SQLITE_OPEN_READONLY,
+                        nullptr) != SQLITE_OK) {
+        spdlog::error("BaselineStore: migrate_from_sqlite: failed to open legacy db {}: {}",
+                      legacy_db_path.string(),
+                      legacy ? sqlite3_errmsg(legacy.get()) : "open failed");
+        return false;
+    }
+    sqlite3_exec(legacy.get(), "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+    {
+        SqliteStmt probe;
+        if (sqlite3_prepare_v2(legacy.get(), "SELECT count(*) FROM sqlite_master", -1, probe.addr(),
+                               nullptr) != SQLITE_OK ||
+            sqlite3_step(probe.get()) != SQLITE_ROW) {
+            spdlog::error("BaselineStore: migrate_from_sqlite: legacy db {} is unreadable/corrupt "
+                          "({}); refusing backfill (fail-closed — never silently drop Guardian "
+                          "Baseline enforcement config)",
+                          legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+            return false;
+        }
+    }
+    const auto has_table = legacy_has_table(legacy.get(), "guaranteed_state_baselines");
+    if (!has_table) {
+        spdlog::error("BaselineStore: migrate_from_sqlite: legacy db {} could not be probed for "
+                      "a guaranteed_state_baselines table ({}); refusing backfill (fail-closed)",
+                      legacy_db_path.string(), sqlite3_errmsg(legacy.get()));
+        return false;
+    }
+    if (!*has_table) {
+        if (!stamp_complete(kSourcelessFingerprint))
+            return false;
+        spdlog::warn("BaselineStore: migrate_from_sqlite: legacy db {} has no "
+                     "guaranteed_state_baselines table; marking backfill complete",
+                     legacy_db_path.string());
+        return true;
+    }
+
+    // Read every legacy row ONCE into a shared snapshot — both the real
+    // migration below and this run's own stamp_complete fingerprint derive
+    // from it (no TOCTOU window between what got migrated and what got
+    // fingerprinted).
+    const auto snap_opt = read_legacy_snapshot(legacy.get());
+    if (!snap_opt) {
+        spdlog::error("BaselineStore: migrate_from_sqlite: legacy read failed: {}",
+                      sqlite3_errmsg(legacy.get()));
+        return false;
+    }
+    const LegacySnapshot& snap = *snap_opt;
+    const auto fingerprint = fingerprint_legacy_snapshot(snap);
+    if (!fingerprint) {
+        spdlog::error("BaselineStore: migrate_from_sqlite: failed to fingerprint legacy content "
+                      "(SHA-256 digest failure) — refusing backfill (fail-closed)");
+        return false;
+    }
+
+    std::vector<std::string> freshly_inserted;
+    std::string failure_detail;
+    const bool ok = pool_.with_txn_for(kBackfillTxnTimeout, [&](PGconn* c) -> bool {
+        // Parent rows first (FK parent-before-child), sorted by baseline_id
+        // for deterministic cross-replica lock-acquisition order
+        // (LicenseStore precedent — avoids a deadlock between two racing
+        // replicas migrating overlapping content).
+        std::vector<LegacyBaselineRow> sorted_baselines = snap.baselines;
+        std::sort(sorted_baselines.begin(), sorted_baselines.end(),
+                  [](const auto& a, const auto& b) { return a.baseline_id < b.baseline_id; });
+
+        for (const auto& lb : sorted_baselines) {
+            pg::PgResult stored = pg::exec_params(
+                c,
+                "SELECT name, description, lifecycle, deployed_snapshot, created_by, "
+                "updated_by, deployed_by, created_at, updated_at, deployed_at FROM "
+                "baseline_store.baselines WHERE baseline_id = $1",
+                std::vector<std::string>{lb.baseline_id});
+            if (stored.status() != PGRES_TUPLES_OK) {
+                failure_detail = std::format("stored-row lookup failed for baseline '{}': {}",
+                                             lb.baseline_id, PQerrorMessage(c));
+                return false;
+            }
+            if (PQntuples(stored.get()) == 0) {
+                pg::PgResult ins = pg::exec_params(
+                    c,
+                    "INSERT INTO baseline_store.baselines (baseline_id, name, description, "
+                    "lifecycle, deployed_snapshot, created_by, updated_by, deployed_by, "
+                    "created_at, updated_at, deployed_at) VALUES "
+                    "($1,$2,$3,$4,$5,$6,$7,$8,$9::bigint,$10::bigint,$11::bigint) "
+                    "ON CONFLICT (baseline_id) DO NOTHING",
+                    std::vector<std::string>{lb.baseline_id, lb.name, lb.description,
+                                             lb.lifecycle, lb.deployed_snapshot, lb.created_by,
+                                             lb.updated_by, lb.deployed_by,
+                                             std::to_string(lb.created_at),
+                                             std::to_string(lb.updated_at),
+                                             std::to_string(lb.deployed_at)});
+                if (ins.status() != PGRES_COMMAND_OK) {
+                    const char* sqlstate_p = PQresultErrorField(ins.get(), PG_DIAG_SQLSTATE);
+                    const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
+                    if (sqlstate == "23505") {
+                        failure_detail = std::format(
+                            "legacy baseline '{}' (name '{}') collides on the UNIQUE(name) "
+                            "constraint with a DIFFERENT already-live baseline_id — a name "
+                            "conflict between this replica's legacy data and live Postgres data "
+                            "cannot be auto-resolved (refusing; rename one side and re-run)",
+                            lb.baseline_id, lb.name);
+                    } else {
+                        failure_detail = std::format("insert failed for baseline '{}': {}",
+                                                     lb.baseline_id, PQerrorMessage(c));
+                    }
+                    return false;
+                }
+                // PQcmdTuples "0" == a concurrent writer landed this exact
+                // row between our lookup and this insert — refuse rather
+                // than silently mix two writers' rows mid-backfill (the
+                // playbook's ON-CONFLICT-DO-NOTHING silent-discard trap).
+                if (std::string_view(PQcmdTuples(ins.get())) == "0") {
+                    failure_detail = std::format(
+                        "concurrent writer inserted baseline '{}' mid-backfill — refusing "
+                        "(re-run will compare directions cleanly)",
+                        lb.baseline_id);
+                    return false;
+                }
+                freshly_inserted.push_back(lb.baseline_id);
+                continue;
+            }
+
+            // Existing row — direction-aware compare on updated_at. IDENTITY
+            // is baseline_id (already matched by the PK lookup above);
+            // every other column is LIFECYCLE.
+            const std::string st_name = text_col(stored.get(), 0, 0);
+            const std::string st_desc = text_col(stored.get(), 0, 1);
+            const std::string st_life = text_col(stored.get(), 0, 2);
+            const std::string st_snap = text_col(stored.get(), 0, 3);
+            const std::string st_created_by = text_col(stored.get(), 0, 4);
+            const std::string st_updated_by = text_col(stored.get(), 0, 5);
+            const std::string st_deployed_by = text_col(stored.get(), 0, 6);
+            const std::int64_t st_created_at = to_i64(PQgetvalue(stored.get(), 0, 7));
+            const std::int64_t st_updated_at = to_i64(PQgetvalue(stored.get(), 0, 8));
+            const std::int64_t st_deployed_at = to_i64(PQgetvalue(stored.get(), 0, 9));
+
+            const bool identical =
+                st_name == lb.name && st_desc == lb.description && st_life == lb.lifecycle &&
+                st_snap == lb.deployed_snapshot && st_created_by == lb.created_by &&
+                st_updated_by == lb.updated_by && st_deployed_by == lb.deployed_by &&
+                st_created_at == lb.created_at && st_updated_at == lb.updated_at &&
+                st_deployed_at == lb.deployed_at;
+            if (identical)
+                continue; // benign no-op; children already match by construction
+            if (st_updated_at > lb.updated_at) {
+                spdlog::warn(
+                    "BaselineStore: migrate_from_sqlite: Postgres baseline '{}' is strictly "
+                    "ahead of the legacy row (stored updated_at={} > legacy {}) — keeping "
+                    "Postgres's value (benign; this replica's legacy snapshot predates live "
+                    "progress); its live members/assignment are already complete and "
+                    "authoritative, legacy children for this baseline are NOT copied",
+                    lb.baseline_id, st_updated_at, lb.updated_at);
+                continue;
+            }
+            failure_detail = std::format(
+                "legacy baseline '{}' {} Postgres's current value (stored updated_at={}; legacy "
+                "updated_at={}) — refusing to silently discard live Guardian enforcement "
+                "config; reconcile which side is authoritative before restarting",
+                lb.baseline_id,
+                lb.updated_at > st_updated_at ? "shows MORE progress than"
+                                              : "contradicts (tied updated_at, differing content)",
+                st_updated_at, lb.updated_at);
+            return false;
+        }
+
+        // Children — ONLY for parents freshly inserted THIS pass (see the
+        // header doc comment: a baseline that already existed live already
+        // has complete, authoritative children via
+        // set_members/set_assignment's atomic full-replace semantics). No
+        // concurrent-writer race is possible here: the parent row is
+        // uncommitted-and-invisible to every other transaction until this
+        // one commits, so nothing else could have written a member/
+        // assignment row against it yet.
+        const std::unordered_set<std::string> fresh_set(freshly_inserted.begin(),
+                                                         freshly_inserted.end());
+        for (const auto& m : snap.members) {
+            if (!fresh_set.contains(m.baseline_id))
+                continue;
+            pg::PgResult ins = pg::exec_params(
+                c, "INSERT INTO baseline_store.baseline_rules (baseline_id, rule_id) VALUES ($1, $2)",
+                std::vector<std::string>{m.baseline_id, m.rule_id});
+            if (ins.status() != PGRES_COMMAND_OK) {
+                failure_detail = std::format("member insert failed for ({}, {}): {}",
+                                             m.baseline_id, m.rule_id, PQerrorMessage(c));
+                return false;
+            }
+        }
+        for (const auto& g : snap.groups) {
+            if (!fresh_set.contains(g.baseline_id))
+                continue;
+            pg::PgResult ins = pg::exec_params(
+                c,
+                "INSERT INTO baseline_store.baseline_groups (baseline_id, group_id, disposition) "
+                "VALUES ($1, $2, $3)",
+                std::vector<std::string>{g.baseline_id, g.group_id, g.disposition});
+            if (ins.status() != PGRES_COMMAND_OK) {
+                failure_detail = std::format("assignment insert failed for ({}, {}): {}",
+                                             g.baseline_id, g.group_id, PQerrorMessage(c));
+                return false;
+            }
+        }
+        return true;
+    });
+
+    if (!ok) {
+        spdlog::error(
+            "BaselineStore: migrate_from_sqlite: backfill transaction failed and was rolled "
+            "back — Guardian Baseline data NOT migrated. Offending: {}. Remediation: "
+            "inspect/fix the referenced row in the retained read-only legacy file ({}), then "
+            "restart the server; the backfill marker was NOT stamped, so the next boot retries "
+            "the whole backfill.",
+            failure_detail.empty() ? "unknown (see the specific-row error above)" : failure_detail,
+            legacy_db_path.string());
+        return false;
+    }
+    if (!stamp_complete(*fingerprint))
+        return false;
+
+    spdlog::info("BaselineStore: migrate_from_sqlite: backfilled {} baseline(s) ({} fresh, {} "
+                 "already-live), {} member row(s), {} assignment row(s) from {}",
+                 snap.baselines.size(), freshly_inserted.size(),
+                 snap.baselines.size() - freshly_inserted.size(), snap.members.size(),
+                 snap.groups.size(), legacy_db_path.string());
+    // Close the legacy read-only handle FIRST: Windows refuses to rename a
+    // file with an open handle (ERROR_SHARING_VIOLATION) — POSIX allows it,
+    // so leaving `legacy` open passes Linux/macOS CI and fails only on the
+    // Windows leg (same fix as RbacStore/CustomPropertiesStore/TagStore).
+    legacy.close();
+    move_legacy_aside(legacy_db_path);
+    return true;
+}
+
 // ── Baseline CRUD ──────────────────────────────────────────────────────────
 
 std::expected<std::string, std::string> BaselineStore::create_baseline(const Baseline& b) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
     if (b.name.empty())
         return std::unexpected("baseline name cannot be empty");
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected("no database connection: " + pool_.last_error());
+    PGconn* conn = lease.get();
 
     const std::string id = b.baseline_id.empty() ? generate_id() : b.baseline_id;
     const int64_t now = now_epoch();
-
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "INSERT INTO guaranteed_state_baselines "
-                           "(baseline_id, name, description, lifecycle, deployed_snapshot, "
-                           "created_by, updated_by, deployed_by, created_at, updated_at, "
-                           "deployed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-
     const std::string lifecycle = b.lifecycle.empty() ? kBaselineDraft : b.lifecycle;
-    sqlite3_bind_text(s, 1, id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, b.name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, b.description.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 4, lifecycle.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 5, b.deployed_snapshot.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 6, b.created_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 7, b.updated_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 8, b.deployed_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 9, now);
-    sqlite3_bind_int64(s, 10, now);
-    sqlite3_bind_int64(s, 11, b.deployed_at);
 
-    const int step = sqlite3_step(s);
-    if (step != SQLITE_DONE) {
-        const int ext = sqlite3_extended_errcode(db_);
-        const std::string err = sqlite3_errmsg(db_);
-        sqlite3_finalize(s);
-        if (is_uniqueness_violation(ext)) {
-            const bool name_collision = err.find(".name") != std::string::npos;
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "INSERT INTO baseline_store.baselines "
+        "(baseline_id, name, description, lifecycle, deployed_snapshot, created_by, updated_by, "
+        " deployed_by, created_at, updated_at, deployed_at) "
+        "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::bigint,$10::bigint,$11::bigint)",
+        std::vector<std::string>{id, b.name, b.description, lifecycle, b.deployed_snapshot,
+                                 b.created_by, b.updated_by, b.deployed_by, std::to_string(now),
+                                 std::to_string(now), std::to_string(b.deployed_at)});
+    if (res.status() != PGRES_COMMAND_OK) {
+        const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
+        if (sqlstate == "23505") {
+            const char* constraint_p = PQresultErrorField(res.get(), PG_DIAG_CONSTRAINT_NAME);
+            const std::string constraint = constraint_p ? constraint_p : "";
+            const bool name_collision = constraint.find("_name_key") != std::string::npos;
             return std::unexpected(format_conflict(
                 name_collision ? ("baseline name '" + b.name + "' already exists")
                                 : ("baseline_id '" + id + "' already exists")));
         }
-        return std::unexpected("insert failed: " + err);
+        return std::unexpected("insert failed: " + std::string(PQresultErrorMessage(res.get())));
     }
-    sqlite3_finalize(s);
     return id;
 }
 
 std::optional<Baseline> BaselineStore::get_baseline(const std::string& baseline_id) const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::nullopt;
-    const std::string sql = std::string("SELECT ") + kBaselineColumns +
-                            " FROM guaranteed_state_baselines WHERE baseline_id = ?;";
-    // SqliteStmt RAII: finalize on every exit incl. a read_baseline_row throw.
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
-        // A prepare failure (DB locked/corrupt) otherwise reads as a benign
-        // not-found — log so a degraded read is visible.
-        spdlog::error("BaselineStore::get_baseline: prepare failed: {}", sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::nullopt;
+    const std::string sql =
+        std::string("SELECT ") + kBaselineCols + " FROM baseline_store.baselines WHERE baseline_id = $1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{baseline_id});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("BaselineStore::get_baseline: query failed: {}",
+                      PQresultErrorMessage(res.get()));
         return std::nullopt;
     }
-    sqlite3_bind_text(s.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-    std::optional<Baseline> result;
-    if (sqlite3_step(s.get()) == SQLITE_ROW)
-        result = read_baseline_row(s.get());
-    return result;
+    if (PQntuples(res.get()) == 0)
+        return std::nullopt;
+    return read_baseline_row(res.get(), 0);
 }
 
 std::optional<Baseline> BaselineStore::get_baseline_by_name(const std::string& name,
                                                             bool* store_ok) const {
-    // Optimistic: only a store FAULT (db-null / prepare-fail) clears this; a genuine
-    // not-found leaves it true so the caller 404s rather than 503s (UP-13/sre-2).
+    // Optimistic: only a store FAULT (not-open / lease-timeout / query-error)
+    // clears this; a genuine not-found leaves it true so the caller 404s
+    // rather than 503s (UP-13/sre-2).
     if (store_ok)
         *store_ok = true;
-    std::shared_lock lock(mtx_);
-    if (!db_) {
+    if (!open_) {
+        if (store_ok)
+            *store_ok = false;
+        return std::nullopt;
+    }
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
         if (store_ok)
             *store_ok = false;
         return std::nullopt;
     }
     // Names are unique (create_baseline rejects a dup); LIMIT 1 is belt-and-braces.
-    const std::string sql = std::string("SELECT ") + kBaselineColumns +
-                            " FROM guaranteed_state_baselines WHERE name = ? LIMIT 1;";
-    // SqliteStmt RAII (sqlite_raii.hpp): finalizes on every exit including an
-    // exception thrown by read_baseline_row's std::string construction between
-    // prepare and finalize — mirrors deployed_member_rule_ids, the safer sibling.
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
-        // Observability (SRE): a prepare failure (DB locked/corrupt) otherwise returns
-        // the SAME std::nullopt as a genuine not-found, so the REST route 404s and a
-        // CMDB consumer reads it as "no such baseline" — masking a store fault as
-        // benign with no signal. Log it so a degraded read is visible; the legitimate
-        // not-found path stays quiet. Name omitted (prepare failure is name-independent
-        // and the value is caller-influenced).
-        spdlog::error("BaselineStore::get_baseline_by_name: prepare failed: {}",
-                      sqlite3_errmsg(db_));
+    const std::string sql = std::string("SELECT ") + kBaselineCols +
+                            " FROM baseline_store.baselines WHERE name = $1 LIMIT 1";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{name});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("BaselineStore::get_baseline_by_name: query failed: {}",
+                      PQresultErrorMessage(res.get()));
         if (store_ok)
-            *store_ok = false;  // fault, not a miss → caller 503s (retryable)
+            *store_ok = false; // fault, not a miss → caller 503s (retryable)
         return std::nullopt;
     }
-    sqlite3_bind_text(s.get(), 1, name.c_str(), -1, SQLITE_TRANSIENT);
-    std::optional<Baseline> result;
-    const int rc = sqlite3_step(s.get());
-    if (rc == SQLITE_ROW) {
-        result = read_baseline_row(s.get());
-    } else if (rc != SQLITE_DONE) {
-        // The "DB locked/corrupt" fault the store_ok contract names surfaces at STEP
-        // (SQLITE_BUSY/LOCKED/IOERR/CORRUPT), not just prepare — SQLITE_DONE is the
-        // clean no-row not-found. Classify a non-DONE step rc as a fault so the route
-        // 503s (retryable), not 404 (which a CMDB reads as "delete this CI"). Without
-        // this the fix is defeated at the step layer (#1623 Gate-8 cpp-safety).
-        spdlog::error("BaselineStore::get_baseline_by_name: step failed (rc={}): {}", rc,
-                      sqlite3_errmsg(db_));
-        if (store_ok)
-            *store_ok = false;
-    }
-    return result;
+    if (PQntuples(res.get()) == 0)
+        return std::nullopt;
+    return read_baseline_row(res.get(), 0);
 }
 
 std::vector<Baseline> BaselineStore::list_baselines() const {
-    std::shared_lock lock(mtx_);
     std::vector<Baseline> out;
-    if (!db_)
+    if (!open_)
         return out;
-    const std::string sql = std::string("SELECT ") + kBaselineColumns +
-                            " FROM guaranteed_state_baselines ORDER BY name;";
-    // SqliteStmt RAII: finalize on every exit incl. a read_baseline_row throw.
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
-        spdlog::error("BaselineStore::list_baselines: prepare failed: {}", sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return out;
+    const std::string sql =
+        std::string("SELECT ") + kBaselineCols + " FROM baseline_store.baselines ORDER BY name";
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("BaselineStore::list_baselines: query failed: {}",
+                      PQresultErrorMessage(res.get()));
         return out;
     }
-    while (sqlite3_step(s.get()) == SQLITE_ROW)
-        out.push_back(read_baseline_row(s.get()));
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.push_back(read_baseline_row(res.get(), i));
     return out;
 }
 
 std::expected<void, std::string> BaselineStore::update_baseline(const Baseline& b) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
     if (b.name.empty())
         return std::unexpected("baseline name cannot be empty");
-
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected("no database connection: " + pool_.last_error());
+    PGconn* conn = lease.get();
     const int64_t now = now_epoch();
-    sqlite3_stmt* s = nullptr;
-    // RETURNING (not sqlite3_changes()) so the affected-row test rides in the
-    // step return code on this FULLMUTEX connection — see CLAUDE.md #1033.
-    if (sqlite3_prepare_v2(db_,
-                           "UPDATE guaranteed_state_baselines SET "
-                           "name = ?, description = ?, lifecycle = ?, deployed_snapshot = ?, "
-                           "updated_by = ?, deployed_by = ?, deployed_at = ?, updated_at = ? "
-                           "WHERE baseline_id = ? RETURNING baseline_id;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
 
-    sqlite3_bind_text(s, 1, b.name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 2, b.description.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 3, b.lifecycle.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 4, b.deployed_snapshot.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 5, b.updated_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s, 6, b.deployed_by.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(s, 7, b.deployed_at);
-    sqlite3_bind_int64(s, 8, now);
-    sqlite3_bind_text(s, 9, b.baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-
-    bool found = false;
-    int rc;
-    while ((rc = sqlite3_step(s)) == SQLITE_ROW)
-        found = true;
-    if (rc != SQLITE_DONE) {
-        const int ext = sqlite3_extended_errcode(db_);
-        const std::string err = sqlite3_errmsg(db_);
-        sqlite3_finalize(s);
-        if (is_uniqueness_violation(ext))
+    // RETURNING (not sqlite3_changes()-style count) so the affected-row test
+    // rides in the query result — CLAUDE.md #1033.
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "UPDATE baseline_store.baselines SET name = $1, description = $2, lifecycle = $3, "
+        "deployed_snapshot = $4, updated_by = $5, deployed_by = $6, deployed_at = $7::bigint, "
+        "updated_at = $8::bigint WHERE baseline_id = $9 RETURNING baseline_id",
+        std::vector<std::string>{b.name, b.description, b.lifecycle, b.deployed_snapshot,
+                                 b.updated_by, b.deployed_by, std::to_string(b.deployed_at),
+                                 std::to_string(now), b.baseline_id});
+    if (res.status() != PGRES_TUPLES_OK) {
+        const char* sqlstate_p = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+        const std::string sqlstate = sqlstate_p ? sqlstate_p : "";
+        if (sqlstate == "23505")
             return std::unexpected(format_conflict("baseline name '" + b.name + "' already exists"));
-        return std::unexpected("update failed: " + err);
+        return std::unexpected("update failed: " + std::string(PQresultErrorMessage(res.get())));
     }
-    sqlite3_finalize(s);
-    if (!found)
+    if (PQntuples(res.get()) == 0)
         return std::unexpected("not found: baseline_id '" + b.baseline_id + "'");
     return {};
 }
 
 std::expected<void, std::string> BaselineStore::delete_baseline(const std::string& baseline_id) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
-    sqlite3_stmt* s = nullptr;
-    // ON DELETE CASCADE clears the member + assignment rows. RETURNING reports
-    // whether the baseline existed without a separate sqlite3_changes() read.
-    if (sqlite3_prepare_v2(db_,
-                           "DELETE FROM guaranteed_state_baselines WHERE baseline_id = ? "
-                           "RETURNING baseline_id;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-    sqlite3_bind_text(s, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-    bool found = false;
-    int rc;
-    while ((rc = sqlite3_step(s)) == SQLITE_ROW)
-        found = true;
-    if (rc != SQLITE_DONE) {
-        const std::string err = sqlite3_errmsg(db_);
-        sqlite3_finalize(s);
-        return std::unexpected("delete failed: " + err);
-    }
-    sqlite3_finalize(s);
-    if (!found)
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
+        return std::unexpected("no database connection: " + pool_.last_error());
+    // ON DELETE CASCADE clears the member + assignment rows. RETURNING
+    // reports whether the baseline existed without a separate row-count read.
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "DELETE FROM baseline_store.baselines WHERE baseline_id = $1 RETURNING baseline_id",
+        std::vector<std::string>{baseline_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected("delete failed: " + std::string(PQresultErrorMessage(res.get())));
+    if (PQntuples(res.get()) == 0)
         return std::unexpected("not found: baseline_id '" + baseline_id + "'");
     return {};
 }
@@ -396,120 +1003,113 @@ std::expected<void, std::string> BaselineStore::delete_baseline(const std::strin
 std::expected<void, std::string>
 BaselineStore::set_members(const std::string& baseline_id,
                            const std::vector<std::string>& rule_ids) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
 
     // Existence check up front: an INSERT enforces the FK, but an EMPTY member
     // set inserts nothing, so a clear() against a bogus baseline_id would
     // silently "succeed". Verify here for a crisp, consistent error either way.
     {
-        SqliteStmt chk;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT 1 FROM guaranteed_state_baselines WHERE baseline_id = ?;",
-                               -1, chk.addr(), nullptr) != SQLITE_OK)
-            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        sqlite3_bind_text(chk.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(chk.get()) != SQLITE_ROW)
+        auto lease = pool_.try_acquire_for(kReadTimeout);
+        if (!lease)
+            return std::unexpected("no database connection: " + pool_.last_error());
+        pg::PgResult chk = pg::exec_params(
+            lease.get(), "SELECT 1 FROM baseline_store.baselines WHERE baseline_id = $1",
+            std::vector<std::string>{baseline_id});
+        if (chk.status() != PGRES_TUPLES_OK)
+            return std::unexpected("query failed: " + std::string(PQresultErrorMessage(chk.get())));
+        if (PQntuples(chk.get()) == 0)
             return std::unexpected("not found: baseline_id '" + baseline_id + "'");
     }
 
-    if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("begin failed: ") + sqlite3_errmsg(db_));
-    // Rolls back on every early return (and on an exception, e.g. bad_alloc while
-    // building an error string or growing `seen`) until commit() succeeds. The
-    // SqliteStmt owners below finalize first (reverse destruction order) so the
-    // rollback runs against a connection with no live statements.
-    SqliteTxn txn(db_);
-
-    {
-        SqliteStmt del;
-        if (sqlite3_prepare_v2(db_,
-                               "DELETE FROM guaranteed_state_baseline_rules WHERE baseline_id = ?;",
-                               -1, del.addr(), nullptr) != SQLITE_OK)
-            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        sqlite3_bind_text(del.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(del.get()) != SQLITE_DONE)
-            return std::unexpected(std::string("delete failed: ") + sqlite3_errmsg(db_));
-    }
-
-    {
+    std::string error;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult del = pg::exec_params(
+            c, "DELETE FROM baseline_store.baseline_rules WHERE baseline_id = $1",
+            std::vector<std::string>{baseline_id});
+        if (del.status() != PGRES_COMMAND_OK) {
+            error = "delete failed: " + std::string(PQerrorMessage(c));
+            return false;
+        }
         std::unordered_set<std::string> seen;
-        SqliteStmt ins;
-        if (sqlite3_prepare_v2(db_,
-                               "INSERT INTO guaranteed_state_baseline_rules (baseline_id, rule_id) "
-                               "VALUES (?, ?);",
-                               -1, ins.addr(), nullptr) != SQLITE_OK)
-            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
         for (const auto& rule_id : rule_ids) {
             if (rule_id.empty() || !seen.insert(rule_id).second)
                 continue; // skip blanks + de-dup
-            sqlite3_reset(ins.get());
-            sqlite3_bind_text(ins.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(ins.get(), 2, rule_id.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(ins.get()) != SQLITE_DONE)
-                return std::unexpected(std::string("insert member failed: ") + sqlite3_errmsg(db_));
+            pg::PgResult ins = pg::exec_params(
+                c,
+                "INSERT INTO baseline_store.baseline_rules (baseline_id, rule_id) VALUES ($1, $2)",
+                std::vector<std::string>{baseline_id, rule_id});
+            if (ins.status() != PGRES_COMMAND_OK) {
+                error = "insert member failed: " + std::string(PQerrorMessage(c));
+                return false;
+            }
         }
-    }
-
-    if (txn.commit() != SQLITE_OK)
-        return std::unexpected(std::string("commit failed: ") + sqlite3_errmsg(db_));
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(error.empty() ? "transaction failed" : error);
     return {};
 }
 
 std::vector<std::string> BaselineStore::get_members(const std::string& baseline_id) const {
-    std::shared_lock lock(mtx_);
+    return get_members_checked(baseline_id).value_or(std::vector<std::string>{});
+}
+
+std::expected<std::vector<std::string>, std::string>
+BaselineStore::get_members_checked(const std::string& baseline_id) const {
+    if (!open_)
+        return std::unexpected("database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("no database connection: " + pool_.last_error());
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT rule_id FROM baseline_store.baseline_rules WHERE baseline_id = $1 ORDER BY rule_id",
+        std::vector<std::string>{baseline_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
     std::vector<std::string> out;
-    if (!db_)
-        return out;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT rule_id FROM guaranteed_state_baseline_rules "
-                           "WHERE baseline_id = ? ORDER BY rule_id;",
-                           -1, &s, nullptr) != SQLITE_OK)
-        return out;
-    sqlite3_bind_text(s, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW)
-        out.emplace_back(safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0))));
-    sqlite3_finalize(s);
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.push_back(text_col(res.get(), i, 0));
     return out;
 }
 
 std::vector<std::string>
 BaselineStore::baselines_containing_rule(const std::string& rule_id) const {
-    std::shared_lock lock(mtx_);
     std::vector<std::string> out;
-    if (!db_)
+    if (!open_)
         return out;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT baseline_id FROM guaranteed_state_baseline_rules "
-                           "WHERE rule_id = ? ORDER BY baseline_id;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return out;
-    sqlite3_bind_text(s, 1, rule_id.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW)
-        out.emplace_back(safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0))));
-    sqlite3_finalize(s);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT baseline_id FROM baseline_store.baseline_rules WHERE rule_id = $1 ORDER BY baseline_id",
+        std::vector<std::string>{rule_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return out;
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.push_back(text_col(res.get(), i, 0));
     return out;
 }
 
 std::size_t BaselineStore::remove_rule_everywhere(const std::string& rule_id) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return 0;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "DELETE FROM guaranteed_state_baseline_rules WHERE rule_id = ? "
-                           "RETURNING baseline_id;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
         return 0;
-    sqlite3_bind_text(s, 1, rule_id.c_str(), -1, SQLITE_TRANSIENT);
-    std::size_t removed = 0;
-    while (sqlite3_step(s) == SQLITE_ROW)
-        ++removed;
-    sqlite3_finalize(s);
-    return removed;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "DELETE FROM baseline_store.baseline_rules WHERE rule_id = $1 RETURNING baseline_id",
+        std::vector<std::string>{rule_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return 0;
+    return static_cast<std::size_t>(PQntuples(res.get()));
 }
 
 // ── Assignment (included − excluded management groups) ───────────────────────
@@ -517,8 +1117,7 @@ std::size_t BaselineStore::remove_rule_everywhere(const std::string& rule_id) {
 std::expected<void, std::string>
 BaselineStore::set_assignment(const std::string& baseline_id,
                               const std::vector<BaselineGroupAssignment>& groups) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return std::unexpected("database not open");
 
     // Validate + collapse duplicates (last disposition wins) BEFORE any write,
@@ -535,138 +1134,132 @@ BaselineStore::set_assignment(const std::string& baseline_id,
     }
 
     {
-        SqliteStmt chk;
-        if (sqlite3_prepare_v2(db_,
-                               "SELECT 1 FROM guaranteed_state_baselines WHERE baseline_id = ?;",
-                               -1, chk.addr(), nullptr) != SQLITE_OK)
-            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        sqlite3_bind_text(chk.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(chk.get()) != SQLITE_ROW)
+        auto lease = pool_.try_acquire_for(kReadTimeout);
+        if (!lease)
+            return std::unexpected("no database connection: " + pool_.last_error());
+        pg::PgResult chk = pg::exec_params(
+            lease.get(), "SELECT 1 FROM baseline_store.baselines WHERE baseline_id = $1",
+            std::vector<std::string>{baseline_id});
+        if (chk.status() != PGRES_TUPLES_OK)
+            return std::unexpected("query failed: " + std::string(PQresultErrorMessage(chk.get())));
+        if (PQntuples(chk.get()) == 0)
             return std::unexpected("not found: baseline_id '" + baseline_id + "'");
     }
 
-    if (sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK)
-        return std::unexpected(std::string("begin failed: ") + sqlite3_errmsg(db_));
-    // Rolls back on every early return / exception until commit() succeeds; the
-    // SqliteStmt owners finalize first (reverse destruction order).
-    SqliteTxn txn(db_);
-
-    {
-        SqliteStmt del;
-        if (sqlite3_prepare_v2(db_,
-                               "DELETE FROM guaranteed_state_baseline_groups WHERE baseline_id = ?;",
-                               -1, del.addr(), nullptr) != SQLITE_OK)
-            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        sqlite3_bind_text(del.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-        if (sqlite3_step(del.get()) != SQLITE_DONE)
-            return std::unexpected(std::string("delete failed: ") + sqlite3_errmsg(db_));
-    }
-
-    {
-        SqliteStmt ins;
-        if (sqlite3_prepare_v2(db_,
-                               "INSERT INTO guaranteed_state_baseline_groups "
-                               "(baseline_id, group_id, disposition) VALUES (?, ?, ?);",
-                               -1, ins.addr(), nullptr) != SQLITE_OK)
-            return std::unexpected(std::string("prepare failed: ") + sqlite3_errmsg(db_));
-        for (const auto& [group_id, disposition] : resolved) {
-            sqlite3_reset(ins.get());
-            sqlite3_bind_text(ins.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(ins.get(), 2, group_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(ins.get(), 3, disposition.c_str(), -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(ins.get()) != SQLITE_DONE)
-                return std::unexpected(std::string("insert assignment failed: ") +
-                                       sqlite3_errmsg(db_));
+    std::string error;
+    const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult del = pg::exec_params(
+            c, "DELETE FROM baseline_store.baseline_groups WHERE baseline_id = $1",
+            std::vector<std::string>{baseline_id});
+        if (del.status() != PGRES_COMMAND_OK) {
+            error = "delete failed: " + std::string(PQerrorMessage(c));
+            return false;
         }
-    }
-
-    if (txn.commit() != SQLITE_OK)
-        return std::unexpected(std::string("commit failed: ") + sqlite3_errmsg(db_));
+        for (const auto& [group_id, disposition] : resolved) {
+            pg::PgResult ins = pg::exec_params(
+                c,
+                "INSERT INTO baseline_store.baseline_groups (baseline_id, group_id, disposition) "
+                "VALUES ($1, $2, $3)",
+                std::vector<std::string>{baseline_id, group_id, disposition});
+            if (ins.status() != PGRES_COMMAND_OK) {
+                error = "insert assignment failed: " + std::string(PQerrorMessage(c));
+                return false;
+            }
+        }
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(error.empty() ? "transaction failed" : error);
     return {};
 }
 
 std::vector<BaselineGroupAssignment>
 BaselineStore::get_assignment(const std::string& baseline_id) const {
-    std::shared_lock lock(mtx_);
     std::vector<BaselineGroupAssignment> out;
-    if (!db_)
+    if (!open_)
         return out;
-    sqlite3_stmt* s = nullptr;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return out;
     // Sort include-before-exclude then by group_id for a stable UI order.
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT group_id, disposition FROM guaranteed_state_baseline_groups "
-                           "WHERE baseline_id = ? ORDER BY disposition, group_id;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT group_id, disposition FROM baseline_store.baseline_groups WHERE baseline_id = $1 "
+        "ORDER BY disposition, group_id",
+        std::vector<std::string>{baseline_id});
+    if (res.status() != PGRES_TUPLES_OK)
         return out;
-    sqlite3_bind_text(s, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-    while (sqlite3_step(s) == SQLITE_ROW) {
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
         BaselineGroupAssignment a;
-        a.group_id = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 0)));
-        a.disposition = safe(reinterpret_cast<const char*>(sqlite3_column_text(s, 1)));
+        a.group_id = text_col(res.get(), i, 0);
+        a.disposition = text_col(res.get(), i, 1);
         out.push_back(std::move(a));
     }
-    sqlite3_finalize(s);
     return out;
 }
 
 std::size_t BaselineStore::remove_group_everywhere(const std::string& group_id) {
-    std::unique_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return 0;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "DELETE FROM guaranteed_state_baseline_groups WHERE group_id = ? "
-                           "RETURNING baseline_id;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease)
         return 0;
-    sqlite3_bind_text(s, 1, group_id.c_str(), -1, SQLITE_TRANSIENT);
-    std::size_t removed = 0;
-    while (sqlite3_step(s) == SQLITE_ROW)
-        ++removed;
-    sqlite3_finalize(s);
-    return removed;
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "DELETE FROM baseline_store.baseline_groups WHERE group_id = $1 RETURNING baseline_id",
+        std::vector<std::string>{group_id});
+    if (res.status() != PGRES_TUPLES_OK)
+        return 0;
+    return static_cast<std::size_t>(PQntuples(res.get()));
 }
 
 // ── Reverse lookups / counting ───────────────────────────────────────────────
 
 std::vector<Baseline> BaselineStore::list_deployed_baselines() const {
-    std::shared_lock lock(mtx_);
     std::vector<Baseline> out;
-    if (!db_)
+    if (!open_)
         return out;
-    const std::string sql = std::string("SELECT ") + kBaselineColumns +
-                            " FROM guaranteed_state_baselines WHERE lifecycle = ? ORDER BY name;";
-    // SqliteStmt RAII: finalize on every exit incl. a read_baseline_row throw.
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db_, sql.c_str(), -1, s.addr(), nullptr) != SQLITE_OK) {
-        spdlog::error("BaselineStore::list_deployed_baselines: prepare failed: {}",
-                      sqlite3_errmsg(db_));
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return out;
+    const std::string sql = std::string("SELECT ") + kBaselineCols +
+                            " FROM baseline_store.baselines WHERE lifecycle = $1 ORDER BY name";
+    pg::PgResult res =
+        pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{kBaselineDeployed});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("BaselineStore::list_deployed_baselines: query failed: {}",
+                      PQresultErrorMessage(res.get()));
         return out;
     }
-    sqlite3_bind_text(s.get(), 1, kBaselineDeployed, -1, SQLITE_STATIC);
-    while (sqlite3_step(s.get()) == SQLITE_ROW)
-        out.push_back(read_baseline_row(s.get()));
+    const int n = PQntuples(res.get());
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i)
+        out.push_back(read_baseline_row(res.get(), i));
     return out;
 }
 
-std::unordered_set<std::string> BaselineStore::deployed_member_rule_ids() const {
-    std::shared_lock lock(mtx_);
-    std::unordered_set<std::string> ids;
-    if (!db_)
-        return ids;
-    // Read only the snapshot column of every deployed Baseline in one pass (one
-    // lock, no per-Baseline get_members round-trip). The snapshot is what was
+std::expected<std::unordered_set<std::string>, std::string>
+BaselineStore::deployed_member_rule_ids() const {
+    if (!open_)
+        return std::unexpected("database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("no database connection: " + pool_.last_error());
+    // Read only the snapshot column of every deployed Baseline in one pass
+    // (one lease, no per-Baseline round-trip). The snapshot is what was
     // deployed; see the deployed_snapshot field doc + deploy_baseline().
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT deployed_snapshot FROM guaranteed_state_baselines "
-                           "WHERE lifecycle = ?;",
-                           -1, s.addr(), nullptr) != SQLITE_OK)
-        return ids;
-    sqlite3_bind_text(s.get(), 1, kBaselineDeployed, -1, SQLITE_STATIC);
-    while (sqlite3_step(s.get()) == SQLITE_ROW) {
-        const char* snap = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
-        if (!snap || !*snap)
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT deployed_snapshot FROM baseline_store.baselines WHERE lifecycle = $1",
+        std::vector<std::string>{kBaselineDeployed});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    std::unordered_set<std::string> ids;
+    const int n = PQntuples(res.get());
+    for (int i = 0; i < n; ++i) {
+        const std::string snap = text_col(res.get(), i, 0);
+        if (snap.empty())
             continue; // never-deployed / empty snapshot contributes nothing (fail-closed)
         // allow_exceptions=false: a malformed snapshot is skipped, not thrown on.
         const auto parsed = nlohmann::json::parse(snap, nullptr, /*allow_exceptions=*/false);
@@ -679,31 +1272,31 @@ std::unordered_set<std::string> BaselineStore::deployed_member_rule_ids() const 
     return ids;
 }
 
-std::vector<std::string>
+std::expected<std::vector<std::string>, std::string>
 BaselineStore::deployed_member_rule_ids(const std::string& baseline_id) const {
-    std::shared_lock lock(mtx_);
-    std::vector<std::string> ids;
-    if (!db_)
-        return ids;
+    if (!open_)
+        return std::unexpected("database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected("no database connection: " + pool_.last_error());
     // The deployed snapshot (the ENFORCED set captured at last deploy) of ONE
-    // Baseline — the per-Baseline analog of the fleet-union overload above, for
-    // the baseline-anchored per-device REST view. The `lifecycle = deployed`
-    // filter mirrors the union overload so the two share ONE definition of "what
-    // is deployed": a draft / never-deployed Baseline yields {} from the store
-    // itself (the "deployed:false ⟹ no guards" contract is self-enforcing here,
-    // not only via the externally-empty snapshot). Same fail-closed parse: an
-    // empty / malformed snapshot also yields {}.
-    SqliteStmt s;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT deployed_snapshot FROM guaranteed_state_baselines "
-                           "WHERE baseline_id = ?1 AND lifecycle = ?2;",
-                           -1, s.addr(), nullptr) != SQLITE_OK)
-        return ids;
-    sqlite3_bind_text(s.get(), 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(s.get(), 2, kBaselineDeployed, -1, SQLITE_STATIC);
-    if (sqlite3_step(s.get()) == SQLITE_ROW) {
-        const char* snap = reinterpret_cast<const char*>(sqlite3_column_text(s.get(), 0));
-        if (snap && *snap) {
+    // Baseline — the per-Baseline analog of the fleet-union overload above,
+    // for the baseline-anchored per-device REST view. The `lifecycle =
+    // deployed` filter mirrors the union overload so the two share ONE
+    // definition of "what is deployed": a draft / never-deployed Baseline
+    // yields {} (the "deployed:false ⟹ no guards" contract is self-enforcing
+    // here, not only via the externally-empty snapshot).
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT deployed_snapshot FROM baseline_store.baselines WHERE baseline_id = $1 AND "
+        "lifecycle = $2",
+        std::vector<std::string>{baseline_id, kBaselineDeployed});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected("query failed: " + std::string(PQresultErrorMessage(res.get())));
+    std::vector<std::string> ids;
+    if (PQntuples(res.get()) > 0) {
+        const std::string snap = text_col(res.get(), 0, 0);
+        if (!snap.empty()) {
             // allow_exceptions=false: a malformed snapshot is skipped, not thrown on.
             const auto parsed = nlohmann::json::parse(snap, nullptr, /*allow_exceptions=*/false);
             if (parsed.is_array())
@@ -718,36 +1311,30 @@ BaselineStore::deployed_member_rule_ids(const std::string& baseline_id) const {
 }
 
 std::size_t BaselineStore::baseline_count() const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return 0;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM guaranteed_state_baselines;", -1, &s,
-                           nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return 0;
-    std::size_t n = 0;
-    if (sqlite3_step(s) == SQLITE_ROW)
-        n = static_cast<std::size_t>(sqlite3_column_int64(s, 0));
-    sqlite3_finalize(s);
-    return n;
+    pg::PgResult res = pg::exec_params(lease.get(), "SELECT COUNT(*) FROM baseline_store.baselines",
+                                       std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return 0;
+    return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
 std::size_t BaselineStore::member_count(const std::string& baseline_id) const {
-    std::shared_lock lock(mtx_);
-    if (!db_)
+    if (!open_)
         return 0;
-    sqlite3_stmt* s = nullptr;
-    if (sqlite3_prepare_v2(db_,
-                           "SELECT COUNT(*) FROM guaranteed_state_baseline_rules "
-                           "WHERE baseline_id = ?;",
-                           -1, &s, nullptr) != SQLITE_OK)
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
         return 0;
-    sqlite3_bind_text(s, 1, baseline_id.c_str(), -1, SQLITE_TRANSIENT);
-    std::size_t n = 0;
-    if (sqlite3_step(s) == SQLITE_ROW)
-        n = static_cast<std::size_t>(sqlite3_column_int64(s, 0));
-    sqlite3_finalize(s);
-    return n;
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT COUNT(*) FROM baseline_store.baseline_rules WHERE baseline_id = $1",
+        std::vector<std::string>{baseline_id});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) == 0)
+        return 0;
+    return static_cast<std::size_t>(to_i64(PQgetvalue(res.get(), 0, 0)));
 }
 
 } // namespace yuzu::server

@@ -66,6 +66,16 @@ yuzu::test::PgTestTemplate guardianstate_tpl{"guardianstate", [](const std::stri
         throw std::runtime_error("guardianstate template: store failed to migrate");
 }};
 
+// Shared key "baselinestore" — SAME setup-callback shape as
+// test_baseline_store.cpp's own template (ADR-0055 migration), so the
+// shared-key replay verification (test_helpers.hpp) passes.
+yuzu::test::PgTestTemplate baselinestore_tpl{"baselinestore", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    BaselineStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("baselinestore template: store failed to migrate");
+}};
+
 GuaranteedStateRuleRow make_rule(std::string rule_id, std::string name) {
     GuaranteedStateRuleRow r;
     r.rule_id = std::move(rule_id);
@@ -107,7 +117,15 @@ struct PushCall {
 struct Harness {
     std::optional<yuzu::test::PostgresTestDb> gs_db_pg;
     std::optional<yuzu::server::pg::PgPool> gs_pool;
-    yuzu::test::TempDbFile bl_db{std::string_view{"guardian-routes-bl-"}};
+    // Separate clone + pool from gs_db_pg/gs_pool above (ADR-0055 migration,
+    // its own "baselinestore" template) — BaselineStore and
+    // GuaranteedStateStore are independent Postgres schemas; a single shared
+    // clone would need a THIRD, harness-specific template key mirroring the
+    // structural union of both, which no other file needs (test_access_
+    // review_model.cpp's RbacStore/EnginePrincipalStore harness is the same
+    // shape: one pool per store).
+    std::optional<yuzu::test::PostgresTestDb> bl_db_pg;
+    std::optional<yuzu::server::pg::PgPool> bl_pool;
 
     std::unique_ptr<GuaranteedStateStore> store;
     std::unique_ptr<BaselineStore> baselines;
@@ -146,7 +164,14 @@ struct Harness {
         REQUIRE(gs_pool->valid());
         store = std::make_unique<GuaranteedStateStore>(*gs_pool);
         REQUIRE(store->is_open());
-        baselines = std::make_unique<BaselineStore>(bl_db.path);
+
+        bl_db_pg.emplace(baselinestore_tpl);
+        INFO("[Harness] baseline fixture status (blank == database came up OK): "
+             << bl_db_pg->error());
+        REQUIRE(bl_db_pg->available());
+        bl_pool.emplace(yuzu::server::pg::PgPool::Options{.conninfo = bl_db_pg->dsn(), .size = 4});
+        REQUIRE(bl_pool->valid());
+        baselines = std::make_unique<BaselineStore>(*bl_pool);
         REQUIRE(baselines->is_open());
 
         auto auth_fn = [this](const httplib::Request&,
@@ -287,7 +312,8 @@ TEST_CASE("deploy_baseline marks deployed, writes the snapshot, and pushes fleet
     REQUIRE(h.pushes.size() == 1);
     CHECK(h.pushes[0].full_sync == true);
     auto enforced = h.baselines->deployed_member_rule_ids();
-    CHECK(enforced.count("g1") == 1);
+    REQUIRE(enforced.has_value());
+    CHECK(enforced->count("g1") == 1);
     CHECK(h.audit_count("guaranteed_state.baseline.deploy", "success") == 1);
 }
 
@@ -307,7 +333,9 @@ TEST_CASE("deploy_baseline is gated on GuaranteedState:Push (no push when denied
     REQUIRE(bl.has_value());
     CHECK(bl->lifecycle == kBaselineDraft); // still a draft
     CHECK(h.pushes.empty());                // the fleet was never touched
-    CHECK(h.baselines->deployed_member_rule_ids().empty());
+    auto enforced = h.baselines->deployed_member_rule_ids();
+    REQUIRE(enforced.has_value());
+    CHECK(enforced->empty());
 }
 
 TEST_CASE("editing a deployed Baseline does not change what the fleet enforces until re-deploy",
@@ -322,8 +350,9 @@ TEST_CASE("editing a deployed Baseline does not change what the fleet enforces u
                             "application/x-www-form-urlencoded") != nullptr);
     {
         auto enforced = h.baselines->deployed_member_rule_ids();
-        CHECK(enforced.size() == 1);
-        CHECK(enforced.count("g1") == 1);
+        REQUIRE(enforced.has_value());
+        CHECK(enforced->size() == 1);
+        CHECK(enforced->count("g1") == 1);
     }
     const std::size_t pushes_after_deploy = h.pushes.size();
 
@@ -338,9 +367,10 @@ TEST_CASE("editing a deployed Baseline does not change what the fleet enforces u
     // ...but the ENFORCED set (the deployed snapshot) did NOT — and no push fired.
     {
         auto enforced = h.baselines->deployed_member_rule_ids();
-        CHECK(enforced.size() == 1);
-        CHECK(enforced.count("g1") == 1);
-        CHECK(enforced.count("g2") == 0);
+        REQUIRE(enforced.has_value());
+        CHECK(enforced->size() == 1);
+        CHECK(enforced->count("g1") == 1);
+        CHECK(enforced->count("g2") == 0);
     }
     CHECK(h.pushes.size() == pushes_after_deploy); // update did not converge the fleet
 
@@ -348,8 +378,9 @@ TEST_CASE("editing a deployed Baseline does not change what the fleet enforces u
     REQUIRE(h.sink.dispatch("POST", "/fragments/guardian/baseline/bl1/deploy", "",
                             "application/x-www-form-urlencoded") != nullptr);
     auto enforced = h.baselines->deployed_member_rule_ids();
-    CHECK(enforced.size() == 2);
-    CHECK(enforced.count("g2") == 1);
+    REQUIRE(enforced.has_value());
+    CHECK(enforced->size() == 2);
+    CHECK(enforced->count("g2") == 1);
 }
 
 TEST_CASE("delete_baseline_action removes a deployed Baseline and converges the fleet",
@@ -367,7 +398,9 @@ TEST_CASE("delete_baseline_action removes a deployed Baseline and converges the 
     CHECK(res->status == 200);
 
     CHECK_FALSE(h.baselines->get_baseline("bl1").has_value());
-    CHECK(h.baselines->deployed_member_rule_ids().empty());
+    auto enforced_after_delete = h.baselines->deployed_member_rule_ids();
+    REQUIRE(enforced_after_delete.has_value());
+    CHECK(enforced_after_delete->empty());
     CHECK(h.pushes.size() == pushes_before_delete + 1); // convergence push for the removed set
     CHECK(h.audit_count("guaranteed_state.baseline.delete", "success") == 1);
 }
