@@ -39,9 +39,12 @@
 #include "execution_tracker.hpp"
 #include "gateway_service_impl.hpp"
 #include "inventory_store.hpp"
+#include "notification_store.hpp"
+#include "offload_target_store.hpp"
 #include "peer_ip.hpp"
 #include "pg/pg_pool.hpp"
 #include "response_store.hpp"
+#include "webhook_store.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
@@ -49,17 +52,23 @@
 #include "../test_helpers.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <memory>
 #include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 using yuzu::server::AuditStore;
+using yuzu::server::NotificationStore;
+using yuzu::server::OffloadAuthType;
+using yuzu::server::OffloadTargetStore;
 using yuzu::server::ResponseStore;
 using yuzu::server::StoredResponse;
+using yuzu::server::WebhookStore;
 using yuzu::server::detail::AgentRegistry;
 using yuzu::server::detail::AgentServiceImpl;
 using yuzu::server::detail::EventBus;
@@ -2131,4 +2140,327 @@ TEST_CASE("AgentRegistry::sweep_revoked does NOT cancel a stream whose cert chan
     const auto cancelled = registry.sweep_revoked(is_revoked);
     REQUIRE(calls == 1);          // evaluated the originally-captured leaf
     REQUIRE(cancelled.empty());   // but the re-check saw PEM-NEW != PEM-OLD → no cancel
+}
+
+// ── #3261: notification/webhook/offload emission with wired stores ────────
+//
+// #3261 fixed a boot-wiring bug where the three set_notification_store /
+// set_webhook_store / set_offload_target_store calls in ServerImpl's
+// constructor ran before their stores were constructed, so the guards were
+// guaranteed-false and every AgentServiceImpl emission on these three paths
+// (Register, Subscribe, process_gateway_response) was silently dead. The
+// source-scan regression guard (test_store_wiring_order.cpp) proves the
+// ORDERING is now correct; these two tests prove the RECEIVING MACHINERY
+// actually works once wired, driving process_gateway_response end-to-end
+// into real (SQLite in-memory / PG-templated) stores.
+
+namespace {
+
+/// Minimal harness: a real AgentServiceImpl with no stores wired at
+/// construction. Unlike GatewayResponseHarness this needs no Postgres —
+/// process_gateway_response's response_store_/analytics_store_/
+/// notification_store_/webhook_store_/offload_target_store_/
+/// execution_tracker_ branches are all independently null-guarded
+/// (agent_service_impl.cpp), so a bare AgentServiceImpl exercises the
+/// webhook/offload emission path with no PG dependency.
+struct BareServiceHarness {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    AgentServiceImpl svc{registry,
+                         bus,
+                         /*require_client_identity=*/false,
+                         auth_mgr,
+                         auto_approve,
+                         metrics,
+                         /*gateway_mode=*/false};
+};
+
+/// MEMBER ORDER LOAD-BEARING, same contract as TrackerScope above: the dtor
+/// must null both borrowed-pointer setters before the stores it borrowed
+/// from destruct. #3261 governance hardening: WebhookStore/OffloadTargetStore
+/// now dispatch deliveries through a bounded StoreWorkerPool instead of a
+/// raw detached std::thread (store_worker_pool.hpp), so this scope's dtor
+/// calls quiesce() before reset() below — a real, bounded guarantee that no
+/// delivery thread is still touching the store, not merely an inference
+/// from every test polling get_deliveries() to completion first (which was
+/// the whole story before the pool existed, and left a narrow gap if a
+/// REQUIRE failed mid-poll and unwound straight into this destructor).
+struct EventSinkScope {
+    std::unique_ptr<WebhookStore> webhooks;
+    std::unique_ptr<OffloadTargetStore> offloads;
+    AgentServiceImpl* svc{nullptr};
+
+    explicit EventSinkScope(AgentServiceImpl& s) : svc(&s) {
+        webhooks = std::make_unique<WebhookStore>(":memory:");
+        REQUIRE(webhooks->is_open());
+        offloads = std::make_unique<OffloadTargetStore>(":memory:");
+        REQUIRE(offloads->is_open());
+        svc->set_webhook_store(webhooks.get());
+        svc->set_offload_target_store(offloads.get());
+    }
+    ~EventSinkScope() {
+        if (svc) {
+            svc->set_webhook_store(nullptr);
+            svc->set_offload_target_store(nullptr);
+        }
+        // #3261 governance hardening (cpp-expert SHOULD, Gate 3): the old
+        // version of this comment argued destruction was safe because
+        // every test using this scope polls get_deliveries() to
+        // completion first — true on the success path, but a REQUIRE
+        // failure mid-poll unwinds straight into this destructor with a
+        // detached delivery thread potentially still in flight. quiesce()
+        // makes that argument unconditional instead of relying on test
+        // discipline: it blocks (bounded) until every queued/in-flight
+        // delivery on the pool has actually finished, so reset() below is
+        // always safe regardless of how this scope exits.
+        if (webhooks)
+            webhooks->quiesce(std::chrono::seconds(5));
+        if (offloads)
+            offloads->quiesce(std::chrono::seconds(5));
+        offloads.reset();
+        webhooks.reset();
+    }
+
+    EventSinkScope(const EventSinkScope&) = delete;
+    EventSinkScope& operator=(const EventSinkScope&) = delete;
+};
+
+/// Poll `get` (a `get_deliveries`-shaped callable) up to 5s for at least
+/// `min_count` results — matches the deterministic-without-a-fixed-sleep
+/// idiom already established for detached delivery threads in
+/// test_offload_target_store.cpp's batch_size test. Default `min_count=1`
+/// preserves the original "wait for non-empty" behavior for existing
+/// callers; a caller re-polling after a second delivery (e.g. a reconnect
+/// firing a second `agent.registered`) passes 2 so it does not observe a
+/// stale still-size-1 result and stop waiting too early.
+template <typename Get>
+auto poll_deliveries(Get get, std::size_t min_count = 1) {
+    constexpr auto kPollDeadline = std::chrono::seconds(5);
+    auto start = std::chrono::steady_clock::now();
+    decltype(get()) rows;
+    while (std::chrono::steady_clock::now() - start < kPollDeadline) {
+        rows = get();
+        if (rows.size() >= min_count)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return rows;
+}
+
+} // namespace
+
+TEST_CASE("process_gateway_response: wired webhook + offload sinks receive "
+          "execution.completed (#3261)",
+          "[agent_service][issue3261]") {
+    BareServiceHarness h;
+    EventSinkScope sinks(h.svc);
+
+    auto wh_id =
+        sinks.webhooks->create_webhook("http://127.0.0.1:1/hook", "execution.completed", "s3cret");
+    REQUIRE(wh_id > 0);
+    // batch_size=2 so the single event fired below buffers deterministically
+    // instead of dispatching immediately (test_offload_target_store.cpp's
+    // batch_size>1 idiom) — proves fire_event ran without racing a
+    // detached-thread dispatch.
+    auto off_id = sinks.offloads->create_target("t1", "http://127.0.0.1:1/off", OffloadAuthType::None,
+                                                "", "execution.completed", /*batch_size=*/2);
+    REQUIRE(off_id > 0);
+
+    auto resp = GatewayResponseHarness::make_response("cmd-hook-1", apb::CommandResponse::SUCCESS,
+                                                        /*output=*/"done", /*exit_code=*/0);
+    h.svc.process_gateway_response("agent-1", resp);
+
+    // Buffered, not yet dispatched.
+    CHECK(sinks.offloads->get_deliveries(off_id).empty());
+    sinks.offloads->flush_all();
+
+    // Neither sink is touched again after this point in this test case, so
+    // quiesce() (a real CV-based wait, not a timing assumption) is safe
+    // here — PR review finding (important): the sleep_for+poll idiom
+    // poll_deliveries() below implements is genuinely necessary at LATER,
+    // multi-delivery call sites (e.g. the reauth test), where quiesce()
+    // would permanently close the pool before a second delivery could
+    // ever fire — but was unnecessary at this first-use site.
+    REQUIRE(sinks.offloads->quiesce(std::chrono::seconds(5)));
+    REQUIRE(sinks.webhooks->quiesce(std::chrono::seconds(5)));
+
+    auto off_deliveries = sinks.offloads->get_deliveries(off_id);
+    REQUIRE(off_deliveries.size() == 1);
+    CHECK(off_deliveries[0].event_count == 1);
+    CHECK(off_deliveries[0].payload.find("execution.completed") != std::string::npos);
+    CHECK(off_deliveries[0].payload.find("cmd-hook-1") != std::string::npos);
+
+    auto wh_deliveries = sinks.webhooks->get_deliveries(wh_id);
+    REQUIRE(wh_deliveries.size() == 1);
+    CHECK(wh_deliveries[0].event_type == "execution.completed");
+    CHECK(wh_deliveries[0].payload.find("cmd-hook-1") != std::string::npos);
+    CHECK(wh_deliveries[0].payload.find("agent-1") != std::string::npos);
+}
+
+namespace {
+
+// NotificationStore is Postgres-backed (ADR-0006 Wave 2) — shares the
+// "notifstore" template key with test_notification_store.cpp (identical
+// setup: construct-and-scope-destruct a single NotificationStore).
+yuzu::test::PgTestTemplate notif_tpl{"notifstore", [](const std::string& dsn) {
+                                         PgPool pool{{.conninfo = dsn, .size = 1}};
+                                         NotificationStore store{pool};
+                                         if (!store.is_open())
+                                             throw std::runtime_error(
+                                                 "notification template: store failed to migrate");
+                                     }};
+
+/// Same drain -> null -> reset discipline as TrackerScope/EventSinkScope
+/// above, for a NotificationStore already cloned from notif_tpl by the
+/// caller (mirrors GatewayResponseHarness's own PgPool-by-reference shape).
+struct NotificationScope {
+    std::unique_ptr<NotificationStore> store;
+    AgentServiceImpl* svc{nullptr};
+
+    NotificationScope(AgentServiceImpl& s, pg::PgPool& pool) : svc(&s) {
+        store = std::make_unique<NotificationStore>(pool);
+        REQUIRE(store->is_open());
+        svc->set_notification_store(store.get());
+    }
+    ~NotificationScope() {
+        if (svc)
+            svc->set_notification_store(nullptr);
+        store.reset();
+    }
+
+    NotificationScope(const NotificationScope&) = delete;
+    NotificationScope& operator=(const NotificationScope&) = delete;
+};
+
+} // namespace
+
+TEST_CASE("process_gateway_response: wired notification store receives an "
+          "Execution Failed row on a non-SUCCESS response (#3261)",
+          "[pg][agent_service][issue3261]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+
+    YUZU_REQUIRE_PG_DB_TPL(ndb, notif_tpl);
+    PgPool npool{{.conninfo = ndb.dsn(), .size = 4}};
+    NotificationScope nscope(h.svc, npool);
+
+    apb::CommandResponse resp;
+    resp.set_command_id("cmd-fail-1");
+    resp.set_status(apb::CommandResponse::FAILURE);
+    resp.mutable_error()->set_message("boom");
+    h.svc.process_gateway_response("agent-9", resp);
+
+    auto rows = nscope.store->list_all();
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].level == "error");
+    CHECK(rows[0].title == "Execution Failed");
+    CHECK(rows[0].message.find("cmd-fail-1") != std::string::npos);
+    CHECK(rows[0].message.find("agent-9") != std::string::npos);
+    CHECK(rows[0].message.find("boom") != std::string::npos);
+}
+
+// ── #3261 governance hardening (Gate 3 quality-engineer SHOULD) ────────────
+//
+// The two TEST_CASEs above exercise process_gateway_response's wiring but
+// never Register/Subscribe's own notification/webhook/offload logic — which,
+// being downstream of the SAME construction-order bug, had never executed
+// in any test or production boot until #3261's fix. This closes that gap,
+// and doubles as the regression test for the reauth-suppression fix
+// (agent_service_impl.cpp Register handler): "Agent Enrolled" must fire
+// once, on first enrollment only; `agent.registered` webhook/offload must
+// fire on EVERY Register, including a reconnect, per the documented
+// contract (docs/user-manual/rest-api.md's webhook/offload sections).
+
+TEST_CASE("Register: notification fires once on first enrollment; webhook/offload "
+          "fire again on a reconnect (#3261)",
+          "[pg][agent_service][issue3261]") {
+    YUZU_REQUIRE_PG_DB_TPL(ndb, notif_tpl);
+    PgPool npool{{.conninfo = ndb.dsn(), .size = 4}};
+
+    BareServiceHarness h;
+    h.auto_approve.add_rule({yuzu::server::auth::AutoApproveRuleType::hostname_glob, "*",
+                             "match-all (test)", /*enabled=*/true});
+    EventSinkScope sinks(h.svc);
+    NotificationScope nscope(h.svc, npool);
+
+    auto wh_id =
+        sinks.webhooks->create_webhook("http://127.0.0.1:1/hook", "agent.registered", "");
+    REQUIRE(wh_id > 0);
+    auto off_id = sinks.offloads->create_target("t1", "http://127.0.0.1:1/off",
+                                                OffloadAuthType::None, "", "agent.registered",
+                                                /*batch_size=*/1);
+    REQUIRE(off_id > 0);
+
+    auto req = make_register("reauth-test-agent");
+
+    // First Register: genuinely new agent.
+    apb::RegisterResponse resp1;
+    REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &resp1).ok());
+    REQUIRE(resp1.accepted());
+
+    auto notifs = nscope.store->list_all();
+    REQUIRE(notifs.size() == 1);
+    CHECK(notifs[0].title == "Agent Enrolled");
+    CHECK(notifs[0].message.find("reauth-test-agent") != std::string::npos);
+
+    auto wh_after_first = poll_deliveries([&] { return sinks.webhooks->get_deliveries(wh_id); });
+    REQUIRE(wh_after_first.size() == 1);
+    auto off_after_first =
+        poll_deliveries([&] { return sinks.offloads->get_deliveries(off_id); });
+    REQUIRE(off_after_first.size() == 1);
+
+    // Second Register with the SAME agent_id: a reconnect.
+    // auth_mgr_.get_pending_status() now returns approved, so is_reauth
+    // becomes true inside Register.
+    apb::RegisterResponse resp2;
+    REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &resp2).ok());
+
+    // Notification: unchanged. A regression here (the pre-#3261-fix shape,
+    // just newly visible) would flood the unreaper'd notification feed on
+    // every fleet-wide restart (Gate 4 happy-path/unhappy-path UP-3).
+    auto notifs_after_reauth = nscope.store->list_all();
+    CHECK(notifs_after_reauth.size() == 1);
+
+    // Webhook/offload: DO fire again, matching the documented contract.
+    auto wh_after_reauth =
+        poll_deliveries([&] { return sinks.webhooks->get_deliveries(wh_id); }, /*min_count=*/2);
+    CHECK(wh_after_reauth.size() == 2);
+    auto off_after_reauth =
+        poll_deliveries([&] { return sinks.offloads->get_deliveries(off_id); }, /*min_count=*/2);
+    CHECK(off_after_reauth.size() == 2);
+}
+
+// ── Metric: all 6 webhook/offload delivery counters pre-seeded to 0 ────────
+//
+// Mirrors server.cpp's ServerImpl constructor pre-seed block (the six
+// metrics_.counter(name) calls right after the six describe() calls,
+// server.cpp:~1614-1633) — same pattern as
+// test_principal_quota_chokepoint.cpp's preseed_quota_metric() helper.
+// Regression guard for the adversarial-review round-2 fix (bf5582461):
+// describe() alone only writes HELP/TYPE metadata, it does not materialize
+// a series, so before that fix a fresh server exposed none of these six
+// series until the first delivery incremented one - breaking absent()-based
+// alerting. This test does not construct a real ServerImpl (too heavyweight
+// for a unit test); it exercises the exact same describe()+counter() calls
+// against a bare MetricsRegistry.
+TEST_CASE("Webhook/offload delivery counters: all 6 pre-seeded to 0 at boot",
+          "[agent_service][issue3261][metrics]") {
+    yuzu::MetricsRegistry reg;
+    const char* names[] = {"yuzu_server_webhook_delivery_success_total",
+                           "yuzu_server_webhook_delivery_failed_total",
+                           "yuzu_server_webhook_delivery_dropped_total",
+                           "yuzu_server_offload_delivery_success_total",
+                           "yuzu_server_offload_delivery_failed_total",
+                           "yuzu_server_offload_delivery_dropped_total"};
+    for (const char* name : names) {
+        reg.describe(name, "test", "counter");
+        reg.counter(name);
+    }
+    for (const char* name : names) {
+        CHECK(reg.counter(name).value() == 0.0);
+    }
 }

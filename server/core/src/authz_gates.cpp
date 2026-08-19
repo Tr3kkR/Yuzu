@@ -3,6 +3,7 @@
 #include "auth_routes.hpp"
 #include "authz_model.hpp"
 #include "rest_a4_envelope_http.hpp"
+#include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 
 #include <unordered_set>
 
@@ -118,7 +119,8 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         // GateFailure::Degraded on the latter — never read a degraded store
         // as an empty-but-legitimate service, and never collapse Degraded
         // into Forbidden (the 503-vs-403 distinction this gate exists for).
-        auto tagged = tag_store_->agents_with_tag("service", session->token_scope_service);
+        auto tagged = tag_store_->agents_with_tag(std::string(authz::kServiceTagKey),
+                                                  session->token_scope_service);
         if (!tagged) {
             audit_log(req, "auth.fleet_read_required", "denied", "", "",
                       "fleet read blocked: tag store degraded resolving service scope");
@@ -180,7 +182,8 @@ bool AuthRoutes::confine_agent_target(const httplib::Request& req, httplib::Resp
     }
     // ADR-0050 typed read — degrade maps to the 503 branch below, never to
     // the not-in-service Forbidden (same reasoning as require_fleet_read).
-    auto tagged = tag_store_->agents_with_tag("service", session->token_scope_service);
+    auto tagged = tag_store_->agents_with_tag(std::string(authz::kServiceTagKey),
+                                              session->token_scope_service);
     if (!tagged) {
         audit_log(req, "auth.agent_target_required", "denied", "Agent", agent_id,
                   "agent target blocked: tag store degraded resolving service scope");

@@ -278,6 +278,19 @@ so `absent()`/`rate()` alerting is meaningful on a healthy server.
 |---|---|---|
 | `yuzu_preflight_tick_errors_total` | counter | Exceptions caught by the background `PreflightRunner`'s per-tick try/catch (60 s cadence). A rising rate means pre-flight runs are not being re-dispatched/settled — check the server log. |
 
+## Webhook / offload delivery metrics (#3261)
+
+`WebhookStore` and `OffloadTargetStore` (see [REST API §Webhooks / §Offload Targets](rest-api.md)) dispatch deliveries through a bounded worker pool; these counters cover delivery outcomes and pool backpressure. All six are pre-seeded to `0` at boot, so `absent()`-based alerting stays meaningful on a fresh server before the first delivery ever fires.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `yuzu_server_webhook_delivery_success_total` | counter | Webhook deliveries that completed with a 2xx response. |
+| `yuzu_server_webhook_delivery_failed_total` | counter | Webhook deliveries that failed (connection error, non-2xx, exception). |
+| `yuzu_server_webhook_delivery_dropped_total` | counter | Webhook deliveries dropped because the delivery worker pool's bounded queue was full, or the store was quiescing (shutdown in progress). A rising rate under normal operation indicates a persistently slow/unreachable endpoint saturating the pool — check `GET /api/webhooks/{id}/deliveries` for the failing target. |
+| `yuzu_server_offload_delivery_success_total` | counter | Offload-target deliveries that completed with a 2xx response. |
+| `yuzu_server_offload_delivery_failed_total` | counter | Offload-target deliveries that failed (connection error, non-2xx, exception, or a tampered non-http(s) URL). |
+| `yuzu_server_offload_delivery_dropped_total` | counter | Offload-target deliveries dropped because the delivery worker pool's bounded queue was full, or the store was quiescing. |
+
 ## Fleet visualization metrics
 
 The fleet-visualization REST surface (PR 3 of feat/viz-engine ladder; see [REST API §Fleet Visualization](rest-api.md)) exposes the following metrics. Routes share one `FleetTopologyStore` cache; all metrics are process-global.
