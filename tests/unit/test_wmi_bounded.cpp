@@ -30,6 +30,7 @@
 using yuzu::shared::wmi::BoundedQueryOptions;
 using yuzu::shared::wmi::BoundedQueryResult;
 using yuzu::shared::wmi::WmiRow;
+using yuzu::shared::wmi::detail::clamp_call_timeout_ms;
 using yuzu::shared::wmi::exec_object_method;
 using yuzu::shared::wmi::run_bounded_wmi_query;
 
@@ -71,19 +72,62 @@ TEST_CASE("WmiRow supports the map operations callers rely on (row_get-style loo
 
 TEST_CASE("Bounded WMI error tokens are stable") {
     // Pins the documented contract (wmi_bounded.hpp's BoundedQueryResult::error
-    // comment) so a future edit to the literal strings in wmi_bounded.cpp is
+    // comment) so a future edit to the literal strings in wmi_bounded.hpp is
     // caught here rather than silently drifting for every downstream caller
     // that pattern-matches on these prefixes (e.g. licensing_win.cpp's
     // row_cap_exceeded / wmi plugin's error| passthrough).
     static const char* const kExpectedTokens[] = {
-        "com_init_failed",     "wbem_locator_failed", "wmi_connect_failed_",
-        "wmi_query_failed_",   "wmi_next_timeout",     "wmi_deadline_exceeded",
-        "wmi_next_failed_",
+        "com_init_failed",          "wbem_locator_failed",
+        "wmi_connect_failed_",      "wmi_proxy_blanket_failed_",
+        "wmi_query_failed_",        "wmi_next_timeout",
+        "wmi_deadline_exceeded",    "wmi_next_failed_",
+        "wmi_put_param_failed_",
     };
     for (const char* tok : kExpectedTokens) {
         REQUIRE(std::string(tok).size() > 0);
     }
-    REQUIRE(sizeof(kExpectedTokens) / sizeof(kExpectedTokens[0]) == 7);
+    REQUIRE(sizeof(kExpectedTokens) / sizeof(kExpectedTokens[0]) == 9);
+}
+
+TEST_CASE("clamp_call_timeout_ms bounds the per-call wait to what remains of the "
+          "overall deadline") {
+    // Regression pin for the deadline-clamp fix (gate-1 remediation): before
+    // the fix, run_bounded_wmi_query/exec_object_method passed
+    // opts.next_timeout_ms UNCLAMPED to Next()/GetResultObject() on every
+    // iteration, so a call begun with little budget left could still block
+    // for the full next_timeout_ms -- overrunning the documented
+    // whole-enumeration deadline by up to one full per-call timeout. This is
+    // pure arithmetic (no COM/live-provider dependency), so the exact
+    // boundary math is testable directly and deterministically rather than
+    // via a hard-to-reproduce live timing race.
+
+    // Plenty of budget left: the per-call wait is the requested timeout,
+    // untouched.
+    REQUIRE(clamp_call_timeout_ms(/*next_timeout_ms=*/10000,
+                                  /*enumeration_deadline_ms=*/60000,
+                                  /*elapsed_ms=*/0) == 10000);
+
+    // Less budget left than the requested per-call timeout: clamp to what
+    // remains -- this is the exact case the original bug got wrong (it would
+    // have returned the full 10000 here instead of 1000).
+    REQUIRE(clamp_call_timeout_ms(/*next_timeout_ms=*/10000,
+                                  /*enumeration_deadline_ms=*/60000,
+                                  /*elapsed_ms=*/59000) == 1000);
+
+    // Deadline already exceeded: no budget left, clamp to zero (an
+    // immediate, non-blocking poll) rather than a negative/wrapped value.
+    REQUIRE(clamp_call_timeout_ms(/*next_timeout_ms=*/10000,
+                                  /*enumeration_deadline_ms=*/60000,
+                                  /*elapsed_ms=*/60000) == 0);
+    REQUIRE(clamp_call_timeout_ms(/*next_timeout_ms=*/10000,
+                                  /*enumeration_deadline_ms=*/60000,
+                                  /*elapsed_ms=*/99999) == 0);
+
+    // Requested timeout smaller than the remaining budget: pass it through
+    // unchanged (no need to clamp when there's more than enough time left).
+    REQUIRE(clamp_call_timeout_ms(/*next_timeout_ms=*/500,
+                                  /*enumeration_deadline_ms=*/60000,
+                                  /*elapsed_ms=*/1000) == 500);
 }
 
 // ── Windows-gated compile/smoke: real calls, deterministic fast paths ──────
@@ -138,6 +182,42 @@ TEST_CASE("exec_object_method fails fast with an error on a nonexistent object p
                                            {}, opts);
     REQUIRE(result.error.has_value());
     REQUIRE(result.rows.empty());
+}
+
+TEST_CASE("exec_object_method succeeds against a safe, always-available instance method "
+          "(gate-1 remediation)") {
+    // Every prior exec_object_method test only exercised a failure path (the
+    // success path was introduced by this branch with zero test coverage --
+    // a real functional gap, not just a style nit). Win32_Process.GetOwner is
+    // read-only and side-effect-free; the test's OWN process is guaranteed to
+    // exist, so calling it against our own PID is a deterministic, safe way
+    // to exercise a real success round trip (input parameter isn't needed for
+    // GetOwner, but the out-parameter/ReturnValue extraction path is real).
+    BoundedQueryOptions opts;
+    opts.enumeration_deadline_ms = 5000;
+    const auto pid = GetCurrentProcessId();
+    const std::wstring object_path = L"Win32_Process.Handle=\"" + std::to_wstring(pid) + L"\"";
+    const auto result = exec_object_method(L"root\\cimv2", object_path, L"GetOwner", {}, opts);
+    REQUIRE_FALSE(result.error.has_value());
+    REQUIRE(result.rows.size() == 1);
+    REQUIRE(result.rows.front().find("User") != result.rows.front().end());
+}
+
+TEST_CASE("run_bounded_wmi_query sets truncated when row_cap is reached before "
+          "enumeration completes (gate-1 remediation)") {
+    // Win32_Process always has multiple running instances (at minimum this
+    // test's own process plus System), so row_cap=1 against it deterministically
+    // exercises the truncation path without depending on host-specific state
+    // beyond "more than one process is running" -- true on every real host.
+    BoundedQueryOptions opts;
+    opts.next_timeout_ms = 5000;
+    opts.row_cap = 1;
+    opts.enumeration_deadline_ms = 10000;
+    const auto result =
+        run_bounded_wmi_query(L"root\\cimv2", L"SELECT ProcessId FROM Win32_Process", opts);
+    REQUIRE_FALSE(result.error.has_value());
+    REQUIRE(result.truncated);
+    REQUIRE(result.rows.size() == 1);
 }
 
 #endif // _WIN32

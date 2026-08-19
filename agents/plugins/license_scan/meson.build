@@ -2,12 +2,13 @@
 # Per-OS translation units are #ifdef-gated internally (the tar-plugin
 # pattern): licensing_win.cpp compiles empty off Windows, licensing_linux.cpp
 # / licensing_macos.cpp likewise on their platforms. The bounded WMI
-# enumerator this plugin's slp_wmi surface uses now lives at
-# agents/shared/wmi_bounded.{hpp,cpp} — this plugin was its origin (roadmap
-# C-8) and compiles it in as its own source, like every other consumer.
+# enumerator this plugin's slp_wmi surface uses lives at the all-inline,
+# header-only agents/shared/wmi_bounded.hpp — this plugin was its origin
+# (roadmap C-8); it is #include-d, not compiled as a separate source, like
+# every other consumer (win_str.hpp / win_com.hpp pattern).
 license_scan_deps = [yuzu_sdk_dep, yuzu_agent_core_dep]
 if host_machine.system() == 'windows'
-  # wmi_bounded.cpp: bounded WMI enumerator — COM + WbemLocator.
+  # wmi_bounded.hpp (header-only): bounded WMI enumerator — COM + WbemLocator.
   # licensing_win.cpp: Reg*W registry probes + hive mounting (advapi32).
   license_scan_deps += [
     cxx.find_library('wbemuuid'),
@@ -25,7 +26,6 @@ shared_library(
     'src/licensing_win.cpp',
     'src/licensing_linux.cpp',
     'src/licensing_macos.cpp',
-    '../../shared/wmi_bounded.cpp',
   ),
   name_prefix: '',
   include_directories: include_directories('../../shared'),  # win_str.hpp (#1681, R17) + wmi_bounded.hpp / win_com.hpp
