@@ -485,7 +485,6 @@ GRANDFATHERED = {
     "agents/plugins/firewall/src/firewall_plugin.cpp",
     "agents/plugins/hardware/src/hardware_plugin.cpp",
     "agents/plugins/installed_apps/src/installed_apps_plugin.cpp",
-    "agents/plugins/interaction/src/interaction_plugin.cpp",
     "agents/plugins/ioc/src/ioc_plugin.cpp",
     "agents/plugins/license_scan/src/licensing_linux.cpp",
     "agents/plugins/msi_packages/src/msi_packages_plugin.cpp",
