@@ -107,17 +107,27 @@ So:
 Every incomplete teardown attempt emits, in order of reliability:
 
 1. An operator log line: `MCP bridge teardown incomplete [reason=<reason>
-   execution_id=<id>]: resource retained until shutdown`. The field is `reason`,
-   matching the metric label, so the same value greps both.
+   execution_id=<id>]: resource retained (retry-eligible on a later sweep)` on any
+   attempt still within `Config::teardown_retry_max`, or `... resource retained
+   until shutdown` once the budget is spent. The field is `reason`, matching the
+   metric label, so the same value greps both.
 2. `yuzu_mcp_bridge_teardown_incomplete_total{reason}` above.
 3. An audit row - `mcp.bridge.<claim-verb>` (`done_reap` / `pin_acked` / `session_dead` /
    `arming_reaped` / `forced_expire`) on the FIRST attempt, `mcp.bridge.teardown_retry` on
    every retry attempt - with `result=failure` and a `detail` naming what was retained.
 
-A retry that finally settles the record additionally emits, once:
+A retry that finally settles the record (mechanically - subscription, charge, and
+map entry all resolved) additionally emits, once:
 
 4. `yuzu_mcp_bridge_teardown_retry_total{outcome="recovered"}`, and a
-   `mcp.bridge.teardown_retry` row with `result=success`.
+   `mcp.bridge.teardown_retry` row whose `result` follows the terminal's fate, not
+   the retention strand's - `success` only if the terminal was delivered or none
+   was owed. A retry can recover the retention strand while replaying a terminal a
+   PRIOR attempt already poisoned or never built; that row still reads
+   `result=failure` (same `"recovered on a retry attempt"` detail) - see
+   `docs/user-manual/audit-log.md`'s `mcp.bridge.teardown_retry` row for the full
+   rule. Do not read `outcome="recovered"` alone as proof the client got its
+   result; check `result` too.
 
 A retry that exhausts `Config::teardown_retry_max` instead emits, once, in place of (4):
 

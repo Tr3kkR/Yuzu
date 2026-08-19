@@ -2500,15 +2500,24 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     // that swallow, and under the OOM this function exists for BOTH can fail - which
     // would leave a stranded record with no evidence of any kind. This log line is
     // the floor; it is itself contained because formatting allocates.
-    const auto log_incomplete = [&](const char* stage) noexcept {
+    const auto log_incomplete = [&](const char* stage, bool retry_eligible) noexcept {
         (void)contained([&] {
             // "reason=" matches the metric label so an operator can correlate the log
             // line with yuzu_mcp_bridge_teardown_incomplete_total{reason} directly.
             // It said "stage=" while the label was renamed, which meant grepping the
             // journal for the label value found nothing.
+            // #2513: "until shutdown" is only true once the retry budget is spent -
+            // on any earlier attempt the record is retry-eligible and typically
+            // resolves within a few sweep ticks, which is exactly the runbook's own
+            // "wait for the next few sweep ticks before treating this as an incident"
+            // guidance. This is the floor evidence under severe pressure (both the
+            // metric and the audit row can also be lost, per the comment above), so
+            // it must not overclaim permanence on the common, self-healing path.
             spdlog::error("MCP bridge teardown incomplete [reason={} execution_id={}]: "
-                          "resource retained until shutdown",
-                          stage, exec_id);
+                          "{}",
+                          stage, exec_id,
+                          retry_eligible ? "resource retained (retry-eligible on a later sweep)"
+                                         : "resource retained until shutdown");
         });
     };
 
@@ -2698,7 +2707,11 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // that bound is hit - by shutdown(). torn_down is NEVER cleared here:
         // re-entering this function is a fresh CALL, not a re-opened claim.
         count_teardown_incomplete(TeardownStage::kUnsubscribe);
-        log_incomplete(stage_name(TeardownStage::kUnsubscribe));
+        // Called ONCE per bail (it mutates retry state / counts the exhausted
+        // outcome), and its result is shared by the log line and the audit detail
+        // below rather than re-derived - re-calling it here would double-count.
+        const bool retry_eligible = mark_retry_or_exhausted();
+        log_incomplete(stage_name(TeardownStage::kUnsubscribe), retry_eligible);
         // The detail must not assert a delivery that did not happen. There are three
         // teardown_claimed call sites; the pin-ack / session-death / arming-reap one
         // passes kNone literally and publishes nothing, and the two pressure sites
@@ -2706,7 +2719,7 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // so "the terminal was published" is only true when the ladder actually
         // committed. The disposition below is derived, not assumed.
         audit_contained(audit_action, exec_id,
-                        mark_retry_or_exhausted()
+                        retry_eligible
                             ? "teardown incomplete: bus unsubscribe failed; the record, its "
                               "streamed charge and its bus subscription are all retained "
                               "(retry-eligible on a later sweep)"
@@ -2740,9 +2753,10 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     }
     if (!step3_ok) {
         count_teardown_incomplete(TeardownStage::kReleaseCharge);
-        log_incomplete(stage_name(TeardownStage::kReleaseCharge));
+        const bool retry_eligible = mark_retry_or_exhausted();
+        log_incomplete(stage_name(TeardownStage::kReleaseCharge), retry_eligible);
         audit_contained(audit_action, exec_id,
-                        mark_retry_or_exhausted()
+                        retry_eligible
                             ? "teardown incomplete: streamed charge release failed; the record "
                               "and its one per-session admission slot are both retained "
                               "(retry-eligible on a later sweep)"
@@ -2780,7 +2794,8 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // failure previously produced no audit evidence at all, which is the same
         // "no row" gap this work closes for the sibling step.
         count_teardown_incomplete(TeardownStage::kErase);
-        log_incomplete(stage_name(TeardownStage::kErase));
+        const bool retry_eligible = mark_retry_or_exhausted();
+        log_incomplete(stage_name(TeardownStage::kErase), retry_eligible);
         // No charge_released branch needed here (#2513): step 3 now bails on its
         // own failure instead of falling through, so reaching this point means
         // the subscription and the streamed charge were BOTH already settled -
@@ -2788,7 +2803,7 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // bail site, so a teardown that poisoned the session and then failed to
         // erase still evidences the poisoning, not just the mechanical failure.
         audit_contained(audit_action, exec_id,
-                        mark_retry_or_exhausted()
+                        retry_eligible
                             ? "teardown incomplete: record erase failed; the subscription and "
                               "the streamed charge were settled, the record is retained "
                               "(retry-eligible on a later sweep)"
