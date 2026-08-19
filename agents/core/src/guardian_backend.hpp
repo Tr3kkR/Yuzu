@@ -10,7 +10,6 @@
 /// "prefer_spark=false; detection backend = legacy IGuard" regardless of the
 /// actual prefer_spark_ value, because no accessor existed to query it).
 
-#include <string>
 #include <utility> // std::unreachable (C++23; precedented in this codebase, mcp_server.cpp)
 
 #include <yuzu/agent/guardian_engine.hpp> // GuardianEngine::SparkAvailability
@@ -61,7 +60,9 @@ enum class GuardianBackend { Legacy, Spark, Unwired, SparkFailed };
 inline constexpr char kGuardianBackendTag[] = "yuzu.guardian_backend";
 
 /// Always emitted (not sparse) - a categorical value with no "zero" state, unlike
-/// the sparse counter families elsewhere in this file group.
+/// the sparse counter families elsewhere in this file group. `TagMap` is any map
+/// with a string `operator[]` - the protobuf status_tags map in production,
+/// std::map in tests.
 template <typename TagMap>
 void emit_guardian_backend_heartbeat_tag(TagMap& tags, bool prefer_spark,
                                          GuardianEngine::SparkAvailability availability) {

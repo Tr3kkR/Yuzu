@@ -1251,7 +1251,11 @@ bool GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule)
             // PRIOR push (a different type, or pre-dating this reconcile op) must not
             // keep silently enforcing in place of the terminal state.
         if (spark_runtime_)
-            spark_runtime_->detach_rule(rule.rule_id()); // defensive; never attached here
+            spark_runtime_->detach_rule(rule.rule_id()); // detach whatever was attached - a
+                // no-op if this rule was never armed via spark, LOAD-BEARING (not merely
+                // defensive) if it was: an Arm-to-Unsupported transition (a mechanism going
+                // inert, or a rule's spark type edited) reaches this call still attached
+                // (happy-path finding, F7/#2298 governance)
         if (const auto type = spark_type_from_token(rule.spark().type())) {
             // classify() only reaches Unsupported for a RECOGNIZED token, so this is
             // always Some - belt-and-braces, not a real gap.

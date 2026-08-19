@@ -139,9 +139,18 @@ state then. Keeping the fallthrough means implementing the same outcome twice, a
 teaching the parity suite, the telemetry, and the operator model two behaviours.
 
 Verified safe to change now:
-- **Enforcement behaviour is identical.** The legacy File/Registry guards already return
-  false from `start()` off-Windows: a silent no-op, no `guards_` entry. Nothing enforces
-  either way. What changes is reporting, from silence to an explicit state.
+- **Enforcement behaviour is identical for the File/Registry case.** The legacy
+  File/Registry guards already return false from `start()` off-Windows: a silent
+  no-op, no `guards_` entry. Nothing enforces either way. What changes is reporting,
+  from silence to an explicit state. This is scoped to File/Registry, not a blanket
+  guarantee across every mechanism: the Service guard's legacy path (`guard_systemd.cpp`)
+  opens its own independent D-Bus connection, so a spark-side registration failure or
+  registered-but-inert mechanism (a containerised host with no systemd bus, per
+  `guaranteed-state.md`'s own worked example) can in principle diverge from legacy's
+  outcome on that one mechanism - see `reconcile_rule_locked`'s own comment on the
+  `Unsupported` branch (enterprise-readiness governance finding, F7/#2298; empirically,
+  the one documented inert case shows no delta - legacy fails identically there too -
+  but the guarantee is narrower than this bullet's original wording implied).
 - **Nothing server-side breaks.** The Guardian status surface is still mock/placeholder
   (§Health/status surface), so no server code validates status tokens yet. This is the
   cheapest moment to introduce one; rung 4 owns its wiring.

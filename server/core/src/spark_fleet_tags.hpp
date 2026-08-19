@@ -40,6 +40,7 @@
 
 #include <charconv>
 #include <cstddef>
+#include <iterator> // std::size
 #include <optional>
 #include <string>
 #include <string_view>
@@ -136,6 +137,28 @@ inline constexpr const char* kSparkMetricUnsupported = "unsupported";
 inline constexpr const char* kSparkMetricTokens[] = {
     kSparkMetricWatchRejected, kSparkMetricQuarantined, kSparkMetricSlowOp,
     kSparkMetricUnsupported};
+
+/// Named indices into kSparkMetricTokens (and therefore into agent_registry.cpp's
+/// spark_mech_metric_keys[mechanism][metric], which is built in this exact order).
+/// F7 governance finding (consistency-auditor C1 / architect): the reader loop used
+/// to index kSparkMetricTokens by bare literal (0/1/2/3) bound to its order only by
+/// a comment - a future reorder or mid-array insertion would still compile, the
+/// name-keyed WRITER side would still succeed, and the reader would silently
+/// misattribute one health signal's fleet sum into another gauge family (e.g.
+/// quarantined counted as watch_rejected), corrupting the family backing the
+/// CRITICAL YuzuSparkMechanismQuarantined alert. These constants + the static_asserts
+/// below make that a compile error instead.
+inline constexpr std::size_t kSparkMetricIdxWatchRejected = 0;
+inline constexpr std::size_t kSparkMetricIdxQuarantined = 1;
+inline constexpr std::size_t kSparkMetricIdxSlowOp = 2;
+inline constexpr std::size_t kSparkMetricIdxUnsupported = 3;
+static_assert(kSparkMetricTokens[kSparkMetricIdxWatchRejected] == kSparkMetricWatchRejected);
+static_assert(kSparkMetricTokens[kSparkMetricIdxQuarantined] == kSparkMetricQuarantined);
+static_assert(kSparkMetricTokens[kSparkMetricIdxSlowOp] == kSparkMetricSlowOp);
+static_assert(kSparkMetricTokens[kSparkMetricIdxUnsupported] == kSparkMetricUnsupported);
+static_assert(std::size(kSparkMetricTokens) == 4,
+              "a 5th metric token needs its own named index + static_assert above, "
+              "and a new read line in agent_registry.cpp's recompute_metrics loop");
 
 /// Compose a per-mechanism-type heartbeat key. MUST match the agent's own
 /// composition byte-for-byte (see the header note above).

@@ -368,6 +368,30 @@ TEST_CASE("full_sync retaining a still-unsupported rule stays idempotent",
     CHECK(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
 }
 
+// Governance finding (quality-engineer, F7 #2298): the interaction between the new
+// Unsupported branch and the pre-existing policy_generation hold-on-failure logic
+// (apply_rules only advances policy_generation_ when reconcile_failures == 0) was
+// previously asserted only in a code comment, never at runtime. An Unsupported
+// classification returns false WITHOUT throwing, so it must never increment
+// reconcile_failures and must never block generation advancement - holding the
+// generation on an all-Unsupported push (e.g. every rule on macOS) would make that
+// agent re-push forever.
+TEST_CASE("an all-unsupported push still advances policy_generation, never holds it",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f;
+    REQUIRE(f.engine->policy_generation() == 0);
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(5);
+    *p.add_rules() = make_file_rule("r1"); // unsupported: no mechanism in this fixture
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString());
+    REQUIRE(dr.exit_code == 0);
+
+    CHECK(f.engine->unsupported_counts_by_type().at(SparkType::File) == 1);
+    CHECK(f.engine->policy_generation() == 5); // advanced, not held
+}
+
 TEST_CASE("a production-order restart reconstructs unsupported_rules_ from cached KV",
           "[spark][guardian][reconcile][boot]") {
     // Mirrors "PRODUCTION boot order: wire_spark_engine before start_local" below -

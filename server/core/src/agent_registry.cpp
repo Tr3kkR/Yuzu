@@ -1959,25 +1959,33 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
             if (auto v = parse_spark_count(get_view(kKeySparkConsumerErrors)))
                 spark_consumer_errors_os[net_os] += *v;
             // Per-mechanism-type health counters. Keys are the precomputed
-            // loop-invariants (perf-S1); index 0/1/2/3 = watch_rejected / quarantined /
-            // slow_op / unsupported (kSparkMetricTokens order). The first three back
-            // the fleet alerts and are agent-side CUMULATIVE counters (only grow until
-            // agent restart), so their fleet sum can only grow too. unsupported (F7,
-            // #2298 rung 2) is a CURRENT gauge instead - GuardianEngine reports a live
-            // snapshot each heartbeat, not a running total, so its fleet sum can
-            // genuinely decrease. set_mech_gauge below (.set(), never delta-
-            // accumulated across sweeps) is identical for all four either way; the
-            // distinction is purely in what the agent-reported VALUE means, not in how
-            // the server publishes it.
+            // loop-invariants (perf-S1), read by the NAMED indices in
+            // spark_fleet_tags.hpp (kSparkMetricIdx*), each pinned to its
+            // kSparkMetricTokens slot by a static_assert there - a future reorder
+            // or insertion fails to compile here rather than silently misattributing
+            // one health signal's fleet sum into another gauge family (governance
+            // finding, F7/#2298: consistency-auditor C1 / architect). The first
+            // three back the fleet alerts and are agent-side CUMULATIVE counters
+            // (only grow until agent restart), so their fleet sum can only grow
+            // too. unsupported (F7, #2298 rung 2) is a CURRENT gauge instead -
+            // GuardianEngine reports a live snapshot each heartbeat, not a running
+            // total, so its fleet sum can genuinely decrease. set_mech_gauge below
+            // (.set(), never delta-accumulated across sweeps) is identical for all
+            // four either way; the distinction is purely in what the agent-reported
+            // VALUE means, not in how the server publishes it.
             for (std::size_t mi = 0; mi < kNMech; ++mi) {
                 const char* mech = kSparkMechTokens[mi];
-                if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][0])))
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxWatchRejected])))
                     spark_watch_rejected_om[net_os][mech] += *v;
-                if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][1])))
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxQuarantined])))
                     spark_quarantined_om[net_os][mech] += *v;
-                if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][2])))
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxSlowOp])))
                     spark_slow_op_om[net_os][mech] += *v;
-                if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][3])))
+                if (auto v = parse_spark_count(
+                        get_view(spark_mech_metric_keys[mi][kSparkMetricIdxUnsupported])))
                     spark_unsupported_om[net_os][mech] += *v;
             }
         } else if (spark_state == SparkRunState::NotRunning) {

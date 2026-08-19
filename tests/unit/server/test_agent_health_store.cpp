@@ -922,8 +922,13 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_spark_unsupported sums across agent
           std::string::npos);
 
     // CURRENT gauge, not cumulative: a2 dropping to 0 must bring the fleet sum down to
-    // exactly a1's contribution, never stay latched at the old total.
-    beat("a2", {{"yuzu.spark_file_unsupported", "0"}});
+    // exactly a1's contribution, never stay latched at the old total. Governance
+    // finding (consistency-auditor C2, F7/#2298): production's sparse-emit contract
+    // OMITS the key at zero-count (guardian_unsupported_heartbeat.hpp), it never
+    // sends an explicit "0" - so this drives the shrink the same way, via an empty
+    // kv (upsert() REPLACES the whole per-agent tag snapshot, never merges), rather
+    // than an explicit "0" tag production never actually emits.
+    beat("a2", {});
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     out = metrics.serialize();
     CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"file\"} ") == 1.0);
@@ -938,6 +943,46 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_spark_unsupported sums across agent
     out = metrics.serialize();
     CHECK(out.find("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"file\"}") ==
           std::string::npos);
+}
+
+// Governance finding (consistency-auditor C1 / architect, F7 #2298): the reader loop
+// in agent_registry.cpp used to index kSparkMetricTokens by bare literal (0/1/2/3),
+// bound to its declared order only by a comment. A future reorder would still
+// compile (the writer composes keys by NAME) but silently misattribute one health
+// signal's fleet sum into another gauge family - e.g. quarantined counts reported
+// under watch_rejected, corrupting the family backing the CRITICAL
+// YuzuSparkMechanismQuarantined alert. Fixed with named indices + static_asserts in
+// spark_fleet_tags.hpp; this test is the regression proof - all four metrics set to
+// DISTINCT non-zero values on one mechanism, each asserted to land in its own gauge,
+// none of the others.
+TEST_CASE("REAL AgentHealthStore: the four per-mechanism spark metrics never "
+          "cross-attribute",
+          "[spark][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> tags;
+    tags["yuzu.os"] = "linux";
+    tags["yuzu.spark_running"] = "1";
+    tags["yuzu.spark_mechs"] = "service";
+    tags["yuzu.spark_service_watch_rejected"] = "11";
+    tags["yuzu.spark_service_quarantined"] = "22";
+    tags["yuzu.spark_service_slow_op"] = "33";
+    tags["yuzu.spark_service_unsupported"] = "44";
+    store.upsert("a1", tags);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    auto val = [&](const std::string& series) -> double {
+        const auto pos = out.find(series);
+        REQUIRE(pos != std::string::npos);
+        return std::stod(out.substr(pos + series.size()));
+    };
+    CHECK(val("yuzu_fleet_spark_watch_rejected{os=\"linux\",mechanism=\"service\"} ") == 11.0);
+    CHECK(val("yuzu_fleet_spark_quarantined{os=\"linux\",mechanism=\"service\"} ") == 22.0);
+    CHECK(val("yuzu_fleet_spark_slow_op{os=\"linux\",mechanism=\"service\"} ") == 33.0);
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"service\"} ") == 44.0);
 }
 
 // ── Guardian durable lifecycle-journal fleet rollup (#2298 gate 3) ────────────

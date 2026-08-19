@@ -21,6 +21,9 @@
 /// simulating a 2 -> 1 -> 0 sequence needs a FRESH map per call (production always
 /// constructs a fresh heartbeat tag map per cycle; the same map reused across calls
 /// would keep a key this function never re-wrote).
+///
+/// `TagMap` is any map with a string `operator[]` - the protobuf status_tags map in
+/// production, std::map in tests.
 
 #include <cstdint>
 #include <map>
