@@ -1,6 +1,6 @@
 // test_wmi_bounded.cpp -- unit coverage for the shared bounded WMI helper
-// (agents/shared/wmi_bounded.{hpp,cpp}), hoisted from license_scan's
-// licensing_wmi.{hpp,cpp} (roadmap C-8).
+// (agents/shared/wmi_bounded.hpp, all-inline/header-only), hoisted from
+// license_scan's licensing_wmi.{hpp,cpp} (roadmap C-8).
 //
 // Windows-only: the helper is #ifdef _WIN32 end to end (COM/WMI has no
 // cross-platform equivalent). On other platforms this compiles to an empty

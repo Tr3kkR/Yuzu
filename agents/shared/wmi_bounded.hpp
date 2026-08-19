@@ -21,8 +21,7 @@
 // Windows-only by construction (#ifdef _WIN32); the header is empty
 // elsewhere.
 
-#ifndef YUZU_SHARED_WMI_BOUNDED_HPP
-#define YUZU_SHARED_WMI_BOUNDED_HPP
+#pragma once
 
 #ifdef _WIN32
 
@@ -395,5 +394,3 @@ inline BoundedQueryResult exec_object_method(const std::wstring& wmi_namespace,
 } // namespace yuzu::shared::wmi
 
 #endif // _WIN32
-
-#endif // YUZU_SHARED_WMI_BOUNDED_HPP
