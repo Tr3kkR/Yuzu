@@ -314,6 +314,8 @@ TEST_CASE("tar parse_ts_param: epoch, datetime-local, and rejection", "[tar][tre
     CHECK(parse_ts_param("2026-06-18T12:00:30xyz") == 1781784030); // trailing junk ignored
     CHECK(parse_ts_param("2026-06-18 12:00:00") == 0);           // space instead of 'T' rejected
     CHECK(parse_ts_param("2026-06-18T12-00") == 0);              // wrong time delimiter rejected
+    CHECK(parse_ts_param("2026-+6-+18T+12:+00:+30") == 1781784030); // %d-style sign acceptance
+    CHECK(parse_ts_param("2026-06-18T12:00:30.123") == 1781784030); // fractional suffix ignored
 }
 
 TEST_CASE("tar anchors: non-positive ts cannot poison observed_since", "[tar][tree][anchor]") {

@@ -34,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib> // std::strtol — timestamp/event-field parsing (no scanf family)
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -127,20 +128,21 @@ int64_t ymd_hms_to_epoch(int y, int mo, int d, int h, int mi, int s) {
 // breaks older-glibc hosts, so no scanf family): skip leading whitespace (as %d
 // does, uncounted against the width), then let strtol consume the longest valid
 // prefix of the next `width` characters (sign included, as scanf counts it).
-// Advances `p` past the consumed characters and returns true on success.
-bool scan_int(const char*& p, int width, int& out) {
+// Advances `p` past the consumed characters; nullopt = no conversion.
+std::optional<int> scan_int(const char*& p, int width) {
     while (std::isspace(static_cast<unsigned char>(*p)))
         ++p;
-    char buf[8]{}; // widths here are 2 or 4
+    char buf[8]{};
+    if (width <= 0 || width > 7) // callers pass 2 or 4; guard the buffer bound
+        return std::nullopt;
     for (int i = 0; i < width && p[i]; ++i)
         buf[i] = p[i];
     char* end{};
     const long v = std::strtol(buf, &end, 10);
     if (end == buf)
-        return false;
+        return std::nullopt;
     p += end - buf;
-    out = static_cast<int>(v); // width <= 4 → |v| <= 9999, cast exact
-    return true;
+    return static_cast<int>(v); // width <= 4 → |v| <= 9999, cast exact
 }
 
 // Parse a flexible timestamp starting at `pos`: "YYYY-MM-DD[T| ]HH:MM:SS" or the
@@ -150,30 +152,35 @@ bool scan_int(const char*& p, int width, int& out) {
 // Preserved quirks: a format ' ' matches ZERO or more whitespace (each %d also
 // skips leading whitespace), and 'T' only follows a '-' date.
 int64_t parse_flexible_ts(const std::string& s, std::size_t pos = 0) {
-    int y = 0, mo = 0, d = 0, h = 0, mi = 0, se = 0;
     const char* p = s.c_str() + pos;
-    if (!scan_int(p, 4, y))
+    const auto y = scan_int(p, 4);
+    if (!y)
         return 0;
     const char sep = *p;
     if (sep != '-' && sep != '/')
         return 0;
     ++p;
-    if (!scan_int(p, 2, mo) || *p != sep)
+    const auto mo = scan_int(p, 2);
+    if (!mo || *p != sep)
         return 0;
     ++p;
-    if (!scan_int(p, 2, d))
+    const auto d = scan_int(p, 2);
+    if (!d)
         return 0;
     if (sep == '-' && *p == 'T')
         ++p;
-    if (!scan_int(p, 2, h) || *p != ':')
+    const auto h = scan_int(p, 2);
+    if (!h || *p != ':')
         return 0;
     ++p;
-    if (!scan_int(p, 2, mi) || *p != ':')
+    const auto mi = scan_int(p, 2);
+    if (!mi || *p != ':')
         return 0;
     ++p;
-    if (!scan_int(p, 2, se))
+    const auto se = scan_int(p, 2);
+    if (!se)
         return 0;
-    return ymd_hms_to_epoch(y, mo, d, h, mi, se);
+    return ymd_hms_to_epoch(*y, *mo, *d, *h, *mi, *se);
 }
 
 // Decode the kernel's octal escapes in /proc/mounts and /etc/fstab fields

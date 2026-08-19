@@ -456,7 +456,7 @@ std::int64_t parse_ts_param(const std::string& s) {
     // makes an absurdly long year a defined reject rather than scanf UB.
     const char* p = s.c_str();
     long f[5]{};
-    constexpr char delim[4] = {'-', '-', 'T', ':'};
+    constexpr char kDelim[4] = {'-', '-', 'T', ':'};
     for (int i = 0; i < 5; ++i) {
         char* end{};
         f[i] = std::strtol(p, &end, 10);
@@ -464,7 +464,7 @@ std::int64_t parse_ts_param(const std::string& s) {
             return 0;
         p = end;
         if (i < 4) {
-            if (*p != delim[i])
+            if (*p != kDelim[i])
                 return 0;
             ++p;
         }

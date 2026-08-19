@@ -137,6 +137,48 @@ TEST_CASE("mapdrive parse_win_security_logons: 4624 type-3 kept, others filtered
     CHECK(out[1].ts == 0); // separator-consistency rejection, without dropping the row
 }
 
+// The flexible-timestamp parser replaced sscanf ("%4d-%2d-%2dT%2d:%2d:%2d" and
+// siblings) for glibc __isoc23_* compatibility; these cases pin the scanf quirks
+// the rewrite must preserve (width caps, sign-in-width, zero-or-more format
+// whitespace, unparseable-field filtering).
+TEST_CASE("mapdrive timestamp/field parsing: scanf quirk pins", "[tar][mapdrive][parse]") {
+    const std::string text =
+        "Event[0]:\n"
+        "  Date: 2026-07-01T10:20:301\n" // three-digit seconds: %2d width cap binds → 30
+        "  Event ID: 4624\n"
+        "Logon Type:\t\t3\n"
+        "New Logon:\n"
+        "\tAccount Name:\t\talice\n"
+        "\tSource Network Address:\t192.168.1.50\n"
+        "Event[1]:\n"
+        "  Date: 2026-+7-01T10:20:30\n" // signed month within width: accepted as 7
+        "  Event ID: 4624\n"
+        "Logon Type:\t\t3\n"
+        "New Logon:\n"
+        "\tAccount Name:\t\tbob\n"
+        "\tSource Network Address:\t192.168.1.51\n"
+        "Event[2]:\n"
+        "  Date: 2026-07-01T10:20:30\n"
+        "  Event ID: 4624\n"
+        "Logon Type:\t\tbad\n" // unparseable logon type keeps -1 → filtered
+        "New Logon:\n"
+        "\tAccount Name:\t\tcarol\n"
+        "\tSource Network Address:\t192.168.1.52\n";
+    auto out = parse_win_security_logons(text);
+    REQUIRE(out.size() == 2);
+    CHECK(out[0].ts == 1782901230); // width-capped seconds (2026-07-01T10:20:30 UTC)
+    CHECK(out[1].ts == 1782901230); // signed month
+    const std::string samba =
+        "[2026/07/01   10:20:30,  3] hdr\n" // multiple format-space whitespace
+        "  s1 (ipv4:10.0.0.1:445) connect to service s1 initially as user u1\n"
+        "[2026/07/0110:20:30,  3] hdr\n" // ZERO format-space whitespace (accepted quirk)
+        "  s2 (ipv4:10.0.0.2:445) connect to service s2 initially as user u2\n";
+    auto sout = parse_samba_logs(samba);
+    REQUIRE(sout.size() == 2);
+    CHECK(sout[0].ts == 1782901230);
+    CHECK(sout[1].ts == 1782901230);
+}
+
 // ── Samba logs / journalctl (Linux inbound historic) ──────────────────────────
 
 TEST_CASE("mapdrive parse_samba_logs: connect events from both log shapes",
