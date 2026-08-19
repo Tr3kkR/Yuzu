@@ -574,10 +574,13 @@ void check_ip_addresses(yuzu::CommandContext& ctx, const std::vector<std::string
         for (const auto& conn : conns) {
             if (conn.remote_addr == ip || conn.local_addr == ip) {
                 found = true;
+                // conn.state is empty for UDP (connectionless — no fabricated "LISTEN");
+                // drop the " - " separator rather than render a bare trailing dash.
+                std::string state_suffix = conn.state.empty() ? std::string{} : " - " + conn.state;
                 if (conn.pid > 0) {
-                    detail = std::format("Active connection - {} (pid {})", conn.state, conn.pid);
+                    detail = std::format("Active connection{} (pid {})", state_suffix, conn.pid);
                 } else {
-                    detail = std::format("Active connection - {}", conn.state);
+                    detail = std::format("Active connection{}", state_suffix);
                 }
                 break;
             }
@@ -701,13 +704,22 @@ void check_ports(yuzu::CommandContext& ctx, const std::vector<std::string>& port
         std::string detail;
 
         for (const auto& conn : conns) {
+            // UDP rows carry an empty state (never a fabricated "LISTEN" — see
+            // get_connections()/walk_sockets()): UDP is connectionless, so a row's mere
+            // presence here already means a process is bound to that local port, the same
+            // fact "LISTEN" records for TCP. Treat empty state as a match for that reason,
+            // not as a wildcard — every other state string (TIME_WAIT, CLOSE_WAIT, ...)
+            // still correctly fails to match.
             if (conn.local_port == target_port &&
-                (iequals(conn.state, "LISTEN") || iequals(conn.state, "ESTABLISHED"))) {
+                (conn.state.empty() || iequals(conn.state, "LISTEN") ||
+                 iequals(conn.state, "ESTABLISHED"))) {
                 found = true;
                 if (conn.pid > 0) {
                     detail = std::format("Listening (pid {})", conn.pid);
-                } else {
+                } else if (!conn.state.empty()) {
                     detail = std::format("{} on {}", conn.state, conn.local_addr);
+                } else {
+                    detail = std::format("Bound on {}", conn.local_addr);
                 }
                 break;
             }
