@@ -88,7 +88,20 @@ TEST_CASE("firewall macOS 'state' acquires through the real bounded-subprocess c
 
     CHECK(result.rc == 0);
     CHECK(result.captured.find("backend|appfirewall") != std::string::npos);
-    CHECK(result.captured.find("state|") != std::string::npos);
+    // "backend|appfirewall" is written unconditionally regardless of whether
+    // socketfilterfw actually ran, so it alone cannot discriminate a broken
+    // acquisition call from a working one -- a false-green risk an external
+    // adversarial review flagged. socketfilterfw --getglobalstate is an
+    // UNPRIVILEGED read (do_state_macos's own comment), so on any real macOS
+    // host this must resolve to a definite enabled/disabled, never fall back
+    // to "unknown": requiring the specific value here is what makes this
+    // assertion fail if the argv/deadline/parsing wiring silently breaks,
+    // where a presence-only check on "state|" would still pass.
+    CHECK((result.captured.find("state|enabled") != std::string::npos ||
+          result.captured.find("state|disabled") != std::string::npos));
+    // pf (read via pfctl) DOES require root, so pf|unknown is the correct,
+    // expected value on an unprivileged run -- presence-only here is
+    // intentional, not the same gap as the state check above.
     CHECK(result.captured.find("pf|") != std::string::npos);
     CHECK(result.captured.find("error|") == std::string::npos);
 }

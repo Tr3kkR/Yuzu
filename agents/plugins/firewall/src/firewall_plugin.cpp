@@ -228,11 +228,24 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
         if (FAILED(qhr) || !rule)
             continue;
 
-        BSTR name_bstr = nullptr;
-        rule->get_Name(&name_bstr);
-        std::wstring name_w = name_bstr ? name_bstr : L"";
-        if (name_bstr)
-            SysFreeString(name_bstr);
+        // RAII over the raw BSTR out-param: the shared win_com.hpp BStr type
+        // only constructs by ALLOCATING a new BSTR, so it can't adopt one
+        // already returned by a COM out-param without an ambiguous overload
+        // (BSTR is literally wchar_t*). A manual SysFreeString here would
+        // leak on any exception thrown between receipt and free (e.g.
+        // std::wstring's allocation) -- unconditional release in the
+        // destructor closes that gap.
+        struct RuleNameBstr {
+            BSTR b = nullptr;
+            ~RuleNameBstr() {
+                if (b)
+                    SysFreeString(b);
+            }
+            RuleNameBstr(const RuleNameBstr&) = delete;
+            RuleNameBstr& operator=(const RuleNameBstr&) = delete;
+        } name_bstr;
+        rule->get_Name(&name_bstr.b);
+        std::wstring name_w = name_bstr.b ? name_bstr.b : L"";
 
         VARIANT_BOOL enabled = VARIANT_FALSE;
         rule->get_Enabled(&enabled);
@@ -319,6 +332,9 @@ struct BusGuard {
         if (bus)
             sd_bus_flush_close_unref(bus);
     }
+    BusGuard() = default;
+    BusGuard(const BusGuard&) = delete;
+    BusGuard& operator=(const BusGuard&) = delete;
 };
 struct SdBusErrorGuard {
     sd_bus_error err = SD_BUS_ERROR_NULL;
@@ -499,6 +515,13 @@ bool try_ufw_state(yuzu::CommandContext& ctx) {
                                       SubprocessOptions{.deadline = kAcqDeadline});
     if (!res.tool_ran)
         return false; // ufw not installed at this path -> try the next backend
+    // Mirrors try_iptables_state's exit-code check, but ufw is NOT the last
+    // backend before "none" (iptables still follows), so a failed read (e.g.
+    // permission denied) falls through to the next backend rather than
+    // stopping the probe here and reporting unknown -- an unprivileged host
+    // that can read iptables but not ufw must still get a real answer.
+    if (res.exit_code != 0)
+        return false;
     ctx.write_output("backend|ufw");
     auto state = yuzu::firewall::parse_ufw_status(res.output);
     ctx.write_output(std::format(
@@ -512,6 +535,10 @@ bool try_ufw_rules(yuzu::CommandContext& ctx) {
     auto res = run_bounded_subprocess({"/usr/sbin/ufw", "status", "numbered"},
                                       SubprocessOptions{.deadline = kAcqDeadline});
     if (!res.tool_ran)
+        return false;
+    // Same fallthrough-not-stop rationale as try_ufw_state: a permission-
+    // denied read must not report zero rules as if ufw genuinely had none.
+    if (res.exit_code != 0)
         return false;
     ctx.write_output("backend|ufw");
     for (const auto& r : yuzu::firewall::parse_ufw_rules(res.output)) {
