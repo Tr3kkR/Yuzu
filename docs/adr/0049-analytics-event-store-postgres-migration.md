@@ -175,8 +175,9 @@ would be redundant — no second replica ever reaches that SELECT concurrently.
 
 The playbook's default: "a Postgres store that cannot open is a fatal startup error," applied
 uniformly to `OfflineEndpointStore`/`PreflightRunStore`/`DeploymentRunStore`/etc. This store
-diverges: **on a migration/open failure, `server.cpp` logs and disables the feature for the run
-(`analytics_store_.reset()`) rather than setting `startup_failed_`.** Reasoning:
+diverges: **on a migration/open failure, `server.cpp` logs and leaves the feature degraded for the
+run — the store stays constructed and wired with `is_open() == false` — rather than setting
+`startup_failed_`.** Reasoning:
 
 - `--no-analytics` defaults **off** (analytics collection is on by default) — so this is not a
   low-blast-radius opt-in feature where "just don't turn it on" is the escape hatch; most
@@ -201,6 +202,25 @@ rotation on a non-critical table's hiccup, exactly contradicting the paragraph a
 comment that used to sit on that row). Fixed: the row now lives in a separate `notices` list that
 surfaces in the `/readyz` body (`"degraded":["analytics_event_store"]`) but never contributes to
 the gating `failed_stores` list or the response's HTTP status.
+
+**Correction (independent Codex/Sol + Fable architect review, 2026-08-19):** the first cut of this
+divergence DID `.reset()` the store object on a failed open, which turned out to be a regression
+against the SQLite predecessor rather than a neutral design choice — checked against the
+predecessor's construction code at branch point `a661cb06a`, which constructs the object
+unconditionally when enabled and only gates sink registration/`start_drain()` on `is_open()`,
+never dropping the object itself. The `.reset()` collapsed two materially different states into
+one nullptr: "disabled by `--no-analytics`" and "enabled but failed to open." That broke the
+degrade-distinguishable-reads claim earlier in this ADR at exactly the seam meant to prevent it —
+`/api/analytics/status` and `/api/analytics/recent` both key off `if (analytics_store_)`, so a
+construction failure rendered identically to intentional disablement, and the four analytics
+Prometheus metric families were only `describe()`/pre-seeded inside the successful-open branch, so
+they never existed at all on a failed open — absence-based alerting couldn't tell "off" from
+"broken" either. Fixed: the object is no longer reset on a failed open (every method already
+internally fail-softs on `is_open()` — `emit()` counts `store_not_open` and returns; reads return
+`nullopt` — so keeping it alive costs nothing and was the only piece missing), and metrics
+registration is unconditional rather than gated on a successful open. `/readyz`'s notices-row logic
+(`analytics_store_ && analytics_store_->is_open()`) was already written to expect a possibly-
+not-open-but-non-null object and needed no change.
 
 **This is the one point in this migration that isn't a straight port of an existing pattern —
 flagged here explicitly for confirmation, per the kickoff doc's governance checkpoint.**

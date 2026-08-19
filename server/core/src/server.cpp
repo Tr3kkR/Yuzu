@@ -4384,70 +4384,90 @@ public:
         // playbook's default "every Postgres store construction failure is
         // fatal" template (ADR-0049): `--no-analytics` defaults OFF (this
         // feature is on by default), but every call site in this codebase
-        // already treats `analytics_store_` as optional (`if
+        // already treats `analytics_store_` as optional-to-USE (`if
         // (analytics_store_) { ... }`, ~15 sites) — nothing downstream is
         // load-bearing on it existing. A migration hiccup on this expendable-
         // telemetry table taking down auth/RBAC/every other store would
         // contradict the store's own fail-soft-everywhere posture, so a
-        // construction failure here logs and leaves the feature disabled
-        // rather than setting startup_failed_. Flagged for confirmation at
-        // the ADR-0049 governance checkpoint — this is the one point in this
-        // migration that isn't a straight port of an existing pattern.
+        // construction failure here logs and leaves the feature degraded
+        // rather than setting startup_failed_.
+        //
+        // The object ITSELF is kept alive on a failed open — this matches
+        // the SQLite predecessor (which never dropped the object either) and
+        // is load-bearing for correctness, not just parity: every method on
+        // AnalyticsEventStore already internally guards on `is_open()` and
+        // fail-softs (emit() counts `store_not_open` and returns; reads
+        // return nullopt), so an early `.reset()` here was the ONE thing
+        // that broke that seam — it collapsed "disabled by --no-analytics"
+        // and "enabled but failed to open" into the same nullptr, which
+        // (a) made the two indistinguishable at the API (`/api/analytics/
+        // status|recent` both key off `if (analytics_store_)`) and (b) never
+        // registered the four analytics metric families at all on a failed
+        // open, so absence-based alerting couldn't tell "off" from "broken"
+        // either — contradicting this same store's "fail-soft means the
+        // caller continues, never that the failure is invisible" posture.
+        // (Fable/architect review, 2026-08-19, cross-checked against the
+        // dev tip predecessor at branch point a661cb06a: dev's construction
+        // never reset the object either, it only gated sinks/start_drain()
+        // on is_open() — this restores that contract, not a new one.)
         if (cfg_.analytics_enabled && pg_pool_ && !startup_failed_) {
             analytics_store_ = std::make_unique<AnalyticsEventStore>(
                 *pg_pool_, cfg_.analytics_drain_interval_seconds, cfg_.analytics_batch_size);
+            analytics_store_->set_metrics(&metrics_);
+            // Bounded-label counters (ADR-0049) — described + pre-seeded
+            // per docs/observability-conventions.md's pre-seed-to-0 rule
+            // (adversarial review finding, 2026-08-14) so the family +
+            // HELP/TYPE are present REGARDLESS of open success (Fable
+            // review, 2026-08-19 — a failed open must still report
+            // `store_not_open` via these families, not go dark) and
+            // absent() alerts stay meaningful, matching the
+            // yuzu_server_mgmt_group_read_degrade_total /
+            // yuzu_server_discovery_read_degrade_total precedent above.
+            metrics_.describe("yuzu_server_analytics_emit_dropped_total",
+                              "AnalyticsEventStore::emit() drops (fail-soft ingest, ADR-0049) "
+                              "by reason (store_not_open/pool_acquire_timeout/query_error/"
+                              "serialize_error) — never a silent swallow",
+                              "counter");
+            for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error",
+                                      "serialize_error"})
+                metrics_.counter("yuzu_server_analytics_emit_dropped_total",
+                                 {{"reason", reason}});
+            metrics_.describe("yuzu_server_analytics_read_degrade_total",
+                              "AnalyticsEventStore query_recent/pending_count reads that "
+                              "returned a degrade (nullopt) rather than a result, by method "
+                              "and reason (store_not_open/pool_acquire_timeout/query_error)",
+                              "counter");
+            for (const auto method : {"query_recent", "pending_count"})
+                for (const auto reason :
+                    {"store_not_open", "pool_acquire_timeout", "query_error"})
+                    metrics_.counter("yuzu_server_analytics_read_degrade_total",
+                                     {{"method", method}, {"reason", reason}});
+            // Drain-thread liveness (governance Gate 3 sre finding,
+            // 2026-08-16, #2037-class): the drain loop now catches every
+            // exception at the thread boundary instead of letting it
+            // std::terminate() the whole server — these two are how an
+            // operator tells "healthy but idle" from "silently dead"
+            // (mirrors yuzu_server_audit_cleanup_failed_total /
+            // yuzu_server_audit_retention_last_pass_unixtime).
+            metrics_.describe("yuzu_server_analytics_drain_pass_failed_total",
+                              "Analytics drain passes that threw an exception at the thread "
+                              "boundary and were abandoned (retried at the next interval)",
+                              "counter");
+            metrics_.counter("yuzu_server_analytics_drain_pass_failed_total");
+            metrics_.describe("yuzu_server_analytics_drain_last_pass_unixtime",
+                              "Wall-clock reading stamped at the start of every drain pass "
+                              "attempt, success or failure. Flat means the drain thread is not "
+                              "running — the one condition drain_pass_failed_total cannot "
+                              "report (a wedged/exited thread never gets to increment it)",
+                              "gauge");
+            metrics_.gauge("yuzu_server_analytics_drain_last_pass_unixtime").set(0);
             if (!analytics_store_->is_open()) {
                 spdlog::error("[PG] analytics-event store migration/open failed — analytics "
-                              "collection disabled for this run (database reachable but the "
-                              "analytics_event_store schema could not be created/opened)");
-                analytics_store_.reset();
+                              "collection degraded for this run (database reachable but the "
+                              "analytics_event_store schema could not be created/opened); "
+                              "the store stays wired so callers observe a degraded read/drop "
+                              "count rather than a silent 'disabled' state");
             } else {
-                analytics_store_->set_metrics(&metrics_);
-                // Bounded-label counters (ADR-0049) — described + pre-seeded
-                // per docs/observability-conventions.md's pre-seed-to-0 rule
-                // (adversarial review finding, 2026-08-14) so the family +
-                // HELP/TYPE are present on a healthy server and absent()
-                // alerts stay meaningful, matching the
-                // yuzu_server_mgmt_group_read_degrade_total /
-                // yuzu_server_discovery_read_degrade_total precedent above.
-                metrics_.describe("yuzu_server_analytics_emit_dropped_total",
-                                  "AnalyticsEventStore::emit() drops (fail-soft ingest, ADR-0049) "
-                                  "by reason (store_not_open/pool_acquire_timeout/query_error/"
-                                  "serialize_error) — never a silent swallow",
-                                  "counter");
-                for (const auto reason : {"store_not_open", "pool_acquire_timeout", "query_error",
-                                          "serialize_error"})
-                    metrics_.counter("yuzu_server_analytics_emit_dropped_total",
-                                     {{"reason", reason}});
-                metrics_.describe("yuzu_server_analytics_read_degrade_total",
-                                  "AnalyticsEventStore query_recent/pending_count reads that "
-                                  "returned a degrade (nullopt) rather than a result, by method "
-                                  "and reason (store_not_open/pool_acquire_timeout/query_error)",
-                                  "counter");
-                for (const auto method : {"query_recent", "pending_count"})
-                    for (const auto reason :
-                        {"store_not_open", "pool_acquire_timeout", "query_error"})
-                        metrics_.counter("yuzu_server_analytics_read_degrade_total",
-                                         {{"method", method}, {"reason", reason}});
-                // Drain-thread liveness (governance Gate 3 sre finding,
-                // 2026-08-16, #2037-class): the drain loop now catches every
-                // exception at the thread boundary instead of letting it
-                // std::terminate() the whole server — these two are how an
-                // operator tells "healthy but idle" from "silently dead"
-                // (mirrors yuzu_server_audit_cleanup_failed_total /
-                // yuzu_server_audit_retention_last_pass_unixtime).
-                metrics_.describe("yuzu_server_analytics_drain_pass_failed_total",
-                                  "Analytics drain passes that threw an exception at the thread "
-                                  "boundary and were abandoned (retried at the next interval)",
-                                  "counter");
-                metrics_.counter("yuzu_server_analytics_drain_pass_failed_total");
-                metrics_.describe("yuzu_server_analytics_drain_last_pass_unixtime",
-                                  "Wall-clock reading stamped at the start of every drain pass "
-                                  "attempt, success or failure. Flat means the drain thread is not "
-                                  "running — the one condition drain_pass_failed_total cannot "
-                                  "report (a wedged/exited thread never gets to increment it)",
-                                  "gauge");
-                metrics_.gauge("yuzu_server_analytics_drain_last_pass_unixtime").set(0);
                 // info, not warn: this branch runs on EVERY successful open,
                 // i.e. every restart forever, not just the actual cutover
                 // boot (adversarial review finding, 2026-08-14) — a warn
@@ -7528,6 +7548,24 @@ public:
         // pending needs its own pooling/draining story, #3279) rather than
         // this PR's fix surface. Both readings are in #3279 verbatim -
         // deferred to Dave to adjudicate, not resolved by this comment.
+        //
+        // SCOPE NOTE (Fable/architect + Codex/Sol cross-review, ADR-0049,
+        // 2026-08-19): the same forward_gateway_pending() ->
+        // process_gateway_response() path also reaches response_store_,
+        // notification_store_, and (new to this migration) analytics_store_
+        // directly - not through fire_event(), but via their own plain
+        // (non-atomic) pointers inside that function body - with the exact
+        // same lack of synchronization against this stop()'s teardown. Named
+        // here because this comment previously enumerated only
+        // webhook_store_/offload_target_store_ and undercounted #3279's
+        // actual reach; the fix (join/drain forward_gateway_pending()'s
+        // workers before any store it can touch is unwired/destroyed) is
+        // the same fix for all of them, not a per-pointer patch, and
+        // analytics_store_ is not a NEW risk class introduced by this PR -
+        // it was already live-and-wired on this exact path before this
+        // migration (the SQLite predecessor was never nulled-then-reset
+        // proactively in stop() either, it just dangled less visibly).
+        // #3279 should be updated to name the full reach set.
         //
         // On timeout: escalate via std::_Exit, the SAME choice web_thread_
         // makes a few hundred lines up, and for the identical reason - NOT

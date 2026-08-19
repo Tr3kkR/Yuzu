@@ -9,12 +9,22 @@
 /// Posture (ADR-0012 §1 / ADR-0049): CONSTRUCTION is a DELIBERATE DIVERGENCE
 /// from the playbook's fatal-on-migration-failure default — unlike every
 /// other Postgres-backed store, a migration/open failure here leaves
-/// `is_open()` false rather than failing server startup: `server.cpp` logs
-/// and disables the feature for the run (`analytics_store_.reset()`) instead
-/// of setting `startup_failed_`, because every caller already null-guards
-/// this store and analytics defaults ON, so gating boot on this one
-/// non-critical table would contradict its own fail-soft posture. See
-/// ADR-0049 §"Construction posture" for the full argument. The store is
+/// `is_open()` false rather than failing server startup, because every
+/// caller already null-guards/degrade-guards this store and analytics
+/// defaults ON, so gating boot on this one non-critical table would
+/// contradict its own fail-soft posture. See ADR-0049 §"Construction
+/// posture" for the full argument. Unlike an EARLIER version of this store's
+/// wiring, `server.cpp` does NOT `.reset()` the object on a failed open — it
+/// stays constructed, wired to every consumer, with `is_open() == false`
+/// (this matches the SQLite predecessor's own construction behavior, which
+/// also never dropped the object on a failed open). This is load-bearing,
+/// not cosmetic: every method here already internally fail-softs on
+/// `is_open()` (`emit()` counts a `store_not_open` drop and returns; reads
+/// return `nullopt`), so keeping the object alive is what lets a caller —
+/// and the `/api/analytics/*` routes, and the four Prometheus metric
+/// families — distinguish "disabled by `--no-analytics`" (object never
+/// constructed) from "enabled but degraded" (constructed, `is_open() ==
+/// false`) instead of collapsing both into the same nullptr. The store is
 /// simply not constructed at all when `--no-analytics`
 /// (`cfg_.analytics_enabled = false`) is passed. RUNTIME ingest is
 /// fail-SOFT (`emit()` never blocks or throws into the calling request path —
