@@ -5,14 +5,18 @@ if host_machine.system() == 'windows'
   device_identity_deps += cxx.find_library('netapi32')
   device_identity_deps += cxx.find_library('secur32')
 elif host_machine.system() == 'linux'
-  # Wave 3 (#2380/ADR-3002 promotion): do_domain's AD-join check calls
+  # Wave 3 (#2380/ADR-3002 promotion): do_domain's AD-join check tries
   # sssd's InfoPipe (org.freedesktop.sssd.infopipe ListDomains) over sd-bus
-  # instead of shelling out to `realm list`. Reuses the SAME systemd_guard
-  # tri-state feature option agent-core already defines (agents/core/meson.build)
-  # — never a second option — and mirrors its enabled/auto/disabled +
-  # YUZU_HAVE_LIBSYSTEMD compile-gate shape so an sd-bus-less build still
-  # compiles (falls straight through to the existing sssd.conf ifstream
-  # fallback at runtime).
+  # first (rung 1, zero processes) instead of unconditionally shelling out to
+  # `realm list`. Reuses the SAME systemd_guard tri-state feature option
+  # agent-core already defines (agents/core/meson.build) — never a second
+  # option — and mirrors its enabled/auto/disabled + YUZU_HAVE_LIBSYSTEMD
+  # compile-gate shape so an sd-bus-less build still compiles (falls through
+  # to the bounded `realm list` runner call -- do_ou's existing, already-
+  # unprivileged call site to the same binary -- then to the sssd.conf
+  # ifstream read at runtime; see BR-011 in the fixup commit for why `realm
+  # list` had to come back as an intermediate fallback rather than going
+  # straight to the file read).
   libsystemd_dep = dependency('libsystemd', required: get_option('systemd_guard'),
                               include_type: 'system')
   if libsystemd_dep.found()

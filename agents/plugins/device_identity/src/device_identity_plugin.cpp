@@ -58,7 +58,10 @@ namespace {
 
 // ── Linux: bounded sd-bus InfoPipe ListDomains (do_domain's AD-join check) ──
 // Wave 3 (#2380/ADR-3002 promotion): rung 1 -- a single bounded D-Bus call to
-// sssd's InfoPipe instead of shelling out to `realm list`. Call shape
+// sssd's InfoPipe, tried before falling back to `realm list` (do_ou's
+// already-unprivileged call site to the same binary; see do_domain()'s
+// Linux leg and BR-011) rather than unconditionally shelling out to it. Call
+// shape
 // mirrors agents/core/src/guardian_state_reader.cpp's read_service_blocking()
 // exactly: sd_bus_open_system(), then sd_bus_set_method_call_timeout(bus,
 // budget) BEFORE the call (this function makes only ONE sd-bus call, so no
@@ -84,12 +87,19 @@ std::optional<std::vector<std::string>> sssd_list_domains_via_sdbus() {
     int r = sd_bus_open_system(&bus);
     if (r < 0 || bus == nullptr)
         return std::nullopt;
+    // BR-012 (found in /adversarial-review, Codex): raw-pointer owners MUST
+    // delete copy construction/assignment -- a copy of any of these would
+    // double-release the underlying sd-bus object (matches
+    // guardian_state_reader.cpp's BusGuard/SdBusErrorGuard/SdBusMessageGuard,
+    // which already do this).
     struct BusGuard {
         sd_bus* b;
         ~BusGuard() {
             if (b)
                 sd_bus_flush_close_unref(b);
         }
+        BusGuard(const BusGuard&) = delete;
+        BusGuard& operator=(const BusGuard&) = delete;
     } bus_guard{bus};
 
     sd_bus_set_method_call_timeout(bus, kSdBusBudgetUs);
@@ -98,6 +108,8 @@ std::optional<std::vector<std::string>> sssd_list_domains_via_sdbus() {
     struct ErrGuard {
         sd_bus_error* e;
         ~ErrGuard() { sd_bus_error_free(e); }
+        ErrGuard(const ErrGuard&) = delete;
+        ErrGuard& operator=(const ErrGuard&) = delete;
     } err_guard{&err};
     sd_bus_message* reply = nullptr;
     r = sd_bus_call_method(bus, kSssdInfoPipeDest, kSssdInfoPipePath, kSssdInfoPipeIface,
@@ -108,6 +120,8 @@ std::optional<std::vector<std::string>> sssd_list_domains_via_sdbus() {
             if (m)
                 sd_bus_message_unref(m);
         }
+        MsgGuard(const MsgGuard&) = delete;
+        MsgGuard& operator=(const MsgGuard&) = delete;
     } msg_guard{reply};
     if (r < 0 || !reply)
         return std::nullopt;
