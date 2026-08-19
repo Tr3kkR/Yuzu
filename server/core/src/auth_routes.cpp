@@ -1432,13 +1432,18 @@ bool AuthRoutes::deny_service_scoped_service_tag_mutation(const httplib::Request
     res.status = 403;
     res.set_content(
         detail::a4_denial(res, 403,
-                          std::string(authz::kServiceTagMutationDeniedMessage)),
+                          authz::kServiceTagMutationDeniedMessage),
         "application/json");
     try {
-        // Gate 4/#3289 hardening round: target_type="Tag" matches the REST
-        // v1 twin's convention for this identical logical event (a denied
-        // tag mutation) — not "Agent", which mismatched both REST's and this
-        // file's own pre-existing tag.set/tag.delete audit rows.
+        // Gate 4/#3289 hardening round: target_type="Tag" matches REST v1's
+        // convention for this identical logical event (a denied tag
+        // mutation) — not "Agent", which matched neither REST's nor any
+        // other surface's convention. This does NOT resolve the separate,
+        // pre-existing mismatch against server.cpp's own tag.set/tag.delete
+        // success/failure rows, which use lowercase "tag" — this caller
+        // (server.cpp, via the legacy dashboard routes) is a DIFFERENT file
+        // from where this comment lives; see the routed-concern row for the
+        // tracked residual.
         audit_log(req, action, "denied", "Tag", agent_id + ":" + key,
                  "service-scoped token blocked: cannot mutate the service tag (path=" +
                      req.path + ")");

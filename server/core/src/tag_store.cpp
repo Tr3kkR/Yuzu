@@ -387,7 +387,7 @@ TagStore::sync_agent_tags(const std::string& agent_id,
             // tracked as a follow-up); this at least makes "how often is this
             // firing fleet-wide" answerable without grepping logs.
             if (metrics_)
-                metrics_->counter("yuzu_tag_store_agent_service_purge_total").increment();
+                metrics_->counter("yuzu_server_tag_store_agent_service_purge_total").increment();
             continue;
         }
         keys.push_back(key);

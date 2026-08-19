@@ -3659,7 +3659,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     "service-scoped token blocked: cannot mutate the service tag");
                 res.set_content(
                     a4_error(kPermissionDenied,
-                            std::string(authz::kServiceTagMutationDeniedMessage)),
+                            authz::kServiceTagMutationDeniedMessage),
                     "application/json");
                 return true;
             };

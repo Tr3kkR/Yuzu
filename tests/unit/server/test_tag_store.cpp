@@ -361,13 +361,13 @@ TEST_CASE("TagStore: sync_agent_tags bumps a purge counter when it drops an "
     store.set_metrics(&registry);
 
     require_ok(store.sync_agent_tags("agent-1", {{"os.version", "11.0"}})); // no service key
-    CHECK(registry.counter("yuzu_tag_store_agent_service_purge_total").value() == 0.0);
+    CHECK(registry.counter("yuzu_server_tag_store_agent_service_purge_total").value() == 0.0);
 
     require_ok(store.sync_agent_tags("agent-1", {{"service", "printers"}, {"hostname", "WS-1"}}));
-    CHECK(registry.counter("yuzu_tag_store_agent_service_purge_total").value() == 1.0);
+    CHECK(registry.counter("yuzu_server_tag_store_agent_service_purge_total").value() == 1.0);
 
     require_ok(store.sync_agent_tags("agent-2", {{"service", "vending"}}));
-    CHECK(registry.counter("yuzu_tag_store_agent_service_purge_total").value() == 2.0);
+    CHECK(registry.counter("yuzu_server_tag_store_agent_service_purge_total").value() == 2.0);
 }
 
 TEST_CASE("TagStore: sync_agent_tags with ONLY a service key is a clean "
