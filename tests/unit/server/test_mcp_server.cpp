@@ -11317,6 +11317,63 @@ TEST_CASE("MCP 2444: item 1 schema tightenings reject at compile-validate on the
     }
 }
 
+// Gate 3 quality-engineer (2026-08-19): item 2's ~30 plain `minLength:1`
+// additions had coverage only for the 5 tools item 1 also pattern-tightened
+// (above) plus execute_bundle's steps. The remaining ~27 fields had zero
+// direct empty-string-rejection assertion — the schema compiler's own tests
+// prove keyword LOGIC works, not that these specific served schemas still
+// CARRY the keyword. Data-driven, one field per distinct tool family, so a
+// silent future removal of any minLength:1 in this set fails here rather
+// than going undetected.
+TEST_CASE("MCP 2444: item 2 minLength:1 sweep — one field per tool family rejects empty "
+          "string on the REAL served schema",
+          "[mcp][2g][schema]") {
+    using yuzu::server::mcp::compile_input_schema;
+    std::map<std::string, std::string> schemas;
+    for (const auto& row : input_schemas_for_test())
+        schemas.emplace(row.name, row.schema_json);
+
+    struct Case {
+        const char* tool;
+        const char* field;
+        const char* other_required; // raw JSON fragment, no leading comma; "" if none
+    };
+    static const Case kCases[] = {
+        {"set_tag", "agent_id", R"("key":"k","value":"v")"},
+        {"delete_tag", "key", R"("agent_id":"a")"},
+        {"approve_request", "approval_id", ""},
+        {"reject_request", "approval_id", ""},
+        {"validate_scope", "expression", ""},
+        {"preview_scope_targets", "expression", ""},
+        {"get_agent_details", "agent_id", ""},
+        {"create_engine_principal", "display_name",
+         R"("principal_id":"engine:v","owner_username":"o","justification":"j","classification":"internal")"},
+        {"rotate_api_token", "token_id", ""},
+        {"confirm_api_token_rotation", "token_id", ""},
+        {"transfer_engine_principal_owner", "new_owner", R"("principal_id":"engine:v")"},
+        {"unassign_engine_role", "role", R"("principal_id":"vuln")"},
+        {"classify_operational_question", "question", ""},
+        {"open_access_review", "title", ""},
+        {"get_access_review", "campaign_id", ""},
+        {"close_access_review", "campaign_id", ""},
+        {"record_attestation", "campaign_id",
+         R"("principal_type":"user","principal_id":"p","role_name":"r","decision":"attested")"},
+    };
+    for (const auto& c : kCases) {
+        INFO("tool: " << c.tool << " field: " << c.field);
+        REQUIRE(schemas.count(c.tool) > 0);
+        auto compiled = compile_input_schema(schemas.at(c.tool));
+        REQUIRE(compiled);
+        std::string body = "{\"" + std::string(c.field) + "\":\"\"";
+        if (*c.other_required != '\0')
+            body += std::string(",") + c.other_required;
+        body += "}";
+        auto violation = compiled->validate(nlohmann::json::parse(body));
+        REQUIRE(violation); // empty string must violate minLength:1
+        CHECK(violation->path == "/" + std::string(c.field));
+    }
+}
+
 TEST_CASE("MCP 2405: real gated schemas enforce enum, bounds and maxLength at the gate",
           "[mcp][integration][approval][schema]") {
     // The pure-compiler test proves the keyword LOGIC on synthetic schemas;
