@@ -2833,9 +2833,9 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     {
         std::lock_guard<std::mutex> rlk(rec->mu);
         attempts = rec->teardown_attempts;
-        if (attempts > 1) {
-            count_teardown_retry(TeardownRetryOutcome::kRecovered);
-        }
+    }
+    if (attempts > 1) {
+        count_teardown_retry(TeardownRetryOutcome::kRecovered);
     }
     // kNone contributes no disposition at all, so a clean pin-ack / session-death
     // reap still emits a byte-identical empty-detail row on a FIRST attempt; a
