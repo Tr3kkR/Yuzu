@@ -241,6 +241,12 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
                 if (b)
                     SysFreeString(b);
             }
+            // A user-declared (even deleted) copy constructor suppresses
+            // the implicitly-declared default constructor entirely --
+            // without this, `} name_bstr;` below fails to compile.
+            // Confirmed with a standalone repro (see BusGuard's identical
+            // comment further down this file).
+            RuleNameBstr() = default;
             RuleNameBstr(const RuleNameBstr&) = delete;
             RuleNameBstr& operator=(const RuleNameBstr&) = delete;
         } name_bstr;
@@ -339,6 +345,13 @@ struct BusGuard {
 struct SdBusErrorGuard {
     sd_bus_error err = SD_BUS_ERROR_NULL;
     ~SdBusErrorGuard() { sd_bus_error_free(&err); }
+    // A user-declared (even deleted) copy constructor suppresses the
+    // implicitly-declared default constructor entirely -- without this,
+    // `SdBusErrorGuard err;` below fails to compile ("no default
+    // constructor"), not merely "uses the deleted one". Confirmed with a
+    // standalone repro on this Mac (Linux-only code, never actually
+    // compiled anywhere else in this branch's history).
+    SdBusErrorGuard() = default;
     SdBusErrorGuard(const SdBusErrorGuard&) = delete;
     SdBusErrorGuard& operator=(const SdBusErrorGuard&) = delete;
 };
@@ -348,6 +361,7 @@ struct SdBusMessageGuard {
         if (m)
             sd_bus_message_unref(m);
     }
+    SdBusMessageGuard() = default;
     SdBusMessageGuard(const SdBusMessageGuard&) = delete;
     SdBusMessageGuard& operator=(const SdBusMessageGuard&) = delete;
 };
@@ -452,13 +466,31 @@ FirewalldQueryResult query_firewalld(bool want_rules) {
         if (sd_bus_call_method(bus.bus, kFirewalldDest, kFirewalldPath, kFirewalldZoneIface,
                                "getServices", &svc_err.err, &svc_reply.m, "s",
                                zone.name.c_str()) >= 0) {
-            char** strv = nullptr;
-            if (sd_bus_message_read_strv(svc_reply.m, &strv) >= 0 && strv) {
-                for (char** p = strv; *p; ++p)
+            // RAII over the raw strv: a manual free() after
+            // zone.services.emplace_back() (which can throw std::bad_alloc)
+            // leaks the array and its remaining strings on exception --
+            // the same shape as the BSTR leak fixed elsewhere in this file.
+            // Unconditional release in the destructor closes that gap.
+            struct StrvGuard {
+                char** v = nullptr;
+                ~StrvGuard() {
+                    if (v) {
+                        for (char** p = v; *p; ++p)
+                            free(*p);
+                        free(v);
+                    }
+                }
+                // A user-declared (even deleted) copy constructor
+                // suppresses the implicitly-declared default constructor
+                // entirely -- without this, `} strv;` below fails to
+                // compile. Confirmed with a standalone repro.
+                StrvGuard() = default;
+                StrvGuard(const StrvGuard&) = delete;
+                StrvGuard& operator=(const StrvGuard&) = delete;
+            } strv;
+            if (sd_bus_message_read_strv(svc_reply.m, &strv.v) >= 0 && strv.v) {
+                for (char** p = strv.v; *p; ++p)
                     zone.services.emplace_back(*p);
-                for (char** p = strv; *p; ++p)
-                    free(*p);
-                free(strv);
             }
         }
     }
