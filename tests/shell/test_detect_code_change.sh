@@ -253,6 +253,22 @@ if [ -f "$workflow" ]; then
     'diff_mode=--git-diff-merge-base '
   expect_caller true  "ci.yml still uses two-dot for the push arm" \
     'diff_mode=--git-diff '
+  # #3270: a bare workspace-wide glob also hashes whatever the vcpkg restore
+  # step above has already unpacked, so the ccache key stops being a function of
+  # our sources alone and the namespace splits. Scoped roots only.
+  expect_caller false "canary ccache key does not use a workspace-wide glob" \
+    "key: ccache-canary-x64-linux-\\\$\\{\\{ hashFiles\\('\\*\\*/"
+  expect_caller true  "canary ccache key is scoped to our own source roots" \
+    "key: ccache-canary-x64-linux-.*hashFiles\\('agents/"
+  # #3269: a cancelled run must not write a thin ccache entry that later
+  # same-source runs exact-hit and then decline to replace.
+  expect_caller true  "canary ccache save is gated on the Build step outcome" \
+    'steps\.build-canary\.outcome'
+  # Assert the DECLARATION too, not just the use: delete the id and both
+  # outcome comparisons silently evaluate empty, the `if:` is false forever,
+  # and the ccache save stops happening at all with nothing to show for it.
+  expect_caller true  "canary Build step still declares the id the gate reads" \
+    'id: build-canary'
 else
   printf '  [skip] ci.yml not found (running outside the repo)\n'
 fi
