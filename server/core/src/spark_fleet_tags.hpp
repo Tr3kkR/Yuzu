@@ -113,16 +113,29 @@ inline constexpr const char* kSparkMechService = "service";
 inline constexpr const char* kSparkMechTokens[] = {kSparkMechFile, kSparkMechRegistry,
                                                    kSparkMechService};
 
-// Per-type metric suffixes — the SparkMechanismStats health counters surfaced per
-// type (the three that back the fleet alerts). `retiring`/`retiring_cap` is a
-// Windows-file IOCP teardown-backpressure internal (0 without arming churn) — it is
-// summed at engine level in SparkEngineStats but its per-{os,mechanism} fleet
-// rollup is deferred to rung 2, when arming makes it non-zero.
+// Per-type metric suffixes. The first three are SparkMechanismStats health
+// counters surfaced per type (the ones that back the fleet alerts). `retiring`/
+// `retiring_cap` is a Windows-file IOCP teardown-backpressure internal (0 without
+// arming churn) - it is summed at engine level in SparkEngineStats but its
+// per-{os,mechanism} fleet rollup is deferred to rung 2, when arming makes it
+// non-zero.
 inline constexpr const char* kSparkMetricWatchRejected = "watch_rejected";
 inline constexpr const char* kSparkMetricQuarantined = "quarantined";
 inline constexpr const char* kSparkMetricSlowOp = "slow_op";
+/// F7 (#2298 rung 2): NOT a SparkMechanismStats counter like its three siblings above
+/// - its data source is GuardianEngine::unsupported_counts_by_type(), a per-rule
+/// classification outcome, not a SparkEngine mechanism-health stat. Composed into the
+/// SAME per-{mechanism} key family regardless (design doc places it in the
+/// yuzu_fleet_spark_* Prometheus family) - verified safe this session: every
+/// consumer of kSparkMetricTokens (the array-size-driven key-composition loop in
+/// agent_registry.cpp, and test_spark_fleet_tags.cpp's reader-keys bind, which only
+/// asserts emitted-keys-are-recognised, never the reverse) is agnostic to which
+/// stats struct backs a given token. A CURRENT gauge, not cumulative, unlike its
+/// three siblings - see guardian_unsupported_heartbeat.hpp.
+inline constexpr const char* kSparkMetricUnsupported = "unsupported";
 inline constexpr const char* kSparkMetricTokens[] = {
-    kSparkMetricWatchRejected, kSparkMetricQuarantined, kSparkMetricSlowOp};
+    kSparkMetricWatchRejected, kSparkMetricQuarantined, kSparkMetricSlowOp,
+    kSparkMetricUnsupported};
 
 /// Compose a per-mechanism-type heartbeat key. MUST match the agent's own
 /// composition byte-for-byte (see the header note above).

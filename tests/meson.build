@@ -203,6 +203,8 @@ agent_test_exe = executable(
     'unit/test_guardian_lifecycle_journal.cpp',
     'unit/test_guardian_journal_heartbeat.cpp',
     'unit/test_guardian_health_heartbeat.cpp',
+    'unit/test_guardian_backend_heartbeat.cpp',
+    'unit/test_guardian_unsupported_heartbeat.cpp',
     'unit/test_guard_registry.cpp',
     'unit/test_guard_file.cpp',
     'unit/test_guard_service.cpp',

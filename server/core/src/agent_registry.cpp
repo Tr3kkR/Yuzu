@@ -1612,6 +1612,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.clear_gauge_family("yuzu_fleet_spark_watch_rejected");
     metrics.clear_gauge_family("yuzu_fleet_spark_quarantined");
     metrics.clear_gauge_family("yuzu_fleet_spark_slow_op");
+    metrics.clear_gauge_family("yuzu_fleet_spark_unsupported"); // F7, #2298 rung 2
     // Guardian durable lifecycle-journal telemetry (#2298 gate 3). Same rule, and it
     // bites hardest here: the writer is sparse (a 0 counter ships no tag), so on a
     // healthy or inert fleet NOBODY reports and every family must be ABSENT. A
@@ -1683,9 +1684,9 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     std::unordered_map<std::string, double> spark_armed_faulted_os, spark_watch_faults_os,
         spark_queued_dropped_os, spark_consumer_errors_os;
     std::unordered_map<std::string, std::unordered_map<std::string, double>> spark_watch_rejected_om,
-        spark_quarantined_om, spark_slow_op_om;
+        spark_quarantined_om, spark_slow_op_om, spark_unsupported_om;
     // Per-{mechanism,metric} spark tag keys are loop-invariant across agents AND
-    // cycles — build the 3×3 once, not per agent per 15s sweep (gov perf-S1). Indexed
+    // cycles — build the 3×4 once, not per agent per 15s sweep (gov perf-S1). Indexed
     // [mechanism][metric] in kSparkMechTokens / kSparkMetricTokens order. Function-
     // static: recompute_metrics is single-threaded, and static-local init is
     // thread-safe regardless.
@@ -1957,9 +1958,17 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                 spark_queued_dropped_os[net_os] += *v;
             if (auto v = parse_spark_count(get_view(kKeySparkConsumerErrors)))
                 spark_consumer_errors_os[net_os] += *v;
-            // Per-mechanism-type health counters (the three that back the alerts).
-            // Keys are the precomputed loop-invariants (perf-S1); index 0/1/2 =
-            // watch_rejected / quarantined / slow_op (kSparkMetricTokens order).
+            // Per-mechanism-type health counters. Keys are the precomputed
+            // loop-invariants (perf-S1); index 0/1/2/3 = watch_rejected / quarantined /
+            // slow_op / unsupported (kSparkMetricTokens order). The first three back
+            // the fleet alerts and are agent-side CUMULATIVE counters (only grow until
+            // agent restart), so their fleet sum can only grow too. unsupported (F7,
+            // #2298 rung 2) is a CURRENT gauge instead - GuardianEngine reports a live
+            // snapshot each heartbeat, not a running total, so its fleet sum can
+            // genuinely decrease. set_mech_gauge below (.set(), never delta-
+            // accumulated across sweeps) is identical for all four either way; the
+            // distinction is purely in what the agent-reported VALUE means, not in how
+            // the server publishes it.
             for (std::size_t mi = 0; mi < kNMech; ++mi) {
                 const char* mech = kSparkMechTokens[mi];
                 if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][0])))
@@ -1968,6 +1977,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
                     spark_quarantined_om[net_os][mech] += *v;
                 if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][2])))
                     spark_slow_op_om[net_os][mech] += *v;
+                if (auto v = parse_spark_count(get_view(spark_mech_metric_keys[mi][3])))
+                    spark_unsupported_om[net_os][mech] += *v;
             }
         } else if (spark_state == SparkRunState::NotRunning) {
             // running == "0" — the agent IS rung-1+ and is NOT running spark. Split the
@@ -2181,6 +2192,7 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     set_mech_gauge("yuzu_fleet_spark_watch_rejected", spark_watch_rejected_om);
     set_mech_gauge("yuzu_fleet_spark_quarantined", spark_quarantined_om);
     set_mech_gauge("yuzu_fleet_spark_slow_op", spark_slow_op_om);
+    set_mech_gauge("yuzu_fleet_spark_unsupported", spark_unsupported_om); // F7, #2298 rung 2
 
     // Guardian journal rollup (#2298 gate 3). Families were cleared at the top, so a
     // signal NOBODY reported this cycle stays ABSENT - never a fabricated 0. On a

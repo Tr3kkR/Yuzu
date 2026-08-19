@@ -879,6 +879,67 @@ TEST_CASE("REAL AgentHealthStore: a garbage spark_disabled value pages on neithe
     CHECK(out.find("yuzu_fleet_spark_disabled{os=\"windows\"}") == std::string::npos);
 }
 
+// F7 (#2298 rung 2): the yuzu_fleet_spark_unsupported gauge, driven through the REAL
+// shipped AgentHealthStore (not the TestAgentHealthStore reproduction above), so this
+// case would fail if the 4th-token parse/accumulate/publish were deleted from
+// agent_registry.cpp - the exact coverage gap this file's header warns a mirror-based
+// case cannot catch.
+TEST_CASE("REAL AgentHealthStore: yuzu_fleet_spark_unsupported sums across agents and "
+          "goes absent after staleness",
+          "[spark][rollup][real]") {
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    auto beat = [&](const std::string& id,
+                    const std::vector<std::pair<std::string, std::string>>& kv) {
+        google::protobuf::Map<std::string, std::string> tags;
+        tags["yuzu.os"] = "linux";
+        tags["yuzu.spark_running"] = "1";
+        tags["yuzu.spark_mechs"] = "file,registry";
+        for (const auto& [k, v] : kv)
+            tags[k] = v;
+        store.upsert(id, tags);
+    };
+
+    // Two agents, both reporting File as unsupported - the fleet gauge is their SUM,
+    // not either one alone.
+    beat("a1", {{"yuzu.spark_file_unsupported", "1"}});
+    beat("a2", {{"yuzu.spark_file_unsupported", "2"}, {"yuzu.spark_registry_unsupported", "5"}});
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    std::string out = metrics.serialize();
+
+    auto val = [&](const std::string& series) -> double {
+        const auto pos = out.find(series);
+        REQUIRE(pos != std::string::npos);
+        return std::stod(out.substr(pos + series.size()));
+    };
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"file\"} ") == 3.0);
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"registry\"} ") == 5.0);
+    // A mechanism nobody reported must not be seeded at 0 (absent-not-zero, same
+    // convention as every other spark gauge in this file).
+    CHECK(out.find("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"service\"}") ==
+          std::string::npos);
+
+    // CURRENT gauge, not cumulative: a2 dropping to 0 must bring the fleet sum down to
+    // exactly a1's contribution, never stay latched at the old total.
+    beat("a2", {{"yuzu.spark_file_unsupported", "0"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"file\"} ") == 1.0);
+
+    // Staleness: an agent that stops reporting entirely (aged past the window) must
+    // vanish from the fleet sum, same absent-not-zero contract the other rollups here
+    // already have tests for. A short sleep first (matching this file's other
+    // staleness case) makes the strict "(now - last_seen) > staleness" comparison
+    // unambiguous rather than relying on sub-millisecond clock resolution alone.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    store.recompute_metrics(metrics, std::chrono::seconds{0}); // everything now "stale"
+    out = metrics.serialize();
+    CHECK(out.find("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"file\"}") ==
+          std::string::npos);
+}
+
 // ── Guardian durable lifecycle-journal fleet rollup (#2298 gate 3) ────────────
 //
 // Driven through the REAL AgentHealthStore, never the reproduction at the top of this
