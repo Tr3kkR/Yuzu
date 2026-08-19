@@ -201,10 +201,6 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
     int count = 0;
     bool truncated = false;
     for (;;) {
-        if (count >= 100) {
-            truncated = true;
-            break;
-        }
         VARIANT v;
         VariantInit(&v);
         ULONG fetched = 0;
@@ -215,6 +211,18 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
         hr = enum_var->Next(1, &v, &fetched);
         if (FAILED(hr) || fetched == 0) {
             VariantClear(&v);
+            break;
+        }
+        // The cap check happens AFTER a successful fetch, not before: at
+        // exactly 100 already-emitted rules, this proves a genuine 101st
+        // rule exists (Next() actually returned one) before declaring
+        // truncation — checking `count >= 100` up front (the original
+        // shape) set truncated|true on a host with EXACTLY 100 rules,
+        // none of them actually cut off, because it never called Next()
+        // again to find out (governance Gate 4 happy-path finding).
+        if (count >= 100) {
+            VariantClear(&v);
+            truncated = true;
             break;
         }
         if (v.vt != VT_DISPATCH || !v.pdispVal) {
@@ -701,8 +709,17 @@ public:
 #elif defined(__linux__)
             if (!try_firewalld_state(ctx) && !try_nftables_state(ctx) && !try_ufw_state(ctx) &&
                 !try_iptables_state(ctx)) {
+                // Every backend was unreachable/absent -- we could not
+                // determine anything, so the honest answer is unknown,
+                // never a false-safe "inactive" (this file's own
+                // never-fabricate invariant, governance Gate 4 unhappy-path
+                // finding UP-9: an nftables-only host with no ufw/iptables
+                // binaries would otherwise report a genuinely-active
+                // firewall as inactive -- pre-existing, byte-identical to
+                // the pre-migration fallback, fixed here while already in
+                // this exact function).
                 ctx.write_output("backend|none");
-                ctx.write_output("state|inactive");
+                ctx.write_output("state|unknown");
             }
 #elif defined(__APPLE__)
             do_state_macos(ctx);
