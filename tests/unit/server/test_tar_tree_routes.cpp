@@ -16,6 +16,7 @@
 #include "test_route_sink.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <memory>
 #include <optional>
@@ -622,10 +623,25 @@ TEST_CASE("TAR device pickers: service-scoped token denied on both frames, "
     auto tree = h.sink.Get("/fragments/tar/process-tree");
     REQUIRE(tree);
     CHECK(tree->status == 403);
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto tree_body = nlohmann::json::parse(tree->body, nullptr, false);
+    REQUIRE_FALSE(tree_body.is_discarded());
+    CHECK_FALSE(tree_body["error"].contains("permission"));
+    CHECK_FALSE(tree_body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(tree->get_header_value("X-Correlation-Id") ==
+         tree_body["error"]["correlation_id"].get<std::string>());
 
     auto cap = h.sink.Get("/fragments/tar/capture-sources");
     REQUIRE(cap);
     CHECK(cap->status == 403);
+    auto cap_body = nlohmann::json::parse(cap->body, nullptr, false);
+    REQUIRE_FALSE(cap_body.is_discarded());
+    CHECK_FALSE(cap_body["error"].contains("permission"));
+    CHECK_FALSE(cap_body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(cap->get_header_value("X-Correlation-Id") ==
+         cap_body["error"]["correlation_id"].get<std::string>());
 
     REQUIRE(h.audit_log.size() == 2);
     CHECK(h.audit_log[0].action == "tar.device_picker.view");
