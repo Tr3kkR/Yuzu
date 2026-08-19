@@ -25,6 +25,7 @@
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
+#include "service_scope_policy.hpp"       // authz::kServiceScopeGlobalSafe (#2298 PR 3 §3c boot cross-check)
 // ADR-0031 operator surface (PR1.6c, p14) — mint/list/revoke_upload_grant.
 // The SAME pure validation grammar the REST route
 // (file_retrieval_routes.cpp) enforces internally, reused here so a
@@ -1500,7 +1501,11 @@ static const ToolDef kTools[] = {
      "which this display accessor deliberately does not) — this is the inspection view an "
      "operator reads before deciding whether to flip it. Absence of a prior flip reads as "
      "enabled=true with no reason/set_by. Requires PluginConfig:Read.",
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":64},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"}},"required":["plugin"]})j",
+     // plugin maxLength is 68, not 64: parse_kill_switch_scope also accepts a
+     // reserved-namespace plugin name (__<identifier>__, #3265), whose total
+     // length can reach kMaxIdentifierBytes (64) + 4 sentinel bytes = 68 —
+     // this schema must not reject an input the store would accept.
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"}},"required":["plugin"]})j",
      R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"}},"required":["plugin","action","enabled"]})j"},
 
     {"set_plugin_kill_switch",
@@ -1510,7 +1515,8 @@ static const ToolDef kTools[] = {
      "store error, so throwing this switch is a reliable emergency stop for the named "
      "plugin/action — there is no separate 'force disable' escalation beyond this call. "
      "Requires PluginConfig:Write.",
-     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":64},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
+     // plugin maxLength is 68 — see the identical note on get_plugin_kill_switch above.
+     R"j({"type":"object","properties":{"plugin":{"type":"string","minLength":1,"maxLength":68},"action":{"type":"string","maxLength":64,"description":"Action name for an action-level switch; omit for the whole-plugin switch"},"enabled":{"type":"boolean","description":"true = allowed (the default/no-row state); false = killed"},"reason":{"type":"string","maxLength":512,"description":"Operator-entered explanation, audited and displayed verbatim"}},"required":["plugin","enabled"]})j",
      R"j({"type":"object","properties":{"plugin":{"type":"string"},"action":{"type":"string"},"enabled":{"type":"boolean"},"reason":{"type":"string"},"set_by":{"type":"string"},"updated_at_ms":{"type":"integer"}},"required":["plugin","action","enabled"]})j"},
 
     {"mint_upload_grant",
@@ -1607,12 +1613,53 @@ static const std::unordered_set<std::string> kWriteTools = [] {
     return s;
 }();
 
+// Service-scoped-token classification for the C8 chokepoint (#2298 PR 3
+// §3c). `denied` is the DEFAULT (see the member initializer below) — a tool
+// gets `confined`/`global_safe` only by explicit registration, so an
+// unclassified or newly-added row fails closed for a service-scoped caller
+// automatically, the same fail-closed-by-omission posture #2383's
+// kKnownMissingSecurity classification already gives every tool for
+// tier/approval. A genuine `enum class` (not a string like securable_type/
+// operation) because — unlike those, which are validated against an
+// EXTERNAL catalogue (rbac_store.cpp's seeded types/ops, kRbacOps/
+// kRbacSecurables below) — this is a purely internal three-way
+// classification with no external system to match strings against, so a
+// typo is better caught at compile time than by a runtime closed-catalogue
+// check. Mirrors `ToolSecurityClass`'s TU-private-enum-plus-testonly-mirror
+// shape (`ToolClassForTest`, mcp_server_testonly.hpp) rather than the
+// string-catalogue shape.
+//   - `denied`: the C8 chokepoint refuses a service-scoped caller outright,
+//     before tier/approval ever runs.
+//   - `confined`: may REACH the handler — NOT a claim the tool is
+//     functionally usable by a service-scoped caller. Under the seeded-empty
+//     `kServiceScopeGlobalSafe` table most `confined` tools still hit their
+//     OWN downstream perm_fn/scoped_perm_fn and get denied there too (e.g.
+//     execute_instruction, mcp_server.cpp's own perm_fn call); confinement
+//     via a real per-agent/service check (`confine_agent_target`-shaped) is
+//     what makes a `confined` tool genuinely usable.
+//   - `global_safe`: proceeds unconfined. Boot-validated: every `global_safe`
+//     row's (securable_type, operation) pair must appear in
+//     `authz::kServiceScopeGlobalSafe` (service_scope_policy.hpp, seeded
+//     EMPTY) — a `global_safe` row with no matching policy-table entry is a
+//     registration defect, refused at boot the same way an unregistered
+//     tool is.
+enum class ServiceScopeClass {
+    denied,
+    confined,
+    global_safe,
+};
+
 // ── Tool → (securable_type, operation) mapping for generic policy checks ──
 // Every tool declares its securable type and operation so that tier_allows()
 // and requires_approval() can be evaluated generically before dispatch.
 struct ToolSecurity {
     const char* securable_type;
     const char* operation;
+    // Default-deny (#2298 PR 3 §3c): every one of the 90+ existing 2-element
+    // `{securable_type, operation}` initializers below picks this up for
+    // free via aggregate initialization — only rows explicitly needing
+    // `confined`/`global_safe` change shape to the 3-element form.
+    ServiceScopeClass service_scope = ServiceScopeClass::denied;
 };
 
 struct ToolSecurityEntry {
@@ -1637,7 +1684,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"query_inventory", {"Infrastructure", "Read"}},
     {"list_inventory_tables", {"Infrastructure", "Read"}},
     {"get_agent_inventory", {"Infrastructure", "Read"}},
-    {"query_installed_software", {"Inventory", "Read"}},
+    {"query_installed_software", {"Inventory", "Read", ServiceScopeClass::confined}},
     {"get_tags", {"Tag", "Read"}},
     {"search_agents_by_tag", {"Tag", "Read"}},
     {"list_policies", {"Policy", "Read"}},
@@ -1646,31 +1693,31 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_management_groups", {"ManagementGroup", "Read"}},
     {"get_execution_status", {"Execution", "Read"}},
     {"list_executions", {"Execution", "Read"}},
-    {"list_schedules", {"Schedule", "Read"}},
+    {"list_schedules", {"Schedule", "Read", ServiceScopeClass::confined}},
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     {"list_pending_approvals", {"Approval", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
     {"list_dex_signals", {"GuaranteedState", "Read"}},
     {"get_dex_signal_scope", {"GuaranteedState", "Read"}},
-    {"get_dex_signal_detail", {"GuaranteedState", "Read"}},
+    {"get_dex_signal_detail", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_perf_fleet", {"GuaranteedState", "Read"}},
     {"get_dex_perf_cohorts", {"GuaranteedState", "Read"}},
     {"list_dex_perf_apps", {"GuaranteedState", "Read"}},
     {"get_dex_app_perf", {"GuaranteedState", "Read"}},
-    {"get_dex_group_app_perf", {"GuaranteedState", "Read"}},
-    {"compare_app_perf_versions", {"GuaranteedState", "Read"}},
+    {"get_dex_group_app_perf", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    {"compare_app_perf_versions", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_perf_cohort_diff", {"GuaranteedState", "Read"}},
-    {"list_dex_perf_devices", {"GuaranteedState", "Read"}},
+    {"list_dex_perf_devices", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_network_fleet", {"GuaranteedState", "Read"}},
-    {"list_network_devices", {"GuaranteedState", "Read"}},
+    {"list_network_devices", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     // Implemented write tools
-    {"set_tag", {"Tag", "Write"}},
-    {"delete_tag", {"Tag", "Delete"}},
-    {"execute_instruction", {"Execution", "Execute"}},
+    {"set_tag", {"Tag", "Write", ServiceScopeClass::confined}},
+    {"delete_tag", {"Tag", "Delete", ServiceScopeClass::confined}},
+    {"execute_instruction", {"Execution", "Execute", ServiceScopeClass::confined}},
     // Live-query bundle (ADR-0011) — same securable as the underlying ops:
     // dispatch is Execution:Execute, collate is Response:Read.
-    {"execute_bundle", {"Execution", "Execute"}},
+    {"execute_bundle", {"Execution", "Execute", ServiceScopeClass::confined}},
     {"get_bundle_result", {"Response", "Read"}},
     // Write tools (#289). NOTE (governance S3/UP-3, revised for PR #1796 review
     // C2): the op here drives the C8 TIER gate (tier_allows / requires_approval),
@@ -1690,7 +1737,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // shares the (securable, op) pair.
     {"approve_request", {"Approval", "Write"}},
     {"reject_request", {"Approval", "Write"}},
-    {"quarantine_device", {"Security", "Execute"}},
+    {"quarantine_device", {"Security", "Execute", ServiceScopeClass::confined}},
     // PKI CA tools (PR4 B-2 — MCP/REST parity for the /api/v1/ca/* surface).
     {"list_issued_certs", {"Security", "Read"}},
     {"revoke_certificate", {"Security", "Delete"}},
@@ -1732,7 +1779,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"discover_routes", {"Infrastructure", "Read"}},
     {"discover_scope_kinds", {"Infrastructure", "Read"}},
     {"discover_plugins", {"Infrastructure", "Read"}},
-    {"query_software_licenses", {"SoftwareLicensing", "Read"}},
+    {"query_software_licenses", {"SoftwareLicensing", "Read", ServiceScopeClass::confined}},
     // Periodic Access Reviews (SOC 2 CC6.2) — parity with the REST twins'
     // AccessReview:Read (export/get/list) and AccessReview:Attest
     // (open/attest/close) gates — a dedicated narrow securable, NOT AuditLog,
@@ -1842,12 +1889,19 @@ ToolSecurityClass classify_tool_security(
     return ToolSecurityClass::kKnownRegistered;
 }
 
-// Borrowed (name, securable, operation) row for the registration validator.
-// Views are valid only for the duration of the call; nothing is retained.
+// Borrowed (name, securable, operation, service_scope) row for the
+// registration validator. Views are valid only for the duration of the
+// call; nothing is retained. `service_scope` carries #2298 PR 3 §3c's
+// global_safe-vs-policy-table cross-check alongside the existing RBAC
+// catalogue checks, rather than threading a 5th parallel sequence through
+// the validator the way #2405 added input_schemas — every row already
+// carries a service_scope value (default-deny), so there is no "empty means
+// skip this check" case to preserve the way input_schemas has one.
 struct ToolSecurityTuple {
     std::string_view name;
     std::string_view securable;
     std::string_view operation;
+    ServiceScopeClass service_scope;
 };
 
 // Closed RBAC operation vocabulary — mirrors rbac_store.cpp's seeded `ops[]`
@@ -2004,6 +2058,23 @@ void validate_tool_security_registration(const std::vector<std::string_view>& to
             offences.push_back("tool '" + std::string(n) + "' has securable type '" +
                                std::string(row.securable) +
                                "' outside the RBAC securable catalogue");
+        // #2298 PR 3 §3c: a `global_safe` row claims a service-scoped token
+        // may exercise this (securable, operation) pair UNCONFINED — that
+        // claim must be backed by an entry in the actual policy table, or a
+        // future edit that flips a row to `global_safe` without also
+        // clearing service_scope_policy.hpp's entry bar (proof + routed-
+        // concerns update + security-guardian sign-off) silently widens every
+        // service-scoped token in the fleet. `kServiceScopeGlobalSafe` is
+        // seeded EMPTY, so today this offence fires for ANY `global_safe`
+        // row — refused at boot, same as an unregistered tool.
+        if (row.service_scope == ServiceScopeClass::global_safe &&
+            !authz::service_scope_global_safe(row.securable, row.operation))
+            offences.push_back(
+                "tool '" + std::string(n) + "' is classified global_safe for (" +
+                std::string(row.securable) + ", " + std::string(row.operation) +
+                ") but that pair is not in kServiceScopeGlobalSafe "
+                "(service_scope_policy.hpp) — a global_safe classification must be backed "
+                "by the policy table, not asserted independently");
     }
     // kWriteTools must be EXACTLY the non-Read subset: the C7 --mcp-read-only
     // guard keys on kWriteTools, so a non-Read tool missing from it silently
@@ -2604,7 +2675,7 @@ McpServer::McpServer() {
     std::vector<ToolSecurityTuple> rows;
     rows.reserve(std::size(kToolSecurityRows));
     for (const auto& r : kToolSecurityRows)
-        rows.push_back({r.name, r.sec.securable_type, r.sec.operation});
+        rows.push_back({r.name, r.sec.securable_type, r.sec.operation, r.sec.service_scope});
     std::vector<std::string_view> writes(std::begin(kWriteToolsRaw), std::end(kWriteToolsRaw));
     // 4th raw sequence (#2405): the served input schemas, from the SAME
     // kTools[] array as `names`, so a schema the C8 gate cannot fully
@@ -3694,7 +3765,44 @@ McpServer::HandlerFn McpServer::build_handler(
             if (sec_class == ToolSecurityClass::kKnownRegistered) {
                 // kKnownRegistered guarantees the row exists (same map the
                 // classifier consulted).
-                const auto& [sec_type, sec_op] = kToolSecurity.find(tool_name)->second;
+                const auto& [sec_type, sec_op, sec_scope] = kToolSecurity.find(tool_name)->second;
+
+                // #2298 PR 3 §3c: service-scope default-deny, BEFORE
+                // tier/approval — a denied tool refuses a service-scoped
+                // caller here, structurally, regardless of what tier its
+                // token happens to carry. `confined` and `global_safe` both
+                // proceed to tier/approval as normal; `confined` is NOT a
+                // claim the tool is functionally usable by a service-scoped
+                // caller (see ServiceScopeClass's doc comment) — most
+                // `confined` tools still deny downstream via their own
+                // perm_fn/scoped_perm_fn under the seeded-empty allow-list.
+                if (!session->token_scope_service.empty() &&
+                    sec_scope == ServiceScopeClass::denied) {
+                    mcp_audit("denied", "service-scoped token blocked: default-deny (C8, #2298)");
+                    // sre Gate 6 (#2298 PR 3 hardening round): this C8
+                    // short-circuit returns before perm_fn/require_permission
+                    // ever runs, so that function's own increment site never
+                    // fires for `denied`-class tools — without this, the ADR's
+                    // "Phase 2 prioritized by this metric" claim would be false
+                    // for exactly the tools it names. `path_class="mcp"`
+                    // mirrors body_cap_policy.hpp's own `/mcp/` row (the
+                    // single source of truth for that label) rather than
+                    // pulling that header in for one constant string.
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_auth_service_scope_default_denied_total",
+                                     {{"permission", std::string(sec_type) + ":" + std::string(sec_op)},
+                                      {"path_class", "mcp"}})
+                            .increment();
+                    }
+                    res.set_content(
+                        a4_error(kPermissionDenied, "service-scoped tokens cannot call this tool",
+                                 "this tool has no per-agent/service confinement; the "
+                                 "service-scope default-deny table is seeded empty — see "
+                                 "docs/adr/1006-service-scope-default-deny.md"),
+                        "application/json");
+                    return;
+                }
 
                 if (!tier_allows(tier, sec_type, sec_op)) {
                     mcp_audit("denied", "tier=" + std::string(tier));
@@ -12164,6 +12272,35 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
     }
 }
 
+// Translate the TU-private `ServiceScopeClass` (#2298 PR 3 §3c) to/from its
+// testonly mirror `ServiceScopeClassForTest`, exhaustive switches so a 4th
+// enumerator on either side fails to compile here rather than silently
+// falling through (same discipline as classify_tool_for_test's switch
+// below).
+ServiceScopeClassForTest service_scope_to_test(ServiceScopeClass c) {
+    switch (c) {
+    case ServiceScopeClass::denied:
+        return ServiceScopeClassForTest::kDenied;
+    case ServiceScopeClass::confined:
+        return ServiceScopeClassForTest::kConfined;
+    case ServiceScopeClass::global_safe:
+        return ServiceScopeClassForTest::kGlobalSafe;
+    }
+    std::unreachable();
+}
+
+ServiceScopeClass service_scope_from_test(ServiceScopeClassForTest c) {
+    switch (c) {
+    case ServiceScopeClassForTest::kDenied:
+        return ServiceScopeClass::denied;
+    case ServiceScopeClassForTest::kConfined:
+        return ServiceScopeClass::confined;
+    case ServiceScopeClassForTest::kGlobalSafe:
+        return ServiceScopeClass::global_safe;
+    }
+    std::unreachable();
+}
+
 // Test-only accessor for the internal kToolSecurity map (decls in
 // mcp_server_testonly.hpp, #2385). The map has internal linkage in the
 // anonymous namespace above but is visible here in the same translation unit;
@@ -12173,7 +12310,8 @@ std::vector<ToolSecurityRow> tool_security_rows_for_test() {
     std::vector<ToolSecurityRow> rows;
     rows.reserve(kToolSecurity.size());
     for (const auto& [name, sec] : kToolSecurity)
-        rows.push_back({name, sec.securable_type, sec.operation});
+        rows.push_back(
+            {name, sec.securable_type, sec.operation, service_scope_to_test(sec.service_scope)});
     return rows;
 }
 
@@ -12231,7 +12369,8 @@ void validate_tool_registration_for_test(const std::vector<std::string>& tool_na
     std::vector<ToolSecurityTuple> rows;
     rows.reserve(security_rows.size());
     for (const auto& r : security_rows)
-        rows.push_back({r.name, r.securable, r.operation});
+        rows.push_back(
+            {r.name, r.securable, r.operation, service_scope_from_test(r.service_scope)});
     std::vector<std::string_view> writes(write_tools.begin(), write_tools.end());
     std::vector<ToolSchemaSource> schemas;
     schemas.reserve(input_schemas.size());

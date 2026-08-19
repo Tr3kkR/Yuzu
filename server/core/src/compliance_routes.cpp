@@ -8,10 +8,13 @@
 #include "dispatch_target_shape.hpp" // check_targeting_shape (#2500)
 
 #include "policy_evaluator.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
+                                     // X-Correlation-Id so header and body always agree
 #include "store_errors.hpp"
 #include "web_utils.hpp"
 
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <string>
@@ -258,9 +261,70 @@ std::string ComplianceRoutes::render_compliance_detail_fragment(const std::strin
     return html;
 }
 
+// guardian-confinement-2298 PR3 §3e — see the declaration comment in
+// compliance_routes.hpp for the ordering/throw-safety rationale (identical
+// to GuardianRoutes::deny_service_scoped_).
+bool ComplianceRoutes::deny_service_scoped_(const httplib::Request& req,
+                                            httplib::Response& res) const {
+    auto session = auth_fn_(req, res);
+    if (!session)
+        return true; // auth_fn_ already wrote 401/redirect; caller returns.
+    if (session->token_scope_service.empty())
+        return false;
+    // Write the 403 FIRST, audit after — a throwing audit_fn_ must not be
+    // able to suppress the 403 (mirrors GuardianRoutes::deny_service_scoped_).
+    res.status = 403;
+    // No `.permission` label: this is a blanket deny with no perm_fn_ gate on
+    // either fragment it covers — a service-scoped token HOLDING Policy:Read
+    // is still denied here, so naming it as "the missing grant" would be a
+    // false self-remediation claim (A4's permission field contract).
+    //
+    // `a4_denial` (not a hand-built `error_json_a4` + bare correlation id):
+    // it mints/reuses the id via `ensure_correlation_id`, which ALSO sets the
+    // X-Correlation-Id response header — a hand-built id embeds a
+    // correlation_id in the body that the header never carries, breaking the
+    // header/body-must-agree contract (found by consistency-auditor, Gate 4).
+    res.set_content(
+        detail::a4_denial(res, 403,
+                          "service-scoped tokens may not read this fleet-wide compliance view"),
+        "application/json");
+    if (audit_fn_) {
+        try {
+            audit_fn_(req, "compliance.fragment.access_denied", "denied", "Policy", "",
+                      "fleet-wide compliance dashboard fragment denied to a service-scoped "
+                      "token (path=" +
+                          req.path + ")");
+        } catch (const std::exception& e) {
+            spdlog::warn("compliance.fragment.access_denied: audit_fn_ threw: {}", e.what());
+        } catch (...) {
+            spdlog::warn("compliance.fragment.access_denied: audit_fn_ threw (non-std)");
+        }
+    }
+    return true;
+}
+
 // ── Route registration ──────────────────────────────────────────────────────
 
 void ComplianceRoutes::register_routes(httplib::Server& svr,
+                                       AuthFn auth_fn,
+                                       PermFn perm_fn,
+                                       AuditFn audit_fn,
+                                       EmitEventFn emit_event_fn,
+                                       PolicyStore* policy_store,
+                                       AgentsJsonFn agents_json_fn,
+                                       PolicyEvaluator* policy_evaluator,
+                                       yuzu::MetricsRegistry* metrics) {
+    // Production shim — wrap the real server in an HttplibRouteSink and
+    // delegate to the sink-based overload. Same handlers, same lambdas,
+    // same observable behaviour. Test code calls the sink overload directly
+    // with a TestRouteSink (#2298 PR 3 §3e).
+    HttplibRouteSink sink(svr);
+    register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
+                    std::move(emit_event_fn), policy_store, std::move(agents_json_fn),
+                    policy_evaluator, metrics);
+}
+
+void ComplianceRoutes::register_routes(HttpRouteSink& sink,
                                        AuthFn auth_fn,
                                        PermFn perm_fn,
                                        AuditFn audit_fn,
@@ -280,7 +344,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
     policy_evaluator_ = policy_evaluator;
 
     // -- Compliance dashboard page ----------------------------------------
-    svr.Get("/compliance",
+    sink.Get("/compliance",
                      [this](const httplib::Request& req, httplib::Response& res) {
                          auto session = auth_fn_(req, res);
                          if (!session) {
@@ -291,8 +355,9 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                      });
 
     // -- Compliance HTMX fragment: fleet summary --------------------------
-    svr.Get("/fragments/compliance/summary",
+    sink.Get("/fragments/compliance/summary",
                      [this](const httplib::Request& req, httplib::Response& res) {
+                         if (deny_service_scoped_(req, res)) return;
                          auto session = auth_fn_(req, res);
                          if (!session) return;
                          res.set_content(render_compliance_summary_fragment(),
@@ -300,8 +365,9 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
                      });
 
     // -- Compliance HTMX fragment: per-policy agent detail ----------------
-    svr.Get(R"(/fragments/compliance/(\w[\w\-]*))",
+    sink.Get(R"(/fragments/compliance/(\w[\w\-]*))",
                      [this](const httplib::Request& req, httplib::Response& res) {
+                         if (deny_service_scoped_(req, res)) return;
                          auto session = auth_fn_(req, res);
                          if (!session) return;
                          auto policy_id = req.matches[1].str();
@@ -312,7 +378,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
     // -- Policy Engine API (Phase 5) ------------------------------------------
 
     // GET /api/policy-fragments -- list all fragments
-    svr.Get("/api/policy-fragments",
+    sink.Get("/api/policy-fragments",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Read"))
                 return;
@@ -353,7 +419,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policy-fragments -- create fragment from YAML
-    svr.Post("/api/policy-fragments",
+    sink.Post("/api/policy-fragments",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Write"))
                 return;
@@ -411,7 +477,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // DELETE /api/policy-fragments/:id
-    svr.Delete(R"(/api/policy-fragments/([^/]+))",
+    sink.Delete(R"(/api/policy-fragments/([^/]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Delete"))
                 return;
@@ -431,7 +497,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // GET /api/policies -- list all policies
-    svr.Get("/api/policies",
+    sink.Get("/api/policies",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Read"))
                 return;
@@ -489,7 +555,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policies -- create policy from YAML
-    svr.Post("/api/policies",
+    sink.Post("/api/policies",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Write"))
                 return;
@@ -529,7 +595,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // GET /api/policies/:id -- get policy detail
-    svr.Get(R"(/api/policies/([^/]+))",
+    sink.Get(R"(/api/policies/([^/]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Read"))
                 return;
@@ -592,7 +658,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // DELETE /api/policies/:id
-    svr.Delete(R"(/api/policies/([^/]+))",
+    sink.Delete(R"(/api/policies/([^/]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Delete"))
                 return;
@@ -614,7 +680,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policies/:id/enable
-    svr.Post(R"(/api/policies/([^/]+)/enable)",
+    sink.Post(R"(/api/policies/([^/]+)/enable)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Write"))
                 return;
@@ -639,7 +705,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policies/:id/disable
-    svr.Post(R"(/api/policies/([^/]+)/disable)",
+    sink.Post(R"(/api/policies/([^/]+)/disable)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Write"))
                 return;
@@ -664,7 +730,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policies/:id/invalidate -- invalidate cache for one policy
-    svr.Post(R"(/api/policies/([^/]+)/invalidate)",
+    sink.Post(R"(/api/policies/([^/]+)/invalidate)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Execute"))
                 return;
@@ -691,7 +757,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // POST /api/policies/invalidate-all -- invalidate cache for all policies
-    svr.Post("/api/policies/invalidate-all",
+    sink.Post("/api/policies/invalidate-all",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Execute"))
                 return;
@@ -718,7 +784,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
 
     // POST /api/policies/:id/evaluate -- force an immediate compliance check
     // (the background evaluator picks it up on its next collect cycle).
-    svr.Post(R"(/api/policies/([^/]+)/evaluate)",
+    sink.Post(R"(/api/policies/([^/]+)/evaluate)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Execute"))
                 return;
@@ -758,7 +824,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
     // POST /api/policies/:id/remediate -- manual, gated remediation. Requires
     // the bound fragment to define a fix_instruction. Optional body
     // {"agent_ids":[...]} scopes the fix; absent => all non_compliant agents.
-    svr.Post(R"(/api/policies/([^/]+)/remediate)",
+    sink.Post(R"(/api/policies/([^/]+)/remediate)",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Execute"))
                 return;
@@ -873,7 +939,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // GET /api/compliance -- fleet compliance summary
-    svr.Get("/api/compliance",
+    sink.Get("/api/compliance",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Read"))
                 return;
@@ -897,7 +963,7 @@ void ComplianceRoutes::register_routes(httplib::Server& svr,
         });
 
     // GET /api/compliance/:policy_id -- per-policy compliance detail
-    svr.Get(R"(/api/compliance/([^/]+))",
+    sink.Get(R"(/api/compliance/([^/]+))",
         [this](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn_(req, res, "Policy", "Read"))
                 return;

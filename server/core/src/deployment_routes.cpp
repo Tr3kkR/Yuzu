@@ -13,7 +13,8 @@
 #include "http_route_sink.hpp"
 #include "preflight_parse.hpp"      // bucket_from_token, PreflightTarget
 #include "preflight_run_store.hpp"  // PreflightRunStore (source go-cohort)
-#include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
+#include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
+                                     // X-Correlation-Id so header and body always agree
 #include "rest_audit.hpp"           // detail::try_persist_audit
 
 #include <yuzu/server/auth.hpp> // AuthManager (id bytes)
@@ -148,14 +149,18 @@ bool DeploymentRoutes::deny_service_scoped_(const httplib::Request& req, httplib
         return true; // auth_fn_ already wrote the response (401/etc).
     if (session->token_scope_service.empty())
         return false;
-    const auto cid = detail::make_correlation_id();
     // Write the 403 FIRST, audit after (mirrors PreflightRoutes/DexRoutes/
     // GuardianRoutes' deny_service_scoped_): a throwing audit_fn_ must not
     // suppress the 403.
     res.status = 403;
+    // `permission` defaults empty (see header) — a caller passing a
+    // non-empty override is now itself a bug, since no grant admits a
+    // service-scoped caller here. `a4_denial` also fixes a second bug found
+    // in the same pass: the hand-built cid never reached the
+    // X-Correlation-Id header.
     res.set_content(
-        detail::error_json_a4(
-            403, "service-scoped tokens may not access this fleet-wide deployment surface", cid,
+        detail::a4_denial(
+            res, 403, "service-scoped tokens may not access this fleet-wide deployment surface",
             detail::A4ErrorOpts{.permission = permission}),
         "application/json");
     (void)detail::try_persist_audit(audit_fn_, req, action, "denied", target_type, "",
@@ -241,7 +246,7 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
         // own service.
         if (deny_service_scoped_(req, res, "deployment.create",
                                  "deployment create denied to a service-scoped token",
-                                 "SoftwareDeployment", "SoftwareDeployment:Execute"))
+                                 "SoftwareDeployment"))
             return;
         // Mutating fleet action: Execute tier; + Infrastructure:Read for the device
         // resolution + the result render it returns (so the repoll isn't 403-walled).
@@ -422,7 +427,7 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
         // outside its own service (SEC-2/SEC-3 class).
         if (deny_service_scoped_(req, res, "deployment.delete",
                                  "deployment delete denied to a service-scoped token",
-                                 "SoftwareDeployment", "SoftwareDeployment:Execute"))
+                                 "SoftwareDeployment"))
             return;
         if (!perm_fn_ || !perm_fn_(req, res, "SoftwareDeployment", "Execute"))
             return;

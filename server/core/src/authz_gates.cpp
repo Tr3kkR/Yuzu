@@ -50,6 +50,27 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         return std::unexpected(authz::GateFailure::Degraded);
     }
 
+    // Decision (#2298 PR 3, "the flip"): preserve `require_permission`'s
+    // service branch hard-403 when RBAC enforcement is not in effect. The
+    // service-tag axis below is RBAC-independent — without this check, a
+    // disabled-RBAC service-scoped session would get a NARROWED (non-empty,
+    // via the tag axis alone) result here, a capability that session never
+    // had through `require_permission`. Same predicate
+    // (`rbac_enforcement_in_effect`, not raw `is_rbac_enabled()`) as
+    // `require_permission`'s service branch, so the two gates can never
+    // disagree on a corrupt/degraded store. `rbac_store_` is known non-null
+    // and open here (the check above already returned Degraded otherwise).
+    if (!session->token_scope_service.empty() && !rbac_enforcement_in_effect(rbac_store_)) {
+        audit_log(req, "auth.fleet_read_required", "denied", "", "",
+                  "fleet read blocked: service-scoped token requires RBAC to be enabled");
+        res.status = 403;
+        res.set_content(detail::a4_denial(res, 403,
+                                          "service-scoped tokens require RBAC to be enabled",
+                                          detail::A4ErrorOpts{.permission = perm}),
+                        "application/json");
+        return std::unexpected(authz::GateFailure::Forbidden);
+    }
+
     // Spelled via deny_all() rather than relying on the switch below to
     // always overwrite the implicit nullopt(TOP) default — defense-in-depth
     // against a future non-exhaustive edit to ListReadDecision's cases

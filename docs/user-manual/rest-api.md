@@ -619,7 +619,16 @@ Remove an agent from a management group.
 
 List role assignments scoped to this management group.
 
-**Permission:** `ManagementGroup:Read`
+**Permission:** `ManagementGroup:Read`. This response is authorization
+topology (who holds what role), so the fleet-wide arm actually authorizing
+it is the floored `UserManagement:Read` (#2376), not `ManagementGroup:Read`
+itself — see [the authorization topology floor](../security-reviews/authz-topology-floor-2026-08-05.md).
+A caller lacking that also succeeds if they are `ITServiceOwner` **of this
+specific group** (a scoped fallback, not the fleet-wide grant) — but a
+service-scoped API token cannot use that fallback (guardian-confinement-2298
+PR 3): the fallback checks group membership only, never the token's own
+service-tag scope, and a service-scoped token is denied outright rather
+than risk it reaching a group outside its own service.
 
 **Response:**
 
@@ -649,7 +658,7 @@ List role assignments scoped to this management group.
 
 Assign a role to a principal within this management group. Only the `Operator` and `Viewer` roles can be delegated. The caller must be a global Administrator or hold the `ITServiceOwner` role on this group.
 
-**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group.
+**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group. A service-scoped API token is denied outright, even one whose minter holds `ITServiceOwner` on this exact group (guardian-confinement-2298 PR 3) — the group-scoped fallback checks membership only, never the token's own service-tag scope.
 
 **Request body:**
 
@@ -691,7 +700,7 @@ Assign a role to a principal within this management group. Only the `Operator` a
 
 Remove a role assignment from this management group.
 
-**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group.
+**Permission:** Global `ManagementGroup:Write` or `ITServiceOwner` on this group. Same service-scoped-token denial as `POST` above.
 
 **Request body:**
 
@@ -772,7 +781,7 @@ Create a new API token. The raw token is returned in the response and is never s
 | `expires_at` | integer | No | Unix epoch seconds. `0` or omitted = never expires. **Required** for MCP tokens (max 90 days). |
 | `mcp_tier` | string | No | MCP authorization tier: `"readonly"`, `"operator"`, or `"supervised"`. Omit for standard API tokens. When set, `expires_at` is mandatory. |
 
-`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap.
+`mcp_tier` is honored at mint time (a value outside `readonly`/`operator`/`supervised` is rejected). A tiered (`mcp_tier` set) or service-scoped token also requires a valid `expires_at` within the 90-day cap. Setting `scope_service` requires RBAC to be enabled and either a global `ManagementGroup:Write` grant or `ITServiceOwner` on the `"Service: <scope_service>"` management group — see [Service-Scoped Tokens](authentication.md#service-scoped-tokens).
 
 **Validation errors (`400`):**
 
@@ -4239,6 +4248,19 @@ the server row cap or 8 MiB aggregate payload cap, the route returns **503**
 ("inventory query truncated ... refusing to materialise a partial result set") rather than
 persisting a silently-incomplete set — a fleet-targeting set is never silently
 narrowed.
+
+**Permission:** `Inventory:Read` (guardian-confinement-2298 PR 3 — this
+route had NO authorization check of any kind before this fix, CWE-862: any
+authenticated session could query up to 5000 fleet-wide inventory records
+with zero scoping. Unlike the async producers below, it is a synchronous
+read, not a dispatch, so it gates on the same securable as `GET
+/api/v1/inventory/software` rather than `Execution:Execute`; a
+service-scoped API token is denied by the same gate). The owner-scoped
+result-set row it creates is only readable/mutable by its own creator
+through the routes below, which — like their HTMX dashboard twins — also
+deny a service-scoped token outright: `session->username` is the *minting*
+principal's identity, not the token's own service tag, so without this a
+service token could reach any other token the same minter held.
 
 #### `POST /api/v1/result-sets/from-tar-query`<br>`POST /api/v1/result-sets/from-instruction-result`<br>`POST /api/v1/result-sets/{id}/re-eval`
 

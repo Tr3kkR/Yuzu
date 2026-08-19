@@ -11,6 +11,7 @@
 #include "oidc_provider.hpp"
 #include "saml_provider.hpp"
 #include "rbac_store.hpp"
+#include "service_scope_policy.hpp" // authz::PermPair — the test-override seam's element type
 #include "tag_store.hpp"
 
 #include <httplib.h>
@@ -172,6 +173,14 @@ public:
     /// legitimately-elevated caller who holds no base grant (the regression
     /// the first #3038 fix attempt shipped).
     ///
+    /// Route-class distinction from `authz::AuthRoutes::require_fleet_read`
+    /// (#2298 PR 3 §3f, closes #3218): this method is the sole gate on
+    /// fleet-wide ROLLUP routes — it refuses a service-scoped session
+    /// outright, since a rollup has no per-service slice to narrow to.
+    /// `require_fleet_read` (`authz_gates.hpp`) is meant to be paired with
+    /// `require_permission` on routes migrating toward real per-request
+    /// service-scope confinement (Phase 2). They are not interchangeable.
+    ///
     /// An engine principal is special-cased (RBAC-only, never legacy-open)
     /// rather than delegated to `authorize_list_read` directly:
     /// `authorize_list_read`'s legacy-open branch returns `AdmitAll` when
@@ -195,17 +204,25 @@ public:
     //    RELATED BUT DISTINCT from `require_list_read` above: both compose
     //    `RbacStore::authorize_list_read`, but for different purposes
     //    (general ADR-0017 confinement vs. service-scope confinement) and
-    //    with different return shapes. Not yet reconciled — tracked as #3218,
-    //    not decided here. The rename below (authorize_* -> require_*/confine_*,
-    //    fjarvis/Kimi K2.7 follow-up review) moves `require_fleet_read` into
-    //    the same `require_*` family as `require_list_read`, which sharpens
-    //    rather than resolves the confusability: unlike `require_list_read`,
-    //    `require_fleet_read` calls `authorize_list_read` directly with no
-    //    JIT-elevation or engine-principal special-casing — see its own doc
-    //    comment's "does NOT cover" paragraph. Whoever wires a route to
-    //    `require_fleet_read` for a caller class that can be elevated or an
-    //    engine principal must resolve #3218 first, not assume parity with
-    //    `require_list_read` from the shared name prefix. ------------------
+    //    with different return shapes. #3218 (this shared-name-prefix
+    //    confusability) is CLOSED as of #2298 PR 3, ADR-1006 "Decision 2 —
+    //    closes #3218": the two gates stay deliberately separate, not
+    //    merged — see `require_list_read`'s own doc comment above
+    //    ("Route-class distinction") and
+    //    `docs/adr/1006-service-scope-default-deny.md` for the resolution.
+    //    The rename below (authorize_* -> require_*/confine_*, fjarvis/Kimi
+    //    K2.7 follow-up review) moved `require_fleet_read` into the same
+    //    `require_*` family as `require_list_read` — a naming proximity
+    //    that is safe only because the closed #3218 discussion already
+    //    settled the two gates are not interchangeable: unlike
+    //    `require_list_read`, `require_fleet_read` calls
+    //    `authorize_list_read` directly with no JIT-elevation or
+    //    engine-principal special-casing — see its own doc comment's "does
+    //    NOT cover" paragraph. A route wiring `require_fleet_read` for a
+    //    caller class that can be elevated or an engine principal must still
+    //    account for that gap explicitly — #3218 closing means the TWO GATES
+    //    are settled as separate, not that this per-caller-class gap is
+    //    resolved. ------------------------------------------------------
 
     /// The two-axis list-read gate. Named `require_*`, not `authorize_*`
     /// (renamed post-#3216, fjarvis/Kimi K2.7 follow-up review): it is a
@@ -245,22 +262,24 @@ public:
     /// What this gate genuinely does NOT cover — a caller needing either must
     /// check it WITHOUT re-deciding the RBAC/mgmt-group axis (i.e. not via
     /// `require_permission`'s full branch chain): `mcp_tier` enforcement
-    /// (`mcp::tier_allows`/`requires_approval`), and the RBAC-enabled
-    /// requirement for service-scoped sessions specifically (a disabled-RBAC
-    /// service session still gets a narrowed, non-empty result here, via the
-    /// service-tag axis alone, unlike `require_permission`'s service branch
-    /// which hard-403s in that case). No such standalone tier/RBAC-enabled
-    /// check exists yet as of this comment — a route wiring this gate to a
-    /// tier-sensitive or service-scope-sensitive operation must add one, not
-    /// assume `require_permission` supplies it. Also NOT covered: unlike
+    /// (`mcp::tier_allows`/`requires_approval`). The RBAC-enabled requirement
+    /// for service-scoped sessions IS now covered (#2298 PR 3, decision 1 —
+    /// corrected from an earlier version of this comment that said the
+    /// opposite): a disabled-RBAC service-scoped session hard-403s here too,
+    /// same predicate (`rbac_enforcement_in_effect`) and same outcome as
+    /// `require_permission`'s service branch, so the two gates cannot
+    /// disagree on this axis. Also NOT covered: unlike
     /// `require_list_read` above, this gate calls `authorize_list_read`
     /// directly with no JIT-elevation branch (an elevated session gets no
     /// special unfiltered treatment here) and no engine-principal branch (an
     /// engine principal is not routed to RBAC-only resolution here the way
-    /// `require_list_read` routes it) — see #3218, the tracked reconciliation
-    /// question. A route reachable by either caller class must not assume
-    /// `require_fleet_read` alone reproduces `require_list_read`'s posture
-    /// for them.
+    /// `require_list_read` routes it). #3218 (the shared-name-prefix
+    /// confusability between these two gates) is CLOSED — see the "Phase 0
+    /// confinement primitives" comment above: the two gates stay
+    /// deliberately separate. Closing #3218 settled THAT question; it did
+    /// NOT resolve THIS per-caller-class gap — a route reachable by either
+    /// caller class must still not assume `require_fleet_read` alone
+    /// reproduces `require_list_read`'s posture for them.
     [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
     require_fleet_read(const httplib::Request& req, httplib::Response& res,
                        const std::string& securable_type, const std::string& operation);
@@ -376,6 +395,41 @@ public:
                                  const std::string& target_id = {},
                                  const std::string& detail = {},
                                  const std::string& principal_class_override = {});
+
+    /// guardian-confinement-2298 PR3 §3e — server.cpp's shared deny gate for
+    /// routes that reach agent/fleet/execution data via `require_auth`
+    /// alone, with no `require_permission`/`require_scoped_permission` call
+    /// at all (so the §3a flip never runs for them). Same
+    /// resolve-then-check-`token_scope_service`-then-403+audit shape and
+    /// throw-safety ordering (403 written before the audit call) as the
+    /// per-file `deny_service_scoped_*` family in guardian_routes.cpp /
+    /// dex_routes.cpp / deployment_routes.cpp / preflight_routes.cpp / etc.
+    /// — server.cpp gets its own copy here (rather than a free function)
+    /// because it already holds `auth_routes_` and delegates every other
+    /// auth primitive through it. Returns true iff the caller must return
+    /// immediately (either a written 401/redirect from `require_auth`, or
+    /// the 403 deny itself); false means the session is present and is not
+    /// service-scoped, so the caller proceeds. Deliberately does NOT touch
+    /// the §3a `yuzu_auth_service_scope_default_denied_total` metric — that
+    /// metric counts `require_permission`'s own default-deny branch, and
+    /// these routes never call it; counting them there would misrepresent
+    /// what "default denied at the flip" means.
+    ///
+    /// `permission` defaults EMPTY, not a securable pair — every route this
+    /// gate covers is a blanket deny with no RBAC grant that would admit a
+    /// service-scoped token (that's the whole point of §3e). A4's
+    /// `permission` field names "the missing grant" for a caller to
+    /// self-remediate; naming one that doesn't exist would be a false claim
+    /// (the A4 builder omits the field entirely when this is empty — see
+    /// `A4ErrorOpts::permission`'s doc comment). Pass a real securable pair
+    /// explicitly only if a future caller of this gate genuinely has one.
+    [[nodiscard]] bool deny_service_scoped_session(const httplib::Request& req,
+                                                   httplib::Response& res,
+                                                   const std::string& action,
+                                                   const std::string& message,
+                                                   const std::string& target_type = {},
+                                                   const std::string& target_id = {},
+                                                   const std::string& permission = {});
 
     /// Emit an analytics event with HTTP request context.
     void emit_event(const std::string& event_type, const httplib::Request& req,
@@ -507,7 +561,37 @@ public:
     /// qe-B: the load-shed branch must be exercised.
     void set_mfa_pending_cap_for_test(std::size_t cap) { mfa_pending_cap_ = cap; }
 
+    /// Override the service-scope global-safe allow-list for a test
+    /// (`kServiceScopeGlobalSafe` is seeded EMPTY in production, #2298 PR 3 —
+    /// see `service_scope_policy.hpp` — so `require_permission`'s
+    /// "cleared the allow-list -> admit" wiring has no real-table path to
+    /// exercise otherwise). `std::nullopt` reverts to the real, empty,
+    /// production table. Test-only seam, same shape as
+    /// `set_mfa_pending_cap_for_test` above.
+    ///
+    /// `PermPair` holds `string_view` fields, stored by value here — a
+    /// caller MUST construct entries from string literals or otherwise
+    /// program-lifetime storage (every current call site does). A
+    /// `std::string` temporary would dangle the moment the constructing
+    /// expression ends (PR review, fjarvis — checked no current call site
+    /// does this, but the risk is real for a future one).
+    void set_service_scope_global_safe_override_for_test(
+        std::optional<std::vector<authz::PermPair>> table) {
+        service_scope_global_safe_override_for_test_ = std::move(table);
+    }
+
 private:
+    /// Whether `(securable_type, operation)` clears the service-scope
+    /// default-deny gate: the test override if one is set, else the real
+    /// `authz::kServiceScopeGlobalSafe` table via
+    /// `authz::service_scope_global_safe`. Shared by `require_permission`'s
+    /// service branch and its engine-branch belt-and-braces so both consult
+    /// the identical decision.
+    [[nodiscard]] bool service_scope_admits(std::string_view securable_type,
+                                            std::string_view operation) const;
+
+    std::optional<std::vector<authz::PermPair>> service_scope_global_safe_override_for_test_;
+
     std::size_t mfa_pending_cap_{kMaxPendingTokens};
     mutable std::mutex mfa_pending_mu_;
     std::unordered_map<std::string, MfaPending> mfa_pending_;
