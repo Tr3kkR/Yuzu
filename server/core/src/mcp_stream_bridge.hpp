@@ -1087,10 +1087,14 @@ private:
         /// progress event the listener overwrites in `progress_slot` before the
         /// projector ever sees it (latest-wins supersede) is counted here too,
         /// under `mu` in the listener, not just on the (sole) projector-thread
-        /// writer the #2438 comment originally described. Flushed from other
-        /// threads (shutdown/teardown), so it stays atomic despite the two
-        /// writers never running concurrently for a given record (listener vs.
-        /// projector are serialized by `mu` and by the swap protocol itself).
+        /// writer the #2438 comment originally described. The atomic is
+        /// load-bearing, not belt-and-braces: the projector's H1 fetch_add
+        /// (project_record's emission loop) runs AFTER the extraction lock
+        /// scope closes - `mu` is not held there - so a listener supersede on
+        /// a NEW event can land on another thread while an H1 suppression for
+        /// the PREVIOUS snapshot is still in flight on this one. Nothing
+        /// serializes the two increments against each other; the atomic RMW
+        /// is what keeps that genuinely concurrent case correct.
         std::atomic<std::uint64_t> progress_suppressed_delta{0};
         /// #2528: ~ClaimGuard released the claim without `mu` and therefore could
         /// not run the settle bookkeeping normally. "Should never happen" - it

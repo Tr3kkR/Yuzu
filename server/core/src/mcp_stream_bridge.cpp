@@ -1472,6 +1472,21 @@ void McpStreamBridge::run_projector() {
     // projector's whole lifetime rather than reallocated on every wake.
     std::unordered_set<std::string> keys;
     for (;;) {
+        // MUST run before the swap below, unconditionally - not after using
+        // `keys`, and not only on the no-throw path. `keys` needs to be
+        // GUARANTEED empty at the swap regardless of how the PREVIOUS
+        // iteration ended, including via the outer catch below (whose throw
+        // sites - snap.reserve/push_back - run before the post-extraction
+        // clear this replaced). A stale non-empty `keys` swapped into
+        // core_->dirty here would corrupt it with keys no mark_dirty call
+        // ever inserted: a LATER mark_dirty on one of those keys would then
+        // see insert() return false (already present) and skip its notify,
+        // stranding that record's next event with no live source left to
+        // wake the projector - the very lost-wakeup mark_dirty's own proof
+        // depends on `dirty` only ever holding what a real mark put there.
+        // Harmless no-op when the previous iteration exits normally, since
+        // the swap below already leaves `keys` empty for next time.
+        keys.clear();
         bool full_scan = false;
         {
             std::unique_lock<std::mutex> lk(core_->mu);
@@ -1482,8 +1497,9 @@ void McpStreamBridge::run_projector() {
                          // obligation (terminals are durable-fetchable)
             }
             core_->work_pending = false;
-            keys.swap(core_->dirty);  // `keys` is empty here (cleared last cycle
-                                      // below) so this ALSO empties core_->dirty
+            keys.swap(core_->dirty);  // `keys` is guaranteed empty here (the
+                                      // clear above), so this ALSO empties
+                                      // core_->dirty unconditionally
             full_scan = core_->scan_all;
             core_->scan_all = false;
         }
@@ -1534,10 +1550,6 @@ void McpStreamBridge::run_projector() {
                     }
                 }
             }
-            keys.clear();  // MUST happen before the next cycle's swap (above) -
-                           // an unclear `keys` would hand last cycle's already-
-                           // processed keys back into core_->dirty instead of
-                           // draining it.
             for (const auto& rec : snap) {
                 try {
                     project_record(rec);
