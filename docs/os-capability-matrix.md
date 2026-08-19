@@ -379,16 +379,16 @@ implementation is.
 | installed_apps | list_inventory | linux | supported | 3 | popen(dpkg-query / rpm / pacman / apk) | - |
 | installed_apps | list_inventory | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
 | installed_apps | list_inventory | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
-| interaction | notify | linux | supported | 3 | notify_send | - |
+| interaction | notify | linux | supported | 2 | notify_send | - |
 | interaction | notify | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
 | interaction | notify | windows | supported | 1 | shell_notifyicon | - |
-| interaction | message_box | linux | supported | 3 | zenity | - |
+| interaction | message_box | linux | supported | 2 | zenity | - |
 | interaction | message_box | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
 | interaction | message_box | windows | supported | 1 | messageboxw | - |
-| interaction | input | linux | supported | 3 | zenity | - |
+| interaction | input | linux | supported | 2 | zenity | - |
 | interaction | input | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
 | interaction | input | windows | supported | 3 | powershell_inputbox | - |
-| interaction | survey | linux | supported | 3 | zenity | - |
+| interaction | survey | linux | supported | 2 | zenity | - |
 | interaction | survey | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
 | interaction | survey | windows | supported | 3 | powershell_winforms | - |
 | interaction | set_dnd | linux | supported | 1 | local_kv_store | - |
