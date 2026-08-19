@@ -943,14 +943,15 @@ split is what makes a fleet-wide spark boot failure visible at all.
 **All series carry an `os` label** — `file` and `registry` mechanisms are
 Windows-only, `service` is Windows + Linux, macOS has none — so **query and alert
 per OS, never `sum without(os)`** (a cross-OS aggregate is meaningless for a
-single-platform mechanism). Four families additionally carry a `mechanism` label
-(`file` / `registry` / `service`): `_watch_rejected`, `_quarantined` and `_slow_op`
+single-platform mechanism). Five families additionally carry a `mechanism` label
+(`file` / `registry` / `service`): `_mechanisms` is a live per-agent capability
+gauge (see its own row above); `_watch_rejected`, `_quarantined` and `_slow_op`
 are fleet **sums of monotonic per-agent counters**, so a bare `> 0` alert **latches**
 until the reporting agent restarts — the shipped **counter** alert templates
 (disabled until rung 2) use `increase(...[15m]) > 0` instead. `_unsupported` (F7,
-#2298 rung 2) is the exception: a **live current gauge**, not a counter - it can
-legally decrease, so it must never be alerted on with `increase()`/latching logic;
-see its own row below. One rule ships
+#2298 rung 2) is the other gauge exception: a **live current gauge**, not a
+counter - it can legally decrease, so it must never be alerted on with
+`increase()`/latching logic; see its own row below. One rule ships
 **active** today: `YuzuSparkBootFailed` on `_failed` (a per-sweep state gauge,
 latch-free) — warning severity, 30m hold (see `docs/prometheus/yuzu-alerts.yml`,
 group `yuzu-fleet-spark-rung1`).
@@ -973,7 +974,7 @@ upgraded to a spark-capable (rung-1+) build. During a phased agent rollout of a
 | `yuzu_fleet_spark_watch_rejected{os,mechanism}` | gauge | Fleet sum of cumulative watch-cap rejections (a rule that could not arm — denial-of-detection). 0 at rung 1 |
 | `yuzu_fleet_spark_quarantined{os,mechanism}` | gauge | Fleet sum of cumulative mechanism quarantines — a structural leak that should stay 0. 0 at rung 1 |
 | `yuzu_fleet_spark_slow_op{os,mechanism}` | gauge | Fleet sum of cumulative slow watch/unwatch ops (a stalled/contended watcher). 0 at rung 1 |
-| `yuzu_fleet_spark_unsupported{os,mechanism}` | gauge | Fleet sum of rules **currently** classified `unsupported` - a known spark type with no mechanism on that host, enforced by **neither** backend (F7, #2298 rung 2). A **live** gauge recomputed every sweep, not cumulative - it can legally decrease (e.g. a mechanism becoming available, or the rule being disabled/removed). Routine and expected, not page-worthy: every rule on macOS reads `unsupported` today, since macOS registers none of file/registry/service |
+| `yuzu_fleet_spark_unsupported{os,mechanism}` | gauge | Fleet sum of rules **currently** classified `unsupported` - a known spark type with no mechanism on that host, enforced by **neither** backend (F7, #2298 rung 2). A **live** gauge recomputed every sweep, not cumulative - it can legally decrease (e.g. a mechanism becoming available, or the rule being disabled/removed). **0 today**: classification only runs once an agent's `prefer_spark` is enabled, which is not yet true anywhere in production (see `yuzu.guardian_backend`, still `legacy` fleet-wide). Once enabled, every rule on macOS reads `unsupported`, since macOS registers none of file/registry/service - routine and expected there, not page-worthy |
 | `yuzu_fleet_spark_watch_faults{os}` | gauge | Fleet sum of cumulative post-arm watch-fault edges (`watch_faults_total`). 0 at rung 1 |
 | `yuzu_fleet_spark_queued_dropped{os}` | gauge | Fleet sum of cumulative queued events dropped (bounded-queue overflow + shutdown). On the enforce lane (rung 3) a drop is a silent compliance failure. 0 at rung 1 |
 | `yuzu_fleet_spark_consumer_errors{os}` | gauge | Fleet sum of cumulative queued handlers that threw (`consumer_errors_total`). 0 at rung 1 |
