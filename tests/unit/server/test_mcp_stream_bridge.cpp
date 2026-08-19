@@ -2062,6 +2062,62 @@ TEST_CASE("bridge teardown retry - shutdown racing a retry whose terminal build 
     CHECK(fx.bridge->record_count() == 0);  // shutdown's walk reclaimed it
 }
 
+TEST_CASE("bridge teardown - an entry-lock failure is CONTAINED, never terminates the "
+          "process (post-merge review finding, #2513)",
+          "[mcp][bridge][2f][2513]") {
+    // Post-merge review on this branch found teardown_claimed's entry-lock
+    // acquisition (attempt bookkeeping + Step-1 idempotence read) was the one
+    // rec->mu site in this function NOT wrapped in the contained() helper every
+    // sibling step already uses for the identical modelled fault - a throw there
+    // would escape the function's own noexcept boundary and std::terminate() the
+    // whole process on the maintenance thread, not just strand one record. This
+    // proves the fix: a fault at the entry lock is caught, logged, and the call
+    // returns cleanly with NO bookkeeping mutated - attempts is not incremented,
+    // teardown_retry_claimable is never set (since mark_retry_or_exhausted is
+    // never reached), so the record is NOT auto-retried by a later Pass R tick -
+    // it sits torn_down and fully unresolved until shutdown() reclaims it. That
+    // is a real degradation from the fault-free path, but it is a degradation,
+    // not a crash - which is the whole point of containing it.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-entry-lock"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+
+    fx.clock_s->store(1801);  // idle_ttl + 1: session-death claims it, decision kNone
+    fx.bridge->inject_record_entry_lock_fault_for_test(1);
+    REQUIRE_NOTHROW(fx.bridge->sweep());  // the claim commits; teardown_claimed's
+                                          // entry lock then fails and is contained
+
+    // SELF-VALIDATING at the boundary that matters most: no exception reached the
+    // caller, no std::terminate - REQUIRE_NOTHROW above already proves that. The
+    // record is claimed (torn_down) but nothing about its teardown bookkeeping
+    // advanced: no audit row was ever written for this attempt (bailed before any
+    // audit_contained call is reachable), and it stays fully retained.
+    CHECK(fx.bridge->record_count() == 1);
+    CHECK(fx.audit_count("mcp.bridge.session_dead") == 0);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", "unsubscribe"}})
+              .value() == 0.0);
+
+    // Not auto-retried: teardown_retry_claimable was never set (mark_retry_or_exhausted
+    // is never reached from the entry bail), so Pass R has nothing to claim. A second,
+    // unfaulted sweep changes nothing for this record.
+    REQUIRE_NOTHROW(fx.bridge->sweep());
+    CHECK(fx.bridge->record_count() == 1);
+
+    // shutdown() is the only reclaimer left. teardown_terminal_handled was never
+    // set true (Step 1 was never reached), so should_poison's predicate reads it
+    // as unresolved and poisons - the conservative, safe default for "genuinely
+    // don't know whether anything was ever owed to this client."
+    fx.bridge->shutdown();
+    CHECK(fx.bridge->record_count() == 0);
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 1);
+    auto attached = s.stream->attach_and_replay(0, nullptr, "alice");
+    CHECK(attached.status == mcp::McpStreamState::AttachStatus::kPoisoned);
+}
+
 TEST_CASE("bridge subscribe() is an exactly-once state-checked transition (#2487 review)",
           "[mcp][bridge][2f]") {
     // This gate is what makes teardown_claimed's lock-free BORROW of execution_id

@@ -760,6 +760,14 @@ public:
     /// so a later release repairs it. The split version cleared the flag first,
     /// and a throw then stranded streamed_unpinned_[session] forever.
     void inject_charge_lock_fault_for_test(int times = 1);
+    /// The NEXT `times` calls into teardown_claimed() throw at its entry lock
+    /// (attempt bookkeeping / Step-1 idempotence read) - the same modelled mutex
+    /// failure as the claim/charge seams above, at the one lock every retry
+    /// attempt takes first. Proves the entry lock is CONTAINED rather than
+    /// escaping teardown_claimed's noexcept boundary (which would terminate the
+    /// process): a hit here must leave attempts NOT incremented and the record
+    /// untouched - this call never happened as far as its bookkeeping goes.
+    void inject_record_entry_lock_fault_for_test(int times = 1);
     /// Override the reaper clock for deterministic age tests (default:
     /// steady_clock::now). Only the difference between calls matters.
     void set_clock_for_test(ClockFn clock);
@@ -1327,6 +1335,7 @@ private:
     std::function<void(TeardownStage, bool)> teardown_step_probe_for_test_;
     std::atomic<int> terminal_build_fault_{0}; ///< remaining teardown frame-build throws (test seam)
     std::atomic<int> charge_lock_fault_{0};    ///< remaining release_charge lock throws (#2529 seam)
+    std::atomic<int> record_entry_lock_fault_{0}; ///< remaining teardown_claimed entry-lock throws (test seam)
     ClockFn clock_;                            ///< reaper clock (default steady_clock::now)
     /// #2791 test seam: the post-ladder-publish, pre-pin-stamp stall. Distinct
     /// mutex from `bridge_mu_`/`BridgeRecord::mu` on purpose - the whole point of

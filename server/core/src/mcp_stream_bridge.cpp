@@ -2529,11 +2529,37 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     // attempt's result, replayed below instead of re-publishing.
     bool terminal_already_handled = false;
     TerminalRung stored_rung = TerminalRung::kNotAttempted;
-    {
+    const bool entry_ok = contained([&] {
+        if (record_entry_lock_fault_.load(std::memory_order_relaxed) > 0 &&
+            record_entry_lock_fault_.fetch_sub(1, std::memory_order_acq_rel) > 0) {
+            // inject_record_entry_lock_fault_for_test - the modelled mutex
+            // failure, thrown before the lock so it models the acquisition
+            // itself failing, same shape as the claim/charge seams.
+            throw std::system_error(std::make_error_code(std::errc::resource_deadlock_would_occur),
+                                    "injected teardown entry lock failure");
+        }
         std::lock_guard<std::mutex> rlk(rec->mu);
         ++rec->teardown_attempts;
         terminal_already_handled = rec->teardown_terminal_handled;
         stored_rung = rec->teardown_last_rung;
+    });
+    if (!entry_ok) {
+        // rec->mu itself failed to lock - every later site in this call locks the
+        // SAME mutex, so nothing past this point can be trusted to succeed either.
+        // Bail without touching bookkeeping: attempts is NOT incremented (the
+        // lock_guard construction throws before entering its own body, so none of
+        // the three statements above ran), so this call never happened as far as
+        // the record's own state is concerned. The record stays torn_down,
+        // unresolved, and un-reclaimed by any later retry pass (its
+        // teardown_retry_claimable, if this was itself a retry, is already false -
+        // Pass R cleared it before calling in) - degraded until shutdown() reaps
+        // it, but the alternative is std::terminate() on the maintenance thread.
+        (void)contained([&] {
+            spdlog::error("MCP bridge teardown entry lock failed [execution_id={}]: "
+                          "resource retained, this attempt did not run",
+                          exec_id);
+        });
+        return;
     }
 
     // ── Step 1: PUBLISH the decided disposition ────────────────────────────────
@@ -2625,11 +2651,27 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     // already handled can replay this exact disposition without re-running Step
     // 1 - skipped when terminal_already_handled, since nothing changed this time.
     if (!terminal_already_handled) {
-        std::lock_guard<std::mutex> rlk(rec->mu);
-        rec->teardown_terminal_handled =
-            decision == TeardownFinal::kNone || rung != TerminalRung::kNotAttempted;
-        rec->teardown_decision = decision;
-        rec->teardown_last_rung = rung;
+        const bool persist_ok = contained([&] {
+            std::lock_guard<std::mutex> rlk(rec->mu);
+            rec->teardown_terminal_handled =
+                decision == TeardownFinal::kNone || rung != TerminalRung::kNotAttempted;
+            rec->teardown_decision = decision;
+            rec->teardown_last_rung = rung;
+        });
+        // On failure the write above never happened, so rec->teardown_terminal_handled
+        // stays at its prior value - false, since terminal_already_handled was false
+        // to reach this branch. That is exactly the safe fallback: a later retry
+        // reads it as unhandled and re-runs Step 1 rather than wrongly skipping a
+        // terminal this attempt may or may not have actually delivered. No corrective
+        // action needed beyond containment; the rest of THIS call still uses the
+        // local `decision`/`rung` below, not the (possibly unpersisted) fields.
+        if (!persist_ok) {
+            (void)contained([&] {
+                spdlog::error("MCP bridge teardown terminal-state persist failed "
+                              "[execution_id={}]: a later retry will re-attempt Step 1",
+                              exec_id);
+            });
+        }
     }
 
     // Derived ONCE and passed to every audit site below, bail or not. See
@@ -2654,13 +2696,24 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     const auto mark_retry_or_exhausted = [&]() noexcept -> bool {
         std::size_t attempts = 0;
         bool eligible = false;
-        {
+        const bool lock_ok = contained([&] {
             std::lock_guard<std::mutex> rlk(rec->mu);
             attempts = rec->teardown_attempts;
             eligible = attempts <= cfg_.teardown_retry_max;
             if (eligible) {
                 rec->teardown_retry_claimable = true;
             }
+        });
+        // A lock failure here is treated exactly like exhaustion: we cannot safely
+        // COMMIT teardown_retry_claimable=true without knowing the write actually
+        // landed, so the conservative choice is to fall through to the already-
+        // written !eligible branch below (count+log exhausted, retained-until-
+        // shutdown) rather than risk marking a record retryable when the flag may
+        // never have been set. A healthy record spuriously exhausted by a rare
+        // lock hiccup is a graceful degradation; retrying a mutation that silently
+        // failed to commit would not be.
+        if (!lock_ok) {
+            eligible = false;
         }
         if (!eligible) {
             count_teardown_retry(TeardownRetryOutcome::kExhausted);
@@ -2830,11 +2883,15 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     // cleared; count that as recovered - it is evidence the retry design is
     // doing its job, not just that a first attempt happened to succeed.
     std::size_t attempts = 0;
-    {
+    const bool attempts_read_ok = contained([&] {
         std::lock_guard<std::mutex> rlk(rec->mu);
         attempts = rec->teardown_attempts;
-    }
-    if (attempts > 1) {
+    });
+    // Purely observability: steps 1-4 have already succeeded by this point (the
+    // record IS settling correctly regardless), so a lock failure here just means
+    // skipping the "recovered" metric bump rather than risking anything on an
+    // unknown attempts count.
+    if (attempts_read_ok && attempts > 1) {
         count_teardown_retry(TeardownRetryOutcome::kRecovered);
     }
     // kNone contributes no disposition at all, so a clean pin-ack / session-death
@@ -3239,6 +3296,10 @@ void McpStreamBridge::inject_terminal_build_fault_for_test(int times) {
 
 void McpStreamBridge::inject_charge_lock_fault_for_test(int times) {
     charge_lock_fault_.store(times, std::memory_order_release);
+}
+
+void McpStreamBridge::inject_record_entry_lock_fault_for_test(int times) {
+    record_entry_lock_fault_.store(times, std::memory_order_release);
 }
 
 void McpStreamBridge::set_clock_for_test(ClockFn clock) { clock_ = std::move(clock); }
