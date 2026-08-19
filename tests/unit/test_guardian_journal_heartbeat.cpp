@@ -190,8 +190,9 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     // it would be dead code asserting a coverage claim this test cannot make. Its
     // emitter<->reader agreement is proven separately (test_spark_fleet_tags.cpp's
     // writer<->reader bind + test_guardian_unsupported_heartbeat.cpp's key pins); no
-    // doc-scrape exists for yuzu.spark_* since metrics.md names no individual spark
-    // wire keys to check.
+    // doc-scrape exists for yuzu.spark_* since metrics.md contains no yuzu.-prefixed
+    // spark wire-key literal for a scrape to match (only the yuzu.spark_* family
+    // glob; prose mentions like spark_running are unprefixed).
     emit_guardian_health_heartbeat_tags(
         emitted, GuardianHealthStats{
                      .unhealthy_suppressed = 1, .unhealthy_refreshed = 1, .priority_demoted = 1});
