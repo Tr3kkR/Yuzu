@@ -22,6 +22,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <yuzu/metrics.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -220,6 +221,52 @@ TEST_CASE("AnalyticsEventStore: migrates and opens", "[pg][analytics_store][db]"
 
     AnalyticsEventStore store(pool);
     REQUIRE(store.is_open());
+}
+
+TEST_CASE("AnalyticsEventStore: a failed open stays constructed-but-degraded, "
+          "not reset (ADR-0049 construction-posture regression guard)",
+          "[analytics_store][construction]") {
+    // Unroutable DSN (TEST-NET-1, RFC 5737) with a tight connect_timeout so
+    // this case fails fast instead of eating the default connect timeout
+    // (governance Gate 4 unhappy-path UP-9's fixture advisory) — matches
+    // the ResponseStore precedent (test_response_store.cpp, #1634 UP-2).
+    // No PgTestTemplate/real Postgres needed: this exercises the
+    // never-opens path, not real query behavior, so it is intentionally
+    // NOT [pg]-tagged and runs unconditionally.
+    PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
+    AnalyticsEventStore store(bad_pool);
+
+    // The regression this guards: an earlier version of this store's
+    // construction called analytics_store_.reset() on this exact path,
+    // which this test cannot observe since a caller here holds the object
+    // directly rather than through ServerImpl's unique_ptr — the contract
+    // under test is that the OBJECT ITSELF stays usable-but-degraded.
+    REQUIRE_FALSE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    AnalyticsEvent event;
+    event.event_type = "test.event";
+    store.emit(event); // must fail-soft, never throw/block
+
+    CHECK(metrics
+              .counter("yuzu_server_analytics_emit_dropped_total",
+                       {{"reason", "store_not_open"}})
+              .value() == 1);
+
+    auto pending = store.pending_count();
+    CHECK_FALSE(pending.has_value());
+    auto recent = store.query_recent();
+    CHECK_FALSE(recent.has_value());
+    CHECK(metrics
+              .counter("yuzu_server_analytics_read_degrade_total",
+                       {{"method", "pending_count"}, {"reason", "store_not_open"}})
+              .value() == 1);
+    CHECK(metrics
+              .counter("yuzu_server_analytics_read_degrade_total",
+                       {{"method", "query_recent"}, {"reason", "store_not_open"}})
+              .value() == 1);
 }
 
 TEST_CASE("AnalyticsEventStore: emit and query_recent", "[pg][analytics_store]") {

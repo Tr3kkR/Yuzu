@@ -7498,18 +7498,6 @@ public:
         // declaration order alone.
         agent_service_.set_notification_store(nullptr);
         notification_store_.reset();
-        // AnalyticsEventStore (ADR-0049) borrows pg_pool_ — same destruct-
-        // before-pool discipline as every sibling PG-backed store above
-        // (governance Gate 2, 2026-08-16: this store was the one missing
-        // from this proactive-reset sequence, left holding a dangling
-        // `PgPool&` past pg_pool_.reset() below — new to this migration,
-        // since the SQLite predecessor never borrowed the pool at all).
-        // The drain thread is already joined via stop_drain() above; unwire
-        // the borrowed raw pointer from both ingest services first.
-        agent_service_.set_analytics_store(nullptr);
-        if (gateway_service_)
-            gateway_service_->set_analytics_store(nullptr);
-        analytics_store_.reset();
         // WebhookStore / OffloadTargetStore (#3261 governance hardening).
         // flush_all() runs HERE, after the gRPC drain above, not before it -
         // an earlier version ran it before Shutdown(deadline), which missed
@@ -7551,21 +7539,31 @@ public:
         // deferred to Dave to adjudicate, not resolved by this comment.
         //
         // SCOPE NOTE (Fable/architect + Codex/Sol cross-review, ADR-0049,
-        // 2026-08-19): the same forward_gateway_pending() ->
+        // 2026-08-19; refined governance Gate 4/8, 2026-08-19, unhappy-path
+        // UP-4): the same forward_gateway_pending() ->
         // process_gateway_response() path also reaches response_store_,
-        // notification_store_, and (new to this migration) analytics_store_
-        // directly - not through fire_event(), but via their own plain
-        // (non-atomic) pointers inside that function body - with the exact
-        // same lack of synchronization against this stop()'s teardown. Named
-        // here because this comment previously enumerated only
+        // notification_store_, and analytics_store_ directly - not through
+        // fire_event(), but via their own plain (non-atomic) pointers
+        // inside that function body - with the exact same lack of
+        // synchronization against this stop()'s teardown. Named here
+        // because this comment previously enumerated only
         // webhook_store_/offload_target_store_ and undercounted #3279's
         // actual reach; the fix (join/drain forward_gateway_pending()'s
         // workers before any store it can touch is unwired/destroyed) is
-        // the same fix for all of them, not a per-pointer patch, and
-        // analytics_store_ is not a NEW risk class introduced by this PR -
-        // it was already live-and-wired on this exact path before this
-        // migration (the SQLite predecessor was never nulled-then-reset
-        // proactively in stop() either, it just dangled less visibly).
+        // the same fix for all of them, not a per-pointer patch.
+        // analytics_store_'s exposure is NOT uniform, unlike the other two:
+        // on a HEALTHY boot it was already live-and-wired on this exact
+        // path before this migration (the SQLite predecessor was never
+        // nulled-then-reset proactively in stop() either, it just dangled
+        // less visibly) - no change there. But on a FAILED-open boot, the
+        // predecessor-era `.reset()` on this store (removed by ADR-0049's
+        // construction-posture fix, which keeps the object alive instead)
+        // meant a degraded store was NEVER wired to this path at all - the
+        // pointer was permanently null, so process_gateway_response()'s
+        // guard always no-op'd. The sentinel restoration makes a degraded
+        // store wired for the ENTIRE process uptime instead of never - a
+        // genuine widening of this store's exposure on that one deployment
+        // shape, confirmed and NOT a mischaracterization to soften.
         // #3279 should be updated to name the full reach set.
         //
         // On timeout: escalate via std::_Exit, the SAME choice web_thread_
@@ -7711,6 +7709,27 @@ public:
         // join — same discipline as the sibling PG stores above.
         agent_service_.set_tag_store(nullptr);
         tag_store_.reset();
+        // AnalyticsEventStore (ADR-0049) borrows pg_pool_ — same destruct-
+        // before-pool discipline as every sibling PG-backed store above,
+        // deliberately torn down LAST among this group, immediately before
+        // pg_pool_.reset() (governance Gate 8, 2026-08-19, architect
+        // finding): this store is one of the three named in the #3279 SCOPE
+        // NOTE below as reachable via forward_gateway_pending()'s untracked
+        // detached thread, which neither Shutdown(deadline) above nor
+        // quiesce() on Webhook/Offload drains. Placing this block first (an
+        // earlier merge resolution) put it ahead of Webhook/Offload's own
+        // up-to-60s quiesce, maximizing rather than minimizing its exposed-
+        // as-freed window across the REST of this function's ~60+s tail.
+        // This ordering restores the SQLite predecessor's effective free-
+        // point (member destruction only after stop()'s entire body had
+        // already run) — it REDUCES, does not ELIMINATE, that window: the
+        // underlying race is the pre-existing #3279 class, not fixed here.
+        // The drain thread is already joined via stop_drain() above; unwire
+        // the borrowed raw pointer from both ingest services first.
+        agent_service_.set_analytics_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_analytics_store(nullptr);
+        analytics_store_.reset();
         pg_pool_.reset();
     }
 

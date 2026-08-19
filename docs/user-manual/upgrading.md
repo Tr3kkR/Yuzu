@@ -669,20 +669,30 @@ legacy `analytics.db` is **never read** on upgrade.
 - If analytics collection is disabled (`--no-analytics`), no store is
   constructed and no log line is emitted for it. If it's enabled but the
   schema fails to migrate, the server logs an error
-  (`[PG] analytics-event store migration/open failed ...`) and continues
-  running with analytics collection off for that run. Either way, a broken
-  analytics store never blocks server startup (this store is the one
-  Postgres-backed store on this ladder that does NOT fail the server closed
-  on a construction failure; see ADR-0049) — `/readyz`'s `degraded` field
-  (not `failed_stores`) names it when it's on but dead, without affecting the
+  (`[PG] analytics-event store migration/open failed ...`) and the store
+  stays constructed but degraded for that run (`is_open()==false`) — it
+  keeps accepting `emit()` calls, which fail-soft and count a
+  `store_not_open` drop, and `/api/analytics/status`/`/api/analytics/recent`
+  return `503` rather than a `200`. Either way, a broken analytics store
+  never blocks server startup (this store is the one Postgres-backed store
+  on this ladder that does NOT fail the server closed on a construction
+  failure; see ADR-0049) — `/readyz`'s `degraded` field (not
+  `failed_stores`) names it when it's on but dead, without affecting the
   node's ready/not-ready status.
+- **The store does not retry a failed open.** `is_open()` is latched once at
+  construction — a Postgres blip that resolves moments after boot still
+  leaves the store degraded for the rest of that process's uptime. Restart
+  the server once Postgres connectivity for the configured DSN is confirmed
+  restored; there is no in-process self-heal to wait out instead.
 - **The Settings page's Enabled/Disabled analytics label is not accurate in
   the migration-failed case above** (governance Gate 6 finding, 2026-08-16) —
   it reads the `--no-analytics` config flag directly, not whether the store
   actually opened, so it can still say "Enabled" while a failed migration has
-  silently disabled collection for the run. Check `/readyz`'s `degraded`
-  field or `GET /api/analytics/status` (`"enabled":false` in this case) for
-  the accurate state, not the Settings page, until this is wired up.
+  left collection degraded for the run. Check `/readyz`'s `degraded` field
+  or `GET /api/analytics/status` (`503 {"error":{"message":"analytics store
+  degraded"}}` in this case — NOT `"enabled":false`, which is reserved for
+  `--no-analytics`) for the accurate state, not the Settings page, until
+  this is wired up.
 - **Security note, separate from the cutover itself:** this release also
   fixes a pre-existing issue in the same store — `AnalyticsEvent.session_id`
   is now a hash of the session cookie, not the raw bearer token. If a token

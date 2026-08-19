@@ -2409,6 +2409,35 @@ groups:
             not read a scoped operator's short/empty list as authoritative while
             this fires.
           runbook_url: "https://docs.yuzu.io/runbooks/management-groups"
+      - alert: YuzuAnalyticsStoreNotOpen
+        # AnalyticsEventStore (ADR-0049) failed to open at boot and is
+        # DEGRADED FOR THE ENTIRE PROCESS UPTIME — is_open() is latched
+        # once at construction and never retried (governance Gate 8,
+        # 2026-08-19), so this condition does not self-heal even if
+        # Postgres connectivity recovers; a restart is required. Analytics
+        # is deliberately non-critical/expendable telemetry (this store is
+        # the one PG-backed store on the ladder that does NOT fail the
+        # server closed on a construction failure) so this stays a warning,
+        # not a page — but it's worth knowing about, since without this
+        # alert the only signals are a boot-time log line and /readyz's
+        # non-gating degraded field, both easy to miss on a long-running
+        # process. reason="store_not_open" specifically (not
+        # pool_acquire_timeout/query_error, which are transient runtime
+        # blips on an otherwise-open store, not this durable condition).
+        expr: |
+          sum(rate(yuzu_server_analytics_emit_dropped_total{reason="store_not_open"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AnalyticsEventStore failed to open at boot and will not self-heal"
+          description: >-
+            yuzu_server_analytics_emit_dropped_total{reason="store_not_open"}
+            is non-zero: the analytics store failed to open (schema
+            migration or initial connection) and is dropping every emit.
+            Check Postgres reachability for the configured DSN, then
+            restart the server - this does not recover on its own.
+          runbook_url: "https://docs.yuzu.io/user-manual/upgrading#postgres-cutover"
       - alert: YuzuMgmtGroupBackfillFailing
         # The one-time SQLite->Postgres confinement backfill (ADR-0042) reported
         # a failed outcome. The server fails closed at boot on a backfill failure
