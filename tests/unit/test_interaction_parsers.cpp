@@ -2,16 +2,20 @@
  * test_interaction_parsers.cpp — pure interaction parse helpers
  * (interaction_parsers.hpp, macOS parity 1.3).
  *
- * The popen shell-out is the impure shell; the decision-shaped decoding of the
- * try/on-error `osascript display dialog` sentinel output is header-pure and
- * pinned here on every host (the licensing_parsers.hpp pattern). The honest-
- * status invariant is the point: anything that is not an offered button or the
- * -128 user-cancel decodes to not_reachable, never a fabricated response.
+ * The runner-backed argv spawn in interaction_plugin.cpp is the impure
+ * shell; the decision-shaped decoding of the try/on-error `osascript
+ * display dialog` sentinel output is header-pure and pinned here on every
+ * host (the licensing_parsers.hpp pattern). The honest-status invariant is
+ * the point: anything that is not an offered button or the -128 user-cancel
+ * decodes to not_reachable, never a fabricated response.
  */
 
 #include "interaction_parsers.hpp"
 
+#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
+#include <string_view>
+#include <vector>
 
 using namespace yuzu::interaction;
 
@@ -49,44 +53,57 @@ TEST_CASE("dialog: unreachable session / missing binary / garbage is never a fal
     CHECK(parse_dialog_result("button returned:OK") == DialogOutcome::not_reachable);
 }
 
-TEST_CASE("build_dialog_command: exact AppleScript shape, pinned against a typo regression",
+TEST_CASE("build_dialog_argv: exact AppleScript argv shape, pinned against a typo regression",
           "[interaction]") {
-    const auto cmd = build_dialog_command("Alert", "Something happened",
-                                          "buttons {\"OK\"} default button \"OK\"");
-    // Title/message land in the one interpolated display-dialog line; every
-    // other fragment (try/on-error/end-try + both sentinel returns) is a
-    // fixed literal a future edit could typo without any compiler diagnostic
-    // — this pins the exact source text parse_dialog_result's contract
-    // depends on.
-    CHECK(cmd ==
-          "osascript -e 'try' "
-          "-e 'display dialog \"Something happened\" with title \"Alert\" "
-          "buttons {\"OK\"} default button \"OK\"' "
-          "-e 'return \"##BTN##\" & (button returned of result)' "
-          "-e 'on error errMsg number errNum' "
-          "-e 'return \"##ERR##\" & errNum' "
-          "-e 'end try' 2>&1");
+    const auto argv = build_dialog_argv("Alert", "Something happened",
+                                        "buttons {\"OK\"} default button \"OK\"");
+    // Title/message land in the one interpolated display-dialog fragment;
+    // every other fragment (try/on-error/end-try + both sentinel returns) is
+    // a fixed literal a future edit could typo without any compiler
+    // diagnostic — this pins the exact source text parse_dialog_result's
+    // contract depends on. One vector element per -e flag/fragment pair, no
+    // shell string, no `2>&1` (stderr merge is expressed via SubprocessOptions
+    // at the call site, not shell redirection).
+    const std::vector<std::string> expected = {
+        "-e", "try",
+        "-e", "display dialog \"Something happened\" with title \"Alert\" "
+              "buttons {\"OK\"} default button \"OK\"",
+        "-e", "return \"##BTN##\" & (button returned of result)",
+        "-e", "on error errMsg number errNum",
+        "-e", "return \"##ERR##\" & errNum",
+        "-e", "end try",
+    };
+    CHECK(argv == expected);
 }
 
-TEST_CASE("build_dialog_command: btn_spec is threaded through verbatim per button config",
+TEST_CASE("build_dialog_argv: btn_spec is threaded through verbatim per button config",
           "[interaction]") {
-    CHECK(build_dialog_command("T", "M", "buttons {\"OK\"} default button \"OK\"")
-              .contains("buttons {\"OK\"} default button \"OK\"'"));
-    CHECK(build_dialog_command("T", "M", "buttons {\"Cancel\", \"OK\"} default button \"OK\"")
-              .contains("buttons {\"Cancel\", \"OK\"} default button \"OK\"'"));
-    CHECK(build_dialog_command("T", "M", "buttons {\"No\", \"Yes\"} default button \"Yes\"")
-              .contains("buttons {\"No\", \"Yes\"} default button \"Yes\"'"));
+    auto contains_fragment = [](const std::vector<std::string>& argv, std::string_view needle) {
+        return std::any_of(argv.begin(), argv.end(),
+                           [&](const std::string& s) { return s.find(needle) != std::string::npos; });
+    };
+    CHECK(contains_fragment(build_dialog_argv("T", "M", "buttons {\"OK\"} default button \"OK\""),
+                            "buttons {\"OK\"} default button \"OK\""));
+    CHECK(contains_fragment(
+        build_dialog_argv("T", "M", "buttons {\"Cancel\", \"OK\"} default button \"OK\""),
+        "buttons {\"Cancel\", \"OK\"} default button \"OK\""));
+    CHECK(contains_fragment(
+        build_dialog_argv("T", "M", "buttons {\"No\", \"Yes\"} default button \"Yes\""),
+        "buttons {\"No\", \"Yes\"} default button \"Yes\""));
     // The sentinel/control-flow skeleton is identical regardless of button
-    // config — only the one display-dialog line varies.
+    // config — only the one display-dialog fragment varies.
     for (auto* spec : {"buttons {\"OK\"} default button \"OK\"",
                        "buttons {\"Cancel\", \"OK\"} default button \"OK\"",
                        "buttons {\"No\", \"Yes\"} default button \"Yes\""}) {
-        const auto cmd = build_dialog_command("T", "M", spec);
-        CHECK(cmd.starts_with("osascript -e 'try' "));
-        CHECK(cmd.ends_with("-e 'end try' 2>&1"));
-        CHECK(cmd.contains("-e 'return \"##BTN##\" & (button returned of result)' "));
-        CHECK(cmd.contains("-e 'on error errMsg number errNum' "));
-        CHECK(cmd.contains("-e 'return \"##ERR##\" & errNum' "));
+        const auto argv = build_dialog_argv("T", "M", spec);
+        REQUIRE(argv.size() == 12);
+        CHECK(argv.front() == "-e");
+        CHECK(argv[1] == "try");
+        CHECK(argv[10] == "-e");
+        CHECK(argv[11] == "end try");
+        CHECK(contains_fragment(argv, "return \"##BTN##\" & (button returned of result)"));
+        CHECK(contains_fragment(argv, "on error errMsg number errNum"));
+        CHECK(contains_fragment(argv, "return \"##ERR##\" & errNum"));
     }
 }
 

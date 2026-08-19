@@ -24,6 +24,7 @@
 #include <format>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace yuzu::interaction {
 
@@ -31,24 +32,31 @@ namespace yuzu::interaction {
 /// sentinel output. `not_reachable` is the fail-closed default.
 enum class DialogOutcome { ok, cancel, yes, no, not_reachable };
 
-/// Builds the try/on-error `display dialog` osascript invocation that
-/// `parse_dialog_result` below decodes. Pulled out as its own pure function
-/// (rather than left inline in the .cpp) so a typo in the AppleScript
-/// fragments — which would silently turn every real button press into
-/// `not_reachable` — is a unit-test failure, not a runtime-only regression.
-/// `safe_title`/`safe_msg` must already be sanitized by the caller; this
-/// function performs no escaping of its own.
-[[nodiscard]] inline std::string build_dialog_command(std::string_view safe_title,
-                                                       std::string_view safe_msg,
-                                                       std::string_view btn_spec) {
-    return std::format(
-        "osascript -e 'try' "
-        "-e 'display dialog \"{}\" with title \"{}\" {}' "
-        "-e 'return \"##BTN##\" & (button returned of result)' "
-        "-e 'on error errMsg number errNum' "
-        "-e 'return \"##ERR##\" & errNum' "
-        "-e 'end try' 2>&1",
-        safe_msg, safe_title, btn_spec);
+/// Builds the argv for the try/on-error `display dialog` osascript
+/// invocation that `parse_dialog_result` below decodes — one AppleScript
+/// fragment per `-e` argv element, exactly as osascript's own multi-`-e`
+/// form expects; no shell involved (osascript is a plain binary with an
+/// argv-native way to pass a multi-statement script, unlike a `-c`-style
+/// interpreter — ADR-3002 Decision 5 classifies this as a rung-2 argv
+/// candidate, not a Decision-7 shell exception). Pulled out as its own pure
+/// function (rather than left inline in the .cpp) so a typo in the
+/// AppleScript fragments — which would silently turn every real button
+/// press into `not_reachable` — is a unit-test failure, not a runtime-only
+/// regression. `safe_title`/`safe_msg` must already be sanitized by the
+/// caller; this function performs no escaping of its own (each fragment is
+/// its own argv element, so there is no shell-quoting surface to escape).
+[[nodiscard]] inline std::vector<std::string> build_dialog_argv(std::string_view safe_title,
+                                                                 std::string_view safe_msg,
+                                                                 std::string_view btn_spec) {
+    return {
+        "-e", "try",
+        "-e", std::format("display dialog \"{}\" with title \"{}\" {}", safe_msg, safe_title,
+                          btn_spec),
+        "-e", "return \"##BTN##\" & (button returned of result)",
+        "-e", "on error errMsg number errNum",
+        "-e", "return \"##ERR##\" & errNum",
+        "-e", "end try",
+    };
 }
 
 /// The osascript command wraps `display dialog` in try/on-error and returns
