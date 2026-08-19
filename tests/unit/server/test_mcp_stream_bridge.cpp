@@ -1830,6 +1830,138 @@ TEST_CASE("bridge teardown retry - a healed retry RE-PUBLISHES a terminal that n
     CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 0);
 }
 
+// Shared by both TSan cases below: park one record, expire it under session-death
+// (decision kNone - no publish to reason about), and burn a one-shot unsubscribe
+// fault on the FIRST attempt so the record lands torn_down + retry-eligible with
+// its terminal already resolved (kNone sets teardown_terminal_handled=true
+// unconditionally in Step 1, before Step 2 ever runs) - the race under test is
+// Pass R's retry claim, not the terminal ladder.
+namespace {
+Fx::Session make_retry_eligible_record(Fx& fx, const char* exec_id) {
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), exec_id));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+    fx.clock_s->store(1801);  // idle_ttl + 1: session-death claims it, decision kNone
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1));
+    fx.bridge->sweep();  // attempt 1: fails, torn_down + retry-eligible, terminal resolved
+    REQUIRE(fx.bridge->record_count() == 1);
+    return s;
+}
+}  // namespace
+
+TEST_CASE("bridge teardown retry - two concurrent sweeps retry-claim a record exactly "
+          "once (#2513, TSan)",
+          "[mcp][bridge][2f][2513]") {
+    // Same property as the #2409 qa-S5 first-claim race, applied to Pass R: the
+    // eligibility check-and-clear (torn_down && teardown_retry_claimable) commits
+    // under bridge_mu_ -> rec->mu in ONE critical section, so a second sweep()
+    // reaching the SAME retry-eligible record while the first is still mid-
+    // teardown_claimed (which runs OUTSIDE that lock, like every claim path) must
+    // find nothing left to claim. A plain two-thread racer loop (qa-S5's own
+    // shape) does not reliably land inside that window for a single record - the
+    // claim-to-clear gap is far narrower than a full sweep() call, so a natural
+    // race almost always resolves before either thread gets close (#3095 hit the
+    // identical problem for a different pass). Forced deterministically instead,
+    // the same way #3095 fixed it: the #2519 probe blocks sweep A right after it
+    // claims (kUnsubscribe entering, BEFORE that step's own work runs), then
+    // sweep B is issued from this thread while A is guaranteed to be holding the
+    // claim - the exact interleaving a natural race can miss.
+    Fx fx;
+    auto s = make_retry_eligible_record(fx, "exec-retry-race");
+    REQUIRE(fx.bus.subscriber_count("exec-retry-race") == 1);  // still held after attempt 1
+
+    std::mutex probe_mu;
+    std::condition_variable probe_cv;
+    bool sweep_a_blocked = false;
+    bool release_a = false;
+    bool wait_timed_out = false;  // set on the probe's own thread; asserted on the main thread
+                                   // below, never here - a failed Catch2 assertion off the main
+                                   // thread aborts the process instead of failing the test.
+    std::atomic<bool> first_entrant{false};
+    fx.bridge->set_teardown_step_probe_for_test([&](Bridge::TeardownStage stage, bool entering) {
+        if (stage != Bridge::TeardownStage::kUnsubscribe || !entering) {
+            return;
+        }
+        if (first_entrant.exchange(true)) {
+            return;  // NOT sweep A: pass straight through - blocking it too would deadlock
+                      // against sweep A's own wait for release_a below (std::call_once would
+                      // do exactly this: a second caller blocks until the first's invocation
+                      // completes, not skip past it - tried, deadlocked, this is the fix).
+        }
+        std::unique_lock<std::mutex> lk(probe_mu);
+        sweep_a_blocked = true;
+        probe_cv.notify_all();
+        if (!probe_cv.wait_for(lk, std::chrono::seconds(5), [&] { return release_a; })) {
+            wait_timed_out = true;
+        }
+    });
+
+    auto sweep_a = std::async(std::launch::async, [&] { fx.bridge->sweep(); });
+    {
+        std::unique_lock<std::mutex> lk(probe_mu);
+        REQUIRE(probe_cv.wait_for(lk, std::chrono::seconds(5), [&] { return sweep_a_blocked; }));
+    }
+    fx.bridge->sweep();  // sweep B: Pass R reaches the same record while A holds the claim
+    {
+        std::lock_guard<std::mutex> lk(probe_mu);
+        release_a = true;
+        probe_cv.notify_all();
+    }
+    sweep_a.get();
+    fx.bridge->set_teardown_step_probe_for_test(nullptr);
+    REQUIRE_FALSE(wait_timed_out);
+
+    CHECK(fx.bridge->record_count() == 0);
+    CHECK(fx.bus.subscriber_count("exec-retry-race") == 0);
+    // Exactly one retry pass actually ran teardown_claimed to completion - not
+    // zero (the record must resolve) and not two (B winning the claim too would
+    // double-count this: a second full pass over the same charge/subscription/
+    // erase, and a second `recovered` row).
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "recovered"}})
+              .value() == 1.0);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "exhausted"}})
+              .value() == 0.0);
+    CHECK(fx.audit_count("mcp.bridge.teardown_retry") == 1);
+}
+
+TEST_CASE("bridge teardown retry - a retry claim racing shutdown reaps once, no double "
+          "teardown (#2513, TSan)",
+          "[mcp][bridge][2f][2513]") {
+    // Pass R's claim (unlike the original pressure claim qa-B2 races) commits
+    // UNDER bridge_mu_ and rechecks shutdown_started_ inside that same lock, so
+    // shutdown() cannot start mid-CLAIM the way the original claim allows - but
+    // Pass R's teardown_claimed(...) call itself still runs OUTSIDE bridge_mu_
+    // (same as every other claim path), so shutdown()'s walk can still race a
+    // WON claim's in-flight teardown. Either reclaimer may end up doing the
+    // actual work; what must hold is no crash and no double-processing.
+    Fx fx;
+    auto s = make_retry_eligible_record(fx, "exec-retry-shutdown");
+
+    auto sweeper = std::async(std::launch::async, [&] {
+        for (int i = 0; i < 300; ++i) {
+            fx.bridge->sweep();
+        }
+    });
+    fx.bridge->shutdown();
+    sweeper.get();
+
+    CHECK(fx.bridge->record_count() == 0);  // one reclaimer or the other got it
+    // At most one retry pass can ever complete teardown_claimed for this one
+    // record (a second would find teardown_retry_claimable already false or the
+    // record already gone from records_).
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "recovered"}})
+              .value() <= 1.0);
+    CHECK(fx.audit_count("mcp.bridge.teardown_retry") <= 1);
+    // decision was kNone (session-death), and Step 1 sets teardown_terminal_handled
+    // unconditionally for kNone the moment ANY attempt's Step 1 runs - which
+    // already happened on the FIRST attempt, before this race even started. So
+    // shutdown's should_poison is false here regardless of who wins the race.
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 0);
+}
+
 TEST_CASE("bridge subscribe() is an exactly-once state-checked transition (#2487 review)",
           "[mcp][bridge][2f]") {
     // This gate is what makes teardown_claimed's lock-free BORROW of execution_id
