@@ -4517,6 +4517,13 @@ TEST_CASE("MCP Integration: tools/call unknown tool returns error", "[mcp][integ
     CHECK(body["error"]["message"].get<std::string>().find("nonexistent_tool") !=
           std::string::npos);
     CHECK(!body.contains("result"));
+
+    // #2445: client-caused (unknown tool name), audited "denied" like most
+    // other rejections on this surface — several other client-caused
+    // rejections on this surface still audit "failure" (tracked in #3176).
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "mcp.nonexistent_tool|denied");
+    CHECK(ts.audit_details[0] == "unknown tool");
 }
 
 // ── 6. Tier denied — readonly tier blocks a read on a tool that needs stores ─

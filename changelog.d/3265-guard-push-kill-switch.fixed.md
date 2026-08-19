@@ -1,6 +1,6 @@
 - **CRITICAL — Guardian rule delivery (`__guard__.push_rules`) was
   permanently kill-switched.** A per-action kill-switch grammar landed on
-  `dev` on 2026-08-14 (never in a tagged release — the last tag, `v0.13.0`,
+  `dev` on 2026-08-15 (never in a tagged release — the last tag, `v0.13.0`,
   predates it, and no customer deployment was affected) requiring a plugin
   name to start with a lowercase letter, which `__guard__` — the server's
   own reserved-namespace dispatch capability used for every Guardian rule
