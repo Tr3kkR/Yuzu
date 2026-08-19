@@ -10655,6 +10655,43 @@ TEST_CASE("MCP 2405: execute_bundle step items are validated recursively",
     sqlite3_close(raw);
 }
 
+TEST_CASE("MCP 2444: execute_bundle empty step plugin/action is rejected pre-mint, not "
+          "burned post-consume (adversarial review)",
+          "[mcp][integration][approval][schema]") {
+    yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw) == SQLITE_OK);
+    {
+        yuzu::server::ApprovalManager appr(raw);
+        appr.create_tables();
+        McpTestServer ts;
+        ts.approval_manager_for_test = &appr;
+        ts.start("supervised");
+
+        // Before this fix, "" passed the pre-existing {"type":"string"}-only
+        // step schema, minted a ticket, and only failed post-consume in
+        // validate_bundle_steps — the exact residual burn class #2444 item 3
+        // exists to alert on. minLength:1 now rejects it at the same
+        // pre-approval gate #2405 established for the other tools.
+        auto body = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":309,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"","action":"a"}]}}})")
+                ->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(appr.pending_count() == 0); // no ticket minted, not just none pending
+
+        auto body2 = nlohmann::json::parse(
+            ts.call(
+                  R"({"jsonrpc":"2.0","method":"tools/call","id":310,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-001","steps":[{"plugin":"p","action":""}]}}})")
+                ->body);
+        REQUIRE(body2.contains("error"));
+        CHECK(body2["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(appr.pending_count() == 0);
+    }
+    sqlite3_close(raw);
+}
+
 TEST_CASE("MCP 2405: malicious argument keys never reach the envelope or audit detail",
           "[mcp][integration][approval][schema]") {
     yuzu::test::TempDbFile adb{std::string_view{"mcp-appr-"}};

@@ -824,7 +824,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{)j"
      R"j("agent_id":{"type":"string","minLength":1,"description":"The single target device — a bundle targets one device"},)j"
      R"j("steps":{"type":"array","minItems":1,"maxItems":32,"description":"1-32 plugin actions to fan out","items":{"type":"object","properties":{)j"
-     R"j("plugin":{"type":"string"},"action":{"type":"string"},)j"
+     R"j("plugin":{"type":"string","minLength":1},"action":{"type":"string","minLength":1},)j"
      R"j("params":{"type":"object","additionalProperties":{"type":"string"}})j"
      R"j(},"required":["plugin","action"]}})j"
      R"j(},"required":["agent_id","steps"]})j",
@@ -3600,19 +3600,32 @@ McpServer::HandlerFn McpServer::build_handler(
                 yuzu::MetricsRegistry* metrics;
                 const std::string& tool_name;
                 const bool& consumed;
-                ~BurnGuard() {
+                ~BurnGuard() noexcept {
                     if (!consumed || metrics == nullptr)
                         return;
                     // A JSON-RPC error envelope (vs the "result" success shape) is
                     // the ONE outcome-agnostic signal every handler produces —
                     // parsed defensively (never expected to fail; res.body is
                     // always this handler's own JSON, never caller-echoed).
-                    auto parsed = nlohmann::json::parse(res.body, nullptr, false);
-                    if (!parsed.is_discarded() && parsed.is_object() && parsed.contains("error"))
-                        metrics
-                            ->counter("yuzu_mcp_approval_burned_total",
-                                     {{"tool", tool_name}, {"reason", "handler_reject"}})
-                            .increment();
+                    //
+                    // Adversarial review (2026-08-19): this destructor is
+                    // implicitly noexcept, and MetricsRegistry::counter(...)
+                    // locks + indexes a map that could in principle throw
+                    // (allocation failure) — an uncaught throw here would
+                    // terminate the process mid-teardown, matching the
+                    // count_denial precedent's own reasoning above. Wrapped for
+                    // the same "observability must never fail the dispatch"
+                    // reason, even though the response has already been built.
+                    try {
+                        auto parsed = nlohmann::json::parse(res.body, nullptr, false);
+                        if (!parsed.is_discarded() && parsed.is_object() &&
+                            parsed.contains("error"))
+                            metrics
+                                ->counter("yuzu_mcp_approval_burned_total",
+                                         {{"tool", tool_name}, {"reason", "handler_reject"}})
+                                .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                    }
                 }
             } burn_guard{res, metrics, tool_name, approval_ticket_just_consumed};
 

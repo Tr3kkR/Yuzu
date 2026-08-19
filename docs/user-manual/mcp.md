@@ -629,10 +629,13 @@ never consumes the ticket. (Semantic checks the schema cannot express — an
 unknown plugin name, a nonexistent agent — still happen in the handler and are
 not pre-empted by this gate. When one of those DOES fire on a recall that
 already consumed a ticket — #2444 item 3 — it is alertable via the
-`yuzu_mcp_approval_burned_total{tool,reason}` counter, distinct from the
-generic `mcp.<tool>|failure` audit row this class always leaves: the counter
-is bounded to approval-gated tools and the metric is the alertable signal,
-the audit row the forensic detail.) The error
+`yuzu_mcp_approval_burned_total{tool,reason}` counter, paired with an audit
+row for forensic detail — usually the generic `mcp.<tool>|failure` row, but
+some handlers' business-rejection paths bypass that generic verb entirely and
+leave only their own domain-verb row instead (e.g. `revoke_certificate`'s
+"serial not found" leaves `ca.cert.revoked|denied`, never `mcp.
+revoke_certificate|failure`); the counter is bounded to approval-gated tools
+and is the reliable alertable signal regardless of which audit row landed.) The error
 message names the offending field as a JSON-pointer-style path (e.g.
 `/steps/1`), and `error.data` carries a `correlation_id` plus a `remediation`
 confirming no ticket was created or consumed. Two strictness notes: `integer`
