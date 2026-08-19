@@ -68,6 +68,18 @@ Timeline Activity Record. TAR captures ordered endpoint activity and response hi
 
 The Erlang service under `gateway/` that scales agent connectivity and command fanout. It proxies registration and heartbeat traffic upstream to the server, exposes agent-facing gRPC, and provides management forwarding for server-dispatched commands.
 
+## Gateway cluster
+
+A **trust-zone- or region-scoped** set of gateway nodes forming one OTP cluster, fronting its own slice of the fleet (ADR-2002). The cluster is the unit of gateway topology: internal-vs-external-facing and regional gateways are **separate** clusters (Erlang distribution's shared-cookie mesh must not span a DMZ or a WAN), and intra-zone scale is more **nodes** in a cluster, not more clusters. An agent is **pinned to its zone's cluster** and never fails over across zones. Any server locates an agent's owning cluster via the Postgres **agent→gateway-cluster routing directory**, then reaches any healthy node of that cluster (OTP `pg` finds the exact node). Distinct from a bare **Gateway** (a single node/service): the cluster is the HA and multi-gateway boundary.
+
+## Coordination substrate
+
+The mechanism the **active–active server tier** uses to agree and signal across instances (ADR-2002): **leader election** (which instance runs the singleton background work) and **cross-instance signalling** (waking peers to a new event). It sits behind a narrow seam with a **Postgres-backed default** — advisory-lock leadership + `LISTEN`/`NOTIFY`-as-hint over durable tables — pluggable for SaaS without touching call sites. Chosen because Postgres already bounds system availability, so a Postgres-backed default adds no new single point of failure. Distinct from the **storage substrate** (Postgres-as-database, ADR-0006): the coordination substrate is Postgres-as-coordinator.
+
+## Server tier
+
+The set of interchangeable **active–active server instances** behind the operator-plane load balancer (ADR-2002). Instances share all durable state (Postgres) and coordinate through the **coordination substrate**; any instance can serve any operator/API/MCP request. Distinct from a single server process (the historical single-server design) and from a **gateway cluster** (the agent-plane concentrator). Server-tier HA (multi-instance servers) and **storage HA** (HA Postgres) are orthogonal axes: either can exist without the other.
+
 ## Reachability
 
 Whether one node in the fleet can initiate a network connection to another. Yuzu distinguishes two kinds and commits to one:
