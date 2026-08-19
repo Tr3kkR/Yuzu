@@ -175,6 +175,7 @@
 #include "scope_engine.hpp"
 #include "instruction_db_pool.hpp"
 #include "tag_store.hpp"
+#include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
 #include "webhook_store.hpp"
 #include "offload_target_store.hpp"
@@ -8289,8 +8290,8 @@ private:
                 // token), so the DISPATCH outcome is unchanged; the
                 // distinction is what makes a degraded read observable
                 // instead of silently indistinguishable from "no agents".
-                if (auto svc = tag_store_->agents_with_tag("service",
-                                                           sess.token_scope_service)) {
+                if (auto svc = tag_store_->agents_with_tag(
+                        std::string(authz::kServiceTagKey), sess.token_scope_service)) {
                     facts.service_tagged = std::unordered_set<std::string>(svc->begin(), svc->end());
                 } else {
                     spdlog::error("derive_exec_visible: tag store degraded resolving service "

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cctype>
 #include <string_view>
 
 /// @file service_scope_policy.hpp
@@ -42,6 +43,42 @@ inline constexpr std::array<PermPair, 0> kServiceScopeGlobalSafe{};
             return true;
     }
     return false;
+}
+
+/// #3289: the tag key that IS a service-scoped token's own confinement
+/// boundary (`AuthRoutes::require_scoped_permission`'s service branch reads
+/// this key via `TagStore::get_tag` to decide admission). Every confinement
+/// reader and every tag-mutation guard key on this single definition — a
+/// second copy is the drift this seam exists to remove for `kPermPair`-shaped
+/// policy above.
+inline constexpr std::string_view kServiceTagKey = "service";
+
+/// ASCII case-insensitive match against `kServiceTagKey`. Tag keys are
+/// user-supplied strings (REST/MCP/legacy dashboard callers, and the agent's
+/// own `tags.json`), so a `"Service"`/`"SERVICE"` variant must not bypass the
+/// mutation guard below.
+[[nodiscard]] inline bool is_service_tag_key(std::string_view key) {
+    if (key.size() != kServiceTagKey.size())
+        return false;
+    for (std::size_t i = 0; i < key.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(key[i])) !=
+            std::tolower(static_cast<unsigned char>(kServiceTagKey[i])))
+            return false;
+    }
+    return true;
+}
+
+/// #3289: may a session whose token scope is `scope` mutate (write OR
+/// delete) tag `key`? Deny iff `scope` is non-empty (i.e. the session is
+/// service-scoped) and `key` is the service tag — VALUE-BLIND by design: even
+/// a no-op rewrite of the token's own current value is denied. The tag being
+/// mutated is the same datum `require_scoped_permission`'s service branch
+/// reads to decide admission (`auth_routes.cpp:1065`), so authorizing a write
+/// to it from its own pre-write value is a TOCTOU the value-blind rule avoids
+/// entirely rather than closing with a read-compare.
+[[nodiscard]] inline bool service_scope_may_mutate_tag_key(std::string_view scope,
+                                                            std::string_view key) {
+    return scope.empty() || !is_service_tag_key(key);
 }
 
 } // namespace yuzu::server::authz

@@ -1081,6 +1081,44 @@ TEST_CASE("AuthRoutes::require_list_read — a dual-attribute token "
 }
 
 // ---------------------------------------------------------------------------
+// authz::is_service_tag_key / authz::service_scope_may_mutate_tag_key (#3289)
+// — pure predicates in service_scope_policy.hpp. No fixture, no store.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("authz::is_service_tag_key — matches the canonical key and common case "
+          "variants, rejects everything else",
+          "[auth_routes][service_scope][tag_write]") {
+    using yuzu::server::authz::is_service_tag_key;
+    CHECK(is_service_tag_key("service"));
+    CHECK(is_service_tag_key("Service"));
+    CHECK(is_service_tag_key("SERVICE"));
+    CHECK(is_service_tag_key("SeRviCe"));
+    CHECK_FALSE(is_service_tag_key("environment"));
+    CHECK_FALSE(is_service_tag_key("service2"));
+    CHECK_FALSE(is_service_tag_key("servic"));
+    CHECK_FALSE(is_service_tag_key(""));
+}
+
+TEST_CASE("authz::service_scope_may_mutate_tag_key — denies a service-scoped "
+          "session mutating the service key, value-blind; admits every other "
+          "combination (#3289)",
+          "[auth_routes][service_scope][tag_write]") {
+    using yuzu::server::authz::service_scope_may_mutate_tag_key;
+    // Service-scoped session, service key: DENY. Value-blind — the function
+    // does not take a value parameter at all, so a would-be no-op rewrite of
+    // the token's own current value is denied identically to any other.
+    CHECK_FALSE(service_scope_may_mutate_tag_key("printers", "service"));
+    CHECK_FALSE(service_scope_may_mutate_tag_key("printers", "Service"));
+    // Service-scoped session, non-service key: ADMIT.
+    CHECK(service_scope_may_mutate_tag_key("printers", "environment"));
+    CHECK(service_scope_may_mutate_tag_key("printers", "owner"));
+    // Non-scoped session (empty token_scope_service): ADMIT regardless of key —
+    // this predicate only confines service-scoped sessions.
+    CHECK(service_scope_may_mutate_tag_key("", "service"));
+    CHECK(service_scope_may_mutate_tag_key("", "environment"));
+}
+
+// ---------------------------------------------------------------------------
 // AuthRoutes::deny_service_scoped_session (#2298 PR 3 §3e) — the shared gate
 // server.cpp's require_auth-only fragment/stream routes call directly, since
 // they never reach require_permission/require_scoped_permission at all (so

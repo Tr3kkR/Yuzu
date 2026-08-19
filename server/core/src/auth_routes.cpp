@@ -1062,7 +1062,7 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
         // pre-migration read collapsed both to "", which happened to
         // deny (fail-closed) but audited the outage as a scope MISMATCH,
         // hiding the real cause from the operator.
-        auto service_tag = tag_store_->get_tag(agent_id, "service");
+        auto service_tag = tag_store_->get_tag(agent_id, std::string(authz::kServiceTagKey));
         if (!service_tag) {
             audit_log(req, "auth.scoped_permission_required", "denied", agent_id, "",
                       "service-scoped token blocked: tag store degraded");
