@@ -89,9 +89,11 @@ std::optional<std::vector<std::string>> sssd_list_domains_via_sdbus() {
         return std::nullopt;
     // BR-012 (found in /adversarial-review, Codex): raw-pointer owners MUST
     // delete copy construction/assignment -- a copy of any of these would
-    // double-release the underlying sd-bus object (matches
-    // guardian_state_reader.cpp's BusGuard/SdBusErrorGuard/SdBusMessageGuard,
-    // which already do this).
+    // double-release the underlying sd-bus object (matches the shape of
+    // guardian_state_reader.cpp's SdBusErrorGuard/SdBusMessageGuard, which
+    // already do this; that file's own BusGuard is still copyable -- a
+    // pre-existing gap in a file this PR doesn't otherwise touch, not fixed
+    // here).
     struct BusGuard {
         sd_bus* b;
         ~BusGuard() {

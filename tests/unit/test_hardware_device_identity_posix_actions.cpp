@@ -75,16 +75,22 @@ struct LoadedPlugin {
     const YuzuPluginDescriptor* descriptor;
 };
 
+// Returns nullopt ONLY when the plugin genuinely isn't part of this build
+// (mirrors test_users_posix_actions.cpp's find_users_plugin precedent: a
+// build without agent plugins skips rather than fails). A path that EXISTS
+// but fails to load or expose a descriptor is a real regression (ABI break,
+// missing dependency, wrong architecture) -- REQUIRE-fail rather than
+// silently return nullopt, so that case can't be confused with "not built
+// here" (governance Gate-3 quality-engineer finding: the two were
+// previously indistinguishable, letting a load regression pass as a skip).
 std::optional<LoadedPlugin> load_plugin(const char* plugin_name) {
     auto plugin_path = find_plugin(plugin_name);
     if (plugin_path.empty())
         return std::nullopt;
     auto handle = yuzu::agent::PluginHandle::load(plugin_path);
-    if (!handle.has_value())
-        return std::nullopt;
+    REQUIRE(handle.has_value());
     const auto* descriptor = handle->descriptor();
-    if (!descriptor)
-        return std::nullopt;
+    REQUIRE(descriptor != nullptr);
     return LoadedPlugin{std::move(*handle), descriptor};
 }
 

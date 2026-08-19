@@ -11,7 +11,8 @@ elif host_machine.system() == 'darwin'
   # shape as tests/meson.build's agent_test_native_deps (PLAN-08) — agent-core
   # itself links no IOKit/CoreFoundation on darwin, so this plugin pulls its
   # own copy.
-  hardware_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'])
+  hardware_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'],
+                               include_type: 'system')
 endif
 
 # Assigned to a variable (mirrors users_plugin_lib in
