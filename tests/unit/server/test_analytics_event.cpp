@@ -236,10 +236,11 @@ TEST_CASE("AnalyticsEventStore: a failed open stays constructed-but-degraded, "
     PgPool bad_pool{{.conninfo = "host=192.0.2.1 port=1 connect_timeout=1", .size = 1}};
     AnalyticsEventStore store(bad_pool);
 
-    // The regression this guards: an earlier version of this store's
-    // construction called analytics_store_.reset() on this exact path,
-    // which this test cannot observe since a caller here holds the object
-    // directly rather than through ServerImpl's unique_ptr — the contract
+    // The regression this guards: an earlier version of ServerImpl's
+    // wiring code (server.cpp, not this store's own constructor) called
+    // analytics_store_.reset() on this exact failed-open path, which this
+    // test cannot observe directly since a caller here holds the object
+    // itself rather than through ServerImpl's unique_ptr — the contract
     // under test is that the OBJECT ITSELF stays usable-but-degraded.
     REQUIRE_FALSE(store.is_open());
 

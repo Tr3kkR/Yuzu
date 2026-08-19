@@ -2433,11 +2433,11 @@ groups:
           summary: "AnalyticsEventStore failed to open at boot and will not self-heal"
           description: >-
             yuzu_server_analytics_emit_dropped_total{reason="store_not_open"}
-            is non-zero: the analytics store failed to open (schema
+            is advancing: the analytics store failed to open (schema
             migration or initial connection) and is dropping every emit.
             Check Postgres reachability for the configured DSN, then
             restart the server - this does not recover on its own.
-          runbook_url: "https://docs.yuzu.io/user-manual/upgrading#postgres-cutover"
+          runbook_url: "https://docs.yuzu.io/runbooks/analytics-store-not-open"
       - alert: YuzuMgmtGroupBackfillFailing
         # The one-time SQLite->Postgres confinement backfill (ADR-0042) reported
         # a failed outcome. The server fails closed at boot on a backfill failure
