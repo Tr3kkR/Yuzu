@@ -79,6 +79,46 @@ TEST_CASE("StoreWorkerPool: quiesce blocks until slow in-flight tasks finish",
     CHECK(task_finished.load());
 }
 
+TEST_CASE("StoreWorkerPool: quiesce waits for QUEUED tasks, not just the "
+          "currently-executing one",
+          "[store_worker_pool]") {
+    // PR review finding (important): no existing test forces a task to sit
+    // genuinely queued (not yet started) while quiesce() is waiting -- the
+    // test above uses 2 workers for 1 task, so it can never distinguish
+    // "waits for pending_==0 (queued+executing)" from a regression that
+    // narrows the wait to "currently-executing only". This is exactly the
+    // semantics an earlier round on this branch's own fix got wrong (see
+    // the governance ledger, 3261-unhappy-p3-1) -- a single busy worker
+    // plus queued work behind it is the reproduction shape.
+    StoreWorkerPool pool(/*num_threads=*/1, /*max_queue=*/16);
+    std::atomic<bool> released{false};
+    ReleaseGuard guard(released); // always fires, even if a CHECK below fails
+    std::atomic<int> queued_ran{0};
+
+    // Occupies the pool's single worker.
+    REQUIRE(pool.submit([&released] {
+        while (!released.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }));
+    // These two sit in the QUEUE -- never started while the worker above is
+    // busy.
+    REQUIRE(pool.submit([&queued_ran] { ++queued_ran; }));
+    REQUIRE(pool.submit([&queued_ran] { ++queued_ran; }));
+
+    // Release the blocking task from a second thread, concurrently with
+    // quiesce() blocking below. A regression that treats "no task
+    // currently executing" as quiesced would let quiesce() return true the
+    // instant the blocking task above finishes, before either queued task
+    // has actually run -- this REQUIRE would then observe queued_ran < 2.
+    std::thread releaser([&released] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        released.store(true);
+    });
+    REQUIRE(pool.quiesce(std::chrono::seconds(5)));
+    releaser.join();
+    CHECK(queued_ran.load() == 2);
+}
+
 TEST_CASE("StoreWorkerPool: quiesce times out on a task that outlives the bound",
           "[store_worker_pool]") {
     StoreWorkerPool pool(/*num_threads=*/1, /*max_queue=*/16);

@@ -2277,13 +2277,23 @@ TEST_CASE("process_gateway_response: wired webhook + offload sinks receive "
     CHECK(sinks.offloads->get_deliveries(off_id).empty());
     sinks.offloads->flush_all();
 
-    auto off_deliveries = poll_deliveries([&] { return sinks.offloads->get_deliveries(off_id); });
+    // Neither sink is touched again after this point in this test case, so
+    // quiesce() (a real CV-based wait, not a timing assumption) is safe
+    // here — PR review finding (important): the sleep_for+poll idiom
+    // poll_deliveries() below implements is genuinely necessary at LATER,
+    // multi-delivery call sites (e.g. the reauth test), where quiesce()
+    // would permanently close the pool before a second delivery could
+    // ever fire — but was unnecessary at this first-use site.
+    REQUIRE(sinks.offloads->quiesce(std::chrono::seconds(5)));
+    REQUIRE(sinks.webhooks->quiesce(std::chrono::seconds(5)));
+
+    auto off_deliveries = sinks.offloads->get_deliveries(off_id);
     REQUIRE(off_deliveries.size() == 1);
     CHECK(off_deliveries[0].event_count == 1);
     CHECK(off_deliveries[0].payload.find("execution.completed") != std::string::npos);
     CHECK(off_deliveries[0].payload.find("cmd-hook-1") != std::string::npos);
 
-    auto wh_deliveries = poll_deliveries([&] { return sinks.webhooks->get_deliveries(wh_id); });
+    auto wh_deliveries = sinks.webhooks->get_deliveries(wh_id);
     REQUIRE(wh_deliveries.size() == 1);
     CHECK(wh_deliveries[0].event_type == "execution.completed");
     CHECK(wh_deliveries[0].payload.find("cmd-hook-1") != std::string::npos);

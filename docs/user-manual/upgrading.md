@@ -131,14 +131,16 @@ the agent-service RPC path (`Register`, `Subscribe`, `process_gateway_response`)
 those three stores were constructed, so the wiring silently never took effect. Dashboard
 notifications for agent enrollment and execution failures, and configured webhook/offload
 deliveries for `agent.registered` and `execution.completed` events, have been dead for
-the life of the process **since the stores were introduced — every tagged release from
-v0.10.0 through v0.13.0 (roughly four months)**. Every use site double-guards
-`ptr && ptr->is_open()` with a silent skip, so nothing logged or alerted; the bug produced
-zero signal. They now fire on every boot.
+the life of the process **since the stores were introduced** — for `NotificationStore`/
+`WebhookStore`, every tagged release from v0.10.0 through v0.13.0 (roughly four months);
+`OffloadTargetStore` didn't exist until v0.12.0, so its affected window is v0.12.0 through
+v0.13.0 (roughly six weeks). Every use site double-guards `ptr && ptr->is_open()` with a
+silent skip, so nothing logged or alerted; the bug produced zero signal. They now fire on
+every boot.
 
-**What to do:** if you configured a webhook (`POST /api/webhooks`) or an offload target
-(`POST /api/v1/offload-targets`) at any point since v0.10.0 expecting live traffic and saw
-none, that integration has been silently non-functional the entire time, not merely quiet
+**What to do:** if you configured a webhook (`POST /api/webhooks`) since v0.10.0, or an
+offload target (`POST /api/v1/offload-targets`) since v0.12.0, expecting live traffic and
+saw none, that integration has been silently non-functional the entire time, not merely quiet
 — there is no queued backlog to replay, because the events were never generated in the
 first place. If you use one of these integrations as part of your own monitoring or
 compliance evidence chain (a SIEM feed, an alerting pipeline), treat the gap as a
@@ -148,7 +150,7 @@ endpoint still exists and can handle real traffic before you rely on it — deli
 start immediately, with no flag or opt-in involved. If your webhook fires to Slack or a
 similar noisy channel for enrollment alerts, note that `agent.registered` fires on every
 gRPC reconnect, not only first enrollment (this is unchanged, documented behaviour — see
-"Webhooks" / "Response Offloading" in [`rest-api.md`](rest-api.md) — but was invisible
+"Webhooks" / "Offload Targets" in [`rest-api.md`](rest-api.md) — but was invisible
 until now); the "Agent Enrolled" **dashboard notification** specifically does not repeat
 on reconnect, so a server restart with N connected agents does not flood that feed.
 

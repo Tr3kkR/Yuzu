@@ -121,7 +121,7 @@ WebhookStore::~WebhookStore() {
     // NOT by itself stop this body from closing `db_` while a worker is
     // still touching it - the member-destruction-order trick only helps
     // once this body returns. Drain explicitly, first. In the intended
-    // production flow (ServerImpl::stop() -> quiesce(15s) -> success ->
+    // production flow (ServerImpl::stop() -> quiesce(60s) -> success ->
     // .reset()) this is always instant: the pool is already empty by the
     // time this destructor runs. It only actually waits for a store
     // destroyed without going through that dance first (tests, or a

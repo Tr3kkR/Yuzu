@@ -147,7 +147,8 @@ public:
     /// vector — `spec.offload.targets` in InstructionDefinition YAML.
     ///
     /// Per the Phase 8.3 doc, `fire_event` returns immediately;
-    /// deliveries run on detached worker threads.
+    /// deliveries run on the bounded StoreWorkerPool (#3261 governance
+    /// hardening), not a raw detached thread.
     void fire_event(const std::string& event_type, const std::string& payload_json,
                     const std::vector<std::string>& target_filter = {});
 

@@ -278,7 +278,7 @@ so `absent()`/`rate()` alerting is meaningful on a healthy server.
 
 ## Webhook / offload delivery metrics (#3261)
 
-`WebhookStore` and `OffloadTargetStore` (see [REST API §Webhooks / §Offload Targets](rest-api.md)) dispatch deliveries through a bounded worker pool; these counters cover delivery outcomes and pool backpressure.
+`WebhookStore` and `OffloadTargetStore` (see [REST API §Webhooks / §Offload Targets](rest-api.md)) dispatch deliveries through a bounded worker pool; these counters cover delivery outcomes and pool backpressure. All six are pre-seeded to `0` at boot, so `absent()`-based alerting stays meaningful on a fresh server before the first delivery ever fires.
 
 | Metric | Type | Meaning |
 |---|---|---|

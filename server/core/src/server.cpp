@@ -7406,7 +7406,7 @@ public:
         // call ARRIVING OVER gRPC still in flight during the up-to-5s drain
         // window (Gate 4 unhappy-path UP-1). Both stores now dispatch
         // deliveries onto a bounded StoreWorkerPool (store_worker_pool.hpp)
-        // instead of a raw detached std::thread, so quiesce(30s) below gives
+        // instead of a raw detached std::thread, so quiesce(60s) below gives
         // a real, bounded guarantee that no delivery thread already
         // SUBMITTED to the pool is still touching the store before it is
         // reset - closing the use-after-free for every producer that
@@ -7495,9 +7495,25 @@ public:
         // stores are otherwise fully independent.
         std::thread offload_wait;
         if (offload_target_store_) {
-            offload_wait = std::thread([this, &offload_drained] {
+            try {
+                offload_wait = std::thread([this, &offload_drained] {
+                    offload_drained = offload_target_store_->quiesce(kStoreQuiesceBound);
+                });
+            } catch (...) {
+                // PR review finding (important, 6-source convergence): the
+                // std::thread constructor can throw std::system_error
+                // (EAGAIN under resource exhaustion) - exactly the hazard
+                // class StoreWorkerPool's own constructor already guards
+                // against a few files over, and this stop() is itself
+                // noexcept, so an uncaught throw here would call
+                // std::terminate() immediately, bypassing the deliberate
+                // _Exit(1) escalation a few lines below entirely. Fall
+                // back to a synchronous quiesce - offload_wait stays in
+                // its default-constructed (not-joinable) state, since the
+                // move-assignment above never ran, so the join() below is
+                // a correct no-op on this path.
                 offload_drained = offload_target_store_->quiesce(kStoreQuiesceBound);
-            });
+            }
         }
         if (webhook_store_)
             webhook_drained = webhook_store_->quiesce(kStoreQuiesceBound);
@@ -10593,7 +10609,7 @@ private:
             // Determine overall status
             bool all_stores_ok =
                 pg_pool_ok && response_ok && audit_ok && instruction_ok && policy_ok &&
-                guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
+                guaranteed_state_ok && baseline_ok && offload_target_ok && webhook_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
