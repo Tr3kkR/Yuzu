@@ -4,8 +4,8 @@
 /// Phase 8.3 (#255) — Response Offloading. Configurable external HTTP
 /// endpoints that receive response data in real time.
 ///
-/// Reuses the WebhookStore delivery pattern (counting-semaphore-bounded
-/// detached thread per delivery, async record), and adds:
+/// Reuses the WebhookStore delivery pattern (bounded-worker-pool dispatch
+/// per delivery, async record - see store_worker_pool.hpp), and adds:
 ///   - typed auth (none / bearer / basic / hmac)
 ///   - server-side batching (`batch_size > 1` accumulates events into a
 ///     per-target buffer and flushes on threshold or on `flush_all()`)
@@ -13,11 +13,14 @@
 ///     `spec.offload.targets` in InstructionDefinition YAML
 ///
 /// Secrets (auth_credential) are persisted but NEVER returned by `list()`.
-/// The `fire_event` call path is fire-and-forget and acquires a 10-slot
-/// semaphore so a slow endpoint can't drown the server.
+/// The `fire_event` call path is fire-and-forget and dispatches onto the
+/// bounded worker pool so a slow endpoint can't drown the server.
+
+#include "store_worker_pool.hpp"
 
 #include <sqlite3.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -27,6 +30,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+namespace yuzu {
+class MetricsRegistry;
+}
 
 namespace yuzu::server {
 
@@ -75,24 +82,39 @@ class OffloadTargetStore {
 public:
     explicit OffloadTargetStore(const std::filesystem::path& db_path);
 
-    /// Destruction does NOT flush pending batched events. Detached worker
-    /// threads spawned by `fire_event` / `flush_all` capture the store
-    /// pointer; flushing in the destructor would race the SQLite handle
-    /// close. Operators that need at-least-once delivery semantics should
-    /// (a) use `batch_size = 1` (immediate dispatch) or (b) call
-    /// `flush_all()` on a graceful-shutdown path before the store is
-    /// destroyed. Detached deliveries already in flight when the store
-    /// is destroyed are best-effort: each captured an `OffloadTarget`
-    /// by value so it can finish independently of the store, but the
-    /// `record_delivery` step that writes to `offload_deliveries.db`
-    /// will silently no-op once the underlying SQLite handle is closed.
-    /// Mirrors the WebhookStore precedent.
+    /// Destruction does NOT flush pending batched events - call
+    /// `flush_all()` on a graceful-shutdown path first if at-least-once
+    /// delivery for batched (`batch_size > 1`) targets matters; anything
+    /// still buffered when this destructs is dropped.
+    ///
+    /// #3261 governance hardening: deliveries used to run on raw detached
+    /// `std::thread`s with no join, so this comment used to say a delivery
+    /// still in flight at destruction time would race the SQLite handle
+    /// close and "silently no-op" - that was optimistic; it was actually a
+    /// use-after-free (`record_delivery` locks `mtx_`, a member, as its
+    /// first statement). Deliveries now run on `pool_`, a bounded worker
+    /// pool this destructor drains BEFORE closing `db_` (see the .cpp), so
+    /// a delivery in flight at destruction time now blocks the destructor
+    /// until it finishes rather than racing it. `flush_all()` before
+    /// destruction is still the right call for at-least-once semantics on
+    /// batched targets - it is about not LOSING buffered events, not about
+    /// safety, which the pool now guarantees unconditionally.
     ~OffloadTargetStore();
 
     OffloadTargetStore(const OffloadTargetStore&) = delete;
     OffloadTargetStore& operator=(const OffloadTargetStore&) = delete;
 
     bool is_open() const;
+
+    /// Wire a metrics sink for delivery outcome counters. Set-before-traffic
+    /// contract, same as DexAlertRouter::set_metrics.
+    void set_metrics(yuzu::MetricsRegistry* metrics);
+
+    /// Stop accepting new deliveries and wait up to `timeout` for every
+    /// queued/in-flight delivery to finish. Returns true if fully drained.
+    /// The caller (ServerImpl::stop()) MUST NOT destroy this store if this
+    /// returns false - see store_worker_pool.hpp's header comment.
+    bool quiesce(std::chrono::milliseconds timeout);
 
     /// Create a new offload target. Returns the assigned id, or -1 on
     /// validation failure (invalid URL scheme, empty name, duplicate
@@ -125,7 +147,8 @@ public:
     /// vector — `spec.offload.targets` in InstructionDefinition YAML.
     ///
     /// Per the Phase 8.3 doc, `fire_event` returns immediately;
-    /// deliveries run on detached worker threads.
+    /// deliveries run on the bounded StoreWorkerPool (#3261 governance
+    /// hardening), not a raw detached thread.
     void fire_event(const std::string& event_type, const std::string& payload_json,
                     const std::vector<std::string>& target_filter = {});
 
@@ -143,6 +166,7 @@ public:
 private:
     sqlite3* db_{nullptr};
     mutable std::shared_mutex mtx_;
+    yuzu::MetricsRegistry* metrics_{nullptr};
 
     /// Per-target accumulator for `batch_size > 1`. Guarded by buf_mu_;
     /// kept separate from mtx_ so a flush in flight does not block the
@@ -160,10 +184,21 @@ private:
     void record_delivery(int64_t target_id, const std::string& event_type, int event_count,
                          const std::string& payload, int status_code, const std::string& error);
 
+    /// Log + count a delivery dropped because pool_.submit() returned
+    /// false (queue full or the store is quiescing/shutting down).
+    void log_dropped_delivery(const std::string& target_url);
+
     /// Build the JSON body to POST. For a single event this is the raw
     /// payload_json. For a batched flush, the events are wrapped in a
     /// JSON array under `{"events":[…]}`.
     static std::string build_batch_body(const std::vector<BufferedEvent>& events);
+
+    // LAST-DECLARED MEMBER (#3261 governance hardening) - see the identical
+    // comment on WebhookStore::pool_ in webhook_store.hpp. The destructor
+    // still drains this explicitly before touching db_/mtx_ (a
+    // destructor's body runs before its members' destructors), so this
+    // ordering is defense in depth, not the sole guarantee.
+    StoreWorkerPool pool_{/*num_threads=*/4, /*max_queue=*/256};
 };
 
 } // namespace yuzu::server
