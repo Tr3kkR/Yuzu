@@ -132,10 +132,13 @@
 // release it). Never evicts a newer record.
 //
 // Teardown ownership is THREE things - the records_ entry, the streamed charge, and
-// the bus subscription - and the claim is ONE-WAY (torn_down excludes the record
-// from every later sweep), so nothing retries what teardown leaves unfinished;
-// shutdown() is the only reclaimer. Each step is therefore contained separately and
-// counted by yuzu_mcp_bridge_teardown_incomplete_total{reason} (#2487). The ORDER is
+// the bus subscription. `torn_down` (set once, NEVER cleared) excludes the record
+// from every ORDINARY sweep claim - but an incomplete teardown IS retried, from a
+// later sweep tick, up to Config::teardown_retry_max times via the record's own
+// `teardown_retry_claimable` flag (#2513); shutdown() remains the reclaimer of last
+// resort, for a record whose retry budget is exhausted or that shutdown races before
+// a retry pass gets to it. Each step is therefore contained separately and counted
+// by yuzu_mcp_bridge_teardown_incomplete_total{reason} (#2487). The ORDER is
 // load-bearing rather than uniform, so be precise about what each failure retains:
 //
 //   0. PUBLISH the decided terminal FIRST. A later step failing must never lose a
@@ -149,8 +152,9 @@
 //      the bus channel can never be collected (GC needs listeners.empty()). The
 //      terminal from step 0 is already committed, so this is "everything except the
 //      publish".
-//   2. charge fails -> the record is STILL erased; a per-session admission slot
-//      leaks instead.
+//   2. charge fails -> return, record left in the map, its per-session admission
+//      slot still held (#2513: erasing here made sense only when nothing could
+//      retry - under retry the record is the only handle back to the leaked charge).
 //   3. erase fails -> the subscription is settled and the charge MAY be (steps 2 and
 //      3 fail independently); the record and one global slot leak.
 //

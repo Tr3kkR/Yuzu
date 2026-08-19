@@ -7496,9 +7496,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         execution_id = *created;
                     } else {
                         // governance R1 unhappy-UP-3: create_execution
-                        // returning an error is a SQLite write failure
-                        // (disk full, locked DB, schema corruption).
-                        // Silently proceeding with empty execution_id
+                        // returning an error is a tracker store failure -
+                        // database not open, statement prepare failure, or
+                        // an insert/write failure (disk full, locked DB,
+                        // schema corruption); created.error() below names
+                        // which. Silently proceeding with empty execution_id
                         // hides the tracker outage from operators. Log
                         // at warn so SREs see the failure; dispatch
                         // continues so the operator's "stop NOW"
