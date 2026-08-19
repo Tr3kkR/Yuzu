@@ -21,11 +21,12 @@ namespace {
 constexpr const char* kMetricRecordsActive = "yuzu_mcp_bridge_records_active";
 constexpr const char* kMetricRejects = "yuzu_mcp_bridge_reject_total";
 constexpr const char* kMetricListenerFailures = "yuzu_mcp_bridge_listener_failures_total";
-constexpr const char* kMetricMailboxDrops = "yuzu_mcp_bridge_mailbox_drops_total";
 // #2438: H1's suppress-non-strictly-increasing-progress rule fires silently -
 // nothing counted a suppression, so a regression that stopped suppressing
 // (re-admitting equal/decreasing progress onto the wire) was only catchable by
-// unit tests, never production alerting.
+// unit tests, never production alerting. WIDENED by #2412: also counts a
+// progress snapshot the listener overwrote (latest-wins) before the projector
+// ever saw it - see the field comment on BridgeRecord::progress_suppressed_delta.
 constexpr const char* kMetricProgressSuppressed = "yuzu_mcp_bridge_progress_suppressed_total";
 constexpr const char* kMetricProjectorCycles = "yuzu_mcp_bridge_projector_cycles_total";
 constexpr const char* kMetricProjectionDegraded = "yuzu_mcp_bridge_projection_degraded_total";
@@ -308,17 +309,26 @@ ExecutionEventBus::Listener McpStreamBridge::make_listener(std::shared_ptr<Bridg
                     rec->terminal_slot = std::move(tmp);
                     rec->terminal_accepted = true;  // sticky from here on
                 } else {
-                    if (rec->mb_count == kBridgeMailboxCap) {
-                        // Drop-oldest-progress; counted record-locally (C5 - the
-                        // listener never touches a metrics mutex).
-                        rec->mb_head = (rec->mb_head + 1) % kBridgeMailboxCap;
-                        --rec->mb_count;
-                        rec->mailbox_drop_delta.fetch_add(1, std::memory_order_relaxed);
+                    // #2412: latest-wins - assign the newest snapshot into the
+                    // spare buffer (may throw on allocation growth; a throw here
+                    // leaves progress_slot untouched - strong guarantee, better
+                    // than the old ring's drop-oldest under the same fault),
+                    // then commit with a noexcept swap (MailboxEntry's nothrow
+                    // move, see the static_assert above). The slot and spare
+                    // flip-flop between listener and projector, so once each
+                    // has grown to its steady-state payload size neither swap
+                    // allocates again.
+                    rec->listener_spare.data.assign(ev.data);
+                    rec->listener_spare.bus_id = ev.id;
+                    std::swap(rec->progress_slot, rec->listener_spare);
+                    if (rec->progress_pending) {
+                        // A prior snapshot was still unprojected - it is the one
+                        // just overwritten by the swap above. Counted AFTER the
+                        // swap commits, so a throw from `assign` (caught below)
+                        // never double-counts a supersede that didn't happen.
+                        rec->progress_suppressed_delta.fetch_add(1, std::memory_order_relaxed);
                     }
-                    MailboxEntry tmp{ev.id, ev.data};
-                    rec->mailbox[(rec->mb_head + rec->mb_count) % kBridgeMailboxCap] =
-                        std::move(tmp);
-                    ++rec->mb_count;
+                    rec->progress_pending = true;
                 }
             }
             wake(*core);
@@ -1082,8 +1092,7 @@ bool McpStreamBridge::abandon(const std::string& session_id, const nlohmann::jso
             }
             rec->phase.store(Phase::kAborted, std::memory_order_release);
             rec->cancel_pending = false;  // discarded, never audited (C1)
-            rec->mb_head = 0;
-            rec->mb_count = 0;
+            rec->progress_pending = false;
             rec->terminal_slot.reset();
             if (rec->streamed_charge_held) {
                 rec->streamed_charge_held = false;
@@ -1358,7 +1367,7 @@ bool McpStreamBridge::has_pending_work_locked(const BridgeRecord& rec) {
     // the divergence is deliberate - a mailbox deliberately held back by the cap
     // drain must STILL count as pending here, because that wake is what lets the
     // settle pass run immediately instead of a tick later.
-    const bool progress = rec.mb_count > 0 && !rec.pressure_requested;
+    const bool progress = rec.progress_pending && !rec.pressure_requested;
     const bool terminal = rec.terminal_accepted &&
                           !rec.terminal_projected.load(std::memory_order_acquire) &&
                           rec.terminal_slot.has_value();
@@ -1465,8 +1474,7 @@ void McpStreamBridge::run_projector() {
 void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, PostBatch* out,
                                      bool cap_expired) {
     Phase ph;
-    std::array<MailboxEntry, kBridgeMailboxCap> batch{};
-    std::size_t batch_n = 0;
+    bool have_progress = false;  ///< #2412: rec->projection_spare holds a latched snapshot
     std::optional<MailboxEntry> term;
     {
         std::lock_guard<std::mutex> rlk(rec->mu);
@@ -1514,7 +1522,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
         const bool settling_cap =
             out != nullptr && cap_expired && rec->cap_progress_drained && !want_terminal;
         const bool want_progress =
-            rec->mb_count > 0 && !rec->pressure_requested && !settling_cap;
+            rec->progress_pending && !rec->pressure_requested && !settling_cap;
         if (!want_progress && !want_terminal) {
             // CAP ARBITRATION, decided INSIDE the record lock alongside the
             // terminal check rather than by the pump beforehand: a terminal that
@@ -1531,12 +1539,12 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
         // lock-free clear (#2528 protocol, stated on the field).
         rec->projection_in_flight.store(true, std::memory_order_relaxed);
         if (want_progress) {
-            for (std::size_t i = 0; i < rec->mb_count; ++i) {
-                batch[i] = std::move(rec->mailbox[(rec->mb_head + i) % kBridgeMailboxCap]);
-            }
-            batch_n = rec->mb_count;
-            rec->mb_head = 0;
-            rec->mb_count = 0;
+            // #2412: extraction is a swap, not a copy-out - allocation-free once
+            // both buffers have grown to their steady-state payload size (see
+            // the field comment on progress_slot).
+            std::swap(rec->progress_slot, rec->projection_spare);
+            rec->progress_pending = false;
+            have_progress = true;
             if (out != nullptr && cap_expired) {
                 // #2739: this IS the drain pass. Marked before the publish loop
                 // (see the field comment for why a mid-pass throw must leave it
@@ -1645,13 +1653,17 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
     // jsonrpc_id) are safe to read lock-free from here.
     const bool get_only = ph == Phase::kArmedGetOnly;
 
-    // Progress first - the final must be last on the wire.
-    if (batch_n > 0 && rec->progress_token.has_value()) {
-        for (std::size_t i = 0; i < batch_n; ++i) {
+    // Progress first - the final must be last on the wire. #2412: at most one
+    // latched snapshot now (latest-wins in the listener), so there is nothing
+    // left to iterate - this stays a `do { } while (false)` so every early
+    // exit (`break`) reads the same as the old per-entry loop's `continue`/
+    // `break`: "nothing more to do with this snapshot", not "stop the loop".
+    if (have_progress && rec->progress_token.has_value()) {
+        do {
             std::uint64_t responded = 0;
             std::uint64_t targeted = 0;
             try {
-                const auto counts = parse_progress(batch[i].data);
+                const auto counts = parse_progress(rec->projection_spare.data);
                 // UP-4: skip a frame with no meaningful denominator. An
                 // execution-progress event published BEFORE set_agents_targeted
                 // (an agent responding during dispatch) carries agents_targeted=0;
@@ -1659,7 +1671,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                 // `total:0` progress notification, which a strict MCP client can
                 // reject. `total` is monotone-meaningful only once targeted>0.
                 if (counts.targeted == 0) {
-                    continue;
+                    break;
                 }
                 targeted = counts.targeted;
                 // Defensive clamp: responded must never exceed targeted on the
@@ -1667,10 +1679,9 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                 // must not surface as progress>total).
                 responded = std::min(counts.responded, counts.targeted);
             } catch (...) {
-                // C4: drop this batch's remainder, keep going to terminal
-                // settlement. A malformed/unbuildable progress delta is
-                // fire-and-forget by contract.
-                spdlog::warn("MCP bridge: progress frame build failed; dropping batch remainder");
+                // C4: a malformed/unbuildable progress delta is fire-and-forget
+                // by contract - drop it, keep going to terminal settlement.
+                spdlog::warn("MCP bridge: progress frame build failed; dropping latched snapshot");
                 break;
             }
             // H1 (governance adversarial review): both supported MCP revisions say
@@ -1684,9 +1695,13 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
             // committed to the wire for this record (the first frame is always
             // allowed, so an initial 0/N is fine as the starting point). Same
             // "a strict client can reject" rationale as the UP-4 total:0 skip.
+            // #2412: this now ALSO catches a snapshot the listener superseded
+            // before the projector ever saw it (see progress_suppressed_delta's
+            // field comment) - both are "a candidate that never reached the
+            // wire", so they share one counter.
             if (rec->progress_sent_any && responded <= rec->last_progress_sent) {
                 rec->progress_suppressed_delta.fetch_add(1, std::memory_order_relaxed);
-                continue;
+                break;
             }
             std::string frame;
             try {
@@ -1695,7 +1710,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                 frame = progress_notification(*rec->progress_token, responded, targeted,
                                               msg, rec->execution_id);
             } catch (...) {
-                spdlog::warn("MCP bridge: progress frame build failed; dropping batch remainder");
+                spdlog::warn("MCP bridge: progress frame build failed; dropping latched snapshot");
                 break;
             }
             const std::uint64_t id = get_only
@@ -1721,7 +1736,7 @@ void McpStreamBridge::project_record(const std::shared_ptr<BridgeRecord>& rec, P
                     }
                 }
             }
-        }
+        } while (false);
     }
 
     if (!term.has_value()) {
@@ -3110,15 +3125,6 @@ void McpStreamBridge::flush_record_obs(BridgeRecord& rec) noexcept {
     // D3: exchange-then-restore. A transiently failing registry never loses the
     // accumulated delta - it is put back (or parked on the shared core) for a
     // later flush; only final process shutdown may drop it.
-    const auto drops = rec.mailbox_drop_delta.exchange(0, std::memory_order_relaxed);
-    if (drops != 0) {
-        if (metrics_ == nullptr ||
-            !obs_guard([&] {
-                metrics_->counter(kMetricMailboxDrops).increment(static_cast<double>(drops));
-            })) {
-            core_->pending_mailbox_drops.fetch_add(drops, std::memory_order_relaxed);
-        }
-    }
     const auto fails = rec.listener_failure_delta.exchange(0, std::memory_order_relaxed);
     if (fails != 0) {
         if (metrics_ == nullptr ||
@@ -3154,13 +3160,6 @@ void McpStreamBridge::flush_core_obs() noexcept {
     if (metrics_ == nullptr) {
         return;  // keep pending - a registry may never appear, but losing the
                  // count is worse than holding an int
-    }
-    const auto drops = core_->pending_mailbox_drops.exchange(0, std::memory_order_relaxed);
-    if (drops != 0 &&
-        !obs_guard([&] {
-            metrics_->counter(kMetricMailboxDrops).increment(static_cast<double>(drops));
-        })) {
-        core_->pending_mailbox_drops.fetch_add(drops, std::memory_order_relaxed);
     }
     const auto fails = core_->pending_listener_failures.exchange(0, std::memory_order_relaxed);
     if (fails != 0 &&

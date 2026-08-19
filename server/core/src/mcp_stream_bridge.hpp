@@ -232,10 +232,6 @@ namespace sse_bus = ::yuzu::server::detail;
 class McpStreamState;
 class McpSessionRegistry;
 
-/// Arming-mailbox capacity (progress frames; the terminal has its own reserved
-/// slot and is never dropped). Matches the sink-queue scale, not the ring's.
-inline constexpr std::size_t kBridgeMailboxCap = 16;
-
 class McpStreamBridge {
 public:
     struct Config {
@@ -825,7 +821,9 @@ public:
 
 private:
     /// One latched bus event. Nothrow-movable - load-bearing for the projector's
-    /// extraction (C4) and the listener's construct-then-move commit (D2).
+    /// extraction (C4), the listener's construct-then-move commit (D2), and
+    /// (#2412) the listener/projector latest-wins progress-slot swaps, which
+    /// rely on the same nothrow move to flip buffers without allocating.
     struct MailboxEntry {
         std::uint64_t bus_id = 0;
         std::string data;
@@ -846,7 +844,6 @@ private:
         /// C5/D3: deltas whose registry flush failed transiently, retried by later
         /// projector passes; records also drain their locals here at teardown.
         std::atomic<std::uint64_t> pending_listener_failures{0};
-        std::atomic<std::uint64_t> pending_mailbox_drops{0};
         std::atomic<std::uint64_t> pending_projection_degraded{0};
         std::atomic<std::uint64_t> pending_progress_suppressed{0};
     };
@@ -908,9 +905,17 @@ private:
 
         // ── Guarded by mu ──────────────────────────────────────────────────
         mutable std::mutex mu;
-        std::array<MailboxEntry, kBridgeMailboxCap> mailbox{};
-        std::size_t mb_head = 0;
-        std::size_t mb_count = 0;
+        /// #2412: the ONE latched progress snapshot - latest-wins, not a ring.
+        /// The listener assigns the newest event into `listener_spare`, then
+        /// swaps it with `progress_slot` (noexcept); the projector swaps
+        /// `progress_slot` with `projection_spare` to extract. Both spares
+        /// exist so every swap is allocation-free once each buffer has grown
+        /// to its steady-state payload size - a straight move-out-and-replace
+        /// would re-allocate the slot's buffer on every extraction.
+        MailboxEntry progress_slot;
+        bool progress_pending = false;    ///< progress_slot holds an unprojected snapshot
+        MailboxEntry listener_spare;      ///< listener's swap partner
+        MailboxEntry projection_spare;    ///< projector's swap partner
         std::optional<MailboxEntry> terminal_slot;  ///< reserved; never dropped
         /// STICKY write-once discriminator (D2): set only after the first
         /// terminal payload is fully secured in terminal_slot; NEVER cleared -
@@ -1057,12 +1062,15 @@ private:
         // C5: record-local, listener-writable observability. Flushed by the
         // projector / teardown through the noexcept obs guard - the listener
         // itself never touches a metrics mutex.
-        std::atomic<std::uint64_t> mailbox_drop_delta{0};
         std::atomic<std::uint64_t> listener_failure_delta{0};
-        /// #2438: H1 progress-monotonicity suppressions. Written on the
-        /// projector thread (no `mu` held from the emission loop onward) but
-        /// flushed from other threads (shutdown/teardown), so it stays atomic
-        /// like its C5 siblings even though there is only one writer.
+        /// #2438: H1 progress-monotonicity suppressions, WIDENED by #2412 - a
+        /// progress event the listener overwrites in `progress_slot` before the
+        /// projector ever sees it (latest-wins supersede) is counted here too,
+        /// under `mu` in the listener, not just on the (sole) projector-thread
+        /// writer the #2438 comment originally described. Flushed from other
+        /// threads (shutdown/teardown), so it stays atomic despite the two
+        /// writers never running concurrently for a given record (listener vs.
+        /// projector are serialized by `mu` and by the swap protocol itself).
         std::atomic<std::uint64_t> progress_suppressed_delta{0};
         /// #2528: ~ClaimGuard released the claim without `mu` and therefore could
         /// not run the settle bookkeeping normally. "Should never happen" - it
