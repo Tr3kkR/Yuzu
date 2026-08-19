@@ -175,6 +175,7 @@
 #include "scope_engine.hpp"
 #include "instruction_db_pool.hpp"
 #include "tag_store.hpp"
+#include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
 #include "webhook_store.hpp"
 #include "offload_target_store.hpp"
@@ -8505,8 +8506,8 @@ private:
                 // token), so the DISPATCH outcome is unchanged; the
                 // distinction is what makes a degraded read observable
                 // instead of silently indistinguishable from "no agents".
-                if (auto svc = tag_store_->agents_with_tag("service",
-                                                           sess.token_scope_service)) {
+                if (auto svc = tag_store_->agents_with_tag(
+                        std::string(authz::kServiceTagKey), sess.token_scope_service)) {
                     facts.service_tagged = std::unordered_set<std::string>(svc->begin(), svc->end());
                 } else {
                     spdlog::error("derive_exec_visible: tag store degraded resolving service "
@@ -13114,6 +13115,41 @@ private:
                 return;
             }
 
+            // #3289 hardening-round follow-up: normalize category keys to
+            // lowercase BEFORE anything downstream compares against them —
+            // mirrors the REST v1 twin (rest_api_v1.cpp), which already did
+            // this. Without it, a caller writing `key="Service"` (capital)
+            // stored the tag under the wrong case and silently skipped the
+            // `ensure_service_management_group` side effect below (a
+            // case-sensitive literal comparison), even though it isn't a
+            // security issue — the #3289 guard's own key check is already
+            // case-insensitive regardless of this normalization. Uses
+            // `kCategoryKeys` (the same constant the tag-push block 40 lines
+            // below already reads) rather than a second hardcoded literal
+            // list.
+            {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == lower_key) {
+                        key = lower_key;
+                        break;
+                    }
+                }
+            }
+
+            // #3289: a service-scoped token authorizing this write via
+            // require_scoped_permission below reads the PRE-WRITE `service`
+            // tag to decide admission — so without this guard it could
+            // authorize the very write that changes that tag out from under
+            // its own confinement. Value-blind, checked before the scoped
+            // gate. See deny_service_scoped_service_tag_mutation's doc
+            // comment (auth_routes.hpp).
+            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.set",
+                                                                       agent_id, key))
+                return;
+
             // K-04/CDX-R4-08: per-TARGET authorization -- NOT a global Tag:Write
             // gate. The old require_permission("Tag","Write") admitted a
             // service-scoped token on its ITServiceOwner grant with no target
@@ -13186,6 +13222,31 @@ private:
                     "application/json");
                 return;
             }
+
+            // Gate 4/#3289 hardening round: normalize category keys to
+            // lowercase, matching the /api/tags/set twin above — without
+            // this, deleting a key by the same case a caller just set it
+            // with (e.g. "Service") silently no-ops (TagStore::delete_tag
+            // finds no row stored under that exact case) instead of removing
+            // the tag, since /api/tags/set now stores the normalized form.
+            {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == lower_key) {
+                        key = lower_key;
+                        break;
+                    }
+                }
+            }
+
+            // #3289: same TOCTOU guard as /api/tags/set — a service-scoped
+            // token must not delete its own confinement key. See
+            // deny_service_scoped_service_tag_mutation's doc comment.
+            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.delete",
+                                                                       agent_id, key))
+                return;
 
             // K-04/CDX-R4-08: per-TARGET authorization (see /api/tags/set) --
             // a service-scoped token must not delete a tag on an out-of-scope

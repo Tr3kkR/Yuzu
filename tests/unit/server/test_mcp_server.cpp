@@ -706,6 +706,7 @@ struct McpTestServer {
     std::vector<std::string> audit_log; // records "action|result" pairs
     std::vector<std::string> audit_details; // records the detail string per audit call (M2)
     std::vector<std::string> audit_target_ids; // records the target_id string per audit call (#2917)
+    std::vector<std::string> audit_target_types; // records target_type per audit call (#3289 Gate 8)
     bool audit_succeeds_{true};         // false → AuditFn returns false (dropped row)
     bool audit_throws_{false};          // true → AuditFn throws (bad_alloc-class) (#1647)
     bool read_only_mode_{false};        // captured by ref by build_handler
@@ -1019,12 +1020,13 @@ private:
         // Mock audit: record calls. Returns audit_succeeds_ so a test can simulate
         // a dropped audit row (#1240: AuditFn is bool; revoke surfaces the gap).
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& result, const std::string& /*target_type*/,
+                               const std::string& result, const std::string& target_type,
                                const std::string& target_id,
                                const std::string& detail) -> bool {
             audit_log.push_back(action + "|" + result);
             audit_details.push_back(detail);
             audit_target_ids.push_back(target_id);
+            audit_target_types.push_back(target_type);
             if (audit_throws_)
                 throw std::runtime_error("audit DB write blew up"); // bad_alloc-class (#1647)
             return audit_succeeds_;
@@ -9332,6 +9334,107 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
     auto body3 = nlohmann::json::parse(res3->body);
     REQUIRE(body3.contains("error"));
     CHECK(body3["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+}
+
+// ── #3289: MCP set_tag/delete_tag must not let a service-scoped token
+// mutate its own confinement tag — same TOCTOU as the REST/legacy twins.
+
+TEST_CASE("MCP set_tag denies a service-scoped token writing the service tag (#3289)",
+          "[pg][mcp][integration][tag][security]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& store = *tag_bundle;
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.mock_token_scope_service = "printers";
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":900,"params":{"name":"set_tag","arguments":{"agent_id":"agent-1","key":"service","value":"vending"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(tag_val(store, "agent-1", "service").empty()); // no write
+    CHECK(ts.audit_log.back() == "mcp.set_tag|denied");
+    // Gate 8: pin target_type="Tag" — this is the site the #3289 Gate 4/6
+    // hardening round actually CHANGED (was "Agent"); REST v1's own pin test
+    // covers the site that didn't need fixing, not this one.
+    REQUIRE_FALSE(ts.audit_target_types.empty());
+    CHECK(ts.audit_target_types.back() == "Tag");
+}
+
+TEST_CASE("MCP set_tag admits a service-scoped token writing a NON-service key "
+          "(#3289 regression: only the service key is guarded)",
+          "[pg][mcp][integration][tag]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& store = *tag_bundle;
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.mock_token_scope_service = "printers";
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":901,"params":{"name":"set_tag","arguments":{"agent_id":"agent-1","key":"role","value":"web"}}})");
+    REQUIRE(res);
+    auto payload = write_tool_payload(res);
+    CHECK(payload["set"] == true);
+    CHECK(tag_val(store, "agent-1", "role") == "web");
+}
+
+TEST_CASE("MCP delete_tag denies a service-scoped token deleting the service "
+          "tag (#3289: tag survives the consumed-ticket recall)",
+          "[pg][mcp][integration][tag][security][approval]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "service", "printers", "server").has_value());
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_3289_mcp_appr_"}};
+    SqliteDb raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), raw.addr()) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.get());
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.mock_token_scope_service = "printers";
+    ts.start("operator");
+
+    // 1. Mint the ticket (approval-gating is generic — reached before the
+    // #3289 guard, same as the ordinary round-trip above).
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":910,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"service"}}})");
+    auto body1 = nlohmann::json::parse(res1->body);
+    REQUIRE(body1.contains("error"));
+    CHECK(body1["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+
+    // 2. Approve it.
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // 3. Recall with the consumed ticket → the #3289 guard denies BEFORE
+    // the actual delete, so the tag survives despite a valid, approved ticket.
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":911,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"service","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto res2 = ts.call(recall);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("error"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(tag_val(tags, "agent-1", "service") == "printers"); // untouched
+    CHECK(ts.audit_log.back() == "mcp.delete_tag|denied");
 }
 
 TEST_CASE("MCP approval recall refuses a ticket presented by a different principal "

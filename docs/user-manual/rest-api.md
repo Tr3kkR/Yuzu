@@ -2262,6 +2262,11 @@ Set a tag on an agent. Creates the tag if it does not exist, or updates the valu
 }
 ```
 
+**Service-scoped tokens:** a service-scoped token can never set the `service` key on any agent, in
+or out of its own scope, regardless of the value being written -- `403`, no `Tag:Write` grant
+admits it (#3289). The `service` tag defines the token's own confinement boundary; see
+[Service-Scoped Tokens](authentication.md#service-scoped-tokens).
+
 ---
 
 #### `DELETE /api/v1/tags/{agent_id}/{key}`
@@ -2269,6 +2274,9 @@ Set a tag on an agent. Creates the tag if it does not exist, or updates the valu
 Delete a tag from an agent.
 
 **Permission:** `Tag:Delete`
+
+**Service-scoped tokens:** cannot delete the `service` key on any agent, for the same reason as
+`PUT` above -- `403`, no `Tag:Delete` grant admits it (#3289).
 
 **Response:**
 
@@ -6751,11 +6759,14 @@ Get tags for an agent. Requires `agent_id` query parameter. Returns tags as an a
 
 #### `POST /api/tags/set`
 
-Set a tag on an agent. Request body: `{"agent_id": "...", "key": "...", "value": "..."}`.
+Set a tag on an agent. Request body: `{"agent_id": "...", "key": "...", "value": "..."}`. A
+service-scoped token cannot set the `service` key on any agent -- `403` (#3289); see
+[Service-Scoped Tokens](authentication.md#service-scoped-tokens).
 
 #### `POST /api/tags/delete`
 
-Delete a tag from an agent. Request body: `{"agent_id": "...", "key": "..."}`.
+Delete a tag from an agent. Request body: `{"agent_id": "...", "key": "..."}`. A service-scoped
+token cannot delete the `service` key on any agent -- `403` (#3289).
 
 #### `POST /api/tags/query`
 
