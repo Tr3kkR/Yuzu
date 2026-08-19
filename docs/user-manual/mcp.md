@@ -629,13 +629,16 @@ never consumes the ticket. (Semantic checks the schema cannot express — an
 unknown plugin name, a nonexistent agent — still happen in the handler and are
 not pre-empted by this gate. When one of those DOES fire on a recall that
 already consumed a ticket — #2444 item 3 — it is alertable via the
-`yuzu_mcp_approval_burned_total{tool,reason}` counter, paired with an audit
-row for forensic detail — usually the generic `mcp.<tool>|failure` row, but
-some handlers' business-rejection paths bypass that generic verb entirely and
-leave only their own domain-verb row instead (e.g. `revoke_certificate`'s
-"serial not found" leaves `ca.cert.revoked|denied`, never `mcp.
-revoke_certificate|failure`); the counter is bounded to approval-gated tools
-and is the reliable alertable signal regardless of which audit row landed.) The error
+`yuzu_mcp_approval_burned_total{tool,reason}` counter, usually paired with an
+audit row for forensic detail — the generic `mcp.<tool>|failure` row, or, for
+handlers whose business-rejection path bypasses that generic verb entirely,
+their own domain-verb row instead (e.g. `revoke_certificate`'s "serial not
+found" leaves `ca.cert.revoked|denied`, never `mcp.revoke_certificate|
+failure`). A handful of pre-existing server-fault branches (e.g.
+`revoke_certificate`'s own CA-store-unavailable check) emit no audit row at
+all — the counter is the ONLY signal for those; the counter is bounded to
+approval-gated tools and is the reliable alertable signal regardless of
+whether an audit row landed.) The error
 message names the offending field as a JSON-pointer-style path (e.g.
 `/steps/1`), and `error.data` carries a `correlation_id` plus a `remediation`
 confirming no ticket was created or consumed. Two strictness notes: `integer`

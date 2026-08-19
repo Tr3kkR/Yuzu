@@ -124,6 +124,12 @@ An MCP approval-ticket recall that hits a store fault has always returned `-3260
 
 **What to do:** if you have automation that blindly retries on `-32603` without checking `retry_after_ms`, it now stops retrying sooner in this specific case — which is the correct behavior (the old retries were futile). If your automation already honors `retry_after_ms` per [invariant A5](../agentic-first-principle.md), no change is needed. See [`mcp.md`](mcp.md) "`-32603`: Approval store unavailable" for the full response-body reference.
 
+## Behaviour change: four MCP tool input schemas got stricter (#2444)
+
+`revoke_certificate.serial_hex`, engine-principal tools' `principal_id`, `confirm_engine_rotation.token_id`, and `quarantine_device.reason`/`whitelist` now carry `pattern`/`maxLength` bounds mirroring their handlers' own checks (previously enforced only at the handler, after an approval ticket was already consumed).
+
+**What to do:** a pending or approved-but-unconsumed approval ticket minted *before* upgrade, whose arguments the new pattern rejects, becomes unrecallable fail-closed once the new server is running — the recall fails pre-consume just like any other schema-invalid call, and the ticket is never burned, but it also can't be redeemed as originally minted. It stays valid until its normal 7-day expiry (pending or approved-unconsumed — see `mcp-server.md`'s "Pre-approval input-schema validation"), then ages out and must be re-requested. No action is required unless you have a specific known-outstanding ticket for one of these four tools that you need to redeem across the upgrade — re-request it after upgrading instead.
+
 ## Behaviour change: webhook and offload-target deliveries, and enrollment/execution-failure notifications, now actually fire (#3261)
 
 A boot-ordering bug wired `NotificationStore`/`WebhookStore`/`OffloadTargetStore` into
