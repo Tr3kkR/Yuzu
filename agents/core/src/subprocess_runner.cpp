@@ -89,8 +89,8 @@
 
 #include <cerrno>
 #include <csignal>
-#include <cstdio> // std::fopen/std::fscanf — read Linux fs.nr_open for the fd ceiling
-#include <cstdlib> // std::getenv (TZ passthrough)
+#include <cstdio> // std::fopen/std::fgets — read Linux fs.nr_open for the fd ceiling
+#include <cstdlib> // std::getenv (TZ passthrough), std::strtol (fs.nr_open)
 #include <ctime>
 #include <fcntl.h>
 #include <mutex>
@@ -408,11 +408,18 @@ long resolve_fd_ceiling() {
         return maxproc;
 #elif defined(__linux__)
     if (FILE* f = std::fopen("/proc/sys/fs/nr_open", "re")) {
-        long v = 0;
-        const int n = std::fscanf(f, "%ld", &v);
+        // fgets+strtol rather than fscanf: glibc 2.38 redirects the scanf family
+        // to versioned __isoc23_* symbols, which breaks loading on older-glibc
+        // (RHEL-era) hosts. The value is a single decimal (max ~20 chars).
+        char buf[32]{};
+        const bool got = std::fgets(buf, sizeof(buf), f) != nullptr;
         std::fclose(f);
-        if (n == 1 && v > 0)
-            return v;
+        if (got) {
+            char* end{};
+            const long v = std::strtol(buf, &end, 10);
+            if (end != buf && v > 0)
+                return v;
+        }
     }
 #endif
     return 1L << 20; // last-resort finite bound (Linux default fs.nr_open)

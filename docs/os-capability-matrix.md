@@ -135,7 +135,7 @@ duplicates.
 | wifi | ✅ | ✅ | ✅ | win/linux/apple all implemented; macOS `connected` via CoreWLAN (`wifi_corewlan.mm`), `list_networks` legacy `airport -s`/`system_profiler` (connection depth: the **Live — Wi-Fi current connection** row) |
 | windows_updates | ✅ | ✅ | ✅ | update history / rpm+apt / `system_profiler` install history (Linux/mac report installed-package history) |
 | wmi | ✅ | ⛔ | ⛔ | Windows-only (`#ifndef _WIN32` → not available) |
-| wol | ✅ | ✅ | ✅ | `wol_plugin.cpp` — `_WIN32` vs POSIX portable UDP broadcast (wake); macOS `check` reachability now uses `ping -t 2` (BSD whole-run deadline; the shared POSIX `-W 2` path meant 2 ms on Darwin → every live host falsely `unreachable`) |
+| wol | ✅ | ✅ | ✅ | `wol_plugin.cpp` — `_WIN32` vs POSIX portable UDP broadcast (wake); `check` reachability is native on every platform (unprivileged ICMP echo with a TCP-connect fallback on port 443, ADR-3002 rung 1) — no subprocess spawn, no `ping` shell-out |
 
 ## Why gaps happen (and how to not get surprised again)
 
@@ -421,12 +421,12 @@ implementation is.
 | netstat | netstat_list | linux | supported | 1 | /proc/net/{tcp,udp}[6] | - |
 | netstat | netstat_list | macos | supported | 1 | libproc | - |
 | netstat | netstat_list | windows | supported | 1 | GetExtendedTcpTable/GetExtendedUdpTable | - |
-| network_actions | flush_dns | linux | constrained | 3 | resolvectl/systemd-resolve via popen | silently reports ok even when neither resolvectl nor systemd-resolve is present |
-| network_actions | flush_dns | macos | supported | 3 | dscacheutil/mDNSResponder via sudo popen | - |
-| network_actions | flush_dns | windows | supported | 3 | ipconfig via popen | - |
-| network_actions | ping | linux | supported | 3 | system ping via popen | - |
-| network_actions | ping | macos | supported | 3 | system ping via popen | - |
-| network_actions | ping | windows | supported | 3 | system ping via popen | - |
+| network_actions | flush_dns | linux | constrained | 2 | resolvectl/systemd-resolve via bounded argv runner (sudo -n) | requires resolvectl (systemd-resolved) or the legacy systemd-resolve CLI; an honest failure is reported if neither is present |
+| network_actions | flush_dns | macos | supported | 2 | dscacheutil + killall via bounded argv runner (sudo -n) | - |
+| network_actions | flush_dns | windows | supported | 2 | ipconfig via bounded argv runner | - |
+| network_actions | ping | linux | supported | 2 | system ping via bounded argv runner | - |
+| network_actions | ping | macos | supported | 2 | system ping via bounded argv runner | - |
+| network_actions | ping | windows | supported | 2 | system ping.exe via bounded argv runner | - |
 | network_config | adapters | linux | supported | 3 | ip(8) via governed shell runner | - |
 | network_config | adapters | macos | supported | 3 | ifconfig via governed shell runner | - |
 | network_config | adapters | windows | supported | 1 | GetAdaptersAddresses | - |
@@ -541,14 +541,14 @@ implementation is.
 | script_exec | bash | linux | supported | 3 | bash_c | - |
 | script_exec | bash | macos | supported | 3 | bash_c | - |
 | script_exec | bash | windows | unsupported | - | - | - |
-| services | list | linux | supported | 3 | systemctl | - |
-| services | list | macos | supported | 3 | launchctl | - |
+| services | list | linux | supported | 2 | runner argv 'systemctl list-units' | - |
+| services | list | macos | supported | 2 | runner argv 'launchctl list' | - |
 | services | list | windows | supported | 1 | win32_service_api | - |
-| services | running | linux | supported | 3 | systemctl | - |
-| services | running | macos | supported | 3 | launchctl | - |
+| services | running | linux | supported | 2 | runner argv 'systemctl list-units' | - |
+| services | running | macos | supported | 2 | runner argv 'launchctl list' | - |
 | services | running | windows | supported | 1 | win32_service_api | - |
-| services | set_start_mode | linux | supported | 3 | systemctl | - |
-| services | set_start_mode | macos | supported | 3 | launchctl | - |
+| services | set_start_mode | linux | supported | 2 | runner argv 'sudo -n -- systemctl enable\|disable\|mask\|unmask' | - |
+| services | set_start_mode | macos | supported | 2 | runner argv 'sudo -n -- launchctl enable\|disable' | - |
 | services | set_start_mode | windows | supported | 1 | win32_service_api | - |
 | sockwho | sockwho_list | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | - |
 | sockwho | sockwho_list | macos | supported | 1 | libproc | - |
@@ -724,9 +724,9 @@ implementation is.
 | wol | wake | linux | supported | 1 | raw UDP broadcast socket | - |
 | wol | wake | macos | supported | 1 | raw UDP broadcast socket | - |
 | wol | wake | windows | supported | 1 | raw UDP broadcast socket | - |
-| wol | check | linux | supported | 3 | system ping via popen | - |
-| wol | check | macos | supported | 3 | system ping via popen | - |
-| wol | check | windows | supported | 3 | system ping via popen | - |
+| wol | check | linux | constrained | 1 | SOCK_DGRAM ICMP ping socket + TCP-connect fallback | requires net.ipv4.ping_group_range to admit the process group for ICMP; falls back to a TCP connect on port 443, and reports CONSTRAINED if neither mechanism is usable |
+| wol | check | macos | supported | 1 | SOCK_DGRAM ICMP ping socket + TCP-connect fallback | - |
+| wol | check | windows | supported | 1 | IcmpSendEcho + TCP-connect fallback | - |
 
 **Undeclared plugins** (ABI<4, or ABI4 with no capability declarations yet — RATCHET: this count must never grow):
 
@@ -816,8 +816,9 @@ verified against the cited code:
 - **New rows:** **Antivirus posture** (macOS 🟡 — real XProtect/EDR probes, no
   real-time-protection state) and **Live — Wi-Fi current connection** (macOS 🟡 —
   CoreWLAN, SSID/BSSID withheld from a daemon).
-- **Honesty-only** (cell unchanged): `wol` `check` (`ping -t 2`, was a false
-  `unreachable`), `wifi connected` (CoreWLAN vs dead `airport -I`), `flush_dns`
+- **Honesty-only** (cell unchanged): `wol` `check` (native ICMP + TCP-connect
+  fallback, no subprocess; was a false `unreachable`), `wifi connected`
+  (CoreWLAN vs dead `airport -I`), `flush_dns`
   (dual-step + real exit codes), `registry`/`sccm`/`rdp_control` off-Windows
   sentinels (no false success on writes), `bitlocker`/`services`/`users`/
   `network_config` macOS enrichments, DNS-cache `unsupported` sentinel.

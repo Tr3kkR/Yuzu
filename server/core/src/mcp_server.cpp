@@ -3637,6 +3637,33 @@ McpServer::HandlerFn McpServer::build_handler(
                 return true;
             };
 
+            // #3289 — MCP twin of the REST/legacy tag-mutation TOCTOU guard.
+            // set_tag/delete_tag's own scoped_perm_fn below authorizes a
+            // Tag:Write/Delete by reading the target's PRE-WRITE `service`
+            // tag, so without this it would authorize the very write that
+            // changes that tag out from under a service-scoped token's own
+            // confinement. Value-blind (see
+            // authz::service_scope_may_mutate_tag_key) — this deny does not
+            // become a membership oracle. `session` already resolved above.
+            auto deny_service_scoped_service_tag_mutation =
+                [&](const std::string& action, const std::string& agent_id,
+                    const std::string& key) -> bool {
+                if (authz::service_scope_may_mutate_tag_key(session->token_scope_service, key))
+                    return false;
+                // Gate 4/#3289 hardening round: target_type="Tag" matches
+                // REST v1's convention for this identical logical event —
+                // not "Agent", which mismatched every pre-existing tag audit
+                // row on any surface.
+                (void)yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, action, "denied", "Tag", agent_id + ":" + key,
+                    "service-scoped token blocked: cannot mutate the service tag");
+                res.set_content(
+                    a4_error(kPermissionDenied,
+                            authz::kServiceTagMutationDeniedMessage),
+                    "application/json");
+                return true;
+            };
+
             // A4 envelope that also carries the durable execution handle. Used by
             // the two streamed-POST 500s, which are the only refusals raised AFTER
             // dispatch - the work is running, so the client needs the id to find it
@@ -7496,9 +7523,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         execution_id = *created;
                     } else {
                         // governance R1 unhappy-UP-3: create_execution
-                        // returning nullopt is a SQLite write failure
-                        // (disk full, locked DB, schema corruption).
-                        // Silently proceeding with empty execution_id
+                        // returning an error is a tracker store failure -
+                        // database not open, statement prepare failure, or
+                        // an insert/write failure (disk full, locked DB,
+                        // schema corruption); created.error() below names
+                        // which. Silently proceeding with empty execution_id
                         // hides the tracker outage from operators. Log
                         // at warn so SREs see the failure; dispatch
                         // continues so the operator's "stop NOW"
@@ -7506,9 +7535,9 @@ McpServer::HandlerFn McpServer::build_handler(
                         // still sees an empty execution_id and can fall
                         // back to query_responses).
                         spdlog::warn("MCP execute_instruction: execution_tracker->create_execution "
-                                     "returned nullopt; dispatching with empty execution_id "
+                                     "failed ({}); dispatching with empty execution_id "
                                      "principal={} plugin={} action={}",
-                                     session->username, plugin, action);
+                                     created.error(), session->username, plugin, action);
                     }
                 }
 
@@ -8204,6 +8233,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // #3289: value-blind TOCTOU guard, before the scoped gate.
+                if (deny_service_scoped_service_tag_mutation("mcp.set_tag", agent_id, key))
+                    return;
                 // H1 (PR #1796): per-device scope gate — a management-group-
                 // confined operator may tag only devices inside their groups.
                 // Runs AFTER agent_id parse (the scope needs the target).
@@ -8267,6 +8299,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // #3289: value-blind TOCTOU guard, before the scoped gate.
+                if (deny_service_scoped_service_tag_mutation("mcp.delete_tag", agent_id, key))
+                    return;
                 // H1 (PR #1796): per-device scope gate (see set_tag above).
                 // K-06/CDX-R4-09: fail CLOSED when unwired, never widen to perm_fn.
                 if (!scoped_perm_fn) {
