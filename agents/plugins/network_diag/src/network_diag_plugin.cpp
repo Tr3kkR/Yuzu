@@ -169,13 +169,19 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "listening",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/tcp[6]", nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "libproc", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "libproc",
+         "a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one "
+         "arbitrarily-chosen owning PID, not one row per owner"},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetExtendedTcpTable", nullptr},
     },
     {
         /* .action      = */ "connections",
         /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/tcp[6]", nullptr},
-        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "libproc", nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "libproc",
+         "a socket shared by more than one process (SO_REUSEPORT, prefork) surfaces under one "
+         "arbitrarily-chosen owning PID, not one row per owner"},
         /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "GetExtendedTcpTable", nullptr},
     },
 };

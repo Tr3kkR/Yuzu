@@ -745,7 +745,12 @@ void check_ports(yuzu::CommandContext& ctx, const std::vector<std::string>& port
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"check",
      /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 1, "procfs", nullptr},
-     /* macos   = */ {YUZU_SUPPORT_SUPPORTED, 1, "libproc", nullptr},
+     /* macos   = */
+     {YUZU_SUPPORT_SUPPORTED, 1, "libproc",
+      "UDP rows carry an empty state (no fabricated \"LISTEN\") — a real UDP listener still "
+      "matches a port check, but its detail text differs from a TCP match; a port shared by "
+      "more than one process (SO_REUSEPORT, prefork) reports the pid of one arbitrarily-chosen "
+      "owner in its match detail, not every owner"},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "iphlpapi_dnsapi", nullptr}},
 };
 
