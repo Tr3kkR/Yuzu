@@ -367,10 +367,16 @@ TEST_CASE("deny_service_scoped_schedule: denies a service-scoped session, writes
 
     SECTION("service-scoped token, an upstream gate already minted a "
             "correlation id -> reused, not overwritten") {
-        // Pre-#3167, this call site set X-Correlation-Id unconditionally,
-        // clobbering one an earlier gate had already minted (unlike every
-        // sibling deny_service_scoped_* helper, which reuses via
-        // ensure_correlation_id). Pin the fixed behavior directly.
+        // Pre-#3167, this call site set X-Correlation-Id unconditionally via
+        // res.set_header, which emplaces into httplib's header multimap
+        // rather than replacing in place — an earlier gate's minted id would
+        // have gained a second entry rather than being overwritten, leaving
+        // which value the caller saw dependent on serialization order
+        // (unlike every sibling deny_service_scoped_* helper, which reuses
+        // via ensure_correlation_id). Pin the fixed behavior directly:
+        // empirically, this SECTION fails against the pre-#3167 code
+        // (get_header_value returns the freshly-minted id, not the upstream
+        // one), confirming it's a genuine, non-vacuous regression test.
         auto req = h.service_scoped_request_for("svc-enabler", "ServiceExecute",
                                                  {{"Execution", "Execute"}}, "printers");
         httplib::Response res;
