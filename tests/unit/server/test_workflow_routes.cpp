@@ -2104,3 +2104,59 @@ TEST_CASE("/fragments/schedules: an ordinary session with Schedule:Read reaches 
     // legitimate path.
     CHECK(res->body.find("Not available") != std::string::npos);
 }
+
+// guardian-confinement-2298 PR3 §3e: POST /api/scope/estimate is auth_fn-only
+// (no perm_fn at all) and probes scope_fn(expression, session->username) —
+// the caller's own visible fleet, which for a service-scoped token is still
+// the minter's full-CRUD-visible set. Same test shape as the schedule-list
+// pair above.
+
+TEST_CASE("POST /api/scope/estimate: a service-scoped token is denied",
+          "[pg][workflow][scope][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.mock_token_scope_service = "printers";
+
+    auto res = h.sink.Post("/api/scope/estimate", R"({"expression":"ostype == \"Windows\""})",
+                           "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("service-scoped") != std::string::npos);
+    // Header/body correlation-id parity (consistency-auditor, Gate 4): a
+    // hand-built id used to land in the body only, never the header.
+    auto j = nlohmann::json::parse(res->body);
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res->get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
+
+    bool saw_denied = false;
+    for (const auto& c : h.audit_calls) {
+        if (c.action == "scope.estimate.access_denied" && c.result == "denied") {
+            saw_denied = true;
+            // PascalCase convention (consistency-auditor, Gate 4): was
+            // "scope_expression".
+            CHECK(c.target_type == "ScopeExpression");
+        }
+    }
+    CHECK(saw_denied);
+}
+
+TEST_CASE("POST /api/scope/estimate: an ordinary session reaches the estimator",
+          "[pg][workflow][scope][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+
+    auto res = h.sink.Post("/api/scope/estimate", R"({"expression":"ostype == \"Windows\""})",
+                           "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body.contains("matched"));
+    CHECK(body.contains("total"));
+
+    for (const auto& c : h.audit_calls) {
+        CHECK(c.action != "scope.estimate.access_denied");
+    }
+}

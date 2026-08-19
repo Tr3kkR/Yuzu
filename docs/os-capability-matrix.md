@@ -92,12 +92,12 @@ duplicates.
 | antivirus | ✅ | ✅ | ✅ | Defender/WMI · ClamAV+Falcon+Sophos · macOS real probes — XProtect bundle version + endpoint-security system-extension enumeration (`antivirus_plugin.cpp`, parsers `antivirus_parsers.hpp`), no longer a hardcoded assertion (posture depth: the **Antivirus posture** row) |
 | asset_tags | ✅ | ✅ | ✅ | portable — `std::filesystem` only |
 | bitlocker | ✅ | ✅ | ✅ | BitLocker `manage-bde` · LUKS `cryptsetup` · FileVault `fdesetup` + per-APFS-volume `diskutil apfs list` (encrypted/not_encrypted/unknown, parser `bitlocker_macos_apfs.hpp`) |
-| certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
+| certificates | ✅ | ✅ | ✅ | full per-OS blocks (`_WIN32`/`__linux__`/`__APPLE__`); Linux now parses in-process via libcrypto (rung 1); macOS System/SystemRoot keychains read natively via SecItem (rung 1), login keychain stays on its registered Decision-7 governed-shell path; macOS depth — login-keychain read + verified SIP-aware delete — in the **Security posture** section rows |
 | chargen | ✅ | ✅ | ✅ | portable — RFC 864 generator |
 | content_dist | ✅ | ✅ | ✅ | `_WIN32` vs POSIX; HTTPS gated on OpenSSL build option, not OS |
 | device_identity | ✅ | ✅ | ✅ | all three branches implemented |
 | diagnostics | ✅ | ✅ | ✅ | portable — `std::filesystem` checks |
-| discovery | ✅ | ✅ | ✅ | all three branches implemented |
+| discovery | ✅ | ✅ | ✅ | all three legs are native (`GetIpNetTable2` / `/proc/net/arp` / sysctl routing table), and the sweep uses a shared unprivileged ICMP socket, constrained on Linux by `net.ipv4.ping_group_range` |
 | disk_space | ✅ | ✅ | ✅ | linux/apple/win branches; `#else` unsupported only |
 | event_logs | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `log show` now runs under the bounded `SubprocessRunner` with a hard wall-clock deadline (no built-in timeout in the tool), classified by pure `event_logs_macos.hpp` (`decide_log_show_output`) — a timed-out/degraded run surfaces a sentinel row + non-zero rc, never a silent empty result |
 | example | ✅ | ✅ | ✅ | portable — sample plugin |
@@ -130,12 +130,12 @@ duplicates.
 | storage | ✅ | ✅ | ✅ | portable — persistent KV store |
 | tags | ✅ | ✅ | ✅ | portable — `std::filesystem` |
 | **tar** | ✅ | 🟡 | 🟡 | Uneven by design — richest on Windows (ETW/dnsapi/registry), `/proc`-based on Linux, ES + scattered branches on macOS. Per-source depth is the **TAR warehouse capture sources** section above (`tar_schema_registry.cpp`) |
-| users | ✅ | ✅ | ✅ | linux/apple/win branches. macOS `local_users` now adds real `last_logon` (`last -y`) and a tri-state `console_state` GUI-login flag (`SCDynamicStoreCopyConsoleUser`, shared `macos_console_user.hpp`) |
+| users | ✅ | ✅ | ✅ | linux/apple/win branches. macOS `local_users` now adds real `last_logon` (`last -y`) and a tri-state `console_state` GUI-login flag (`SCDynamicStoreCopyConsoleUser`, shared `macos_console_user.hpp`); Windows `primary_user`/`session_history` now read the Security channel natively via wevtapi, and the POSIX account tools run as bounded argv invocations instead of a shell |
 | vuln_scan | ✅ | ✅ | ✅ | linux/apple/win branches |
 | wifi | ✅ | ✅ | ✅ | win/linux/apple all implemented; macOS `connected` via CoreWLAN (`wifi_corewlan.mm`), `list_networks` legacy `airport -s`/`system_profiler` (connection depth: the **Live — Wi-Fi current connection** row) |
 | windows_updates | ✅ | ✅ | ✅ | update history / rpm+apt / `system_profiler` install history (Linux/mac report installed-package history) |
 | wmi | ✅ | ⛔ | ⛔ | Windows-only (`#ifndef _WIN32` → not available) |
-| wol | ✅ | ✅ | ✅ | `wol_plugin.cpp` — `_WIN32` vs POSIX portable UDP broadcast (wake); macOS `check` reachability now uses `ping -t 2` (BSD whole-run deadline; the shared POSIX `-W 2` path meant 2 ms on Darwin → every live host falsely `unreachable`) |
+| wol | ✅ | ✅ | ✅ | `wol_plugin.cpp` — `_WIN32` vs POSIX portable UDP broadcast (wake); `check` reachability is native on every platform (unprivileged ICMP echo with a TCP-connect fallback on port 443, ADR-3002 rung 1) — no subprocess spawn, no `ping` shell-out |
 
 ## Why gaps happen (and how to not get surprised again)
 
@@ -214,13 +214,13 @@ implementation is.
 | bitlocker | state | linux | supported | 3 | lsblk+cryptsetup | - |
 | bitlocker | state | macos | supported | 3 | fdesetup+diskutil | - |
 | bitlocker | state | windows | supported | 3 | manage_bde | - |
-| certificates | list | linux | supported | 3 | openssl x509 via governed shell runner | - |
-| certificates | list | macos | supported | 3 | security find-certificate with login shell fallback | - |
+| certificates | list | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
+| certificates | list | macos | supported | 3 | SecItem (System/root, in-process) + security find-certificate via governed shell (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo ~user hop (Decision-7 governed-shell exception) |
 | certificates | list | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
-| certificates | details | linux | supported | 3 | openssl x509 via governed shell runner | - |
-| certificates | details | macos | supported | 3 | security find-certificate with login shell fallback | - |
+| certificates | details | linux | supported | 1 | libcrypto X509 (in-process PEM parse) | - |
+| certificates | details | macos | supported | 3 | SecItem (System/root, in-process) + security find-certificate via governed shell (login) | System.keychain and SystemRootCertificates.keychain are read natively via SecItemCopyMatching (rung 1); the login keychain still requires the launchctl/sudo ~user hop (Decision-7 governed-shell exception) |
 | certificates | details | windows | supported | 1 | CryptoAPI (CertEnumCertificatesInStore) | - |
-| certificates | delete | linux | supported | 3 | openssl lookup via governed shell + filesystem remove | - |
+| certificates | delete | linux | supported | 1 | libcrypto X509 lookup + filesystem remove | - |
 | certificates | delete | macos | constrained | 2 | security delete-certificate via subprocess runner | SystemRootCertificates.keychain is sealed under SIP and rejected outright; only System/MY store deletes are supported |
 | certificates | delete | windows | supported | 1 | CryptoAPI (CertDeleteCertificateFromStore) | - |
 | chargen | chargen_start | linux | supported | 1 | in-process | - |
@@ -262,9 +262,9 @@ implementation is.
 | diagnostics | connection_info | linux | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
 | diagnostics | connection_info | macos | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
 | diagnostics | connection_info | windows | supported | 1 | in-process agent config (agent.server_address/tls.enabled/*) | - |
-| discovery | scan_subnet | linux | supported | 3 | arp table + ping sweep via popen/system() | - |
-| discovery | scan_subnet | macos | supported | 3 | arp table + ping sweep via popen/system() | - |
-| discovery | scan_subnet | windows | supported | 3 | GetIpNetTable + ping sweep via system() | - |
+| discovery | scan_subnet | linux | constrained | 1 | /proc/net/arp + unprivileged SOCK_DGRAM ICMP | the ICMP sweep needs net.ipv4.ping_group_range to admit the agent's gid; ARP-only results with a CONSTRAINED/PARTIAL status otherwise, or UNAVAILABLE/PARTIAL when the ICMP socket cannot be created at all. netlink RTM_GETNEIGH is a recorded future promotion over /proc/net/arp |
+| discovery | scan_subnet | macos | supported | 1 | sysctl NET_RT_FLAGS/RTF_LLINFO + SOCK_DGRAM ICMP | - |
+| discovery | scan_subnet | windows | supported | 1 | GetIpNetTable2 + IcmpSendEcho | - |
 | disk_space | free | linux | supported | 1 | statvfs(2) | - |
 | disk_space | free | macos | supported | 1 | statfs(2) | - |
 | disk_space | free | windows | supported | 1 | GetDiskFreeSpaceExW | - |
@@ -379,16 +379,16 @@ implementation is.
 | installed_apps | list_inventory | linux | supported | 3 | popen(dpkg-query / rpm / pacman / apk) | - |
 | installed_apps | list_inventory | macos | supported | 3 | popen(system_profiler SPApplicationsDataType) | - |
 | installed_apps | list_inventory | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
-| interaction | notify | linux | supported | 3 | notify_send | - |
+| interaction | notify | linux | supported | 2 | notify_send | - |
 | interaction | notify | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
 | interaction | notify | windows | supported | 1 | shell_notifyicon | - |
-| interaction | message_box | linux | supported | 3 | zenity | - |
+| interaction | message_box | linux | supported | 2 | zenity | - |
 | interaction | message_box | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
 | interaction | message_box | windows | supported | 1 | messageboxw | - |
-| interaction | input | linux | supported | 3 | zenity | - |
+| interaction | input | linux | supported | 2 | zenity | - |
 | interaction | input | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
 | interaction | input | windows | supported | 3 | powershell_inputbox | - |
-| interaction | survey | linux | supported | 3 | zenity | - |
+| interaction | survey | linux | supported | 2 | zenity | - |
 | interaction | survey | macos | constrained | 3 | osascript | no reachable GUI session under a headless/root LaunchDaemon |
 | interaction | survey | windows | supported | 3 | powershell_winforms | - |
 | interaction | set_dnd | linux | supported | 1 | local_kv_store | - |
@@ -421,12 +421,12 @@ implementation is.
 | netstat | netstat_list | linux | supported | 1 | /proc/net/{tcp,udp}[6] | - |
 | netstat | netstat_list | macos | supported | 1 | libproc | - |
 | netstat | netstat_list | windows | supported | 1 | GetExtendedTcpTable/GetExtendedUdpTable | - |
-| network_actions | flush_dns | linux | constrained | 3 | resolvectl/systemd-resolve via popen | silently reports ok even when neither resolvectl nor systemd-resolve is present |
-| network_actions | flush_dns | macos | supported | 3 | dscacheutil/mDNSResponder via sudo popen | - |
-| network_actions | flush_dns | windows | supported | 3 | ipconfig via popen | - |
-| network_actions | ping | linux | supported | 3 | system ping via popen | - |
-| network_actions | ping | macos | supported | 3 | system ping via popen | - |
-| network_actions | ping | windows | supported | 3 | system ping via popen | - |
+| network_actions | flush_dns | linux | constrained | 2 | resolvectl/systemd-resolve via bounded argv runner (sudo -n) | requires resolvectl (systemd-resolved) or the legacy systemd-resolve CLI; an honest failure is reported if neither is present |
+| network_actions | flush_dns | macos | supported | 2 | dscacheutil + killall via bounded argv runner (sudo -n) | - |
+| network_actions | flush_dns | windows | supported | 2 | ipconfig via bounded argv runner | - |
+| network_actions | ping | linux | supported | 2 | system ping via bounded argv runner | - |
+| network_actions | ping | macos | supported | 2 | system ping via bounded argv runner | - |
+| network_actions | ping | windows | supported | 2 | system ping.exe via bounded argv runner | - |
 | network_config | adapters | linux | supported | 3 | ip(8) via governed shell runner | - |
 | network_config | adapters | macos | supported | 3 | ifconfig via governed shell runner | - |
 | network_config | adapters | windows | supported | 1 | GetAdaptersAddresses | - |
@@ -541,14 +541,14 @@ implementation is.
 | script_exec | bash | linux | supported | 3 | bash_c | - |
 | script_exec | bash | macos | supported | 3 | bash_c | - |
 | script_exec | bash | windows | unsupported | - | - | - |
-| services | list | linux | supported | 3 | systemctl | - |
-| services | list | macos | supported | 3 | launchctl | - |
+| services | list | linux | supported | 2 | runner argv 'systemctl list-units' | - |
+| services | list | macos | supported | 2 | runner argv 'launchctl list' | - |
 | services | list | windows | supported | 1 | win32_service_api | - |
-| services | running | linux | supported | 3 | systemctl | - |
-| services | running | macos | supported | 3 | launchctl | - |
+| services | running | linux | supported | 2 | runner argv 'systemctl list-units' | - |
+| services | running | macos | supported | 2 | runner argv 'launchctl list' | - |
 | services | running | windows | supported | 1 | win32_service_api | - |
-| services | set_start_mode | linux | supported | 3 | systemctl | - |
-| services | set_start_mode | macos | supported | 3 | launchctl | - |
+| services | set_start_mode | linux | supported | 2 | runner argv 'sudo -n -- systemctl enable\|disable\|mask\|unmask' | - |
+| services | set_start_mode | macos | supported | 2 | runner argv 'sudo -n -- launchctl enable\|disable' | - |
 | services | set_start_mode | windows | supported | 1 | win32_service_api | - |
 | sockwho | sockwho_list | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | - |
 | sockwho | sockwho_list | macos | supported | 1 | libproc | - |
@@ -662,26 +662,26 @@ implementation is.
 | tar | purge_source | macos | supported | 1 | sqlite | - |
 | tar | purge_source | windows | supported | 1 | sqlite | - |
 | users | logged_on | linux | supported | 1 | utmp (setutent/getutent) | - |
-| users | logged_on | macos | supported | 3 | runner /bin/sh -c 'who' | - |
+| users | logged_on | macos | supported | 2 | runner argv 'who' | - |
 | users | logged_on | windows | supported | 1 | WTSEnumerateSessionsW + WTSQuerySessionInformationW | - |
-| users | sessions | linux | supported | 3 | runner /bin/sh -c 'w -h' | - |
-| users | sessions | macos | supported | 3 | runner /bin/sh -c 'w -h' | - |
+| users | sessions | linux | supported | 2 | runner argv 'w -h' | - |
+| users | sessions | macos | supported | 2 | runner argv 'w -h' | - |
 | users | sessions | windows | supported | 1 | WTSEnumerateSessionsW + WTSQuerySessionInformationW | - |
-| users | local_users | linux | supported | 3 | /etc/passwd read + runner /bin/sh -c 'lastlog -u <user>' per account | - |
-| users | local_users | macos | supported | 3 | runner /bin/sh -c 'dscl . -list/-read UserShell/RealName' + 'last -y -1 <user>' per account | - |
+| users | local_users | linux | supported | 2 | /etc/passwd read + runner argv 'lastlog -u <user>' per account | - |
+| users | local_users | macos | supported | 2 | runner argv 'dscl . -list/-read UserShell/RealName' + 'last -y -1 <user>' per account | - |
 | users | local_users | windows | supported | 1 | NetUserEnum | - |
 | users | local_admins | linux | supported | 1 | getgrnam(sudo/wheel) + getpwuid(0) | - |
-| users | local_admins | macos | supported | 3 | runner /bin/sh -c 'dscl . -read /Groups/admin GroupMembership' | - |
+| users | local_admins | macos | supported | 2 | runner argv 'dscl . -read /Groups/admin GroupMembership' | - |
 | users | local_admins | windows | supported | 1 | NetLocalGroupGetMembers | - |
 | users | group_members | linux | supported | 1 | getgrnam + /etc/passwd primary-group scan | - |
-| users | group_members | macos | supported | 3 | runner /bin/sh -c 'dscl . -read /Groups/<name> GroupMembership' | - |
+| users | group_members | macos | supported | 2 | runner argv 'dscl . -read /Groups/<name> GroupMembership' | - |
 | users | group_members | windows | supported | 1 | NetLocalGroupGetMembers | - |
-| users | primary_user | linux | supported | 3 | runner /bin/sh -c 'last -F, piped through head -200' | - |
-| users | primary_user | macos | supported | 3 | runner /bin/sh -c 'last, piped through head -200' | - |
-| users | primary_user | windows | constrained | 3 | _popen(wevtutil qe Security EventID=4624) | falls back to an ungoverned _popen(reg query ProfileList) scan (no login-count) when the Security event log is inaccessible |
-| users | session_history | linux | supported | 3 | runner /bin/sh -c 'last -F -n <count>' | - |
-| users | session_history | macos | supported | 3 | runner /bin/sh -c 'last -n <count>' | - |
-| users | session_history | windows | constrained | 3 | _popen(wevtutil qe Security EventID=4624/4634) | requires an elevated/administrative token to read the Security event log; reports an error otherwise |
+| users | primary_user | linux | supported | 2 | runner argv 'last -F' (max_lines=200 cap) | - |
+| users | primary_user | macos | supported | 2 | runner argv 'last' (max_lines=200 cap) | - |
+| users | primary_user | windows | supported | 1 | wevtapi (EvtQuery/EvtRender, Security 4624) | falls back to a native ProfileList registry enumeration (no login count) when the Security channel is inaccessible |
+| users | session_history | linux | supported | 2 | runner argv 'last -F -n <count>' | - |
+| users | session_history | macos | supported | 2 | runner argv 'last -n <count>' | - |
+| users | session_history | windows | constrained | 1 | wevtapi (EvtQuery/EvtRender, Security 4624/4634) | requires an elevated token to read the Security channel; reports an error otherwise |
 | vuln_scan | scan | linux | supported | 3 | popen(pkg-manager+iptables/nft/ufw) | - |
 | vuln_scan | scan | macos | supported | 3 | popen(system_profiler/brew+security-checks) | - |
 | vuln_scan | scan | windows | supported | 1 | win32_registry | - |
@@ -724,9 +724,9 @@ implementation is.
 | wol | wake | linux | supported | 1 | raw UDP broadcast socket | - |
 | wol | wake | macos | supported | 1 | raw UDP broadcast socket | - |
 | wol | wake | windows | supported | 1 | raw UDP broadcast socket | - |
-| wol | check | linux | supported | 3 | system ping via popen | - |
-| wol | check | macos | supported | 3 | system ping via popen | - |
-| wol | check | windows | supported | 3 | system ping via popen | - |
+| wol | check | linux | constrained | 1 | SOCK_DGRAM ICMP ping socket + TCP-connect fallback | requires net.ipv4.ping_group_range to admit the process group for ICMP; falls back to a TCP connect on port 443, and reports CONSTRAINED if neither mechanism is usable |
+| wol | check | macos | supported | 1 | SOCK_DGRAM ICMP ping socket + TCP-connect fallback | - |
+| wol | check | windows | supported | 1 | IcmpSendEcho + TCP-connect fallback | - |
 
 **Undeclared plugins** (ABI<4, or ABI4 with no capability declarations yet — RATCHET: this count must never grow):
 
@@ -816,8 +816,9 @@ verified against the cited code:
 - **New rows:** **Antivirus posture** (macOS 🟡 — real XProtect/EDR probes, no
   real-time-protection state) and **Live — Wi-Fi current connection** (macOS 🟡 —
   CoreWLAN, SSID/BSSID withheld from a daemon).
-- **Honesty-only** (cell unchanged): `wol` `check` (`ping -t 2`, was a false
-  `unreachable`), `wifi connected` (CoreWLAN vs dead `airport -I`), `flush_dns`
+- **Honesty-only** (cell unchanged): `wol` `check` (native ICMP + TCP-connect
+  fallback, no subprocess; was a false `unreachable`), `wifi connected`
+  (CoreWLAN vs dead `airport -I`), `flush_dns`
   (dual-step + real exit codes), `registry`/`sccm`/`rdp_control` off-Windows
   sentinels (no false success on writes), `bitlocker`/`services`/`users`/
   `network_config` macOS enrichments, DNS-cache `unsupported` sentinel.

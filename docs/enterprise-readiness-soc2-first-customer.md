@@ -99,6 +99,43 @@ before #2376, treat the grant-population export as having been accessible to all
 authenticated principals unless RBAC was explicitly enabled on that deployment.** Full
 decision record: `docs/security-reviews/authz-topology-floor-2026-08-05.md`.
 
+**Addendum — service-scoped token fleet-wide confinement, durably closed
+(CC6.1/CC6.3, guardian-confinement-2298 PR 3 — "the flip", 2026-08-18).**
+`require_permission`'s service-scoped branch previously admitted any
+operation the `ITServiceOwner` role granted — since that role holds broad
+CRUD across most securables, a token bound to one IT service's agents
+could, in practice, reach fleet-wide data with no per-agent narrowing,
+across every route gated this way (not an enumerated list). This PR
+inverts the default: a `(securable, operation)` pair must now also clear a
+server-side allow-list that ships **empty**, so a route not yet migrated
+to real per-request confinement denies a service-scoped token outright
+rather than admitting it unfiltered — including routes not yet found.
+Mirrored at the MCP `tools/call` layer via `ServiceScopeClass`. This
+closes the confinement class the "Narrowed 2026-08-14" clause of "The
+machine-health audit exemption" bullet above (Workstream E) narrowed
+piecemeal, and is the durable fix that `docs/user-manual/server-admin.md`'s
+matching PR2 Upgrade Notes entry's own **"This note does not claim the
+underlying class is fully closed"** caveat anticipated. **For any
+assessment covering a period before this PR, treat a service-scoped token
+as having had the reach of its minting principal's `ITServiceOwner`
+grants, not the reach of its own service tag, on any route gated solely
+by `require_permission`/`require_scoped_permission` that lacked its own
+per-request confinement.** Three items this PR identifies but does not
+itself close, to be filed as follow-up issues at this PR's landing: (1)
+whoever can set an agent's `service` tag effectively moves that agent's
+scope membership — this PR does not harden that write path (ADR-1006
+Consequences); (2) a known remainder of the per-file `deny_service_scoped_*`
+family (`PreflightRoutes`, `schedule_routes.*`, and inline checks in
+device/network/inventory/TAR routes) still names a `.permission` that
+cannot admit a service-scoped caller — the same false-self-remediation
+defect this PR's own hardening round found and fixed in five sibling
+sites (`.claude/routed-concerns-access-control.md` clause 5); (3) the ~15 pre-existing per-file
+`deny_service_scoped_*` helpers and the 7 MCP double-deny sites this
+default-deny makes redundant are scheduled for Phase 2 consolidation, not
+retired here. Full design: `docs/adr/1006-service-scope-default-deny.md`;
+closed route inventory:
+`docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
+
 **Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
 principals (ADR-1005 class) are already least-privilege by construction —
 default-deny RBAC resolution, structurally barred from admin/built-in/
@@ -175,9 +212,13 @@ devices tagged with its own service on every one of those surfaces; a global
 administrator, a JIT-elevated session, or a legacy-RBAC-disabled admin remains
 full-fleet (their actual authority, not a bypass); the derivation fails
 **closed** (a present-empty visible set, never "unfiltered") if the underlying
-store is unavailable. Credit as a CC6.1 least-privilege control and a CC6.3
-access-enforcement control with consistent enforcement across every listed
-surface; operator-facing reference is `docs/authz-model.md`. **Residual, not
+store is unavailable. (2026-08-17: "unavailable" now also covers a mid-scan
+read failure on an otherwise-reachable tag store, not just prepare-time/
+connection failures — `TagStore::agents_with_tag_checked`, closed by the
+PR #3216's hardening round.) Credit as a CC6.1
+least-privilege control and a CC6.3 access-enforcement control with
+consistent enforcement across every listed surface; operator-facing
+reference is `docs/authz-model.md`. **Residual, not
 yet closed, for THIS seam specifically:** a purely management-group-confined
 operator (no global grant) reaching one of the surfaces above is *narrowed but
 not yet reachable* — that principal is still denied earlier by the base
@@ -309,6 +350,7 @@ the SQLite table above. Each new server store registers here.
 | Response store | `response_store` (`responses`, `response_facets`) | Agent command/instruction **results** powering the executions drawer + `/tar` dashboard (ADR-0039, migrated from SQLite `responses.db`). Device-attributable (`agent_id`). **Sensitivity is plugin-dependent** — most results are machine-scope operational output, but some carry **usage-class behavioral PII**: the per-application panel persists per-app image names, and the device-page **Get live info** cards persist process tree / active connections / logged-in users / DNS resolver cache (`device.live.*`). `output`/`error_detail` are agent-supplied bytes, UTF-8-sanitized to U+FFFD at ingest and finalize; no secret-class column. | **90-day** default (`response_retention_days`). **Clock-guarded + capped reap** (ADR-0039, parity with `AuditStore`'s #2360 guard): `reap_expired()` reads/persists `gc_meta`, takes `pg_try_advisory_xact_lock('response_store:reap')` for single-sweeper semantics across replicas, declines-once via `audit_retention::classify` on a would-wipe / clock-ahead pass (implausibly-ahead bound ~120 d, sized above the 90 d horizon), and deletes at most 10,000 rows per pass. `ttl_expires_at` stamped at INSERT, never rewritten. Series: `yuzu_server_response_reap_passes_total{result}` plus `..._ingest_dropped_total{reason}` / `..._read_degrade_total{reason,source}`, all zero-seeded at boot. | No wired DSAR / decommission purge — the platform #1666 gap. The future F3 DSAR/erasure path must treat the usage-class `device.live.*` categories and per-app-panel results in this store as an erasure source (see the behavioral-read channel notes below). TTL reap is the only automatic disposal today. | `response_retention_days` |
 | Management-group confinement config | `management_group_store` (`management_groups`, `group_members`, `group_role_assignments`) | **Confinement / access-segregation configuration** — the operator scoping hierarchy that backs RBAC management-group confinement and the ADR-0017 `authorize_list_read` gate (ADR-0042). Holds the group tree (name, parent, membership type, scope expression), static membership records, and group→role assignments. **No end-user PII and no secrets** — it is access-control metadata. Device-attributable only via a membership row's `agent_id` (which device sits in which scope), never carrying device inventory or behavioral data itself. | **Indefinite / operator-lifecycle** — confinement config persists until an operator changes it; there is **no time-based reaper** (a stale scope is a mis-configuration to fix, not data to age out). | **Explicit group/member CRUD** — `DELETE /api/v1/management-groups/{id}` cascade-deletes child groups, their membership records, and their role assignments; individual members are removed via the members sub-resource. No automatic reaper and (by design) no per-subject DSAR purge — this is access-control config, not subject data. | Managed entirely through the `/api/v1/management-groups` REST + MCP surface (`ManagementGroup:Read` / `:Write`); no deploy-time collection knob. |
 | Network-discovered devices | `discovery_store` (`discovered_devices`, `discovery_meta`) | Network-scan **asset-discovery** inventory (Issue 7.18, ADR-0044) — IP address, MAC address, hostname, the operator-set `managed` flag + associated `agent_id` once promoted to an enrolled agent, and first-seen (`discovered_at`/`discovered_by`) provenance. **No secrets.** **MAC address, hostname, and IP address are device-persistent identifiers** — the same class `device_ci` (above) already classifies as personal data under GDPR when device-attributable to a person, and works-council co-determination-relevant on the *capability* to discover/track a device over a network (BetrVG §87(1)(6) class), independent of whether the device is ever promoted to `managed`. Unlike `device_ci`, rows here are **agent-less by default** (a discovered-but-unmanaged device has no `agent_id`) — `agent_id` populates only once an operator confirms `managed=true` via `mark_managed`. | **Indefinite — no time-based reaper.** A discovered device's row persists until an operator explicitly clears it; there is no current-state-replace-and-age-out behavior like the daily-sync stores above. | **`clear_results`** (all rows, or subnet-scoped) is the only bulk-delete path — **operator/internal-API only, no REST route today** (ADR-0044 Follow-ups). **Not wired into the ADR-0024 `AgentDecommission` cascade** — decommissioning a managed device does not remove its `discovery_store` row, and there is no row-level/per-subject DSAR (Art. 17) erasure path (same #1666-class gap as the stores above). | No deploy-time collection knob — discovery scanning is driven by the calling agent/instruction, not a store-level flag. |
+| Device tags (scope-targeting config) | `tag_store` (`tags`, `tag_store_meta`) | **Targeting / confinement configuration** — per-agent key→value tags (operator/API/MCP-authored plus agent-self-reported, `source`-tracked with #1411 precedence) that back `tag:<key>` scope-DSL resolution, service-scoped API-token confinement, and dynamic service-group membership (ADR-0050, migrated from SQLite `tags.db`). Device-attributable (`agent_id`). **No secrets and no structured PII**; free-text values (max 448 bytes) may incidentally carry a name-shaped label an operator typed (same free-text posture as custom properties / group descriptions). Reads are typed degrade-distinguishable — a store failure fails scope evaluation closed, never resolving to fewer/more devices. | **Indefinite / operator-lifecycle** — tag config persists until changed; agent-sourced rows are full-replaced on each agent Register sync; **no time-based reaper.** | **Explicit tag CRUD** (`DELETE /api/v1/tags/{agent}/{key}`, MCP `delete_tag`); `delete_all_tags(agent_id)` exists at the store seam but is **NOT wired into the ADR-0024 `AgentDecommission` cascade** — a decommissioned device's tag rows persist (tracked follow-up; same #1666-class gap as the sibling stores outside the cascade). | No deploy-time collection knob — operator-authored config plus the agent's own `scopable_tags` report (bounded at 256 tags per sync). |
 | Notification feed | `notification_store` (`notifications`, `notification_meta`) | **Operational display state** — the dashboard toast/badge feed (`level`, `title`, `message`, `read`/`dismissed`), migrated from SQLite `notifications.db` (ADR-0046). Free-text `title`/`message` may incidentally carry a hostname or username as display content (e.g. "Agent enrolled: workstation-jsmith") but the store is not authoritative for any decision — display-only, never fed into a grant/target/enforce/skip check. No secrets, no structured device/behavioral telemetry. | **Indefinite — no time-based reaper.** Unbounded growth is a known, documented gap (not this store's SOC 2 posture, a forward-looking operational note); any future retention pass must follow the CLAUDE.md clock-guarded-retention contract. | No wired per-device / DSAR purge (`mark_read`/`dismiss` are the only mutations besides create; no delete endpoint exists). Same #1666-class gap as the other per-agent stores lacking a decommission hook. | No deploy-time collection knob — populated by internal server events (agent enrollment, execution failures, DEX alerts), not agent-supplied data. |
 | Analytics event outbox | `analytics_event_store` (`analytics_buffer`) | **Outbox/spool, not operator state** — analytics telemetry for login/MFA/OIDC/SAML/role-elevation events and agent/gateway command-lifecycle events (ADR-0049, migrated from per-process SQLite `analytics.db`). Free-text `attributes`/`payload` carry usernames, source IPs, reason strings, method/status labels, durations, byte/exit-code counts — no plaintext password, TOTP code, or API-token fragment. `session_id` is `AuthManager::sha256_hex(cookie)`, never the raw bearer token (governance Gate 2 finding, 2026-08-16 — a prior draft of this migration stored it raw, which under this store's own indefinite retention and its `Infrastructure:Read`-gated read route would have been a durable, widely-readable session-hijack vector; see `changelog.d/20260816-analytics-session-id-hash.security.md`). Some events carry `agent_id`; the write path is fail-soft (a dropped event never fails the request that emitted it). | **Indefinite — deliberately no reaper.** Drained rows (already delivered to every configured sink) are kept forever, unlike every retention-guarded store elsewhere in this table — a DELIBERATE decision (ADR-0049 §Retention), not an oversight: this store's own growth caveat is recorded as a follow-up (adjacent to #2508), not solved by this migration. Undrained-at-cutover events were a one-time, bounded loss at the SQLite→Postgres cutover only. | **None wired.** No per-device / DSAR purge, no decommission-cascade hook, no time-based prune — same #1666-class gap as the other per-agent stores above, compounded by the no-reaper retention decision. A future retention pass, if added, must follow the CLAUDE.md clock-guarded-retention contract like every sibling store in this table. | `--no-analytics` (disables collection entirely — no store, no buffer); `--analytics-drain-interval` / `--analytics-batch-size` (drain pacing only, not retention); `clickhouse_*` / `analytics_jsonl_path` (sink configuration, downstream of this buffer). |
 

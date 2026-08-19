@@ -1212,7 +1212,13 @@ TEST_CASE("journal prune: a whole-journal wipe is declined even with no clock ju
     // or the OUTCOME - this pass would age out everything. Every other test in the suite trips
     // it via the step, so the outcome branch was dead-covered: removing it left the whole suite
     // green (#2345 Gate 3 QE). Here the clock advances normally and the RETENTION WINDOW is
-    // tiny, so only the outcome branch can fire.
+    // tiny, so only the outcome branch can fire - on the FIRST pass. Retention=0 makes the step
+    // threshold itself zero, so once last_prune_now_ms_ is non-zero any later pass ALSO trips
+    // the step branch, with a fact set distinct from the first pass's outcome-only one (#2573 GJ
+    // half): it must decline on ITS OWN merits too, not ride the first decline through silently
+    // (the old bool-latch defect this rung fixes). The THIRD pass repeats pass 2's exact fact
+    // shape (still wipe, still step - the step threshold never stops being zero), so it is a
+    // suppressed repeat and finally proceeds.
     TestKv t;
     GuardianLifecycleJournal j(t.kv.get());
     const std::int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1234,9 +1240,132 @@ TEST_CASE("journal prune: a whole-journal wipe is declined even with no clock ju
     // deferred and the journal is NOT idle - the prune stamp must read a growing age, not fresh.
     CHECK_FALSE(declined.progress_or_verified);
 
-    const auto accepted = j.prune(now + 6000); // ...and the next pass proceeds
+    // A zero-day window's step threshold is zero, so ANY elapsed time now ALSO satisfies
+    // big_step - a fact set the first pass never recorded (its own step was false, being the
+    // first pass ever). This must decline as its OWN anomaly, not proceed on the strength of
+    // pass 1's still-set latch.
+    const auto declined_again = j.prune(now + 6000);
+    CHECK(declined_again.evicted == 0);
+    CHECK(j.clock_jump_skips() == 2); // counted as a second, DISTINCT anomaly
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2);
+
+    // Same fact shape as the pass above (still wipe, still step) - a suppressed repeat, so this
+    // one finally proceeds.
+    const auto accepted = j.prune(now + 7000);
     CHECK(accepted.evicted == 2);
+    CHECK(j.clock_jump_skips() == 2); // not counted a third time
     CHECK(accepted.progress_or_verified); // retention actually ran -> verified
+}
+
+TEST_CASE("journal prune: a distinct anomaly arriving after a decline is declined too, not "
+          "swallowed by a stale latch (#2573 GJ half)",
+          "[guardian][journal][prune][chaos]") {
+    // The #2573 defect class: a bool latch can only remember THAT a decline fired, not WHICH
+    // anomaly. A DIFFERENT anomaly arriving while the bool was still set was neither declined
+    // nor counted under the old scheme, and the pass deleted silently. Here pass 1 trips WIPE
+    // (would_wipe, no step - it's the first pass, so last_prune_now_ms_ is still zero) and pass
+    // 2 trips STEP on top of it (a forward jump past the retention window) - a fact set that
+    // differs from pass 1's only in big_step, so it must decline on its own merits rather than
+    // ride pass 1's still-set latch into a silent eviction.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1);
+
+    constexpr std::int64_t kWindowMs = 7LL * 86400 * 1000; // kJournalRetentionDays default
+    constexpr std::int64_t kNow1 = 32503680000000LL;       // ~year 3000: everything is expired
+    const auto pass1 = j.prune(kNow1);
+    CHECK(pass1.evicted == 0);
+    CHECK(j.clock_jump_skips() == 1);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2);
+
+    // A forward jump just past the retention window: would_wipe is still true (nothing new was
+    // added), and NOW big_step is also true - a fact set pass 1 never recorded.
+    const auto pass2 = j.prune(kNow1 + kWindowMs + 1000);
+    CHECK(pass2.evicted == 0);        // declined again, not silently evicted
+    CHECK(j.clock_jump_skips() == 2); // counted as its OWN anomaly
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 2);
+}
+
+TEST_CASE("journal prune: an identical repeat is suppressed, so a genuine backlog still drains",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    constexpr std::size_t kBatches = 66; // > kMaxAgeEvictionsPerPass (64): forces a 2-pass drain
+    for (std::size_t i = 0; i < kBatches; ++i)
+        REQUIRE(persist_all(j, one("r" + std::to_string(i), "armed")) == 1);
+    REQUIRE(count_keys(*t.kv, kBatchKeyPrefix) == kBatches);
+
+    constexpr std::int64_t kNow = 32503680000000LL; // ~year 3000: all batches are expired
+    const auto pass1 = j.prune(kNow);
+    CHECK(pass1.evicted == 0);
+    CHECK(j.clock_jump_skips() == 1); // declined once
+
+    // Same anomaly, same shape (tiny delta, still all expired): the recorded fact set matches,
+    // so this pass is a suppressed repeat, not a fresh decline - it proceeds and drains up to
+    // the per-pass age cap.
+    const auto pass2 = j.prune(kNow + 1000);
+    CHECK(pass2.evicted == 64);
+    CHECK(j.clock_jump_skips() == 1); // NOT counted a second time
+
+    // The remaining 2 batches are still expired under the same fact shape - still a suppressed
+    // repeat.
+    const auto pass3 = j.prune(kNow + 2000);
+    CHECK(pass3.evicted == 2);
+    CHECK(j.clock_jump_skips() == 1);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 0);
+}
+
+TEST_CASE("journal prune: the recorded fact set clears once the backlog drains, re-arming the "
+          "guard",
+          "[guardian][journal][prune]") {
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get());
+    REQUIRE(persist_all(j, one("r1", "armed")) == 1);
+    REQUIRE(persist_all(j, one("r2", "armed")) == 1);
+
+    constexpr std::int64_t kNow = 32503680000000LL;
+    const auto pass1 = j.prune(kNow); // declines: first anomaly
+    CHECK(pass1.evicted == 0);
+    CHECK(j.clock_jump_skips() == 1);
+
+    const auto pass2 = j.prune(kNow + 1000); // identical facts, suppressed repeat: drains fully
+    CHECK(pass2.evicted == 2);
+    CHECK(j.clock_jump_skips() == 1);
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 0);
+
+    // A fresh batch arrives, and the SAME shape of anomaly recurs (still all expired under the
+    // huge now_ms). Because the backlog fully drained above, the recorded fact set was cleared -
+    // this must decline again on its own merits, not be waved through as an "identical repeat"
+    // of a decline that already resolved.
+    REQUIRE(persist_all(j, one("r3", "armed")) == 1);
+    const auto pass3 = j.prune(kNow + 2000);
+    CHECK(pass3.evicted == 0);
+    CHECK(j.clock_jump_skips() == 2); // re-armed: counted as a NEW decline
+    CHECK(count_keys(*t.kv, kBatchKeyPrefix) == 1);
+}
+
+TEST_CASE("journal prune: an idle journal's clock jump is not reported (#2573 GJ half: "
+          "classify() requires something to actually be expired)",
+          "[guardian][journal][prune]") {
+    // Accepted behavior delta from adopting the shared classify(): the OLD (would_wipe ||
+    // big_step) trigger fired on ANY big forward jump regardless of whether anything was
+    // actually expired, so an idle journal still warned and incremented clock_jump_skips_ on
+    // every restart-after-a-long-gap. classify()'s !has_expired short-circuit to None means a
+    // jump with nothing to lose is not an anomaly at all.
+    TestKv t;
+    GuardianLifecycleJournal j(t.kv.get()); // empty: nothing persisted
+
+    constexpr std::int64_t kWindowMs = 7LL * 86400 * 1000;
+    constexpr std::int64_t kNow1 = 1'700'000'000'000LL;
+    const auto pass1 = j.prune(kNow1);
+    CHECK(j.clock_jump_skips() == 0);
+    CHECK(pass1.progress_or_verified);
+
+    const auto pass2 = j.prune(kNow1 + kWindowMs * 2); // huge forward jump, still nothing to lose
+    CHECK(pass2.evicted == 0);
+    CHECK(j.clock_jump_skips() == 0);
+    CHECK(pass2.progress_or_verified);
 }
 
 TEST_CASE("journal prune: an IMPLAUSIBLY LARGE value cannot evict the rest of the journal",
