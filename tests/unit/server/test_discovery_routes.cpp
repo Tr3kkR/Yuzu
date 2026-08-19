@@ -423,6 +423,52 @@ TEST_CASE("discover.instructions: enabled-only subset with parsed parameter_sche
     CHECK(cached->status == 304);
 }
 
+// Adversarial review of #2986 (2026-08-19): create/update/import bind a
+// caller-supplied parameter_schema as text with no object-shape validation,
+// so a non-object JSON value is reachable — the discover_instructions
+// outputSchema advertises parameter_schema as object|null only, so a stored
+// array/string/number/bool must null out, not forward raw. Mirrors
+// discover.plugins' existing is_object() guard (UP-9).
+TEST_CASE("discover.instructions: non-object parameter_schema nulls out, matching the "
+          "advertised object|null outputSchema",
+          "[discovery][instructions][pg]") {
+    DiscoverHarness h;
+    auto array_id = h.instr->create_definition(
+        make_def("Array Schema", /*enabled=*/true, "[1,2,3]"));
+    REQUIRE(array_id.has_value());
+    auto bool_id = h.instr->create_definition(make_def("Bool Schema", /*enabled=*/true, "true"));
+    REQUIRE(bool_id.has_value());
+    auto string_id =
+        h.instr->create_definition(make_def("String Schema", /*enabled=*/true, R"("not-a-schema")"));
+    REQUIRE(string_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/discover/instructions");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+
+    auto j = nlohmann::json::parse(res->body);
+    const auto& arr = j["instructions"];
+
+    bool saw_array = false, saw_bool = false, saw_string = false;
+    for (const auto& d : arr) {
+        if (d["id"] == *array_id) {
+            saw_array = true;
+            CHECK(d["parameter_schema"].is_null());
+        }
+        if (d["id"] == *bool_id) {
+            saw_bool = true;
+            CHECK(d["parameter_schema"].is_null());
+        }
+        if (d["id"] == *string_id) {
+            saw_string = true;
+            CHECK(d["parameter_schema"].is_null());
+        }
+    }
+    CHECK(saw_array);
+    CHECK(saw_bool);
+    CHECK(saw_string);
+}
+
 TEST_CASE("discover.instructions: null InstructionStore -> 503",
           "[discovery][instructions][pg]") {
     DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/false);
