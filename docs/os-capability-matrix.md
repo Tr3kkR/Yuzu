@@ -395,7 +395,7 @@ implementation is.
 | interaction | set_dnd | macos | supported | 1 | local_kv_store | - |
 | interaction | set_dnd | windows | supported | 1 | local_kv_store | - |
 | ioc | check | linux | supported | 1 | procfs | - |
-| ioc | check | macos | supported | 1 | libproc | UDP rows carry an empty state (no fabricated "LISTEN") — a real UDP listener still matches a port check, but its detail text differs from a TCP match |
+| ioc | check | macos | supported | 1 | libproc | UDP rows carry an empty state (no fabricated "LISTEN") — a real UDP listener still matches a port check, but its detail text differs from a TCP match; a port shared by more than one process (SO_REUSEPORT, prefork) reports the pid of one arbitrarily-chosen owner in its match detail, not every owner |
 | ioc | check | windows | supported | 1 | iphlpapi_dnsapi | - |
 | license_scan | list | linux | supported | 3 | popen(rpm/dpkg-query/openssl) | - |
 | license_scan | list | macos | constrained | 1 | filesystem_probe(glob+plist) | binary (bplist00) Info.plist files are not parsed; falls back to the bundle name with an empty version |
