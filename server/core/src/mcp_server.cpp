@@ -9167,8 +9167,20 @@ McpServer::HandlerFn McpServer::build_handler(
                 // default before it's ever read or echoed.
                 std::string kind = param_str(args, "kind", "fleet");
                 if (kind != "fleet" && kind != "agent" && kind != "execution" &&
-                    kind != "result_set")
+                    kind != "result_set") {
+                    // Gate 6 sre (2026-08-19): silent normalization is
+                    // operationally invisible — a client sending a
+                    // persistently stale/malformed kind (schema drift, an
+                    // integration bug) would otherwise be undetectable. No
+                    // audit row exists for this ReadOnly tool to piggyback
+                    // on (see the class comment above), so this debug line
+                    // is the only signal; not elevated to warn since a
+                    // single stray call is not itself operator-actionable.
+                    spdlog::debug("MCP summarize_working_set: unknown kind '{}' normalized to "
+                                  "'fleet'",
+                                  kind);
                     kind = "fleet";
+                }
                 const std::string target_id = param_str(args, "id");
                 const int limit = std::clamp(param_int32(args, "limit", 25), 1, 100);
                 JArr links;
