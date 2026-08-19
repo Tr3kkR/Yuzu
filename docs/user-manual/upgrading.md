@@ -128,7 +128,33 @@ An MCP approval-ticket recall that hits a store fault has always returned `-3260
 
 `revoke_certificate.serial_hex`, `confirm_engine_rotation.token_id`, `quarantine_device.reason`/`whitelist`, and the eight *approval-gated* engine-principal tools' `principal_id` (`create`/`revoke_engine_principal`, `mint`/`rotate_engine_credential`, `transfer_engine_principal_owner`, `assign`/`unassign_engine_role`) now carry `pattern`/`maxLength` bounds mirroring their handlers' own checks (previously enforced only at the handler, after an approval ticket was already consumed). `get_engine_principal` and `list_engine_roles` also gained the same `principal_id` pattern, but per this codebase's standing rule that input-schema validation runs only on the approval-gated path (`mcp-server.md`'s "Pre-approval input-schema validation"), those two are Read-tier and never approval-gated — the pattern is advertised metadata on `tools/list` only, not server-enforced; a malformed `principal_id` still reaches the handler and is rejected there exactly as before.
 
-**What to do:** a pending or approved-but-unconsumed approval ticket minted *before* upgrade, whose arguments the new pattern rejects, becomes unrecallable fail-closed once the new server is running — the recall fails pre-consume just like any other schema-invalid call, and the ticket is never burned, but it also can't be redeemed as originally minted. It stays valid until its normal 7-day expiry (pending or approved-unconsumed — see `mcp-server.md`'s "Pre-approval input-schema validation"), then ages out and must be re-requested. No action is required unless you have a specific known-outstanding ticket for one of these ten tools that you need to redeem across the upgrade — re-request it after upgrading instead.
+**Who this affects:** any operator or automation with an outstanding (pending or
+approved-but-unconsumed) approval ticket for one of these ten tools —
+`revoke_certificate`, `confirm_engine_rotation`, `quarantine_device`,
+`create_engine_principal`, `revoke_engine_principal`, `mint_engine_credential`,
+`rotate_engine_credential`, `transfer_engine_principal_owner`,
+`assign_engine_role`, `unassign_engine_role` — whose arguments don't match the
+new bound: `serial_hex` must be `^[0-9A-Fa-f]{1,64}$`; `token_id` must be
+`^[0-9a-f]{24}$`; `quarantine_device.reason`/`whitelist` must be ≤1024/≤512
+bytes (whitelist additionally charset-restricted); `principal_id` must match
+`^engine:[a-z0-9._-]+$` (or the bare-slug form on `assign`/`unassign_engine_role`).
+Full patterns: `mcp-server.md`'s "Pre-approval input-schema validation" section.
+
+**What to do:** such a ticket becomes unrecallable fail-closed once the new
+server is running — the recall fails pre-consume just like any other
+schema-invalid call, and the ticket is never burned, but it also can't be
+redeemed as originally minted. It stays valid until its normal 7-day expiry
+(pending or approved-unconsumed), then ages out and must be re-requested. To
+check exposure before upgrading, list your outstanding tickets for these ten
+tools (`list_pending_approvals` MCP tool or `GET /api/v1/approvals`) and
+compare each one's arguments against the patterns above; no action is needed
+for a ticket that already matches, or if you have none outstanding.
+
+**Verify:** re-request any ticket the check above flagged, confirm the new
+recall succeeds under the same tier, and confirm a deliberately malformed
+value (e.g. a non-hex `serial_hex`) is now rejected at mint time — `-32602`,
+no approval created — rather than being accepted and only failing later at
+the handler.
 
 ## Behaviour change: webhook and offload-target deliveries, and enrollment/execution-failure notifications, now actually fire (#3261)
 
