@@ -7083,6 +7083,111 @@ TEST_CASE("MCP CA: revoke_certificate full approval-ticket round-trip reaches re
     CHECK(body2["result"]["structuredContent"] == payload);
 }
 
+// #2444 item 3: yuzu_mcp_approval_burned_total{tool,reason}. revoke_certificate
+// is a deliberate pick — its "serial not found" business rejection (CaStore::
+// revoke returning false) is emitted ONLY via the domain-verb audit_fn call
+// ("ca.cert.revoked", result "denied"); the handler never calls mcp_audit for
+// this branch. That makes it a real test of the BurnGuard's design point: the
+// counter must fire from inspecting the actual JSON-RPC response, not from
+// hooking mcp_audit (which this exact branch bypasses).
+TEST_CASE("MCP 2444: yuzu_mcp_approval_burned_total fires on a post-consume handler reject, "
+          "not on schema-invalid or success",
+          "[mcp][2g][approval][metrics]") {
+    yuzu::test::TempDbFile db{std::string_view{"yuzu_test_mcp_ca_burn_"}};
+    yuzu::server::CaStore store(db.path); // deliberately empty — no cert recorded
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_mcp_appr_burn_"}};
+    yuzu::test::SqliteHandleOwner<sqlite3> raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), &raw.db) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.db);
+    appr.create_tables();
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.metrics_for_test = &reg;
+    ts.start("supervised");
+
+    const auto burned = [&]() {
+        return reg
+            .counter("yuzu_mcp_approval_burned_total",
+                     {{"tool", "revoke_certificate"}, {"reason", "handler_reject"}})
+            .value();
+    };
+    // Baseline: a fresh, request-local MetricsRegistry (not the production
+    // registry server.cpp pre-seeds) mints any never-touched series at 0.
+    CHECK(burned() == 0.0);
+
+    // 1. A schema-invalid mint attempt (serial_hex fails #2444 item 1's pattern)
+    // never mints a ticket at all (#2441) — nothing to burn, and indeed no
+    // ticket is EVER consumed for this attempt, so the guard must not fire.
+    auto bad_mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"not-hex!"}}})");
+    REQUIRE(bad_mint);
+    auto bad_mint_body = nlohmann::json::parse(bad_mint->body);
+    REQUIRE(bad_mint_body.contains("error"));
+    CHECK(bad_mint_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(appr.pending_count() == 0); // no ticket minted
+    CHECK(burned() == 0.0);
+
+    // 2. Mint a REAL ticket for a schema-valid serial that does not exist in
+    // the (empty) store.
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"BEEF"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    CHECK(mint_body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE_FALSE(approval_id.empty());
+    CHECK(burned() == 0.0); // mint itself never consumes — must not count yet
+
+    // 3. Approve, then recall. The ticket IS consumed (schema passed), but the
+    // handler's own store.revoke() call fails (serial not found) — the burn
+    // class #2441 left open.
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"BEEF","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error")); // "serial not found or already revoked"
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(burned() == 1.0);
+
+    // 4. A second, independent full success round-trip must NOT increment the
+    // burned counter — success is not a burn.
+    yuzu::server::IssuedCertRecord rec;
+    rec.serial_hex = "FACE";
+    rec.subject = "agent-burn";
+    rec.purpose = "agent";
+    rec.not_after = 4102444800;
+    REQUIRE(store.record_issued(rec));
+    auto mint2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"FACE"}}})");
+    REQUIRE(mint2);
+    auto mint2_body = nlohmann::json::parse(mint2->body);
+    const std::string approval_id2 =
+        mint2_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id2, "reviewer-bob", "ok"));
+    std::string recall2 =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"revoke_certificate","arguments":{"serial_hex":"FACE","approval_id":")" +
+        approval_id2 + R"("}}})";
+    auto res2 = ts.call(recall2);
+    REQUIRE(res2);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("result")); // SUCCESS
+    CHECK(burned() == 1.0); // unchanged — the burn from step 3 stays the only one
+
+    // 5. The bounded label set: a DIFFERENT tool's series stays at its
+    // pre-seeded 0 — the burn above is attributed to revoke_certificate only.
+    CHECK(reg
+              .counter("yuzu_mcp_approval_burned_total",
+                       {{"tool", "quarantine_device"}, {"reason", "handler_reject"}})
+              .value() == 0.0);
+}
+
 // ── #2395 track D: KEK rotation MCP tools (parity with kek_routes.cpp) ────────
 // rotate_kek / rewrap_secrets / get_kek_status are the MCP twins of
 // POST/GET /api/v1/secrets/kek/*, sharing the SAME KekOps seam (kek_ops_for_test,

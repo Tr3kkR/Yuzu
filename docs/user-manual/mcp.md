@@ -627,7 +627,12 @@ the published `inputSchema`) answers `-32602` immediately — it never creates a
 request, and a re-call carrying an `approval_id` with schema-invalid arguments
 never consumes the ticket. (Semantic checks the schema cannot express — an
 unknown plugin name, a nonexistent agent — still happen in the handler and are
-not pre-empted by this gate.) The error
+not pre-empted by this gate. When one of those DOES fire on a recall that
+already consumed a ticket — #2444 item 3 — it is alertable via the
+`yuzu_mcp_approval_burned_total{tool,reason}` counter, distinct from the
+generic `mcp.<tool>|failure` audit row this class always leaves: the counter
+is bounded to approval-gated tools and the metric is the alertable signal,
+the audit row the forensic detail.) The error
 message names the offending field as a JSON-pointer-style path (e.g.
 `/steps/1`), and `error.data` carries a `correlation_id` plus a `remediation`
 confirming no ticket was created or consumed. Two strictness notes: `integer`

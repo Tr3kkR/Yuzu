@@ -3542,6 +3542,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 return *cached_agents;
             };
 
+            // #2444 item 3 (Gate 6 sre): set true ONLY after the C8 approval gate
+            // below successfully consumes a one-time ticket for THIS request. Read
+            // by the BurnGuard below (NOT by mcp_audit — see its comment for why
+            // hooking mcp_audit directly under-counts).
+            bool approval_ticket_just_consumed = false;
+
             // Audit helper. Returns the AuditFn bool so SOC 2 read/write surfaces can
             // surface a dropped evidence row (audit_persisted:false), mirroring the
             // CA-revoke handler (#1550 HIGH-2 / #1240). Existing callers that ignore
@@ -3554,6 +3560,61 @@ McpServer::HandlerFn McpServer::build_handler(
                 return yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "mcp." + tool_name, result_status, "mcp_tool", tool_name, detail);
             };
+
+            // #2444 item 3 (Gate 6 sre): yuzu_mcp_approval_burned_total{tool,reason}.
+            // Deliberately NOT wired inside mcp_audit above: not every handler's
+            // business-rejection path calls mcp_audit at all — several (e.g.
+            // revoke_certificate's "serial not found", revoke_engine_principal's
+            // "principal not found") emit ONLY their own domain-verb audit_fn call
+            // ("ca.cert.revoked"/"engine_principal.revoke", result "denied"/
+            // "failure") and return without ever touching mcp_audit, so a counter
+            // hooked there would silently under-count exactly the class this issue
+            // is about. This guard instead inspects the ACTUAL JSON-RPC response
+            // this request produced, at function-scope exit — after whichever
+            // `if (tool_name == ...)` branch below has already called
+            // res.set_content(...) — so it counts every outcome uniformly,
+            // independent of which handler ran or what it chose to audit. Declared
+            // once per request; consumed is read only at destruction, so setting it
+            // AFTER this declaration (below, once consume_ticket succeeds) still
+            // takes effect — the reference stays bound to the same bool.
+            //
+            // Scope is deliberately wider than pure ARGS-semantic rejection: by the
+            // time any tool-specific handler code runs post-recall, consume_ticket
+            // has already spent the ticket, so a store-unavailable failure counts
+            // exactly as much as a business-rule reject — both are a wasted
+            // one-time human approval. Both land under reason="handler_reject".
+            //
+            // CH-1 (recorded here per the issue's request): this counter does NOT
+            // interact with the kMcpSubmitterPendingCap 25-slot cap —
+            // pending_count_for() counts only status='pending' rows, and
+            // consume_ticket() never touches `status` (only consumed_at/
+            // consumed_by); a ticket already left the pending bucket at
+            // ADMIN-APPROVAL time, before it could ever reach this burn class. So a
+            // semantic-burn loop cannot exhaust a submitter's pending-cap through
+            // burned tickets themselves — the cap only throttles un-approved
+            // pending mints, which item 1's schema tightening already reduces (a
+            // schema-invalid mint is refused before it can occupy a pending slot
+            // at all, #2441).
+            struct BurnGuard {
+                httplib::Response& res;
+                yuzu::MetricsRegistry* metrics;
+                const std::string& tool_name;
+                const bool& consumed;
+                ~BurnGuard() {
+                    if (!consumed || metrics == nullptr)
+                        return;
+                    // A JSON-RPC error envelope (vs the "result" success shape) is
+                    // the ONE outcome-agnostic signal every handler produces —
+                    // parsed defensively (never expected to fail; res.body is
+                    // always this handler's own JSON, never caller-echoed).
+                    auto parsed = nlohmann::json::parse(res.body, nullptr, false);
+                    if (!parsed.is_discarded() && parsed.is_object() && parsed.contains("error"))
+                        metrics
+                            ->counter("yuzu_mcp_approval_burned_total",
+                                     {{"tool", tool_name}, {"reason", "handler_reject"}})
+                            .increment();
+                }
+            } burn_guard{res, metrics, tool_name, approval_ticket_just_consumed};
 
             // BR-006 second half, MCP twin of plugin_config_routes.cpp's
             // `audit_outcome`. The five plugin-config/secret/kill-switch tools
@@ -4491,6 +4552,11 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     mcp_audit("approved", "consumed approval_id=" + supplied_id);
+                    // #2444 item 3: from here on, any mcp_audit("failure", ...) the
+                    // tool handler below emits for THIS request is a burned ticket —
+                    // set AFTER the "approved" row above so that row itself (result
+                    // "approved", not "failure") never counts.
+                    approval_ticket_just_consumed = true;
                     // Ticket consumed → fall through to the tool handler below.
                     // NOTE: the per-handler perm_fn (real RBAC op) has not run
                     // yet; a tier-allows-but-RBAC-denies token can mint→approve→
