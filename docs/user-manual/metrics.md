@@ -948,7 +948,7 @@ every mechanism- and consumer-health counter below is **0** in production today 
 `_reporting`, `_disabled`, `_failed` and `_mechanisms` are the four that carry live
 signal, and none of them depends on a consumer being armed; the rest go live when
 rung 2 arms real rules. A `(metric, os[, mechanism])` nobody reported is **absent**,
-never a fabricated 0 (all eleven families are cleared and re-emitted every sweep, the
+never a fabricated 0 (all twelve families are cleared and re-emitted every sweep, the
 same idiom as `yuzu_fleet_net_*`). An agent started with `--spark-disable` reports
 `spark_running=0` + `spark_disabled=1`: it is absent from `_reporting` and counted in
 `_disabled`. An agent whose engine was enabled but **threw at boot** reports
@@ -958,11 +958,15 @@ split is what makes a fleet-wide spark boot failure visible at all.
 **All series carry an `os` label** — `file` and `registry` mechanisms are
 Windows-only, `service` is Windows + Linux, macOS has none — so **query and alert
 per OS, never `sum without(os)`** (a cross-OS aggregate is meaningless for a
-single-platform mechanism). The four mechanism counters additionally carry a
-`mechanism` label (`file` / `registry` / `service`). The mechanism counters are
-fleet **sums of monotonic per-agent counters**, so a bare `> 0` alert **latches**
+single-platform mechanism). Five families additionally carry a `mechanism` label
+(`file` / `registry` / `service`): `_mechanisms` is a live per-agent capability
+gauge (see its own row above); `_watch_rejected`, `_quarantined` and `_slow_op`
+are fleet **sums of monotonic per-agent counters**, so a bare `> 0` alert **latches**
 until the reporting agent restarts — the shipped **counter** alert templates
-(disabled until rung 2) use `increase(...[15m]) > 0` instead. One rule ships
+(disabled until rung 2) use `increase(...[15m]) > 0` instead. `_unsupported` (F7,
+#2298 rung 2) is the other gauge exception: a **live current gauge**, not a
+counter - it can legally decrease, so it must never be alerted on with
+`increase()`/latching logic; see its own row below. One rule ships
 **active** today: `YuzuSparkBootFailed` on `_failed` (a per-sweep state gauge,
 latch-free) — warning severity, 30m hold (see `docs/prometheus/yuzu-alerts.yml`,
 group `yuzu-fleet-spark-rung1`).
@@ -985,6 +989,7 @@ upgraded to a spark-capable (rung-1+) build. During a phased agent rollout of a
 | `yuzu_fleet_spark_watch_rejected{os,mechanism}` | gauge | Fleet sum of cumulative watch-cap rejections (a rule that could not arm — denial-of-detection). 0 at rung 1 |
 | `yuzu_fleet_spark_quarantined{os,mechanism}` | gauge | Fleet sum of cumulative mechanism quarantines — a structural leak that should stay 0. 0 at rung 1 |
 | `yuzu_fleet_spark_slow_op{os,mechanism}` | gauge | Fleet sum of cumulative slow watch/unwatch ops (a stalled/contended watcher). 0 at rung 1 |
+| `yuzu_fleet_spark_unsupported{os,mechanism}` | gauge | Fleet sum of rules **currently** classified `unsupported` - a known spark type with no mechanism on that host, enforced by **neither** backend (F7, #2298 rung 2). A **live** gauge recomputed every sweep, not cumulative - it can legally decrease (e.g. a mechanism becoming available, or the rule being disabled/removed). **0 today**: classification only runs once an agent's `prefer_spark` is enabled, which is not yet true anywhere in production (see `yuzu.guardian_backend`, still `legacy` fleet-wide). Once enabled, every rule on macOS reads `unsupported`, since macOS registers none of file/registry/service - routine and expected there, not page-worthy |
 | `yuzu_fleet_spark_watch_faults{os}` | gauge | Fleet sum of cumulative post-arm watch-fault edges (`watch_faults_total`). 0 at rung 1 |
 | `yuzu_fleet_spark_queued_dropped{os}` | gauge | Fleet sum of cumulative queued events dropped (bounded-queue overflow + shutdown). On the enforce lane (rung 3) a drop is a silent compliance failure. 0 at rung 1 |
 | `yuzu_fleet_spark_consumer_errors{os}` | gauge | Fleet sum of cumulative queued handlers that threw (`consumer_errors_total`). 0 at rung 1 |

@@ -1859,6 +1859,13 @@ public:
         metrics_.describe("yuzu_fleet_spark_slow_op",
                           "Fleet sum (per {`os`,`mechanism`}) of cumulative slow watch/unwatch ops "
                           "(a stalled watcher)", "gauge");
+        metrics_.describe("yuzu_fleet_spark_unsupported",
+                          "Fleet sum (per {`os`,`mechanism`}) of rules CURRENTLY classified "
+                          "unsupported - a known spark type with no mechanism on that host, "
+                          "enforced by neither backend (F7, #2298 rung 2). A live gauge "
+                          "recomputed every sweep, not cumulative - it can legally decrease "
+                          "(e.g. a mechanism becoming available). Routine, not page-worthy: "
+                          "distinct from armed_faulted/watch_rejected", "gauge");
         // Guardian durable lifecycle-journal fleet rollup (#2298 gate 3). Registered from
         // the SAME table AgentHealthStore::recompute_metrics clears and publishes from
         // (guardian_journal_fleet_tags.hpp), so a new signal cannot ship with a gauge but
