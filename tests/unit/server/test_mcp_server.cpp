@@ -13051,6 +13051,56 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
                   .value() == 1.0);
     }
+
+    SECTION("create_execution failure degrades to the plain path, dispatch still runs, counted") {
+        // #2413: a real ExecutionTracker bound to no database. create_execution
+        // returns std::unexpected("database not open") deterministically, with
+        // no I/O and no fault-injection seam needed on the bridge side - this is
+        // the same failure class CLAUDE.md calls "a failed sqlite3_prepare".
+        yuzu::server::ExecutionTracker broken(nullptr);
+        ts.execution_tracker_for_test = &broken;
+
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+            return {"cmd-noexecrow", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_exec(exec_body(14, true));
+        REQUIRE(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result"));  // plain success shape - degrade is silent to the caller
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        // dispatch still happened - a broken tracker must never block the
+        // operator's "stop NOW" semantic (the comment at the site this test
+        // covers).
+        CHECK(text["command_id"] == "cmd-noexecrow");
+        // create_execution never produced a row, so there is no durable fetch
+        // handle for this run - execution_id must be empty, not a fresh one
+        // silently generated some other way.
+        CHECK(text["execution_id"].get<std::string>().empty());
+        // No bridge record at all: bridge_active was cleared before the
+        // subscribe fork runs (S2/S3), so this never reaches reserve/subscribe.
+        CHECK(bridge.record_count() == 0);
+        CHECK_FALSE(bridge.phase_for(sid, nlohmann::json(14)).has_value());
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "no_execution_row"}})
+                  .value() == 1.0);
+        // Regression guard for the fix documented at the site (streamed_active +
+        // stream_lease reset before this degrade fires): no OTHER reason moved,
+        // i.e. this is not double-counted through a later fork in the same
+        // request.
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_rejected"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_threw"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "arm_threw"}})
+                  .value() == 0.0);
+    }
 }
 
 // ── 2f PR 3b (C8): streamed POST — SSE-on-POST ───────────────────────────────

@@ -381,6 +381,13 @@ TEST_CASE("bridge progress is strictly monotonic on the wire (H1)", "[mcp][bridg
     // the MSVC preprocessor (the #2365 comma-in-macro class).
     const std::vector<std::uint64_t> expected{1, 3, 5};
     CHECK(got == expected);
+    // #2438: the 4 non-strictly-increasing candidates (1-dup, 2, 3-dup, 4) must
+    // each count. Polled: the flush that turns the delta into the registered
+    // counter runs on the projector thread, after (not observably-before, from
+    // the test thread) the publish this poll_until above already waited on.
+    REQUIRE(poll_until([&] {
+        return fx.reg.counter("yuzu_mcp_bridge_progress_suppressed_total").value() == 4.0;
+    }));
 }
 
 TEST_CASE("bridge GET-only lifecycle - live progress, no final, no pin", "[mcp][bridge][2f]") {
@@ -505,6 +512,9 @@ TEST_CASE("bridge flip-and-drain - no frame strands across arm (H2)", "[mcp][bri
         CHECK(j["params"]["progress"].get<std::uint64_t>() > prev);
         prev = j["params"]["progress"].get<std::uint64_t>();
     }
+    // #2438: distinct increasing counts by construction (see comment above) -
+    // H1 suppresses nothing here, so the counter must stay at zero.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_progress_suppressed_total").value() == 0.0);
 }
 
 TEST_CASE("bridge listener fault - contained, counted, one-shot", "[mcp][bridge][2f]") {
@@ -1341,91 +1351,94 @@ TEST_CASE("bridge pressure - one sweep is bounded by the population it started w
     // marks under bridge_mu_ -> rec->mu, the clearing walk takes the same pair, and
     // the producer mutates records_ throughout.
     //
-    // The assertion needs at least one record to arrive DURING a sweep. That is
-    // near-certain with a tight producer against a sweep doing 32 teardowns, but it
-    // is a race, so the scenario gets a few attempts and passes on the first that
-    // lands. It cannot false-RED into a wrong conclusion: without the budget the
-    // sweep drains until the producer stops, and the counter can never move at all.
-    // Streamed admission is capped at 4 per SESSION (pin slots), so a population of
-    // this size needs a session pool. Every session is minted on THIS thread up
-    // front - make_session carries Catch2 assertions, which are not valid off the
-    // main thread - and the producer only ever touches its own slice.
+    // The assertion needs at least one record to arrive DURING a sweep. #3095: an
+    // earlier version left that to chance (a tight producer racing a 32-teardown
+    // sweep, retried a few attempts) and it starved outright on a 2-core CI runner
+    // under scheduler contention - honest-red firing for the RIGHT structural
+    // reason (the scenario genuinely was never exercised), but too often to be
+    // useful. Forced deterministically instead: the #2519 teardown-step probe
+    // blocks the sweep thread mid-teardown of its FIRST pressure victim (outside
+    // every bridge lock - the pressure claim commits without bridge_mu_, so the
+    // producer's own reserve/subscribe/arm calls cannot deadlock against this) until
+    // the producer's first park lands, which GUARANTEES the interleave the test
+    // needs rather than hoping for it. The honest-red property survives the
+    // determinism: the probe still releases on a bounded timeout if the producer
+    // never manages to park anything, and the final CHECK is what actually fails if
+    // that happens - nothing here can silently pass an unexercised scenario.
     constexpr int kPerSession = 4;
     constexpr int kMainSessions = 8;   // 32 records parked before the sweep
     constexpr int kProdSessions = 40;  // up to 160 arrivals during it
-    bool observed = false;
-    for (int attempt = 0; attempt < 12 && !observed; ++attempt) {
-        // The per-principal SESSION cap (8, Decision 15(d)) would otherwise bound the
-        // pool to 32 records - exactly the pre-sweep population, leaving the producer
-        // nothing to add. Raised here only to reach a population big enough for the
-        // budget to bite; nothing in this test depends on the production value.
-        Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0},
-              mcp::McpSessionRegistry::Config{.per_principal_cap = 64}};
-        std::vector<Fx::Session> pool;
-        pool.reserve(kMainSessions + kProdSessions);
-        for (int i = 0; i < kMainSessions + kProdSessions; ++i) {
-            pool.push_back(fx.make_session());
+
+    // The per-principal SESSION cap (8, Decision 15(d)) would otherwise bound the
+    // pool to 32 records - exactly the pre-sweep population, leaving the producer
+    // nothing to add. Raised here only to reach a population big enough for the
+    // budget to bite; nothing in this test depends on the production value.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 0},
+          mcp::McpSessionRegistry::Config{.per_principal_cap = 64}};
+    std::vector<Fx::Session> pool;
+    pool.reserve(kMainSessions + kProdSessions);
+    for (int i = 0; i < kMainSessions + kProdSessions; ++i) {
+        pool.push_back(fx.make_session());
+    }
+    auto park = [&](const Fx::Session& s, int slot) {
+        const auto j = json(slot);
+        if (!fx.bridge->reserve(s.id, "alice", j, json("t"), true).ok) {
+            return false;
         }
-        auto park = [&](const Fx::Session& s, int slot) {
-            const auto j = json(slot);
-            if (!fx.bridge->reserve(s.id, "alice", j, json("t"), true).ok) {
-                return false;
-            }
-            if (!fx.bridge->subscribe(s.id, j, s.id + "-exec-" + std::to_string(slot))) {
-                return false;
-            }
-            if (fx.bridge->arm(s.id, j, Bridge::ArmMode::kStreaming) !=
-                Bridge::ArmOutcome::kArmed) {
-                return false;
-            }
-            return fx.bridge->on_post_closed(s.id, j);
-        };
-        for (int i = 0; i < kMainSessions; ++i) {
-            for (int slot = 0; slot < kPerSession; ++slot) {
-                REQUIRE(park(pool[static_cast<std::size_t>(i)], slot));
-            }
+        if (!fx.bridge->subscribe(s.id, j, s.id + "-exec-" + std::to_string(slot))) {
+            return false;
         }
-
-        std::atomic<bool> stop{false};
-        auto producer = std::async(std::launch::async, [&] {
-            for (int i = kMainSessions; i < kMainSessions + kProdSessions; ++i) {
-                for (int slot = 0; slot < kPerSession; ++slot) {
-                    if (stop.load(std::memory_order_relaxed)) {
-                        return;
-                    }
-                    (void)park(pool[static_cast<std::size_t>(i)], slot);
-                }
-            }
-        });
-
-        fx.bridge->sweep();  // MUST return without waiting for the producer to stop
-        stop.store(true, std::memory_order_relaxed);
-        producer.get();
-
-        // THE COUNTER IS THE CONDITION, not a proxy for it. An earlier version
-        // gated on a producer-side arrival count and then hard-CHECKed the
-        // counter - but that count also included parks completing AFTER sweep()
-        // returned, because `stop` is only stored post-sweep and the producer
-        // re-reads it per slot. So a run where nothing arrived DURING the sweep
-        // still entered the
-        // branch, found the budget legitimately unexhausted, and failed. It went red
-        // 2 of 3 times at 1.5x CPU oversubscription - which is the ordinary state of
-        // both self-hosted pools, four runner agents to a box - while passing 8/8
-        // unloaded. The in-file claim that it "cannot false-RED into a wrong
-        // conclusion" was simply wrong, and measuring only on an idle machine is
-        // what hid it.
-        //
-        // Reading the counter directly is sound in both directions: it is written
-        // ONLY in the budget-exhausted branch, so it can never move without the fix,
-        // and a run where the producer did not interleave just retries instead of
-        // asserting something it did not establish.
-        if (fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() > 0.0) {
-            observed = true;
+        if (fx.bridge->arm(s.id, j, Bridge::ArmMode::kStreaming) != Bridge::ArmOutcome::kArmed) {
+            return false;
+        }
+        return fx.bridge->on_post_closed(s.id, j);
+    };
+    for (int i = 0; i < kMainSessions; ++i) {
+        for (int slot = 0; slot < kPerSession; ++slot) {
+            REQUIRE(park(pool[static_cast<std::size_t>(i)], slot));
         }
     }
-    // Honest failure, not a silent pass: if the producer never interleaved in any
-    // attempt the scenario was never exercised, and that is a result worth seeing.
-    CHECK(observed);
+
+    // The deterministic barrier: the FIRST kUnsubscribe entry blocks the sweep
+    // thread until producer_parked is set, or the bounded timeout elapses.
+    std::mutex probe_mu;
+    std::condition_variable probe_cv;
+    bool producer_parked = false;
+    std::once_flag block_once;
+    fx.bridge->set_teardown_step_probe_for_test([&](Bridge::TeardownStage stage, bool entering) {
+        if (stage != Bridge::TeardownStage::kUnsubscribe || !entering) {
+            return;
+        }
+        std::call_once(block_once, [&] {
+            std::unique_lock<std::mutex> lk(probe_mu);
+            probe_cv.wait_for(lk, std::chrono::seconds(5), [&] { return producer_parked; });
+        });
+    });
+
+    std::atomic<bool> stop{false};
+    auto producer = std::async(std::launch::async, [&] {
+        for (int i = kMainSessions; i < kMainSessions + kProdSessions; ++i) {
+            for (int slot = 0; slot < kPerSession; ++slot) {
+                if (stop.load(std::memory_order_relaxed)) {
+                    return;
+                }
+                if (park(pool[static_cast<std::size_t>(i)], slot)) {
+                    std::lock_guard<std::mutex> lk(probe_mu);
+                    producer_parked = true;
+                    probe_cv.notify_all();
+                }
+            }
+        }
+    });
+
+    fx.bridge->sweep();  // blocks on the probe until the producer's first park lands
+    stop.store(true, std::memory_order_relaxed);
+    producer.get();
+    fx.bridge->set_teardown_step_probe_for_test(nullptr);
+
+    // THE COUNTER IS THE CONDITION, not a proxy for it - it is written ONLY in
+    // the budget-exhausted branch, so it can never move without the fix.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_pressure_budget_exhausted_total").value() > 0.0);
 }
 
 TEST_CASE("bridge pressure - two concurrent sweeps reap a victim exactly once (#2409 qa-S5, TSan)",
@@ -1617,71 +1630,500 @@ TEST_CASE("bridge session-death sweep - non-touching exists, registry untouched"
     CHECK(fx.sessions.active_count() == 0);
 }
 
-TEST_CASE("bridge teardown - a failed unsubscribe retains the record, never orphans its listener "
-          "(#2487)",
+TEST_CASE("bridge teardown - a failed unsubscribe retains the record for retry, never orphans "
+          "its listener (#2487, #2513)",
           "[mcp][bridge][2f]") {
-    // teardown_claimed runs on the bare maintenance thread, so it may not throw; and
-    // because the sweep claim is ONE-WAY (torn_down permanently excludes the record
-    // from later claims) whatever it cannot finish is held until shutdown(). The one
-    // failure the unsubscribe step actually admits is a mutex failure - it allocates
-    // nothing given a const& key. The contained posture must therefore be "leave the
-    // record whole", NOT "erase it and hope something reclaims the subscription":
+    // teardown_claimed runs on the bare maintenance thread, so it may not throw. The
+    // one failure the unsubscribe step actually admits is a mutex failure - it
+    // allocates nothing given a const& key. The contained posture is therefore "leave
+    // the record whole", NOT "erase it and hope something reclaims the subscription":
     // the listener owns a shared_ptr to the record, so erasing destroys nothing and
-    // strands a live listener that shutdown() can no longer reach.
-    Fx fx;
+    // strands a live listener nothing can reach.
+    SECTION("persistent fault exhausts the retry budget, then behaves exactly as before #2513") {
+        Fx fx;  // default Config: teardown_retry_max == 3 -> 4 total attempts
+        auto s = fx.make_session();
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2487"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+        REQUIRE(fx.bus.subscriber_count("exec-2487") == 1);
+
+        fx.clock_s->store(1801);  // session death: the pass-2 teardown this exercises
+        // Armed up FRONT with exactly the 4 attempts this record will consume (first
+        // claim + 3 retries) - not a huge "persistent" count and not re-armed between
+        // sweep() calls, so the fault genuinely outlives the retry budget rather than
+        // outliving the test.
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe,
+                                                                4));
+        REQUIRE_NOTHROW(fx.bridge->sweep());  // attempt 1 (original claim): fails
+
+        // SELF-VALIDATING: with the fault reduced to a no-op the record is torn down
+        // and record_count() is 0, so a mutant seam fails right here rather than
+        // passing identically.
+        CHECK(fx.bridge->record_count() == 1);
+        CHECK(fx.bus.subscriber_count("exec-2487") == 1);
+        {
+            // The row must say the teardown did not happen, in BOTH the detail and
+            // the result field - the production sink used to stamp every bridge row
+            // "success" regardless of detail (#2487 review).
+            std::lock_guard<std::mutex> lk(fx.audit_mu);
+            bool saw_incomplete = false;
+            for (const auto& row : fx.audits) {
+                if (row.action == "mcp.bridge.session_dead" &&
+                    row.detail.find("teardown incomplete") != std::string::npos &&
+                    row.result == "failure") {
+                    saw_incomplete = true;
+                    // This is a session-death reap: its disposition is kNone, so
+                    // NOTHING was published. The row must not claim otherwise - a
+                    // generic "teardown incomplete" grep would pass over exactly
+                    // that lie.
+                    CHECK(row.detail.find("published nothing") != std::string::npos);
+                    CHECK(row.detail.find("frame was published") == std::string::npos);
+                    CHECK(row.detail.find("retry-eligible") != std::string::npos);
+                }
+            }
+            CHECK(saw_incomplete);
+        }
+
+        fx.bridge->sweep();  // attempt 2 (retry): fails, still eligible
+        fx.bridge->sweep();  // attempt 3 (retry): fails, still eligible
+        CHECK(fx.bridge->record_count() == 1);
+        CHECK(fx.bus.subscriber_count("exec-2487") == 1);
+        fx.bridge->sweep();  // attempt 4 (retry): fails, budget exhausted
+
+        // Exactly 4 attempts made it to the unsubscribe step, all failing; exactly
+        // one retry-outcome row, exhausted.
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total",
+                              {{"reason", "unsubscribe"}})
+                  .value() == 4.0);
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "exhausted"}})
+                  .value() == 1.0);
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "recovered"}})
+                  .value() == 0.0);
+        {
+            std::lock_guard<std::mutex> lk(fx.audit_mu);
+            bool saw_exhausted = false;
+            int retry_rows = 0;
+            for (const auto& row : fx.audits) {
+                if (row.action == "mcp.bridge.teardown_retry") {
+                    ++retry_rows;
+                    if (row.detail.find("retry budget exhausted") != std::string::npos) {
+                        saw_exhausted = true;
+                    }
+                }
+            }
+            CHECK(retry_rows == 3);  // attempts 2, 3, 4 - all via the retry pass
+            CHECK(saw_exhausted);
+        }
+
+        // Exhausted behaves exactly like pre-#2513: retained until shutdown, no
+        // further sweep touches it (a 5th sweep, still faulted, changes nothing).
+        fx.bridge->sweep();
+        CHECK(fx.bridge->record_count() == 1);
+        CHECK(fx.bus.subscriber_count("exec-2487") == 1);
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total",
+                              {{"reason", "unsubscribe"}})
+                  .value() == 4.0);  // unchanged - the exhausted record is never reattempted
+
+        // shutdown() is the reclaimer: it walks records_, which is exactly why the
+        // contained path must leave the record THERE.
+        fx.bridge->shutdown();
+        CHECK(fx.bus.subscriber_count("exec-2487") == 0);
+    }
+
+    SECTION("a one-shot fault heals on the next sweep's retry pass") {
+        Fx fx;
+        auto s = fx.make_session();
+        REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+        REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-heal"));
+        REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+                Bridge::ArmOutcome::kArmed);
+        REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+        REQUIRE(fx.bus.subscriber_count("exec-heal") == 1);
+
+        fx.clock_s->store(1801);
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe,
+                                                                1));  // one-shot
+        fx.bridge->sweep();  // attempt 1: fails (consumes the one-shot fault)
+        CHECK(fx.bridge->record_count() == 1);
+        CHECK(fx.bus.subscriber_count("exec-heal") == 1);
+
+        fx.bridge->sweep();  // attempt 2 (retry): the fault is gone - succeeds
+        CHECK(fx.bridge->record_count() == 0);
+        CHECK(fx.bus.subscriber_count("exec-heal") == 0);
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "recovered"}})
+                  .value() == 1.0);
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "exhausted"}})
+                  .value() == 0.0);
+        {
+            std::lock_guard<std::mutex> lk(fx.audit_mu);
+            bool saw_recovered = false;
+            for (const auto& row : fx.audits) {
+                if (row.action == "mcp.bridge.teardown_retry" && row.result == "success") {
+                    saw_recovered = true;
+                    CHECK(row.detail.find("recovered on a retry attempt") != std::string::npos);
+                }
+            }
+            CHECK(saw_recovered);
+        }
+    }
+}
+
+TEST_CASE("bridge teardown retry - a healed retry RE-PUBLISHES a terminal that never got "
+          "built on attempt 1, and shutdown sees nothing left to poison (#2513)",
+          "[mcp][bridge][2f]") {
+    // Guards the exact regression the design worried about: if a future change set
+    // teardown_terminal_handled=true on attempt 1 despite the frame build failing
+    // (rung staying kNotAttempted), a retry would skip Step 1 forever - the client
+    // never gets its -32014, and if the record then survived to an exhausted-budget
+    // shutdown, shutdown()'s should_poison check (keyed on !teardown_terminal_handled)
+    // would wrongly see "handled" and stay silent, reproducing #2517 under a new name.
+    // This forces attempt 1 to fail at BOTH the frame build AND the unsubscribe step
+    // (so the record bails and stays retry-eligible rather than being erased by Steps
+    // 2-4 succeeding around an unpublished terminal), then lets both one-shot faults
+    // heal for the retry, and checks the ring - not just record_count() - for the
+    // actual publish.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    // A (older, never completes) is the pressure victim -> kSynthesizeUnavailable.
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-republish-a"));
+    REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-republish-b"));
+    REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+    fx.bus.publish("exec-republish-b", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+    fx.bridge->inject_terminal_build_fault_for_test(1);  // one-shot: attempt 1's build fails
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1));
+    REQUIRE_NOTHROW(fx.bridge->sweep());  // attempt 1: pressure-claims A, bails at unsubscribe
+
+    // Retained, unresolved: nothing published (build failed before the ladder ran).
+    // NOT asserting subscriber_count here: a pressure claim removes the bus
+    // subscription atomically with the claim itself (before teardown_claimed's
+    // Step 2 ever runs), so it reads 0 whether or not the injected unsubscribe
+    // fault fires - the #2487-review test above doesn't assert it either, for
+    // the same reason.
+    CHECK(fx.bridge->record_count() == 2);
+    CHECK(count_error_code(ring_frames(*s.stream, "alice"), mcp::kMcpTerminalUnavailable) == 0);
+
+    REQUIRE_NOTHROW(fx.bridge->sweep());  // attempt 2 (retry pass): both faults spent, heals
+
+    // Exactly one -32014 reached the ring - the retry actually re-ran Step 1, it did
+    // not silently treat the record as already handled.
+    CHECK(count_error_code(ring_frames(*s.stream, "alice"), mcp::kMcpTerminalUnavailable) == 1);
+    CHECK(fx.bridge->record_count() == 1);  // A settled and erased; B still live/pinned
+    CHECK(fx.bus.subscriber_count("exec-republish-a") == 0);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "recovered"}})
+              .value() == 1.0);
+
+    // A resolved normally before shutdown ran, so there is nothing left for shutdown's
+    // walk to poison - a healed retry must not ALSO leave a spurious shutdown_reap
+    // trail behind it (the #3052 shutdown-evidence contract this retry sits on top of).
+    fx.bridge->shutdown();
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 0);
+}
+
+// Shared by both TSan cases below: park one record, expire it under session-death
+// (decision kNone - no publish to reason about), and burn a one-shot unsubscribe
+// fault on the FIRST attempt so the record lands torn_down + retry-eligible with
+// its terminal already resolved (kNone sets teardown_terminal_handled=true
+// unconditionally in Step 1, before Step 2 ever runs) - the race under test is
+// Pass R's retry claim, not the terminal ladder.
+namespace {
+Fx::Session make_retry_eligible_record(Fx& fx, const char* exec_id) {
     auto s = fx.make_session();
     REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
-    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-2487"));
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), exec_id));
     REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
             Bridge::ArmOutcome::kArmed);
     REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
-    REQUIRE(fx.bus.subscriber_count("exec-2487") == 1);
+    fx.clock_s->store(1801);  // idle_ttl + 1: session-death claims it, decision kNone
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1));
+    fx.bridge->sweep();  // attempt 1: fails, torn_down + retry-eligible, terminal resolved
+    REQUIRE(fx.bridge->record_count() == 1);
+    return s;
+}
+}  // namespace
 
-    fx.clock_s->store(1801);  // session death: the pass-2 teardown this exercises
-    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe,
-                                                            1000));  // persistent
-    REQUIRE_NOTHROW(fx.bridge->sweep());  // the whole point - no escape to the thread
+TEST_CASE("bridge teardown retry - two concurrent sweeps retry-claim a record exactly "
+          "once (#2513, TSan)",
+          "[mcp][bridge][2f][2513]") {
+    // Same property as the #2409 qa-S5 first-claim race, applied to Pass R: the
+    // eligibility check-and-clear (torn_down && teardown_retry_claimable) commits
+    // under bridge_mu_ -> rec->mu in ONE critical section, so a second sweep()
+    // reaching the SAME retry-eligible record while the first is still mid-
+    // teardown_claimed (which runs OUTSIDE that lock, like every claim path) must
+    // find nothing left to claim. A plain two-thread racer loop (qa-S5's own
+    // shape) does not reliably land inside that window for a single record - the
+    // claim-to-clear gap is far narrower than a full sweep() call, so a natural
+    // race almost always resolves before either thread gets close (#3095 hit the
+    // identical problem for a different pass). Forced deterministically instead,
+    // the same way #3095 fixed it: the #2519 probe blocks sweep A right after it
+    // claims (kUnsubscribe entering, BEFORE that step's own work runs), then
+    // sweep B is issued from this thread while A is guaranteed to be holding the
+    // claim - the exact interleaving a natural race can miss.
+    Fx fx;
+    auto s = make_retry_eligible_record(fx, "exec-retry-race");
+    REQUIRE(fx.bus.subscriber_count("exec-retry-race") == 1);  // still held after attempt 1
 
-    // SELF-VALIDATING: with the fault reduced to a no-op the record is torn down and
-    // record_count() is 0, so a mutant seam fails right here rather than passing
-    // identically.
-    CHECK(fx.bridge->record_count() == 1);
-    CHECK(fx.bus.subscriber_count("exec-2487") == 1);
-    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", "unsubscribe"}})
-              .value() == 1.0);
-    {
-        // The row must say the teardown did not happen, in BOTH the detail and the
-        // result field - the production sink used to stamp every bridge row
-        // "success" regardless of detail (#2487 review).
-        std::lock_guard<std::mutex> lk(fx.audit_mu);
-        bool saw_incomplete = false;
-        for (const auto& row : fx.audits) {
-            if (row.action == "mcp.bridge.session_dead" &&
-                row.detail.find("teardown incomplete") != std::string::npos &&
-                row.result == "failure") {
-                saw_incomplete = true;
-                // This is a session-death reap: its disposition is kNone, so NOTHING
-                // was published. The row must not claim otherwise - a generic
-                // "teardown incomplete" grep would pass over exactly that lie.
-                CHECK(row.detail.find("published nothing") != std::string::npos);
-                CHECK(row.detail.find("frame was published") == std::string::npos);
-            }
+    std::mutex probe_mu;
+    std::condition_variable probe_cv;
+    bool sweep_a_blocked = false;
+    bool release_a = false;
+    bool wait_timed_out = false;  // set on the probe's own thread; asserted on the main thread
+                                   // below, never here - a failed Catch2 assertion off the main
+                                   // thread aborts the process instead of failing the test.
+    std::atomic<bool> first_entrant{false};
+    fx.bridge->set_teardown_step_probe_for_test([&](Bridge::TeardownStage stage, bool entering) {
+        if (stage != Bridge::TeardownStage::kUnsubscribe || !entering) {
+            return;
         }
-        CHECK(saw_incomplete);
+        if (first_entrant.exchange(true)) {
+            return;  // NOT sweep A: pass straight through - blocking it too would deadlock
+                      // against sweep A's own wait for release_a below (std::call_once would
+                      // do exactly this: a second caller blocks until the first's invocation
+                      // completes, not skip past it - tried, deadlocked, this is the fix).
+        }
+        std::unique_lock<std::mutex> lk(probe_mu);
+        sweep_a_blocked = true;
+        probe_cv.notify_all();
+        if (!probe_cv.wait_for(lk, std::chrono::seconds(5), [&] { return release_a; })) {
+            wait_timed_out = true;
+        }
+    });
+
+    auto sweep_a = std::async(std::launch::async, [&] { fx.bridge->sweep(); });
+    {
+        std::unique_lock<std::mutex> lk(probe_mu);
+        REQUIRE(probe_cv.wait_for(lk, std::chrono::seconds(5), [&] { return sweep_a_blocked; }));
     }
+    fx.bridge->sweep();  // sweep B: Pass R reaches the same record while A holds the claim
+    {
+        std::lock_guard<std::mutex> lk(probe_mu);
+        release_a = true;
+        probe_cv.notify_all();
+    }
+    sweep_a.get();
+    fx.bridge->set_teardown_step_probe_for_test(nullptr);
+    REQUIRE_FALSE(wait_timed_out);
 
-    // The claim is one-way ON PURPOSE (re-opening it is a change to the exactly-once
-    // teardown protocol, not a containment fix), so healing the fault does NOT make a
-    // later sweep retry. This is the honest bound the metric exists to surface.
-    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 0));
-    fx.bridge->sweep();
-    CHECK(fx.bridge->record_count() == 1);
-    CHECK(fx.bus.subscriber_count("exec-2487") == 1);
+    CHECK(fx.bridge->record_count() == 0);
+    CHECK(fx.bus.subscriber_count("exec-retry-race") == 0);
+    // Exactly one retry pass actually ran teardown_claimed to completion - not
+    // zero (the record must resolve) and not two (B winning the claim too would
+    // double-count this: a second full pass over the same charge/subscription/
+    // erase, and a second `recovered` row).
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "recovered"}})
+              .value() == 1.0);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "exhausted"}})
+              .value() == 0.0);
+    CHECK(fx.audit_count("mcp.bridge.teardown_retry") == 1);
+}
 
-    // shutdown() is the reclaimer: it walks records_, which is exactly why the
-    // contained path must leave the record THERE.
+TEST_CASE("bridge teardown retry - a retry claim racing shutdown reaps once, no double "
+          "teardown (#2513, TSan)",
+          "[mcp][bridge][2f][2513]") {
+    // Pass R's claim (unlike the original pressure claim qa-B2 races) commits
+    // UNDER bridge_mu_ and rechecks shutdown_started_ inside that same lock, so
+    // shutdown() cannot start mid-CLAIM the way the original claim allows - but
+    // Pass R's teardown_claimed(...) call itself still runs OUTSIDE bridge_mu_
+    // (same as every other claim path), so shutdown()'s walk can still race a
+    // WON claim's in-flight teardown. Either reclaimer may end up doing the
+    // actual work; what must hold is no crash and no double-processing.
+    Fx fx;
+    auto s = make_retry_eligible_record(fx, "exec-retry-shutdown");
+
+    auto sweeper = std::async(std::launch::async, [&] {
+        for (int i = 0; i < 300; ++i) {
+            fx.bridge->sweep();
+        }
+    });
     fx.bridge->shutdown();
-    CHECK(fx.bus.subscriber_count("exec-2487") == 0);
+    sweeper.get();
+
+    CHECK(fx.bridge->record_count() == 0);  // one reclaimer or the other got it
+    // At most one retry pass can ever complete teardown_claimed for this one
+    // record (a second would find teardown_retry_claimable already false or the
+    // record already gone from records_).
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "recovered"}})
+              .value() <= 1.0);
+    CHECK(fx.audit_count("mcp.bridge.teardown_retry") <= 1);
+    // decision was kNone (session-death), and Step 1 sets teardown_terminal_handled
+    // unconditionally for kNone the moment ANY attempt's Step 1 runs - which
+    // already happened on the FIRST attempt, before this race even started. So
+    // shutdown's should_poison is false here regardless of who wins the race.
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 0);
+}
+
+TEST_CASE("bridge teardown retry - shutdown racing a retry whose terminal build keeps "
+          "failing poisons exactly once, never double-delivers (#2513, chaos CH-4, TSan)",
+          "[mcp][bridge][2f][2513]") {
+    // The gap the two #2513 TSan tests above deliberately leave open: both race
+    // shutdown() against a kNone-decision record, where Step 1 resolves the
+    // instant it runs (decision==kNone => teardown_terminal_handled=true
+    // unconditionally) - so shutdown's should_poison is false by construction in
+    // both, and the interesting kSynthesizeUnavailable/kPoisoned interaction is
+    // never exercised. Here the terminal-build fault is PERSISTENT (not one-shot),
+    // so a retry's own Step 1 keeps failing to build a frame across every attempt -
+    // teardown_terminal_handled stays false, which is exactly shutdown()'s
+    // should_poison predicate. The deterministic barrier catches attempt 2 (a real
+    // Pass R retry, not the original pressure claim) right after its own Step 1
+    // has already failed again, still holding torn_down + unresolved terminal,
+    // and races shutdown()'s reaped-walk against it from there - the same window
+    // #2517's poison-vs-teardown arbitration exists to make safe, now exercised
+    // under an active retry instead of a first attempt.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    // A (older, never completes) is the pressure victim -> kSynthesizeUnavailable.
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-ch4-a"));
+    REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-ch4-b"));
+    REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+    fx.bus.publish("exec-ch4-b", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+    // Persistent: outlives both attempt 1 and attempt 2's own Step 1 call.
+    fx.bridge->inject_terminal_build_fault_for_test(1000);
+    // One-shot: only attempt 1 needs an independent reason to bail-and-retain -
+    // without this, steps 2-4 would succeed around the unpublished terminal and
+    // erase A outright, leaving nothing to retry.
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1));
+    REQUIRE_NOTHROW(fx.bridge->sweep());  // attempt 1: pressure-claims A, build fails, bails
+    REQUIRE(fx.bridge->record_count() == 2);
+    REQUIRE(count_error_code(ring_frames(*s.stream, "alice"), mcp::kMcpTerminalUnavailable) == 0);
+
+    // Deterministic barrier: block the RETRY's (attempt 2's) teardown_claimed right
+    // after its own Step 1 has already failed again (kUnsubscribe entering fires
+    // strictly after Step 1 in the function body), so shutdown() is guaranteed to
+    // observe torn_down + an unresolved terminal while attempt 2 is genuinely
+    // in-flight - not a timing hope.
+    std::mutex probe_mu;
+    std::condition_variable probe_cv;
+    bool retry_blocked = false;
+    bool release_retry = false;
+    bool wait_timed_out = false;  // observed on the main thread only, never asserted
+                                   // from the probe's own thread (see the sibling
+                                   // TSan test above for why that would abort instead
+                                   // of failing).
+    std::atomic<bool> first_entrant{false};
+    fx.bridge->set_teardown_step_probe_for_test([&](Bridge::TeardownStage stage, bool entering) {
+        if (stage != Bridge::TeardownStage::kUnsubscribe || !entering) {
+            return;
+        }
+        if (first_entrant.exchange(true)) {
+            return;  // not the retry attempt this test is blocking - pass through
+        }
+        std::unique_lock<std::mutex> lk(probe_mu);
+        retry_blocked = true;
+        probe_cv.notify_all();
+        if (!probe_cv.wait_for(lk, std::chrono::seconds(5), [&] { return release_retry; })) {
+            wait_timed_out = true;
+        }
+    });
+
+    auto retry_sweep = std::async(std::launch::async, [&] { fx.bridge->sweep(); });
+    {
+        std::unique_lock<std::mutex> lk(probe_mu);
+        REQUIRE(probe_cv.wait_for(lk, std::chrono::seconds(5), [&] { return retry_blocked; }));
+    }
+    fx.bridge->shutdown();  // races the blocked retry: sees torn_down, unresolved terminal
+    {
+        std::lock_guard<std::mutex> lk(probe_mu);
+        release_retry = true;
+        probe_cv.notify_all();
+    }
+    retry_sweep.get();
+    fx.bridge->set_teardown_step_probe_for_test(nullptr);
+    REQUIRE_FALSE(wait_timed_out);
+
+    // Exactly one terminal disposition ever reaches the client: shutdown's poison,
+    // never a synthesized -32014 (Step 1 never once succeeded, across either
+    // attempt - the fault outlived both, and the pre-race REQUIRE above already
+    // pinned the ring at 0 before this point), and never both. attach_and_replay
+    // cannot be used to re-check the ring content here: a poisoned stream refuses
+    // every later attach by design (session-wide, #2517/#2740), which is itself
+    // the assertion - not a limitation of this check.
+    auto attached = s.stream->attach_and_replay(0, nullptr, "alice");
+    CHECK(attached.status == mcp::McpStreamState::AttachStatus::kPoisoned);
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 1);
+    CHECK(fx.bridge->record_count() == 0);  // shutdown's walk reclaimed it
+}
+
+TEST_CASE("bridge teardown - an entry-lock failure is CONTAINED, never terminates the "
+          "process (post-merge review finding, #2513)",
+          "[mcp][bridge][2f][2513]") {
+    // Post-merge review on this branch found teardown_claimed's entry-lock
+    // acquisition (attempt bookkeeping + Step-1 idempotence read) was the one
+    // rec->mu site in this function NOT wrapped in the contained() helper every
+    // sibling step already uses for the identical modelled fault - a throw there
+    // would escape the function's own noexcept boundary and std::terminate() the
+    // whole process on the maintenance thread, not just strand one record. This
+    // proves the fix: a fault at the entry lock is caught, logged, and the call
+    // returns cleanly with NO bookkeeping mutated - attempts is not incremented,
+    // teardown_retry_claimable is never set (since mark_retry_or_exhausted is
+    // never reached), so the record is NOT auto-retried by a later Pass R tick -
+    // it sits torn_down and fully unresolved until shutdown() reclaims it. That
+    // is a real degradation from the fault-free path, but it is a degradation,
+    // not a crash - which is the whole point of containing it.
+    Fx fx;
+    auto s = fx.make_session();
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json(1), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json(1), "exec-entry-lock"));
+    REQUIRE(fx.bridge->arm(s.id, json(1), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json(1)));
+
+    fx.clock_s->store(1801);  // idle_ttl + 1: session-death claims it, decision kNone
+    fx.bridge->inject_record_entry_lock_fault_for_test(1);
+    REQUIRE_NOTHROW(fx.bridge->sweep());  // the claim commits; teardown_claimed's
+                                          // entry lock then fails and is contained
+
+    // SELF-VALIDATING at the boundary that matters most: no exception reached the
+    // caller, no std::terminate - REQUIRE_NOTHROW above already proves that. The
+    // record is claimed (torn_down) but nothing about its teardown bookkeeping
+    // advanced: no audit row was ever written for this attempt (bailed before any
+    // audit_contained call is reachable), and it stays fully retained.
+    CHECK(fx.bridge->record_count() == 1);
+    CHECK(fx.audit_count("mcp.bridge.session_dead") == 0);
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", "unsubscribe"}})
+              .value() == 0.0);
+    // Gate 8 review (post-merge): this reaches the SAME permanent-retention end
+    // state as a genuinely retry-budget-exhausted record (retained until
+    // shutdown, no further attempts - see below), even though it never went
+    // through mark_retry_or_exhausted. YuzuMcpBridgeTeardownRetryExhausted is
+    // documented as THE complete signal for that state, so this path counts
+    // the same way rather than silently bypassing it.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "exhausted"}})
+              .value() == 1.0);
+
+    // Not auto-retried: teardown_retry_claimable was never set (mark_retry_or_exhausted
+    // is never reached from the entry bail), so Pass R has nothing to claim. A second,
+    // unfaulted sweep changes nothing for this record.
+    REQUIRE_NOTHROW(fx.bridge->sweep());
+    CHECK(fx.bridge->record_count() == 1);
+
+    // shutdown() is the only reclaimer left. teardown_terminal_handled was never
+    // set true (Step 1 was never reached), so should_poison's predicate reads it
+    // as unresolved and poisons - the conservative, safe default for "genuinely
+    // don't know whether anything was ever owed to this client."
+    fx.bridge->shutdown();
+    CHECK(fx.bridge->record_count() == 0);
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 1);
+    auto attached = s.stream->attach_and_replay(0, nullptr, "alice");
+    CHECK(attached.status == mcp::McpStreamState::AttachStatus::kPoisoned);
 }
 
 TEST_CASE("bridge subscribe() is an exactly-once state-checked transition (#2487 review)",
@@ -1816,23 +2258,27 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         fx.clock_s->store(1801);  // session death drives the pass-2 teardown
     };
 
-    SECTION("release_charge fails: the record IS erased, one admission slot leaks, "
-            "and the row says failure") {
+    SECTION("release_charge fails: the record is RETAINED for retry (#2513), the "
+            "subscription is already gone, and the row says failure") {
         Fx fx;
         auto s = fx.make_session();
         park_one(fx, s);
         REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge,
                                                                 1000));
         REQUIRE_NOTHROW(fx.bridge->sweep());
-        // Distinct from the unsubscribe stage: teardown CONTINUES past this failure.
-        CHECK(fx.bridge->record_count() == 0);
+        // #2513: distinct from the pre-retry posture - a charge failure now BAILS
+        // like unsubscribe does, instead of falling through to erase. Step 2
+        // (unsubscribe) already ran and succeeded, so the subscription is gone even
+        // though the record itself is retained.
+        CHECK(fx.bridge->record_count() == 1);
         CHECK(fx.bus.subscriber_count("exec-stage") == 0);
         CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total",
                              {{"reason", "release_charge"}})
                   .value() == 1.0);
         const auto row = row_for(fx, "mcp.bridge.session_dead");
         CHECK(row.result == "failure");  // NOT "success" - a slot is still held
-        CHECK(row.detail.find("streamed charge not released") != std::string::npos);
+        CHECK(row.detail.find("streamed charge release failed") != std::string::npos);
+        CHECK(row.detail.find("admission slot") != std::string::npos);
         // A session-death reap publishes nothing, so the row must say so rather than
         // reporting only the leaked slot: an unconditional charge message used to
         // ERASE the publish disposition, which meant a teardown that both poisoned
@@ -1871,7 +2317,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
         CHECK(row.result == "failure");
         CHECK(row.detail.find("frame was published") != std::string::npos);
-        CHECK(row.detail.find("admission slot is held") != std::string::npos);
+        CHECK(row.detail.find("admission slot") != std::string::npos);
         CHECK(row.detail.find("published nothing") == std::string::npos);
     }
     SECTION("release_charge fails on a POISONED teardown: the row names both, not just the "
@@ -1894,7 +2340,7 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
 
         const auto row = row_for(fx, "mcp.bridge.forced_expire");
         CHECK(row.result == "failure");
-        CHECK(row.detail.find("charge not released") != std::string::npos);
+        CHECK(row.detail.find("streamed charge release failed") != std::string::npos);
         CHECK(row.detail.find("POISONED") != std::string::npos);
     }
     SECTION("unsubscribe fails on a POISONED teardown: that site names it too") {
@@ -1933,33 +2379,41 @@ TEST_CASE("bridge teardown - each stage retains a DIFFERENT resource and audits 
         CHECK(row.detail.find("record erase failed") != std::string::npos);
         CHECK(row.detail.find("POISONED") != std::string::npos);
     }
-    SECTION("release_charge AND erase both fail: the row names BOTH retained resources") {
-        // The compound case. Nothing stops both stages failing in one call - they
-        // fail on the same class of fault - and the erase-failure row used to
-        // hardcode "subscription and charge were settled", affirmatively DENYING the
-        // admission-slot leak it had just caused. That is the audit-accuracy defect
-        // this whole change exists to remove, so it gets its own case rather than
-        // being left to the two single-fault sections, neither of which can see it.
+    SECTION("release_charge and erase fail on SUCCESSIVE attempts: retry proves the "
+            "resources settle independently, not just that each fails alone") {
+        // #2513: a release_charge failure now bails before erase is ever attempted
+        // (the two can no longer fail together in ONE call, which is what the
+        // pre-retry version of this case pinned) - so this proves the retry
+        // sequence instead: attempt 1 fails at release_charge, healing it lets
+        // attempt 2 (the retry) reach erase, which fails in turn, and attempt 3
+        // finally settles both.
         Fx fx;
         auto s = fx.make_session();
         park_one(fx, s);
         REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kReleaseCharge,
-                                                                1000));
-        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1000));
-        REQUIRE_NOTHROW(fx.bridge->sweep());
+                                                                1));  // attempt 1 only
+        REQUIRE_NOTHROW(fx.bridge->sweep());  // attempt 1: fails at release_charge
         CHECK(fx.bridge->record_count() == 1);
         CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total",
                              {{"reason", "release_charge"}})
                   .value() == 1.0);
         CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", "erase"}})
+                  .value() == 0.0);  // never reached yet
+
+        REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kErase, 1));
+        fx.bridge->sweep();  // attempt 2 (retry): release_charge now succeeds, erase fails
+        CHECK(fx.bridge->record_count() == 1);
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", "erase"}})
                   .value() == 1.0);
-        const auto row = row_for(fx, "mcp.bridge.session_dead");
+        const auto row = row_for(fx, "mcp.bridge.teardown_retry");
         CHECK(row.result == "failure");
-        // Both retained resources named; and emphatically NOT a claim that the
-        // charge was settled.
-        CHECK(row.detail.find("erase failed") != std::string::npos);
-        CHECK(row.detail.find("charge was not released") != std::string::npos);
-        CHECK(row.detail.find("were settled") == std::string::npos);
+        CHECK(row.detail.find("record erase failed") != std::string::npos);
+        CHECK(row.detail.find("were settled") != std::string::npos);  // true this time
+
+        fx.bridge->sweep();  // attempt 3 (retry): both faults spent - settles
+        CHECK(fx.bridge->record_count() == 0);
+        CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "recovered"}})
+                  .value() == 1.0);
     }
 }
 
