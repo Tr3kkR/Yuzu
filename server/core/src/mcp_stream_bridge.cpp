@@ -2640,7 +2640,9 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
                                     rung == TerminalRung::kFallback;
 
     // #2513: called from every bail site below, AFTER that site's own
-    // count_teardown_incomplete/log_incomplete has already fired for its stage.
+    // count_teardown_incomplete but BEFORE its log_incomplete - log_incomplete's
+    // wording depends on this call's result (retry-eligible vs. exhausted), so it
+    // needs the answer, not just the fact that a bail happened.
     // Marks the record retry-eligible for a later sweep under
     // Config::teardown_retry_max, or - once that bound is hit - counts and logs
     // the exhausted disposition instead. Returns whether the record is STILL
