@@ -306,6 +306,10 @@ agent_test_exe = executable(
     'unit/test_hardware_macos_bios.cpp',      # Wave 3 PR3.2: pure Boot ROM / System Firmware Version parser
     'unit/test_hardware_linux_parsers.cpp',   # Wave 3 PR3.2: pure dmidecode memory parser + injected /sys/block disk-row builder
     'unit/test_device_identity_macos.cpp',    # Wave 3 PR3.2: pure dsconfigad -show parser (device_identity's first tests)
+    'unit/test_hardware_device_identity_posix_actions.cpp', # Wave 3 PR3.2 gate-1 remediation: real
+                                                # hardware.dylib/device_identity.dylib driven end to end
+                                                # via LocalDispatcher (macOS-only; a no-op TU elsewhere
+                                                # via the file's own #if defined(__APPLE__) guard)
   ),
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
@@ -357,9 +361,13 @@ agent_test_exe = executable(
   # cases WARN-and-skip instead of failing (code-review re-verification finding).
   # os_info_plugin_lib / processes_plugin_lib / network_diag_plugin_lib / ioc_plugin_lib:
   # same reasoning, for test_wave3_pr31_macos_actions.cpp (Wave 3 PR3.1 remediation).
+  # hardware_plugin_lib / device_identity_plugin_lib (agents/plugins/{hardware,device_identity}/meson.build):
+  # test_hardware_device_identity_posix_actions.cpp loads both real plugins by
+  # path for the identical reason (Wave 3 PR3.2 gate-1 remediation).
   link_depends: [reserved_name_fixture_plugin, invalid_name_fixture_plugin, abi3_fixture_plugin,
                 users_plugin_lib, os_info_plugin_lib, processes_plugin_lib,
-                network_diag_plugin_lib, ioc_plugin_lib],
+                network_diag_plugin_lib, ioc_plugin_lib,
+                hardware_plugin_lib, device_identity_plugin_lib],
 )
 # Two agent tests are [tsan-heavy]: concurrency STRESS checkpoints that spin four to five
 # threads on real SQLite I/O with no throttle. Their wall time is contention-dominated - it

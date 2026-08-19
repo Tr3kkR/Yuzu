@@ -24,7 +24,12 @@ elif host_machine.system() == 'linux'
   endif
 endif
 
-shared_library(
+# Assigned to a variable (mirrors users_plugin_lib in
+# agents/plugins/users/meson.build) so tests/meson.build's link_depends can
+# order this build ahead of test_hardware_device_identity_posix_actions.cpp,
+# which loads the real device_identity.dylib/.so by path via
+# yuzu::agent::PluginHandle::load.
+device_identity_plugin_lib = shared_library(
   'device_identity',
   files('src/device_identity_plugin.cpp'),
   name_prefix: '',

@@ -14,7 +14,12 @@ elif host_machine.system() == 'darwin'
   hardware_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'])
 endif
 
-shared_library(
+# Assigned to a variable (mirrors users_plugin_lib in
+# agents/plugins/users/meson.build) so tests/meson.build's link_depends can
+# order this build ahead of test_hardware_device_identity_posix_actions.cpp,
+# which loads the real hardware.dylib/.so by path via
+# yuzu::agent::PluginHandle::load.
+hardware_plugin_lib = shared_library(
   'hardware',
   files('src/hardware_plugin.cpp'),
   name_prefix: '',
