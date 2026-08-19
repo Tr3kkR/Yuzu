@@ -79,7 +79,7 @@ TEST_CASE("StoreWorkerPool: quiesce blocks until slow in-flight tasks finish",
     CHECK(task_finished.load());
 }
 
-TEST_CASE("StoreWorkerPool: quiesce waits for QUEUED tasks, not just the "
+TEST_CASE("StoreWorkerPool: quiesce waits for QUEUED tasks -- not just the "
           "currently-executing one",
           "[store_worker_pool]") {
     // PR review finding (important): no existing test forces a task to sit
@@ -90,6 +90,13 @@ TEST_CASE("StoreWorkerPool: quiesce waits for QUEUED tasks, not just the "
     // semantics an earlier round on this branch's own fix got wrong (see
     // the governance ledger, 3261-unhappy-p3-1) -- a single busy worker
     // plus queued work behind it is the reproduction shape.
+    //
+    // No comma in the test name (scoped-governance quality-engineer SHOULD):
+    // Catch2 splits a positional name-filter argv token on commas, and
+    // scripts/ci/flake-retry.py's isolated-case-retry path passes the raw
+    // case name as one positional arg -- a comma-corrupted zero-match
+    // filter would make a genuinely-recovered flaky run of this test
+    // unrecoverable-looking rather than reported "recovered".
     StoreWorkerPool pool(/*num_threads=*/1, /*max_queue=*/16);
     std::atomic<bool> released{false};
     ReleaseGuard guard(released); // always fires, even if a CHECK below fails
@@ -101,21 +108,60 @@ TEST_CASE("StoreWorkerPool: quiesce waits for QUEUED tasks, not just the "
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }));
     // These two sit in the QUEUE -- never started while the worker above is
-    // busy.
-    REQUIRE(pool.submit([&queued_ran] { ++queued_ran; }));
-    REQUIRE(pool.submit([&queued_ran] { ++queued_ran; }));
+    // busy. Each sleeps 20ms before incrementing (scoped-governance
+    // quality-engineer SHOULD, empirically verified): without this, the
+    // exact regression this test targets -- decrementing pending_ at
+    // DEQUEUE time instead of task-COMPLETION time -- passed 100/100 runs
+    // against a deliberately-mutated header, because the worker's own next
+    // instruction (a bare ++queued_ran) reliably completes before the main
+    // thread wakes on idle_cv_.notify_all() regardless of which point
+    // pending_ was decremented at. The sleep widens that window enough to
+    // make the same mutant reliably red (100/100) with zero false-reds
+    // against the real implementation (100/100 still green, 250 runs
+    // total including 8-way parallel contention).
+    REQUIRE(pool.submit([&queued_ran] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        ++queued_ran;
+    }));
+    REQUIRE(pool.submit([&queued_ran] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        ++queued_ran;
+    }));
 
     // Release the blocking task from a second thread, concurrently with
     // quiesce() blocking below. A regression that treats "no task
     // currently executing" as quiesced would let quiesce() return true the
     // instant the blocking task above finishes, before either queued task
-    // has actually run -- this REQUIRE would then observe queued_ran < 2.
+    // has actually run -- the CHECK below would then observe queued_ran < 2.
+    //
+    // JoinGuard (scoped-governance cpp-safety/cpp-expert BLOCKING, policy
+    // floor -- CLAUDE.md: "unjoined thread", unqualified as to production
+    // vs test code; identical precedent already established in this repo
+    // at test_license_store.cpp/test_secret_codec.cpp): a bare
+    // std::thread left joinable when pool.quiesce() below returns false --
+    // exactly the failure mode this test exists to catch -- would call
+    // std::terminate() in ~thread() on the REQUIRE-throw unwind instead of
+    // reporting one clean red assertion. NOT std::jthread -- that
+    // substitution broke Apple Clang's libc++ once already in this
+    // codebase (Gate 8 history).
     std::thread releaser([&released] {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         released.store(true);
     });
-    REQUIRE(pool.quiesce(std::chrono::seconds(5)));
-    releaser.join();
+    struct JoinGuard {
+        std::thread& t;
+        ~JoinGuard() {
+            if (t.joinable())
+                t.join();
+        }
+    } join_guard{releaser};
+
+    const bool drained = pool.quiesce(std::chrono::seconds(5));
+    releaser.join(); // explicit join before asserting; join_guard is the safety
+                      // net if anything between here and scope-exit ever throws
+                      // first -- its destructor checks joinable() and is then a
+                      // correct no-op
+    REQUIRE(drained);
     CHECK(queued_ran.load() == 2);
 }
 

@@ -3775,7 +3775,7 @@ List recent delivery attempts for a webhook. Includes HTTP status code, response
 
 ### Offload Targets
 
-Response-offload control plane (issue #255, Phase 8.3). Targets are named external HTTP endpoints that receive a copy of `agent.registered` and `execution.completed` events as they fire — heavier-duty than webhooks: typed auth (none / bearer / basic / hmac) and server-side batching for SIEM / data-warehouse ingestion that prefers fewer, larger requests.
+Response-offload control plane (issue #255, Phase 8.3). Targets are named external HTTP endpoints that receive a copy of the same events webhooks do (see the event-types table in the Webhooks section above) as they fire — heavier-duty than webhooks: typed auth (none / bearer / basic / hmac) and server-side batching for SIEM / data-warehouse ingestion that prefers fewer, larger requests.
 
 A target is identified by a unique `name` so a definition can reference it via `spec.offload.targets` in YAML (see [yaml-dsl-spec.md](../yaml-dsl-spec.md#specoffload)).
 

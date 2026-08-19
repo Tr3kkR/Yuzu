@@ -7512,6 +7512,17 @@ public:
                 // its default-constructed (not-joinable) state, since the
                 // move-assignment above never ran, so the join() below is
                 // a correct no-op on this path.
+                //
+                // Scoped-governance cpp-safety + sre (2-way convergence):
+                // this fallback is necessarily SEQUENTIAL, not concurrent
+                // with webhook_store_'s wait below - the ~115s headroom
+                // this file's own comment above computes assumed the
+                // concurrent case. Worst case here is ~60s (this call) +
+                // ~60s (webhook, next) = ~120s added to the pre-existing
+                // ~55s stack = ~175s, still inside the shipped 210s
+                // stop_grace_period/TimeoutStopSec - not a real risk, but
+                // only reachable by genuine thread-creation exhaustion at
+                // shutdown, which is itself already a degraded state.
                 offload_drained = offload_target_store_->quiesce(kStoreQuiesceBound);
             }
         }
@@ -10630,6 +10641,15 @@ private:
                   {"baselines", baseline_ok ? "ok" : "error"},
                   {"offload_target", offload_target_ok ? "ok" : "error"},
                   {"webhook_store", webhook_ok ? "ok" : "error"},
+                  // Scoped-governance sre + consistency-auditor (2-way
+                  // convergence): approval_ok already gated all_stores_ok
+                  // below but had no entry here — the mirror of the
+                  // webhook_ok bug this same commit fixes. A degraded
+                  // approval_manager_ flipped top-level status to
+                  // "degraded" with no per-store detail to explain why.
+                  // /readyz already names it "approval_manager" (its own
+                  // StoreCheck vector); matching that name here.
+                  {"approval_manager", approval_ok ? "ok" : "error"},
                   {"ca", ca_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},

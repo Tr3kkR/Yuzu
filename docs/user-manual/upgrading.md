@@ -134,7 +134,7 @@ deliveries for `agent.registered` and `execution.completed` events, have been de
 the life of the process **since the stores were introduced** — for `NotificationStore`/
 `WebhookStore`, every tagged release from v0.10.0 through v0.13.0 (roughly four months);
 `OffloadTargetStore` didn't exist until v0.12.0, so its affected window is v0.12.0 through
-v0.13.0 (roughly six weeks). Every use site double-guards `ptr && ptr->is_open()` with a
+v0.13.0 (roughly three months). Every use site double-guards `ptr && ptr->is_open()` with a
 silent skip, so nothing logged or alerted; the bug produced zero signal. They now fire on
 every boot.
 
