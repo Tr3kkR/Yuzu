@@ -165,6 +165,9 @@ struct KillSwitchScope {
     constexpr std::string_view kSentinel = "__";
     if (!s.starts_with(kSentinel) || !s.ends_with(kSentinel))
         return false;
+    // starts_with(kSentinel) already guarantees pos<=size(); for s.size()<4 the
+    // count below underflows, but substr clamps it to size()-pos, so this stays
+    // in-bounds for every input.
     return is_valid_identifier(s.substr(kSentinel.size(), s.size() - kSentinel.size() * 2));
 }
 
