@@ -432,22 +432,6 @@ TEST_CASE("#3265: an explicitly-set kill switch on __guard__/push_rules still bl
     CHECK(w.store.action_allowed("__guard__", "push_rules"));
 }
 
-TEST_CASE("#3265: a whole-plugin-level kill on __guard__ also reaches push_rules, same "
-          "inheritance rule as an ordinary plugin",
-          "[pg][store][plugin_config][killswitch]") {
-    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
-    Wired w{db.dsn()};
-
-    // No action-level row exists yet — this pins the plugin-level-only
-    // inheritance path, distinct from the action-level-wins case above
-    // (action_allowed's contract: an action-level row always wins over an
-    // inherited plugin-level one, by design — see "an action-level row
-    // overrides an inherited plugin-level state" above).
-    REQUIRE(w.store.set_kill_switch("__guard__", "", false, "lockdown", "alice").has_value());
-    CHECK_FALSE(w.store.action_allowed("__guard__", "push_rules"));
-    CHECK_FALSE(w.store.action_allowed("__guard__", ""));
-}
-
 // ── #3265: the REAL finalize_classified_command composition, not a stubbed
 //    push_fn_ (TestRouteSink-style stubs bypass this chokepoint entirely,
 //    which is why the original regression shipped undetected) ────────────

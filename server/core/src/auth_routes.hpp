@@ -431,6 +431,31 @@ public:
                                                    const std::string& target_id = {},
                                                    const std::string& permission = {});
 
+    /// #3289 — the legacy dashboard tag-mutation family's guard against the
+    /// tag-write TOCTOU `require_scoped_permission`'s service branch has on
+    /// its own: that branch authorizes a mutation of tag `key` using the
+    /// PRE-WRITE value of that same tag (`agent's service tag == token's
+    /// scope`), so a service-scoped token can rewrite/delete its own
+    /// cohort's `service` tag and move an agent out of (or a different
+    /// agent into) its own confinement. Call this BEFORE
+    /// `require_scoped_permission("Tag", "Write"|"Delete", agent_id)`, right
+    /// after the key is parsed/normalized. Value-blind by design (see
+    /// `authz::service_scope_may_mutate_tag_key`) — this deny does not
+    /// become a membership oracle: it is identical whether `agent_id` is in
+    /// or out of the token's scope, unlike `require_scoped_permission`'s own
+    /// mismatch deny (`auth_routes.cpp:1084-1087`), which still discloses
+    /// membership for non-service keys — that disclosure is pre-existing and
+    /// out of this guard's scope. Returns true iff the caller must return
+    /// immediately; false means either the session is not service-scoped or
+    /// `key` is not the service tag, so the caller proceeds to its normal
+    /// gate. No `.permission` in the A4 body — no grant admits a
+    /// service-scoped session past this rule (routed-concern clause 5).
+    [[nodiscard]] bool deny_service_scoped_service_tag_mutation(const httplib::Request& req,
+                                                                 httplib::Response& res,
+                                                                 const std::string& action,
+                                                                 const std::string& agent_id,
+                                                                 const std::string& key);
+
     /// Emit an analytics event with HTTP request context.
     void emit_event(const std::string& event_type, const httplib::Request& req,
                     const nlohmann::json& attrs = {}, const nlohmann::json& payload_data = {},

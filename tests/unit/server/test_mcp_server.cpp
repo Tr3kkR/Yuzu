@@ -706,6 +706,7 @@ struct McpTestServer {
     std::vector<std::string> audit_log; // records "action|result" pairs
     std::vector<std::string> audit_details; // records the detail string per audit call (M2)
     std::vector<std::string> audit_target_ids; // records the target_id string per audit call (#2917)
+    std::vector<std::string> audit_target_types; // records target_type per audit call (#3289 Gate 8)
     bool audit_succeeds_{true};         // false → AuditFn returns false (dropped row)
     bool audit_throws_{false};          // true → AuditFn throws (bad_alloc-class) (#1647)
     bool read_only_mode_{false};        // captured by ref by build_handler
@@ -1019,12 +1020,13 @@ private:
         // Mock audit: record calls. Returns audit_succeeds_ so a test can simulate
         // a dropped audit row (#1240: AuditFn is bool; revoke surfaces the gap).
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
-                               const std::string& result, const std::string& /*target_type*/,
+                               const std::string& result, const std::string& target_type,
                                const std::string& target_id,
                                const std::string& detail) -> bool {
             audit_log.push_back(action + "|" + result);
             audit_details.push_back(detail);
             audit_target_ids.push_back(target_id);
+            audit_target_types.push_back(target_type);
             if (audit_throws_)
                 throw std::runtime_error("audit DB write blew up"); // bad_alloc-class (#1647)
             return audit_succeeds_;
@@ -4517,6 +4519,13 @@ TEST_CASE("MCP Integration: tools/call unknown tool returns error", "[mcp][integ
     CHECK(body["error"]["message"].get<std::string>().find("nonexistent_tool") !=
           std::string::npos);
     CHECK(!body.contains("result"));
+
+    // #2445: client-caused (unknown tool name), audited "denied" like most
+    // other rejections on this surface — several other client-caused
+    // rejections on this surface still audit "failure" (tracked in #3176).
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "mcp.nonexistent_tool|denied");
+    CHECK(ts.audit_details[0] == "unknown tool");
 }
 
 // ── 6. Tier denied — readonly tier blocks a read on a tool that needs stores ─
@@ -9327,6 +9336,107 @@ TEST_CASE("MCP delete_tag full approval-ticket round-trip + replay is rejected",
     CHECK(body3["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
 }
 
+// ── #3289: MCP set_tag/delete_tag must not let a service-scoped token
+// mutate its own confinement tag — same TOCTOU as the REST/legacy twins.
+
+TEST_CASE("MCP set_tag denies a service-scoped token writing the service tag (#3289)",
+          "[pg][mcp][integration][tag][security]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& store = *tag_bundle;
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.mock_token_scope_service = "printers";
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":900,"params":{"name":"set_tag","arguments":{"agent_id":"agent-1","key":"service","value":"vending"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(tag_val(store, "agent-1", "service").empty()); // no write
+    CHECK(ts.audit_log.back() == "mcp.set_tag|denied");
+    // Gate 8: pin target_type="Tag" — this is the site the #3289 Gate 4/6
+    // hardening round actually CHANGED (was "Agent"); REST v1's own pin test
+    // covers the site that didn't need fixing, not this one.
+    REQUIRE_FALSE(ts.audit_target_types.empty());
+    CHECK(ts.audit_target_types.back() == "Tag");
+}
+
+TEST_CASE("MCP set_tag admits a service-scoped token writing a NON-service key "
+          "(#3289 regression: only the service key is guarded)",
+          "[pg][mcp][integration][tag]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& store = *tag_bundle;
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.mock_token_scope_service = "printers";
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":901,"params":{"name":"set_tag","arguments":{"agent_id":"agent-1","key":"role","value":"web"}}})");
+    REQUIRE(res);
+    auto payload = write_tool_payload(res);
+    CHECK(payload["set"] == true);
+    CHECK(tag_val(store, "agent-1", "role") == "web");
+}
+
+TEST_CASE("MCP delete_tag denies a service-scoped token deleting the service "
+          "tag (#3289: tag survives the consumed-ticket recall)",
+          "[pg][mcp][integration][tag][security][approval]") {
+    yuzu::test::TagStorePg tag_bundle;
+    yuzu::server::TagStore& tags = *tag_bundle;
+    REQUIRE(tags.set_tag("agent-1", "service", "printers", "server").has_value());
+    yuzu::test::TempDbFile adb{std::string_view{"yuzu_test_3289_mcp_appr_"}};
+    SqliteDb raw;
+    REQUIRE(sqlite3_open(adb.path.string().c_str(), raw.addr()) == SQLITE_OK);
+    yuzu::server::ApprovalManager appr(raw.get());
+    appr.create_tables();
+
+    McpTestServer ts;
+    ts.tag_store_for_test = &tags;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.approval_manager_for_test = &appr;
+    ts.mock_token_scope_service = "printers";
+    ts.start("operator");
+
+    // 1. Mint the ticket (approval-gating is generic — reached before the
+    // #3289 guard, same as the ordinary round-trip above).
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":910,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"service"}}})");
+    auto body1 = nlohmann::json::parse(res1->body);
+    REQUIRE(body1.contains("error"));
+    CHECK(body1["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    std::string approval_id = body1["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(!approval_id.empty());
+
+    // 2. Approve it.
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    // 3. Recall with the consumed ticket → the #3289 guard denies BEFORE
+    // the actual delete, so the tag survives despite a valid, approved ticket.
+    std::string recall = R"({"jsonrpc":"2.0","method":"tools/call","id":911,"params":{"name":"delete_tag","arguments":{"agent_id":"agent-1","key":"service","approval_id":")" +
+                         approval_id + R"("}}})";
+    auto res2 = ts.call(recall);
+    auto body2 = nlohmann::json::parse(res2->body);
+    REQUIRE(body2.contains("error"));
+    CHECK(body2["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(tag_val(tags, "agent-1", "service") == "printers"); // untouched
+    CHECK(ts.audit_log.back() == "mcp.delete_tag|denied");
+}
+
 TEST_CASE("MCP approval recall refuses a ticket presented by a different principal "
           "than its submitter",
           "[pg][mcp][integration][tag][approval][security]") {
@@ -12940,6 +13050,56 @@ TEST_CASE("MCP Integration: execute_instruction progress bridge - GET-only mode 
         CHECK(bridge.record_count() == 0);  // reserved then abandoned on subscribe throw
         CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
                   .value() == 1.0);
+    }
+
+    SECTION("create_execution failure degrades to the plain path, dispatch still runs, counted") {
+        // #2413: a real ExecutionTracker bound to no database. create_execution
+        // returns std::unexpected("database not open") deterministically, with
+        // no I/O and no fault-injection seam needed on the bridge side - this is
+        // the same failure class CLAUDE.md calls "a failed sqlite3_prepare".
+        yuzu::server::ExecutionTracker broken(nullptr);
+        ts.execution_tracker_for_test = &broken;
+
+        auto dispatch = [&](const std::string&, const std::string&,
+                            const std::vector<std::string>&, const std::string&,
+                            const std::unordered_map<std::string, std::string>&,
+                            const std::string&, const yuzu::server::DispatchCaller&) -> std::pair<std::string, int> {
+            return {"cmd-noexecrow", 2};
+        };
+        ts.start_with_dispatch(dispatch, "operator");
+        ts.mcp.set_stream_bridge(&bridge);
+
+        auto res = call_exec(exec_body(14, true));
+        REQUIRE(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j.contains("result"));  // plain success shape - degrade is silent to the caller
+        auto text = nlohmann::json::parse(j["result"]["content"][0]["text"].get<std::string>());
+        // dispatch still happened - a broken tracker must never block the
+        // operator's "stop NOW" semantic (the comment at the site this test
+        // covers).
+        CHECK(text["command_id"] == "cmd-noexecrow");
+        // create_execution never produced a row, so there is no durable fetch
+        // handle for this run - execution_id must be empty, not a fresh one
+        // silently generated some other way.
+        CHECK(text["execution_id"].get<std::string>().empty());
+        // No bridge record at all: bridge_active was cleared before the
+        // subscribe fork runs (S2/S3), so this never reaches reserve/subscribe.
+        CHECK(bridge.record_count() == 0);
+        CHECK_FALSE(bridge.phase_for(sid, nlohmann::json(14)).has_value());
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "no_execution_row"}})
+                  .value() == 1.0);
+        // Regression guard for the fix documented at the site (streamed_active +
+        // stream_lease reset before this degrade fires): no OTHER reason moved,
+        // i.e. this is not double-counted through a later fork in the same
+        // request.
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_rejected"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "reserve_threw"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "subscribe_failed"}})
+                  .value() == 0.0);
+        CHECK(metrics.counter("yuzu_mcp_bridge_degrade_total", {{"reason", "arm_threw"}})
+                  .value() == 0.0);
     }
 }
 

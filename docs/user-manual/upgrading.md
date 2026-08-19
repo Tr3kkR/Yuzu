@@ -124,6 +124,36 @@ An MCP approval-ticket recall that hits a store fault has always returned `-3260
 
 **What to do:** if you have automation that blindly retries on `-32603` without checking `retry_after_ms`, it now stops retrying sooner in this specific case — which is the correct behavior (the old retries were futile). If your automation already honors `retry_after_ms` per [invariant A5](../agentic-first-principle.md), no change is needed. See [`mcp.md`](mcp.md) "`-32603`: Approval store unavailable" for the full response-body reference.
 
+## Behaviour change: webhook and offload-target deliveries, and enrollment/execution-failure notifications, now actually fire (#3261)
+
+A boot-ordering bug wired `NotificationStore`/`WebhookStore`/`OffloadTargetStore` into
+the agent-service RPC path (`Register`, `Subscribe`, `process_gateway_response`) before
+those three stores were constructed, so the wiring silently never took effect. Dashboard
+notifications for agent enrollment and execution failures, and configured webhook/offload
+deliveries for `agent.registered` and `execution.completed` events, have been dead for
+the life of the process **since the stores were introduced** — for `NotificationStore`/
+`WebhookStore`, every tagged release from v0.10.0 through v0.13.0 (roughly four months);
+`OffloadTargetStore` didn't exist until v0.12.0, so its affected window is v0.12.0 through
+v0.13.0 (roughly three months). Every use site double-guards `ptr && ptr->is_open()` with a
+silent skip, so nothing logged or alerted; the bug produced zero signal. They now fire on
+every boot.
+
+**What to do:** if you configured a webhook (`POST /api/webhooks`) since v0.10.0, or an
+offload target (`POST /api/v1/offload-targets`) since v0.12.0, expecting live traffic and
+saw none, that integration has been silently non-functional the entire time, not merely quiet
+— there is no queued backlog to replay, because the events were never generated in the
+first place. If you use one of these integrations as part of your own monitoring or
+compliance evidence chain (a SIEM feed, an alerting pipeline), treat the gap as a
+documented monitoring-coverage lapse for that period, not just a product bug, when
+recording it in your own change or incident log. After upgrading, confirm your receiving
+endpoint still exists and can handle real traffic before you rely on it — deliveries
+start immediately, with no flag or opt-in involved. If your webhook fires to Slack or a
+similar noisy channel for enrollment alerts, note that `agent.registered` fires on every
+gRPC reconnect, not only first enrollment (this is unchanged, documented behaviour — see
+"Webhooks" / "Offload Targets" in [`rest-api.md`](rest-api.md) — but was invisible
+until now); the "Agent Enrolled" **dashboard notification** specifically does not repeat
+on reconnect, so a server restart with N connected agents does not flood that feed.
+
 ## Behaviour change: `mcp.bridge.*` audit rows can now carry `result=failure` (#2487 / #2506)
 
 Audit rows for the MCP progress bridge (`mcp.bridge.done_reap`, `session_dead`, `arming_reaped`, `pin_acked`, `forced_expire`) were previously stamped `result=success` unconditionally, regardless of what actually happened. They now report the real outcome: `result=failure` when a background teardown could not release one of the resources it owns, or when the terminal-frame publish ladder poisoned the session, threw, or was never reached. The `detail` field names which, and no longer asserts a delivery or a poisoning that did not occur.
@@ -131,6 +161,20 @@ Audit rows for the MCP progress bridge (`mcp.bridge.done_reap`, `session_dead`, 
 **What to do:** if you have a SIEM rule, dashboard or evidence query that treats `result` on this verb family as a constant `success` - for example "alert if any `mcp.bridge.*` row is not `success`" - update it before upgrading, or it will fire on legitimate rows. Note also that `failure` here is *self-audited*: a rule that surfaces failure branches by filtering on `denied` will not see these. Filter on `result != "success"` where you need both. `mcp.bridge.cancel` is unaffected and remains `success`.
 
 These rows are background-actor events (`principal=system`), not operator actions, and a `failure` row does **not** mean a client lost a result - executions stay durably fetchable by `execution_id`. See [`audit-log.md`](audit-log.md) for the verb family and [`../ops-runbooks/mcp-bridge-teardown-recovery.md`](../ops-runbooks/mcp-bridge-teardown-recovery.md) for what to do when the paired alert fires.
+
+## Behaviour change: MCP unknown-tool calls now audit `result=denied`, not `failure` (#2445)
+
+An MCP `tools/call` request naming a tool that doesn't exist has always returned `-32601` (`kMethodNotFound`) with the same error message. The audit row for that rejection previously carried `result=failure` - the token this codebase reserves for server-side faults - while every sibling denial on the surface (tier, read-only, schema, input-bounds, per-submitter-cap) uses `result=denied`. It now audits `result=denied` too, matching those siblings. Nothing about the JSON-RPC response changed.
+
+**What to do:** if you have a SIEM rule, dashboard or evidence query that classifies `mcp.<tool_name>` rows by filtering on `result=failure` to catch unknown-tool probes, re-point it at `result=denied` before upgrading, or it will stop matching. A rule that already filters on `result != "success"` sees both and needs no change. Note `result=failure` was never a clean isolator for unknown-tool probes specifically - it is also emitted for genuine server-side faults on *known* tools (store degraded, dispatch exception, etc.) and for several other client-caused-but-mislabeled rejections on the same surface (still open, tracked in #3176), so a rule that wants unknown-tool rows specifically should filter on `detail="unknown tool"`, which this change does not touch. See [`audit-log.md`](audit-log.md) "Result vocabulary" for the surface's current token usage.
+
+## Behaviour change: a failed MCP progress-bridge teardown is now retried instead of being permanently retained (#2513)
+
+A `mcp.bridge.*` teardown step (unsubscribe, releasing the streamed admission charge, or erasing the correlation record) that failed used to strand the record - and the bus channel, replay buffer, and per-session admission slot it held - for the rest of the process's life. It now gets up to `Config::teardown_retry_max` retries beyond the first attempt (4 total attempts by default), one per later sweep tick, before falling back to the old permanent-retention behavior. New `yuzu_mcp_bridge_teardown_retry_total{outcome="recovered"|"exhausted"}` metric and `mcp.bridge.teardown_retry` audit action evidence which happened; see [`audit-log.md`](audit-log.md) and [`../ops-runbooks/mcp-bridge-teardown-recovery.md`](../ops-runbooks/mcp-bridge-teardown-recovery.md).
+
+**What to do:** the shipped `YuzuMcpBridgeTeardownIncomplete` alert changed from a raw counter test (fires and never clears, since the underlying series is monotonic) to a windowed `increase(...[15m]) > 0` test, because most of its movement now self-heals via retry within a few sweep ticks. If you copied the old rule into your own alerting config instead of re-importing `docs/prometheus/yuzu-alerts.yml`, update it the same way or it will stay permanently firing on transient, already-recovered blips. The new `YuzuMcpBridgeTeardownRetryExhausted` alert is now the actual permanent-retention signal - add it if you track these alerts individually rather than loading the bundled rules file wholesale.
+
+If you have dashboard or SIEM logic reading the pre-existing `yuzu_mcp_bridge_teardown_incomplete_total` counter directly rather than through the bundled alert - it is unchanged in name and label shape, but its increment semantics changed: previously one increment per stranded record (ever), now up to `Config::teardown_retry_max` + 1 increments for the SAME record (once per failed step, per attempt) before it either recovers or exhausts. Arithmetic that read the counter as "count of stranded records" will now overcount under retry; read `yuzu_mcp_bridge_teardown_retry_total{outcome="exhausted"}` for that instead. `Config::teardown_retry_max` is a code-constant default, not an operator-configurable flag or env var - there is nothing to tune here.
 
 ## Behaviour change: an MCP maintenance failure degrades instead of aborting the server (#2487)
 
@@ -767,31 +811,49 @@ server `PgPool`).
   graceful `SIGTERM` walks several independently-bounded waits in sequence —
   up to 30 s draining in-flight executions, up to 5 s waiting on the
   NVD-sync background thread, up to 15 s waiting on the HTTP listener thread
-  (#2703 Gate 7 item 2), and up to 5 s on the gRPC shutdown deadline — which
-  can stack to **~55 s** in the worst case if more than one is genuinely
-  wedged. Kubernetes' default `terminationGracePeriodSeconds` is **30**, so
-  a pod with slow-draining work in more than one of those stages can be
-  `SIGKILL`ed mid-sequence before the server finishes its own bounded
-  teardown. If you run under Kubernetes (or any orchestrator with a similar
-  default), raise the grace period to comfortably exceed ~55 s rather than
-  relying on the platform default. **Two things a longer grace period does
-  NOT fix:** (1) the 30 s drain window re-queries `execution_tracker_` for
+  (#2703 Gate 7 item 2), up to 5 s on the gRPC shutdown deadline, and (#3261
+  governance hardening) up to 60 s waiting for WebhookStore and
+  OffloadTargetStore to drain their delivery queues — the last of which runs
+  the two stores CONCURRENTLY, not sequentially, so it adds 60 s to the
+  total rather than 120 s. Stacked, this can reach **~115 s** in the worst
+  case if more than one stage is genuinely wedged. The shipped
+  docker-compose/systemd units already set a 210 s grace period
+  (`stop_grace_period` / `TimeoutStopSec`), which comfortably covers this —
+  but if you deploy under Kubernetes or another orchestrator, its default is
+  frequently far shorter (Kubernetes' own default
+  `terminationGracePeriodSeconds` is **30**), and a pod with slow-draining
+  work in more than one of those stages can be `SIGKILL`ed mid-sequence
+  before the server finishes its own bounded teardown. Raise the grace
+  period to comfortably exceed ~115 s rather than relying on the platform
+  default. **Two things a longer grace period does NOT fix:** (1) the 30 s
+  drain window re-queries `execution_tracker_` for
   `running` executions on each of its one-second iterations — so it also
   picks up work that starts mid-drain, not just what was already running
   when `SIGTERM` arrived — but it never stops the HTTP listener from
   ACCEPTING new requests during that window, so a request that lands late in
-  the drain is not bounded by the ~55 s figure at all; raising the grace
+  the drain is not bounded by the ~115 s figure at all; raising the grace
   period does not close this gap, because the gap is about admission, not
-  about how long the drain itself waits. (2) if the 15 s HTTP-listener bound IS exceeded, the server
+  about how long the drain itself waits. (2) if the 15 s HTTP-listener bound
+  or the 60 s WebhookStore/OffloadTargetStore bound IS exceeded, the server
   force-exits (`std::_Exit(1)`) on its OWN internal schedule, independent of
   whatever grace period the orchestrator was configured with — a longer
   external grace period only prevents the orchestrator from `SIGKILL`ing
   the process BEFORE that internal bound fires; it cannot prevent or delay
   the force-exit itself, and the force-exit skips
   `offload_target_store_->flush_all()` and any other still-pending teardown
-  the same way a `SIGKILL` would. If the 15 s HTTP-listener bound is
-  exceeded, the diagnostic line is written directly to **stderr** (not
-  through the configured logger) before the process force-exits — an
+  the same way a `SIGKILL` would (this is also true of the 60 s webhook/
+  offload bound itself: batched offload events flushed into the delivery
+  queue immediately before the wait are abandoned, not delivered, if that
+  wait times out). Note the 60 s webhook/offload bound is a heuristic sized
+  against this deployment's overall shutdown budget, not a proven per-
+  delivery ceiling — a slow-but-legitimate delivery target can legitimately
+  push close to it under load; if you see this bound trip in production
+  under otherwise-healthy conditions, that is a signal to look at your
+  configured webhook/offload endpoints' latency, not necessarily a wedged
+  delivery. If any of these bounds is exceeded, the diagnostic line is
+  written directly to **stderr** (not through the configured logger,
+  and naming which store timed out for the webhook/offload case) before the
+  process force-exits — an
   async-signal-safety requirement, since `stop()` runs synchronously inside
   the SIGTERM handler (see #3007). If you rely on the log file or a
   structured log sink rather than captured stderr, this one line will not

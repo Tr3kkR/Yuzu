@@ -175,6 +175,7 @@
 #include "scope_engine.hpp"
 #include "instruction_db_pool.hpp"
 #include "tag_store.hpp"
+#include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
 #include "update_registry.hpp"
 #include "webhook_store.hpp"
 #include "offload_target_store.hpp"
@@ -721,6 +722,13 @@ public:
                           "Oldest-progress frames dropped from a record's bounded arming mailbox "
                           "(terminals are never dropped)",
                           "counter");
+        metrics_.describe("yuzu_mcp_bridge_progress_suppressed_total",
+                          "notifications/progress candidates dropped by the H1 monotonic-progress "
+                          "rule (#2438) - a duplicate or momentarily-decreasing snapshot from the "
+                          "bus, never forwarded to the client. Correct, expected movement under "
+                          "normal load; watch for a sustained high rate relative to "
+                          "yuzu_mcp_bridge_projector_cycles_total as a sign of upstream event churn",
+                          "counter");
         metrics_.describe("yuzu_mcp_stream_terminal_publish_failures_total",
                           "Terminal-frame publish failures seen by the bridge's "
                           "publish_final → fallback → poison ladder (Decision 15(f))",
@@ -818,14 +826,28 @@ public:
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_teardown_incomplete_total",
                           "Progress-bridge teardown steps that could not complete on the "
-                          "maintenance thread, by reason. DEFENCE IN DEPTH, not the live "
-                          "out-of-memory signal: all three steps allocate nothing, so only a "
-                          "mutex failure can reach them today - use "
+                          "maintenance thread on a given ATTEMPT, by reason - fires once per "
+                          "failed step per attempt, so a record retried 3 times moves this "
+                          "counter 3 times even though it is one strand, not three. DEFENCE IN "
+                          "DEPTH, not the live out-of-memory signal: all three steps allocate "
+                          "nothing, so only a mutex failure can reach them today - use "
                           "yuzu_mcp_stream_terminal_publish_failures_total for allocation "
-                          "pressure. The claim is one-way, so a record that fails here is never "
-                          "retried and what it still owns is held until the process restarts; a "
-                          "retained record also pins that session's whole stream state, its "
-                          "replay ring and any pinned finals. Alert on > 0",
+                          "pressure. A record whose teardown fails IS RETRIED by a later sweep "
+                          "(#2513), up to Config::teardown_retry_max times, before what it still "
+                          "owns is held until the process restarts; a retained record also pins "
+                          "that session's whole stream state, its replay ring and any pinned "
+                          "finals. This counter ALONE is not yet an incident - check "
+                          "yuzu_mcp_bridge_teardown_retry_total{outcome} next, which is the one "
+                          "to alert on",
+                          "counter");
+        metrics_.describe("yuzu_mcp_bridge_teardown_retry_total",
+                          "#2513: the final disposition of a retry pass's re-entry into a "
+                          "previously-incomplete teardown, by outcome (recovered|exhausted). "
+                          "exhausted means the record failed every attempt up to "
+                          "Config::teardown_retry_max and is now retained exactly like the "
+                          "pre-#2513 posture: until the process restarts. THIS is the metric to "
+                          "alert on, not teardown_incomplete alone, which moves on every attempt "
+                          "including ones that go on to recover",
                           "counter");
         metrics_.describe("yuzu_mcp_bridge_forced_expire_total",
                           "Parked progress-bridge records force-expired by the ring-only "
@@ -924,6 +946,7 @@ public:
         metrics_.gauge("yuzu_mcp_bridge_records_active").set(0);
         metrics_.counter("yuzu_mcp_bridge_listener_failures_total");
         metrics_.counter("yuzu_mcp_bridge_mailbox_drops_total");
+        metrics_.counter("yuzu_mcp_bridge_progress_suppressed_total");
         metrics_.counter("yuzu_mcp_bridge_projector_cycles_total");
         metrics_.counter("yuzu_mcp_bridge_projection_degraded_total");
         metrics_.counter("yuzu_mcp_stream_attach_audit_failures_total");
@@ -957,6 +980,11 @@ public:
         // fourth owned resource cannot be added without this loop following.
         for (auto stage : mcp::McpStreamBridge::kTeardownStageNames) {
             metrics_.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", stage}});
+        }
+        // #2513: CLOSED set, derived the same way, so a third retry outcome
+        // cannot ship without this seed following it.
+        for (auto outcome : mcp::McpStreamBridge::kTeardownRetryOutcomeNames) {
+            metrics_.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", outcome}});
         }
         // sre-N1 (#2489): CLOSED set, derived from TeardownFinal the same way, so a
         // fourth disposition cannot ship without this seed following it. Seeding
@@ -1587,6 +1615,54 @@ public:
                           "Cooldown entries evicted at the capacity bound", "counter");
         metrics_.describe("yuzu_server_dex_alert_routed_types",
                           "Number of obs_types currently routed to alerts", "gauge");
+        // #3261 governance hardening (Gate 8 consistency-auditor) - the same
+        // parity gap DexAlertRouter's family above had before its own
+        // describe() calls were added: without this, these six counters
+        // emit no HELP/TYPE line and stay entirely absent until first
+        // incremented.
+        metrics_.describe("yuzu_server_webhook_delivery_success_total",
+                          "Webhook deliveries that completed with a 2xx response", "counter");
+        metrics_.describe("yuzu_server_webhook_delivery_failed_total",
+                          "Webhook deliveries that failed (connection error, non-2xx, exception)",
+                          "counter");
+        metrics_.describe("yuzu_server_webhook_delivery_dropped_total",
+                          "Webhook deliveries dropped because the delivery worker pool's queue "
+                          "was full or the store was quiescing",
+                          "counter");
+        metrics_.describe("yuzu_server_offload_delivery_success_total",
+                          "Offload-target deliveries that completed with a 2xx response", "counter");
+        metrics_.describe("yuzu_server_offload_delivery_failed_total",
+                          "Offload-target deliveries that failed (connection error, non-2xx, "
+                          "exception, or a tampered non-http(s) URL)",
+                          "counter");
+        metrics_.describe("yuzu_server_offload_delivery_dropped_total",
+                          "Offload-target deliveries dropped because the delivery worker pool's "
+                          "queue was full or the store was quiescing",
+                          "counter");
+        // Pre-seed all six to 0 (adversarial-review round 2, Kimi+Codex
+        // both independently confirmed) - describe() alone only writes
+        // HELP/TYPE metadata (MetricsRegistry::describe()), it does not
+        // create a series; counter(name) with no labels does. Each of
+        // these six is a no-label counter, so it has exactly one known
+        // "label combination" - itself - and the same bounded-label
+        // pre-seed rule applies (docs/observability-conventions.md
+        // "Bounded-label counters are pre-seeded to 0 at startup"),
+        // matching the yuzu_server_principal_quota_exhausted_total
+        // precedent (~line 511) and the tag_store block a few thousand
+        // lines below (cpp-safety, final targeted check: an earlier
+        // version of this comment cited tag_store as "above," which is
+        // wrong - it is well below this line).
+        // Without this, a fresh server has no series at all for any of
+        // these until the first delivery fires, so absent()-based
+        // alerting can't distinguish "not wired" from "no deliveries yet".
+        for (const char* name : {"yuzu_server_webhook_delivery_success_total",
+                                 "yuzu_server_webhook_delivery_failed_total",
+                                 "yuzu_server_webhook_delivery_dropped_total",
+                                 "yuzu_server_offload_delivery_success_total",
+                                 "yuzu_server_offload_delivery_failed_total",
+                                 "yuzu_server_offload_delivery_dropped_total"}) {
+            metrics_.counter(name);
+        }
         // ADR-0010 §Decision 3. Carried in the gauge family because the
         // authoritative cumulative count lives in SecretCodec and is exported
         // pull-model at scrape time, but it IS a monotonic counter — declared
@@ -4365,12 +4441,6 @@ public:
         if (analytics_store_ && gateway_service_) {
             gateway_service_->set_analytics_store(analytics_store_.get());
         }
-        if (notification_store_)
-            agent_service_.set_notification_store(notification_store_.get());
-        if (webhook_store_)
-            agent_service_.set_webhook_store(webhook_store_.get());
-        if (offload_target_store_)
-            agent_service_.set_offload_target_store(offload_target_store_.get());
 
         // Initialize instruction store (Phase 2)
         {
@@ -5018,6 +5088,10 @@ public:
                     spdlog::info("NotificationStore initialized (schema notification_store; "
                                  "legacy backfill source {})",
                                  notif_db.string());
+                    // #3261: wire the consumer immediately after construction,
+                    // inside the full-success branch - the old top-of-ctor
+                    // wiring block ran before this store existed and never fired.
+                    agent_service_.set_notification_store(notification_store_.get());
                 }
             }
         }
@@ -5025,10 +5099,14 @@ public:
         {
             auto webhook_db = cfg_.db_dir() / "webhooks.db";
             webhook_store_ = std::make_unique<WebhookStore>(webhook_db);
+            webhook_store_->set_metrics(&metrics_);
+            agent_service_.set_webhook_store(webhook_store_.get());
         }
         {
             auto offload_db = cfg_.db_dir() / "offload_targets.db";
             offload_target_store_ = std::make_unique<OffloadTargetStore>(offload_db);
+            offload_target_store_->set_metrics(&metrics_);
+            agent_service_.set_offload_target_store(offload_target_store_.get());
         }
 
         // Phase 7: Inventory Store (Issue 7.17) — generic per-source blob store,
@@ -7047,16 +7125,6 @@ public:
             }
         }
 
-        // Phase 8.3 #255 — drain offload batch buffers BEFORE the store is
-        // reset further down. Detached delivery threads continue past
-        // process exit's perspective but get a fair chance to finish
-        // before the SQLite handle goes away. flush_all() spawns a final
-        // round of detached deliveries; we don't join them, but the
-        // buffer state is consistent (RESTART-1 from Gate 6 SRE).
-        if (offload_target_store_) {
-            offload_target_store_->flush_all();
-        }
-
         // Shutdown gRPC with a deadline FIRST so in-flight Subscribe and
         // ManagementService streams drain before we drop the stores they
         // reference. Without a deadline, Shutdown() waits indefinitely for
@@ -7359,6 +7427,182 @@ public:
         // declaration order alone.
         agent_service_.set_notification_store(nullptr);
         notification_store_.reset();
+        // WebhookStore / OffloadTargetStore (#3261 governance hardening).
+        // flush_all() runs HERE, after the gRPC drain above, not before it -
+        // an earlier version ran it before Shutdown(deadline), which missed
+        // any delivery fired by a Register/Subscribe/process_gateway_response
+        // call ARRIVING OVER gRPC still in flight during the up-to-5s drain
+        // window (Gate 4 unhappy-path UP-1). Both stores now dispatch
+        // deliveries onto a bounded StoreWorkerPool (store_worker_pool.hpp)
+        // instead of a raw detached std::thread, so quiesce(60s) below gives
+        // a real, bounded guarantee that no delivery thread already
+        // SUBMITTED to the pool is still touching the store before it is
+        // reset - closing the use-after-free for every producer that
+        // dispatches through fire_event() -> pool_.submit() (every
+        // Register/Subscribe/process_gateway_response call arriving over
+        // gRPC, security-guardian/cpp-safety/sre Gate 2/3) and the
+        // unbounded-thread-creation risk on a mass-reconnect burst (Gate 4
+        // unhappy-path UP-2/UP-8), since the pool caps concurrent thread
+        // creation, not just concurrent HTTP work.
+        //
+        // KNOWN GAP, filed as #3279, NOT fixed here (Gate 8 re-review):
+        // forward_gateway_pending()'s outbound-forward thread is a
+        // separate, pre-existing, untracked std::thread(...).detach() that
+        // also eventually calls process_gateway_response -> fire_event() on
+        // agent_service_'s plain (non-atomic) webhook_store_/
+        // offload_target_store_ pointers. This diff did not modify that
+        // thread - but per this same reachability rubric applied everywhere
+        // else in this PR, the diff DID make the race live: before #3261
+        // those two pointers were wired before construction and
+        // permanently null, so fire_event() on this path was always a
+        // no-op; now that they are correctly wired, this pre-existing
+        // thread reaches the exact defect class this block exists to
+        // close, via a producer neither Shutdown(deadline) above (gRPC
+        // handler threads only) nor quiesce() below (pool-submitted work
+        // only) drains. security-guardian's Gate 8 verdict on this point
+        // was PARTIALLY RESOLVED / recommend continued BLOCK; cpp-safety,
+        // architect and sre's independent Gate 8 passes over the same site
+        // characterized it as a separate subsystem (forward_gateway_
+        // pending needs its own pooling/draining story, #3279) rather than
+        // this PR's fix surface. Both readings are in #3279 verbatim -
+        // deferred to Dave to adjudicate, not resolved by this comment.
+        //
+        // On timeout: escalate via std::_Exit, the SAME choice web_thread_
+        // makes a few hundred lines up, and for the identical reason - NOT
+        // the nvd_sync leak-and-continue precedent (Gate 8 unhappy-path
+        // UP-9 caught this: an earlier version of this block DID leak, on
+        // the theory that db_/mtx_ staying valid-but-unreferenced was
+        // enough. It missed that both stores also borrow metrics_, a raw
+        // pointer into THIS ServerImpl's own metrics_ member - leaking the
+        // store does not extend metrics_'s lifetime, and ~ServerImpl runs
+        // moments after stop() returns. A worker that eventually finishes
+        // its delivery would then call metrics_->counter(...) against a
+        // freed object. The nvd_sync precedent is safe only when nothing
+        // else in this function touches what the leaked object references
+        // again; that does not hold here, exactly as the web_thread_
+        // comment above already warns.
+        //
+        // BOUND (Gate 8 round-2 targeted re-review, cpp-safety AND
+        // unhappy-path independently): this is NOT a per-delivery
+        // HTTP-timeout bound, and an earlier version of this comment was
+        // wrong to derive one that way. Two things disprove that framing,
+        // both verified against source: (1) quiesce() waits for pending_ to
+        // reach ZERO - the WHOLE queue (capacity 256 across 4 workers), not
+        // one delivery, so a burst of pending deliveries (the exact "mass
+        // agent-reconnect" scenario store_worker_pool.hpp's own header
+        // names as its motivating case) already exceeds any single-
+        // delivery estimate; (2) httplib's connect/read/write timeouts
+        // (deliver_single's set_*_timeout calls) reset PER CALL, not per
+        // connection (offload_target_store.cpp's destructor comment, #3017)
+        // - a slow-dribbling-but-legitimate endpoint can hold ONE delivery
+        // open indefinitely, so no finite per-delivery ceiling is even
+        // derivable from those three setters. There is no mathematically
+        // provable bound here, so this is a heuristic sized against this
+        // DEPLOYMENT's actual shutdown budget instead:
+        // docs/user-manual/upgrading.md documents the pre-existing stacked
+        // shutdown bound at ~55s (executions + NVD-sync + web_thread_ +
+        // gRPC drain), and the shipped compose/systemd grace period is 210s
+        // (deploy/docker/docker-compose*.yml stop_grace_period,
+        // deploy/systemd/yuzu-server.service TimeoutStopSec). 60s here,
+        // run CONCURRENTLY for both stores below (not sequentially, which
+        // would double the worst case), brings the documented stacked total
+        // to ~115s - comfortably inside 210s, with real headroom over the
+        // "a handful of pending deliveries" case above. Update
+        // upgrading.md's stacked-bound section if this constant changes.
+        // This bound is exactly as heuristic, and exactly as unproven, as
+        // the pre-existing web_thread_ 15s bound a few hundred lines up -
+        // an established pattern in this codebase, not a new risk class.
+        if (offload_target_store_)
+            offload_target_store_->flush_all();
+        static constexpr auto kStoreQuiesceBound = std::chrono::seconds(60);
+        bool webhook_drained = true;
+        bool offload_drained = true;
+        // Run both waits concurrently (Gate 8 round-2 targeted re-review,
+        // cpp-safety SHOULD) - sequential quiesce(60s) then quiesce(60s)
+        // would double the worst-case stall to 120s for no benefit; the two
+        // stores are otherwise fully independent.
+        std::thread offload_wait;
+        if (offload_target_store_) {
+            try {
+                offload_wait = std::thread([this, &offload_drained] {
+                    offload_drained = offload_target_store_->quiesce(kStoreQuiesceBound);
+                });
+            } catch (...) {
+                // PR review finding (important, 6-source convergence): the
+                // std::thread constructor can throw std::system_error
+                // (EAGAIN under resource exhaustion) - exactly the hazard
+                // class StoreWorkerPool's own constructor already guards
+                // against a few files over, and this stop() is itself
+                // noexcept, so an uncaught throw here would call
+                // std::terminate() immediately, bypassing the deliberate
+                // _Exit(1) escalation a few lines below entirely. Fall
+                // back to a synchronous quiesce - offload_wait stays in
+                // its default-constructed (not-joinable) state, since the
+                // move-assignment above never ran, so the join() below is
+                // a correct no-op on this path.
+                //
+                // Scoped-governance cpp-safety + sre (2-way convergence):
+                // this fallback is necessarily SEQUENTIAL, not concurrent
+                // with webhook_store_'s wait below - the ~115s headroom
+                // this file's own comment above computes assumed the
+                // concurrent case. Worst case here is ~60s (this call) +
+                // ~60s (webhook, next) = ~120s added to the pre-existing
+                // ~55s stack = ~175s, still inside the shipped 210s
+                // stop_grace_period/TimeoutStopSec - not a real risk, but
+                // only reachable by genuine thread-creation exhaustion at
+                // shutdown, which is itself already a degraded state.
+                offload_drained = offload_target_store_->quiesce(kStoreQuiesceBound);
+            }
+        }
+        if (webhook_store_)
+            webhook_drained = webhook_store_->quiesce(kStoreQuiesceBound);
+        if (offload_wait.joinable())
+            offload_wait.join();
+        if (!webhook_drained || !offload_drained) {
+            // Async-signal-safe only (see the web_thread_ comment above for
+            // why spdlog is not used here): a raw write() of a fixed
+            // message, then _Exit. Skips the remaining teardown below,
+            // exactly as a supervisor SIGKILL would - strictly no worse.
+            // Three fixed literals rather than one shared string (Gate 8
+            // round-2, unhappy-path SHOULD: name which store, so an
+            // operator with only stderr in hand knows which configured
+            // endpoint to investigate) - still async-signal-safe, since
+            // selecting among fixed literals is a branch, not a format/
+            // allocation.
+            if (!webhook_drained && !offload_drained) {
+                const char msg[] =
+                    "ServerImpl::stop: WebhookStore AND OffloadTargetStore did not quiesce "
+                    "within 60s (#3261 governance hardening) - force-exiting.\n";
+#ifdef _WIN32
+                _write(2, msg, sizeof(msg) - 1);
+#else
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            } else if (!webhook_drained) {
+                const char msg[] =
+                    "ServerImpl::stop: WebhookStore did not quiesce within 60s "
+                    "(#3261 governance hardening) - force-exiting.\n";
+#ifdef _WIN32
+                _write(2, msg, sizeof(msg) - 1);
+#else
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            } else {
+                const char msg[] =
+                    "ServerImpl::stop: OffloadTargetStore did not quiesce within 60s "
+                    "(#3261 governance hardening) - force-exiting.\n";
+#ifdef _WIN32
+                _write(2, msg, sizeof(msg) - 1);
+#else
+                (void)::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+#endif
+            }
+            std::_Exit(1);
+        }
+        agent_service_.set_webhook_store(nullptr);
+        agent_service_.set_offload_target_store(nullptr);
+        webhook_store_.reset();
+        offload_target_store_.reset();
         // TagStore (ADR-0050) borrows pg_pool_ — unwire the borrowed raw
         // pointer from agent_service_ (the Register sync_agent_tags ingest —
         // Register-only, heartbeats do not sync tags; governance perf-F8),
@@ -8289,8 +8533,8 @@ private:
                 // token), so the DISPATCH outcome is unchanged; the
                 // distinction is what makes a degraded read observable
                 // instead of silently indistinguishable from "no agents".
-                if (auto svc = tag_store_->agents_with_tag("service",
-                                                           sess.token_scope_service)) {
+                if (auto svc = tag_store_->agents_with_tag(
+                        std::string(authz::kServiceTagKey), sess.token_scope_service)) {
                     facts.service_tagged = std::unordered_set<std::string>(svc->begin(), svc->end());
                 } else {
                     spdlog::error("derive_exec_visible: tag store degraded resolving service "
@@ -10322,6 +10566,10 @@ private:
             // /api/v1/offload-targets endpoint and every fire_event call
             // silently no-ops on a migration failure (HC-1 from Gate 6).
             bool offload_target_ok = offload_target_store_ && offload_target_store_->is_open();
+            // #3261 governance hardening (Gate 6 SRE) - same HC-1 gap class
+            // as offload_target above; webhook_store was missing from this
+            // probe even though its sibling was already covered.
+            bool webhook_ok = webhook_store_ && webhook_store_->is_open();
             // #1238 B-3: ca.db is load-bearing whenever default certs are active
             // (issuance / revocation / CRL). It was wired into /readyz but missing
             // here, so /healthz could report "healthy" with a dead ca.db. Mirrors
@@ -10400,7 +10648,7 @@ private:
             // Determine overall status
             bool all_stores_ok =
                 pg_pool_ok && response_ok && audit_ok && instruction_ok && policy_ok &&
-                guaranteed_state_ok && baseline_ok && offload_target_ok && ca_ok &&
+                guaranteed_state_ok && baseline_ok && offload_target_ok && webhook_ok && ca_ok &&
                 offline_endpoint_ok && software_inventory_ok && vuln_finding_ok &&
                 app_perf_daily_ok && app_perf_fleet_ok && device_inventory_ok && inventory_ok &&
                 approval_ok && rbac_ok && result_set_ok && mgmt_group_ok && discovery_ok &&
@@ -10420,6 +10668,16 @@ private:
                   {"guaranteed_state", guaranteed_state_ok ? "ok" : "error"},
                   {"baselines", baseline_ok ? "ok" : "error"},
                   {"offload_target", offload_target_ok ? "ok" : "error"},
+                  {"webhook_store", webhook_ok ? "ok" : "error"},
+                  // Scoped-governance sre + consistency-auditor (2-way
+                  // convergence): approval_ok already gated all_stores_ok
+                  // below but had no entry here — the mirror of the
+                  // webhook_ok bug this same commit fixes. A degraded
+                  // approval_manager_ flipped top-level status to
+                  // "degraded" with no per-store detail to explain why.
+                  // /readyz already names it "approval_manager" (its own
+                  // StoreCheck vector); matching that name here.
+                  {"approval_manager", approval_ok ? "ok" : "error"},
                   {"ca", ca_ok ? "ok" : "error"},
                   {"offline_endpoint_store", offline_endpoint_ok ? "ok" : "error"},
                   {"software_inventory_store", software_inventory_ok ? "ok" : "error"},
@@ -10563,6 +10821,13 @@ private:
                 // would silently no-op all offload deliveries while the
                 // probe reported "ready" (HC-1 gap from Gate 6 SRE).
                 {"offload_target_store", offload_target_store_ && offload_target_store_->is_open()},
+                // #3261 governance hardening (Gate 6 SRE) - WebhookStore is
+                // load-bearing for /api/webhooks and the same AgentService
+                // fan-out path as offload_target_store above, but was
+                // missing from this probe (its two siblings,
+                // offload_target_store and notification_store below, were
+                // already covered) - same HC-1 gap class.
+                {"webhook_store", webhook_store_ && webhook_store_->is_open()},
                 // Governance UAT 2026-05-06 SRE-1: ExecutionTracker became
                 // load-bearing in this batch — AgentServiceImpl's
                 // notify_exec_tracker calls update_agent_status on every
@@ -12877,6 +13142,41 @@ private:
                 return;
             }
 
+            // #3289 hardening-round follow-up: normalize category keys to
+            // lowercase BEFORE anything downstream compares against them —
+            // mirrors the REST v1 twin (rest_api_v1.cpp), which already did
+            // this. Without it, a caller writing `key="Service"` (capital)
+            // stored the tag under the wrong case and silently skipped the
+            // `ensure_service_management_group` side effect below (a
+            // case-sensitive literal comparison), even though it isn't a
+            // security issue — the #3289 guard's own key check is already
+            // case-insensitive regardless of this normalization. Uses
+            // `kCategoryKeys` (the same constant the tag-push block 40 lines
+            // below already reads) rather than a second hardcoded literal
+            // list.
+            {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == lower_key) {
+                        key = lower_key;
+                        break;
+                    }
+                }
+            }
+
+            // #3289: a service-scoped token authorizing this write via
+            // require_scoped_permission below reads the PRE-WRITE `service`
+            // tag to decide admission — so without this guard it could
+            // authorize the very write that changes that tag out from under
+            // its own confinement. Value-blind, checked before the scoped
+            // gate. See deny_service_scoped_service_tag_mutation's doc
+            // comment (auth_routes.hpp).
+            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.set",
+                                                                       agent_id, key))
+                return;
+
             // K-04/CDX-R4-08: per-TARGET authorization -- NOT a global Tag:Write
             // gate. The old require_permission("Tag","Write") admitted a
             // service-scoped token on its ITServiceOwner grant with no target
@@ -12949,6 +13249,31 @@ private:
                     "application/json");
                 return;
             }
+
+            // Gate 4/#3289 hardening round: normalize category keys to
+            // lowercase, matching the /api/tags/set twin above — without
+            // this, deleting a key by the same case a caller just set it
+            // with (e.g. "Service") silently no-ops (TagStore::delete_tag
+            // finds no row stored under that exact case) instead of removing
+            // the tag, since /api/tags/set now stores the normalized form.
+            {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                for (auto cat_key : kCategoryKeys) {
+                    if (cat_key == lower_key) {
+                        key = lower_key;
+                        break;
+                    }
+                }
+            }
+
+            // #3289: same TOCTOU guard as /api/tags/set — a service-scoped
+            // token must not delete its own confinement key. See
+            // deny_service_scoped_service_tag_mutation's doc comment.
+            if (auth_routes_->deny_service_scoped_service_tag_mutation(req, res, "tag.delete",
+                                                                       agent_id, key))
+                return;
 
             // K-04/CDX-R4-08: per-TARGET authorization (see /api/tags/set) --
             // a service-scoped token must not delete a tag on an out-of-scope

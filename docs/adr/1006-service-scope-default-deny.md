@@ -225,10 +225,29 @@ reasoning): `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md
   otherwise leave every `denied`-class MCP tool structurally invisible to
   the signal this bullet names (found by `sre` in this PR's own governance
   review, fixed in the same round).
-- **Service-tag writes are an accepted, unhardened boundary for now.**
-  Whoever can set an agent's `service` tag effectively moves that agent's
-  scope membership; this PR does not harden that write path. Tracked as
-  its own follow-up review, not folded in here.
+- **Service-tag writes are now hardened (#3289, follow-up to this PR).** Two
+  distinct gaps existed. (1) `require_scoped_permission`'s service branch
+  authorized a `Tag:Write`/`Tag:Delete` mutation by reading the target
+  agent's PRE-WRITE `service` tag — so a service-scoped token could rewrite
+  or delete its own cohort's `service` tag and move an agent out of (or a
+  different agent into) its own confinement, a TOCTOU on the very datum the
+  gate was checking. (2) the agent's own gRPC `Register` sync path
+  (`TagStore::sync_agent_tags`) had no restriction at all — see the
+  Bootstrap-gap bullet below. Both are now closed: a service-scoped session
+  is denied — value-blind, before the scoped gate ever runs — at every
+  REST/legacy-dashboard/MCP tag-mutation site, and the `service` key is
+  silently dropped from agent-sourced sync (a pre-existing agent-authored
+  row self-heals — purges on the agent's next sync). A plain
+  `Tag:Write`/`Tag:Delete` grant remains SUFFICIENT authority for a
+  non-service-scoped holder — Administrator, Operator, and an unscoped
+  ITServiceOwner grant are already fleet-scoped roles, so their ability to
+  move a `service` tag is not itself a confinement bypass; only a
+  service-scoped token's own write is restricted, because for that caller
+  the tag being written IS the confinement boundary. A third, related
+  finding — a live agent's in-memory self-reported tags shadowing the store
+  during scope-DSL evaluation (`agent_registry.cpp`), independent of any
+  TagStore write — surfaced during the same review and is tracked
+  separately (#3295), not folded into this fix.
 - **No cached derived confinement sets.** Every check in this design reads
   live state (RBAC grants, the allow-list, tag data) — no precomputed
   "this token can see these agents" cache is introduced, avoiding a whole
@@ -238,11 +257,17 @@ reasoning): `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md
   (ADR-0033) is a separate, already-decided mechanism; migrating its four
   remaining `authorize_list_read` callers off a supersede-style
   composition is deferred to Phase 2 (§3d), not part of this PR.
-- **Bootstrap gap, by design.** An empty-cohort service token cannot
-  bootstrap its own scope — there is no route it can call, under this
-  design, that would let it discover or claim a service tag for itself.
-  Onboarding a brand-new service therefore still needs an interactive or
-  otherwise-unscoped path; see the operator runbook in
+- **Bootstrap gap — true for tokens by design; was NOT true for agents until
+  #3289.** An empty-cohort service TOKEN cannot bootstrap its own scope via
+  any REST/MCP route: no route lets a token holder discover or claim a
+  service tag for itself. That was never the whole boundary, though — the
+  AGENT's own gRPC `Register` call (`TagStore::sync_agent_tags`) had no
+  equivalent restriction, so an un-tagged (or freshly re-tagged) agent could
+  freely self-claim its own `service` value on every Register, independent
+  of any token. #3289 closed that path: `sync_agent_tags` now drops the
+  `service` key from agent-supplied tags outright. Onboarding a brand-new
+  service still needs an interactive or otherwise-unscoped path to assign
+  the FIRST `service` tag on a device; see the operator runbook in
   `docs/user-manual/authentication.md`.
 - **The per-file `deny_service_scoped_*` helpers become largely redundant
   double-denies** for any route that also calls `require_permission`

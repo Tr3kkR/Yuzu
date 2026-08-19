@@ -304,7 +304,7 @@ Plugins for network configuration, active connections, diagnostics, and administ
 | Action | Description |
 |---|---|
 | `wake` | Send a Wake-on-LAN magic packet to a target MAC address. The packet contains 6 bytes of `0xFF` followed by the target MAC repeated 16 times. Parameters: `mac` (required, format `AA:BB:CC:DD:EE:FF`). |
-| `check` | Ping a host to verify it responded to a WoL wake. Parameters: `host` (required, IP address or hostname). |
+| `check` | Check whether a host has become reachable, typically polled after a `wake` to see whether the target booted. Native unprivileged ICMP echo is the primary mechanism, with a TCP-connect fallback on port 443 for hosts/kernels that drop or deny unprivileged ICMP (e.g. Linux `net.ipv4.ping_group_range`) — no shell-out, no subprocess. Parameters: `host` (required, IP address or hostname), `count` (optional, 1-10, default 3 — samples per mechanism), `timeout_ms` (optional, 100-5000, default 1000 — per-sample timeout). Returns a `mechanism` row alongside the `check` result naming which mechanism produced the verdict (`icmp`, `tcp-fallback`, `tcp-refused`, or `icmp+tcp-fallback` for a genuine checked-no-reply). If NEITHER mechanism could even be attempted, the action reports an honest CONSTRAINED/PARTIAL degrade (`mechanism|unavailable`) rather than a fabricated "unreachable" — a check that could not run is not the same as a check that ran and found nothing. |
 
 ### discovery
 
@@ -614,6 +614,12 @@ Plugins for running arbitrary commands, managing device tags, and structured ass
 | `check` | Check whether a tag with the given key exists. |
 | `clear` | Remove all tags. |
 | `count` | Return the total number of tags. |
+
+> **The `service` key is not synced from `tags.json` (#3289).** `service` is the confinement
+> boundary a service-scoped API token is checked against, so the server silently drops it from
+> an agent's self-reported tags rather than accepting it — set-locally-only, never propagated. A
+> device's `service` tag must always be assigned by an operator (dashboard/REST) or an API
+> integration, never by a `tags.json` entry shipped with the agent.
 
 ### asset_tags
 

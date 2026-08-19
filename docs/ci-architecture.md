@@ -720,6 +720,17 @@ base *is* `base.sha` and three-dot silently collapses back to two-dot. That
 no-op is pinned by cases in `tests/shell/test_detect_code_change.sh`, which
 also assert the caller passes a resolved head.
 
+**Cache keys must not be reachable by an earlier restore step.** The canary's
+ccache key is scoped to the source roots meson compiles rather than a
+workspace-wide glob: `hashFiles` does not honour `.gitignore`, and the vcpkg
+restore runs first, so a bare glob also hashed the vendored dependency headers and
+the key differed between a cold and a warm run — splitting the namespace and
+leaving the dev-warmed ccache entry at a key no warm PR recomputes (#3270). The
+ccache save is gated on the Build step having run, pass or fail, so a cancelled
+run cannot leave a thin entry that later same-source runs exact-hit and decline to
+replace (#3269); the vcpkg save is gated more strictly, on its install step
+succeeding, because a partial tree is a correctness problem rather than a slow one.
+
 **Pushes to `dev` are what keep the cache warm.** GHA cache scope lets a PR job
 read its own ref, the default branch, and its base branch — never a sibling
 PR's. Every PR bases on `dev`, so a dev-scoped entry serves all of them; main-only
