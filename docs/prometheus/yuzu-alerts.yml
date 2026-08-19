@@ -704,12 +704,15 @@ groups:
             exception aborted the whole process, so a firing here is strictly
             better than the alternative - but a sustained rate means that class of
             maintenance is not running at all. Correlate with host memory pressure.
-            DELIBERATELY increase() over a window, unlike the teardown-incomplete
-            rule next to it: a skipped tick is retried on the next cycle, so this
-            condition is self-healing and the alert must clear when it stops. The
-            raw-counter form is correct ONLY where the retention it reports is
-            permanent until restart, which is true of teardown_incomplete and not
-            of this.
+            DELIBERATELY increase() over a window, same shape as
+            YuzuMcpBridgeTeardownIncomplete (#2513 rewrote that one to match, since
+            teardown is now retried too - see that alert's own annotation): a
+            skipped tick is retried on the next cycle, so this condition is
+            self-healing and the alert must clear when it stops. The raw-counter
+            form is correct ONLY where the retention it reports is permanent until
+            restart - that is now YuzuMcpBridgeTeardownRetryExhausted, not
+            teardown_incomplete, which moved to this same windowed shape for the
+            identical reason.
             Runbook: docs/ops-runbooks/mcp-bridge-teardown-recovery.md
           runbook_url: "https://docs.yuzu.io/runbooks/mcp-bridge-teardown-recovery"
       - alert: YuzuMcpBridgeRecordsNearCap
