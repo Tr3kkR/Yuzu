@@ -14509,8 +14509,7 @@ private:
             // its creating principal's username (ApiToken::principal_id) —
             // without this it could delete a fleet-wide schedule its own
             // principal created interactively.
-            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id,
-                                             "Schedule:Delete"))
+            if (deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.delete", id))
                 return;
             // M-01 (#1806): owner-scoped delete — a Schedule:Delete grant
             // deletes only schedules the caller created, not the whole
@@ -14562,7 +14561,7 @@ private:
             // service-scoped token keeps its kill-switch (H-01's own
             // rationale for gating disable on Schedule:Write alone).
             if (enabled && deny_service_scoped_schedule(*auth_routes_, req, res, "schedule.enable",
-                                                        id, "Schedule:Write"))
+                                                        id))
                 return;
 
             // M-01 (#1806): owner-scoped enable/disable, same as delete above.
