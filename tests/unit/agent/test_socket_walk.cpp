@@ -13,6 +13,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <macos_socket_walk.hpp>
+#include <yuzu/agent/scoped_fd.hpp>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -28,32 +29,34 @@ using yuzu::shared::walk_sockets;
 namespace {
 
 // RAII ephemeral TCP listener bound to 127.0.0.1:0 (kernel-assigned port).
+// The socket fd is a ScopedFd assigned immediately on acquisition (gate-2
+// /adversarial-review remediation): a REQUIRE below it that fails throws
+// and unwinds before this constructor completes, and C++ never runs a
+// not-fully-constructed object's OWN destructor -- but an already-
+// constructed member subobject (this ScopedFd) IS destroyed during that
+// same unwind, so the fd still gets closed instead of leaking (confirmed
+// live: this exact path fires under a sandbox that denies loopback bind()).
 struct EphemeralListener {
-    int fd{-1};
+    yuzu::agent::ScopedFd fd;
     uint16_t port{0};
 
     EphemeralListener() {
-        fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        REQUIRE(fd >= 0);
+        fd = yuzu::agent::ScopedFd(::socket(AF_INET, SOCK_STREAM, 0));
+        REQUIRE(fd.valid());
 
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = 0; // ask the kernel for an ephemeral port
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-        REQUIRE(::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
-        REQUIRE(::listen(fd, 1) == 0);
+        REQUIRE(::bind(fd.get(), reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+        REQUIRE(::listen(fd.get(), 1) == 0);
 
         struct sockaddr_in bound{};
         socklen_t len = sizeof(bound);
-        REQUIRE(::getsockname(fd, reinterpret_cast<struct sockaddr*>(&bound), &len) == 0);
+        REQUIRE(::getsockname(fd.get(), reinterpret_cast<struct sockaddr*>(&bound), &len) == 0);
         port = ntohs(bound.sin_port);
         REQUIRE(port != 0);
-    }
-
-    ~EphemeralListener() {
-        if (fd >= 0)
-            ::close(fd);
     }
 
     EphemeralListener(const EphemeralListener&) = delete;
@@ -87,8 +90,12 @@ TEST_CASE("walk_sockets dedup collapses a duplicated fd", "[agent][socket_walk]"
     // socket, distinct fd numbers). The walk keys dedup on
     // proto+local+remote, not fd, so this collapses to one row either way;
     // dup() is what the same-process test binary can control deterministically.
-    int dup_fd = ::dup(listener.fd);
-    REQUIRE(dup_fd >= 0);
+    // ScopedFd immediately on acquisition, same reasoning as EphemeralListener
+    // above -- no throwing statement currently sits between this dup() and
+    // its close, but a ScopedFd removes that as a standing precondition
+    // rather than relying on it staying true across future edits.
+    yuzu::agent::ScopedFd dup_fd(::dup(listener.fd.get()));
+    REQUIRE(dup_fd.valid());
 
     auto count_matching = [&](const std::vector<SocketInfo>& v) {
         return std::count_if(v.begin(), v.end(), [&](const SocketInfo& s) {
@@ -104,8 +111,6 @@ TEST_CASE("walk_sockets dedup collapses a duplicated fd", "[agent][socket_walk]"
 
     auto deduped = walk_sockets(/*dedup=*/true);
     CHECK(count_matching(deduped) == 1);
-
-    ::close(dup_fd);
 }
 
 #endif // __APPLE__

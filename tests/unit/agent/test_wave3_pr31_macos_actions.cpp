@@ -22,12 +22,39 @@
  * listener silently stopped matching. check_ports() now also accepts an
  * empty state; this test binds a real UDP socket and would fail without
  * that fix.
+ *
+ * gate-2 (/adversarial-review) remediation, on top of the above: two HIGH
+ * findings, each independently confirmed by both reviewers via live
+ * reproduction --
+ *   (1) load_plugin() returning nullopt on a load/descriptor failure and
+ *       every call site WARN-ing and returning let the "proof the plugin
+ *       actually runs" tests pass with zero assertions when the .dylib
+ *       exists but fails to load (bad ABI, missing export, null
+ *       descriptor) -- a false-green on exactly the wiring-bug class this
+ *       file exists to catch (tests/meson.build's link_depends on the four
+ *       *_plugin_lib targets already makes "file not found" close to
+ *       unreachable in a real build, but does nothing for a load-time
+ *       failure). load_plugin() now hard-fails via FAIL() with a message
+ *       naming which step failed, instead of returning std::nullopt for a
+ *       caller to silently skip.
+ *   (2) EphemeralTcpListener/BoundUdpSocket stored a raw `int fd` and
+ *       issued REQUIRE()s (bind/listen/getsockname/port) *inside* their
+ *       constructors, after `::socket()` already succeeded -- a failing
+ *       REQUIRE throws and unwinds before the constructor completes, and a
+ *       not-fully-constructed object never runs its own destructor, so the
+ *       fd leaked for the rest of the ~1800-case test process. Both now
+ *       store `yuzu::agent::ScopedFd` (agents/core/include/yuzu/agent/
+ *       scoped_fd.hpp) and assign it immediately after `::socket()` --
+ *       a member subobject that finished constructing IS destroyed during
+ *       stack unwind even when the owning object's constructor does not
+ *       complete, so this closes the leak on every REQUIRE below it.
  */
 #ifdef __APPLE__
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <yuzu/agent/plugin_loader.hpp>
+#include <yuzu/agent/scoped_fd.hpp>
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
@@ -42,7 +69,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <format>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -79,16 +105,28 @@ struct LoadedPlugin {
     const YuzuPluginDescriptor* descriptor;
 };
 
-std::optional<LoadedPlugin> load_plugin(const std::string& plugin_name) {
+// Loads `plugin_name`'s real built .dylib or fails the current test case
+// outright. tests/meson.build's link_depends on os_info_plugin_lib /
+// processes_plugin_lib / network_diag_plugin_lib / ioc_plugin_lib makes the
+// dylib a hard build prerequisite of this very test binary, so "file not
+// found" should never legitimately happen in a real build; a load failure
+// (bad ABI, missing export) or a null descriptor is exactly the class of
+// wiring regression this file exists to catch, not an optional capability
+// to skip past.
+LoadedPlugin load_plugin(const std::string& plugin_name) {
     auto plugin_path = find_plugin(plugin_name);
-    if (plugin_path.empty())
-        return std::nullopt;
+    if (plugin_path.empty()) {
+        FAIL("plugin '" << plugin_name << "' .dylib not found under any search candidate -- "
+             "tests/meson.build's link_depends should have built it ahead of this test binary");
+    }
     auto handle = yuzu::agent::PluginHandle::load(plugin_path);
-    if (!handle.has_value())
-        return std::nullopt;
+    if (!handle.has_value()) {
+        FAIL("PluginHandle::load() failed for '" << plugin_path.string() << "'");
+    }
     const auto* descriptor = handle->descriptor();
-    if (!descriptor)
-        return std::nullopt;
+    if (!descriptor) {
+        FAIL("plugin '" << plugin_name << "' loaded but returned a null descriptor");
+    }
     return LoadedPlugin{std::move(*handle), descriptor};
 }
 
@@ -110,29 +148,30 @@ std::string sysctl_string(const char* name) {
 
 // RAII ephemeral TCP listener bound to 127.0.0.1:0 -- mirrors
 // test_socket_walk.cpp's EphemeralListener (separate translation unit, so
-// duplicated rather than shared).
+// duplicated rather than shared). The socket fd is a ScopedFd assigned
+// immediately on acquisition: a REQUIRE below it that fails throws and
+// unwinds before this constructor completes, and C++ never runs a
+// not-fully-constructed object's OWN destructor -- but an already-
+// constructed member subobject (this ScopedFd) IS destroyed during that
+// same unwind, so the fd still gets closed instead of leaking.
 struct EphemeralTcpListener {
-    int fd{-1};
+    yuzu::agent::ScopedFd fd;
     uint16_t port{0};
 
     EphemeralTcpListener() {
-        fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        REQUIRE(fd >= 0);
+        fd = yuzu::agent::ScopedFd(::socket(AF_INET, SOCK_STREAM, 0));
+        REQUIRE(fd.valid());
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = 0;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        REQUIRE(::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
-        REQUIRE(::listen(fd, 1) == 0);
+        REQUIRE(::bind(fd.get(), reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+        REQUIRE(::listen(fd.get(), 1) == 0);
         struct sockaddr_in bound{};
         socklen_t len = sizeof(bound);
-        REQUIRE(::getsockname(fd, reinterpret_cast<struct sockaddr*>(&bound), &len) == 0);
+        REQUIRE(::getsockname(fd.get(), reinterpret_cast<struct sockaddr*>(&bound), &len) == 0);
         port = ntohs(bound.sin_port);
         REQUIRE(port != 0);
-    }
-    ~EphemeralTcpListener() {
-        if (fd >= 0)
-            ::close(fd);
     }
     EphemeralTcpListener(const EphemeralTcpListener&) = delete;
     EphemeralTcpListener& operator=(const EphemeralTcpListener&) = delete;
@@ -140,28 +179,25 @@ struct EphemeralTcpListener {
 
 // RAII bound-but-unconnected UDP socket -- connectionless, so bind() alone
 // is enough for it to show up in the libproc walk (SOCKINFO_IN, no LISTEN
-// concept). No listen()/accept() involved.
+// concept). No listen()/accept() involved. Same ScopedFd-on-acquisition
+// reasoning as EphemeralTcpListener above.
 struct BoundUdpSocket {
-    int fd{-1};
+    yuzu::agent::ScopedFd fd;
     uint16_t port{0};
 
     BoundUdpSocket() {
-        fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-        REQUIRE(fd >= 0);
+        fd = yuzu::agent::ScopedFd(::socket(AF_INET, SOCK_DGRAM, 0));
+        REQUIRE(fd.valid());
         struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = 0;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        REQUIRE(::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
+        REQUIRE(::bind(fd.get(), reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0);
         struct sockaddr_in bound{};
         socklen_t len = sizeof(bound);
-        REQUIRE(::getsockname(fd, reinterpret_cast<struct sockaddr*>(&bound), &len) == 0);
+        REQUIRE(::getsockname(fd.get(), reinterpret_cast<struct sockaddr*>(&bound), &len) == 0);
         port = ntohs(bound.sin_port);
         REQUIRE(port != 0);
-    }
-    ~BoundUdpSocket() {
-        if (fd >= 0)
-            ::close(fd);
     }
     BoundUdpSocket(const BoundUdpSocket&) = delete;
     BoundUdpSocket& operator=(const BoundUdpSocket&) = delete;
@@ -172,14 +208,12 @@ struct BoundUdpSocket {
 TEST_CASE("os_info plugin: os_name/os_version/os_build read the real host plist/sysctl chain",
           "[agent][os_info][wave3_pr31]") {
     auto plugin = load_plugin("os_info");
-    if (!plugin) {
-        WARN("os_info plugin library not found -- skipping LocalDispatcher round-trip test");
-        return;
-    }
 
     const auto expected_product_version = sysctl_string("kern.osproductversion");
     const auto expected_build = sysctl_string("kern.osversion");
     if (expected_product_version.empty() || expected_build.empty()) {
+        // Genuine environment-capability gap (sysctlbyname unavailable),
+        // not a plugin-load failure -- WARN-and-skip stays correct here.
         WARN("sysctlbyname(kern.osproductversion/kern.osversion) unavailable on this host -- "
              "skipping content cross-check");
         return;
@@ -188,7 +222,7 @@ TEST_CASE("os_info plugin: os_name/os_version/os_build read the real host plist/
     yuzu::agent::LocalDispatcher dispatcher;
 
     {
-        auto result = dispatcher.run(plugin->descriptor, "os_name");
+        auto result = dispatcher.run(plugin.descriptor, "os_name");
         CHECK(result.rc == 0);
         // Reverting the migrated chain (wrong plist path, dropped fallback,
         // wrong descriptor wiring) either fails this call or falls all the
@@ -198,13 +232,13 @@ TEST_CASE("os_info plugin: os_name/os_version/os_build read the real host plist/
              std::string::npos);
     }
     {
-        auto result = dispatcher.run(plugin->descriptor, "os_version");
+        auto result = dispatcher.run(plugin.descriptor, "os_version");
         CHECK(result.rc == 0);
         CHECK(result.captured.find("os_product_version|" + expected_product_version) !=
              std::string::npos);
     }
     {
-        auto result = dispatcher.run(plugin->descriptor, "os_build");
+        auto result = dispatcher.run(plugin.descriptor, "os_build");
         CHECK(result.rc == 0);
         CHECK(result.captured.find("os_build|" + expected_build) != std::string::npos);
     }
@@ -213,13 +247,9 @@ TEST_CASE("os_info plugin: os_name/os_version/os_build read the real host plist/
 TEST_CASE("processes plugin: list enumerates this process, skips pid 0, sorts ascending by pid",
           "[agent][processes][wave3_pr31]") {
     auto plugin = load_plugin("processes");
-    if (!plugin) {
-        WARN("processes plugin library not found -- skipping");
-        return;
-    }
 
     yuzu::agent::LocalDispatcher dispatcher;
-    auto result = dispatcher.run(plugin->descriptor, "list");
+    auto result = dispatcher.run(plugin.descriptor, "list");
     CHECK(result.rc == 0);
 
     const pid_t self = getpid();
@@ -249,16 +279,12 @@ TEST_CASE("processes plugin: list enumerates this process, skips pid 0, sorts as
 TEST_CASE("network_diag plugin: listening finds this process's own real TCP listener",
           "[agent][network_diag][wave3_pr31]") {
     auto plugin = load_plugin("network_diag");
-    if (!plugin) {
-        WARN("network_diag plugin library not found -- skipping");
-        return;
-    }
 
     EphemeralTcpListener listener;
     const pid_t self = getpid();
 
     yuzu::agent::LocalDispatcher dispatcher;
-    auto result = dispatcher.run(plugin->descriptor, "listening");
+    auto result = dispatcher.run(plugin.descriptor, "listening");
     CHECK(result.rc == 0);
 
     // Reverting the lsof->walk_sockets migration, or wiring "listening" to
@@ -273,10 +299,6 @@ TEST_CASE("network_diag plugin: listening finds this process's own real TCP list
 TEST_CASE("ioc plugin: check matches a real TCP listener and a real UDP socket by port",
           "[agent][ioc][wave3_pr31]") {
     auto plugin = load_plugin("ioc");
-    if (!plugin) {
-        WARN("ioc plugin library not found -- skipping");
-        return;
-    }
 
     EphemeralTcpListener tcp_listener;
     BoundUdpSocket udp_socket;
@@ -286,7 +308,7 @@ TEST_CASE("ioc plugin: check matches a real TCP listener and a real UDP socket b
     std::vector<YuzuParam> params{{"ports", ports_csv.c_str()}};
 
     yuzu::agent::LocalDispatcher dispatcher;
-    auto result = dispatcher.run(plugin->descriptor, "check", params);
+    auto result = dispatcher.run(plugin.descriptor, "check", params);
     CHECK(result.rc == 0);
 
     // TCP: real listener must match via its real LISTEN state -- proves the
