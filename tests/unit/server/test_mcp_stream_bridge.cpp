@@ -1962,6 +1962,106 @@ TEST_CASE("bridge teardown retry - a retry claim racing shutdown reaps once, no 
     CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 0);
 }
 
+TEST_CASE("bridge teardown retry - shutdown racing a retry whose terminal build keeps "
+          "failing poisons exactly once, never double-delivers (#2513, chaos CH-4, TSan)",
+          "[mcp][bridge][2f][2513]") {
+    // The gap the two #2513 TSan tests above deliberately leave open: both race
+    // shutdown() against a kNone-decision record, where Step 1 resolves the
+    // instant it runs (decision==kNone => teardown_terminal_handled=true
+    // unconditionally) - so shutdown's should_poison is false by construction in
+    // both, and the interesting kSynthesizeUnavailable/kPoisoned interaction is
+    // never exercised. Here the terminal-build fault is PERSISTENT (not one-shot),
+    // so a retry's own Step 1 keeps failing to build a frame across every attempt -
+    // teardown_terminal_handled stays false, which is exactly shutdown()'s
+    // should_poison predicate. The deterministic barrier catches attempt 2 (a real
+    // Pass R retry, not the original pressure claim) right after its own Step 1
+    // has already failed again, still holding torn_down + unresolved terminal,
+    // and races shutdown()'s reaped-walk against it from there - the same window
+    // #2517's poison-vs-teardown arbitration exists to make safe, now exercised
+    // under an active retry instead of a first attempt.
+    Fx fx{Bridge::Config{.global_record_cap = 256, .ring_only_pressure_cap = 1}};
+    auto s = fx.make_session();
+    // A (older, never completes) is the pressure victim -> kSynthesizeUnavailable.
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("a"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("a"), "exec-ch4-a"));
+    REQUIRE(fx.bridge->arm(s.id, json("a"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("a")));
+    REQUIRE(fx.bridge->reserve(s.id, "alice", json("b"), json("t"), true).ok);
+    REQUIRE(fx.bridge->subscribe(s.id, json("b"), "exec-ch4-b"));
+    REQUIRE(fx.bridge->arm(s.id, json("b"), Bridge::ArmMode::kStreaming) ==
+            Bridge::ArmOutcome::kArmed);
+    REQUIRE(fx.bridge->on_post_closed(s.id, json("b")));
+    fx.bus.publish("exec-ch4-b", "execution-completed", kCompleted, /*is_terminal=*/true);
+    REQUIRE(poll_until([&] { return s.stream->pinned_count() == 1; }));
+
+    // Persistent: outlives both attempt 1 and attempt 2's own Step 1 call.
+    fx.bridge->inject_terminal_build_fault_for_test(1000);
+    // One-shot: only attempt 1 needs an independent reason to bail-and-retain -
+    // without this, steps 2-4 would succeed around the unpublished terminal and
+    // erase A outright, leaving nothing to retry.
+    REQUIRE(fx.bridge->inject_teardown_step_fault_for_test(Bridge::TeardownStage::kUnsubscribe, 1));
+    REQUIRE_NOTHROW(fx.bridge->sweep());  // attempt 1: pressure-claims A, build fails, bails
+    REQUIRE(fx.bridge->record_count() == 2);
+    REQUIRE(count_error_code(ring_frames(*s.stream, "alice"), mcp::kMcpTerminalUnavailable) == 0);
+
+    // Deterministic barrier: block the RETRY's (attempt 2's) teardown_claimed right
+    // after its own Step 1 has already failed again (kUnsubscribe entering fires
+    // strictly after Step 1 in the function body), so shutdown() is guaranteed to
+    // observe torn_down + an unresolved terminal while attempt 2 is genuinely
+    // in-flight - not a timing hope.
+    std::mutex probe_mu;
+    std::condition_variable probe_cv;
+    bool retry_blocked = false;
+    bool release_retry = false;
+    bool wait_timed_out = false;  // observed on the main thread only, never asserted
+                                   // from the probe's own thread (see the sibling
+                                   // TSan test above for why that would abort instead
+                                   // of failing).
+    std::atomic<bool> first_entrant{false};
+    fx.bridge->set_teardown_step_probe_for_test([&](Bridge::TeardownStage stage, bool entering) {
+        if (stage != Bridge::TeardownStage::kUnsubscribe || !entering) {
+            return;
+        }
+        if (first_entrant.exchange(true)) {
+            return;  // not the retry attempt this test is blocking - pass through
+        }
+        std::unique_lock<std::mutex> lk(probe_mu);
+        retry_blocked = true;
+        probe_cv.notify_all();
+        if (!probe_cv.wait_for(lk, std::chrono::seconds(5), [&] { return release_retry; })) {
+            wait_timed_out = true;
+        }
+    });
+
+    auto retry_sweep = std::async(std::launch::async, [&] { fx.bridge->sweep(); });
+    {
+        std::unique_lock<std::mutex> lk(probe_mu);
+        REQUIRE(probe_cv.wait_for(lk, std::chrono::seconds(5), [&] { return retry_blocked; }));
+    }
+    fx.bridge->shutdown();  // races the blocked retry: sees torn_down, unresolved terminal
+    {
+        std::lock_guard<std::mutex> lk(probe_mu);
+        release_retry = true;
+        probe_cv.notify_all();
+    }
+    retry_sweep.get();
+    fx.bridge->set_teardown_step_probe_for_test(nullptr);
+    REQUIRE_FALSE(wait_timed_out);
+
+    // Exactly one terminal disposition ever reaches the client: shutdown's poison,
+    // never a synthesized -32014 (Step 1 never once succeeded, across either
+    // attempt - the fault outlived both, and the pre-race REQUIRE above already
+    // pinned the ring at 0 before this point), and never both. attach_and_replay
+    // cannot be used to re-check the ring content here: a poisoned stream refuses
+    // every later attach by design (session-wide, #2517/#2740), which is itself
+    // the assertion - not a limitation of this check.
+    auto attached = s.stream->attach_and_replay(0, nullptr, "alice");
+    CHECK(attached.status == mcp::McpStreamState::AttachStatus::kPoisoned);
+    CHECK(fx.audit_count("mcp.bridge.shutdown_reap") == 1);
+    CHECK(fx.bridge->record_count() == 0);  // shutdown's walk reclaimed it
+}
+
 TEST_CASE("bridge subscribe() is an exactly-once state-checked transition (#2487 review)",
           "[mcp][bridge][2f]") {
     // This gate is what makes teardown_claimed's lock-free BORROW of execution_id
