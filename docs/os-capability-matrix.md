@@ -247,7 +247,7 @@ implementation is.
 | device_identity | device_name | linux | supported | 1 | gethostname(3) | - |
 | device_identity | device_name | macos | supported | 1 | gethostname(3) | - |
 | device_identity | device_name | windows | supported | 1 | GetComputerNameExA | - |
-| device_identity | domain | linux | supported | 1 | /etc/resolv.conf read + sd-bus org.freedesktop.sssd.infopipe ListDomains [fallback: /etc/sssd/sssd.conf read] | - |
+| device_identity | domain | linux | supported | 1 | /etc/resolv.conf read + sd-bus org.freedesktop.sssd.infopipe ListDomains [fallback: run_bounded_subprocess(realm list); further fallback: /etc/sssd/sssd.conf read] | - |
 | device_identity | domain | macos | supported | 2 | run_bounded_subprocess(dsconfigad -show) + native parser (device_identity_macos.hpp) [fallback: gethostname(3) + getaddrinfo(AI_CANONNAME)] | - |
 | device_identity | domain | windows | supported | 1 | NetGetJoinInformation | - |
 | device_identity | ou | linux | supported | 2 | run_bounded_subprocess(realm list) [fallback: /etc/sssd/sssd.conf read] | - |

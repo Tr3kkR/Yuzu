@@ -227,17 +227,46 @@ int do_domain(yuzu::CommandContext& ctx) {
     // Check AD join via sssd's InfoPipe over sd-bus (rung 1) instead of
     // shelling out to `realm list`. On ANY sd-bus error/timeout/absence
     // (sssd not installed, InfoPipe not registered, no libsystemd at build
-    // time), fall through unconditionally to the EXISTING sssd.conf ifstream
-    // parse -- never treat an sd-bus failure as "not joined".
+    // time), fall through unconditionally -- never treat an sd-bus failure
+    // as "not joined".
+    //
+    // BR-011 (found in /adversarial-review, cross-checked against SSSD's own
+    // docs): InfoPipe's `allowed_uids` defaults to "0 (only the root user is
+    // allowed to access the InfoPipe responder)" (sssd-ifp(5)), and
+    // /etc/sssd/sssd.conf ships root:root mode 0600 (sssd.io's AD-provider
+    // and not-root-sssd design docs). Yuzu's own agent-privilege-model.md
+    // runs the Linux agent as the unprivileged `yuzu` account with no
+    // InfoPipe/D-Bus grant -- so on a stock, default-configured SSSD/AD host
+    // the sd-bus call is denied AND the sssd.conf fallback can't open,
+    // and a genuinely joined host would silently report "not joined". The
+    // pre-migration code never had this gap: it read `realm list`'s output
+    // directly (unprivileged, confirmed by do_ou's identical, still-live
+    // call a few lines below). Restore that as the fallback ahead of the
+    // sssd.conf read, using the same bounded-runner call site do_ou already
+    // uses (device_identity/do_ou#1 in docs/agent-spawn-sink-manifest.md --
+    // this is that same site, a second call from a second action, not a new
+    // spawn site) rather than only the file read that shares its 0600 fate.
     bool joined = false;
-    bool resolved_via_sdbus = false;
+    bool resolved = false;
 #if defined(YUZU_HAVE_LIBSYSTEMD)
     if (auto domains = sssd_list_domains_via_sdbus()) {
         joined = !domains->empty();
-        resolved_via_sdbus = true;
+        resolved = true;
     }
 #endif
-    if (!resolved_via_sdbus) {
+    if (!resolved) {
+        auto realm_path = yuzu::agent::probe_tool_path({"/usr/sbin/realm", "/usr/bin/realm"});
+        if (!realm_path.empty()) {
+            auto res = yuzu::agent::run_bounded_subprocess(
+                {realm_path, "list"},
+                yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds(10)});
+            if (res.tool_ran && !res.timed_out && !res.output_truncated && !res.output.empty()) {
+                joined = true;
+                resolved = true;
+            }
+        }
+    }
+    if (!resolved) {
         std::ifstream sssd("/etc/sssd/sssd.conf");
         if (sssd.good()) {
             std::string line;
@@ -447,7 +476,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "/etc/resolv.conf read + sd-bus org.freedesktop.sssd.infopipe ListDomains "
-         "[fallback: /etc/sssd/sssd.conf read]",
+         "[fallback: run_bounded_subprocess(realm list); further fallback: "
+         "/etc/sssd/sssd.conf read]",
          nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2,
