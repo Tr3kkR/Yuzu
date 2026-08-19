@@ -1209,6 +1209,98 @@ TEST_CASE("AuthRoutes::deny_service_scoped_session — no session at all defers 
 }
 
 // ---------------------------------------------------------------------------
+// AuthRoutes::deny_service_scoped_service_tag_mutation (#3289) — the legacy
+// dashboard's tag-mutation guard, tested directly against the helper the
+// same way deny_service_scoped_session is above (no httplib route harness
+// exists for server.cpp's /api/tags/set|delete, matching every sibling
+// server.cpp handler; the shared predicate + this direct call together
+// cover the decision logic the route wiring only forwards to).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::deny_service_scoped_service_tag_mutation — a "
+          "service-scoped session mutating the service key is denied (#3289)",
+          "[pg][auth_routes][service_scope][tag_write]") {
+    AuthRoutesFixture fix;
+    auto now = service_scope_flip_now_epoch();
+    auto raw = fix.api_tokens->create_token("scoped", "test_user", now + 3600, "printers", "");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_service_tag_mutation(
+        req, res, "tag.set", "agent-1", "service");
+    CHECK(must_return);
+    CHECK(res.status == 403);
+    auto j = nlohmann::json::parse(res.body);
+    CHECK(j["error"]["message"].get<std::string>().find("service-scoped token may not modify") !=
+          std::string::npos);
+    CHECK_FALSE(j["error"].contains("permission"));
+    CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(res.get_header_value("X-Correlation-Id") ==
+          j["error"]["correlation_id"].get<std::string>());
+}
+
+TEST_CASE("AuthRoutes::deny_service_scoped_service_tag_mutation — case-insensitive "
+          "('Service') (#3289)",
+          "[pg][auth_routes][service_scope][tag_write]") {
+    AuthRoutesFixture fix;
+    auto now = service_scope_flip_now_epoch();
+    auto raw = fix.api_tokens->create_token("scoped", "test_user", now + 3600, "printers", "");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_service_tag_mutation(
+        req, res, "tag.delete", "agent-1", "Service");
+    CHECK(must_return);
+    CHECK(res.status == 403);
+}
+
+TEST_CASE("AuthRoutes::deny_service_scoped_service_tag_mutation — a "
+          "service-scoped session mutating a NON-service key is admitted "
+          "(#3289 regression)",
+          "[pg][auth_routes][service_scope][tag_write]") {
+    AuthRoutesFixture fix;
+    auto now = service_scope_flip_now_epoch();
+    auto raw = fix.api_tokens->create_token("scoped", "test_user", now + 3600, "printers", "");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_service_tag_mutation(
+        req, res, "tag.set", "agent-1", "environment");
+    CHECK_FALSE(must_return);
+    CHECK(res.status == -1); // untouched
+}
+
+TEST_CASE("AuthRoutes::deny_service_scoped_service_tag_mutation — an "
+          "ordinary (non-scoped) session is unaffected (#3289 regression)",
+          "[pg][auth_routes][service_scope][tag_write]") {
+    AuthRoutesFixture fix;
+    auto raw = fix.mint_token(); // no scope_service
+    auto req = request_with_header("Authorization", "Bearer " + raw);
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_service_tag_mutation(
+        req, res, "tag.set", "agent-1", "service");
+    CHECK_FALSE(must_return);
+    CHECK(res.status == -1);
+}
+
+TEST_CASE("AuthRoutes::deny_service_scoped_service_tag_mutation — no session "
+          "at all defers to require_auth's own 401 (#3289)",
+          "[pg][auth_routes][service_scope][tag_write]") {
+    AuthRoutesFixture fix;
+    httplib::Request req; // no credential of any kind
+    httplib::Response res;
+
+    bool must_return = fix.ar->deny_service_scoped_service_tag_mutation(
+        req, res, "tag.set", "agent-1", "service");
+    CHECK(must_return);
+    CHECK(res.status == 401);
+}
+
+// ---------------------------------------------------------------------------
 // Bearer token length guard tests (#630 — Claude review F4/F6)
 // ---------------------------------------------------------------------------
 

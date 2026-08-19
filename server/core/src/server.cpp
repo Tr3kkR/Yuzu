@@ -12878,6 +12878,27 @@ private:
                 return;
             }
 
+            // #3289 hardening-round follow-up: normalize category keys to
+            // lowercase BEFORE anything downstream compares against them —
+            // mirrors the REST v1 twin (rest_api_v1.cpp), which already did
+            // this. Without it, a caller writing `key="Service"` (capital)
+            // stored the tag under the wrong case and silently skipped the
+            // `ensure_service_management_group` side effect below (a
+            // case-sensitive literal comparison), even though it isn't a
+            // security issue — the #3289 guard's own key check is already
+            // case-insensitive regardless of this normalization.
+            {
+                std::string lower_key = key;
+                std::transform(lower_key.begin(), lower_key.end(), lower_key.begin(),
+                               [](unsigned char c) { return std::tolower(c); });
+                for (auto cat : {"role", "environment", "location", "service"}) {
+                    if (lower_key == cat) {
+                        key = lower_key;
+                        break;
+                    }
+                }
+            }
+
             // #3289: a service-scoped token authorizing this write via
             // require_scoped_permission below reads the PRE-WRITE `service`
             // tag to decide admission — so without this guard it could
