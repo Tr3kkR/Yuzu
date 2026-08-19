@@ -3709,7 +3709,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 // future orphaned handler branch would otherwise execute with
                 // no tier/approval gate. Same audit + response as the terminal
                 // "Unknown tool" backstop at the bottom of the chain.
-                mcp_audit("failure", "unknown tool");
+                //
+                // Audited "denied", not "failure" (#2445): the caller named a
+                // tool that doesn't exist — client-caused, matching most
+                // other rejections on this surface (tier/read-only/schema/
+                // bounds/cap denials all use "denied"; several other
+                // client-caused rejections on this surface are known,
+                // undischarged "failure" exceptions — not exhaustively
+                // enumerated here, tracked in #3176). "failure" is otherwise
+                // reserved for server-side faults (misconfig, store degraded,
+                // dispatch exception) — see kKnownMissingSecurity below.
+                mcp_audit("denied", "unknown tool");
                 res.set_content(
                     error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
                     "application/json");
@@ -11992,7 +12002,16 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── Unknown tool ──────────────────────────────────────────────
-            mcp_audit("failure", "unknown tool");
+            // "denied" not "failure" (#2445) — see the pre-gate kUnknown
+            // branch above for the taxonomy rationale. NOTE (adversarial
+            // review, unfixed, tracked in #3176): the pre-gate already exits
+            // for every name the caller can actually cause to reach here, so
+            // this backstop can only fire for a SERVED, security-registered
+            // tool with no matching dispatch branch — a registration defect,
+            // not a client action. No boot-time validator proves dispatch
+            // coverage today, so this stays "denied" (matching the pre-gate)
+            // rather than "failure" until that gap is closed.
+            mcp_audit("denied", "unknown tool");
             res.set_content(error_response(id, kMethodNotFound, "Unknown tool: " + tool_name),
                             "application/json");
             return;
