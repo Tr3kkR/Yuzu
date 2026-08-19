@@ -2100,6 +2100,14 @@ TEST_CASE("bridge teardown - an entry-lock failure is CONTAINED, never terminate
     CHECK(fx.audit_count("mcp.bridge.session_dead") == 0);
     CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_incomplete_total", {{"reason", "unsubscribe"}})
               .value() == 0.0);
+    // Gate 8 review (post-merge): this reaches the SAME permanent-retention end
+    // state as a genuinely retry-budget-exhausted record (retained until
+    // shutdown, no further attempts - see below), even though it never went
+    // through mark_retry_or_exhausted. YuzuMcpBridgeTeardownRetryExhausted is
+    // documented as THE complete signal for that state, so this path counts
+    // the same way rather than silently bypassing it.
+    CHECK(fx.reg.counter("yuzu_mcp_bridge_teardown_retry_total", {{"outcome", "exhausted"}})
+              .value() == 1.0);
 
     // Not auto-retried: teardown_retry_claimable was never set (mark_retry_or_exhausted
     // is never reached from the entry bail), so Pass R has nothing to claim. A second,

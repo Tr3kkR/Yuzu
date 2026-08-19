@@ -2554,6 +2554,12 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // teardown_retry_claimable, if this was itself a retry, is already false -
         // Pass R cleared it before calling in) - degraded until shutdown() reaps
         // it, but the alternative is std::terminate() on the maintenance thread.
+        // Reaches the IDENTICAL permanent-retention end state as an exhausted
+        // retry budget (retained until shutdown, no further attempts) even on a
+        // FIRST attempt, so it counts the same way - YuzuMcpBridgeTeardownRetryExhausted
+        // is documented as THE complete signal for that state; a silent bypass
+        // here would be an undercount review found and confirmed empirically.
+        count_teardown_retry(TeardownRetryOutcome::kExhausted);
         (void)contained([&] {
             spdlog::error("MCP bridge teardown entry lock failed [execution_id={}]: "
                           "resource retained, this attempt did not run",
@@ -2665,6 +2671,25 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
         // terminal this attempt may or may not have actually delivered. No corrective
         // action needed beyond containment; the rest of THIS call still uses the
         // local `decision`/`rung` below, not the (possibly unpersisted) fields.
+        //
+        // Gate 8 review (post-merge): this is a deliberate AT-LEAST-ONCE choice,
+        // not an accident. If Step 1 above genuinely published/poisoned AND this
+        // persist then fails AND a later step (2-4) in this SAME attempt ALSO
+        // fails (making the record retry-eligible), a later retry's Step 1 will
+        // re-run and can re-publish a second terminal frame or re-poison an
+        // already-served session. publish_final has no dedup guard, so this is
+        // real, not theoretical - but it needs TWO independent instances of the
+        // same near-unreachable mutex fault to land in one attempt, and the
+        // consequence (a stale duplicate frame a resuming client may see, or a
+        // spurious extra poison of a session that already has its real answer)
+        // matches the SAME "spurious poison is harmless, idempotent, remediated
+        // by the durable execution_id fetch" tradeoff #2517 already accepts
+        // elsewhere in this file. The alternative - bailing this whole attempt
+        // the way the entry lock above does - would make the FAR more common
+        // single-fault case (persist fails, nothing else does) strictly worse:
+        // it would give up on steps 2-4 even when they would have succeeded,
+        // for no benefit against a risk that requires a second fault to matter.
+
         if (!persist_ok) {
             (void)contained([&] {
                 spdlog::error("MCP bridge teardown terminal-state persist failed "
@@ -2719,11 +2744,23 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
             count_teardown_retry(TeardownRetryOutcome::kExhausted);
             // Contained (not the bare noexcept boundary alone): formatting
             // allocates, same reasoning as log_incomplete above.
+            // Gate 8 review: `attempts` reads as its zero-init default when
+            // !lock_ok (the read that would set it never ran) - printing that
+            // as though it were the real count would misreport, so the two
+            // cases get distinct static-literal formats rather than sharing
+            // one that silently lies on the lock-failure path.
             (void)contained([&] {
-                spdlog::error(
-                    "MCP bridge teardown retry exhausted [execution_id={} attempts={}]: "
-                    "resource retained until shutdown",
-                    exec_id, attempts);
+                if (lock_ok) {
+                    spdlog::error(
+                        "MCP bridge teardown retry exhausted [execution_id={} attempts={}]: "
+                        "resource retained until shutdown",
+                        exec_id, attempts);
+                } else {
+                    spdlog::error(
+                        "MCP bridge teardown retry exhausted [execution_id={} attempts=unknown "
+                        "(exhaustion check itself lock-faulted)]: resource retained until shutdown",
+                        exec_id);
+                }
             });
         }
         return eligible;
@@ -2902,6 +2939,11 @@ void McpStreamBridge::teardown_claimed(std::shared_ptr<BridgeRecord> rec, Teardo
     // "success" row would otherwise look identical to one that never needed
     // retrying at all.
     const bool clean_kNone = decision == TeardownFinal::kNone;
+    // Reuses `attempts` without re-checking `attempts_read_ok` (Gate 8 review) -
+    // deliberately safe by construction, not an oversight: on a lock failure
+    // `attempts` stays at its zero-init default, and 0 > 1 is false, which is
+    // the exact same outcome an explicit guard would produce. Kept unguarded
+    // rather than adding a redundant check that can never change this branch.
     const char* const stage_detail = attempts > 1 ? "recovered on a retry attempt" : "";
     audit_contained(audit_action, exec_id, stage_detail,
                     clean_kNone ? std::string_view{} : std::string_view{disposition},
