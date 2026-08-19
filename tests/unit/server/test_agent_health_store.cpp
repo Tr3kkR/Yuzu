@@ -927,11 +927,35 @@ TEST_CASE("REAL AgentHealthStore: yuzu_fleet_spark_unsupported sums across agent
     // OMITS the key at zero-count (guardian_unsupported_heartbeat.hpp), it never
     // sends an explicit "0" - so this drives the shrink the same way, via an empty
     // kv (upsert() REPLACES the whole per-agent tag snapshot, never merges), rather
-    // than an explicit "0" tag production never actually emits.
+    // than an explicit "0" tag production never actually emits. This also drops a2's
+    // registry=5 report, not just file - a2 was registry's ONLY reporter.
     beat("a2", {});
     store.recompute_metrics(metrics, std::chrono::seconds{300});
     out = metrics.serialize();
     CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"file\"} ") == 1.0);
+    // Registry now has no reporter at all - fully ABSENT, not a present 0 (the
+    // series line does not exist; find() must fail). Contrast with the explicit-"0"
+    // case immediately below.
+    CHECK(out.find("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"registry\"}") ==
+          std::string::npos);
+
+    // A THIRD agent, sent an explicit "0" for registry, keeps this integration path
+    // exercising parse_spark_count's explicit-zero branch too (governance finding,
+    // F7/#2298 Gate 8: fixing the shrink above to use omission silently dropped this
+    // file's only integration-level coverage of that branch - the raw parser's
+    // unit-level "0" case is separately covered in test_spark_fleet_tags.cpp, but a
+    // real explicit "0" arriving through the real AgentHealthStore was untested
+    // anywhere after that fix). This also proves explicit-zero and omission are NOT
+    // the same wire shape even though they parse to the same value: an explicit "0"
+    // creates a PRESENT series reading 0 (parse_spark_count succeeds and the map
+    // entry is created), where the full omission just above left the series fully
+    // ABSENT - the exact absent-not-zero distinction this file's other rollups
+    // already rely on.
+    beat("a3", {{"yuzu.spark_registry_unsupported", "0"}});
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    out = metrics.serialize();
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"file\"} ") == 1.0);
+    CHECK(val("yuzu_fleet_spark_unsupported{os=\"linux\",mechanism=\"registry\"} ") == 0.0);
 
     // Staleness: an agent that stops reporting entirely (aged past the window) must
     // vanish from the fleet sum, same absent-not-zero contract the other rollups here

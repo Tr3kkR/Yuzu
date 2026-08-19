@@ -148,9 +148,10 @@ Verified safe to change now:
   registered-but-inert mechanism (a containerised host with no systemd bus, per
   `guaranteed-state.md`'s own worked example) can in principle diverge from legacy's
   outcome on that one mechanism - see `reconcile_rule_locked`'s own comment on the
-  `Unsupported` branch (enterprise-readiness governance finding, F7/#2298; empirically,
-  the one documented inert case shows no delta - legacy fails identically there too -
-  but the guarantee is narrower than this bullet's original wording implied).
+  `Unsupported` branch (enterprise-readiness governance finding, F7/#2298; by
+  inspection, the one documented inert case shows no delta - legacy fails identically
+  there too - but the guarantee is narrower than this bullet's original wording
+  implied).
 - **Nothing server-side breaks.** The Guardian status surface is still mock/placeholder
   (§Health/status surface), so no server code validates status tokens yet. This is the
   cheapest moment to introduce one; rung 4 owns its wiring.

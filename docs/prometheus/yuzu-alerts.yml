@@ -2919,8 +2919,10 @@ groups:
   #     # non-inert capability set (guardian_engine.cpp), so a registration failure or a
   #     # registered-but-inert mechanism can also land a rule here on a platform where it
   #     # should have worked - see docs/user-manual/guaranteed-state.md's on-call note for
-  #     # how to tell the two apart. Revisit at rung 11 once real per-platform baselines
-  #     # exist to alert against (docs/spark-stage2-guardian-consumer-design.md item 11).
+  #     # how to tell the two apart. Revisit at rung 11 (docs/spark-stage2-guardian-
+  #     # consumer-design.md's deferred server-side fleet-signal alert work - flap
+  #     # detector + SparkFailed-prevalence) once real per-platform baselines exist to
+  #     # alert against.
   #     - alert: YuzuSparkQueuedDropped
   #       expr: |
   #         increase(yuzu_fleet_spark_queued_dropped[15m]) > 0
