@@ -173,6 +173,28 @@ constexpr const char* kOsascriptPath = "/usr/bin/osascript";
 const std::vector<std::string> kZenityPaths = {"/usr/bin/zenity", "/usr/local/bin/zenity"};
 const std::vector<std::string> kNotifySendPaths = {"/usr/bin/notify-send",
                                                    "/usr/local/bin/notify-send"};
+
+/**
+ * Whether this process has a plausible GUI session to talk to. zenity fails
+ * to connect ("Failed to open display", exit 1) when neither an X11 DISPLAY
+ * nor a Wayland WAYLAND_DISPLAY is set -- the normal state for a headless
+ * daemon, which is the ordinary deployment posture for a Linux Yuzu agent
+ * (docs/agent-privilege-model.md). zenity's own exit-code contract cannot
+ * distinguish that delivery failure from a real user decline -- `--info`
+ * has no decline at all, so ANY nonzero exit there is a delivery failure
+ * with no legitimate alternate reading, and `--question`/`--entry` collapse
+ * a real Cancel/No onto the exact same exit code a display failure produces
+ * (verified live: `DISPLAY= zenity --question/--info/--entry ...` -> exit 1,
+ * "Failed to open display", indistinguishable from rc=1 on a real display).
+ * Checking this UPFRONT, before ever spawning zenity, closes that honest-
+ * status gap at its root instead of trying to infer it from an ambiguous
+ * exit code after the fact.
+ */
+bool has_linux_display_session() {
+    const char* display = std::getenv("DISPLAY");
+    const char* wayland = std::getenv("WAYLAND_DISPLAY");
+    return (display && *display) || (wayland && *wayland);
+}
 #endif
 
 /**
@@ -334,7 +356,11 @@ int platform_notify(yuzu::CommandContext& ctx, const std::string& title,
     // binary with no interpreter role; clean argv, no shell (ADR-3002
     // Decision 1: rung-2 candidate).
     auto notify_send_path = yuzu::agent::probe_tool_path(kNotifySendPaths);
-    auto result = run_tool({notify_send_path, "-u", urgency, safe_title, safe_msg});
+    // ADR-3002 Decision 6 argv hygiene: title/message are positional (no
+    // preceding --summary/--body flag), so sanitize()'s allowed leading '-'
+    // could otherwise be parsed as a notify-send option instead of data
+    // (e.g. a title of "-i" reads as --icon) -- "--" ends option parsing.
+    auto result = run_tool({notify_send_path, "-u", urgency, "--", safe_title, safe_msg});
 
     if (result.exit_code == 0) {
         ctx.write_output("status|ok");
@@ -471,6 +497,15 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
 
 int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
                          const std::string& message, const std::string& buttons) {
+    if (!has_linux_display_session()) {
+        // Closes the round-2 review blocker at its root: zenity's own exit
+        // code cannot distinguish "no display" from a real button press
+        // (--info has no legitimate nonzero reading at all), so check
+        // upfront rather than spawn and guess.
+        ctx.write_output("status|unavailable|no reachable GUI session");
+        return 1;
+    }
+
     std::string safe_title = sanitize(title);
     std::string safe_msg = sanitize(message);
     auto zenity_path = yuzu::agent::probe_tool_path(kZenityPaths);
@@ -506,6 +541,16 @@ int platform_message_box(yuzu::CommandContext& ctx, const std::string& title,
         if (result.exit_code == -1) {
             yuzu::agent::forward_runner_failure(ctx, result.res);
             ctx.write_output("status|unavailable|zenity dialog failed to complete");
+            return 1;
+        }
+        // `--info` has no button to decline -- there is no legitimate
+        // reading of a nonzero exit here other than a delivery failure
+        // (e.g. a DISPLAY that is set but stale/unreachable, since the
+        // has_linux_display_session() check above only catches the unset
+        // case). Never fabricate response|ok on a dialog that may never
+        // have been shown.
+        if (result.exit_code != 0) {
+            ctx.write_output("status|unavailable|zenity dialog did not complete");
             return 1;
         }
         ctx.write_output("response|ok");
@@ -646,6 +691,11 @@ int platform_input(yuzu::CommandContext& ctx, const std::string& title,
 
 int platform_input(yuzu::CommandContext& ctx, const std::string& title,
                    const std::string& prompt, const std::string& default_value) {
+    if (!has_linux_display_session()) {
+        ctx.write_output("status|unavailable|no reachable GUI session");
+        return 1;
+    }
+
     std::string safe_title = sanitize(title);
     std::string safe_prompt = sanitize(prompt);
     std::string safe_default = sanitize(default_value);
@@ -1071,8 +1121,16 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
 
 int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
                     const std::vector<SurveyQuestion>& questions) {
-    // Linux: sequential zenity dialogs for each question
-    ctx.write_output("cancelled|false");
+    // Linux: sequential zenity dialogs for each question. "cancelled|false"
+    // is emitted only after every question below has succeeded (see the tail
+    // of this function) — matching macOS/Windows; emitting it up front here
+    // would contradict a later "status|unavailable" or "cancelled|true" for
+    // the very same survey.
+    if (!has_linux_display_session()) {
+        ctx.write_output("status|unavailable|no reachable GUI session");
+        return 1;
+    }
+
     auto zenity_path = yuzu::agent::probe_tool_path(kZenityPaths);
 
     for (size_t i = 0; i < questions.size(); ++i) {
@@ -1116,6 +1174,13 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
             std::vector<std::string> argv = {zenity_path,  "--list", "--title",
                                              safe_title,   "--text", safe_prompt,
                                              "--column=Option"};
+            // ADR-3002 Decision 6 argv hygiene: the choices are trailing
+            // positional argv elements with no preceding flag, so a choice
+            // starting with '-' (sanitize() allows a leading hyphen) could
+            // otherwise be parsed as a zenity option instead of a list item
+            // (e.g. "-timeout" -> "This option is not available") -- "--"
+            // ends option parsing before the first positional element.
+            argv.push_back("--");
             for (const auto& ch : q.choices) {
                 argv.push_back(sanitize(ch));
             }
@@ -1156,6 +1221,9 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& title,
             }
         }
     }
+    // All questions completed without failure or cancellation — only now is
+    // it accurate to report the survey as not cancelled.
+    ctx.write_output("cancelled|false");
     ctx.write_output(std::format("question_count|{}", questions.size()));
     return 0;
 }
@@ -1172,12 +1240,19 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& /*title*/,
 
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
-// linux/macos: notify/message_box/input/survey all shell out via
-// run_bounded_subprocess({"/bin/sh", "-c", cmd}, ...) -- rung 3 (a shell
-// string executed through the runner) -- notify-send/zenity on Linux,
-// osascript on macOS. macOS additionally has no reachable Aqua/GUI session
-// when running as a root LaunchDaemon (docs/agent-privilege-model.md); the
-// code explicitly detects and reports that ("no reachable GUI session" /
+// Per-OS rung split (docs/agent-spawn-sink-manifest.md is the authoritative
+// evidence ledger; this table must stay consistent with it):
+// linux: notify/message_box/input/survey spawn notify-send/zenity via clean
+// argv through run_bounded_subprocess -- rung 2 (plain binaries, no
+// interpreter role; ADR-3002 Decision 1). has_linux_display_session() checks
+// DISPLAY/WAYLAND_DISPLAY upfront before ever spawning, but that is a
+// runtime honest-degrade path, not a change to the platform's rung.
+// macos: the same four actions spawn osascript via its own multi-`-e` argv
+// form -- rung 3 (ADR-3002 Decision 5: osascript is the deepest interpreter
+// intentionally invoked and sets the rung, even though the outer spawn is
+// argv-clean). macOS additionally has no reachable Aqua/GUI session when
+// running as a root LaunchDaemon (docs/agent-privilege-model.md); the code
+// explicitly detects and reports that ("no reachable GUI session" /
 // "not_reachable"), so those 4 legs are CONSTRAINED rather than SUPPORTED.
 // windows: notify/message_box are native Win32 (Shell_NotifyIconW /
 // MessageBoxW, rung 1); input/survey spawn powershell.exe via
@@ -1189,25 +1264,25 @@ int platform_survey(yuzu::CommandContext& ctx, const std::string& /*title*/,
 // set_dnd is a pure in-process KV-store write on every OS (rung 1).
 const YuzuActionDescriptor kActionDescriptors[] = {
     {"notify",
-     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "notify_send", nullptr},
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "notify_send", nullptr},
      /* macos   = */
      {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
       "no reachable GUI session under a headless/root LaunchDaemon"},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "shell_notifyicon", nullptr}},
     {"message_box",
-     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "zenity", nullptr},
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "zenity", nullptr},
      /* macos   = */
      {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
       "no reachable GUI session under a headless/root LaunchDaemon"},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 1, "messageboxw", nullptr}},
     {"input",
-     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "zenity", nullptr},
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "zenity", nullptr},
      /* macos   = */
      {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
       "no reachable GUI session under a headless/root LaunchDaemon"},
      /* windows = */ {YUZU_SUPPORT_SUPPORTED, 3, "powershell_inputbox", nullptr}},
     {"survey",
-     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 3, "zenity", nullptr},
+     /* linux   = */ {YUZU_SUPPORT_SUPPORTED, 2, "zenity", nullptr},
      /* macos   = */
      {YUZU_SUPPORT_CONSTRAINED, 3, "osascript",
       "no reachable GUI session under a headless/root LaunchDaemon"},

@@ -35,10 +35,14 @@ enum class DialogOutcome { ok, cancel, yes, no, not_reachable };
 /// Builds the argv for the try/on-error `display dialog` osascript
 /// invocation that `parse_dialog_result` below decodes — one AppleScript
 /// fragment per `-e` argv element, exactly as osascript's own multi-`-e`
-/// form expects; no shell involved (osascript is a plain binary with an
-/// argv-native way to pass a multi-statement script, unlike a `-c`-style
-/// interpreter — ADR-3002 Decision 5 classifies this as a rung-2 argv
-/// candidate, not a Decision-7 shell exception). Pulled out as its own pure
+/// form expects; no shell involved in the OUTER spawn (unlike a `-c`-style
+/// interpreter, osascript takes a multi-statement script as ordinary argv
+/// elements). This does NOT make it a rung-2 site: ADR-3002 Decision 5 is
+/// explicit that a site's rung is set by the deepest interpreter
+/// intentionally invoked, not the outer spawn API — osascript IS that
+/// interpreter, so this stays a rung-3 governed-interpreter site (Decision-5
+/// registration), just no longer a Decision-7 shell exception. Pulled out
+/// as its own pure
 /// function (rather than left inline in the .cpp) so a typo in the
 /// AppleScript fragments — which would silently turn every real button
 /// press into `not_reachable` — is a unit-test failure, not a runtime-only
