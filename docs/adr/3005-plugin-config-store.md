@@ -114,7 +114,9 @@ forbid, so the collapse happens explicitly rather than being left for each call 
 because its doc comment names it as a potential hot dispatch-gating path — a fail-closed posture
 makes giving up fast always safe here (a timeout only ever means "disabled").
 
-**Update (2026-08-18, #3265):** the kill-switch scope grammar
+### Update (2026-08-18, #3265) — reserved-namespace kill-switch scope grammar
+
+The kill-switch scope grammar
 (`plugin_config_parsers.hpp::parse_kill_switch_scope`) accepts a **reserved-namespace** plugin
 name of the form `__<identifier>__` (e.g. `__guard__`, matching the `__guard__`/`__observation__`
 convention used elsewhere in this codebase) in addition to an ordinary `is_valid_identifier`
