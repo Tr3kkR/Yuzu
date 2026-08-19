@@ -333,6 +333,76 @@ TEST_CASE("TagStore: agent sync cannot clobber an operator tag for the same key 
     CHECK(require_ok(store.get_tag("agent-2", "model")).value_or("") == "operator-final");
 }
 
+// ============================================================================
+// #3289: sync_agent_tags must never author or move the `service` tag — a
+// service-scoped token's confinement boundary — from agent-supplied data.
+// ============================================================================
+
+TEST_CASE("TagStore: sync_agent_tags drops the service key but keeps sibling "
+          "keys (#3289)",
+          "[pg][tag_store][security]") {
+    TAGS_SHARED(store);
+
+    require_ok(store.sync_agent_tags(
+        "agent-1", {{"service", "printers"}, {"os.version", "11.0"}, {"hostname", "WS-1"}}));
+
+    CHECK_FALSE(require_ok(store.get_tag("agent-1", "service")).has_value());
+    CHECK(require_ok(store.get_tag("agent-1", "os.version")).value_or("") == "11.0");
+    CHECK(require_ok(store.get_tag("agent-1", "hostname")).value_or("") == "WS-1");
+}
+
+TEST_CASE("TagStore: sync_agent_tags with ONLY a service key is a clean "
+          "no-insert sync (#3289 tags.json bootstrap path)",
+          "[pg][tag_store][security]") {
+    TAGS_SHARED(store);
+
+    auto sync = store.sync_agent_tags("agent-1", {{"service", "printers"}});
+    REQUIRE(sync.has_value()); // not an error — the key is dropped, not refused
+
+    CHECK_FALSE(require_ok(store.get_tag("agent-1", "service")).has_value());
+    CHECK(require_ok(store.get_all_tags("agent-1")).empty());
+}
+
+TEST_CASE("TagStore: sync_agent_tags purges a pre-existing agent-sourced "
+          "service row (#3289 self-heal — upgrading past a pre-fix agent claim)",
+          "[pg][tag_store][security]") {
+    TAGS_SHARED(store);
+
+    // Simulate a pre-#3289 agent that already self-claimed a service tag.
+    require_ok(store.set_tag("agent-1", "service", "printers", "agent"));
+    CHECK(require_ok(store.get_tag("agent-1", "service")).value_or("") == "printers");
+
+    // The agent's next Register sync (no service key survives the filter,
+    // but the pre-existing agent-sourced row must still purge via the
+    // unconditional agent-source DELETE).
+    require_ok(store.sync_agent_tags("agent-1", {{"os.version", "11.0"}}));
+
+    CHECK_FALSE(require_ok(store.get_tag("agent-1", "service")).has_value());
+    CHECK(require_ok(store.get_tag("agent-1", "os.version")).value_or("") == "11.0");
+}
+
+TEST_CASE("TagStore: sync_agent_tags cannot resurrect service via a case "
+          "variation ('Service') (#3289)",
+          "[pg][tag_store][security]") {
+    TAGS_SHARED(store);
+
+    require_ok(store.sync_agent_tags("agent-1", {{"Service", "printers"}}));
+    CHECK_FALSE(require_ok(store.get_tag("agent-1", "Service")).has_value());
+    CHECK_FALSE(require_ok(store.get_tag("agent-1", "service")).has_value());
+}
+
+TEST_CASE("TagStore: an operator-sourced service row survives an agent sync "
+          "carrying a service claim (#1411 + #3289 — belt and braces)",
+          "[pg][tag_store][security]") {
+    TAGS_SHARED(store);
+
+    require_ok(store.set_tag("agent-1", "service", "printers", "server"));
+    require_ok(store.sync_agent_tags("agent-1", {{"service", "vending"}, {"os.version", "11.0"}}));
+
+    CHECK(require_ok(store.get_tag("agent-1", "service")).value_or("") == "printers");
+    CHECK(require_ok(store.get_tag("agent-1", "os.version")).value_or("") == "11.0");
+}
+
 TEST_CASE("TagStore: sync_agent_tags rolls back to the prior set on a mid-sync write failure "
           "(UP-1 / CH-R)",
           "[pg][tag_store][atomicity][security]") {

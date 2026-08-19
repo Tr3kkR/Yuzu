@@ -5,6 +5,7 @@
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
+#include "service_scope_policy.hpp" // authz::is_service_tag_key — #3289
 #include "sqlite_raii.hpp"
 #include "utf8_sanitize.hpp"
 
@@ -368,6 +369,20 @@ TagStore::sync_agent_tags(const std::string& agent_id,
     for (const auto& [key, value] : tags) {
         if (!validate_key(key) || !validate_value(value))
             continue; // skip malformed entries; not a transaction failure
+        // #3289: the `service` tag is a service-scoped token's own
+        // confinement boundary (auth_routes.cpp's require_scoped_permission
+        // reads it via TagStore::get_tag) — an agent-supplied claim over
+        // gRPC Register must never author or move it. Silently dropped, not
+        // an error: every other agent-reported key still syncs normally.
+        // The DELETE below is NOT similarly filtered, so a pre-existing
+        // agent-sourced `service` row (written before this fix) purges on
+        // the agent's next sync rather than lingering — self-healing.
+        if (authz::is_service_tag_key(key)) {
+            spdlog::info("TagStore::sync_agent_tags: dropped agent-reported 'service' tag for "
+                        "{} (#3289) — the service tag is operator/API-assigned only",
+                        agent_id);
+            continue;
+        }
         keys.push_back(key);
         values.push_back(sanitize_pg_text(value));
     }
