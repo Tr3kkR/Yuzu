@@ -281,9 +281,15 @@ std::expected<void, std::string> GuardianEngine::start_local() {
             if (reconcile_rule_locked(rule)) // count only rules that actually armed (either backend)
                 ++rearmed;
         } catch (const std::exception& e) {
-            spdlog::error("Guardian: rule '{}' failed to re-arm ({}) - NOT enforcing this rule; "
-                          "agent continues with the remaining rules",
-                          rule.rule_id(), e.what());
+            // Build once, log, and record for last_rearm_degrade_message_for_test - a single
+            // source of truth rather than a second copy of this text. spdlog::error("{}", msg)
+            // (not spdlog::error(msg)) so an e.what() containing '{'/'}' is never reinterpreted
+            // as format syntax, which would throw out of this degrade handler.
+            const std::string degrade_msg =
+                "Guardian: rule '" + rule.rule_id() + "' failed to re-arm (" + e.what() +
+                ") - NOT enforcing this rule; agent continues with the remaining rules";
+            spdlog::error("{}", degrade_msg);
+            last_rearm_degrade_message_for_test_ = degrade_msg;
         }
     }
 

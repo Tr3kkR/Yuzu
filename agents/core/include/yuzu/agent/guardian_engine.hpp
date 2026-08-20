@@ -395,6 +395,22 @@ public:
         rearm_fault_hook_for_test_ = std::move(hook);
     }
 
+    /// TEST-ONLY: the exact message logged for the most recent start_local() re-arm
+    /// degrade (empty if none occurred this run). Recorded directly at the point of
+    /// emission rather than observed via spdlog - a test binary's process-wide
+    /// spdlog::set_default_logger() swap is not guaranteed to be visible to spdlog::
+    /// calls made inside this class's own translation unit across every supported
+    /// toolchain (confirmed on a macOS dylib build: the swap in the test image never
+    /// reached this catch's spdlog::error call, silently emptying the capture -
+    /// same cross-image-state class as the #501 abseil hash-seed split
+    /// guardian_dispatch_push_bytes_for_test works around). Plain object-member
+    /// state has no such hazard: it lives in the GuardianEngine instance regardless
+    /// of which image the writing method's code was compiled into. No production
+    /// caller.
+    [[nodiscard]] const std::string& last_rearm_degrade_message_for_test() const {
+        return last_rearm_degrade_message_for_test_;
+    }
+
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
@@ -541,6 +557,8 @@ private:
     bool maintenance_jitter_{false};
     /// TEST-ONLY re-arm fault injector (see set_rearm_fault_hook_for_test); null = no-op.
     std::function<void(const std::string&)> rearm_fault_hook_for_test_;
+    /// TEST-ONLY (see last_rearm_degrade_message_for_test); empty = no degrade this run.
+    std::string last_rearm_degrade_message_for_test_;
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     /// rule_id -> SparkType for every rule CURRENTLY classified RulePlacement::Unsupported

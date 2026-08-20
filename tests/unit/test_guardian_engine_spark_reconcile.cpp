@@ -19,7 +19,6 @@
 #include "spark_mechanism.hpp"
 
 #include "test_helpers.hpp"
-#include "test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -528,17 +527,6 @@ TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached 
                                     "injected thread exhaustion");
     });
 
-    // LogCapture swaps the process-wide spdlog default logger (Gate 3 cpp-safety review,
-    // #2238): the drain worker + convergence-scheduler lanes are already live at this point
-    // (wire_spark_engine ran above, boot-order-required so spark is Available during the
-    // re-arm walk) and their firewalled catch blocks call spdlog:: free functions on an
-    // internal exception - concurrently with LogCapture's set_default_logger() that would be
-    // a genuine, spdlog-documented-unsafe registry race. LATENT here, not reachable: nothing
-    // in this deterministic fixture (FakeServiceMechanism never throws) exercises any of
-    // those firewalls during the capture window. Safe by inspection, same posture as this
-    // file's own [tsan] checkpoint - flagging for whoever next touches this test under a
-    // config where a background firewall COULD fire mid-capture.
-    yuzu::test::LogCapture cap;
     REQUIRE(engine.start_local().has_value()); // degrade contract: success despite one poisoned rule
 
     // Assert BEFORE stop() - stop() unwinds spark watch state.
@@ -556,19 +544,22 @@ TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached 
     CHECK(has_c);
     CHECK(mechanism->watching_count() == 2);
 
-    // Quiesce every thread that can still log before reading the capture (LogCapture's
-    // documented ordering contract).
+    // Read directly off the engine, not via spdlog: a captured-logger swap in the test
+    // binary was found (macOS CI) to be invisible to spdlog:: calls made inside guardian_engine.cpp,
+    // which is compiled into the separate libyuzu_agent_core shared library - the same class
+    // of cross-image state-duplication problem as the #501 abseil hash-seed split. Plain
+    // object-member state has no such hazard, hence last_rearm_degrade_message_for_test().
+    // "re-armed=2" is deliberately not re-checked here - spark_armed_rule_count()==2 above
+    // already proves the same fact more directly.
+    const std::string degrade_msg = engine.last_rearm_degrade_message_for_test();
+    CHECK(degrade_msg.find("r2") != std::string::npos);
+    CHECK(degrade_msg.find("failed to re-arm") != std::string::npos);
+    CHECK(degrade_msg.find("NOT enforcing") != std::string::npos);
+    CHECK(degrade_msg.find("injected thread exhaustion") != std::string::npos);
+
     engine.set_rearm_fault_hook_for_test(nullptr);
-    cap.stop();
     engine.stop();
     spark_engine.stop();
-
-    const std::string logs = cap.text();
-    CHECK(logs.find("r2") != std::string::npos);
-    CHECK(logs.find("failed to re-arm") != std::string::npos);
-    CHECK(logs.find("NOT enforcing") != std::string::npos);
-    CHECK(logs.find("injected thread exhaustion") != std::string::npos);
-    CHECK(logs.find("re-armed=2") != std::string::npos);
 }
 
 TEST_CASE("prefer_spark=false never populates unsupported_rules_, even for a type "
