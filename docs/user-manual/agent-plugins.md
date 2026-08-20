@@ -829,7 +829,7 @@ Every non-success outcome is reported as its own line rather than an empty resul
 
 | | |
 |---|---|
-| **Version** | v1.0.0 |
+| **Version** | v1.1.0 |
 | **Platforms** | W |
 | **Description** | Windows Management Instrumentation (WMI) queries. Execute WQL SELECT statements against any WMI namespace with structured property/value output. |
 
