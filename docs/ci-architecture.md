@@ -12,8 +12,8 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
 
 - **Tier 1 — PR fast-path** (`ci.yml` on `pull_request`): one Linux variant
   (gcc-15 debug on the `yuzu-bigtam-linux` pool), one Windows variant (MSVC debug on
-  the `yuzu-weetam-windows` pool), one macOS variant (appleclang debug on GHA-hosted
-  `macos-15`), plus `proto-compat`. Wall target: <10 min per leg.
+  the `yuzu-weetam-windows` pool), one macOS variant (appleclang debug on the
+  `yuzu-bigmags-macos` pool), plus `proto-compat`. Wall target: <10 min per leg.
 - **Tier 2 — push to dev/main** (`ci.yml` on push): full 4-way Linux matrix
   (gcc-15 / clang-21 × debug / release), 2-way Windows, 2-way macOS. **No
   sanitizers, no coverage** — those moved out (#410).
@@ -270,7 +270,7 @@ so the push hits BuildKit's own solver cache and rebuilds nothing.
 |---|---|---|
 | `yuzu-bigtam-linux-{0..3}` | Big Tam Threadripper 9970X, native Ubuntu **26.04** (gcc-15/clang-21) — 4 L3/CCD-pinned runners (`0-7,32-39`; `8-15,40-47`; `16-23,48-55`; `24-31,56-63`), Ninja capped at `-j16` | **all self-hosted Linux** (shared label `yuzu-bigtam-linux`): ci.yml `linux` matrix, `proto-compat`, sanitizer-tests (asan/tsan), nightly (asan/tsan/coverage), codeql Linux leg, **release.yml** (build-linux, build-gateway, docker-publish\*), cache-prune-linux. 4 runners on one host. Provisioned from [`deploy/linux/`](../deploy/linux/README.md). |
 | `yuzu-weetam-windows-{0..3}` | Wee Tam 9970X native Windows 11 — 4 CCD-pinned runners, shared label `yuzu-weetam-windows` | **all self-hosted Windows**: ci.yml `windows`, nightly `windows-asan`, codeql Windows leg, release `build-windows`, instructions-windows-validate, cache-prune-windows. Provisioned from [`deploy/windows/`](../deploy/windows/README.md). |
-| `yuzu-bigmags-macos-{0,1}` | BigMags Mac Mini (Apple M4 Pro, 24 GiB, macOS 26) — 2 runners as headless LaunchDaemons, shared label `yuzu-bigmags-macos` | **self-hosted macOS**: ci.yml `macos` matrix. `release.yml` build-macos + pre-release install-macos deliberately stay GitHub-hosted (`macos-15`/`macos-14`) until on-box signing. Provisioned from [`deploy/macos/`](../deploy/macos/README.md). |
+| `yuzu-bigmags-macos-{0,1}` | BigMags Mac Mini (Apple M4 Pro, 24 GiB, macOS 26) — 2 runners as headless LaunchDaemons, shared label `yuzu-bigmags-macos` | **self-hosted macOS**: ci.yml `macos` matrix + `release.yml` build-macos. Only pre-release `install-macos` stays GitHub-hosted (`macos-14`, an install-to-root smoke test). Release **signing/notarization is deferred** — macOS releases currently ship UNSIGNED (Phase B = on-token `rcodesign`). Provisioned from [`deploy/macos/`](../deploy/macos/README.md). |
 
 **Retired 2026-06-21:** `yuzu-wsl2-linux` (Shulgi WSL2 Ubuntu 24.04, label
 `yuzu-shulgi`) and `yuzu-local-windows` (Shulgi native Windows) — superseded by
@@ -400,8 +400,9 @@ macOS now runs on the self-hosted **BigMags** pool ([`deploy/macos/`](../deploy/
 ccache persists in the runner user's HOME and the vcpkg binary cache in
 `runner.tool_cache`, like Big Tam/Wee Tam. Per-agent `test-runs.db` telemetry is
 NOT yet wired into the `macos` job (Phase 4 to-do), so the DB queries above have
-no macOS data yet. The `release.yml`/`pre-release.yml` macOS legs stay on
-GitHub-hosted `macos-15`/`macos-14`, which are ephemeral.
+no macOS data yet. `release.yml` build-macos is now self-hosted on BigMags too (unsigned —
+signing/notarization deferred to Phase B). Only the `pre-release.yml`
+`install-macos` smoke test stays GitHub-hosted (`macos-14`, ephemeral).
 
 Inventory declared in `.github/runner-inventory.json`. The sentinel at
 `runner-inventory-sentinel.yml` (every 30 min) compares actual to expected

@@ -163,10 +163,11 @@ sha256sum -c SHA256SUMS          # checksums of the laid-out tree
 # UPSTREAM-SHA256SUMS is the signed checksum manifest from the GitHub release.
 ```
 
-The Windows binaries are Authenticode-signed and the macOS binaries are
-notarized; those signatures are embedded in the files and survive the
-copy in/out of the image. If macOS quarantines a copied file, clear it with
-`xattr -dr com.apple.quarantine <dir>`.
+The Windows binaries are Authenticode-signed; that signature is embedded and
+survives the copy in/out of the image. **macOS binaries are not yet signed or
+notarized** (deferred — see Phase B / `docs/macos-code-signing` when it lands),
+so a copied macOS file is unsigned and Gatekeeper will quarantine it; clear it
+with `xattr -dr com.apple.quarantine <dir>`.
 
 The **image itself** (when built by the `docker-publish-agent-bundle` release
 job) is cosign-keyless-signed with SLSA provenance and a CycloneDX/SPDX SBOM, so
