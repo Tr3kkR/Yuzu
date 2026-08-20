@@ -1,9 +1,10 @@
 # ADR-0049: AnalyticsEventStore → PostgreSQL (Wave 2, batch 3)
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-14
 - **Deciders:** pg workstream; security-guardian + docs-writer (Gate 2) — construction-posture
-  divergence flagged for Dave's explicit confirmation (see "Construction posture" below).
+  divergence confirmed by Dave, 2026-08-20 (directed in session following the Codex/Sol + Fable
+  correction, a314c5f22, which he authored; see "Construction posture" below).
 - **Parents:** ADR-0006/0007/0008(+Correction), ADR-0009, ADR-0012; closest posture precedent
   ADR-0039 (ResponseStore) — fail-soft ingest, expendable telemetry, skippable backfill. Drain
   claim pattern extends the single-sweeper advisory lease shipped in `audit_store.cpp` /
@@ -222,8 +223,9 @@ registration is unconditional rather than gated on a successful open. `/readyz`'
 (`analytics_store_ && analytics_store_->is_open()`) was already written to expect a possibly-
 not-open-but-non-null object and needed no change.
 
-**This is the one point in this migration that isn't a straight port of an existing pattern —
-flagged here explicitly for confirmation, per the kickoff doc's governance checkpoint.**
+**This is the one point in this migration that isn't a straight port of an existing pattern.**
+Confirmed by Dave, 2026-08-20, per the kickoff doc's governance checkpoint — closes COMP-MERGE /
+SEC-3 / ARCH-2 (`governance.d/analytics-event-store-postgres-migration.8XBNVK.jsonl`).
 
 ## Considered and rejected
 
