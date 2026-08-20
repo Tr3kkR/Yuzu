@@ -15,6 +15,7 @@
 
 #include "analytics_event_store.hpp"
 #include "api_token_store.hpp"
+#include "test_analytics_pg_helper.hpp" // AnalyticsEventStorePg — ADR-0049 PG port
 #include "test_api_token_pg_helper.hpp" // ApiTokenStorePg — PR 4.1 PG port
 #include "test_tag_store_pg_helper.hpp" // TagStorePg — ADR-0050 PG port
 #include "oidc_provider.hpp"
@@ -61,7 +62,7 @@ struct AuthRoutesFixture {
     // SKIPs the current TEST_CASE when YUZU_TEST_POSTGRES_DSN is unset, and
     // FAILs when it is set but broken (same posture as every other [pg] test).
     yuzu::test::ApiTokenStorePg api_tokens;
-    std::unique_ptr<AnalyticsEventStore> analytics;
+    yuzu::test::AnalyticsEventStorePg analytics;
     std::shared_mutex oidc_mu;
     std::unique_ptr<oidc::OidcProvider> oidc_provider;  // empty
     std::unique_ptr<AuthRoutes> ar;
@@ -75,8 +76,6 @@ struct AuthRoutesFixture {
                   ("yuzu_auth_routes_test_" + std::to_string(::getpid()) + "_" +
                    std::to_string(seq.fetch_add(1)));
         fs::create_directories(tmp_dir);
-        analytics = std::make_unique<AnalyticsEventStore>(tmp_dir / "analytics.db");
-        REQUIRE(analytics->is_open());
 
         // Register a known user so synthesize_token_session resolves a real role.
         REQUIRE(auth_mgr.upsert_user("test_user", "test_password", auth::Role::admin));
@@ -95,7 +94,7 @@ struct AuthRoutesFixture {
 
     ~AuthRoutesFixture() {
         std::error_code ec;
-        // Drop stores before removing the directory so SQLite handles close cleanly.
+        // Drop stores before removing the directory so file handles close cleanly.
         ar.reset();
         analytics.reset();
         api_tokens.reset();
@@ -301,11 +300,12 @@ TEST_CASE("AuthRoutes::emit_event — analytics event records principal from "
 
     fix.ar->emit_event("test.event", req);
 
-    // Drain the buffer (the in-memory store flushes on demand via query_recent).
+    // Drain the buffer (the store flushes on demand via query_recent).
     auto events = fix.analytics->query_recent(10);
-    REQUIRE_FALSE(events.empty());
+    REQUIRE(events.has_value()); // degrade-distinguishable seam: not nullopt
+    REQUIRE_FALSE(events->empty());
     bool found = false;
-    for (const auto& e : events) {
+    for (const auto& e : *events) {
         if (e.event_type == "test.event") {
             CHECK(e.principal == "test_user");
             CHECK(e.principal_role == "admin");

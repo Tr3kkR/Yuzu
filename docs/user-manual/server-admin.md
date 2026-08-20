@@ -2905,7 +2905,7 @@ Yuzu exposes four HTTP probe endpoints for orchestrators, load balancers, and mo
 | Path | Use case | Body | Draining-aware |
 |---|---|---|---|
 | `/livez` | Kubernetes liveness probe — fast check that the HTTP listener is up. | `{"status":"ok"}` | No |
-| `/readyz` | Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain. | `{"status":"ready"}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["api_token_store", ...]}` (503) when a store's database failed to open at startup | **Yes** |
+| `/readyz` | Kubernetes readiness probe — covers per-store migration completion AND graceful-shutdown drain. | `{"status":"ready"}` (200), `{"status":"draining"}` (503), or `{"status":"not ready","failed_stores":["api_token_store", ...]}` (503) when a store's database failed to open at startup. A non-critical store that's on but degraded (currently: `analytics_event_store`, ADR-0049) is reported via a non-gating `"degraded":[...]` array alongside either `status` value, rather than flipping the node to not-ready. | **Yes** |
 | `/health` | Monitoring dashboards (Prometheus blackbox exporter, Datadog, Nagios). Rich JSON with per-store status, agent counts, execution stats, and version. | Structured JSON — see [REST API: Health](rest-api.md#health). | No |
 | `/api/health` | Identical alias of `/health`, provided for monitoring integrations that prefix every REST call with `/api/`. Restored in v0.12.0 (issue #620). | Identical to `/health`. | No |
 
