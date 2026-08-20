@@ -183,7 +183,21 @@ void AnalyticsEventStore::emit(AnalyticsEvent event) {
 }
 
 std::optional<std::vector<AnalyticsEvent>> AnalyticsEventStore::query_recent(int limit) const {
-    if (!open_ || shutting_down_.load(std::memory_order_acquire)) {
+    // Deliberately NOT gated on shutting_down_ (PR #3350 review, fjarvis,
+    // 2026-08-20): reads must stay answerable between stop_drain() and the
+    // pool's actual teardown -- this store's own drain tests read
+    // pending_count()/query_recent() right after stop_drain() to observe
+    // final state, which is the intended, documented usage. Safety against
+    // pg_pool_.reset() comes from a different, already-verified mechanism
+    // for THIS path specifically: the sole production callers are
+    // web_server_->Get(...) handlers, and server.cpp's web_thread_ join
+    // (with its own bounded wait/_Exit escalation) completes well before
+    // pg_pool_.reset() runs -- no in-flight HTTP handler can still be here
+    // when the pool is freed (cpp-safety review, PR #3350, 2026-08-20).
+    // emit() and start_drain() stay gated: they're reachable from the
+    // untracked forward_gateway_pending() detached thread / can spin up a
+    // fresh pool-touching thread, neither of which this argument covers.
+    if (!open_) {
         note_read_degrade(metrics_, "query_recent", kReasonStoreNotOpen);
         return std::nullopt;
     }
@@ -215,7 +229,9 @@ std::optional<std::vector<AnalyticsEvent>> AnalyticsEventStore::query_recent(int
 }
 
 std::optional<std::size_t> AnalyticsEventStore::pending_count() const {
-    if (!open_ || shutting_down_.load(std::memory_order_acquire)) {
+    // See query_recent()'s comment above -- same reasoning, same
+    // deliberate omission of the shutting_down_ check.
+    if (!open_) {
         note_read_degrade(metrics_, "pending_count", kReasonStoreNotOpen);
         return std::nullopt;
     }

@@ -641,10 +641,10 @@ TEST_CASE("AnalyticsEvent: event_time auto-stamped by emit", "[pg][analytics_sto
     CHECK((*results)[0].event_time == (*results)[0].ingest_time);
 }
 
-TEST_CASE("AnalyticsEventStore: stop_drain() latches shutdown -- emit/query_recent/"
-          "pending_count/start_drain all refuse pool_ access afterward "
-          "(PR #3350 review regression guard, fjarvis/security-guardian/cpp-safety, "
-          "2026-08-20)",
+TEST_CASE("AnalyticsEventStore: stop_drain() latches shutdown -- emit/start_drain refuse "
+          "pool_ access afterward, reads stay answerable "
+          "(PR #3350 review regression guard, fjarvis/security-guardian/cpp-safety/"
+          "architect, 2026-08-20)",
           "[pg][analytics_store]") {
     YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -682,17 +682,18 @@ TEST_CASE("AnalyticsEventStore: stop_drain() latches shutdown -- emit/query_rece
                        {{"reason", "store_not_open"}})
               .value() == 1);
 
-    // Reads must degrade the same way, not touch pool_.
-    CHECK_FALSE(store.pending_count().has_value());
-    CHECK_FALSE(store.query_recent().has_value());
-    CHECK(metrics
-              .counter("yuzu_server_analytics_read_degrade_total",
-                       {{"method", "pending_count"}, {"reason", "store_not_open"}})
-              .value() == 1);
-    CHECK(metrics
-              .counter("yuzu_server_analytics_read_degrade_total",
-                       {{"method", "query_recent"}, {"reason", "store_not_open"}})
-              .value() == 1);
+    // Reads must stay answerable after stop_drain() -- they are NOT gated
+    // on shutting_down_ (a first cut of this fix gated them too, which
+    // broke this exact pattern: reading pending_count() right after
+    // stop_drain() to observe final state is this store's own established
+    // drain-test convention, exercised throughout this file). The pending
+    // event from before shutdown must still be visible.
+    auto pending_after = store.pending_count();
+    REQUIRE(pending_after.has_value());
+    CHECK(*pending_after == 1);
+    auto recent_after = store.query_recent();
+    REQUIRE(recent_after.has_value());
+    CHECK(recent_after->size() == 1);
 
     // start_drain() is sticky-stop: a caller after shutdown must not spin up
     // a fresh drain thread against a pool the owner may already be tearing

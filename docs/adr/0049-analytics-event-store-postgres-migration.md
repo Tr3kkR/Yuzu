@@ -255,8 +255,10 @@ A second, separate divergence from the sibling PG-backed stores, found and close
   structurally rather than by timing margin. The complementary `pg_pool_`-borrow vector (the
   object staying alive doesn't mean `pool_` does) is closed by an internal `shutting_down_` latch
   on `AnalyticsEventStore` itself, set first-thing in `stop_drain()` (called well before
-  `pg_pool_.reset()` in `stop()`'s sequence) and checked before any `pool_` access in `emit()`,
-  `query_recent()`, `pending_count()`, and (sticky-stop) `start_drain()`.
+  `pg_pool_.reset()` in `stop()`'s sequence) and checked before any `pool_` access in `emit()`
+  and (sticky-stop) `start_drain()` — the two paths reachable from an untracked thread or able to
+  spin up a fresh pool-touching one. `query_recent()`/`pending_count()` are deliberately NOT
+  gated on it (a first cut did gate them too; see the correction below).
 - **The weak_ptr members themselves must never be written after wiring** (architect review, PR
   #3350, 2026-08-20): the first cut of this fix kept the siblings' unwire-then-reset habit,
   calling `set_analytics_store({})` in `stop()` to clear the `weak_ptr`. That's a plain,
@@ -267,6 +269,17 @@ A second, separate divergence from the sibling PG-backed stores, found and close
   the shared control block atomically for every locker, which is precisely what that machinery
   is built for. The wiring calls at construction are this member's only write, ever, before any
   concurrent reader exists — write-once-before-concurrency, race-free by construction.
+- **Reads must stay answerable after `stop_drain()`** (fjarvis, PR #3350, 2026-08-20; correcting
+  the bullet above): the fix that added the `shutting_down_` latch initially gated
+  `query_recent()`/`pending_count()` on it too, for symmetry. That broke this store's own drain
+  tests, which call `stop_drain()` then read `pending_count()` to observe final state — the
+  intended, established usage, not a test bug. Root cause was never actually reachable for these
+  two methods: their sole production callers are `web_server_->Get(...)` HTTP handlers, and
+  `server.cpp`'s `web_thread_` join (with its own bounded wait/`_Exit` escalation) completes well
+  before `pg_pool_.reset()` runs — no in-flight handler can still be here when the pool is freed.
+  The gate was defense-in-depth for a caller that doesn't exist on these two paths; removed. This
+  first surfaced on CI's initial real `[pg]` execution (these tests skip locally without
+  `YUZU_TEST_ENABLE_PG`) — verified by hand against a real local Postgres before re-pushing.
 - **Residual, deliberately not fixed here**: `forward_gateway_pending()`'s detached thread itself
   outliving `stop()`, generally, is the pre-existing #3279 class — Dave has already deferred that
   for the sibling stores (`response_store_`/`webhook_store_`/`offload_target_store_`, commit
