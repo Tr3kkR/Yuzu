@@ -12,9 +12,16 @@
  *
  * One deliberate asymmetry vs the props contract (the resolver comment in
  * agent_registry.cpp records it): a NULL tag_store with a tag: atom does NOT
- * abort, because session->scopable_tags is a first-class in-memory source
+ * abort, because session->scopable_tags is an in-memory FALLBACK source
  * that legitimately answers tag: atoms without any store. A DEGRADED
  * (non-null, failing) store still aborts.
+ *
+ * #3295: the tag: resolver is STORE-FIRST — a TagStore row (any source)
+ * wins over a connected agent's in-memory scopable_tags claim for the same
+ * key; scopable_tags answers only when the store has no row for that
+ * (agent, key) at all (gateway-proxied agents, or a tag not yet synced).
+ * 'service' is dropped from scopable_tags entirely at session ingest
+ * (register_agent) and never answers via the fallback.
  */
 
 #include "agent_registry.hpp"
@@ -103,17 +110,97 @@ TEST_CASE("evaluate_scope: tag:<key> resolves preloaded store values",
         CHECK_FALSE(has(*matched, "agent-lin"));
     }
 
-    SECTION("in-memory scopable_tags shadow the store row (pre-existing precedence, preserved)") {
+    SECTION("an operator store row wins over a conflicting in-memory self-report (#3295)") {
         auto shadowed = info("agent-shadow");
         (*shadowed.mutable_scopable_tags())["env"] = "prod";
         registry.register_agent(shadowed);
         REQUIRE(store.set_tag("agent-shadow", "env", "staging").has_value());
 
+        auto matches_env = [&](const char* value) {
+            auto expr = yuzu::scope::parse(std::string(R"(tag:env == ")") + value + "\"");
+            REQUIRE(expr.has_value());
+            auto matched = registry.evaluate_scope(*expr, &store, nullptr);
+            REQUIRE(matched.has_value());
+            return has(*matched, "agent-shadow");
+        };
+        CHECK_FALSE(matches_env("prod"));    // in-memory claim no longer wins
+        CHECK(matches_env("staging"));       // store row is authoritative
+    }
+
+    SECTION("in-memory fallback still answers when the store has no row (gateway-proxied "
+            "agents never sync_agent_tags — #3295)") {
+        auto gw = info("agent-gw");
+        (*gw.mutable_scopable_tags())["env"] = "prod";
+        registry.register_agent(gw); // no store.set_tag() for agent-gw at all
+
         auto expr = yuzu::scope::parse(R"(tag:env == "prod")");
         REQUIRE(expr.has_value());
         auto matched = registry.evaluate_scope(*expr, &store, nullptr);
         REQUIRE(matched.has_value());
-        CHECK(has(*matched, "agent-shadow")); // in-memory "prod" wins over store "staging"
+        CHECK(has(*matched, "agent-gw"));
+        CHECK(has(*matched, "agent-win")); // the pre-existing store row still matches too
+    }
+
+    SECTION("an agent-claimed 'service' tag never answers via the in-memory fallback "
+            "(#3295 — dropped at register_agent ingest)") {
+        auto claimant = info("agent-claim");
+        (*claimant.mutable_scopable_tags())["service"] = "printers";
+        registry.register_agent(claimant); // no store row for "service" on agent-claim
+
+        auto eq_expr = yuzu::scope::parse(R"(tag:service == "printers")");
+        REQUIRE(eq_expr.has_value());
+        auto eq_matched = registry.evaluate_scope(*eq_expr, &store, nullptr);
+        REQUIRE(eq_matched.has_value());
+        CHECK_FALSE(has(*eq_matched, "agent-claim"));
+
+        auto exists_expr = yuzu::scope::parse(R"(EXISTS tag:service)");
+        REQUIRE(exists_expr.has_value());
+        auto exists_matched = registry.evaluate_scope(*exists_expr, &store, nullptr);
+        REQUIRE(exists_matched.has_value());
+        CHECK_FALSE(has(*exists_matched, "agent-claim"));
+
+        // An operator-set store row for the same key still resolves normally —
+        // only the agent's OWN self-report is suppressed.
+        REQUIRE(store.set_tag("agent-claim", "service", "vending").has_value());
+        auto after_store = yuzu::scope::parse(R"(tag:service == "vending")");
+        REQUIRE(after_store.has_value());
+        auto after_matched = registry.evaluate_scope(*after_store, &store, nullptr);
+        REQUIRE(after_matched.has_value());
+        CHECK(has(*after_matched, "agent-claim"));
+    }
+
+    SECTION("an empty in-memory value cannot mask a non-empty store row (#3295)") {
+        auto empty_claim = info("agent-empty");
+        (*empty_claim.mutable_scopable_tags())["env"] = "";
+        registry.register_agent(empty_claim);
+        REQUIRE(store.set_tag("agent-empty", "env", "prod").has_value());
+
+        auto exists_expr = yuzu::scope::parse(R"(EXISTS tag:env)");
+        REQUIRE(exists_expr.has_value());
+        auto exists_matched = registry.evaluate_scope(*exists_expr, &store, nullptr);
+        REQUIRE(exists_matched.has_value());
+        CHECK(has(*exists_matched, "agent-empty"));
+
+        auto eq_expr = yuzu::scope::parse(R"(tag:env == "prod")");
+        REQUIRE(eq_expr.has_value());
+        auto eq_matched = registry.evaluate_scope(*eq_expr, &store, nullptr);
+        REQUIRE(eq_matched.has_value());
+        CHECK(has(*eq_matched, "agent-empty"));
+    }
+
+    SECTION("an agent-authored store row from a failed re-sync still beats a fresher "
+            "in-memory claim — store stays authoritative, self-heals on next sync (#3295)") {
+        auto stale = info("agent-stale-sync");
+        (*stale.mutable_scopable_tags())["env"] = "fresh-claim";
+        registry.register_agent(stale);
+        REQUIRE(store.set_tag("agent-stale-sync", "env", "stale-agent-row", "agent")
+                    .has_value());
+
+        auto expr = yuzu::scope::parse(R"(tag:env == "stale-agent-row")");
+        REQUIRE(expr.has_value());
+        auto matched = registry.evaluate_scope(*expr, &store, nullptr);
+        REQUIRE(matched.has_value());
+        CHECK(has(*matched, "agent-stale-sync"));
     }
 
     SECTION("a scope with no tag: atom triggers no preload") {
@@ -206,6 +293,43 @@ TEST_CASE("evaluate_scope: tag:<key> with a NULL TagStore resolves from in-memor
     REQUIRE(not_matched.has_value());
     CHECK(has(*not_matched, "agent-bare"));
     CHECK_FALSE(has(*not_matched, "agent-mem"));
+}
+
+// register_agent's ingest filter (#3295): a 'service' claim and any
+// key/value failing TagStore::validate_key/validate_value are dropped
+// before session->scopable_tags is populated, so neither can ever answer a
+// tag: atom via the in-memory fallback — not just when the store shadows
+// them, but unconditionally (e.g. a gateway-proxied agent, where the store
+// never has a row at all).
+TEST_CASE("register_agent: ingest filter drops invalid/service scopable_tags",
+          "[scope][tag_store][authz]") {
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+
+    auto claimant = info("agent-ingest");
+    auto* tags = claimant.mutable_scopable_tags();
+    (*tags)["env"] = "prod";            // valid — survives
+    (*tags)["empty"] = "";              // valid (empty VALUE allowed) — survives
+    (*tags)["service"] = "printers";    // dropped — is_service_tag_key
+    (*tags)["Service"] = "printers";    // dropped — case-insensitive match
+    (*tags)[""] = "no-key";             // dropped — validate_key rejects empty key
+    (*tags)[std::string(65, 'a')] = "too-long-key";      // dropped — validate_key: max 64
+    (*tags)["bad key!"] = "invalid-chars";               // dropped — validate_key: charset
+    (*tags)["oversized"] = std::string(449, 'x');         // dropped — validate_value: max 448
+    registry.register_agent(claimant);
+
+    auto session = registry.get_session("agent-ingest");
+    REQUIRE(session != nullptr);
+    CHECK(session->scopable_tags.size() == 2);
+    CHECK(session->scopable_tags.at("env") == "prod");
+    CHECK(session->scopable_tags.at("empty") == "");
+    CHECK(session->scopable_tags.find("service") == session->scopable_tags.end());
+    CHECK(session->scopable_tags.find("Service") == session->scopable_tags.end());
+    CHECK(session->scopable_tags.find("") == session->scopable_tags.end());
+    CHECK(session->scopable_tags.find(std::string(65, 'a')) == session->scopable_tags.end());
+    CHECK(session->scopable_tags.find("bad key!") == session->scopable_tags.end());
+    CHECK(session->scopable_tags.find("oversized") == session->scopable_tags.end());
 }
 
 // ── collect_attribute_suffixes: synthetic-attribute decoding (governance
