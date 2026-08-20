@@ -148,20 +148,20 @@ active" filter.)
 ### MCP (for agentic workers)
 
 The **`query_installed_software`** MCP tool exposes the same data to agentic
-workers (gated on `Inventory:Read`):
+workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
 - Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
 - Returns up to `limit` rows (max 1000). When `result_truncated_by_cap` is
   `true`, more rows exist past the cap (keyset pagination is a follow-up).
-- **A per-agent management-group drop filter is applied** — out-of-scope
-  devices are dropped (and the omission audited), with the count returned as
-  `devices_omitted` (absent when zero). **Caveat (ADR-0017): this confinement is
-  not yet verified effective.** The tool gates on the *global* `Inventory:Read`
-  permission, under which the filter does not narrow results (a confined operator
-  is denied at the gate; a global operator sees all) — list-view management-group
-  confinement becomes effective only once the ADR-0017 admit-then-filter gate lands
-  and the #1713/#1676 UAT confirms it. When present, a positive `devices_omitted`
-  means matching software exists outside your scope — an empty or short result does
+- **A per-agent scope drop filter is applied** — out-of-scope devices are
+  dropped (and the omission audited), with the count returned as
+  `devices_omitted` (absent when zero). This confinement is **effective**: the
+  gate composes management-group visibility with the caller's service-scope tag
+  (`meet(management-group, service-scope)`), so a management-group-confined
+  operator and a correctly-confined service-scoped API token both get a real
+  filtered result — a service-scoped token is no longer denied outright as it
+  was before #3290. When present, a positive `devices_omitted` means matching
+  software exists outside your scope — an empty or short result does
   **not** mean the software is absent fleet-wide. This is distinct from the generic
   `query_inventory` / `get_agent_inventory` tools, which read a *separate*
   generic blob store on `Infrastructure:Read` and do **not** surface this typed
@@ -175,8 +175,9 @@ workers (gated on `Inventory:Read`):
 
 ### REST (for automation / scripts)
 
-The same data is exposed over REST at **`GET /api/v1/inventory/software`** (gated on
-`Inventory:Read`), the agentic-first sibling of the MCP tool:
+The same data is exposed over REST at **`GET /api/v1/inventory/software`**, gated
+SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2) — the agentic-first
+sibling of the MCP tool:
 
 ```bash
 # Which devices run Google Chrome (fleet-wide, within your scope)?
@@ -196,12 +197,13 @@ curl -H "Authorization: Bearer $TOKEN" \
   release, arch, signature_status, distro_id, distro_version}` — the v2 fields
   are `""` where the ecosystem does not store them (see the availability matrix
   above). The MCP tool's rows carry the identical field set.
-- **Carries the same per-agent management-group drop filter as the MCP tool**
+- **Carries the same per-agent scope drop filter as the MCP tool**
   (out-of-scope devices dropped, omission audited, `devices_omitted` reports the
-  count) — and the same **ADR-0017 caveat: not yet verified effective** under the
-  global `Inventory:Read` gate (see the MCP note above; #1713/#1676). When present, a
-  positive `devices_omitted` means matching software exists outside your scope — an
-  empty or short result does **not** mean the software is absent fleet-wide.
+  count) — the SAME `require_fleet_read` gate, so REST and MCP cannot observe a
+  different admit/filter decision for the same caller (see the MCP note above).
+  When present, a positive `devices_omitted` means matching software exists
+  outside your scope — an empty or short result does **not** mean the software
+  is absent fleet-wide.
 - `result_truncated_by_cap: true` (present only when set) means more rows exist past
   `limit` (keyset pagination is a follow-up, #1634).
 - **On store degradation** the endpoint returns **`503`** (an A4 error envelope with a
