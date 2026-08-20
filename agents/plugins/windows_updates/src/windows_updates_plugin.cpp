@@ -235,9 +235,23 @@ using BStrGuard = std::unique_ptr<std::remove_pointer_t<BSTR>, decltype(&::SysFr
 constexpr std::chrono::seconds kCleanupJoinGrace{3}; // matches hard_exit.hpp's kOrphanDrainGrace
 std::atomic<int> g_outstanding_cleanups{0};
 
-void track_detached_cleanup(std::thread t) {
+// Takes the cleanup work itself (not an already-constructed std::thread):
+// a std::thread starts running the instant it's constructed, so incrementing
+// the counter AFTER construction (as an earlier version of this function
+// did, taking `std::thread t` by value) has a real race -- if the new
+// thread's work finishes fast enough to reach cleanup_finished()'s
+// fetch_sub() before this function's fetch_add() runs, a concurrent
+// join_all_detached_cleanups() can observe zero outstanding and return
+// while a cleanup thread is still starting up, letting shutdown() proceed
+// (and the host dlclose the plugin) while that thread is about to touch
+// this module's code -- reintroducing the exact race this whole mechanism
+// exists to close. Incrementing BEFORE construction closes it: no code in
+// the new thread can run before this function's caller has already
+// registered it as outstanding.
+template <typename Fn>
+void track_detached_cleanup(Fn&& cleanup_work) {
     g_outstanding_cleanups.fetch_add(1, std::memory_order_relaxed);
-    t.detach();
+    std::thread(std::forward<Fn>(cleanup_work)).detach();
 }
 
 // Called by a cleanup thread itself, as its last action, once CleanUp()/
@@ -485,11 +499,11 @@ int do_missing(yuzu::CommandContext& ctx) {
         job->RequestAbort();
         ISearchJob* raw_job = job.get();
         raw_job->AddRef();
-        track_detached_cleanup(std::thread([raw_job]() {
+        track_detached_cleanup([raw_job]() {
             raw_job->CleanUp();
             raw_job->Release();
             cleanup_finished();
-        }));
+        });
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "windows_updates:search_deadline_exceeded");
         ctx.write_output("available|none|Update search did not complete within the time budget");

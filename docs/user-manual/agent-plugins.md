@@ -358,7 +358,7 @@ Plugins for software inventory, Windows-specific package management, update stat
 
 | Action | Description |
 |---|---|
-| `installed` | List installed updates/hotfixes with KB number, date, and type. |
+| `installed` | List installed updates/hotfixes with KB number, date, and type. On Windows, sourced from a bounded WMI `Win32_QuickFixEngineering` query, capped at 512 rows with **no sort order** — WQL has no `ORDER BY` for a data-class query, so this no longer matches the retired PowerShell path's 50-most-recent-by-install-date behavior. |
 | `missing` | List updates that are available but not yet installed. |
 | `pending_reboot` | Detect whether the endpoint requires a reboot after updates. Checks Windows registry keys, Linux reboot-required file and kernel version, macOS softwareupdate restart flag. |
 
