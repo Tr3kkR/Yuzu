@@ -115,7 +115,12 @@ AnalyticsEventStore::AnalyticsEventStore(pg::PgPool& pool, int drain_interval_se
 AnalyticsEventStore::~AnalyticsEventStore() { stop_drain(); }
 
 void AnalyticsEventStore::emit(AnalyticsEvent event) {
-    if (!open_) {
+    // shutting_down_ (set by stop_drain(), acquire-paired with its release)
+    // must be checked before pool_ is touched below — this is what lets
+    // server.cpp free pg_pool_ during stop() safely even though a caller
+    // reaching this line (e.g. via the detached forward_gateway_pending()
+    // thread's weak_ptr::lock()) may run well past that point.
+    if (!open_ || shutting_down_.load(std::memory_order_acquire)) {
         note_emit_dropped(metrics_, kReasonStoreNotOpen);
         return;
     }
@@ -173,7 +178,7 @@ void AnalyticsEventStore::emit(AnalyticsEvent event) {
 }
 
 std::optional<std::vector<AnalyticsEvent>> AnalyticsEventStore::query_recent(int limit) const {
-    if (!open_) {
+    if (!open_ || shutting_down_.load(std::memory_order_acquire)) {
         note_read_degrade(metrics_, "query_recent", kReasonStoreNotOpen);
         return std::nullopt;
     }
@@ -205,7 +210,7 @@ std::optional<std::vector<AnalyticsEvent>> AnalyticsEventStore::query_recent(int
 }
 
 std::optional<std::size_t> AnalyticsEventStore::pending_count() const {
-    if (!open_) {
+    if (!open_ || shutting_down_.load(std::memory_order_acquire)) {
         note_read_degrade(metrics_, "pending_count", kReasonStoreNotOpen);
         return std::nullopt;
     }
@@ -241,6 +246,12 @@ void AnalyticsEventStore::add_sink(std::unique_ptr<AnalyticsEventSink> sink) {
 void AnalyticsEventStore::start_drain() {
     if (!open_ || drain_interval_seconds_ <= 0 || sinks_.empty())
         return;
+    // Sticky-stop (matches the Spark prefer_spark_/start_local() convention):
+    // once stop_drain() has run, never re-arm — a caller after shutdown would
+    // otherwise spin up a fresh drain thread walking straight into a pool_
+    // that stop() may already be tearing down.
+    if (shutting_down_.load(std::memory_order_acquire))
+        return;
     // Defensive (governance Gate 3 cpp-safety, 2026-08-16): assigning over a
     // still-joinable jthread/thread calls std::terminate(). No production
     // call site invokes start_drain() twice today, but a future caller or a
@@ -256,6 +267,12 @@ void AnalyticsEventStore::start_drain() {
 }
 
 void AnalyticsEventStore::stop_drain() {
+    // Set first, before anything else below: this is what makes it safe
+    // for server.cpp's stop() to free pg_pool_ (which this object borrows
+    // by reference) without waiting on or joining the untracked
+    // forward_gateway_pending() detached thread — emit() checks this before
+    // ever touching pool_.
+    shutting_down_.store(true, std::memory_order_release);
 #ifdef __cpp_lib_jthread
     if (drain_thread_.joinable()) {
         drain_thread_.request_stop();

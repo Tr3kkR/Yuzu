@@ -640,3 +640,67 @@ TEST_CASE("AnalyticsEvent: event_time auto-stamped by emit", "[pg][analytics_sto
     CHECK((*results)[0].ingest_time > 0);
     CHECK((*results)[0].event_time == (*results)[0].ingest_time);
 }
+
+TEST_CASE("AnalyticsEventStore: stop_drain() latches shutdown -- emit/query_recent/"
+          "pending_count/start_drain all refuse pool_ access afterward "
+          "(PR #3350 review regression guard, fjarvis/security-guardian/cpp-safety, "
+          "2026-08-20)",
+          "[pg][analytics_store]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, analytics_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    AnalyticsEventStore store(pool, /*drain_interval=*/1, /*batch_size=*/100);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    store.set_metrics(&metrics);
+
+    auto sink = std::make_unique<MockSink>();
+    auto* sink_ptr = sink.get();
+    store.add_sink(std::move(sink));
+
+    // A pre-shutdown emit must still work normally.
+    AnalyticsEvent before;
+    before.event_type = "test.pre_shutdown";
+    store.emit(before);
+    auto pending_before = store.pending_count();
+    REQUIRE(pending_before.has_value());
+    CHECK(*pending_before == 1);
+
+    // stop_drain() with no drain thread ever started is a plain latch-set —
+    // this is exactly the AnalyticsEventStore-internal half of what a real
+    // ServerImpl::stop() does (server.cpp calls stop_drain() long before
+    // pg_pool_.reset(); this test proves the latch's own contract without
+    // needing to construct a whole ServerImpl).
+    store.stop_drain();
+
+    // emit() must drop via the shutdown path, never touch pool_.
+    AnalyticsEvent after;
+    after.event_type = "test.post_shutdown";
+    store.emit(after);
+    CHECK(metrics
+              .counter("yuzu_server_analytics_emit_dropped_total",
+                       {{"reason", "store_not_open"}})
+              .value() == 1);
+
+    // Reads must degrade the same way, not touch pool_.
+    CHECK_FALSE(store.pending_count().has_value());
+    CHECK_FALSE(store.query_recent().has_value());
+    CHECK(metrics
+              .counter("yuzu_server_analytics_read_degrade_total",
+                       {{"method", "pending_count"}, {"reason", "store_not_open"}})
+              .value() == 1);
+    CHECK(metrics
+              .counter("yuzu_server_analytics_read_degrade_total",
+                       {{"method", "query_recent"}, {"reason", "store_not_open"}})
+              .value() == 1);
+
+    // start_drain() is sticky-stop: a caller after shutdown must not spin up
+    // a fresh drain thread against a pool the owner may already be tearing
+    // down. Deliberately never called start_drain() before stop_drain()
+    // above (keeps this deterministic instead of racing a real drain
+    // cycle) — so the sink must still be empty: completing this call
+    // without hanging/crashing plus zero sink activity is the guard.
+    store.start_drain();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    CHECK(sink_ptr->received().empty());
+}

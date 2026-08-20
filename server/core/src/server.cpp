@@ -4474,7 +4474,7 @@ public:
         // never reset the object either, it only gated sinks/start_drain()
         // on is_open() — this restores that contract, not a new one.)
         if (cfg_.analytics_enabled && pg_pool_ && !startup_failed_) {
-            analytics_store_ = std::make_unique<AnalyticsEventStore>(
+            analytics_store_ = std::make_shared<AnalyticsEventStore>(
                 *pg_pool_, cfg_.analytics_drain_interval_seconds, cfg_.analytics_batch_size);
             analytics_store_->set_metrics(&metrics_);
             // Bounded-label counters (ADR-0049) — described + pre-seeded
@@ -4559,7 +4559,7 @@ public:
         if (tag_store_)
             agent_service_.set_tag_store(tag_store_.get());
         if (analytics_store_)
-            agent_service_.set_analytics_store(analytics_store_.get());
+            agent_service_.set_analytics_store(analytics_store_);
         // W1.4 / #827: AuditStore for enrollment-token consume rows.
         // Direct path (AgentServiceImpl) AND gateway path
         // (GatewayUpstreamServiceImpl) both get the same store so the
@@ -4572,7 +4572,7 @@ public:
             }
         }
         if (analytics_store_ && gateway_service_) {
-            gateway_service_->set_analytics_store(analytics_store_.get());
+            gateway_service_->set_analytics_store(analytics_store_);
         }
 
         // Initialize instruction store (Phase 2)
@@ -7802,26 +7802,36 @@ public:
         // join — same discipline as the sibling PG stores above.
         agent_service_.set_tag_store(nullptr);
         tag_store_.reset();
-        // AnalyticsEventStore (ADR-0049) borrows pg_pool_ — same destruct-
-        // before-pool discipline as every sibling PG-backed store above,
-        // deliberately torn down LAST among this group, immediately before
-        // pg_pool_.reset() (governance Gate 8, 2026-08-19, architect
-        // finding): this store is one of the three named in the #3279 SCOPE
-        // NOTE below as reachable via forward_gateway_pending()'s untracked
-        // detached thread, which neither Shutdown(deadline) above nor
-        // quiesce() on Webhook/Offload drains. Placing this block first (an
-        // earlier merge resolution) put it ahead of Webhook/Offload's own
-        // up-to-60s quiesce, maximizing rather than minimizing its exposed-
-        // as-freed window across the REST of this function's ~60+s tail.
-        // This ordering restores the SQLite predecessor's effective free-
-        // point (member destruction only after stop()'s entire body had
-        // already run) — it REDUCES, does not ELIMINATE, that window: the
-        // underlying race is the pre-existing #3279 class, not fixed here.
-        // The drain thread is already joined via stop_drain() above; unwire
-        // the borrowed raw pointer from both ingest services first.
-        agent_service_.set_analytics_store(nullptr);
+        // AnalyticsEventStore (ADR-0049) borrows pg_pool_ by reference and,
+        // unlike every sibling PG-backed store above, is reachable from a
+        // genuinely untracked path: forward_gateway_pending()'s per-command
+        // std::thread(...).detach() (up to ~900s lifetime across its 3
+        // retries) calls into AgentServiceImpl::process_gateway_response(),
+        // which used to hold this store via a raw, non-atomic pointer — an
+        // explicit stop()-time free at any position in this function was
+        // reachable from that thread no matter where it sat (PR #3350
+        // review, fjarvis + security-guardian, 2026-08-20; two earlier
+        // attempts here — Gate 8's reorder, then a stop_drain()-set latch
+        // alone — each closed one sub-problem but not both).
+        //
+        // Fix: analytics_store_ is now shared_ptr, and both ingest services
+        // hold it as weak_ptr, locked per-call. A detached-thread caller
+        // that successfully .lock()s keeps the object alive for exactly as
+        // long as its own call takes, regardless of what stop() does below
+        // — the object-lifetime UAF is closed structurally, not by timing
+        // margin. What .lock() alone does NOT protect is the pg::PgPool&
+        // that object still borrows: AnalyticsEventStore::stop_drain(),
+        // called well above, sets an internal shutting_down_ latch as its
+        // first statement, and emit() checks it before ever touching
+        // pool_ — so a locked-but-late caller is refused before it can
+        // reach the pool, rather than reaching pg_pool_.reset() below.
+        // The residual — the detached thread itself outliving this
+        // function, generally — is the pre-existing, already-deferred
+        // #3279 class (Dave, commit 4c070b484); this store's blast radius
+        // within that class is now no wider than reading a nullptr.
+        agent_service_.set_analytics_store({});
         if (gateway_service_)
-            gateway_service_->set_analytics_store(nullptr);
+            gateway_service_->set_analytics_store({});
         analytics_store_.reset();
         pg_pool_.reset();
 
@@ -19105,7 +19115,7 @@ private:
     std::unique_ptr<UpdateRegistry> update_registry_;
 
     // Analytics
-    std::unique_ptr<AnalyticsEventStore> analytics_store_;
+    std::shared_ptr<AnalyticsEventStore> analytics_store_;
 
     // Phase 1: Data infrastructure
     std::unique_ptr<ResponseStore> response_store_;

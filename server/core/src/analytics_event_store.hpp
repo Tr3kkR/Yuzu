@@ -136,6 +136,20 @@ public:
 private:
     pg::PgPool& pool_;
     bool open_{false};
+    // Set by stop_drain() before anything else in that call — checked by
+    // every method that touches pool_ (emit, query_recent, pending_count,
+    // start_drain), independent of the drain thread's own stop-token
+    // machinery below. This object's OWN lifetime is protected separately
+    // (server.cpp wires it as shared_ptr, callers hold weak_ptr and
+    // .lock() per-call — see server.cpp's ServerImpl::stop()), so a caller
+    // reaching a method here always has valid `this`. What this flag adds
+    // is the narrower guarantee that such a caller never touches pool_
+    // after server.cpp's stop() has freed pg_pool_ — without it, a late
+    // caller (e.g. the untracked forward_gateway_pending() detached
+    // thread, #3279 class) would dereference a freed PgPool& even though
+    // the store object itself was still alive (governance/PR #3350
+    // review, fjarvis + security-guardian + cpp-safety, 2026-08-20).
+    std::atomic<bool> shutting_down_{false};
     int drain_interval_seconds_;
     int batch_size_;
     std::atomic<std::uint64_t> total_emitted_{0};
