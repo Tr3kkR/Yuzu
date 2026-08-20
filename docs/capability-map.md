@@ -381,7 +381,9 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 `windows_updates` plugin `pending_reboot` action. Cross-platform reboot-pending detection:
 Windows (3 registry keys: WindowsUpdate RebootRequired, CBS RebootPending, Session Manager PendingFileRenameOperations),
 Linux (reboot-required file + kernel version comparison + needs-restarting fallback),
-macOS (softwareupdate restart flag). Reports per-source status and aggregate boolean.
+macOS (softwareupdate restart flag, bounded to a 60s deadline — replaces the plugin's
+own prior unbounded `popen()` call, which could hang indefinitely on a headless/offline
+Mac). Reports per-source status and aggregate boolean.
 
 ### 8.3 Patch Deployment :white_check_mark: `T2`
 

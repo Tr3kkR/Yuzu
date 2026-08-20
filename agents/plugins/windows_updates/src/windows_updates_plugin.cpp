@@ -253,6 +253,14 @@ using BStrGuard = std::unique_ptr<std::remove_pointer_t<BSTR>, decltype(&::SysFr
 constexpr std::chrono::seconds kCleanupJoinGrace{3}; // matches hard_exit.hpp's kOrphanDrainGrace
 std::atomic<int> g_outstanding_cleanups{0};
 
+// Well above realistic legitimate concurrency (a sustained WSUS wedge with
+// periodic dispatch could otherwise pile up one thread per timed-out
+// do_missing() call, unbounded) but far below what would meaningfully
+// threaten the process's OS thread budget -- same ceiling shape as
+// agents/plugins/discovery/src/bounded_wait.hpp's kMaxOutstandingBoundedCalls
+// (governance Gate 4 unhappy-path finding).
+constexpr int kMaxOutstandingCleanups = 64;
+
 // Takes the cleanup work itself (not an already-constructed std::thread):
 // a std::thread starts running the instant it's constructed, so incrementing
 // the counter AFTER construction (as an earlier version of this function
@@ -266,22 +274,37 @@ std::atomic<int> g_outstanding_cleanups{0};
 // exists to close. Incrementing BEFORE construction closes it: no code in
 // the new thread can run before this function's caller has already
 // registered it as outstanding.
+//
+// Returns false (no thread spawned) if the outstanding-cleanup ceiling is
+// already reached, or if std::thread's constructor itself throws (e.g.
+// EAGAIN under resource exhaustion) -- either way cleanup_work() never
+// ran, so cleanup_finished() never will either; the caller is responsible
+// for its own bounded fallback (see do_missing()'s call site).
 template <typename Fn>
-void track_detached_cleanup(Fn&& cleanup_work) {
+bool track_detached_cleanup(Fn&& cleanup_work) {
+    if (g_outstanding_cleanups.load(std::memory_order_relaxed) >= kMaxOutstandingCleanups) {
+        // A sustained wedge already has this many searches stuck in
+        // cleanup -- spawning yet another thread risks exhausting the
+        // whole agent's OS thread budget, not just this plugin's. Refuse
+        // rather than either grow unbounded or run cleanup_work() inline
+        // here (which would move CleanUp()'s unbounded wait onto THIS
+        // command thread -- exactly what the whole detached-thread design
+        // exists to avoid).
+        spdlog::warn("windows_updates: outstanding WUA cleanup ceiling ({}) reached, "
+                     "not spawning another cleanup thread (sustained wedge?)",
+                     kMaxOutstandingCleanups);
+        return false;
+    }
     g_outstanding_cleanups.fetch_add(1, std::memory_order_relaxed);
     try {
         std::thread(std::forward<Fn>(cleanup_work)).detach();
+        return true;
     } catch (const std::system_error&) {
-        // std::thread's constructor can throw (e.g. EAGAIN under resource
-        // exhaustion) -- if it does, cleanup_work() never runs, so
-        // cleanup_finished() never runs either. Undo the increment here so
-        // a future join_all_detached_cleanups() doesn't wait out its full
-        // grace for a cleanup that was never actually started. The COM
-        // reference this specific caller AddRef'd is leaked on this path
-        // (nothing else can release it once the thread failed to start) --
-        // an accepted, narrow, resource-exhaustion-only cost against
-        // permanently wedging every future shutdown instead.
+        // Undo the increment here so a future join_all_detached_cleanups()
+        // doesn't wait out its full grace for a cleanup that was never
+        // actually started.
         g_outstanding_cleanups.fetch_sub(1, std::memory_order_relaxed);
+        return false;
     }
 }
 
@@ -530,7 +553,7 @@ int do_missing(yuzu::CommandContext& ctx) {
         job->RequestAbort();
         ISearchJob* raw_job = job.get();
         raw_job->AddRef();
-        track_detached_cleanup([raw_job]() {
+        const bool spawned = track_detached_cleanup([raw_job]() {
             // COM apartment state is per-thread: the ComInit further up
             // do_missing() only covers the calling thread, which returns
             // (destroying that ComInit) right after this lambda is handed
@@ -542,11 +565,42 @@ int do_missing(yuzu::CommandContext& ctx) {
             // already tolerated by ComInit::ok(), and either way Release()
             // still needs to run: not calling it leaks the AddRef'd
             // reference outright, which is worse than a degraded call).
-            yuzu::shared::win::ComInit cleanup_com_init;
-            raw_job->CleanUp();
-            raw_job->Release();
+            //
+            // try/catch: this lambda is a std::thread entry function, not
+            // covered by any pool-level exception firewall. CleanUp()/
+            // Release() are ordinary HRESULT-returning COM calls and don't
+            // throw C++ exceptions by contract, but an SEH-to-C++
+            // translator (if enabled anywhere in this process) or a
+            // provider-side corruption could still surface one here --
+            // uncaught, that would escape a detached thread's entry
+            // function and std::terminate() the WHOLE AGENT, not just
+            // this search (governance Gate 4 unhappy-path finding; mirrors
+            // discovery/bounded_wait.hpp's identical guard on its own
+            // detached-thread body).
+            try {
+                yuzu::shared::win::ComInit cleanup_com_init;
+                raw_job->CleanUp();
+                raw_job->Release();
+            } catch (...) {
+                // Nothing else can react from here; the AddRef'd reference
+                // may leak if Release() itself is what threw, which is the
+                // accepted cost of surviving rather than terminating.
+            }
             cleanup_finished();
         });
+        if (!spawned) {
+            // Ceiling reached, or std::thread's constructor itself threw:
+            // cleanup_work() above never ran, so nothing released the
+            // AddRef() taken for it. Balance it directly here -- Release()
+            // alone (unlike CleanUp()) isn't documented to block, so this
+            // doesn't reintroduce an unbounded wait on this command
+            // thread; the cost is skipping CleanUp() itself (whatever
+            // WUA-internal state it would have released stays unreleased
+            // for this one search), a narrow, accepted tradeoff against
+            // either blocking this call or growing the OS thread count
+            // without bound.
+            raw_job->Release();
+        }
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "windows_updates:search_deadline_exceeded");
         ctx.write_output("available|none|Update search did not complete within the time budget");
