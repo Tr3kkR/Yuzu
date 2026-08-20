@@ -5483,70 +5483,97 @@ public:
         // operator-minted client certs (the pre-PKI contract). The revocation
         // checker is wired whenever a CA root exists so a revoked leaf is refused
         // even on an operator-supplied-cert install that still uses our CA.
-        if (ca_store_ && ca_store_->is_open() && ca_store_->has_root()) {
-            // LIFETIME: these [this]-capturing lambdas are invoked from gRPC worker
-            // threads and dereference ca_store_/agent_ca_cert_pem_/csr_issue_*. That
-            // is safe only because stop() (run from ~ServerImpl) calls
-            // agent_server_->Shutdown(deadline) — draining/cancelling all in-flight
-            // RPCs — BEFORE any member is destroyed, even though ca_store_ is
-            // declared after agent_service_/agent_server_ (destructs first). Same
-            // shutdown-before-destruct contract as execution_tracker_. agent_ca_cert_pem_
-            // is written ONCE here, before BuildAndStart accepts traffic (publish-
-            // before-start), so the worker-thread reads are race-free; do not re-wire
-            // the CA at runtime without adding synchronisation.
-            // Cache the issuing-CA cert PEM so is_yuzu_issued() can signature-verify
-            // a presented client leaf against OUR CA specifically (Hermes CRITICAL-1
-            // / LOW-5 — a foreign cert in a multi-CA trust bundle must not be
-            // mistaken for a Yuzu agent identity or a revoked Yuzu serial).
-            if (auto r = ca_store_->get_root(); r && r->has_value())
-                agent_ca_cert_pem_ = (*r)->cert_pem;
-            // ONE guarded signer, shared by the direct (AgentServiceImpl) and
-            // gateway-proxied (GatewayUpstreamServiceImpl::ProxyRegister, PR5d)
-            // Register paths — so an agent enrolling through the gateway receives a
-            // per-agent client cert too, with the SAME CA / rate-limit / ca_issued
-            // recording / CSR-size cap (one chokepoint, cannot drift). The
-            // try/catch enforces sign_agent_csr's documented "nullopt on any
-            // failure" contract even if it throws (e.g. bad_alloc) — an uncaught
-            // exception out of a sync gRPC handler on the exposed one-way-TLS agent
-            // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
-            std::function<std::optional<std::pair<std::string, std::string>>(
-                const std::string&, const std::string&, CertIssuanceSource)>
-                cert_signer = [this](const std::string& csr_pem, const std::string& agent_id,
-                                     CertIssuanceSource src)
-                -> std::optional<std::pair<std::string, std::string>> {
-                try {
-                    return sign_agent_csr(csr_pem, agent_id, src);
-                } catch (const std::exception& e) {
-                    spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
-                                  agent_id);
-                    return std::nullopt;
-                } catch (...) {
-                    spdlog::error("PKI: agent CSR signing threw (unknown) for {} — non-fatal",
-                                  agent_id);
-                    return std::nullopt;
-                }
-            };
-            agent_service_.set_agent_cert_signer(cert_signer);
-            if (gateway_service_)
-                gateway_service_->set_agent_cert_signer(cert_signer);
-            agent_service_.set_revocation_checker(
-                [this](const std::string& peer_cert_pem) { return is_peer_cert_revoked(peer_cert_pem); });
-            // Recognizer: lets the Register re-auth gate treat ONLY Yuzu-issued
-            // certs as agent identities (foreign certs fall through to bootstrap).
-            agent_service_.set_peer_cert_recognizer(
-                [this](const std::string& peer_cert_pem) { return is_yuzu_issued(peer_cert_pem); });
-            spdlog::info("PKI: per-agent mTLS issuance active (CA {})",
-                         default_cert_set_.ca_fingerprint_sha256.empty()
-                             ? std::string("operator-supplied")
-                             : default_cert_set_.ca_fingerprint_sha256);
-            // Hermes M1: pre-publish the CRL at startup so the PUBLIC GET
-            // /api/v1/ca/crl serves a cached, already-signed CRL and never loads
-            // the CA key for an anonymous caller (the public handler is
-            // serve-or-503, it does NOT build). Best-effort: a failure just means
-            // /ca/crl returns 503 until the next revoke republishes.
-            if (!publish_crl())
-                spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
-                             "the next revocation republishes");
+        if (ca_store_ && ca_store_->is_open()) {
+            // ADR-0036/ADR-0053 (adversarial-review HIGH, 2026-08-20): get_root()
+            // directly, NOT has_root() — this one-shot decision wires (or skips) the
+            // revocation checker/signer/recognizer for the rest of the process's
+            // life, with no retry. has_root() folds a genuine Postgres lease/query
+            // failure into "no root", so a transient blip here used to skip wiring
+            // SILENTLY — the server would keep serving with revoked Yuzu-issued
+            // agent certs unchecked until the next restart, exactly the fail-open
+            // ADR-0053 documents has_root() as unsafe for outside the CRL-freshness
+            // tick and /readyz. Fail the boot instead on a genuine error: run()'s
+            // existing startup_failed_ recheck after start_web_server() (same shape
+            // as the SCIM boot-failure case above) tears down the already-
+            // BuildAndStart'd gRPC listeners before any RPC is served.
+            auto root_or_err = ca_store_->get_root();
+            if (!root_or_err) {
+                spdlog::error("PKI: get_root() failed while wiring per-agent mTLS at boot ({}) — "
+                              "refusing to start rather than serve with revocation enforcement "
+                              "unwired",
+                              root_or_err.error());
+                startup_failed_ = true;
+                // Bare return, not fall-through: nothing has called BuildAndStart yet at this
+                // point in run() (same precedent as the TLS-credential failures a few dozen
+                // lines below) — no listener is up to tear down, so there is nothing stop()
+                // would additionally need to do here that ~ServerImpl won't already do.
+                return;
+            } else if (root_or_err->has_value()) {
+                // LIFETIME: these [this]-capturing lambdas are invoked from gRPC worker
+                // threads and dereference ca_store_/agent_ca_cert_pem_/csr_issue_*. That
+                // is safe only because stop() (run from ~ServerImpl) calls
+                // agent_server_->Shutdown(deadline) — draining/cancelling all in-flight
+                // RPCs — BEFORE any member is destroyed, even though ca_store_ is
+                // declared after agent_service_/agent_server_ (destructs first). Same
+                // shutdown-before-destruct contract as execution_tracker_. agent_ca_cert_pem_
+                // is written ONCE here, before BuildAndStart accepts traffic (publish-
+                // before-start), so the worker-thread reads are race-free; do not re-wire
+                // the CA at runtime without adding synchronisation.
+                // Cache the issuing-CA cert PEM so is_yuzu_issued() can signature-verify
+                // a presented client leaf against OUR CA specifically (Hermes CRITICAL-1
+                // / LOW-5 — a foreign cert in a multi-CA trust bundle must not be
+                // mistaken for a Yuzu agent identity or a revoked Yuzu serial).
+                agent_ca_cert_pem_ = (*root_or_err)->cert_pem;
+                // ONE guarded signer, shared by the direct (AgentServiceImpl) and
+                // gateway-proxied (GatewayUpstreamServiceImpl::ProxyRegister, PR5d)
+                // Register paths — so an agent enrolling through the gateway receives a
+                // per-agent client cert too, with the SAME CA / rate-limit / ca_issued
+                // recording / CSR-size cap (one chokepoint, cannot drift). The
+                // try/catch enforces sign_agent_csr's documented "nullopt on any
+                // failure" contract even if it throws (e.g. bad_alloc) — an uncaught
+                // exception out of a sync gRPC handler on the exposed one-way-TLS agent
+                // edge would otherwise terminate the server (Hermes pass-2 MEDIUM).
+                std::function<std::optional<std::pair<std::string, std::string>>(
+                    const std::string&, const std::string&, CertIssuanceSource)>
+                    cert_signer = [this](const std::string& csr_pem, const std::string& agent_id,
+                                         CertIssuanceSource src)
+                    -> std::optional<std::pair<std::string, std::string>> {
+                    try {
+                        return sign_agent_csr(csr_pem, agent_id, src);
+                    } catch (const std::exception& e) {
+                        spdlog::error("PKI: agent CSR signing threw ({}) for {} — non-fatal", e.what(),
+                                      agent_id);
+                        return std::nullopt;
+                    } catch (...) {
+                        spdlog::error("PKI: agent CSR signing threw (unknown) for {} — non-fatal",
+                                      agent_id);
+                        return std::nullopt;
+                    }
+                };
+                agent_service_.set_agent_cert_signer(cert_signer);
+                if (gateway_service_)
+                    gateway_service_->set_agent_cert_signer(cert_signer);
+                agent_service_.set_revocation_checker(
+                    [this](const std::string& peer_cert_pem) { return is_peer_cert_revoked(peer_cert_pem); });
+                // Recognizer: lets the Register re-auth gate treat ONLY Yuzu-issued
+                // certs as agent identities (foreign certs fall through to bootstrap).
+                agent_service_.set_peer_cert_recognizer(
+                    [this](const std::string& peer_cert_pem) { return is_yuzu_issued(peer_cert_pem); });
+                spdlog::info("PKI: per-agent mTLS issuance active (CA {})",
+                             default_cert_set_.ca_fingerprint_sha256.empty()
+                                 ? std::string("operator-supplied")
+                                 : default_cert_set_.ca_fingerprint_sha256);
+                // Hermes M1: pre-publish the CRL at startup so the PUBLIC GET
+                // /api/v1/ca/crl serves a cached, already-signed CRL and never loads
+                // the CA key for an anonymous caller (the public handler is
+                // serve-or-503, it does NOT build). Best-effort: a failure just means
+                // /ca/crl returns 503 until the next revoke republishes.
+                if (!publish_crl())
+                    spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
+                                 "the next revocation republishes");
+            }
+            // else: nullopt — genuinely no root (operator brought their own certs) —
+            // no signer/recognizer/revocation-checker wiring, same as before.
         }
 
         grpc::EnableDefaultHealthCheckService(true);
@@ -7331,6 +7358,12 @@ public:
         // declaration order alone.
         agent_service_.set_notification_store(nullptr);
         notification_store_.reset();
+        // CaStore (ADR-0053) borrows pg_pool_ — its PKI callbacks (signer/revocation
+        // checker/recognizer) are already nulled above; drop the store explicitly
+        // before the pool rather than relying on declaration-order destruction alone
+        // (adversarial-review MEDIUM, 2026-08-20 — matches the sibling stores' own
+        // explicit-reset discipline in this function).
+        ca_store_.reset();
         pg_pool_.reset();
     }
 

@@ -148,19 +148,36 @@ write its marker, refuses to serve under material nobody else recognises, return
 the same store — the second call returns the FIRST call's root verbatim (fingerprint and
 `cert_pem`), and a subsequent `get_root()` confirms the stored row is still exactly the winner's.
 
-#### `has_root()` / `get_root()` split — B-2's re-root guard needed the typed channel, three other callers did not
+#### `has_root()` / `get_root()` split — two callers needed the typed channel, two did not
 
 `get_root()` becomes `std::expected<std::optional<CaRoot>, std::string>`. A NEW `has_root()`
-convenience collapses a degraded read to `false` — kept **only** because three of the four
-production call sites are safe with that collapse (a background CRL-freshness-sweep tick
-skipping harmlessly; the `/readyz` `ca_root` signal, where "can't prove a root exists" SHOULD
-read as unhealthy anyway). The FOURTH — `default_certs.cpp`'s B-2 guard ("never silently re-root a
-populated CA," #1238) — was switched to call `get_root()` directly and fail closed (refuse to
-proceed) on a genuine read error, because collapsing that ONE call site's degraded read to "no
-root" would let a fresh CA generation proceed and silently re-root a fleet that already has one —
-precisely the danger B-2 exists to prevent, and precisely the ADR-0036 reviewer test ("could a
-silently-false read gate a downstream generate/replace decision? If yes, fail closed, never
-empty").
+convenience collapses a degraded read to `false` — kept **only** for the two production call
+sites genuinely safe with that collapse: a background CRL-freshness-sweep tick skipping
+harmlessly, and the `/readyz` `ca_root` signal, where "can't prove a root exists" SHOULD read as
+unhealthy anyway. Two other call sites needed the typed channel instead:
+
+- `default_certs.cpp`'s B-2 guard ("never silently re-root a populated CA," #1238) calls
+  `get_root()` directly and fails closed (refuses to proceed) on a genuine read error — collapsing
+  this ONE call site's degraded read to "no root" would let a fresh CA generation proceed and
+  silently re-root a fleet that already has one, precisely the danger B-2 exists to prevent.
+- **`server.cpp`'s boot-time PKI wiring block** (the `run()` code that wires the per-agent cert
+  signer, the revocation checker, and the peer-cert recognizer) was **initially left on
+  `has_root()`** in this migration's first two commits — an oversight caught by adversarial review
+  (Kimi + Codex, both independently, 2026-08-20), not by the author. `has_root()`'s collapse turns
+  a transient Postgres lease/query failure at this ONE call site into "no root," which silently
+  skips wiring the revocation checker for the rest of the process's life — no retry, no periodic
+  re-check. A revoked Yuzu-issued agent cert would then pass `Register`/`Subscribe`/heartbeat
+  unchecked until the next restart: a fail-open security regression, and exactly the ADR-0036
+  reviewer test this store's OTHER read paths were built to satisfy ("could a silently-false read
+  gate a downstream grant/enforce/skip decision? If yes, fail closed, never empty") — just missed
+  on this one call site. **Fixed**: the block now calls `get_root()` directly; an `unexpected` sets
+  `startup_failed_ = true` and returns from `run()` immediately — this call site runs BEFORE
+  `BuildAndStart()`, so nothing is listening yet, matching the bare-`return`-on-failure precedent
+  the TLS-credential checks a few dozen lines below already use at this same pre-`BuildAndStart`
+  point in `run()` (no listener to tear down, unlike the later SCIM-boot-failure recheck, which
+  fires AFTER `BuildAndStart()` and so needs the heavier `stop()` call to close what is already
+  open). A genuinely-empty root (`nullopt` — operator brought their own certs) is unchanged: skip
+  wiring, no signer, same pre-PKI contract as before.
 
 ### Write-path failure classification (#3097 precedent)
 
@@ -283,13 +300,16 @@ here.
 
 ## Considered and rejected
 
-- **Folding `has_root()` entirely into `get_root()` and updating all four call sites to the typed
-  form.** Rejected as unnecessary churn: three of the four call sites are demonstrably safe with a
-  degraded-collapses-to-false read (a background sweep tick, `/readyz`), and forcing them onto the
-  richer type would add call-site verbosity with no behavioral benefit. Keeping `has_root()` as a
-  documented, narrow convenience — with an explicit doc-comment warning against using it for a
-  re-root safety gate — was judged clearer than either extreme (blanket-typed everywhere, or
-  blanket-bool everywhere).
+- **Folding `has_root()` entirely into `get_root()` and updating every call site to the typed
+  form.** Rejected as unnecessary churn: the two remaining `has_root()` callers (a background
+  sweep tick, `/readyz`) are demonstrably safe with a degraded-collapses-to-false read, and
+  forcing them onto the richer type would add call-site verbosity with no behavioral benefit.
+  Keeping `has_root()` as a documented, narrow convenience — with an explicit doc-comment warning
+  against using it for a security-relevant gate — was judged clearer than either extreme
+  (blanket-typed everywhere, or blanket-bool everywhere). That doc-comment warning existed from
+  this migration's first commit; it just did not stop the author from missing one of its own
+  call sites (see "Adversarial review" below) — a warning comment narrows the class of mistake, it
+  does not substitute for checking every call site against it.
 - **Solving cross-instance CRL numbering (auto-retry-on-conflict) as part of this migration.**
   Rejected as scope creep beyond "migrate the persistence layer" — it is a pre-existing, already-
   tracked (#1240 UP-4) limitation this migration does not worsen (a collision was always refused
@@ -299,6 +319,40 @@ here.
   constants.** Rejected per the established Wave 2/3 precedent (ADR-0048's "Considered and
   rejected"): each store's error-prefix constants stay local so a future rename of one cannot
   silently affect another.
+
+## Adversarial review (2026-08-20, pre-push)
+
+Two independent external models (Kimi K2.7, Codex GPT-5.5 at high reasoning), each compiling this
+branch and running the real Postgres-backed `[pki]`/full-server test suite, cross-examined this
+migration against the anchors above (`docs/pki-architecture.md`, ADR-0006/0007/0008/0009/0010/0012,
+`docs/postgres-store-playbook.md`, this ADR, ADR-0048). Both independently found and, after
+cross-examination, converged on:
+
+- **HIGH (fixed):** the boot-time `has_root()` mischaracterization above — the security-relevant
+  regression this section already describes in full. Both reviewers cited the same anchors
+  (`docs/pki-architecture.md`'s fail-closed contract, this ADR's own `has_root()`/`get_root()`
+  split text, ADR-0036/the playbook's type-distinguishable-reads rule) independently before
+  cross-examining each other, which is the strongest class of finding this process produces.
+- **MEDIUM (fixed):** `ServerImpl::stop()` did not explicitly `ca_store_.reset()` before
+  `pg_pool_.reset()`, unlike every sibling Postgres store in the same function
+  (`result_set_store_`, `quarantine_store_`, `notification_store_`, ...). Reverse-declaration-order
+  destruction made this safe for `~ServerImpl` (`ca_store_` is declared after `pg_pool_`, so it
+  destructs first), and `stop()` already nulls the PKI callbacks before this point — so nothing
+  live actually touched a dangling pool reference — but `stop()` bypasses that declaration-order
+  protection by resetting `pg_pool_` explicitly mid-function, and both reviewers judged relying on
+  declaration order alone (rather than the explicit-reset discipline every sibling store follows)
+  a latent lifecycle gap worth closing now rather than after a future change adds a pool-touching
+  path to `CaStore`. Fixed: `ca_store_.reset();` added immediately before `pg_pool_.reset();`.
+- **LOW (not fixed, out of scope):** REST (`ca_routes.cpp`) and MCP (`mcp_server.cpp`) reject a
+  colon/whitespace-decorated serial (e.g. `AB:CD:12`, common OpenSSL/browser copy-paste form) that
+  `CaStore::normalize_serial_hex` itself would accept and canonicalize. Both reviewers confirmed via
+  `git show` against this branch's merge-base that the REST validator predates this migration —
+  it is a pre-existing REST/MCP-vs-store parity gap, not introduced here, and is a usability defect
+  (rejects too much) rather than a security bypass (`is_revoked()`/`revoke()` still canonicalize
+  and fail closed on the store side). Left for a separate, appropriately-scoped fix rather than
+  folded into this migration.
+
+Full transcripts: `/tmp/advrev-ca-store/{kimi,codex}.phase{1,2}.md` (local scratch, not committed).
 
 ## Consequences
 
