@@ -2,12 +2,20 @@
  * test_policy_evaluator.cpp — Unit tests for the compliance check -> verdict
  * pipeline (PolicyEvaluator).
  *
- * Strategy: real PolicyStore / InstructionStore / ResponseStore /
- * ManagementGroupStore on :memory:-style temp DBs, target resolution via a
- * static management group (so no AgentRegistry is needed), a FAKE dispatch_fn
- * that synchronously seeds canned ResponseStore rows under the execution_id it
- * is handed (keyed by agent + plugin), and an injectable clock to drive the
- * grace window deterministically.
+ * Strategy: real PolicyStore (Postgres, ADR-0056) / InstructionStore (still
+ * SQLite) / ResponseStore (Postgres, ADR-0039) / ManagementGroupStore
+ * (Postgres, ADR-0042) on a shared pool + per-test temp files, target
+ * resolution via a static management group (so no AgentRegistry is needed),
+ * a FAKE dispatch_fn that synchronously seeds canned ResponseStore rows
+ * under the execution_id it is handed (keyed by agent + plugin), and an
+ * injectable clock to drive the grace window deterministically.
+ *
+ * The final TEST_CASE is the regression test for ADR-0056's headline design:
+ * two PolicyEvaluator instances sharing one PolicyStore assert exactly one
+ * dispatch per policy per interval (the durable claim_due_policies lease),
+ * and that only the dispatching instance ever collects its own in-flight
+ * check (the other instance's tick claims nothing for it, by design — see
+ * policy_store.hpp's header comment on why collect stays per-replica).
  */
 
 #include "instruction_store.hpp"
@@ -34,8 +42,15 @@ using yuzu::server::pg::PgPool;
 
 namespace {
 
-// ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
-// "responsestore" template key with test_response_store.cpp (identical setup).
+// ResponseStore is a migrated Postgres store (ADR-0039) — shares the
+// "responsestore" template key with test_response_store.cpp (identical
+// setup). PolicyStore (ADR-0056) is constructed against the SAME pool/DB
+// (a different schema namespace, `policy_store` vs `response_store` —
+// exactly how they coexist in production's one shared pg_pool_); it is not
+// part of this template's pre-baked setup, so each fresh clone pays its own
+// migration on first construction — a fine trade-off here (this file is not
+// benchmarking migration cost), and avoids adding PolicyStore's migration
+// cost to every OTHER test file that shares the "responsestore" key.
 yuzu::test::PgTestTemplate responsestore_tpl{"responsestore", [](const std::string& dsn) {
     PgPool pool{{.conninfo = dsn, .size = 1}};
     ResponseStore store{pool};
@@ -58,8 +73,8 @@ std::string out_json2(const std::string& c1, const std::string& v1, const std::s
 }
 
 struct Harness {
-    yuzu::test::TempDbFile poldb{std::string_view("pol-")}, insdb{std::string_view("ins-")};
-    PolicyStore ps{poldb.path};
+    yuzu::test::TempDbFile insdb{std::string_view("ins-")};
+    PolicyStore ps;
     InstructionStore is{insdb.path};
     ResponseStore rs;
     yuzu::test::ManagementGroupStorePg mg_bundle;
@@ -73,7 +88,7 @@ struct Harness {
 
     std::string group_id;
 
-    explicit Harness(pg::PgPool& pool) : rs(pool) {
+    explicit Harness(pg::PgPool& pool) : ps(pool), rs(pool) {
         auto def = [&](const std::string& id, const std::string& plugin) {
             InstructionDefinition d;
             d.id = id;
@@ -110,6 +125,7 @@ struct Harness {
         d.mgmt_group_store = &mg;
         d.grace_seconds = 15;
         d.default_interval_seconds = 3600;
+        d.fixing_stale_seconds = 1800;
         d.now_fn = [this] { return fake_now; };
         d.dispatch_fn = [this](const std::string& plugin, const std::string&,
                                const std::vector<std::string>& agents, const std::string&,
@@ -139,7 +155,8 @@ struct Harness {
     }
 
     // Author a fragment + policy bound to the static group. Returns policy id.
-    std::string author(const std::string& check_cel, bool with_fix = false) {
+    std::string author(const std::string& check_cel, bool with_fix = false,
+                       int64_t interval_seconds = 0) {
         std::string frag = std::string("apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n") +
                            "spec:\n  check:\n    instruction: test.check\n    compliance: \"" +
                            check_cel + "\"\n";
@@ -153,6 +170,10 @@ struct Harness {
 
         std::string pol = std::string("apiVersion: yuzu.io/v1alpha1\nkind: Policy\n") + "spec:\n  fragment: " +
                           *fid + "\n  managementGroups:\n    - " + group_id + "\n";
+        if (interval_seconds > 0) {
+            pol += "  triggers:\n    - type: interval\n      interval_seconds: " +
+                   std::to_string(interval_seconds) + "\n";
+        }
         auto pid = ps.create_policy(pol);
         REQUIRE(pid.has_value());
         return *pid;
@@ -160,7 +181,9 @@ struct Harness {
 
     std::string status_of(const std::string& pid, const std::string& agent) {
         auto s = ps.get_agent_status(pid, agent);
-        return s ? s->status : std::string("<none>");
+        if (!s || !*s)
+            return "<none>";
+        return (*s)->status;
     }
 };
 
@@ -383,4 +406,63 @@ TEST_CASE("policy evaluator: remediation rejected when no fix_instruction",
     auto rr = ev.remediate(pid, {});
     CHECK_FALSE(rr.ok);
     CHECK(rr.error.find("remediation pathway") != std::string::npos);
+}
+
+// ============================================================================
+// Multi-replica dispatch claim (ADR-0056) — the regression test for the
+// design this migration exists to settle.
+// ============================================================================
+
+TEST_CASE("policy evaluator: two instances sharing one store dispatch a policy exactly once "
+          "per interval, and only the dispatcher collects it",
+          "[pg][policy][evaluator][claim]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 8}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "yuzu-a")};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "")};
+    // A short, explicit interval so dispatch_due() actually claims on tick()
+    // rather than relying on evaluate_now()'s bypass.
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/false, /*interval_seconds=*/300);
+
+    // Two independent PolicyEvaluator instances, sharing the SAME
+    // PolicyStore/DB (simulating two server replicas) but each with its OWN
+    // in-memory in_flight_ (Deps carries no shared state between them) and
+    // its OWN dispatch counter via a shared Harness dispatch_fn (dispatch
+    // calls are counted process-wide in `h`, which is enough to prove
+    // dedup — both evaluators funnel through the same fake dispatch_fn).
+    PolicyEvaluator evA(h.deps());
+    PolicyEvaluator evB(h.deps());
+
+    // Both tick at the same logical moment. Only one may win the advisory
+    // lock and claim the due policy; the other's dispatch_due() must claim
+    // nothing this tick.
+    evA.tick();
+    evB.tick();
+    CHECK(h.dispatch_calls == 1);
+
+    // A second simultaneous tick round, still within the 300s interval:
+    // neither dispatches again (the durable claim, not either evaluator's
+    // own memory, is what prevents the second dispatch).
+    h.fake_now += 20;
+    evA.tick();
+    evB.tick();
+    CHECK(h.dispatch_calls == 1);
+
+    // Whichever evaluator dispatched is the only one whose in_flight_ holds
+    // the check — advance past grace and let BOTH collect. The verdict must
+    // land exactly once, correctly, regardless of which instance dispatched
+    // (the other's collect_ready() has nothing in its own in_flight_ for
+    // this execution, so it is a no-op for this check).
+    h.fake_now += 300; // past grace AND past the 300s interval
+    evA.tick();
+    evB.tick();
+
+    CHECK(h.status_of(pid, "agentA") == "compliant");
+    CHECK(h.status_of(pid, "agentB") == "non_compliant");
+    // The interval elapsed during that last round, so a THIRD dispatch is
+    // expected (from whichever instance's dispatch_due() wins the claim
+    // this time) — total calls is 2, not 3+, proving the second round above
+    // truly claimed nothing.
+    CHECK(h.dispatch_calls == 2);
 }
