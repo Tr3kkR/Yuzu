@@ -116,10 +116,15 @@ AnalyticsEventStore::~AnalyticsEventStore() { stop_drain(); }
 
 void AnalyticsEventStore::emit(AnalyticsEvent event) {
     // shutting_down_ (set by stop_drain(), acquire-paired with its release)
-    // must be checked before pool_ is touched below — this is what lets
-    // server.cpp free pg_pool_ during stop() safely even though a caller
-    // reaching this line (e.g. via the detached forward_gateway_pending()
-    // thread's weak_ptr::lock()) may run well past that point.
+    // refuses NEW entrants once stop_drain() has run — it is a latch, not a
+    // rundown/quiesce guard: a caller that already read it as false an
+    // instant earlier is not blocked from reaching pool_ below. What makes
+    // that acceptable in practice: stop_drain() runs at server.cpp's
+    // stop_drain() call site, a multi-second span (several joins/quiesce
+    // waits) before pg_pool_.reset() — see the comment there. This does
+    // not make the window provably zero, only practically small (cpp-expert
+    // review, PR #3350, 2026-08-20 — a prior version of this comment
+    // overclaimed the guarantee as absolute).
     if (!open_ || shutting_down_.load(std::memory_order_acquire)) {
         note_emit_dropped(metrics_, kReasonStoreNotOpen);
         return;

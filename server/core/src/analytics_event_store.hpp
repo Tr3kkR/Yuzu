@@ -142,11 +142,16 @@ private:
     // machinery below. This object's OWN lifetime is protected separately
     // (server.cpp wires it as shared_ptr, callers hold weak_ptr and
     // .lock() per-call — see server.cpp's ServerImpl::stop()), so a caller
-    // reaching a method here always has valid `this`. What this flag adds
-    // is the narrower guarantee that such a caller never touches pool_
-    // after server.cpp's stop() has freed pg_pool_ — without it, a late
-    // caller (e.g. the untracked forward_gateway_pending() detached
-    // thread, #3279 class) would dereference a freed PgPool& even though
+    // reaching a method here always has valid `this`. This flag is a
+    // latch, not a rundown guard: it refuses new entrants once set, but a
+    // caller already past the check when pg_pool_.reset() runs is not
+    // blocked — the real protection is the multi-second span between
+    // stop_drain() and pg_pool_.reset() in server.cpp's stop() (several
+    // joins/quiesce waits sit between them), which makes that residual
+    // window small in practice, not zero by construction. Without this
+    // flag at all, a late caller (e.g. the untracked
+    // forward_gateway_pending() detached thread, #3279 class) would
+    // dereference a freed PgPool& even though
     // the store object itself was still alive (governance/PR #3350
     // review, fjarvis + security-guardian + cpp-safety, 2026-08-20).
     std::atomic<bool> shutting_down_{false};

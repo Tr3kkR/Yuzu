@@ -18,7 +18,10 @@ into `analytics_buffer`; a background thread (default 10s interval, batch 100) d
 rows to registered `AnalyticsEventSink`s (JSONL file, ClickHouse HTTP) and marks them drained.
 Writers include the auth/SCIM routes (login/MFA/OIDC/SAML/role-elevation events) and the
 agent/gateway service handlers (command lifecycle events) — roughly 15 call sites, all already
-null-guarding the store (`if (analytics_store_) { ... }`).
+null-guarding the store. The auth/SCIM routes hold `ServerImpl`'s own `analytics_store_`
+(`if (analytics_store_) { ... }`, a `shared_ptr` — see "Teardown" below); the 15 agent/gateway
+service handler sites hold a `weak_ptr` and lock it per-call
+(`if (auto analytics_store = analytics_store_.lock()) { ... }`).
 
 Public API: `emit(AnalyticsEvent)`, `query_recent(limit)`, `pending_count()`, `total_emitted()`,
 `add_sink()`, `start_drain()`, `stop_drain()`, `is_open()`.
@@ -183,8 +186,9 @@ run — the store stays constructed and wired with `is_open() == false` — rath
 - `--no-analytics` defaults **off** (analytics collection is on by default) — so this is not a
   low-blast-radius opt-in feature where "just don't turn it on" is the escape hatch; most
   deployments carry it.
-- Every one of the ~15 call sites already treats `analytics_store_` as optional
-  (`if (analytics_store_) { ... }`) — nothing downstream is load-bearing on it existing. The
+- Every one of the ~15 call sites already treats `analytics_store_` as optional (null-guarded
+  or, for the agent/gateway service handlers, `weak_ptr::lock()`-guarded — see "Teardown"
+  below) — nothing downstream is load-bearing on it existing. The
   store's own posture bundle (fail-soft ingest, degrade-distinguishable reads, skippable
   backfill) is "this data is expendable" end to end; gating the whole server's boot — auth, RBAC,
   every other store — on this one non-critical table's migration succeeding would contradict
@@ -226,6 +230,62 @@ not-open-but-non-null object and needed no change.
 **This is the one point in this migration that isn't a straight port of an existing pattern.**
 Confirmed by Dave, 2026-08-20, per the kickoff doc's governance checkpoint — closes COMP-MERGE /
 SEC-3 / ARCH-2 (`governance.d/analytics-event-store-postgres-migration.8XBNVK.jsonl`).
+
+### Teardown — object lifetime vs. the detached-thread reader
+
+A second, separate divergence from the sibling PG-backed stores, found and closed during PR
+#3350 review (2026-08-20): `analytics_store_` is the only ingest-service-wired store owned as
+`shared_ptr`/observed as `weak_ptr` rather than `unique_ptr`/raw pointer.
+
+- **SEC-5** (governance, 2026-08-16): `analytics_store_` was never `.reset()` in `stop()` before
+  `pg_pool_.reset()`, unlike every sibling PG-backed store — a dangling `PgPool&` risk. Fixed by
+  adding an explicit `analytics_store_.reset()` to `stop()`, matching sibling discipline.
+- **FJARVIS-UAF** (PR #3350 CHANGES_REQUESTED review, fjarvis, 2026-08-20; independently
+  confirmed by security-guardian): that fix raced `forward_gateway_pending()`'s untracked,
+  unjoined detached thread (up to ~900s lifetime across its 3 retries), which reads
+  `AgentServiceImpl`/`GatewayServiceImpl`'s `analytics_store_` with no synchronization and calls
+  `emit()` on it — a reachable use-after-free. Declaration-order reasoning alone (destructing the
+  object via implicit member destruction rather than an explicit `stop()`-time reset) bought no
+  meaningful wall-clock margin against a thread that can outlive `stop()` by hundreds of seconds.
+- **Fix**: `analytics_store_` converted to `shared_ptr` (owned by `ServerImpl`, constructed via
+  `make_shared`); `AgentServiceImpl`/`GatewayServiceImpl` hold it as `weak_ptr`, locked per-call
+  at all 15 call sites (`if (auto analytics_store = analytics_store_.lock()) { ... }`) — a caller
+  that successfully locks holds a real `shared_ptr` keeping the object alive for the duration of
+  its own call, regardless of `stop()`'s teardown timing. This closes the object-lifetime vector
+  structurally rather than by timing margin. The complementary `pg_pool_`-borrow vector (the
+  object staying alive doesn't mean `pool_` does) is closed by an internal `shutting_down_` latch
+  on `AnalyticsEventStore` itself, set first-thing in `stop_drain()` (called well before
+  `pg_pool_.reset()` in `stop()`'s sequence) and checked before any `pool_` access in `emit()`,
+  `query_recent()`, `pending_count()`, and (sticky-stop) `start_drain()`.
+- **The weak_ptr members themselves must never be written after wiring** (architect review, PR
+  #3350, 2026-08-20): the first cut of this fix kept the siblings' unwire-then-reset habit,
+  calling `set_analytics_store({})` in `stop()` to clear the `weak_ptr`. That's a plain,
+  unsynchronized write to the same `weak_ptr` instance a detached-thread caller may concurrently
+  `.lock()` — a genuine data race (confirmed under TSan on a minimal reproducer of this exact
+  shape), not merely theoretical. Fixed by deleting those two calls: a `weak_ptr` needs no
+  explicit clearing, since `analytics_store_.reset()` (the owning `shared_ptr`) already expires
+  the shared control block atomically for every locker, which is precisely what that machinery
+  is built for. The wiring calls at construction are this member's only write, ever, before any
+  concurrent reader exists — write-once-before-concurrency, race-free by construction.
+- **Residual, deliberately not fixed here**: `forward_gateway_pending()`'s detached thread itself
+  outliving `stop()`, generally, is the pre-existing #3279 class — Dave has already deferred that
+  for the sibling stores (`response_store_`/`webhook_store_`/`offload_target_store_`, commit
+  `4c070b484`). This fix does not extend, and was not asked to extend, that deferral's scope; it
+  makes `analytics_store_` specifically no longer reachable through the UAF vector at all,
+  independent of whether #3279 is ever resolved for the siblings.
+- **Deliberate inconsistency, not an oversight**: `analytics_store_` is now the only ingest-wired
+  store on this ownership model — siblings remain raw-pointer/`unique_ptr`, unmodified. This was
+  an explicit scope choice (Dave, 2026-08-20, choosing this over extending the #3279 deferral to
+  analytics_store_ by name, or doing the full #3279 root fix — joining/tracking the detached
+  threads — for every affected store). The dividing line, sharpened: a new store wired into
+  `AgentServiceImpl`/`GatewayServiceImpl` but NOT reached by `forward_gateway_pending()`'s
+  detached thread should default to the sibling raw-pointer pattern (matching the majority, and
+  #3279's still-open scope) — that thread's reach is what turns the generic #3279 exposure into
+  a concrete UAF, so a store outside it doesn't inherit the risk this fix closes. A new store
+  that IS reached by that thread inherits the identical concrete risk `analytics_store_` had and
+  should get this same treatment (or #3279's eventual root fix, once one exists) rather than the
+  raw-pointer default. A future change attempting to "fix" the inconsistency by reverting
+  `analytics_store_` to raw-pointer should read this section first.
 
 ## Considered and rejected
 

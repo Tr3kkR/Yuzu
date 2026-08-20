@@ -7628,31 +7628,38 @@ public:
         //
         // SCOPE NOTE (Fable/architect + Codex/Sol cross-review, ADR-0049,
         // 2026-08-19; refined governance Gate 4/8, 2026-08-19, unhappy-path
-        // UP-4): the same forward_gateway_pending() ->
-        // process_gateway_response() path also reaches response_store_,
-        // notification_store_, and analytics_store_ directly - not through
-        // fire_event(), but via their own plain (non-atomic) pointers
-        // inside that function body - with the exact same lack of
+        // UP-4; analytics_store_ removed from this enumeration, PR #3350
+        // review, architect, 2026-08-20 -- see below): the same
+        // forward_gateway_pending() -> process_gateway_response() path also
+        // reaches response_store_ and notification_store_ directly - not
+        // through fire_event(), but via their own plain (non-atomic)
+        // pointers inside that function body - with the exact same lack of
         // synchronization against this stop()'s teardown. Named here
         // because this comment previously enumerated only
         // webhook_store_/offload_target_store_ and undercounted #3279's
         // actual reach; the fix (join/drain forward_gateway_pending()'s
         // workers before any store it can touch is unwired/destroyed) is
-        // the same fix for all of them, not a per-pointer patch.
-        // analytics_store_'s exposure is NOT uniform, unlike the other two:
-        // on a HEALTHY boot it was already live-and-wired on this exact
-        // path before this migration (the SQLite predecessor was never
+        // the same fix for both of them, not a per-pointer patch.
+        // analytics_store_ USED to belong in this same enumeration, with a
+        // non-uniform exposure history worth recording for the record: on
+        // a HEALTHY boot it was already live-and-wired on this exact path
+        // before the ADR-0049 migration (the SQLite predecessor was never
         // nulled-then-reset proactively in stop() either, it just dangled
-        // less visibly) - no change there. But on a FAILED-open boot, the
+        // less visibly) - no change there. On a FAILED-open boot, the
         // predecessor-era `.reset()` on this store (removed by ADR-0049's
         // construction-posture fix, which keeps the object alive instead)
         // meant a degraded store was NEVER wired to this path at all - the
         // pointer was permanently null, so process_gateway_response()'s
-        // guard always no-op'd. The sentinel restoration makes a degraded
+        // guard always no-op'd. The sentinel restoration made a degraded
         // store wired for the ENTIRE process uptime instead of never - a
         // genuine widening of this store's exposure on that one deployment
-        // shape, confirmed and NOT a mischaracterization to soften.
-        // #3279 should be updated to name the full reach set.
+        // shape. PR #3350 review (fjarvis, 2026-08-20) found this made the
+        // widened exposure concretely reachable, not just theoretical;
+        // analytics_store_ is now shared_ptr/weak_ptr-locked (see the block
+        // below), which is why it no longer belongs in this enumeration -
+        // response_store_/notification_store_ remain on the raw-pointer
+        // pattern, #3279's reach set for them is unchanged.
+        // #3279 should be updated to name the (now two-store) reach set.
         //
         // On timeout: escalate via std::_Exit, the SAME choice web_thread_
         // makes a few hundred lines up, and for the identical reason - NOT
@@ -7822,16 +7829,34 @@ public:
         // margin. What .lock() alone does NOT protect is the pg::PgPool&
         // that object still borrows: AnalyticsEventStore::stop_drain(),
         // called well above, sets an internal shutting_down_ latch as its
-        // first statement, and emit() checks it before ever touching
-        // pool_ — so a locked-but-late caller is refused before it can
-        // reach the pool, rather than reaching pg_pool_.reset() below.
-        // The residual — the detached thread itself outliving this
-        // function, generally — is the pre-existing, already-deferred
-        // #3279 class (Dave, commit 4c070b484); this store's blast radius
-        // within that class is now no wider than reading a nullptr.
-        agent_service_.set_analytics_store({});
-        if (gateway_service_)
-            gateway_service_->set_analytics_store({});
+        // first statement, and emit()/query_recent()/pending_count()/
+        // start_drain() all check it before ever touching pool_ — a
+        // latch, not a rundown guard, so it refuses NEW entrants from the
+        // moment stop_drain() runs, not a caller already past the check.
+        // That residual is bounded by the multi-second span between
+        // stop_drain() (above) and pg_pool_.reset() (below) — several
+        // joins/quiesce waits sit in between — which makes it small in
+        // practice, not zero by construction (cpp-expert review, PR
+        // #3350, 2026-08-20). The detached thread itself outliving this
+        // function, generally, is the pre-existing, already-deferred
+        // #3279 class (Dave, commit 4c070b484); this fix does not extend
+        // that deferral's scope, it makes this store's own free point no
+        // longer the thing that turns #3279 into a reachable UAF.
+        //
+        // Deliberately NOT calling agent_service_.set_analytics_store({})/
+        // gateway_service_->set_analytics_store({}) here (architect review,
+        // PR #3350, 2026-08-20): that's the raw-pointer siblings'
+        // unwire-then-reset habit, and applying it to a weak_ptr member is
+        // actively unsafe — it's a concurrent, unsynchronized write to the
+        // SAME weak_ptr instance a detached-thread caller may concurrently
+        // .lock() (confirmed as a real data race under TSan on a minimal
+        // reproducer of this exact shape). A weak_ptr needs no explicit
+        // clearing: the wiring calls above are this member's only write,
+        // ever, before any concurrent reader exists, so it is write-once-
+        // before-concurrency and race-free by construction. Every .lock()
+        // from here on reads the shared control block, which IS built for
+        // concurrent access — analytics_store_.reset() below is what
+        // expires it, atomically, for every locker regardless of thread.
         analytics_store_.reset();
         pg_pool_.reset();
 
