@@ -22,6 +22,7 @@
 #include <yuzu/plugin.h>
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <expected>
@@ -381,9 +382,16 @@ public:
     ///
     /// CONTRACT: fires with mtx_ HELD (start_local() holds it for the whole re-arm
     /// walk) — throw or observe only; re-entering the engine from the hook
-    /// self-deadlocks. MUST be set BEFORE start_local() runs (set-then-use). No
-    /// production caller.
+    /// self-deadlocks. This is a genuine same-thread std::mutex relock (undefined
+    /// behavior in practice: a silent hang, not the loud WorkerHostileMutex abort —
+    /// that guard only fires for the worker threads stop() joins, and the calling
+    /// thread here is never one of those). Arming a hook (non-null) MUST happen
+    /// BEFORE start_local() runs (set-then-use; asserted) — clearing it (nullptr),
+    /// typically during teardown after start_local() already ran, is always fine.
+    /// No production caller.
     void set_rearm_fault_hook_for_test(std::function<void(const std::string& rule_id)> hook) {
+        assert((!hook || !started_) &&
+               "set_rearm_fault_hook_for_test: arming a hook must happen before start_local()");
         rearm_fault_hook_for_test_ = std::move(hook);
     }
 

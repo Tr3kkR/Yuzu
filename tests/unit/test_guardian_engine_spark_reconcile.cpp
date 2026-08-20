@@ -959,7 +959,7 @@ TEST_CASE("journal_age_stats: present on a live prefer_spark worker, nullopt whe
 
 TEST_CASE("wire_spark_engine constructs the spark workers unconditionally but starts them "
           "ONLY under prefer_spark",
-          "[spark][guardian][reconcile][boot]") {
+          "[spark][guardian][reconcile]") {
     // #2238 item 2 (fixes BLOCKING-2b): the convergence scheduler + drain worker are
     // CONSTRUCTED in wire_spark_engine() regardless of prefer_spark_, but only START()ed
     // under the flag (guardian_engine.cpp's `if (prefer_spark_) { ...->start(); ...
