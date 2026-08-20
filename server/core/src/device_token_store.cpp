@@ -9,6 +9,7 @@
 #include "utf8_sanitize.hpp"
 
 #include <libpq-fe.h>
+#include <openssl/evp.h> // sha256_hex's EVP_Digest — needed unconditionally (backfill fingerprinting runs on every platform), never gated behind _WIN32 like the SHA256-vs-BCrypt hash_token() split below
 #include <spdlog/spdlog.h>
 #include <sqlite3.h>
 
@@ -22,7 +23,6 @@
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
 #else
-#include <openssl/evp.h>
 #include <openssl/sha.h>
 #endif
 
@@ -306,18 +306,22 @@ DeviceTokenStore::DeviceTokenStore(pg::PgPool& pool) : pool_(pool) {
 // ever moves 0->1, never back). An identity mismatch fails the boot closed — the same class as
 // every other migrated store's IDENTITY conflict.
 //
-// The LIFECYCLE direction check is where this store DIVERGES from DeploymentStore/LicenseStore's
-// generic "compute a rank, whichever side is ahead wins" shape (ADR-0052): `revoked` is not just
-// bookkeeping, it is the auth-bypass-relevant field. If the legacy row shows revoked=true but
-// Postgres currently holds revoked=false, that is exactly the shape ADR-0009's
-// rollback-then-roll-forward note warns about — an operator revoked this token while running the
-// pre-migration binary, and silently keeping Postgres's stale "still active" value would
-// resurrect a credential the operator explicitly killed. That case FAILS THE BACKFILL CLOSED,
-// naming both sides, exactly like an IDENTITY mismatch — never a WARNING-logged benign no-op.
-// The reverse (Postgres already revoked, legacy still shows active) is safe: revoked is
-// monotone, so Postgres being ahead is the ordinary shape of post-migration progress and is a
-// benign no-op. A `last_used_at`-only divergence (both sides agree on `revoked`) carries no
-// auth-bypass risk either direction — it is bookkeeping, not authorization state — so it is
+// The LIFECYCLE direction check applies the SAME fail-closed-on-legacy-ahead rule
+// DeploymentStore/LicenseStore's rank-based template already uses (gov architect, corrected —
+// both siblings also fail closed when the legacy side is strictly ahead; verify against
+// deployment_store.cpp's/license_store.cpp's own conflict-handling blocks, not this comment).
+// This store's field just doesn't need a rank computed: `revoked` is a two-value monotone flag
+// with no terminal-tie case a multi-value status enum has to resolve, so "which side is ahead"
+// reduces to a single boolean check. `revoked` is also the auth-bypass-relevant field here — if
+// the legacy row shows revoked=true but Postgres currently holds revoked=false, that is exactly
+// the shape ADR-0009's rollback-then-roll-forward note warns about — an operator revoked this
+// token while running the pre-migration binary, and silently keeping Postgres's stale "still
+// active" value would resurrect a credential the operator explicitly killed. That case FAILS THE
+// BACKFILL CLOSED, naming both sides, exactly like an IDENTITY mismatch — never a WARNING-logged
+// benign no-op. The reverse (Postgres already revoked, legacy still shows active) is safe:
+// revoked is monotone, so Postgres being ahead is the ordinary shape of post-migration progress
+// and is a benign no-op. A `last_used_at`-only divergence (both sides agree on `revoked`) carries
+// no auth-bypass risk either direction — it is bookkeeping, not authorization state — so it is
 // always a benign no-op regardless of which side is numerically ahead; the backfill never
 // updates an existing row either way.
 //
@@ -528,6 +532,17 @@ bool DeviceTokenStore::migrate_from_sqlite(const std::filesystem::path& legacy_d
             // Conflict: a row with this token_id already exists. `ON CONFLICT` matches on
             // token_id ALONE — read the existing row back and compare in two classes (file
             // header).
+            //
+            // gov unhappy-path UP-1: this read-back is NOT row-locked (no `FOR UPDATE`) and runs
+            // as a second statement in the same transaction, so it can observe a state a
+            // concurrent writer produced after the INSERT's conflict was detected. Safe ONLY
+            // because IDENTITY columns are write-once (no code path ever UPDATEs them) and
+            // `revoked` is monotone false->true (a race can only make `stored.revoked` MORE
+            // true, which is always this function's benign branch — see the LIFECYCLE direction
+            // comment above `migrate_from_sqlite`). A future change that makes any IDENTITY
+            // column mutable, or that lets `revoked` move true->false, reopens a real race here
+            // and would need this read-back to become `FOR UPDATE` (inside a transaction that
+            // also holds the lock across the eventual write, which today's design never issues).
             pg::PgResult existing = pg::exec_params(
                 conn,
                 "SELECT token_id, token_hash, name, principal_id, device_id, definition_id, "

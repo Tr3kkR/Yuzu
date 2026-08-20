@@ -26,7 +26,7 @@ previously a SQLite store (`device-tokens.db` by convention — the legacy path 
 matching every other migrated store), guarded by a single `shared_mutex`, single table
 `device_auth_tokens`.
 
-### DORMANT — verified 2026-08-18 against `origin/dev`; corrects the kickoff's dormancy guess
+### DORMANT — verified 2026-08-18 against `origin/dev`; resolves the kickoff's open dormancy question
 
 **Nothing in production constructs this store.** `rest_api_v1.hpp`'s `register_routes` overloads
 take `DeviceTokenStore* device_token_store = nullptr`, and the `/api/v1/device-tokens*` route
@@ -35,16 +35,19 @@ the server passes a non-null pointer. `AgentRegistry` holds only a nullable
 `DeviceTokenStore* device_token_store_` via `set_device_token_store`, read inside
 `register_agent`'s W1.5/#823 revoke-on-re-registration path.
 
-**The kickoff doc for this migration hypothesized this store was "never-wired" — pickaxing the
-history disproves that.** `git log --all -S"make_unique<DeviceTokenStore>"` finds it:
-construction WAS wired by `495c3f2e8` ("Add T2 capabilities with governance fixes for 9 blocking
+**The kickoff doc left open whether this store was never-wired or unwired — pickaxing the
+history answers it: UNWIRED.** `git log --all -S"make_unique<DeviceTokenStore>"` finds it:
+construction WAS wired by `acc6c481a` ("Add T2 capabilities with governance fixes for 9 blocking
 findings") — `device_token_store_ = std::make_unique<DeviceTokenStore>(dt_db)`, alongside
 `sw_deploy_store_`/`license_store_` in the same `Phase 7: Software Deployment, Device Tokens,
 Licensing` block — and removed by `2fcfb95b5` ("Decompose server.cpp god object") in the exact
 same diff hunk that dropped `SoftwareDeploymentStore`'s and `LicenseStore`'s construction sites.
 All three stores are the identical **UNWIRED** family (ADR-0048/0051's "same two commits"
 finding), not a distinct never-wired one — `DeviceTokenStore` is simply the third member,
-confirmed here rather than assumed. Re-verify with `git show 2fcfb95b5 -- server/core/src/server.cpp
+confirmed here rather than assumed. (History note: `acc6c481a` and `495c3f2e8` are duplicate
+commit objects — identical tree and message, different parents — a pre-existing artifact of this
+repo's history; `acc6c481a` is cited here to match the exact hash ADR-0048/0051 already use for
+the same event.) Re-verify with `git show 2fcfb95b5 -- server/core/src/server.cpp
 | grep -B3 device_token_store_`. Confirmed with the product owner (2026-08-18) that this is a
 deliberate current state (the same T2-capability shelving as its siblings), not an accidental
 regression.
@@ -53,7 +56,7 @@ regression.
 the store's persistence layer only.
 
 **Backfill is NOT skippable on the strength of that dormancy.** The store WAS constructed during
-the `495c3f2e8..2fcfb95b5` window, so a deployment that upgraded through that window can hold a
+the `acc6c481a..2fcfb95b5` window, so a deployment that upgraded through that window can hold a
 real `device-tokens.db` with genuinely issued (and possibly since-revoked) tokens. There is no
 production fleet today (memory: "fresh-build does not downgrade a defect/obligation" is the
 standing rule this ADR follows), so the backfill code path below is shipped and unit-tested but
@@ -114,11 +117,18 @@ auth-credential store, not durability-on-top:
   caller-input-validation errors (see the REST classification fix below).
 - **`validate_token`'s typed `RejectedToken`/`DeviceTokenValidateError` contract is preserved
   EXACTLY** (#1052/#1053, W1.3) — same enum values, same field-population-by-variant table, same
-  ordering (not_found → revoked → expired → unbound_legacy → binding_mismatch). Every PG error
-  reaching `validate_token` collapses to `DeviceTokenValidateError::internal_error`, never a
-  benign rejection reason — labelling a store fault as `not_found` would pollute the
-  not-found/SIEM signal exactly as `LicenseStore`'s parallel finding (#1056) already established
-  for this store's own pre-migration code. `device_token_rejection.hpp`'s wire-boundary-collapse
+  ordering (not_found → revoked → expired → unbound_legacy → binding_mismatch). Every genuine
+  transaction-level PG error reaching `validate_token` collapses to
+  `DeviceTokenValidateError::internal_error`, never a benign rejection reason — labelling a store
+  fault as `not_found` would pollute the not-found/SIEM signal exactly as `LicenseStore`'s
+  parallel finding (#1056) already established for this store's own pre-migration code. (gov
+  unhappy-path UP-3: this is deliberately narrower than "every PG error" — the pre-flight `!open_`
+  guard at the top of `validate_token`, which fires when the store itself failed to construct,
+  collapses to `invalid_input`, not `internal_error`, unchanged from the pre-migration store's own
+  contract — see `device_token_store.hpp`'s doc comment on `invalid_input`: "Empty / malformed raw
+  token, or store closed." Wire behavior is unaffected either way — all variants collapse to the
+  same 401 — but a boot-time Postgres outage would report through the `invalid_input` SIEM/metric
+  bucket rather than `internal_error`.) `device_token_rejection.hpp`'s wire-boundary-collapse
   contract (every variant → the same 401/UNAUTHENTICATED response) is untouched — it depends on
   the enum shape, not the store's internal transport.
 - **`validate_token` runs the read (row-locked, `SELECT ... FOR UPDATE`) and the accepted-path
@@ -127,6 +137,17 @@ auth-credential store, not durability-on-top:
   ... a concurrent revoke_token could slip through between the read and the write"). A concurrent
   `revoke_token`/`revoke_by_principal` on the same row blocks until the transaction commits,
   rather than racing it.
+- **Capacity note for the future wiring PR (gov Gate 6 sre)** — `kValidateTimeout` (2000ms)
+  bounds only the pool-acquire wait; the `SELECT ... FOR UPDATE` lock-wait inside `with_txn_for`
+  runs to `lock_timeout_ms` (10000ms default), a real worst case well past the 2s figure this ADR
+  otherwise documents as the budget. Once wired, `validate_token` is a genuine per-request
+  bearer-credential hot path on httplib's thread-per-connection model, so a lease blocked on a
+  contended row pins an HTTP worker, not just one slow response — pool saturation converts
+  directly into worker starvation. The wiring PR should revisit `kValidateTimeout` toward a
+  sub-second fail-fast budget and confirm pool sizing against anticipated validation QPS (the
+  `PgPool`'s `Options` are shared cross-store today, no per-store knob). Mitigating factor: distinct
+  tokens hash to distinct rows, so lock contention serializes per-device, not globally — a chatty
+  single device only ever serializes against itself.
 - **`revoke_by_principal`'s #823 security-shaped hazard, closed by typing it.** This method is
   the re-registration-time defence against a briefly-impersonated agent (#779) replaying a
   previously issued token. The pre-migration signature (`int64_t`, 0 on both "nothing to revoke"
@@ -200,9 +221,14 @@ has to guard against.
   `GREATEST()`, `revoked` only ever moves false→true, never back). An IDENTITY mismatch fails the
   backfill closed, naming both sides, the same class as every other migrated store's IDENTITY
   conflict.
-- **The LIFECYCLE direction check DIVERGES from `DeploymentStore`/`LicenseStore`'s generic
-  "compute a rank, whichever side is ahead wins" shape — this is the store-specific hazard the
-  kickoff flagged.** `revoked` is not bookkeeping, it is the auth-bypass-relevant field:
+- **The LIFECYCLE direction check applies the SAME fail-closed-on-legacy-ahead rule
+  `DeploymentStore`/`LicenseStore`'s rank-based template already uses (gov Gate 3 architect,
+  corrected from an earlier draft that mischaracterized this as a divergence — both siblings also
+  fail closed when the legacy side is strictly ahead; verify against their own conflict-handling
+  code, not this paragraph).** This store's field just doesn't need a rank computed: `revoked` is
+  a two-value monotone flag with no terminal-tie case a multi-value status enum has to resolve —
+  the store-specific point (flagged by the kickoff) is that `revoked` is not bookkeeping, it is
+  the auth-bypass-relevant field:
     - Legacy shows `revoked=true`, Postgres currently holds `revoked=false` → **FAILS THE
       BACKFILL CLOSED**, the same treatment as an IDENTITY mismatch. Silently keeping Postgres's
       stale "still active" value would resurrect a credential the operator explicitly killed —

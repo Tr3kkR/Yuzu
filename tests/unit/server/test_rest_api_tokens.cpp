@@ -22,6 +22,7 @@
 #include "audit_store.hpp"
 #include "device_token_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "rest_api_v1.hpp"
 #include "secure_random.hpp"
 #include "test_route_sink.hpp"
@@ -714,6 +715,70 @@ TEST_CASE("REST POST /api/v1/device-tokens: CSPRNG failure increments "
     REQUIRE(res->status == 503);
 
     CHECK(h.metrics.counter("yuzu_secure_random_failure_total", labels).value() == 1.0);
+}
+
+// gov Gate 2 security-guardian + Gate 3 quality-engineer (ADR-0052 round 1, MEDIUM): every
+// existing 503 case above exercises the CSPRNG-failure branch, a DIFFERENT code path from the
+// new kDeviceTokenDbErrorPrefix branch device_token_error_status/the POST handler's db_error
+// split add. Mirrors test_rest_software_packages.cpp's "answer 503 (not 400), never leaking the
+// raw Postgres error" schema-drop technique — the established precedent for this exact gap on
+// the sibling SoftwareDeploymentStore migration (PR #3174).
+TEST_CASE("REST device-token routes answer correct status on a genuine store failure, never "
+          "leaking the raw Postgres error",
+          "[pg][rest][device_token]") {
+    RestTokensHarness h;
+    h.session_user = "alice";
+    h.session_role = auth::Role::admin;
+
+    // Seed one token before dropping the schema, so DELETE has a real id to target.
+    auto seeded = h.sink.Post("/api/v1/device-tokens",
+                              R"({"name":"seed","device_id":"dev-seed","definition_id":""})");
+    REQUIRE(seeded);
+    REQUIRE(seeded->status == 201);
+
+    h.audit_log.clear(); // isolate the failures under test from the seed call's own audit row
+
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.device_token_db_->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(conn.get(), "DROP SCHEMA device_token_store CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    SECTION("GET /api/v1/device-tokens") {
+        auto res = h.sink.Get("/api/v1/device-tokens");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("does not exist") == std::string::npos);
+        CHECK(res->body.find("device_token_store") == std::string::npos);
+    }
+
+    SECTION("POST /api/v1/device-tokens") {
+        auto res = h.sink.Post(
+            "/api/v1/device-tokens",
+            R"({"name":"after-drop","device_id":"dev-002","definition_id":""})");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Retry-After") == "5");
+        CHECK(res->body.find("service unavailable") != std::string::npos);
+        // A genuine DB failure must never be mislabeled as CSPRNG exhaustion, and must never
+        // leak libpq's raw error text (relation/schema name) to the client.
+        CHECK(res->body.find("CSPRNG") == std::string::npos);
+        CHECK(res->body.find("does not exist") == std::string::npos);
+        CHECK(res->body.find("device_token_store") == std::string::npos);
+        yuzu::Labels labels{{"reason", "prng_failure"}, {"site", "device_token"}};
+        CHECK(h.metrics.counter("yuzu_secure_random_failure_total", labels).value() == 0.0);
+    }
+
+    SECTION("DELETE /api/v1/device-tokens/{id}: genuine failure is 503, distinct from 404") {
+        auto res = h.sink.Delete("/api/v1/device-tokens/deadbeef");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("service unavailable") != std::string::npos);
+        CHECK(res->body.find("not found") == std::string::npos);
+        CHECK(res->body.find("does not exist") == std::string::npos);
+        CHECK(res->body.find("device_token_store") == std::string::npos);
+    }
 }
 
 TEST_CASE("REST POST /api/v1/tokens: validation 400 (oversized) does NOT increment "

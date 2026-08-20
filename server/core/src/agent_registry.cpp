@@ -81,6 +81,16 @@ void AgentRegistry::register_agent(const pb::AgentInfo& info) {
                 // revoke failure should instead block the registration) is out of scope for the
                 // migration; this call site has no live caller today (device_token_store_ is
                 // never non-null in production).
+                //
+                // gov cpp-safety: this call now runs a blocking Postgres round-trip (up to
+                // kWriteTimeout, currently 4s) INSIDE the `mu_` critical section above — the
+                // install-then-revoke atomicity W1.5/#823 requires is deliberate, but it means a
+                // future re-wiring serializes every `register_agent` caller behind this store's
+                // pool-acquire latency, the same lock-discipline shape `sweep_revoked` in this
+                // file documents as forbidden (gov #1117) for a cross-store query. The wiring PR
+                // must resolve this tension (e.g. `sweep_revoked`'s snapshot-off-lock,
+                // re-verify-under-lock pattern) rather than inherit "hold mu_ across the call" by
+                // default — do not copy this shape unexamined once the store goes live.
                 auto revoked = device_token_store_->revoke_by_principal(info.agent_id());
                 if (!revoked) {
                     spdlog::error(
