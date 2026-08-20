@@ -12,6 +12,8 @@
   worker with a real `this`-capturing send and tears the engine down while a
   send may be in flight, exercising the race between `stop()`'s join and an
   in-flight send for the first time. All three seams are test-only (no
-  production behaviour change) and every new test is mutation-verified: it goes
-  red against a reversion of the fix it covers, then green again against the
-  real code.
+  production behaviour change). Items (1) and (2) are mutation-verified: each
+  goes red against a reversion of the fix it covers, then green again against
+  the real code. Item (3) is a liveness/TSan checkpoint, not a fix-regression
+  test — verified green across repeated isolated runs plus the full agent
+  suite, and under TSan looped 20x clean.

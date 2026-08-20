@@ -1586,12 +1586,25 @@ TEST_CASE("start-drain-then-stop: the this-capturing send races stop()'s join (T
             pusher_exit_codes.push_back(dr.exit_code);
         }
     }};
+    // A fatal assertion in the main-thread loop below (f.apply()'s REQUIRE) can unwind
+    // while pusher is still running. Join on scope exit so an unwind cannot destroy a
+    // joinable std::thread (std::terminate) and mask the real assertion failure behind
+    // a raw abort - same shape as ReleaseParkedWorker further down this file.
+    struct JoinOnExit {
+        std::thread& t;
+        ~JoinOnExit() {
+            if (t.joinable())
+                t.join();
+        }
+    } join_pusher_on_exit{pusher};
     for (int i = 0; i < 6; ++i)
         f.apply(make_service_rule("m" + std::to_string(i), true, "SvcM" + std::to_string(i)),
                 /*full_sync=*/false);
 
     // Test-side lifetime only: the pusher thread dereferences f.engine, so it must finish
-    // before anything tears that down - not a production ordering constraint.
+    // before anything tears that down - not a production ordering constraint. Redundant
+    // with JoinOnExit's destructor on the non-throwing path (join() on an already-joined
+    // thread is undefined, but joinable() is false by then, so the guard's join is skipped).
     pusher.join();
     {
         std::lock_guard<std::mutex> lk{pusher_mu};
