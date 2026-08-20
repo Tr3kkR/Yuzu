@@ -28,13 +28,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <random>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 
 #if defined(_WIN32)
@@ -176,6 +179,48 @@ struct TempDbFile {
     TempDbFile(TempDbFile&&) = delete;
     TempDbFile& operator=(TempDbFile&&) = delete;
 };
+
+/// Sanitizer-aware scale factor for the liveness deadlines below. Deadlines here bound
+/// "a background worker should have got to this by now" — they are a liveness backstop
+/// so a stuck worker fails the suite instead of hanging it, never the property under
+/// test, so stretching them cannot weaken an assertion.
+///
+/// Under a sanitizer they must stretch. Instrumented builds run several times slower
+/// and the whole agent suite shares one process, so a deadline sized for a normal build
+/// turns into an unexplained failure that reproduces nowhere: twice in
+/// test_guardian_outbox_drain_worker.cpp already, both times with ZERO ThreadSanitizer
+/// warnings and a clean 3/3 in isolation. Scaling once here beats discovering the next
+/// one in a nightly run.
+///
+/// Promoted from test_guardian_outbox_drain_worker.cpp (governance CON-S4 —
+/// promote-at-second-user; second user: test_guardian_engine_spark_reconcile.cpp #2238).
+inline constexpr int kSpinScale =
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+    6;
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
+    6;
+#else
+    1;
+#endif
+#else
+    1;
+#endif
+
+/// Spin on `pred` until it is true or `timeout` (sanitizer-scaled) elapses; returns the
+/// final poll of `pred`. Liveness-only — never encode a timing property in `pred`
+/// itself, only "did the thing happen".
+inline bool spin_until(std::function<bool()> pred,
+                       std::chrono::milliseconds timeout = std::chrono::seconds{5}) {
+    timeout *= kSpinScale;
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (pred())
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+    return pred();
+}
 
 #if defined(YUZU_TEST_ENABLE_PG)
 
