@@ -988,6 +988,97 @@ TEST_CASE("require_list_read — engine principal with an explicit global RBAC a
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 6c. require_fleet_read (#3290 Phase 2, D1) — this gate was Phase-0-only
+//     (zero route callers, no caller-class branches) when 6a/6b above were
+//     written; #3290 gave it the same engine special-case require_permission
+//     and require_list_read already have, for the identical reason: its own
+//     management-group axis (authorize_list_read) has a legacy-open branch
+//     that would otherwise hand an engine credential with zero RBAC
+//     assignments a fleet-wide unfiltered read the moment RBAC is off.
+//     Mirrors 6b's three cases exactly, on require_fleet_read's
+//     std::expected<ListAuthority, GateFailure> return shape instead of
+//     ListReadGate's bool+scope shape.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("require_fleet_read — engine principal denied Read when RBAC is disabled "
+          "(no legacy-open, mirrors require_list_read's 6b coverage)",
+          "[pg][engine_principal][integration][auth_routes][rbac][service_scope]") {
+    EngineRbacGateFixture fix;
+    yuzu::test::RbacStorePg rbac_bundle;
+    RbacStore& rbac_store = *rbac_bundle;
+    REQUIRE(rbac_store.is_open());
+    REQUIRE_FALSE(rbac_store.is_rbac_enabled()); // default-off — the hazard scenario
+
+    AuthRoutes ar(fix.cfg, fix.auth_mgr, &rbac_store, fix.api_tokens.get(),
+                 /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                 /*analytics_store=*/nullptr, fix.oidc_mu, fix.oidc_provider);
+    ar.set_engine_principal_store(fix.engine_store.get());
+
+    auto req = fix.request();
+    httplib::Response res;
+    auto result = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Forbidden);
+    CHECK(res.status == 403);
+}
+
+TEST_CASE("require_fleet_read — engine principal denied (503) when the RBAC store is "
+          "unavailable",
+          "[pg][engine_principal][integration][auth_routes][rbac][service_scope]") {
+    EngineRbacGateFixture fix;
+
+    // rbac_store_ == nullptr models "RBAC store unavailable" — session
+    // synthesis succeeds independently (engine_principal_store_, not
+    // rbac_store_), isolating require_fleet_read's OWN null-store check
+    // inside its engine branch.
+    AuthRoutes ar(fix.cfg, fix.auth_mgr, /*rbac_store=*/nullptr, fix.api_tokens.get(),
+                 /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                 /*analytics_store=*/nullptr, fix.oidc_mu, fix.oidc_provider);
+    ar.set_engine_principal_store(fix.engine_store.get());
+
+    auto req = fix.request();
+    httplib::Response res;
+    auto result = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == authz::GateFailure::Degraded);
+    CHECK(res.status == 503);
+}
+
+TEST_CASE("require_fleet_read — engine principal with an explicit global RBAC assignment "
+          "is admitted TOP (current engine grants are fleet-wide only, no per-tag "
+          "scoping concept)",
+          "[pg][engine_principal][integration][auth_routes][rbac][service_scope]") {
+    EngineRbacGateFixture fix;
+    yuzu::test::RbacStorePg rbac_bundle;
+    RbacStore& rbac_store = *rbac_bundle;
+    REQUIRE(rbac_store.is_open());
+    rbac_store.set_rbac_enabled(true);
+    REQUIRE(rbac_store.create_role({.name = "EngineReader", .description = "d"}).has_value());
+    REQUIRE(
+        rbac_store.set_permission({"EngineReader", "GuaranteedState", "Read", "allow"}).has_value());
+    REQUIRE(rbac_store.assign_role({"engine", "engine:vuln", "EngineReader"}).has_value());
+
+    AuthRoutes ar(fix.cfg, fix.auth_mgr, &rbac_store, fix.api_tokens.get(),
+                 /*audit_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*tag_store=*/nullptr,
+                 /*analytics_store=*/nullptr, fix.oidc_mu, fix.oidc_provider);
+    ar.set_engine_principal_store(fix.engine_store.get());
+
+    auto req = fix.request();
+    httplib::Response res;
+    auto result = ar.require_fleet_read(req, res, "GuaranteedState", "Read");
+    REQUIRE(result.has_value());
+    CHECK(result->unfiltered()); // TOP — never routed through meet(mgmt, service)
+
+    // Regression: an operation the assignment does NOT grant is still denied —
+    // proves this isn't silently falling through to a legacy-open path.
+    httplib::Response res2;
+    auto result2 = ar.require_fleet_read(req, res2, "GuaranteedState", "Write");
+    REQUIRE_FALSE(result2.has_value());
+    CHECK(result2.error() == authz::GateFailure::Forbidden); // Write denied structurally (Read-only gate)
+    CHECK(res2.status == 403);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 7. External-review Blocker 3 — engine actions must audit as
 //    principal_class=="engine", not the credential-presentation-only "agent"
 //    that principal_class_of(req) infers for every bearer token.
