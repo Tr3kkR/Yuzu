@@ -28,6 +28,22 @@
  * `unknown` management_point) are the ones this test pins.
  *
  * Windows-only; the plugin's SCM/COM code is a no-op elsewhere.
+ *
+ * Adversarial-review remediation (both external reviewers, independently):
+ * two defects fixed. (1) A plugin the loader could not find or load used
+ * to WARN-and-return here, which passed with zero assertions -- CLAUDE.md
+ * floors exactly this shape ("a false-green test offered as closure
+ * evidence for a blocking finding"). tests/meson.build's link_depends on
+ * sccm_plugin_lib orders the plugin build ahead of this test binary, so on
+ * a correctly configured Windows CI leg the plugin is ALWAYS present; its
+ * absence is now a real regression, not a benign skip case, so it is a
+ * REQUIRE. (2) The honest-degradation values this test file's own header
+ * comment already identifies as the discriminating evidence
+ * (`not_found`/`not_configured`/`unknown`) used to be checked only inside
+ * a WARN, which cannot fail the test -- promoted to hard CHECKs below,
+ * since every host these tests run on (CI or dev) genuinely lacks an
+ * SCCM/ConfigMgr client and a `ccmexec` service/`SMS:*` registry key by
+ * construction, making these values deterministic, not merely likely.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -90,10 +106,10 @@ TEST_CASE("sccm plugin (Windows): client_version executes the real native "
           "SCM query, never a reverted sc-query shell-out",
           "[sccm][windows][actions]") {
     auto plugin = load_sccm_plugin();
-    if (!plugin) {
-        WARN("sccm plugin library not found -- skipping LocalDispatcher round-trip test");
-        return;
-    }
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch.
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "client_version");
@@ -104,25 +120,24 @@ TEST_CASE("sccm plugin (Windows): client_version executes the real native "
     // differently-shaped line (or none at all on a CI host with no shell
     // access to `sc`), never this exact prefix.
     CHECK(result.captured.find("service_status|") != std::string::npos);
-    // On any host without a real SCCM client (every dev/CI host reachable
-    // here), the honest outcome is not_found -- a bare "not installed"
-    // silence, or "unavailable" from a broken SCM connect, would both be
-    // wrong on a healthy CI runner's own SCM.
-    if (result.captured.find("service_status|not_found") == std::string::npos) {
-        WARN("service_status was not 'not_found' -- host may have an actual ccmexec "
-             "service (SCCM client installed) or a degraded SCM connect; "
-             "captured: " << result.captured);
-    }
+    // Hard CHECK, not WARN: on every host these tests run on (CI or dev),
+    // no ccmexec service exists, so query_ccmexec_service_status()'s real
+    // OpenServiceW call deterministically returns ERROR_SERVICE_DOES_NOT_EXIST
+    // -> not_found. This is the specific value a reverted `sc query`
+    // text-parse (or a broken SCM connect reporting "unavailable" instead)
+    // would NOT reliably reproduce -- the discriminating evidence this
+    // test exists to pin, not merely a plausible outcome.
+    CHECK(result.captured.find("service_status|not_found") != std::string::npos);
 }
 
 TEST_CASE("sccm plugin (Windows): site executes the real registry "
           "enumeration + COM attempt, never a reverted PowerShell shell-out",
           "[sccm][windows][actions]") {
     auto plugin = load_sccm_plugin();
-    if (!plugin) {
-        WARN("sccm plugin library not found -- skipping LocalDispatcher round-trip test");
-        return;
-    }
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch.
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "site");
@@ -133,10 +148,15 @@ TEST_CASE("sccm plugin (Windows): site executes the real registry "
     // literal "SMS:{}" the pre-migration bug produced, and never absent.
     CHECK(result.captured.find("site_code|") != std::string::npos);
     CHECK(result.captured.find("management_point|") != std::string::npos);
-    if (result.captured.find("site_code|not_configured") == std::string::npos) {
-        WARN("site_code was not 'not_configured' -- host may have an actual SCCM "
-             "Authority registry key or client; captured: " << result.captured);
-    }
+    // Hard CHECKs, not WARN: on every host these tests run on, no SCCM
+    // Authority registry key and no Microsoft.SMS.Client COM registration
+    // exist, so the real registry enumeration + CLSIDFromProgID attempt
+    // deterministically falls through to site_code|not_configured and
+    // management_point|unknown -- the specific values a reverted
+    // PowerShell ComObject shell-out (or the pre-migration dead-literal
+    // "SMS:{}" bug) would not reliably reproduce.
+    CHECK(result.captured.find("site_code|not_configured") != std::string::npos);
+    CHECK(result.captured.find("management_point|unknown") != std::string::npos);
 }
 
 #endif // _WIN32

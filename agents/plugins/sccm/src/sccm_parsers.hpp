@@ -37,7 +37,7 @@ namespace yuzu::sccm {
 // (stale/mismatched Authority branch) -- first-found is deterministic given
 // a stable enumeration order, and there is no second live signal available
 // here to break a tie more precisely.
-std::optional<std::string> select_authority_subkey(const std::vector<std::string>& subkeys,
+inline std::optional<std::string> select_authority_subkey(const std::vector<std::string>& subkeys,
                                                     std::string_view site_code) {
     if (!site_code.empty()) {
         const std::string exact = std::format("SMS:{}", site_code);
@@ -68,7 +68,7 @@ struct SmsInvokeResult {
     std::string value;
 };
 
-SmsInvokeResult interpret_sms_invoke(bool succeeded, bool is_bstr, std::string bstr_utf8) {
+inline SmsInvokeResult interpret_sms_invoke(bool succeeded, bool is_bstr, std::string bstr_utf8) {
     if (!succeeded)
         return {SmsInvokeOutcome::failed, {}};
     if (!is_bstr)

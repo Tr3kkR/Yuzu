@@ -22,6 +22,27 @@
  * not by an automated unit-suite test here.
  *
  * Windows-only; the plugin's WMI/WUA code is a no-op elsewhere.
+ *
+ * Adversarial-review remediation (both external reviewers, independently):
+ * a plugin the loader could not find or load used to WARN-and-return here,
+ * which passed with zero assertions -- CLAUDE.md floors exactly this shape
+ * ("a false-green test offered as closure evidence for a blocking
+ * finding"). tests/meson.build's link_depends on windows_updates_plugin_lib
+ * orders the plugin build ahead of this test binary, so on a correctly
+ * configured Windows CI leg the plugin is ALWAYS present; its absence is
+ * now a real regression, not a benign skip case, so it is a REQUIRE.
+ *
+ * Disclosed residual gap: the prefix-only assertion below (`update|`)
+ * cannot fully discriminate the migrated native WMI path from a
+ * hypothetically-reverted PowerShell Get-HotFix implementation, because
+ * output wire-format compatibility was intentionally preserved across the
+ * migration (verified against the merge-base's PowerShell output). What
+ * this test DOES prove: the real plugin DLL loads, LocalDispatcher reaches
+ * its `installed` handler, and that handler executes to completion against
+ * a real bounded WMI query without crashing or hanging -- closing the
+ * "revert-survivor" gap this file was added for, short of full
+ * mechanism-level discrimination (which would need an injected WMI
+ * adapter -- a larger change than this migration's own scope).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -88,11 +109,10 @@ TEST_CASE("windows_updates plugin (Windows): installed executes the real "
           "bounded WMI Win32_QuickFixEngineering query, never silence",
           "[windows_updates][windows][actions]") {
     auto plugin = load_windows_updates_plugin();
-    if (!plugin) {
-        WARN("windows_updates plugin library not found -- skipping LocalDispatcher "
-             "round-trip test");
-        return;
-    }
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch.
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "installed");

@@ -21,6 +21,29 @@
  * unit suite risks exactly the flakiness/slowness CLAUDE.md's test
  * discipline warns against, so they are deliberately left for a separate,
  * opt-in integration test rather than folded in here.
+ *
+ * Adversarial-review remediation (both external reviewers, independently):
+ * a plugin the loader could not find or load used to WARN-and-return here,
+ * which passed with zero assertions -- CLAUDE.md floors exactly this shape
+ * ("a false-green test offered as closure evidence for a blocking
+ * finding"). tests/meson.build's link_depends on windows_updates_plugin_lib
+ * orders the plugin build ahead of this test binary, so on a correctly
+ * configured CI leg the plugin is ALWAYS present; its absence is now a real
+ * regression (a broken build/packaging step), not a benign "plugin
+ * variant not built" case, so it is a REQUIRE, not a WARN.
+ *
+ * Disclosed residual gap: `installed`'s prefix-only assertion below
+ * (`update|`/`package|`) cannot fully discriminate the migrated native
+ * argv path from a hypothetically-reverted shell implementation, because
+ * output wire-format compatibility was intentionally preserved across the
+ * migration -- the retired implementation emitted the identical prefixes
+ * (verified against the merge-base). What this test DOES prove: the real
+ * plugin DSO loads, LocalDispatcher reaches its `installed` handler, and
+ * that handler executes to completion against the real local OS tooling
+ * without crashing or hanging (rc == 0, a recognised row shape, not bare
+ * silence) -- closing the "revert-survivor" gap this file was added for,
+ * short of full mechanism-level discrimination (which would need injected
+ * WMI/argv adapters -- a larger change than this migration's own scope).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -46,9 +69,10 @@ constexpr const char* kPluginExt = ".so";
 #endif
 
 // Mirrors test_users_posix_actions.cpp's find_users_plugin, pointed at the
-// windows_updates plugin's own build output. Empty path (never a hard
-// failure) when not found, so a build without agent plugins skips rather
-// than fails.
+// windows_updates plugin's own build output. Empty path on failure --
+// callers here REQUIRE a non-empty result rather than skip (see the file
+// header comment): tests/meson.build's link_depends guarantees the plugin
+// is built before this test runs, so "not found" means a real regression.
 fs::path find_windows_updates_plugin() {
     const std::string lib_name = std::string{"windows_updates"} + kPluginExt;
 
@@ -97,11 +121,11 @@ TEST_CASE("windows_updates plugin: installed executes the real local package/"
           "history query, never silence",
           "[windows_updates][posix_actions]") {
     auto plugin = load_windows_updates_plugin();
-    if (!plugin) {
-        WARN("windows_updates plugin library not found -- skipping LocalDispatcher "
-             "round-trip test");
-        return;
-    }
+    // Hard failure, not WARN-and-skip: the plugin build is guaranteed
+    // ordered ahead of this test (tests/meson.build link_depends), so its
+    // absence is a real regression this test exists to catch, not a
+    // benign "plugin not built this configuration" case.
+    REQUIRE(plugin.has_value());
 
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "installed");

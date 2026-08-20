@@ -28,10 +28,11 @@
 #include <filesystem>
 #include <fstream>
 #include <format>
-#include <mutex>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #ifdef _WIN32
@@ -70,7 +71,11 @@ namespace {
 
 // ── subprocess helpers ─────────────────────────────────────────────────────
 
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__)
+// Linux-only: its three call sites (do_pending_reboot's uname -r / ls -t
+// /boot/vmlinuz-* / needs-restarting -r, see the comment below) are all
+// Linux-branch-only, so guarding this to __APPLE__ too just produced an
+// unused-function warning on every macOS build for no reason.
 std::string run_command(const char* cmd) {
     std::string result;
     std::array<char, 256> buf{};
@@ -182,31 +187,78 @@ private:
     std::atomic<ULONG> ref_{1};
 };
 
+// RAII owner for a BSTR returned by an out-parameter (e.g. IUpdate::
+// get_Title/get_MsrcSeverity), so the allocation is freed on every exit
+// path -- including a throwing conversion between the accessor call and
+// the manual SysFreeString that used to follow it (adversarial review
+// finding: CLAUDE.md's "non-RAII manual cleanup in new C++" governance
+// floor). Not agents/shared/win_com.hpp's BStr: that class only allocates
+// (SysAllocString/SysAllocStringLen), it has no adopt-an-existing-BSTR
+// constructor, and win_com.hpp belongs to sibling PR3.3-a -- extending it
+// here would touch a file this branch does not own. std::unique_ptr with a
+// SysFreeString deleter needs nothing from that file.
+using BStrGuard = std::unique_ptr<std::remove_pointer_t<BSTR>, decltype(&::SysFreeString)>;
+
 // Outstanding best-effort ISearchJob::CleanUp() threads from a deadline-
-// exceeded search (see do_missing() below). CleanUp() genuinely blocks, so
-// these run detached during normal operation -- but the host's reconnect/
-// shutdown path does dlclose()/FreeLibrary() this plugin on a live process
-// (see agents/core/include/yuzu/agent/subprocess_runner.hpp's header
-// comment), and a thread still executing this translation unit's code when
-// that happens crashes into unmapped memory. Tracked here so shutdown() can
-// join every outstanding one before the host is allowed to unload us.
-std::mutex g_cleanup_threads_mu;
-std::vector<std::thread> g_cleanup_threads;
+// exceeded search (see do_missing() below). CleanUp() genuinely blocks with
+// no documented bound, so these run DETACHED during normal operation -- but
+// the host's reconnect/shutdown path does dlclose()/FreeLibrary() this
+// plugin on a live process (see agents/core/include/yuzu/agent/
+// subprocess_runner.hpp's header comment), and a thread still executing
+// this module's code when that happens crashes into unmapped memory.
+//
+// A prior version of this fix joined every such thread unconditionally at
+// shutdown() -- but shutdown() runs SYNCHRONOUSLY inside Agent::Run()'s
+// final-teardown loop (agents/core/src/agent.cpp), so an unbounded join on
+// a genuinely wedged CleanUp() (a wedged/offline WSUS -- precisely the
+// scenario the bounded-poll design exists to survive) hangs the ENTIRE
+// agent's shutdown, recreating the exact "hang-forever" failure mode
+// docs/adr/3002-acquisition-ladder.md's rung-1 bounded-broker-call
+// requirement exists to remove (adversarial review finding, both external
+// reviewers independently). Fixed here by giving shutdown() a short,
+// bounded grace to wait for outstanding cleanups (covering the normal case
+// -- CleanUp() returning promptly once RequestAbort() has been honored --
+// with the same closing-the-dlclose-race benefit as before) and, on
+// timeout, letting a still-running cleanup keep running detached rather
+// than blocking shutdown -- the same bounded-poll shape this codebase's
+// own wait_for_workers_to_drain() (agents/core/src/hard_exit.hpp) uses for
+// the identical problem class in Guardian's own detached I/O workers (F3);
+// reimplemented locally rather than included, since that header is
+// agents/core-internal (same-directory #include only, not exposed to
+// plugins via the public agents/core/include/yuzu/agent/ surface) and
+// pulling it in would be a larger cross-module API change than this
+// migration's own scope. A cleanup
+// thread outliving a timed-out grace period, in the rare genuinely-wedged
+// case, keeps the original (narrower) dlclose-race residual risk this
+// mechanism cannot fully close without an agent-core-owned killable
+// broker boundary -- a larger change than this migration's scope.
+constexpr std::chrono::seconds kCleanupJoinGrace{3}; // matches hard_exit.hpp's kOrphanDrainGrace
+std::atomic<int> g_outstanding_cleanups{0};
 
 void track_detached_cleanup(std::thread t) {
-    std::lock_guard<std::mutex> lock(g_cleanup_threads_mu);
-    g_cleanup_threads.push_back(std::move(t));
+    g_outstanding_cleanups.fetch_add(1, std::memory_order_relaxed);
+    t.detach();
 }
 
+// Called by a cleanup thread itself, as its last action, once CleanUp()/
+// Release() have actually returned.
+void cleanup_finished() {
+    g_outstanding_cleanups.fetch_sub(1, std::memory_order_relaxed);
+}
+
+// Polls g_outstanding_cleanups until it reaches zero or kCleanupJoinGrace
+// elapses -- the same bounded-poll shape as hard_exit.hpp's
+// wait_for_workers_to_drain(), reimplemented locally (see the header
+// comment above for why that utility isn't included directly). Returns
+// once either condition is met; does not itself decide what "still
+// nonzero after grace" means -- the caller (shutdown(), below) simply lets
+// a not-yet-finished cleanup keep running detached rather than blocking.
 void join_all_detached_cleanups() {
-    std::vector<std::thread> threads;
-    {
-        std::lock_guard<std::mutex> lock(g_cleanup_threads_mu);
-        threads.swap(g_cleanup_threads);
-    }
-    for (auto& t : threads) {
-        if (t.joinable())
-            t.join();
+    const auto deadline = std::chrono::steady_clock::now() + kCleanupJoinGrace;
+    while (g_outstanding_cleanups.load(std::memory_order_relaxed) > 0) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 }
 #endif // _WIN32
@@ -425,16 +477,18 @@ int do_missing(yuzu::CommandContext& ctx) {
         // job off (via an extra COM ref, not a move -- ComPtr is neither
         // copyable nor movable) to a background thread that blocks in
         // CleanUp() on its own time; this call returns the honest
-        // CONSTRAINED result immediately either way. The thread is tracked
-        // (not detached) and joined in shutdown() before the host is
-        // allowed to dlclose()/FreeLibrary() this plugin -- see
-        // track_detached_cleanup/join_all_detached_cleanups above.
+        // CONSTRAINED result immediately either way. shutdown() waits a
+        // short bounded grace for this to finish (see
+        // track_detached_cleanup/join_all_detached_cleanups above) rather
+        // than joining it unconditionally -- a wedged CleanUp() must not be
+        // able to hang the whole agent's shutdown.
         job->RequestAbort();
         ISearchJob* raw_job = job.get();
         raw_job->AddRef();
         track_detached_cleanup(std::thread([raw_job]() {
             raw_job->CleanUp();
             raw_job->Release();
+            cleanup_finished();
         }));
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "windows_updates:search_deadline_exceeded");
@@ -504,15 +558,20 @@ int do_missing(yuzu::CommandContext& ctx) {
         }
 
         yuzu::windows_updates::UpdateRow row;
-        BSTR title_bstr = nullptr;
-        if (SUCCEEDED(update->get_Title(&title_bstr)) && title_bstr) {
-            row.title = yuzu::win::from_wide(title_bstr);
-            SysFreeString(title_bstr);
+        BSTR title_raw = nullptr;
+        if (SUCCEEDED(update->get_Title(&title_raw)) && title_raw) {
+            // Adopted into the RAII guard immediately -- from_wide() below
+            // allocates a std::string and is not noexcept; if it throws,
+            // title_bstr's destructor still runs during unwind and frees
+            // the BSTR (was: a raw SysFreeString call AFTER from_wide()
+            // that a throw would skip, leaking the COM allocation).
+            BStrGuard title_bstr(title_raw, &::SysFreeString);
+            row.title = yuzu::win::from_wide(title_bstr.get());
         }
-        BSTR severity_bstr = nullptr;
-        if (SUCCEEDED(update->get_MsrcSeverity(&severity_bstr)) && severity_bstr) {
-            row.msrc_severity = yuzu::win::from_wide(severity_bstr);
-            SysFreeString(severity_bstr);
+        BSTR severity_raw = nullptr;
+        if (SUCCEEDED(update->get_MsrcSeverity(&severity_raw)) && severity_raw) {
+            BStrGuard severity_bstr(severity_raw, &::SysFreeString);
+            row.msrc_severity = yuzu::win::from_wide(severity_bstr.get());
         }
         rows.push_back(std::move(row));
     }
@@ -1096,11 +1155,14 @@ public:
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
 #ifdef _WIN32
-        // Join every background ISearchJob::CleanUp() thread left running by
-        // an aborted do_missing() search before returning -- the host
-        // dlcloses/FreeLibrary()s this module right after shutdown() on its
-        // reconnect/shutdown path, and a thread still executing this
-        // module's code at that point would crash into unmapped memory.
+        // Wait a short bounded grace for every background ISearchJob::
+        // CleanUp() thread left running by an aborted do_missing() search
+        // before returning -- the host dlcloses/FreeLibrary()s this module
+        // right after shutdown() on its reconnect/shutdown path, and a
+        // thread still executing this module's code at that point would
+        // crash into unmapped memory. NOT an unconditional join: a wedged
+        // CleanUp() must not be able to hang shutdown() itself, since this
+        // runs synchronously inside the agent's own final-teardown path.
         join_all_detached_cleanups();
 #endif
     }
